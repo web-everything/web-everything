@@ -4,14 +4,16 @@
  * requests verification, records the wait, and ends the turn; the harness resumes the SAME session.
  * This slice only supplies the record and liveness exemptions; no fixer writes it automatically yet.
  */
-import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync } from 'node:fs';
+import { statSync, readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { ghRepoSlug, DEFAULT_REPO_KEY, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { loadSelfReviewPolicy, formatSelfReviewPolicyLine } from '../lib/fix-push-policy.mjs';
+import { withFileLock } from '../lib/atomic-json-file.mjs';
 
 /** Lane-local await record filename. */
 export const AWAIT_VERIFY_FILE = '.fix-await-verify';
@@ -44,12 +46,15 @@ export function resolveAwaitVerifyPath(cwd, { statFn = statSync, readFileSyncFn 
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonEmpty = (value) => typeof value === 'string' && value.trim().length > 0;
+const isQueueId = (value) => typeof value === 'string' && value === value.trim()
+  && /^[A-Za-z][A-Za-z0-9._-]{0,31}$/.test(value);
+const validItem = (value) => (Number.isInteger(value) && value > 0) || isQueueId(value);
 /** Kinds that hold no PR yet and push nothing: the harness only reports the verdict, the agent's own `open-pr` pushes. */
 export const AWAIT_VERIFY_NO_PUSH_KINDS = Object.freeze(['delivery', 'prepare']);
 const validRecord = (record) => isObject(record) && record.v === 1
   && typeof record.requestedAt === 'string' && Number.isFinite(Date.parse(record.requestedAt))
   && ((Number.isInteger(record.pr) && record.pr > 0)
-    || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && Number.isInteger(record.item) && record.item > 0));
+    || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && validItem(record.item)));
 
 /** Read JSON objects only; missing, unreadable and malformed files are unknown. */
 export function readAwaitVerifyRecord(cwd, io = {}) {
@@ -163,7 +168,8 @@ export function listStoredAwaitVerify({ dir = awaitVerifyStoreDir(), readdirSync
 }
 /** Atomically write (or replace) one store record. */
 export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), writeFileSyncFn = writeFileSync,
-  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID } = {}) {
+  renameSyncFn = renameSync, unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID,
+  withFileLockFn = withFileLock } = {}) {
   if (!validRecord(record)) return { ok: false, reason: 'malformed' };
   const key = awaitVerifyStoreKey(record);
   if (!key) return { ok: false, reason: 'malformed' };
@@ -173,13 +179,53 @@ export function writeStoredAwaitVerify(record, { dir = awaitVerifyStoreDir(), wr
     mkdirSyncFn(dir, { recursive: true });
     tmp = `${path}.${uniqueId()}.tmp`;
     writeFileSyncFn(tmp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx' });
-    renameSyncFn(tmp, path);
+    withFileLockFn(join(dir, '.store.lock'), () => renameSyncFn(tmp, path));
     return { ok: true, path, key };
   } catch {
     if (tmp) { try { unlinkSyncFn(tmp); } catch { /* best-effort temporary cleanup */ } }
     return { ok: false, reason: 'write-failed' };
   }
 }
+/** Previous-head CI failures remain owned until a verified repair handoff. */
+export function previousCiFailurePending(record, timing = { pushAfterCi: true }) {
+  return Boolean(timing?.pushAfterCi && record?.kind === 'fix'
+    && record.previousCi?.ready?.ciFailures?.length > 0
+    && !(record.previousCi.failuresHandedOff && (record.pendingResume?.kind === 'green'
+      || (record.earlyPush?.ok && String(record.earlyPush.sha ?? '').toLowerCase() === String(record.sha ?? '').toLowerCase()))));
+}
+
+/** Retire only the expected shared record; serialize quarantine/deletion with store publication. */
+export function clearStoredAwaitVerifyIf(key, expected, { dir = awaitVerifyStoreDir(),
+  readFileSyncFn = readFileSync, renameSyncFn = renameSync, unlinkSyncFn = unlinkSync,
+  existsSyncFn = existsSync, uniqueId = randomUUID, withFileLockFn = withFileLock } = {}) {
+  if (!nonEmpty(key) || !STORE_KEY_RE.test(key)
+    || !nonEmpty(expected?.sha) || !nonEmpty(expected?.requestedAt)) return { cleared: false };
+  const path = join(dir, `${key}.json`);
+  const tmp = `${path}.${uniqueId()}.tmp`;
+  const matches = file => {
+    try {
+      const current = JSON.parse(readFileSyncFn(file, 'utf8'));
+      return ['sha', 'requestedAt', 'sessionId'].every(field => current?.[field] === expected[field])
+        && isDeepStrictEqual(current, expected);
+    } catch { return false; }
+  };
+  // Missing or changed records need no lock; a matching snapshot is checked again under the mutex.
+  if (!matches(path)) return { cleared: false };
+  try {
+    return withFileLockFn(join(dir, '.store.lock'), () => {
+      if (!matches(path)) return { cleared: false };
+      renameSyncFn(path, tmp);
+      if (!matches(tmp)) {
+        // Preserve unexpected content, including changes from a writer that does not honor the lock.
+        try { if (!existsSyncFn(path)) renameSyncFn(tmp, path); } catch { /* leave quarantined content intact */ }
+        return { cleared: false };
+      }
+      unlinkSyncFn(tmp);
+      return { cleared: true };
+    });
+  } catch { return { cleared: false }; }
+}
+
 /** Remove one store record by key. */
 export function clearStoredAwaitVerify(key, { dir = awaitVerifyStoreDir(), unlinkSyncFn = unlinkSync } = {}) {
   try {
@@ -263,6 +309,15 @@ export const AWAIT_VERIFY_REF_RE = /^lane\/[A-Za-z0-9._/-]+$/;
 /** Session kinds whose briefs know how to be resumed by the verdict pass. */
 export const AWAIT_VERIFY_KINDS = Object.freeze(['fix', 'ci-heal', 'delivery', 'prepare']);
 
+/** Is this a record the harness pass owns (written by `mark --ref`)? Shared with stale-wait classification. */
+export function isHarnessRecord(record) {
+  return !!record && record.v === 1
+    && ((Number.isInteger(record.pr) && record.pr > 0) || (AWAIT_VERIFY_NO_PUSH_KINDS.includes(record.kind) && validItem(record.item)))
+    && /^[a-f\d]{40}$/i.test(String(record.sha ?? '')) && typeof record.lane === 'string' && record.lane.startsWith('/')
+    && AWAIT_VERIFY_REF_RE.test(String(record.ref ?? '')) && !String(record.ref).includes('..')
+    && AWAIT_VERIFY_KINDS.includes(record.kind) && Number.isFinite(Date.parse(record.requestedAt));
+}
+
 /**
  * Thin CLI shell; filesystem, subprocess, environment, clock and output ports are injectable.
  * `mark` refuses a dirty working tree: the harness pushes the committed sha, so the verified tree must BE that
@@ -309,7 +364,7 @@ export function main(argv = process.argv.slice(2), {
     const record = {
       v: 1, sessionId: callerSessionId(),
       who: flags.who, repo: noPush ? (flags.repo ?? ghRepoSlug(DEFAULT_REPO_KEY)) : flags.repo,
-      ...(noPush ? { item: Number(flags.item) } : { pr: Number(flags.pr) }),
+      ...(noPush ? { item: isQueueId(flags.item) ? flags.item : Number(flags.item) } : { pr: Number(flags.pr) }),
       sha: flags.sha ?? git(['rev-parse', 'HEAD']).trim(),
       requestedAt: new Date(now()).toISOString(), attempt: Number(flags.attempt ?? 1),
     };
@@ -325,7 +380,7 @@ export function main(argv = process.argv.slice(2), {
       if (!AWAIT_VERIFY_REF_RE.test(String(flags.ref)) || String(flags.ref).includes('..')) { err('malformed --ref (must be lane/*)'); return 2; }
       const kind = flags.kind ?? 'fix';
       if (!AWAIT_VERIFY_KINDS.includes(kind)) { err(`malformed --kind (one of ${AWAIT_VERIFY_KINDS.join(', ')})`); return 2; }
-      if (noPush && !(Number.isInteger(record.item) && record.item > 0)) { err('malformed: --kind=delivery|prepare needs --item=<NNN>'); return 2; }
+      if (noPush && !validItem(record.item)) { err('malformed: --kind=delivery|prepare needs --item=<NNN|queue-id>'); return 2; }
       // A fix pushes the committed sha, so its tree must BE that commit. A delivery/prepare lane pushes nothing here: its
       // verified working-tree hash is re-proven against the marker instead (a step-5 gate runs before the commit).
       if (!noPush && git(['status', '--porcelain', '--untracked-files=all']).trim()) {
@@ -338,6 +393,20 @@ export function main(argv = process.argv.slice(2), {
     }
     if (record.lane && foreignRecord(awaitVerifyStoreKey(record), record.lane)) {
       err(`refusing to overwrite the await record for ${awaitVerifyStoreKey(record)}: it belongs to another lane`); return 2;
+    }
+    if (record.kind === 'fix') {
+      const previous = readStore(awaitVerifyStoreKey(record));
+      // The same repair round may re-mark a new commit after a previous-CI handoff.
+      // Carry its pinned evidence, but never inherit it from another PR, branch or session.
+      if (previous?.kind === 'fix' && ['sessionId', 'who', 'repo', 'pr', 'lane', 'ref'].every(key => previous[key] === record[key])
+        && previous.previousCi) {
+        record.previousCi = previous.previousCi;
+        // A mark racing a busy/failed handoff must not turn its intent marker into a delivered inventory.
+        if (previous.pendingResume?.kind === 'previous-ci' && !previous.pendingResume.delivered) {
+          record.pendingResume = previous.pendingResume;
+          record.resumeFailures = previous.resumeFailures ?? 0;
+        }
+      }
     }
     const result = write({ cwd, record });
     if (!result.ok) { err(result.reason); return 2; }

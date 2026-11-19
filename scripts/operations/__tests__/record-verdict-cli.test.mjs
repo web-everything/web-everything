@@ -29,7 +29,7 @@ process.env.REVIEW_PR_CODEX_ADVISORY = '0';
 // #x8n4crp — the fourth seat's own env var needs the identical pin, for the identical reason.
 process.env.REVIEW_PR_CODEX_CORRECTNESS_ADVISORY = '0';
 // #3383 — the fifth seat's own env var needs the identical pin, for the identical reason: its probation
-// registration (`model-probation.json`'s `antigravity`/`gemini-3.1-pro` entry) defaults it ON too.
+// registration (`model-probation.json`'s `antigravity`/`gemini-4-argon-high` entry) defaults it ON too.
 process.env.REVIEW_PR_ANTIGRAVITY_REVIEW = '0';
 
 const BASE_INPUT = { pr: 4242, repo: 'web-everything/web-everything' };

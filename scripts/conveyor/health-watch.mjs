@@ -26,7 +26,11 @@
  *   episodes/<id>.md    the durable per-episode report (+ .json)
  *
  * Every child call has a hard timeout; a whole-tick watchdog kills a hung tick and records it, so the next tick
- * raises the `health-tick-overrun` smell.
+ * raises the `health-tick-overrun` smell. The deadline is budget × 3 × clamp(load1 / cores, 1, maxScale),
+ * capped by an absolute ceiling (defaults: maxScale 3, ceiling 540000ms; idle deadline 180000ms).
+ * Policy `healthWatchTickWatchdog`: standard → platform → health dir config.json (flat tickBudgetMs,
+ * tickKillLoadScaleMax, tickKillCeilingMs) → WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX / WE_HEALTH_TICK_KILL_CEILING_MS.
+ * Invalid settings fall back to their standard values and are logged with effective provenance.
  *
  * Usage:
  *   node scripts/conveyor/health-watch.mjs tick    [--json] [--force-gh] [--no-gh] [--dry-run] [--state-root=DIR]
@@ -41,6 +45,8 @@
  *   node scripts/conveyor/health-watch.mjs silence --smell=ID [--subject=S] --card=NNN [--hours=72]
  *   node scripts/conveyor/health-watch.mjs unsilence --smell=ID [--subject=S]
  */
+import { runArchiveRetentionTick } from './archive-retention-tick.mjs';
+export { archiveRetentionTickAllowed } from './archive-retention-tick.mjs';
 import { sweepReviewTmp, probeDiskSpace } from './review-tmp-health.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { superviseNeedsYouFeed } from './needs-you-feed-job.mjs';
@@ -48,6 +54,7 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { sealDueBatches } from '../operations/card-batch-seal-io.mjs';
 import { readFixLoopRows } from './fix-loop-ledger.mjs';
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { mirrorSyncForTick } from '../lib/mirror-sync.mjs';
 import { archiveClaudeJobs, formatClaudeJobsArchiveLine } from './claude-jobs-archive.mjs';
 import { sweepOurTmp, readBusyTopLevel, formatTmpSweepLine } from './tmp-sweep.mjs';
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -59,6 +66,7 @@ import {
 import { homedir, hostname, loadavg, cpus, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+export { resolveTickWatchdogLimit } from './health-watch-tick-limit.mjs';
 
 import {
   DEFAULT_HEALTH_CONFIG, emptyHealthState, runHealthTick, renderEpisodeReport, renderHealthSection, summarizeDiagnosisOutput, scrubText, scrubDeep, parsePsOutput, MINUTE, HOUR,
@@ -68,6 +76,7 @@ import { SMELLS } from './health-smells/index.mjs';
 import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
+import { probeForgeShareForWatch } from './forge-share-probe.mjs';
 import { runInvestigations } from './health-investigate-dispatch.mjs';
 import {
   planFileRequests, recordRequested, readLedgerStrict, writeLedger, spliceFilingSection, withLedgerLock,
@@ -78,10 +87,12 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { laneJournalPath, readLaneJournalTail, reconcileLaneJournalEntry } from '../lib/lane-history.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { laneIndicesIn, poolsWithLanes } from '../lib/lane-pool-scan.mjs';
+import { probeLaneCheckouts } from './lane-checkout-probe.mjs';
 import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { kickOverlayMainSync } from '../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
@@ -109,6 +120,11 @@ import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
+// Keep the watchdog's IO behind its probe boundary, outside the lane-action helper inventory.
+export async function probeLiveOwnerWatch(options) {
+  const { probeLiveOwnerWatch: probe } = await import('./pr-live-owner-watch.mjs');
+  return probe(options);
+}
 import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 import { runPrSweepJob, resolvePrSweepSettings, prSweepTickAllowed } from './pr-sweep-job.mjs';
 import { runNightlyCoronerJob, resolveNightlyCoronerSettings, nightlyCoronerTickAllowed, publishCoronerFailure, coronerNightDue } from './nightly-coroner-job.mjs';
@@ -415,19 +431,31 @@ export function daemonNameForLabel(label) {
  * (every resident daemon that is not a `pass-daemon.mjs` watcher), which the smell already treats as "use the
  * generic default".
  */
-export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000 } = {}) {
+export function probeLeasePid(pid, { signal = process.kill } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  try { signal(pid, 0); return true; } // signal 0 only checks existence; it never terminates anything
+  catch (e) { return e?.code === 'ESRCH' ? false : e?.code === 'EPERM' ? true : null; }
+}
+
+export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000,
+  leasePidAlive = pid => probeLeasePid(pid),
+} = {}) {
   const exec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, timeout: timeoutMs });
   const read = assess(collect({ exec }));
   return read.daemons.filter((d) => d.readable !== false).map((d) => {
     const ms = (v) => (v == null ? null : typeof v === 'number' ? v : Date.parse(v) || null);
     const entry = d.lease?.entry ?? null;
+    const outsideLaunchd = !d.running && Number.isSafeInteger(entry?.pid) && entry.pid > 1
+      ? leasePidAlive(entry.pid) : false;
     const activity = [ms(d.tick?.lastActivityAt), ms(d.tick?.at), ms(d.tick?.logMtimeMs)].filter(Number.isFinite);
     const log = daemonNameForLabel(d.name);
     return {
       log,
       role: d.kind ?? null,
       pid: entry?.pid ?? null,
-      pidAlive: !!d.running,
+      pidAlive: !!d.running, // unchanged: a bare signal-0 probe never feeds the silent-daemon investigation
+      // Launchd absence does not prove that the process holding the daemon lease is dead; the alert smell reads this.
+      outsideLaunchd,
       heartbeatAt: ms(entry?.heartbeatAt),
       lastActivityAt: activity.length ? Math.max(...activity) : null,
       daemonState: d.state,
@@ -1099,7 +1127,19 @@ export function resolveLaneScanTarget(flags, dir, fixtureTick) {
   return { laneScanDir, laneScanWrite: !!laneScanDir };
 }
 
+export function probeOverlayMainSync(flags, roots = () => daemonCloneRoots(workspaceOf(REPO_ROOT)),
+  kick = options => kickOverlayMainSync(options)) {
+  if (flags['logs-dir'] || flags['lock-root'] || flags['state-root'] || flags['dry-run']
+    || Object.keys(flags).some(key => key.endsWith('-fixture'))) return undefined;
+  return roots().map(root => {
+    try { return kick({ root }); }
+    catch (error) { return { root, error: String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 1000) }; }
+  });
+}
+
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
+// The one place this file calls the needs-you feed publisher (shared by every NEEDS-YOU line the tick writes).
+const feedPublish = (item, opts) => publishAttention(item, opts);
 export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
@@ -1124,6 +1164,13 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     : null;
 
   if (sweepAllowed && config.tmpSweepEnabled) attempt('reviewTmp', () => sweepReviewTmp({ tmpRoot: flags['tmp-sweep-root'] || tmpdir(), config, now, dryRun: !!flags['dry-run'] }));
+
+  // R217: each kind owns a 24h stamp; fixture ticks never touch host archives.
+  await attempt('archiveRetention', async () => {
+    const { results, error } = await runArchiveRetentionTick({ flags, now, archive: deps.archiveRetention ?? undefined });
+    if (error) probeErrors.archiveRetention = error;
+    return results;
+  });
 
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
@@ -1186,6 +1233,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // #4370 — fs-only, every tick. A fixture tick (any of the fixture-dir flags) reads only an explicit
   // `--lane-pool-root`, never the host's real pool.
   const fixtureTick = flags['logs-dir'] || flags['lock-root'] || flags['state-root'];
+  probes.overlayMainSync = attempt('overlayMainSync', () => probeOverlayMainSync(flags));
   probes.operationRuns = attempt('operationRuns', () => probeOperationRuns(fixtureTick ? { roots: [flags['state-root'] || logsDir], jobsRoot: null } : {}));
   probes.fixLoopLedger = attempt('fixLoopLedger', () => flags['fix-loop-ledger']
     ? readFixLoopRows({ env: { WE_FIX_LOOP_LEDGER: flags['fix-loop-ledger'] } })
@@ -1197,6 +1245,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.laneVerifyMarkers = attempt('laneVerifyMarkers', () => probeLaneVerifyMarkers({
     poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)),
   }));
+  probes.laneCheckouts = attempt('laneCheckouts', () => probeLaneCheckouts({ poolRoot: flags['lane-pool-root'] || (fixtureTick ? null : defaultPoolRoot(REPO_ROOT)), repoRoot: REPO_ROOT }));
   // #4200-ish — cheap, fs-only, every tick: catches a shim baked with a lane-clone path BEFORE that lane resets.
   probes.ghShimLanes = attempt('ghShimLanes', () => probeGhShimLanes());
   // #4317 — cheap, every tick: an aged untracked backlog card sitting inside a daemon clone (the exact class of
@@ -1207,6 +1256,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.heavyQueue = attempt('heavyQueue', () => (flags['heavy-status-file']
     ? JSON.parse(readFileSync(flags['heavy-status-file'], 'utf8'))
     : JSON.parse(run(process.execPath, [join(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs'), 'status', '--json'], { timeoutMs: 15_000 }))));
+  // R497 — Forge share (settings-driven, never throws: any failure reads as unknown, which the smell alarms on).
+  probes.forgeShare = probeForgeShareForWatch({ repoRoot: REPO_ROOT });
   // `machine-overload`'s own inputs — every tick, cheap, never gh-gated. `--ps-fixture`/`--machine-load-fixture`
   // are the incident-reproduction path: this repo never runs a load generator to test this smell (see that
   // smell's own header) — it feeds a real-shaped `ps` snapshot through the exact same tick instead.
@@ -1225,6 +1276,11 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.heavyRunSamples = attempt('heavyRunSamples', () => readRecentSamples(heavyRunSamplesPath, {
     now, windowMs: config.heavyRunUngatedWindowMs ?? 10 * MINUTE,
   }));
+  probes.liveOwnerWatch = await attempt('liveOwnerWatch', () => probeLiveOwnerWatch({
+    dir, now, config, flags, remainingMs: Math.max(0, (config.tickBudgetMs ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs) - (Date.now() - started)),
+    ...(deps.liveOwnerWatchPass ? { runPass: deps.liveOwnerWatchPass } : {}),
+  }));
+  if (probes.liveOwnerWatch?.error) probeErrors.liveOwnerWatch = probes.liveOwnerWatch.error;
   // `gh-call-failures` — fs-only, every tick: the gh-throttle call log's tail (`--gh-calls-log=FILE` in tests).
   probes.ghCalls = attempt('ghCalls', () => probeGhCalls(flags['gh-calls-log'] ? { logPath: flags['gh-calls-log'] } : {}));
   // #4309 — alongside (never replacing) the 2 MB tail above: persist every fully closed hour of GitHub spend once,
@@ -1345,6 +1401,19 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     if (got.probes.prs && got.probes.agents) ghCache.at = now;
   }
 
+  // Mirror freshness has its own cadence, independent of GitHub probes and --no-gh.
+  await attempt('mirrorSync', async () => {
+    const mirrorSync = await mirrorSyncForTick({
+      flags, fixtureTick, dryRun: !!flags['dry-run'], now, config,
+      deps: { syncMirror: deps.syncMirror, stateDir: dir },
+    });
+    if (flags['dry-run'] || fixtureTick) return;
+    if (!['synced', 'rate-limited', 'locked'].includes(mirrorSync?.status)) {
+      throw new Error(`${mirrorSync?.status || 'unavailable'}: ${mirrorSync?.reason || 'mirror refresh did not complete'}`);
+    }
+  });
+  if (probeErrors.mirrorSync) probeErrors.mirrorSync = probeErrors.mirrorSync.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 240);
+
   // A tick the watchdog killed last time is the overrun smell's input.
   const overrunPath = join(dir, 'overrun.json');
   const overrun = readJson(overrunPath, null);
@@ -1388,7 +1457,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   else if (prev.prSweep) state.prSweep = prev.prSweep;
   if (!flags['state-root'] && !flags['dry-run']) {
     for (const t of result.transitions.filter(t => t.type === 'opened' && t.episode?.smell === 'disk-space')) {
-      attempt('diskSpaceNeedsYou', () => publishAttention({
+      attempt('diskSpaceNeedsYou', () => feedPublish({
         repo: `host/${hostname()}`, pr: 0,
         // Episode report ids have minute precision. openedAt distinguishes even
         // two openings in the same minute and supplies the feed's complete identity.
@@ -1505,11 +1574,39 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // `notifyDesktopChecked` already reports its own failure rather than throwing; a delivery failure here must
   // never fail the tick.
   const notifications = [];
-  for (const p of result.plan.filter((x) => x.kind === 'notify' && !x.suppressed)) {
+  // A failed NEEDS-YOU publish retries next tick (not only on the next notify transition); desktop notify is not repeated.
+  const needsYouRetries = Object.entries(state.episodes ?? {})
+    .filter(([k, e]) => e?.smell === 'claude-auth-expired' && Number.isFinite(e.needsYouFailedAt) && !Number.isFinite(e.needsYouAt) && !e.tracked
+      && (e.status === 'open' || e.status === 'flapping') && !result.plan.some((x) => x.key === k && x.kind === 'notify' && !x.suppressed))
+    .map(([key]) => ({ key, kind: 'notify', retry: true }));
+  for (const p of [...result.plan.filter((x) => x.kind === 'notify' && !x.suppressed), ...needsYouRetries]) {
     const ep = state.episodes[p.key];
+    if (ep?.smell === 'claude-auth-expired' && !Number.isFinite(ep.needsYouAt) && !flags['no-notify']) {
+      // Event-only kind (like 'disk-space'): NOT in the feed's REPORT_KINDS, so a complete operator-queue refresh can't
+      // clear it by absence while the episode is still open — health-watch owns the condition and publishes once.
+      const item = { key: p.key, repo: 'health-watch', kind: 'claude-auth-expired', pr: 0,
+        head: `${p.key}:${ep.openedAt ?? ep.firstBreachAt}`,
+        reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
+        at: new Date(now).toISOString() };
+      if (flags['dry-run']) {
+        notifications.push({ key: p.key, channel: 'needs-you', dryRun: true, item });
+      } else {
+        try {
+          await (deps.publishNeedsYou ?? feedPublish)(item);
+          // Reminder/unsilence plans may notify again; the feed alerts once per episode.
+          ep.needsYouAt = now;
+          notifications.push({ key: p.key, channel: 'needs-you', item, ok: true, error: null });
+        } catch (e) {
+          const error = String(e?.message || e).split('\n')[0].slice(0, 200);
+          ep.needsYouFailedAt = now;
+          console.error(`health-watch: NEEDS-YOU publish failed: ${error}`);
+          notifications.push({ key: p.key, channel: 'needs-you', item, ok: false, error });
+        }
+      }
+    }
     // `--dry-run`/`--no-notify` both skip actually SENDING one (an OS-visible side effect, unlike the
     // read-only diagnoses above) — a dry-run reports what it would have sent via `result.plan` already.
-    if (!ep || flags['no-notify'] || flags['dry-run']) continue;
+    if (!ep || p.retry || flags['no-notify'] || flags['dry-run']) continue;
     if (ALERT_ONCE_PER_SUBJECT.has(ep.smell)) continue; // sent once per break by the block below
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
@@ -1647,7 +1744,6 @@ async function main(argv) {
   // `--in-process` is the watchdog's worker child: its parent already holds the tick lock.
   const release = flags['dry-run'] || flags['in-process'] ? () => {} : acquireTickLock(dir);
   if (!release) { console.error('health-watch: another tick holds the tick lock — skipping.'); return 0; }
-  const budget = (readJson(join(dir, 'config.json'), {}).tickBudgetMs) ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs;
   if (flags['in-process']) {
     // The worker: runs the tick itself. Its probes block on synchronous child calls, so no timer in THIS
     // process could interrupt it — the watchdog lives in the parent (below).
@@ -1664,7 +1760,10 @@ async function main(argv) {
     } finally { release(); }
   }
   try {
-    return await runTickWithWatchdog(argv, { dir, killAfterMs: budget * 3 });
+    // Only the parent tick needs to resolve the watchdog deadline.
+    const { resolveTickWatchdogLimit } = await import('./health-watch-tick-limit.mjs');
+    const { killAfterMs } = resolveTickWatchdogLimit({ config: readJson(join(dir, 'config.json'), {}) });
+    return await runTickWithWatchdog(argv, { dir, killAfterMs });
   } finally { release(); }
 }
 
@@ -1675,7 +1774,9 @@ async function main(argv) {
  * execFileSync probes block the very event loop the timer needs.)
  * @returns {Promise<number>} the exit code: the child's own, or 3 when the watchdog killed it
  */
-export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLToPath(import.meta.url) }) {
+export function runTickWithWatchdog(argv, { dir, killAfterMs, script = fileURLToPath(import.meta.url), spawnChild = spawn }) {
+  // Keep the reviewed spawn call explicit while allowing hermetic watchdog fixtures.
+  const spawn = spawnChild;
   return new Promise((resolveExit) => {
     const child = spawn(process.execPath, [script, ...argv, '--in-process'], { stdio: 'inherit' });
     let killed = false;

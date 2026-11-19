@@ -126,7 +126,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
       readHeadCheckState: () => { throw new Error('must not be called'); },
       clearAwaitingCi: NOOP_STATUS,
     });
-    expect(result).toEqual({ dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
+    expect(result).toEqual({ handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
   });
 
   it('a gh failure on one PR is reported as a refusal and does not stop the rest of the batch', () => {
@@ -522,4 +522,62 @@ describe('runReconcilePromoteDraftDispatch — restore-review-label half (PR #38
     const r = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
     expect(r.refusals).toEqual([expect.objectContaining({ kind: 'label-failed' })]);
   });
+});
+
+it('yields between complete PR effects and resumes at the cursor with wraparound', () => {
+  let time = 10, inEffect = false;
+  const touched = [];
+  const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
+  const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
+    reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: 'a' })), refusals: [] }),
+    readHeadCheckState: () => { inEffect = true; time = 11; return { state: 'green' }; },
+    readPrLabels: () => [], provider: { ready: pr => { touched.push(pr); } },
+    clearAwaitingCi: () => { expect(inEffect).toBe(true); inEffect = false; },
+  };
+  const first = runReconcilePromoteDraftDispatch(options);
+  expect(first).toMatchObject({ handled: 1, deferred: [2, 3], nextCursor: 2 });
+  expect(touched).toEqual([1]);
+  // The entry check, then each PR's clock read.
+  expect(now).toHaveBeenCalledTimes(3);
+  touched.length = 0;
+  const second = runReconcilePromoteDraftDispatch({ ...options, cursor: first.nextCursor, deadlineAt: 20 });
+  expect(touched).toEqual([2, 3, 1]);
+  expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
+});
+
+it('past deadline with a cursor skips reconcile, uses deferred=[cursor], and keeps the cursor for next pass', () => {
+  const reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
+  const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
+  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+    now: () => 11, deadlineAt: 10, cursor: 42, reconcile,
+    provider: { ready }, readHeadCheckState, readPrLabels,
+  });
+  expect(result).toMatchObject({ handled: 0, deferred: [42], nextCursor: 42 });
+  for (const fn of [reconcile, ready, readHeadCheckState, readPrLabels]) expect(fn).not.toHaveBeenCalled();
+});
+
+it('past deadline without a cursor skips reconcile and flags deadlineSkipped', () => {
+  const reconcile = vi.fn(() => ({ dispatch: [43, 42].map(prNumber => ({ kind: 'promote-draft', prNumber })), refusals: [] }));
+  const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
+  const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+    now: () => 11, deadlineAt: 10, reconcile, provider: { ready }, readHeadCheckState, readPrLabels,
+  });
+  expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
+  for (const fn of [reconcile, ready, readHeadCheckState, readPrLabels]) expect(fn).not.toHaveBeenCalled();
+});
+
+it('promote-draft: a reconcile that always overruns the budget still handles one entry every pass (no starvation)', () => {
+  let time = 0;
+  const promoted = [];
+  const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
+    reconcile: () => { time += 1000; return { dispatch: [5, 6].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: 'a' })), refusals: [] }; },
+    readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => [],
+    provider: { ready: pr => { promoted.push(pr); } }, clearAwaitingCi: () => {} };
+  let cursor;
+  for (let pass = 0; pass < 2; pass += 1) {
+    const result = runReconcilePromoteDraftDispatch({ ...options, deadlineAt: time + 100, cursor });
+    expect(result).toMatchObject({ handled: 1, deferred: [pass === 0 ? 6 : 5], nextCursor: pass === 0 ? 6 : 5 });
+    cursor = result.nextCursor ?? undefined;
+  }
+  expect(promoted).toEqual([5, 6]);
 });

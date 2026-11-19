@@ -13,9 +13,10 @@
  *
  * IMPURE by construction: `child_process`.
  */
+import { checkCanonicalAuditForOpen } from './canonical-audit-gate.mjs';
 import { readMainCard, assertMachineTitle } from './machine-pr-title.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
@@ -77,6 +78,7 @@ function pathWithShimFirst(dir, pathEnv) {
   return [dir, ...pathEnv.split(':').filter((d) => d && d !== dir)].join(':');
 }
 import { checkPrePrReview, loadPrePrSettings, renderBypassNote, codeSpan } from '../lib/pre-pr-review.mjs';
+import { isPrepExempt, logPrepEvent, prepVerdict } from '../lib/prep-block.mjs';
 import { prepareItemFromRef, preparePrTitle, verifyPreparePr, prepareBatchIds, verifyPrepareBatchPr } from './prepare-pr.mjs';
 
 /** The single home. Resolved from THIS file's location, never cwd — the lane being opened is not this repo. */
@@ -90,17 +92,25 @@ export const OPEN_PR_TIMEOUT_MS = 30 * 60 * 1000;
  * span) to a COPY of the PR body file. FAILS CLOSED: a bypass whose PR-body note cannot be written throws, so the
  * caller refuses it rather than opening a PR whose body does not record the bypass. `cleanup` removes the copy.
  */
-function withBypassInBody(argv, b) {
+function withBypassInBody(argv, b, cwd) {
   const i = argv.findIndex((a) => a.startsWith('--body-file='));
   if (i < 0) throw new Error('the request has no --body-file, so the bypass cannot be recorded in the PR body');
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-bypass-'));
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   try {
     const out = join(dir, 'body.md');
-    // pr-land expands a leading `~` in --body-file; read the same file it will.
-    writeFileSync(out, readFileSync(argv[i].slice('--body-file='.length).replace(/^~/, homedir()), 'utf8') + renderBypassNote(b));
+    writeFileSync(out, readFileSync(bodyFilePath(argv[i].slice('--body-file='.length), cwd), 'utf8') + renderBypassNote(b));
     return { argv: argv.map((a, j) => (j === i ? `--body-file=${out}` : a)), cleanup };
   } catch (e) { cleanup(); throw e; }
+}
+
+/** Match pr-land's expandHome exactly: replace any leading `~`, including in `~name`. */
+const expandBodyFileHome = (p) => (p && p.startsWith('~') ? p.replace(/^~/, homedir()) : p);
+
+/** Prefix the publisher's cwd without collapsing symlink/.. traversal (join/resolve would change the target). */
+function bodyFilePath(path, cwd) {
+  const expanded = expandBodyFileHome(path);
+  return isAbsolute(expanded) ? expanded : `${cwd}${sep}${expanded}`;
 }
 
 /** The decisions a gate may return; anything else (null, `{}`, a typo'd action) is a check error, never a pass. */
@@ -129,7 +139,10 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
  */
-export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen, prePrReview = checkPrePrReview, loadSettings = loadPrePrSettings, spawn = spawnSync, cwd = process.cwd(),
+  // Advisory rollout until automated producers have migrated their generated bodies.
+  // Enforce remains injectable so admission and path-parity tests cover the eventual strict gate.
+  prepMode = 'advise', prepGate = prepVerdict, readPrepBody = readFileSync, prepLogPath,
   // Card 6931 — the credential env is resolved per run, inside the runner, so a daemon's guard refusal is a refused
   // outcome before any gh call (never a crash where run.mjs builds the sinks). An explicit `env` skips resolution;
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
@@ -146,6 +159,28 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     let r;
     let cleanupBody = () => {}; // removes the temp PR-body copy a bypass writes; called on every path out
     const arg = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
+    if (!argv.includes('--dry-run')) {
+      let body = '';
+      let readable = true;
+      const bodyFile = arg('body-file');
+      if (bodyFile) {
+        try { body = readPrepBody(bodyFilePath(bodyFile, cwd), 'utf8'); }
+        catch (error) {
+          readable = false;
+          const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+          process.stderr.write(`open-pr: WARNING — prep body unreadable; deferring to existing handling: ${detail}\n`);
+        }
+      }
+      if (readable) {
+        const prep = prepGate(body);
+        if (prep.waived) logPrepEvent({ kind: 'waiver', detail: prep.reason }, { logPath: prepLogPath });
+        else if (!isPrepExempt(arg('title')) && !prep.ok) {
+          if (prepMode !== 'advise') return { outcome: 'refused', reason: 'prep-block-missing', detail: prep.reason };
+          logPrepEvent({ kind: 'prep-advisory', detail: prep.reason }, { logPath: prepLogPath });
+          process.stderr.write(`open-pr: prep advisory (rollout pending caller migration) — ${String(prep.reason).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}\n`);
+        }
+      }
+    }
     // Pre-PR review gate (card 2): ADDED before the home's own gates, never instead of them (the post-PR review
     // gate and the verify finish-guard still run inside pr-land). A rehearsal opens nothing, so it is not gated.
     // Any failure of the check is mode-aware (`failedGate`): enforce refuses, it never silently admits.
@@ -160,7 +195,7 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
       // Gate and push are bound to the SAME commit: pr-land publishes exactly the sha the gate judged.
       if (gate.sha) argv = [...argv.filter((a) => !a.startsWith('--sha=')), `--sha=${gate.sha}`];
       if (gate.bypass) {
-        try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, gate.bypass)); }
+        try { ({ argv, cleanup: cleanupBody } = withBypassInBody(argv, gate.bypass, cwd)); }
         catch (e) { return { outcome: 'refused', reason: 'pre-pr-review-bypass-unrecorded', detail: `bypass refused — ${e.message}` }; }
       }
       if (gate.action === 'advise') process.stderr.write(`open-pr: advisory — ${gate.message}\n`);
@@ -187,6 +222,14 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
         return { outcome: 'refused', reason: String(e.message || e) };
       }
     }
+    let audit;
+    try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env }); }
+    catch { audit = { ok: false, reason: 'canonical-audit-missing', message: 'canonical audit check failed; resolve the full head sha and run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' }; }
+    if (audit?.ok !== true) {
+      cleanupBody();
+      return { outcome: 'refused', reason: audit?.reason || 'canonical-audit-missing', detail: audit?.message || 'canonical audit check returned no decision' };
+    }
+    if (audit.sha) argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
     try {
       r = spawn(process.execPath, [PR_LAND_CLI, ...argv, '--json'], {
         encoding: 'utf8', timeout: OPEN_PR_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, cwd, env,

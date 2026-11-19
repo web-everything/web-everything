@@ -1,0 +1,282 @@
+import { existsSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
+import { cpus, loadavg } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { admissionLockRoot, admissionBypassReason, poolRootOf, loadAdmissionPolicy, decideRemote, resolveRemoteClient } from '../readiness/heavy-admission.mjs';
+import { defaultPoolRoot } from './lane-pool-paths.mjs';
+import { allowedCommand, allowedEnv } from '../readiness/forge-exec-run.mjs';
+import { verificationInfrastructureFailure } from './lane-verify.mjs';
+import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
+import { shellQuote } from './verify-lane-gate.mjs';
+
+function simpleShellWords(command) {
+  if (/[\r\n]/.test(command)) return null;
+  // Plain words and single-quoted segments only; shell operators and expansions stay local. A quoted
+  // segment may also hold `"[]`, literal inside single quotes, so a JSON VERIFY_SCAN_FILES list parses.
+  const word = "(?:[a-zA-Z0-9_./:=@%+,\\-]|'[a-zA-Z0-9_./:=@%+, \"\\[\\]\\-]*')+";
+  if (!new RegExp(`^${word}(?:[ \\t]+${word})*$`).test(command)) return null;
+  return command.match(new RegExp(word, 'g'));
+}
+const unquote = arg => arg.replaceAll("'", '');
+
+// A leading `KEY=value` is a plain word or one shell single-quoted string (`'\''` encodes an apostrophe).
+// The quoted form carries repo-scan's changed-file JSON; its content is checked by Forge's own env allowlist.
+const ASSIGNMENT_PREFIX = /^([A-Za-z_][A-Za-z0-9_]*)=('(?:[^'\r\n]|'\\'')*'|[a-zA-Z0-9_./:=@%+,\-]*)(?:[ \t]+|$)/;
+const unquoteValue = raw => raw.startsWith("'") ? raw.slice(1, -1).replaceAll("'\\''", "'") : raw;
+// Keys that change neither the nested wrapper's admission (CI bypasses it) nor its routing. Each must
+// also pass Forge's env allowlist, so the remote run sees the same value.
+const SEGMENT_ENV_KEYS = Object.freeze(['TZ', 'LANG', 'LC_ALL', 'FORCE_COLOR', 'NO_COLOR', 'VERIFY_SCAN_FILES']);
+
+function isVitestSegment(command) {
+  // Consume one assignment at a time. Repeating quoted/unquoted alternatives in one regexp
+  // backtracks exponentially on quoted assignments followed by a non-Vitest command.
+  let rest = command;
+  for (let m; (m = ASSIGNMENT_PREFIX.exec(rest)); ) rest = rest.slice(m[0].length);
+  return /^npx vitest(?=\s|$)/.test(rest);
+}
+
+// Splits a segment into its leading allowlisted assignments (kept as original text) and plain words.
+function segmentParts(command) {
+  if (/[\r\n]/.test(command)) return null;
+  let rest = command;
+  let prefix = '';
+  for (let m; (m = ASSIGNMENT_PREFIX.exec(rest)); ) {
+    // Leading assignments run with the nested wrapper, so they apply locally and reach Forge only
+    // through its env allowlist. Any other key keeps the segment local.
+    if (!SEGMENT_ENV_KEYS.includes(m[1]) || !allowedEnv({ [m[1]]: unquoteValue(m[2]) })) return null;
+    prefix += m[0];
+    rest = rest.slice(m[0].length);
+  }
+  const words = simpleShellWords(rest);
+  return words ? { prefix, words } : null;
+}
+
+function wrappedVitestCommand(command, checkoutWrapped, checkoutTestUnitWrapped) {
+  const parts = segmentParts(command);
+  if (!parts) return null;
+  const { prefix, words } = parts;
+  if (words[0] !== 'npx' || words[1] !== 'vitest' || !['run', 'related'].includes(words[2])) return null;
+  // Both rewrites below name the TARGET checkout's own WE wrapper (directly, or via its self-wrapped `test:unit`).
+  if (!checkoutWrapped()) return null;
+  const related = words[2] === 'related';
+  const args = words.slice(3);
+  // The nested wrapper and Forge both receive every original argument; Forge's allowlist accepts the
+  // gate options (R314), so nothing is stripped. Options must be literal words: a quoted spelling stays local.
+  if (!args.length || args.some(arg => arg.startsWith("'-") || (arg.startsWith('-') && arg.includes("'") && !arg.startsWith("--outputFile.json='/")))) return null;
+  // R335 widened the runner allowlist for the soak guard only (json report, --config); verify keeps those local.
+  // The always-run guard (`run` + json reporter + ONE absolute outputFile, no config) is the one exception: the
+  // nested wrapper strips the path before Forge and writes the returned report back locally (fail-closed there).
+  const unquoted = args.map(unquote);
+  const reportArgs = unquoted.filter(arg => arg.startsWith('--outputFile'));
+  const guard = !related && reportArgs.length === 1 && /^--outputFile\.json=\/[^\0]+$/.test(reportArgs[0])
+    && !reportArgs[0].split('/').includes('..') && unquoted.includes('--reporter=json') && !unquoted.includes('--config');
+  if (!guard && unquoted.some(arg => /^(?:--reporter=json|--outputFile|--config)\b/.test(arg))) return null;
+  const checked = guard ? unquoted.map(arg => arg.startsWith('--outputFile') ? '--outputFile.json=guard-report.json' : arg) : unquoted;
+  if (!allowedCommand(['npx', 'vitest', words[2], ...checked])) return null;
+  if (guard) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest run ${args.join(' ')}`;
+  // `vitest related` has no package script: the nested heavy-admission wrapper maps `npx vitest related` itself
+  // (remote first, then its own local fallback), and Forge's allowlist already requires `--run` for it.
+  if (related) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest related ${args.join(' ')}`;
+  // `npm run test:unit` exists only where the checkout declares it, and owns admission only where it wraps itself.
+  // Any other checkout (plateau-app: `test` only) gets the wrapper directly, never a missing script (PR #6772).
+  if (!checkoutTestUnitWrapped()) return `${prefix}node scripts/readiness/heavy-admission.mjs run -- npx vitest run ${args.join(' ')}`;
+  return `${prefix}npm run test:unit -- ${args.join(' ')}`;
+}
+
+// A package script that already wraps itself in heavy-admission (`npm run test:unit|check:standards`):
+// the nested wrapper owns remote dispatch and local fallback, so the segment is passed through verbatim.
+function wrappedNpmScript(command, checkoutStandardsWrapped = () => false) {
+  const words = simpleShellWords(command)?.map(unquote);
+  if (!words || words[0] !== 'npm' || words[1] !== 'run' || !['test:unit', 'check:standards'].includes(words[2])) return null;
+  if (words.length > 3 && words[3] !== '--') return null;
+  if (words[2] === 'test:unit' && words.slice(4).some(arg => arg.startsWith('-') && !allowedCommand(['npm', 'run', 'test:unit', '--', arg]))) return null;
+  if (allowedCommand(words)) return command;
+  // `check:standards -- --scope=<session>` is a session-claim gate Forge's allowlist refuses by design. The package script
+  // wraps itself in heavy-admission, which owns that segment's remote-or-local choice, so it passes through verbatim and
+  // leaves the chain's vitest segments free to run remote. Only plain scope words; anything else keeps the chain local.
+  if (words[2] === 'check:standards' && words[3] === '--' && words.length > 4 && checkoutStandardsWrapped()
+    && words.slice(4).every(arg => /^--scope=[A-Za-z0-9_.\/:@%+,-]+$/.test(arg) && !arg.includes('..'))) return command;
+  return null;
+}
+
+// A gate built as `vitest run … && npm run check:standards && …` (the scan phase, the default gate's
+// phases, the whole `verify` gate `npm run test:unit && npm run check:standards`) is remote-eligible only
+// when EVERY top-level segment is; the shell keeps `&&` short-circuiting and each nested wrapper owns its
+// own fallback.
+function wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) {
+  const wrapped = command.split(' && ').map(segment => wrappedVitestCommand(segment, checkoutWrapped, checkoutTestUnitWrapped) ?? wrappedNpmScript(segment, checkoutStandardsWrapped));
+  return wrapped.every(Boolean) ? wrapped.join(' && ') : null;
+}
+
+// Only THIS checkout-independent wrapper (beside this module) owns its own admission; any other path is an ordinary command.
+export const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
+// The `npx vitest related|run` rewrites above name the TARGET checkout's own admission wrapper: `node <this path> run`
+// directly, or WE's self-wrapped `npm run test:unit`. A sibling checkout (plateau-app, frontierui) has neither, so a
+// rewrite there dies on a missing module before any test runs (PR #6769). Resolved against the checkout the gate runs in.
+export const CHECKOUT_ADMISSION_WRAPPER = 'scripts/readiness/heavy-admission.mjs';
+// Fail closed: an unreadable probe counts as absent, so the phase stays an ordinary local command under our own slot.
+function checkoutHasAdmissionWrapper(cwd, fileExists = existsSync) {
+  try { return fileExists(resolve(cwd, CHECKOUT_ADMISSION_WRAPPER)) === true; } catch { return false; }
+}
+// The checkout's own `test:unit` must be exactly WE's self-wrapped `vitest run`: a script that only mentions the wrapper
+// (`echo … && vitest run`) or wraps another runner (`… -- jest`, watch-mode `… -- vitest`) would run something else.
+// Unreadable, oversized (64 KiB bounded read, regular file only), malformed or missing counts as not wrapped.
+const SELF_WRAPPED_TEST_UNIT = /^node scripts\/readiness\/heavy-admission\.mjs run -- vitest run$/;
+const readCheckoutPackageJson = cwd => readBoundedReport(resolve(cwd, 'package.json'));
+const SELF_WRAPPED_STANDARDS = /^node scripts\/readiness\/heavy-admission\.mjs run -- node scripts\/check-standards\.mjs$/;
+function checkoutHasSelfWrappedStandards(cwd, readPackageJson = readCheckoutPackageJson) {
+  try {
+    const script = JSON.parse(readPackageJson(cwd))?.scripts?.['check:standards'];
+    return typeof script === 'string' && SELF_WRAPPED_STANDARDS.test(script);
+  } catch { return false; }
+}
+function checkoutHasSelfWrappedTestUnit(cwd, readPackageJson = readCheckoutPackageJson) {
+  try {
+    const script = JSON.parse(readPackageJson(cwd))?.scripts?.['test:unit'];
+    return typeof script === 'string' && SELF_WRAPPED_TEST_UNIT.test(script);
+  } catch { return false; }
+}
+const REWRITTEN_VITEST_SEGMENT = /^npx vitest (?:related|run)(?=\s|$)/;
+// Why a phase the wrapper cannot take stays local. A `vitest related` phase whose args Forge cannot run as written
+// (no `--run`, unknown flag, quoted option) still stays local; a clean one is wrapped in heavy-admission above.
+// With `cwd`, a vitest phase in a checkout without the admission wrapper names that as its reason instead.
+export function localPhaseReason(command, { cwd, fileExists } = {}) {
+  const segments = command.split(' && ').map(segment => segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, ''));
+  if (cwd !== undefined && segments.some(s => REWRITTEN_VITEST_SEGMENT.test(s)) && !checkoutHasAdmissionWrapper(cwd, fileExists)) {
+    return 'no-checkout-admission-wrapper';
+  }
+  return segments.some(segment => /^npx vitest related(?=\s|$)/.test(segment)) ? 'vitest-related-local-only' : 'raw-command';
+}
+
+// Names the shape of a phase command for the fallback log: per `&&` segment, the tool, subcommand and flag NAMES only
+// (no env values, paths, test names or flag values), so an unwrapped shape is visible without leaking arguments.
+export function localPhaseShape(command) {
+  const shape = String(command ?? '').split(' && ').map((segment) => {
+    const rest = segment.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'(?:[^']|'\\'')*'|\S*)\s+)+/, '');
+    const words = rest.split(/\s+/).filter(Boolean);
+    const flags = [...new Set(words.filter(w => w.startsWith('--')).map(w => w.replace(/[=.].*$/, '')))];
+    const head = words.filter(w => !w.startsWith('-')).slice(0, words[0] === 'node' ? 1 : 3).map(w => w.replace(/[^\w:./-]/g, '').slice(0, 40));
+    return [...head, ...flags].join(' ');
+  });
+  return shape.join(' && ').slice(0, 200);
+}
+
+export function phaseAdmissionPlan({ command, decision, cwd = process.cwd(), fileExists = existsSync, readPackageJson = readCheckoutPackageJson }) {
+  if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
+    return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
+  }
+  if (command.split(' && ').every(segment => isVitestSegment(segment) || /^npm run (?:test:unit|check:standards)(?=\s|$)/.test(segment))) {
+    // Probed lazily, only for a remote decision with a vitest segment to rewrite; a local decision never rewrites.
+    let probed;
+    const checkoutWrapped = () => (probed ??= checkoutHasAdmissionWrapper(cwd, fileExists));
+    let testUnitProbed;
+    const checkoutTestUnitWrapped = () => (testUnitProbed ??= checkoutHasSelfWrappedTestUnit(cwd, readPackageJson));
+    let standardsProbed;
+    const checkoutStandardsWrapped = () => (standardsProbed ??= checkoutHasSelfWrappedStandards(cwd, readPackageJson) && checkoutTestUnitWrapped());
+    const wrapped = decision?.remote === true ? wrappedChain(command, checkoutWrapped, checkoutTestUnitWrapped, checkoutStandardsWrapped) : null;
+    if (wrapped || command.split(' && ').some(isVitestSegment)) {
+      return { command: wrapped ?? command, takeLocalSlot: !wrapped, setHeld: !wrapped };
+    }
+  }
+  const words = simpleShellWords(command)?.map(unquote);
+  const eligible = !!words && (
+    (words[0] === 'npm' && words[1] === 'run' && ['test:unit', 'check:standards'].includes(words[2])
+      && (words.length === 3 || words[3] === '--'))
+    || (words[0] === 'node' && words[2] === 'run'
+      && resolve(cwd, words[1]) === resolve(cwd, 'scripts/readiness/heavy-admission.mjs')));
+  const remote = eligible && decision?.remote === true;
+  return { command, takeLocalSlot: !remote, setHeld: !remote };
+}
+
+export function shouldConfirmRemoteRed({ plan, exitCode, signal, timedOut, ranOn, failureDetails } = {}) {
+  // The nested wrapper owns local fallback. Only a reported remote red authorizes confirmation:
+  // missing/malformed reports or a successful prefix cannot rule out an already-local failure.
+  // Outside the shard wrapper, 75 without failures can be a nested admission deferral. Confirm it locally;
+  // the shard wrapper owns its retries and must retain its terminal UNSETTLED verdict.
+  const infrastructure = verificationInfrastructureFailure({ exitCode, signal });
+  return !plan?.shardWrapper && plan?.takeLocalSlot === false && ['remote', 'mixed'].includes(ranOn?.location)
+    && ranOn.failureLocation === 'remote'
+    && !(exitCode === SHARD_UNSETTLED_EXIT && failureDetails?.tests?.length)
+    && Number.isInteger(exitCode) && exitCode > 0 && exitCode !== 124
+    && !timedOut && (!infrastructure || infrastructure.reason === 'verify-unsettled');
+}
+
+// This is a preflight only. The nested wrapper remains the sole remote executor and fallback owner.
+export async function decidePhaseRemote({ cwd, env = process.env, policy, argv = [],
+  loadPerCore = () => loadavg()[0] / cpus().length, checkHealth } = {}) {
+  try {
+    const lockRoot = admissionLockRoot(cwd, env);
+    if (admissionBypassReason({ env, poolExists: existsSync(poolRootOf(lockRoot)) })) return { remote: false, reason: 'admission-bypass' };
+    policy ??= loadAdmissionPolicy({ env, checkoutRoot: cwd });
+    let load;
+    try { load = loadPerCore(); } catch { /* unreadable load remains local */ }
+    const decision = decideRemote({ policy, loadPerCore: load, argv });
+    if (!decision.remote) return decision;
+    const client = resolveRemoteClient({ clientPath: policy.settings.remote.clientPath,
+      laneRoots: [defaultPoolRoot(cwd, env), defaultPoolRoot()] });
+    if (client.reason) return { remote: false, reason: 'remote-client-unusable' };
+    checkHealth ??= (await import('../readiness/forge-remote-health.mjs')).checkRemoteHealth;
+    const health = await checkHealth({ root: join(dirname(lockRoot), 'remote'), settings: policy.settings.remote });
+    return health.ok === true ? decision : { remote: false, reason: health.reason ?? 'remote-health-unreadable' };
+  } catch { return { remote: false, reason: 'remote-preflight-unreadable' }; }
+}
+
+function readBoundedReport(path) {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 65536) throw new Error('invalid report size');
+    const buffer = Buffer.alloc(65537);
+    const size = readSync(fd, buffer, 0, buffer.length, 0);
+    if (size > 65536 || size !== st.size) throw new Error('incomplete or oversized report');
+    return buffer.subarray(0, size).toString('utf8');
+  } finally { closeSync(fd); }
+}
+export function readRemoteReport(path, read = readBoundedReport) {
+  try {
+    const text = read(path, 'utf8');
+    if (Buffer.byteLength(text) > 65536) return [];
+    const reports = text.trim().split('\n').map(line => JSON.parse(line));
+    if (!reports.length || reports.some(r => !['remote', 'local-fallback'].includes(r?.location)
+      || !Number.isInteger(r.exitCode) || r.exitCode < 0 || r.exitCode > 254
+      // The executor also accepts receiptless completions. Receipts are optional metadata, but
+      // when supplied must remain valid; a missing receipt must not discard a sibling local red.
+      || (r.receiptId !== undefined && (typeof r.receiptId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(r.receiptId))))) return [];
+    return reports;
+  } catch { return []; }
+}
+// `remoteAttempt` says whether this attempt was handed to the nested remote wrapper. Only an attempt that was
+// never dispatched (verify-lane held admission itself) is local without a report. A dispatched attempt without a
+// valid report is `unknown`: it may have run anywhere. A missing flag counts as dispatched (fails closed).
+export function phaseRunLocation(reports, { remoteAttempt } = {}) {
+  if (!reports.length) return { location: remoteAttempt === false ? 'local' : 'unknown' };
+  const locations = new Set(reports.map(r => r.location === 'remote' ? 'remote' : 'local'));
+  const receiptId = reports.find(r => r.location === 'remote' && r.receiptId)?.receiptId;
+  // A successful local segment in an && chain says nothing about a later remote failure.
+  // Even inconsistent reports must preserve a local red rather than let confirmation erase it.
+  const failureLocation = reports.some(r => r.location === 'local-fallback' && r.exitCode > 0) ? 'local'
+    : reports.some(r => r.location === 'remote' && r.exitCode > 0) ? 'remote' : null;
+  const last = reports.at(-1);
+  // An && chain stops at its first nonzero exit. Only a final local completion after a successful
+  // prefix can explain the overall local exit; an earlier local success cannot explain exit 124.
+  const localExitCode = last.location === 'local-fallback' && reports.slice(0, -1).every(r => r.exitCode === 0)
+    ? last.exitCode : undefined;
+  return { location: locations.size > 1 ? 'mixed' : [...locations][0], ...(receiptId ? { receiptId } : {}),
+    ...(failureLocation ? { failureLocation } : {}), ...(localExitCode !== undefined ? { localExitCode } : {}) };
+}
+export function mergeRunLocation(a, b) {
+  if (a === 'unknown' || b === 'unknown') return 'unknown';
+  return a === b ? a : 'mixed';
+}
+export function overallRunLocation(phases) {
+  const locations = [...new Set(Object.values(phases).map(p => p.location))];
+  return { location: locations.length ? locations.reduce(mergeRunLocation) : 'local', phases };
+}
+export const REMOTE_TERMINATION_UNCONFIRMED = Object.freeze({ reason: 'remote-termination-unconfirmed',
+  detail: 'verification infrastructure failure: remote termination unconfirmed (exit 124); confirm remote termination before retrying; no test verdict.' });
+// Exit 124 means "remote termination unconfirmed" only for an attempt dispatched to the remote wrapper whose report
+// does not prove that the failing segment finished locally with 124. A local attempt (never dispatched,
+// or a local confirmation) exiting 124 is an ordinary local exit code.
+export function remoteInfrastructureFailure({ exitCode, remoteAttempt, ranOn } = {}) {
+  return exitCode === 124 && remoteAttempt === true && ranOn?.localExitCode !== 124 ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null;
+}

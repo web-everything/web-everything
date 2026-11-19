@@ -50,9 +50,8 @@
  * script (its suite is `"test": "vitest run"`), so the WE-shaped gate always failed there with "Missing script".
  * The IO shell now injects the target checkout's npm script NAMES (`scripts`, read from its package.json) and
  * {@link composeGate} builds only the halves that checkout actually has:
- *   - vitest half: `test:unit` present ⇒ today's logic, unchanged (diff-driven shrink or `npm run test:unit`);
- *     absent but `test` present ⇒ `npm test` (full — the shrink's allow-list is WE-shaped, so it is never applied
- *     to a checkout without WE's `test:unit` convention); neither ⇒ skipped, with an explicit reason.
+ *   - vitest half: `test:unit` or `test` present ⇒ the selected related command (or its empty-target echo);
+ *     neither ⇒ skipped, with an explicit reason. R913 forbids promoting a local default to a whole suite.
  *   - check:standards half: included (scoped exactly as before) only when the checkout has `check:standards`.
  * `scripts` omitted/unknown ⇒ assumed WE-shaped, so a WE checkout's command is byte-for-byte unchanged. frontierui
  * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
@@ -60,17 +59,52 @@
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
-import { relative, sep } from 'node:path';
+import { relative, sep, join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Absolute path of the wrapper beside this module: a daemon verifies a lane checkout that may not contain it yet.
+const SHARD_RUN_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'verify-shard-run.mjs');
 import { stripVTControlCharacters } from 'node:util';
 import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS, findLastGreenAncestor, decideSinceLastGreen } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
-import { isCardOnlyDiff } from '../ci-card-only.mjs';
+import { isCardOnlyDiff, isCardPath, isDocsPath } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests } from './related-test-selection.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
+
+/**
+ * PR 7008 — decode one line of Git path output. With the default `core.quotePath`, Git wraps a path holding a
+ * non-ASCII byte, `"`, `\` or a control byte in quotes, with `\NNN` octal per UTF-8 byte and C escapes. Git always
+ * quotes a path containing `"`, so a line that starts and ends with `"` is never a literal filename. Octal escapes
+ * are bytes and are reassembled before one UTF-8 decode. An unquoted line passes through untouched.
+ */
+export function unquoteGitPath(line) {
+  if (typeof line !== 'string' || line.length < 2 || line[0] !== '"' || line[line.length - 1] !== '"') return line;
+  const body = line.slice(1, -1);
+  const simple = { n: 0x0a, t: 0x09, r: 0x0d, f: 0x0c, b: 0x08, v: 0x0b, a: 0x07, '\\': 0x5c, '"': 0x22 };
+  const bytes = [];
+  for (let i = 0; i < body.length; i += 1) {
+    if (body[i] !== '\\') {
+      // Whole code point, so a literal astral character (core.quotePath=false) is not split into surrogates.
+      const ch = String.fromCodePoint(body.codePointAt(i));
+      bytes.push(...Buffer.from(ch, 'utf8'));
+      i += ch.length - 1;
+      continue;
+    }
+    const octal = body.slice(i + 1, i + 4);
+    if (/^[0-3][0-7]{2}$/.test(octal)) { bytes.push(parseInt(octal, 8)); i += 3; continue; }
+    if (Object.hasOwn(simple, body[i + 1] ?? '')) { bytes.push(simple[body[i + 1]]); i += 1; continue; }
+    bytes.push(0x5c);
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/** Split Git `--name-only` / `ls-files` output into real path names (decoded, empty lines dropped). */
+function gitPathLines(out, { trim = false } = {}) {
+  return String(out).split('\n').map((s) => (trim ? s.trim() : s)).filter(Boolean).map(unquoteGitPath);
+}
 
 /** The pathspecs `testsNaming` greps — every vitest test-file suffix (PR #2680 review: one list, pinned by a test). */
 export const VITEST_TEST_PATHSPECS = Object.freeze(['*.test.ts', '*.test.tsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.cjs', '*.test.mts', '*.test.cts']);
@@ -98,7 +132,7 @@ export function scaledTimeoutFlags(factor) {
 /** Local target bound: refuse oversized selection; never promote it to a full suite. */
 export const MAX_RELATED_TARGETS = 300;
 
-/** The historical, always-safe fallback gate: the full unit suite plus the repo health gate. */
+/** Explicit tool/env opt-in only: the full unit suite plus repo health, never a local default. */
 export const FULL_GATE = 'npm run test:unit && npm run check:standards';
 
 /** Script names a WE-shaped checkout is assumed to have when the caller injects none (back-compat default). */
@@ -116,8 +150,8 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = 
   let testHalf = null;
   if (have.has('test:unit')) testHalf = vitestCmd;
   else if (have.has('test')) {
-    testHalf = 'npm test';
-    gateReasons.push('no `test:unit` script in this checkout — running `npm test` (full, no diff shrink)');
+    testHalf = vitestCmd;
+    gateReasons.push('no `test:unit` script in this checkout — keeping the related vitest command (including any empty-target skip)');
   } else gateReasons.push('no `test:unit` or `test` script in this checkout — test half skipped');
   let standardsHalf = null;
   if (have.has('check:standards')) standardsHalf = checkStandardsCmd;
@@ -132,7 +166,7 @@ export function composeGate({ vitestCmd, checkStandardsCmd, scripts, scanCmds = 
 }
 
 /** Single-quote a string for safe inclusion in a shell command (handles an embedded `'`). */
-function shellQuote(str) {
+export function shellQuote(str) {
   return `'${String(str).replace(/'/g, `'\\''`)}'`;
 }
 
@@ -197,6 +231,24 @@ export function stampedTimeoutFactor(gate) {
   return match ? Number(match[1]) / VITEST_BASE_TIMEOUTS.testTimeout : 1;
 }
 
+/** Compare default gates across checkouts, ignoring only the absolute shard-wrapper root.
+ * Keep every argument and remaining shell step exact; the matched plan executes our own wrapper.
+ * The quoted path accepts shellQuote's escaped apostrophes as well as ordinary checkout names.
+ */
+const SHARD_WRAPPER_PREFIX = /^node '\/(?:[^']|'\\'')*\/scripts\/lib\/verify-shard-run\.mjs'(?= )/;
+/** A sharded selected-test command from ANY checkout root (shellQuote'd absolute wrapper path). */
+export const isShardWrapperCommand = command => typeof command === 'string' && SHARD_WRAPPER_PREFIX.test(command);
+/** A composed related-test half: `npx vitest related|run …` or its sharded wrapper. Never an echo or a standards half. */
+export const isRelatedTestCommand = command => typeof command === 'string'
+  && (/^npx vitest (?:related|run) /.test(command) || isShardWrapperCommand(command));
+export function gateCommandsEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  if (left === right) return true;
+  const leftPrefix = SHARD_WRAPPER_PREFIX.exec(left), rightPrefix = SHARD_WRAPPER_PREFIX.exec(right);
+  return !!leftPrefix && !!rightPrefix
+    && left.slice(leftPrefix[0].length) === right.slice(rightPrefix[0].length);
+}
+
 /**
  * #66 — recognize a dispatched child's `--gate` as the requester's DEFAULT gate even when the requester resolved it
  * under different settings than this child (an older lane base without the settings file, or a session whose env
@@ -225,7 +277,7 @@ export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, v
   let other;
   try { other = resolveUnder(otherEnv); } catch { return null; }
   if (!other || other.decision?.selectionMode?.mode === ours) return null;
-  if (other.command === gate) return other;
+  if (gateCommandsEqual(other.command, gate)) return other;
   return matchUnderSelection({ gate, env: otherEnv, resolved: other, resolveUnder, variants });
 }
 
@@ -246,7 +298,7 @@ function matchUnderSelection({ gate, env, resolved, resolveUnder, variants }) {
         for (const policy of VERIFY_STANDARDS_POLICIES) {
           let variant;
           try { variant = resolveUnder({ ...env, ...selection, WE_VERIFY_STANDARDS: policy }); } catch { continue; }
-          if (variant?.command !== gate || !sameDiff(variant)) continue;
+          if (!gateCommandsEqual(variant?.command, gate) || !sameDiff(variant)) continue;
           if (relatedMode === ours.relatedMode && factor === ours.factor && limit === null) return resolved;
           const plan = resolveUnder({ ...env, ...selection });
           return sameDiff(plan) ? plan : null;
@@ -269,7 +321,7 @@ export function localDiffIsCardOnly({ base = 'origin/main', runGit }) {
   try {
     const mergeBase = pinnedMergeBase({ base, runGit });
     if (!mergeBase) return false;
-    const lines = (out) => String(out).split('\n').map((s) => s.trim()).filter(Boolean);
+    const lines = (out) => gitPathLines(out, { trim: true });
     const tracked = lines(runGit(['diff', '--name-only', '--no-renames', mergeBase]));
     const untracked = lines(runGit(['ls-files', '--others', '--exclude-standard'])).filter((f) => !isAllowlistedLitterPath(f));
     return isCardOnlyDiff([...new Set([...tracked, ...untracked])]);
@@ -358,6 +410,36 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   return withMode(delta, { mode: 'since-last-green', base: greenSha, reason: eligibility.reason });
 }
 
+/**
+ * Push's default uses the same related selection as verify-lane. Pure with injected IO/resolver;
+ * a blocked, missing or unreadable decision is gate-red (exit 2), never permission to push.
+ * Call only after fetching the requested base and determining there is something to publish.
+ */
+/** The selected test half as its own command word: `[npx ]vitest related|run …` (no env prefix, no leading step). */
+const PUSH_TEST_HALF = /^(?:npx\s+)?vitest\s+(?:related|run)\s/;
+export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate) {
+  const refuse = detail => ({ command: null, exitCode: 2,
+    detail: `Default push gate blocked: ${detail}. Supply an explicit affected-test --gate or use CI for exhaustive verification.` });
+  try {
+    const gate = resolveGate(options);
+    if (!gate?.decision || gate.decision.mode !== 'shrink'
+        || typeof gate.command !== 'string' || !gate.command.trim()) {
+      return refuse(gate?.decision?.reasons?.join('; ') || 'selection has no runnable related gate');
+    }
+    // Judge the TEST HALF itself, never a substring of the whole command: a changed path such as docs/shard-run.md
+    // (or one spelling `&& vitest`) inside the standards half's --files= list once passed with no test half at all.
+    // The half must exist, must be a vitest related/run command or the shard wrapper as its own first token, and
+    // must be the command's own first step. Anything else (no test script, the skipped-target echo) proves nothing.
+    const testCommand = typeof gate.testCommand === 'string' ? gate.testCommand : '';
+    if (!testCommand.trim()) return refuse('the default push gate runs no related tests (no test script in this checkout, or nothing selected)');
+    if (!PUSH_TEST_HALF.test(testCommand) && !SHARD_WRAPPER_PREFIX.test(testCommand)) return refuse('the default push gate\'s test half is not a related vitest command (nothing selected)');
+    if (gate.command !== testCommand && !gate.command.startsWith(`${testCommand} && `)) return refuse('the default push gate does not start with its own test half');
+    return { ...gate, exitCode: 0 };
+  } catch (error) {
+    return refuse(`unable to resolve related selection (${error?.message || String(error)})`);
+  }
+}
+
 function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip }) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
@@ -429,11 +511,19 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     // `--passWithNoTests`: a diff whose files no test reaches (docs, a backlog card) is a pass, not a failure.
     // Deletions or excluded untracked scratch can leave no target, and `vitest related` with no
     // positional file is an error (a false red); there is nothing for vitest to run, so say so and skip it.
-    const vitestCmd = selection?.status === 'selection-truncated'
+    let vitestCmd = selection?.status === 'selection-truncated'
       ? `npx vitest run ${selection.tests.map(shellQuote).join(' ')} --passWithNoTests${timeoutFlags}`
       : targets.length
       ? `npx vitest related ${targets.map(shellQuote).join(' ')} --run --passWithNoTests${timeoutFlags}`
       : `echo ${shellQuote('verify-lane: no remaining changed file for vitest to relate — vitest half skipped (deletions or excluded untracked scratch)')}`;
+    if (selection?.status === 'selection-truncated' && settings.shardMinTests > 0
+      && selection.tests.length >= settings.shardMinTests) {
+      const shards = { count: Math.ceil(selection.tests.length / settings.shardSize), size: settings.shardSize, parallel: settings.shardParallel };
+      selection.shards = shards;
+      decision.shards = shards;
+      decision.reasons = [...decision.reasons, `${shards.count} shards (size ${shards.size}, parallel ${shards.parallel}); shardMinTests=${settings.shardMinTests} (${settingsSource.shardMinTests}), shardSize=${settings.shardSize} (${settingsSource.shardSize}), shardParallel=${settings.shardParallel} (${settingsSource.shardParallel}), phaseTimeoutMs=${settings.phaseTimeoutMs} (${settingsSource.phaseTimeoutMs})`];
+      vitestCmd = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=${shards.count} --parallel=${shards.parallel} --budget-ms=${Math.floor(0.9 * settings.phaseTimeoutMs)} -- ${vitestCmd}`;
+    }
     // #3887 — `vitest related` selects tests that IMPORT a changed file; a repo-SCANNING test reads files from disk and
     // imports nothing, so it was never selected. Run the marked scanners scoped to the changed files (cost ~ the number
     // of changed files, never the whole repo); see scripts/lib/repo-scan-tests.mjs. Scanner reach is the full changed
@@ -461,7 +551,7 @@ function relatedSelection({ targets, runGit, readRepoFile, settings }) {
   try {
     let reverse = graphCache.get(readRepoFile);
     if (!reverse) {
-      const files = String(runGit(['ls-files', '--cached', '--others', '--exclude-standard'])).split('\n').map((f) => f.trim()).filter(Boolean);
+      const files = gitPathLines(runGit(['ls-files', '--cached', '--others', '--exclude-standard']), { trim: true });
       reverse = buildReverseImportGraph({ files, readFile: readRepoFile });
       graphCache.set(readRepoFile, reverse);
     }
@@ -486,7 +576,9 @@ function relatedSelection({ targets, runGit, readRepoFile, settings }) {
 export function localChangedSet({ base = 'origin/main', runGit }) {
   const mergeBase = pinnedMergeBase({ base, runGit });
   if (!mergeBase) return null;
-  const lines = (out) => String(out).split('\n').map((s) => s.trim()).filter(Boolean);
+  // R984: whitespace is part of a Git path; never trim changed-file names.
+  // PR 7008: decode Git's C-quoted form so callers (the privacy producer's lstat/read) get the real filename.
+  const lines = (out) => gitPathLines(out);
   try {
     const tracked = lines(runGit(['diff', '--name-only', mergeBase]));
     const deletedFiles = lines(runGit(['diff', '--name-only', '--diff-filter=D', mergeBase]));
@@ -627,18 +719,23 @@ export function laneRelevantChangeSince({ recordSha, headSha, base = 'origin/mai
   if (!recordSha || !headSha) return null;
   if (recordSha === headSha) return [];
   if (!HEX_SHA_RE.test(recordSha) || !HEX_SHA_RE.test(headSha)) return null;
-  const lines = (out) => Array.from(new Set(String(out).split('\n').map((s) => s.trim()).filter(Boolean))).sort();
+  const lines = (out) => Array.from(new Set(gitPathLines(out, { trim: true }))).sort();
   const relevantAgainstBase = (sha) => {
     // Pinned explicitly to `sha`, NEVER the literal `HEAD` {@link pinnedMergeBase} uses — a caller may verify a
     // `headSha` that is not (or is no longer) this checkout's actual current HEAD (e.g. an explicit `--sha=`).
     const mergeBase = String(runGit(['merge-base', base, sha])).trim() || null;
     if (!mergeBase) return null;
-    return lines(runGit(['diff', '--name-only', mergeBase, sha, '--']));
+    return lines(runGit(['diff', '--name-only', '--no-renames', mergeBase, sha, '--']));
   };
   try {
     // The trailing `--` separates the two revisions from a pathspec (there is none) so a validly-hex-shaped but
     // still-unexpected value can never be read as a path or a further option either.
-    const changedSinceRecord = lines(runGit(['diff', '--name-only', recordSha, headSha, '--']));
+    // A backlog card / .md doc after the marker carries no code to verify: drop those paths from the net diff
+    // (--no-renames so a code file renamed to a .md name still lists its old path). A marker for a commit that is
+    // NOT an ancestor of headSha is refused (`--is-ancestor` exits 1 -> runGit throws -> null).
+    runGit(['merge-base', '--is-ancestor', recordSha, headSha]);
+    const changedSinceRecord = lines(runGit(['diff', '--name-only', '--no-renames', recordSha, headSha, '--']))
+      .filter((f) => !isCarriedDocPath(f));
     if (changedSinceRecord.length === 0) return [];
     // The UNION of "relevant at record time" and "relevant at headSha" — see the header doc above for why
     // `headSha` alone misses a lane-side revert of its own already-verified work.
@@ -688,8 +785,6 @@ export function testsNaming(needles, runGit) {
 }
 
 const VITEST_SEGMENT = /^(?:npx\s+)?vitest\s+(related|run)(?=\s|$)/;
-/** The whole-suite test commands, exactly — `npm test` is what `composeGate` emits for a sibling repo with no `test:unit`. */
-const FULL_TEST_SEGMENT = /^npm\s+(?:run\s+test:unit|test)$/;
 const CHECK_STANDARDS_SEGMENT = /^npm\s+run\s+check:standards(?=\s|$)/;
 /** The only vitest flags an explicit gate may carry. Anything else can silence or redirect the run:
  *  `--passWithNoTests`, `--config`/`--root`/`--dir` (point at other code), `--reporter` (arbitrary module),
@@ -700,10 +795,10 @@ const ALLOWED_VITEST_FLAG = /^--(?:run|bail(?:=\d+)?)$/;
  * When the DEFAULT local selection is blocked (config / dependency / unknown / oversized diff — the highest-risk
  * surfaces), an agent must supply its own `--gate`. That string becomes the recorded `suites` and a green marker
  * satisfies the mandatory landing check, so it may not be an arbitrary command (`true`, `exit 0`, `vitest … || true`).
- * Accept only `&&`-joined segments of `vitest related|run <targets…> [--run|--bail]` / `npm run test:unit` /
- * `npm test` / `npm run check:standards …`, at least one of which really runs tests (`vitest related` needs at
- * least one target; no flag that can silence or redirect the run — see {@link ALLOWED_VITEST_FLAG}; the whole-suite
- * commands take no arguments), with no `;`, `|`, `||`, lone `&`, backticks, `$(…)` or redirections. A SHAPE check,
+ * Accept only `&&`-joined segments of `vitest related|run <targets…> [--run|--bail]` /
+ * `npm run check:standards …`, at least one of which really runs tests (`vitest related` needs at
+ * least one target; no flag that can silence or redirect the run — see {@link ALLOWED_VITEST_FLAG}),
+ * with no `;`, `|`, `||`, lone `&`, backticks, `$(…)` or redirections. A SHAPE check,
  * not proof of strength — CI still runs the full suite. Pure.
  * @param {string} gate
  * @returns {string|null} a refusal reason, or `null` when the gate shape is acceptable
@@ -723,10 +818,8 @@ export function explicitGateRefusal(gate) {
       if (badFlag) return `\`${badFlag}\` is not an allowed flag in an explicit gate (only --run and --bail; others can silence or redirect the run)`;
       if (vitest[1] === 'related' && !tokens.some((t) => !t.startsWith('-'))) return '`vitest related` in the explicit gate names no target file';
       runsTests = true;
-    } else if (FULL_TEST_SEGMENT.test(segment)) {
-      runsTests = true;
     } else if (!CHECK_STANDARDS_SEGMENT.test(segment)) {
-      return 'every `&&` segment of the explicit gate must be `vitest related|run <targets>`, `npm run test:unit` / `npm test` (no arguments) or `npm run check:standards`';
+      return 'every `&&` segment of the explicit gate must be `vitest related|run <targets>` or `npm run check:standards`';
     }
   }
   if (!runsTests) return 'the explicit gate runs no tests (check:standards alone is not an affected-test gate)';
@@ -870,6 +963,7 @@ export function buildVerifyPhases({ admissionWaitMs, vitestMs, scanMs, standards
       ? decision.referencedTests.filter(file => !decision.relatedFiles.includes(file)).length : null,
     // #5128 — what the related-test selection ran and why; `status: 'selection-truncated'` means farther tests were left to CI.
     selection: decision?.selection ? {
+      ...(decision.selection.shards ? { shards: decision.selection.shards } : {}),
       status: decision.selection.status, fullTestCount: decision.selection.fullTestCount,
       selectedTestCount: decision.selection.selectedTestCount, directTestCount: decision.selection.directTestCount,
       droppedCount: decision.selection.droppedCount, depth: decision.selection.depth, maxDepth: decision.selection.maxDepth,
@@ -897,4 +991,9 @@ export function formatVerifyPhases(phases) {
   ...Object.entries(counts).filter(([, value]) => value != null).map(([name, value]) => `${name}=${value}`),
   ...(phases.settingsSource ? [`settingsSource=${JSON.stringify(phases.settingsSource)}`] : []),
   ...Object.entries(phases.admissionPhases ?? {}).map(([name, phase]) => `${name}Wait=${phase.waitedMs}(${phase.lane})`)].join(' ');
+}
+
+/** A path whose change carries no code: a `.md` under backlog/ (card) or docs/ ONLY — never a root `README.md`. */
+function isCarriedDocPath(f) {
+  return (isCardPath(f) || isDocsPath(f)) && /^(?:backlog|docs)\/.+\.md$/.test(f);
 }

@@ -4,8 +4,11 @@
  *   reconcile note episode: stable episode keys, an unforgeable marker, and the ONE IO shell that actually posts.
  */
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import * as commentPolicy from '../../lib/pr-comment-policy.mjs';
 import {
-  NOTE_COMMENT_MARKER, noteEpisodeKey, noteHeadline, buildNoteComment, hasPostedNoteComment, planNoteComment,
+  NOTE_COMMENT_MARKER, INFO_NOTE_COMMENT_MARKER, noteEpisodeKey, noteHeadline, buildNoteComment, hasPostedNoteComment, planNoteComment,
   postNoteComment,
 } from '../reconcile-note-comment.mjs';
 
@@ -76,6 +79,13 @@ describe('noteHeadline — the operator\'s own rule', () => {
 });
 
 describe('buildNoteComment', () => {
+  it('referral-hold-auto-resolved posts an informational marker without a decision header', () => {
+    const body = buildNoteComment({ kind: 'referral-hold-auto-resolved', prNumber: 7, text: 'all referrals already ruled' });
+    expect(body.startsWith(INFO_NOTE_COMMENT_MARKER)).toBe(true);
+    expect(body).not.toContain(NOTE_COMMENT_MARKER);
+    expect(body).not.toMatch(/conveyor\s+—\s+needs your decision/i);
+  });
+
   it('first line is the stable marker; carries the headline, the note text, and the episode key', () => {
     const note = { kind: 'ci-heal-exhausted', prNumber: 2636, attempts: 3, cap: 3, text: 'auto-heal exhausted' };
     const body = buildNoteComment(note);
@@ -218,5 +228,45 @@ describe('postNoteComment — the IO shell', () => {
   it('reports ok:false with the error, never throws', () => {
     const exec = () => { throw new Error('gh: rate limited'); };
     expect(postNoteComment({ pr: 10, body: 'hello', exec })).toEqual({ ok: false, error: 'gh: rate limited' });
+  });
+});
+
+describe('informational note kinds (conveyor.notes.informationalKinds)', async () => {
+  it.each(commentPolicy.NO_ASK_NOTE_KINDS)('%s remains informational with an empty settings list', (kind) => {
+    expect(commentPolicy.isInformationalNote({ kind }, { kinds: [] })).toBe(true);
+  });
+  it('does not classify an unknown kind as informational with an empty settings list', () => {
+    expect(commentPolicy.isInformationalNote({ kind: 'unknown-note-kind' }, { kinds: [] })).toBe(false);
+  });
+  it('exports referral-hold-auto-resolved as a built-in no-ask kind', () => {
+    expect(commentPolicy.NO_ASK_NOTE_KINDS).toContain('referral-hold-auto-resolved');
+  });
+  it('unions built-in no-ask kinds with an empty settings list', () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'no-ask-note-'));
+    try {
+      const path = join(dir, 'settings.json');
+      writeFileSync(path, JSON.stringify({ conveyor: { notes: { informationalKinds: [] } } }));
+      const kinds = commentPolicy.loadInformationalNoteKinds({ path });
+      expect(commentPolicy.isInformationalNote({ kind: 'referral-hold-auto-resolved' }, { kinds })).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  const { latestUnresolvedPersonNote } = await import('../../operations/operator-queue-needs-person.mjs');
+  const { loadInformationalNoteKinds } = await import('../../lib/pr-comment-policy.mjs');
+  const asComment = (note) => ({ body: buildNoteComment(note), createdAt: '2026-11-03T10:00:00Z', viewerDidAuthor: true, author: { login: 'x' } });
+  it('settings list the fallback-heal kind', () => {
+    expect(loadInformationalNoteKinds()).toContain('timeout-retry-fallback-heal');
+  });
+  it('an info kind posts as an info note and creates no needs-decision item', () => {
+    const c = asComment({ kind: 'timeout-retry-fallback-heal', prNumber: 7, text: 'falling back' });
+    expect(c.body.startsWith('ℹ️ conveyor — note')).toBe(true);
+    expect(c.body).not.toMatch(/needs your decision/i);
+    expect(latestUnresolvedPersonNote([c])).toBeNull();
+  });
+  it('a real decision kind still posts needs-decision and raises an item', () => {
+    const c = asComment({ kind: 'ci-heal-exhausted', prNumber: 7, attempts: 3, cap: 3, text: 'x' });
+    expect(c.body.startsWith(NOTE_COMMENT_MARKER)).toBe(true);
+    expect(latestUnresolvedPersonNote([c])?.kind).toBe('ci-heal-exhausted');
   });
 });

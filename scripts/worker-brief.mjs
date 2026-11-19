@@ -1,23 +1,66 @@
 import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
 import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
+import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { VERIFY_LANE_CLI } from './operations/verify-io.mjs';
+import { shellQuoteWord } from './readiness/heavy-admission.mjs';
+import { redTeamBrief as defaultRedTeamBrief, readBriefRedTeamPolicy, renderRedTeamSection,
+  isBriefRedTeamTouchSet, readPrepFile, boundedRead } from './lib/brief-red-team.mjs';
+// Trusted checkout's audit script (like VERIFY_LANE_CLI), so the lane under audit cannot alter its own auditor.
+const CODEX_AUDIT_CLI = join(dirname(fileURLToPath(import.meta.url)), 'operations', 'codex-audit.mjs');
+const PURPOSE_TOKEN = /^[a-z0-9][a-z0-9-]*(?![\s\S])/;
+const OWNER_TOKEN = /^[A-Za-z0-9][A-Za-z0-9-]*(?![\s\S])/;
+
+function workerScratchDir(purpose, owner) {
+  if (typeof owner !== 'string' || !OWNER_TOKEN.test(owner)) throw new Error('--owner must be an alphanumeric token.');
+  if (typeof purpose !== 'string' || !PURPOSE_TOKEN.test(purpose)) throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
+  // Hex preserves every owner byte even on case-insensitive filesystems. Neither
+  // component permits underscores, so purpose/owner boundaries stay unambiguous.
+  const prefix = `we-scratch-${purpose}_`;
+  if (prefix.length + owner.length * 2 > 255) throw new Error('Scratch directory name exceeds 255 bytes; use a shorter --purpose or --owner.');
+  return `/tmp/${prefix}${Buffer.from(owner, 'utf8').toString('hex')}`;
+}
+
 /**
  * @file worker-brief.mjs
  * @description Render the standard worker-brief block so dispatchers do not retype
- * drifting rules. Encodes operator handoff rules 20, 21, 23, 26 and "no pkill".
+ * drifting rules. Encodes operator handoff rules 20, 21, 23, 26, "no pkill" and the R302 speed rules
+ * (live Forge run early, one verify at the end, small fixes by hand, `--resume` for Codex follow-ups).
  * The renderer resolves the shared build and tests-first policies, including the living checklist,
  * for the injectable CLI and in-process callers.
  */
 import { writeFile as defaultWriteFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { touchesDaemonSoakScope } from './lib/daemon-soak-scope.mjs';
 import { pathToFileURL } from 'node:url';
 
 const DEFAULT_PROOF = 'Prove the change on the live case with before/after evidence (command + output), not only unit tests.';
+const FORGE_SETUP = new URL('./readiness/forge-setup.sh', import.meta.url);
+
+/** Bundled-file allowlist, read from forge-setup.sh (`allowed = {...}`); empty set if unparseable. */
+export function readForgeAllowlist(text = (() => { try { return readFileSync(FORGE_SETUP, 'utf8'); } catch { return ''; } })()) {
+  const m = /\ballowed\s*=\s*\{([^}]*)\}/.exec(text);
+  return new Set(m ? [...m[1].matchAll(/"([^"]+)"/g)].map(x => x[1]) : []);
+}
+
+/** Targeted scope notes for the brief; '' when no path is relevant. */
+export function renderScopeFlags(paths, forgeAllowed = readForgeAllowlist()) {
+  const bare = paths.map(p => p.trim().replace(/^[a-z]+:/, ''));
+  const lines = [];
+  if (touchesDaemonSoakScope(bare)) lines.push('This is daemon-soak scope: a bug fix here needs a soak break (module + .soak.test.mjs + breaks registration) from the start, or open-pr refuses with soak-declaration.');
+  if (bare.some(p => p.startsWith('scripts/readiness/') && forgeAllowed.has(p.slice('scripts/readiness/'.length)))) lines.push('This file ships to the Forge runner: new imports must be added to the installer allowlist, and the file must contain no literal key/token-shaped strings.');
+  return lines.length ? `\n${lines.join('\n')}\n` : '';
+}
+
 const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b [options]
 
   --purpose=<slug>        Required lowercase slug for lane and scope registration
   --files=a,b             Required allowed files; bare paths receive we:
   --edge-clone=<path>     Include daemon overlay and adoption instructions
   --proof=<text>          Override the live before/after proof requirement
+  --prep-file=<path>      Red-team prep/acceptance file (regular file, max 128 KiB; pipes refused; fail open)
   --repo=we|plateau-app   Lane repository (default: we)
   --owner=<token>         Scope-registry owner token (default: fresh per brief, so two workers with one slug stay apart)
   --report-lines=N        Positive report line limit (default: 8)
@@ -36,13 +79,11 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  * @param {number} [params.reportLines]
  * @param {string} [params.owner] Registry owner token; the default is minted per call (per dispatch), which is what
  *   keeps a re-dispatch or a generic slug from colliding with another live worker's registration.
+ * @param {object} [params.freeScope] Resolved shared free-scope settings; defaults to the registry's platform/env cascade.
  * @returns {string} Markdown with a trailing newline.
  */
-export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }) } = {}) {
-  if (typeof owner !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) throw new Error('--owner must be an alphanumeric token.');
-  if (typeof purpose !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(purpose)) {
-    throw new Error('--purpose must be a lowercase slug ([a-z0-9][a-z0-9-]*).');
-  }
+export function renderWorkerBrief({ purpose, files, edgeClone, redTeam, proof = DEFAULT_PROOF, repo = 'we', reportLines = 8, owner = randomUUID().slice(0, 8), policy = resolveBuildPolicy({ log: line => console.error(line) }), freeScope = resolveFreeScopeSettings({ log: line => console.error(line) }) } = {}) {
+  const scratchDir = workerScratchDir(purpose, owner);
   const paths = typeof files === 'string' ? files.split(',') : files;
   if (!Array.isArray(paths) || !paths.length || paths.some(path => typeof path !== 'string' || !path.trim())) {
     throw new Error('--files requires a nonempty list of paths.');
@@ -54,41 +95,90 @@ export function renderWorkerBrief({ purpose, files, edgeClone, proof = DEFAULT_P
   if (edgeClone !== undefined && (typeof edgeClone !== 'string' || !SAFE.test(edgeClone))) throw new Error('--edge-clone has unsafe characters.');
   const qualified = paths.map(path => path.trim()).map(path => path.includes(':') ? path : `${repo}:${path}`);
   const commaList = qualified.join(',');
+  const { staleAfterMinutes } = freeScope;
+  const heartbeatMinutes = Math.min(20, staleAfterMinutes / 2);
+  // Registry ISO timestamps have millisecond precision: reserve at least two ticks
+  // so the half-window heartbeat can advance lastSeenAt before the entry expires.
+  if (!Number.isFinite(staleAfterMinutes) || !(heartbeatMinutes >= 1 / 60e3)) {
+    throw new Error('Invalid staleAfterMinutes: the stale window must be at least 2 milliseconds for a heartbeat cadence of at least 1 millisecond; correct the free-scope setting and regenerate the brief.');
+  }
   const laneRepo = repo === 'plateau-app' ? ' --repo=<plateau-app checkout>' : '';
   // Codex's full and related gates need WE's scripts/verify-lane.mjs; a plateau-app lane has only its own standards.
   const codexGate = repo === 'plateau-app' && policy.finalGate !== 'none' ? 'standards' : policy.finalGate;
-  const edge = renderEdgeStep({ edgeClone, ref: `lane/${purpose}` });
+  const edge = renderEdgeStep({ edgeClone, ref: `lane/${purpose}` }) + renderDaemonList({ edgeClone });
 
-  return `## Standard worker rules (generated by scripts/worker-brief.mjs — do not hand-edit)
+  return `${renderRedTeamSection(redTeam)}## Standard worker rules (generated by scripts/worker-brief.mjs — do not hand-edit)
+
+Every build Agent brief (the ones the prep gate covers) needs a \`Slot:\` line: \`Slot: plan:<item>\`, \`Slot: blocker:<what it unblocks>\`, \`Slot: operator:<quoted placement>\`, or \`Slot: waived — <reason>\`.
+**Scratch dir.** \`${scratchDir}\`. Run \`mkdir -m 700 -p ${scratchDir}\` first.
+The directory must be owned by your UID with mode 0700; if an existing directory fails this check, use a fresh owner token.
+ALL PR body and notes/report files go ONLY there, never to a shared path like /tmp/body.md,
+and never into the repo or committed.
 
 **Scope.** You may edit only these files:
 
 ${qualified.map(path => `- ${path}`).join('\n')}
 
 Anything else is out of scope: stop and report.
-The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
+${renderScopeFlags(paths)}The ONE new backlog card you file with \`file-item\` is always in scope and need not be listed: a brand-new card file
 cannot collide, and free-scope never counts other PRs' new cards against \`backlog/\`. List an existing card only if you edit it.
+
+**Search first.** Search the backlog before designing or building: \`node scripts/capability-search.mjs "<concept>"\`.
+
+**Speed.** These four rules keep a worker fast:
+- For Forge/remote work, do a real live Forge run in the first 15 minutes.
+- Narrow tests while iterating; ONE full verify at the end (re-run only if code changed after it).
+- Make small fixes (a few lines, a known finding) yourself; send Codex only larger builds.
+- For a Codex follow-up fix, pass \`--resume=<threadId>\` from its previous run, with the exact file, line range and finding in the task.
 
 1. **Free-scope pre-check.** Before editing, run
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList}\`.
    If any file is OCCUPIED (an open PR or a running agent holds it), stop and report who holds it. Do not start.
    If the verdict is UNKNOWN (exit 2: a PR list was cut off or unreadable), the scope is NOT proven free: stop and report it. Do not start.
-2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList}\`.
+2. **Register your scope.** \`node scripts/operations/free-scope-cli.mjs register --agent=${purpose} --owner=${owner} --purpose="${purpose}" --files=${commaList} --heartbeat\`.
    If register exits non-zero (the scope is occupied or the registry refused), stop and report; do not edit anything.
-   The \`--owner\` token is yours alone: if register refuses because the name is held by a different owner, another live worker
+   The \`--owner\` token \`${owner}\` was generated once for you: reuse exactly this token in every register, heartbeat, recheck
+   and release below; never mint a new one. If register refuses because the name is held by a different owner, another live worker
    shares your slug. Stop and report; never release or overwrite their entry.
+   **Heartbeat.** \`--heartbeat\` makes the reservation go stale about ${staleAfterMinutes} minutes after the owner was last seen, so a killed worker
+   does not block its own restart. To keep the reservation alive, re-run this owner-tokened check at least every ${heartbeatMinutes} minutes of
+   work (for example after each Codex round, after each narrow-test round, and before verify):
+   \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
+   This cadence is half the configured stale window, capped at 20 minutes. Use the same free-scope settings when registering;
+   if they change, regenerate the brief. Keep this cadence during long commands too; if you cannot, stop work and release the scope.
+   Each check refreshes \`lastSeenAt\` only while your reservation exists; it never extends the four-hour TTL.
+   If it reports OCCUPIED or UNKNOWN (exit 2), stop and report.
+   If stderr says "reservation is gone", stop editing even if the check exits 0; a free verdict does not reserve your files.
+   Resume only after the exact register command above succeeds with the same owner token and \`--heartbeat\`;
+   if it refuses, stop and report. Never release another owner's entry.
+   After every successful heartbeat check, re-run the exact register command above before continuing work.
+   This renewal resets the four-hour TTL before it expires, using the same token, files and \`--heartbeat\`.
+   If renewal exits non-zero, stop and report; do not continue editing on the check's free verdict.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
    Base the lane on origin/main (what acquire gives you). Do not base it on another open PR.
    Stack on an unmerged PR ONLY when your declared files overlap that PR's changed files. Check first:
    \`gh pr view <N> --json files --jq '.files[].path'\` and compare with your --files list. No overlap => base on origin/main.
    Never stack just to get edge-loaded: daemon-overlay add is stack-aware and a main-based lane loads on its own.
-   Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
+   Work only in the lane path it prints. Never branch or edit the primary checkout.
+   Any file-item card must be committed and its PR opened BEFORE you release the lane. Releasing with uncommitted cards
+   sends them to ~/.claude/lane-salvage and they never land. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
-4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
-   acceptance) go to Codex: \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
-   It is SYNCHRONOUS: run it in the foreground, never backgrounded, never wrapped in a wait. Review the diff before
-   you commit. You keep root cause, design, edge adoption and live proof.
+4. **Codex for larger builds.** Larger coding sub-tasks (a new feature, a multi-file change, a test suite) go to Codex:
+   \`node scripts/codex-direct-task.mjs --task-file=<f> --dir=<lane> --gate=${codexGate}\`.
+   Do small fixes (a few lines, a known finding) yourself. For a follow-up fix on the same work, add
+   \`--resume=<threadId>\` (the \`threadId\` from the previous run's report) so Codex keeps its context instead of re-reading files.
+   Add \`--detach\` to the command above, then repeat \`node scripts/codex-direct-task.mjs wait --job=<id> --wait=150000\`
+   in separate foreground calls. Repeat only on exit 75 (still running); exit 0 = success;
+   status=failed is a terminal worker failure: stop and report it; don't start a second copy.
+   status=wait-error (exit 2), missing/unreadable JSON, or a wait command error does not prove the worker stopped.
+   Pause dependent work, retain the lane and scope (keep renewing leases), and report the waiter error;
+   recover waiting and retry the same job. Do not release either resource or end the turn until the worker is confirmed terminal.
+   If waiting cannot recover, escalate for supervised termination and confirm the worker stopped before cleanup.
+   Even with \`timeout: 600000\`, agent Bash calls over ~180s are auto-backgrounded. Such a call is harness-tracked,
+   but never end the turn while a task is running. Use the bounded waits to follow the detached job to completion.
+   Do not use \`&\`, \`nohup\`, or \`setsid\` to create an untracked child. Review the diff before you commit.
+   You keep root cause, design, edge adoption and live proof.
 5. **Red-green tests through the heavy queue.** Write the failing test first, then the fix.
    ${testsFirstWorkerRule()}
    Run tests with \`npm run test:unit -- <test files>\`. Running vitest directly is denied.
@@ -99,13 +189,27 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    If over the limit, stop and propose a split plan instead of finishing the build.
    If unreadable, stop, restore readable git diff evidence, and retry before verify/converge.
 
-6. **One PR.** Commit with a tight pathspec (your files only), verify with
-   \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
-   \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
+6. **One PR.** Commit with a tight pathspec (your files only), verify ONCE at the end with
+   \`node scripts/operations/run.mjs verify --checkout=<lane>\` (re-run only if code changed after it).
+   While verification is running, repeat \`node ${shellQuoteWord(VERIFY_LANE_CLI)} check --wait=150000 --json --repo=<lane>\` in separate foreground calls
+   until it settles. Use the same lane path as verify's --checkout, quoting it if needed. Repeat only for a timeout with lastStatus=running;
+   stop and report red, infrastructure-failure, or any other non-running result.
+   If settled is not true, JSON is missing/unreadable, or the check command errors, pause dependent work,
+   retain the lane and scope (keep renewing leases), and recover observation of the same verification.
+   Do not release either resource or end the turn until verification is confirmed terminal;
+   if observation cannot recover, escalate for supervised termination before cleanup. Open a PR only after green;
+   never end the turn while a task is running.
+${repo !== 'plateau-app' ? '   The related-tests gate (the verify-lane default diff-driven related-test selection, with no explicit `--gate` override) must be green on the exact commit BEFORE the audit runs, because any later code change invalidates the audit record and its waiver binding.\n' : ''}   6a. **Codex audit.** After verify is green and before open-pr, commit, then run the repo's Codex audit on the net diff:
+   \`node ${shellQuoteWord(CODEX_AUDIT_CLI)} --base=origin/main --head=<40-hex sha of your lane HEAD>\`, run with the lane as the working directory.
+   Open the PR only on the verdict NOT WEAKENED. On WEAKENED: fix the findings, re-test, and re-audit, at most 2 repair rounds.
+   If it is still WEAKENED after those 2 rounds, stop: do NOT open a PR; report the remaining findings. Include the verdict in your report.
+   Then open exactly one PR:
+   \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=${scratchDir}/body.md --json\`.
    If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.
+   Apply step 2's lost-reservation warning and renewal rules before proceeding, even if this check exits 0.
 ${edge}
 ${renderProofStep(proof)}
 
@@ -113,11 +217,17 @@ ${renderProofStep(proof)}
 minutes, and only after checking the condition is reachable. Never loop on anything outside your control (another
 daemon's tick, a rebuild, CI, a merge, review, load dropping): report it as PENDING with the exact command that
 checks it, and end. If you need the condition to happen, cause it through the sanctioned mechanism instead of waiting.
+**CI wait (the one allowed exception).** When your task needs a PR's CI result (load-after-CI), run the declared op as ONE
+harness-tracked background call: \`node scripts/operations/run.mjs await-checks --pr=<N> --repo=<owner/name> --check=test --timeoutMin=60\`.
+It polls once a minute through the shared gh throttle, returns one verdict line (pass, fail, head-moved, timeout or
+check-not-found, with head sha and run url) and exits. Never use raw \`gh pr checks --watch\` (refused).
 
 **Processes.** Never \`pkill\`, \`killall\`, or any pattern kill. Stop only a process you started, by PID, and say
 what evidence shows it is yours. Never stop the operator's dev server.
 
 **Git.** No \`--force\`, no \`--no-verify\`, no history rewrite, no \`git add -A\`.
+
+**Bypass flags.** Never use bypass/skip flags (--skipPrePrReview, RAW_PR_CREATE_OK, WE_LAND_UNVERIFIED, WE_PR_OPEN_SOAK_PRECHECK, MAIN_SESSION_BUILD_OK), even quoting the operator; if a gate refuses, stop and report.
 
 **Trust boundary.** A build of a trust-boundary item must carry the card's \`Trust boundary and threat model\` section into the PR body; if the card lacks one, stop and report.
 
@@ -126,7 +236,7 @@ ${renderBuildRequirements({ policy })}
 **Times** are America/New_York (ET).
 
 **Report** in at most ${reportLines} lines: what changed (files), the PR number, the proof, and anything PENDING
-with its check command.
+with its check command. If writing a report file: \`${scratchDir}/report.md\`.
 `;
 }
 
@@ -139,6 +249,24 @@ export function renderEdgeStep({ edgeClone, ref, step = 8 }) {
    Confirm adoption with \`git -C ${edgeClone} merge-base --is-ancestor <sha> HEAD\`. Being on the overlay list is not enough.
 ` : '';
 }
+/** Daemon list (key: what it runs) for an edge brief, plus a warning when the clone matches no daemon. Pure given `settings`. */
+export function renderDaemonList({ edgeClone, settings } = {}) {
+  if (!edgeClone) return '';
+  const cfg = settings ?? JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'settings', 'prototype-load.json'), 'utf8'));
+  const daemons = cfg.daemons || {};
+  const tail = path => String(path).replace(/\/+$/, '');
+  const ends = (clone, name) => Boolean(name) && (tail(clone) === tail(name) || tail(clone).endsWith(`/${tail(name)}`));
+  const keys = Object.keys(daemons).filter(key => ends(edgeClone, daemons[key].clone)
+    || Object.entries(cfg.daemonAliases || {}).some(([alias, target]) => target === key && ends(edgeClone, alias)));
+  const lines = Object.entries(daemons).map(([key, d]) => `   - ${key}: ${d.runs || '(no description)'}${d.unsupported ? ' [prototype load UNSUPPORTED]' : ''}`);
+  const refused = keys.filter(key => daemons[key].unsupported);
+  const verdict = refused.length
+    ? `WARNING: --edge-clone ${edgeClone} matches daemon key ${refused.join(', ')}, which cannot adopt prototype loads (${daemons[refused[0]].unsupported}). Do not load a prototype there; land the change through a normal PR.`
+    : keys.length
+    ? `--edge-clone ${edgeClone} matches daemon key ${keys.join(', ')}.`
+    : `WARNING: --edge-clone ${edgeClone} matches no daemon clone. Check which daemon runs your code before loading.`;
+  return `   Daemons (key: what it runs):\n${lines.join('\n')}\n   ${verdict}\n`;
+}
 export function renderProofStep(proof) { return `**Proof.** ${proof}`; }
 export function renderOperatorReport({ pr = 'none', adoptionSha = 'not requested', proof = 'not requested' } = {}) {
   const line = value => String(value).replace(/[\r\n]+/g, ' ').replace(/<!--/g, '&lt;!--');
@@ -150,10 +278,12 @@ export function renderReportStep() {
 
 /** Run the CLI with injectable writable streams and an async or sync file writer. */
 export async function main(argv, { stdout = process.stdout, stderr = process.stderr, writeFile = defaultWriteFile,
-  newOwner = () => randomUUID().slice(0, 8) } = {}) {
-  const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out', 'owner']);
+  newOwner = () => randomUUID().slice(0, 8), redTeamBrief = defaultRedTeamBrief,
+  readText = readPrepFile, readPolicy = readBriefRedTeamPolicy } = {}) {
+  const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out', 'owner', 'prep-file']);
   const options = {};
   let brief;
+  let renderParams;
   try {
     for (const arg of argv) {
       if (arg === '--help') { options.help = true; continue; }
@@ -163,14 +293,29 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       options[match[1]] = match[2];
     }
     if (options.help) { stdout.write(USAGE); return 0; }
-    brief = renderWorkerBrief({
+    renderParams = {
       purpose: options.purpose, files: options.files, edgeClone: options['edge-clone'],
       proof: options.proof, repo: options.repo, owner: options.owner ?? newOwner(),
       reportLines: options['report-lines'] === undefined ? 8 : Number(options['report-lines']),
-    });
+    };
+    brief = renderWorkerBrief(renderParams);
   } catch (error) {
     stderr.write(`${error.message}\n\n${USAGE}`);
     return 2;
+  }
+  if (options['prep-file']) {
+    try {
+      const files = options.files.split(',').map(path => path.trim());
+      const policy = readPolicy();
+      // Never touch the prep source unless the red-team will actually use it.
+      if (policy.enabled && isBriefRedTeamTouchSet(files)) {
+        const prep = await boundedRead(() => readText(options['prep-file']), policy.timeoutMs);
+        const redTeam = await redTeamBrief({ files, prep, policy, log: line => stderr.write(line + '\n') });
+        brief = renderWorkerBrief({ ...renderParams, redTeam });
+      }
+    } catch (error) {
+      stderr.write(`brief red-team failed (fail-open): ${String(error?.message ?? error).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')}\n`);
+    }
   }
   try {
     if (options.out) await writeFile(options.out, brief, 'utf8');

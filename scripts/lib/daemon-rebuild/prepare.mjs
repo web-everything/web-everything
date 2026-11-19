@@ -4,17 +4,20 @@
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, readReadyCandidate,
+  alertsFilePath, readRebuildState, writeRebuildState, readReadyCandidate,
 } from './state.mjs';
-import { mkdirSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
+import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   READY_MAX_AGE_ENV, DEFAULT_READY_MAX_AGE_MS, claimBuildLease, buildLeaseIsLive,
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
   pruneLandedBacklogSidecars,
@@ -24,27 +27,81 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { readPendingDrops } from '../overlay-drop-pending.mjs';
+import { detectOverlayStale } from './overlay-prune.mjs';
+import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
+import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
 import { healWrongBranch } from './wrong-branch-heal.mjs';
-import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
+import { repairCloneRefs, holdsCloneWriteLock, probeBrokenRefs, diagnoseLane } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
 } from '../overlay-conflict-wake.mjs';
+
+/** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
+export function readOverlayEventLog(root, env) {
+  try {
+    const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
+    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
+  } catch { return []; }
+}
+
+/** Record pr-merged drop evidence without changing drop policy. Unknown proof fails closed. */
+export function prMergedDropEvidence({ git, ref, mainSha }) {
+  let tip = null;
+  const evidence = { contentInMain: false, cleanMerges: false };
+  try {
+    const tipRev = `refs/remotes/origin/${ref}^{commit}`;
+    const resolved = git(['rev-parse', '--verify', '--quiet', tipRev]);
+    const value = typeof resolved?.stdout === 'string' ? resolved.stdout.trim() : '';
+    if (resolved?.status !== 0 || !/^[a-f0-9]{40}$/.test(value)) return { tip, evidence };
+    tip = value;
+    if (!/^[a-f0-9]{40}$/.test(mainSha)) return { tip, evidence };
+    const proof = carriedBeyondMain({
+      ref, mainRef: mainSha,
+      git: (args) => {
+        // Reuse the resolved tip so the evidence and event describe the same observation.
+        const result = args[0] === 'rev-parse' && args[3] === tipRev ? resolved : git(args);
+        return { code: result?.status, stdout: result?.stdout };
+      },
+    });
+    if (proof.ok === true) {
+      evidence.contentInMain = proof.contentInMain === true;
+      evidence.cleanMerges = proof.cleanMerges === true;
+    }
+  } catch { /* Keep the drop, but never claim unreadable evidence proves graduation. */ }
+  return { tip, evidence };
+}
+
+/** An omitted overlay is safe only when merging it changes nothing in the candidate's own tree.
+ * A conflict, unsupported merge-tree command, or unreadable build tree fails closed. */
+export function contentContainedInBuild(git, sha, build) {
+  // Custom merge drivers can discard overlay changes while reporting an unchanged tree: refuse (fail closed).
+  if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
+  const m = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+  const t = String(m.stdout ?? '').split('\n')[0].trim();
+  return m.status === 0 && !!t && t === verifyRev(git, `${build}^{tree}`);
+}
 
 /**
  * Phase 1 (LOCKED, fast — no smoke, no `reset --hard`): recovery, safety, fetch, `planRebuild`, overlay-list
  * edits, and the up-to-date/still-rejected/untracked-collision short-circuits — everything the old single-phase
  * `doRebuild` did in its Steps 0-4.5. Returns EITHER `{terminal:true, result, alerts}` (a final `rebuildClone`
  * result — the caller returns it as-is) or `{terminal:false, plan, prevHead, alerts}` (proceed to build +
- * smoke a candidate — see {@link rebuildClone}).
+ * smoke a candidate — see {@link rebuildClone}). In readyOnly mode recovery may update bookkeeping,
+ * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
   }
+  // Tests must opt in to the detector: it queries GitHub for open PR heads.
+  if (process.env.VITEST === 'true' && env?.WE_OVERLAY_STALE === undefined) env = { ...env, WE_OVERLAY_STALE: '0' };
+  // Status must not refresh the live index while an excluded spawner may still be reading it.
+  if (readyOnly) env = { ...env, GIT_OPTIONAL_LOCKS: '0' };
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
@@ -69,13 +126,28 @@ export async function prepareRebuild({
     return { terminal: true, result, alerts: alertsList };
   };
 
+  const mutationDue = (mutation) => terminal({
+    moved: false, reason: 'readonly-job-mutation-due', mutation,
+    detail: 'Deferred to the next daemon tick holding the normal clone write lock.',
+  });
+
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+  // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
+  // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
+  // Re-read at each mutation point (not one early snapshot): a retirement can start during recovery or planning.
+  const dropPendingNow = () => {
+    try { return readPendingDrops(root, env).length > 0; } catch (error) {
+      alert('drop-pending-unsettled', { error: String(error.message) });
+      return true;
+    }
+  };
 
   const finishVerifiedSwaps = async () => {
     try {
       if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
-        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
+        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled
+        && !dropPendingNow()) { // swaps remove registrations: never while a drop intent is unsettled
         await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
       }
     } catch (error) {
@@ -91,12 +163,15 @@ export async function prepareRebuild({
     const st = statSync(indexLockPath);
     const staleMs = Number(env?.WE_DAEMON_INDEX_LOCK_STALE_MS) || 120_000;
     if (nowMs() - st.mtimeMs > staleMs) {
+      if (readyOnly) return mutationDue('index-lock-recovery');
       unlinkSync(indexLockPath);
       alert('index-lock-recovered', { ageMs: nowMs() - st.mtimeMs });
     } else {
       return terminal({ moved: false, reason: 'index-locked' });
     }
-  } catch { /* no index.lock present — nothing to recover */ }
+  } catch (error) {
+    if (readyOnly && error?.code !== 'ENOENT') return mutationDue('index-lock-unverified');
+  }
 
   if (state.inProgress) {
     const staleMs = Number(env?.WE_DAEMON_REBUILD_STALE_MS) || 30 * 60_000;
@@ -116,6 +191,7 @@ export async function prepareRebuild({
       // last verified head and let this tick rebuild + smoke it off-lock like any other candidate.
       const atUnverifiedTarget = headNow === ip.target && ip.target !== ip.prevHead && ip.verified !== true;
       if (atUnverifiedTarget) {
+        if (readyOnly) return mutationDue('in-progress-rollback');
         const rolled = rollbackUnverified({ git, prevHead: ip.prevHead });
         if (!rolled) {
           alert('rebuild-interrupted-unrecoverable', { inProgress: ip, headNow, unverified: true });
@@ -161,6 +237,7 @@ export async function prepareRebuild({
   if (state.unverified) {
     const uv = state.unverified;
     if (verifyRev(git, 'HEAD') === uv.head && uv.head !== uv.prevHead) {
+      if (readyOnly) return mutationDue('unverified-rollback');
       if (!rollbackUnverified({ git, prevHead: uv.prevHead })) {
         alert('rebuild-interrupted-unrecoverable', { unverified: uv });
         return terminal({ moved: false, reason: 'rebuild-interrupted-unrecoverable' });
@@ -180,6 +257,7 @@ export async function prepareRebuild({
     const untracked = collectUntrackedPaths(git);
     const clean = status.status === 0 && !String(status.stdout ?? '').trim() && untracked !== null
       && !untracked.some((p) => git(['cat-file', '-e', `${qHead}:${p}`]).status === 0);
+    if (clean && readyOnly) return mutationDue('quarantine-reset');
     const reset = clean ? git(['reset', '--hard', state.quarantine.prevHead]) : { status: 1 };
     if (clean && reset.status === 0) {
       state.quarantine = null;
@@ -197,6 +275,7 @@ export async function prepareRebuild({
   if (!onMain) {
     // A store writer that checked its branch out in THIS clone (live 2026-10-09) is healed back to main when the
     // branch is allowlisted and only store files changed; anything else still refuses (wrong-branch-heal.mjs).
+    if (readyOnly) return mutationDue('wrong-branch-heal');
     const heal = healWrongBranch({ git, now: nowMs });
     alert(heal.healed ? 'wrong-branch-healed' : 'wrong-branch-heal-refused', heal);
     if (heal.healed) {
@@ -209,9 +288,27 @@ export async function prepareRebuild({
     return terminal({ moved: false, reason: 'not-on-main' });
   }
 
-  const unsafe = ensureSafeToMove({
-    git, root, env, stEnv, alert, knownInputs: knownInputsOf(state),
-  });
+  if (readyOnly) {
+    // repairCloneRefs can prune refs, heal commit graphs, or replace the whole clone. Use only
+    // read probes here; even an incomplete diagnosis defers to the normal tick, never to repair.
+    try {
+      const refs = probeBrokenRefs(root);
+      if (refs.probeFailed !== false || !Array.isArray(refs.broken)) return mutationDue('clone-ref-repair');
+      // repairCloneRefs prunes only dangling remote-tracking refs other than HEAD's; any other dangling ref is
+      // merely reported, so it must not defer every ready-only job.
+      const head = refs.broken.length ? String(git(['symbolic-ref', '-q', 'HEAD']).stdout ?? '').trim() : '';
+      if (refs.broken.some((b) => String(b?.ref).startsWith('refs/remotes/') && b.ref !== head)) return mutationDue('clone-ref-repair');
+      const diagnosis = diagnoseLane(root);
+      // repairCloneRefs ignores the "ref(s) point at missing objects" problem too (handled above).
+      const problems = Array.isArray(diagnosis.problems) ? diagnosis.problems.filter((p) => !/ref\(s\) point at missing objects/.test(p)) : null;
+      if (!problems || problems.length || (diagnosis.ok !== true && !refs.broken.length)) return mutationDue('clone-reclone');
+      if (git(['commit-graph', 'verify']).status !== 0) return mutationDue('clone-commit-graph-repair');
+    } catch { return mutationDue('clone-repair-unverified'); }
+  }
+  const safetyArgs = { git, root, env, stEnv, alert, knownInputs: knownInputsOf(state) };
+  // The recovery helper restores tracked claim stamps and migrates tracked runtime stores.
+  const unsafe = readyOnly ? findUnsafeLocalState(safetyArgs) : ensureSafeToMove(safetyArgs);
+  if (readyOnly && unsafe.reason === 'dirty') return mutationDue('dirty-tree-recovery');
   if (!unsafe.safe) {
     alert(unsafe.reason, unsafe.detail);
     return terminal({ moved: false, reason: unsafe.reason });
@@ -221,6 +318,11 @@ export async function prepareRebuild({
     alert('head-unresolved');
     return terminal({ moved: false, reason: 'head-unresolved' });
   }
+  // Drops the ready candidate; a forced one that will never be adopted also closes its rollback watch (see dropReadyCandidate).
+  const dropReady = (reason, keepSha = null) => dropReadyCandidate({
+    root, env: stEnv, keepSha, reason,
+    emit: (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } }),
+  });
 
   // ── Step 2: fetch ────────────────────────────────────────────────────────────────────────────────────
   // A corrupt overlay file reads as an empty list. Building on that would quietly rebuild onto main alone and
@@ -238,7 +340,7 @@ export async function prepareRebuild({
   // repairCloneRefs re-checks that lock itself and refuses without it.
   // The write lock was taken under `env`'s lock root (rebuild.mjs), so the proof must be read from that same root.
   const lockRoot = env?.WE_DAEMON_CLONE_LOCK_ROOT;
-  const cloneRepair = repairCloneRefs(root, {
+  const cloneRepair = readyOnly ? { ok: true, pruned: [], reportedNew: [] } : repairCloneRefs(root, {
     log: (m) => log?.error?.(m), allowReclone: true, holdsWriteLock: (d) => holdsCloneWriteLock(d, lockRoot ? { lockRoot } : {}),
   });
   if (cloneRepair.pruned.length || cloneRepair.reportedNew.length || cloneRepair.quarantinedTo || !cloneRepair.ok) {
@@ -252,7 +354,7 @@ export async function prepareRebuild({
   if (cloneRepair.quarantinedTo) {
     for (const k of ['adopted', 'held', 'rejected', 'inProgress', 'unverified', 'quarantine', 'building', 'smokePassed']) state[k] = null;
     writeState();
-    clearReadyCandidate(root, stEnv);
+    await dropReady('clone-recloned'); // the whole checkout was replaced: no forced build can still be head
     return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
   }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
@@ -264,7 +366,10 @@ export async function prepareRebuild({
   for (const ref of fetchResult.goneRefs) alert('overlay-ref-gone-on-fetch', { ref });
 
   const fetchedMainSha = verifyRev(git, 'origin/main^{commit}');
-  pruneLandedBacklogSidecars({ git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert });
+  const prunedSidecars = pruneLandedBacklogSidecars({
+    git, root, paths: unsafe.untracked, mainSha: fetchedMainSha, alert, dryRun: readyOnly,
+  });
+  if (readyOnly && prunedSidecars.length) return mutationDue('backlog-sidecar-prune');
   const remaining = collectUntrackedPaths(git);
   if (remaining === null) {
     alert('status-failed', 'Post-cleanup ls-files --others failed');
@@ -279,10 +384,16 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
+    auditedTip: makeAuditedTipGate(env),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
+  if (plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
+  if (!readyOnly) {
+    try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git, feed: await import('../../operations/needs-you-feed.mjs') }); }
+    catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }
+  }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
@@ -297,12 +408,16 @@ export async function prepareRebuild({
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   for (const event of plan.alerts || []) {
-    if (event.kind === 'overlay-pinned') {
+    // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
+    // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
+    // still log. The record is pruned as soon as a plan stops reporting it.
+    if (event.kind === 'overlay-pinned' || event.kind === 'overlay-unaudited-tip') {
       const { ref, pr, newTip, files } = event.detail;
-      pinnedNow[ref] = newTip;
+      const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
+      pinnedNow[ref] = noticeKey;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
-      if (pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
-      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === newTip) continue;
+      if (event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
     }
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
@@ -386,11 +501,27 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  if ((plan.finalSha !== prevHead || plan.decisions.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
-      removeOverlay(root, d.ref, { env, why: d.reason });
-      appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
+      const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
+      // Bind the removal to the registration the plan judged: a re-registration after planning is not removed.
+      // The pending-drop check and the removal are atomic under the add-guard lock retire/replace use (I2).
+      let refused = null;
+      try {
+        const { withAddGuardLock } = await import('../../daemon-overlay.mjs');
+        refused = await withAddGuardLock(root, env, () => {
+          if (dropPendingNow()) return 'drop-pending-unsettled';
+          removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) });
+          return null;
+        });
+      } catch (error) { // a refused removal stops this build; the next tick replans from the current registrations
+        alert('overlay-removal-refused', { ref: d.ref, error: String(error.message) });
+        return terminal({ moved: false, reason: 'overlay-removal-refused', plan });
+      }
+      if (refused) return terminal({ moved: false, reason: refused, plan });
+      appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
       alert('overlay-conflict-dropped', {
@@ -426,7 +557,7 @@ export async function prepareRebuild({
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
     }
-    clearReadyCandidate(root, stEnv); // current already — nothing a passed-but-unadopted build could add
+    await dropReady('up-to-date', plan.finalSha); // current already — nothing a passed-but-unadopted build could add
     return terminal({ moved: false, reason: 'up-to-date', plan });
   }
 
@@ -437,6 +568,7 @@ export async function prepareRebuild({
   {
     const ready = readReadyCandidate(root, stEnv);
     if (ready) {
+      if (readyOnly) return mutationDue('ready-candidate-adopt');
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
       // NOT wanted), plus overlays that left because main now has them. A mainOnly rebuild wants no overlay.
       const registeredRefs = new Set((overlaysBefore || []).map((o) => o?.ref));
@@ -445,13 +577,32 @@ export async function prepareRebuild({
       for (const d of plan.decisions) {
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
       }
+      const wantedTips = new Map();
+      const wantedTip = (ref) => {
+        if (!wantedTips.has(ref)) wantedTips.set(ref, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`));
+        return wantedTips.get(ref);
+      };
+      const stillWanted = (ref, sha) => {
+        if (!wantedRefs.has(ref)) return false;
+        if (!sha) return true; // fallback registration check
+        const tip = wantedTip(ref);
+        return tip ? tip === sha || git(['merge-base', '--is-ancestor', sha, tip]).status === 0
+          : !registeredRefs.has(ref) && tipInMain(git, plan.mainSha, sha);
+      };
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
+      let overlayEvents;
+      const readOverlayEvents = () => {
+        if (overlayEvents === undefined) {
+          overlayEvents = readOverlayEventLog(root, env);
+        }
+        return overlayEvents;
+      };
       const m = matchReadyCandidate({
         ready,
         plan,
         prevHead,
         treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
-        stillWanted: (ref) => wantedRefs.has(ref),
+        stillWanted,
         verifyBuilt: (adopt) => readyBuildVerified({
           git, adopt, mainTip: plan.mainSha, prevHead,
           approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
@@ -462,25 +613,75 @@ export async function prepareRebuild({
         rejected: state.rejected,
         nowMs: nowMs(),
         maxAgeMs,
+        // unaudited-tip: the record's own tips are re-judged against the evidence at adoption time (a red record appended since
+        // the smoke revokes it even when the live alert names only a later tip), by a fresh gate so the snapshot is current.
+        auditedTip: makeAuditedTipGate(env),
+        tipInMain: (sha) => tipInMain(git, plan.mainSha, sha),
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build
         liveApplied: liveOverlaysOf(prevHead, plan.mainSha),
         carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
-        leftForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        leftForMain: (a, build) => overlayGraduated({
+          readyAt: ready.at ?? ready.passedAt,
+          ref: a.ref, sha: a.sha, build, registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r), events: readOverlayEvents(), git,
+        }),
+        retiredByOperator: (a) => overlayRetiredByOperator({
+          ref: a.ref, sha: a.sha, events: readOverlayEvents(),
+          registered: (r) => registeredRefs.has(r) || overlaysBefore.some((o) => o?.ref === r),
+        }),
+        contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
+        removedForMain: (ref, sha) => {
+          if (plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main'))) return true;
+          // Historical merge retirement vouches only for this exact live tip, while still unregistered.
+          // The shared reader rejects the entire log on unreadable input; any later event vetoes this proof.
+          if (registeredRefs.has(ref) || overlaysBefore.some((o) => o?.ref === ref)) return false;
+          const last = readOverlayEvents().findLast((event) => event?.ref === ref);
+          if (!last || !['auto-retired', 'auto-dropped'].includes(last.kind) || last.tip !== sha || typeof last.reason !== 'string') return false;
+          // A positive statement only ("PR 123 ... merged ..." or in-main); negations never count.
+          const reason = last.reason;
+          if (/\b(not|never|no|yet|unmerged|pending|without|unless|if|until)\b|n['’]t\b|\bun-?merged\b/i.test(reason)) return false;
+          if (!(/^pr-merged$/i.test(reason.trim()) || /\bPR\s*#?\d+\b[^.]*\bmerged\b/i.test(reason) || /\bin[- ]main\b/i.test(reason))) return false;
+          // Explicit negative proof vetoes; the retirement must predate the candidate's smoke (it saw the shrunken registry).
+          if (last.evidence?.contentInMain === false || last.evidence?.cleanMerges === false) return false;
+          const retiredMs = Date.parse(last.at || '');
+          const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
+          return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs < readyMs;
+        },
+        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
+        forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
       if (!m.adopt) {
-        clearReadyCandidate(root, stEnv);
-        alert('ready-candidate-discarded', { target: ready.adopt.finalSha, reason: m.reason });
+        // A discarded forced build can no longer be adopted, so its rollback watch (it would only wait out the TTL and
+        // block the next force) is closed and the audit log says the build was NOT adopted. A build already running
+        // as head keeps its watch.
+        // …except an UNREADABLE watch: that may be a transient read failure, and dropping would throw the operator's build away while
+        // the abort (which cannot read the file either) leaves the watch behind. Not adopting is already the fail-closed part, so the
+        // record is kept and retried every tick; it is bounded by the ready record's own max age, which drops it as 'expired'.
+        if (m.reason === 'forced-watch-unreadable') {
+          alert('forced-watch-unreadable', { target: ready.adopt.finalSha, message: 'the forced build is NOT adopted while its rollback watch cannot be read; its ready record is kept and retried' });
+          return terminal({ moved: false, reason: 'forced-watch-unreadable', plan });
+        }
+        await dropReady(m.reason, prevHead);
+        reportDiscardedCandidate({
+          ready, match: m, alert,
+          needsYou: ({ kind, ...detail }) => {
+            try {
+              appendOverlayEvent(root, { kind: 'needs-you', need: kind, ...detail }, { env });
+            } catch { /* the alert remains visible when the event log is unwritable */ }
+            alert('ready-candidate-discarded-needs-you', detail);
+          },
+        });
       } else {
         const colliding = unsafe.untracked.filter((p) => git(['cat-file', '-e', `${m.adopt.finalSha}:${p}`]).status === 0);
         if (colliding.length > 0) {
-          clearReadyCandidate(root, stEnv);
+          await dropReady('untracked-collision');
           alert('untracked-collision', { paths: colliding });
           return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
         }
         alert('ready-candidate-adopted', {
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({
@@ -500,6 +701,11 @@ export async function prepareRebuild({
             : undefined,
         });
         const { alerts: finAlerts = [], ...finResult } = fin;
+        if (finResult.adopted && ready.kind !== 'fallback') {
+          const pending = [...registeredRefs].filter((ref) => wantedRefs.has(ref)
+            && !m.adopt.applied?.some((a) => a.ref === ref && a.sha === wantedTip(ref)));
+          if (pending.length) alert('ready-candidate-adopted-partial', { target: m.adopt.finalSha, pending });
+        }
         return {
           terminal: true,
           result: { ...finResult, ...(finResult.adopted ? { reason: 'ready-adopted', readyMatch: m.match } : {}) },
@@ -512,13 +718,23 @@ export async function prepareRebuild({
   // not re-smoked on every main move: it would cost up to three full smokes per move and every one would fail
   // the same way. Until its backoff expires the clone stays on its last-good build (and keeps dispatching —
   // `main-staleness.mjs#assertMainNotStale`), whatever the new inputs are.
-  if (state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
+  // R508: an operator force-adopt request that names EXACTLY this candidate (same sha) must reach a fresh smoke, so it can be
+  // consumed there, even when this candidate is held by a sticky rejection or the harness-broken backoff. A request for any
+  // other build never lifts a rejection (`forceRequestFor` is the one sha matcher). While a force watch is open / unreadable or a
+  // rollback is owed, a second force is refused (smoke.mjs `force-adopt-refused`); lifting the gate then would re-smoke this
+  // candidate on every tick for nothing, so the rejection stands until the watch ends. If such a refusal DOES happen (the blocker
+  // appeared during the smoke), smoke.mjs consumes the request and writes the sticky rejection, so it never stays pending.
+  const forceBypass = !forceBlockedReason(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
+  if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
+    alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
+  }
+  if (!forceBypass && state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
     const retryAtMs = Date.parse(state.rejected.retryAt || '');
     if (Number.isFinite(retryAtMs) && nowMs() < retryAtMs) {
       return terminal({ moved: false, reason: 'smoke-harness-broken-backoff', plan });
     }
   }
-  if (state.rejected?.inputsKey === plan.inputsKey) {
+  if (!forceBypass && state.rejected?.inputsKey === plan.inputsKey) {
     // An external-only rejection (only gh/network checks failed) is never permanent: once its backoff expires
     // the same inputs are smoked again, instead of sticking until main or an overlay moves.
     const retryAtMs = Date.parse(state.rejected.retryAt || '');
@@ -559,6 +775,33 @@ export async function prepareRebuild({
     const changedFiles = diff.status === 0 ? String(diff.stdout ?? '').split('\0').filter(Boolean) : null;
     const d = skipCheck(changedFiles);
     if (d?.skip) {
+      if (readyOnly) return mutationDue('skip-unrelated-adopt');
+      // R508: an open force watch for the build this successor replaces needs nothing from this path: the watch follows HEAD onto ANY
+      // successor on its next tick, keeping its rollback target (daemon-force-adopt.mjs, the single watch-transition rule), so an
+      // unsmoked adoption can neither erase it nor depend on a carry write that could fail.
+      let guardUndeclared = false; // true: the unverified status could not be passed on, so this successor is built and smoked instead
+      // R508: a force-adopted build is never a trusted smoke baseline (`forceUnverifiedTrees`, see smoke.mjs `changedSince`). This unsmoked
+      // successor inherits that status BEFORE it is adopted, or a docs-only hop would launder it and the next incremental smoke would
+      // skip the checks the force-adopted build failed. Fail closed: if it cannot be recorded, build and smoke the successor instead.
+      if (!guardUndeclared) {
+        try {
+          const trees = Array.isArray(state.forceUnverifiedTrees) ? state.forceUnverifiedTrees : [];
+          if (trees.length) {
+            const fromTree = verifyRev(git, `${prevHead}^{tree}`);
+            if (!fromTree || trees.includes(fromTree)) {
+              const toTree = verifyRev(git, `${plan.finalSha}^{tree}`);
+              if (!toTree) throw new Error('successor tree unresolvable');
+              state.forceUnverifiedTrees = [toTree, ...trees.filter((t) => t !== toTree)].slice(0, 5);
+              writeState();
+            }
+          }
+        } catch {
+          guardUndeclared = true;
+        }
+      }
+      if (guardUndeclared) {
+        log?.error?.(`daemon-rebuild: NOT skipping rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — the force-unverified status of ${String(prevHead).slice(0, 9)} could not be passed on to it; building and smoking it instead`);
+      } else {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
         root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
@@ -569,6 +812,7 @@ export async function prepareRebuild({
         result: { ...finResult, ...(finResult.adopted ? { reason: 'skipped-unrelated', skippedSmoke: true } : {}) },
         alerts: [...alertsList, ...finAlerts],
       };
+      }
     }
   }
 
@@ -576,7 +820,7 @@ export async function prepareRebuild({
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
   const lease = claimBuildLease({
-    state, plan, root, run, env: stEnv, nowMs: nowMs(),
+    state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly,
   });
   if (!lease) {
     const b = state.building;

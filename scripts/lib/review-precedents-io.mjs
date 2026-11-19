@@ -19,6 +19,7 @@ import {
 } from './review-precedents.mjs';
 import { resolveOperationRoute } from './dispatch-routing-policy-io.mjs';
 import { claudeSpawnAlias } from './dispatch-routing-policy.mjs';
+import { markWorkerEnv } from '../operations/session-role.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from './mandate-fence.mjs';
 import { OPERATOR_LOGINS, AUTOMATION_LOGINS } from './marker-authorship.mjs';
 import { parseOperatorRulingComment } from './jury-core.mjs';
@@ -182,7 +183,7 @@ export function draftPatternWithModel(capture, { spawn = spawnSync, route = defa
     if (selected?.provider !== 'claude' || !selected.model) return null;
     const alias = claudeSpawnAlias(selected.model);
     const prompt = `Write ONE sentence (at most 300 characters) stating the reusable review rule implied by the operator's decision. Phrase it as a general rule, with no PR numbers. Return only that sentence.\n\n${FENCED_DATA_RULE}\n\n${fenceUntrusted('decision', `${capture.operatorWords ?? ''}\n\n${capture.body ?? ''}`)}`;
-    const result = spawn('claude', ['-p', '--model', alias, '--tools', '', '--output-format', 'text'], { input: prompt, encoding: 'utf8', timeout: 90000 });
+    const result = spawn('claude', ['-p', '--model', alias, '--tools', '', '--output-format', 'text'], { input: prompt, encoding: 'utf8', timeout: 90000, env: markWorkerEnv(process.env) });
     if (result.error || result.status !== 0) return null;
     const line = String(result.stdout ?? '').split(/\r\n|[\r\n\u2028\u2029\u0085\v\f]/u).find(value => value.trim());
     if (!line || line.trim().length > 400) return null;

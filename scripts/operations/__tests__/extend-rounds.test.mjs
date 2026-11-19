@@ -114,3 +114,15 @@ describe('buildRoundExtensionComment — the granted count cannot start a new pr
     expect(body.split('\n').filter(line => /^\*\*Verdict:\*\*/.test(line))).toEqual([]);
   });
 });
+
+
+describe('R671 v1 refuses judge round grants', () => {
+  it.each([{}, { files: ['src/ordinary.js'], headRefOid: 'a'.repeat(40), changedFiles: 1 }])(
+    'judge grant is refused regardless of supplied evidence %j', over => {
+      expect(() => planRoundExtension({ ...read, ...over }, { ...input, actor: 'judge:r10' }))
+        .toThrow('judge grant is refused in v1; operator-only');
+    });
+  it('unknown actors remain refused', () => {
+    expect(() => planRoundExtension(read, { ...input, actor: 'judge:unknown' })).toThrow(/operator|actor/i);
+  });
+});

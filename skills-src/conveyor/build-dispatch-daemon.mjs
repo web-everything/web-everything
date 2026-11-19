@@ -48,6 +48,8 @@ import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispa
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { readCiJobLog } from '../../scripts/lib/gh-ci-log.mjs';
+import { stripVTControlCharacters } from 'node:util';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
@@ -100,6 +102,7 @@ import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFai
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
 
 import { resolveScorecardStorePath } from '../../scripts/conveyor/run-scorecard-store.mjs';
+import { fetchFresh } from '../../scripts/lib/git-fetch-fresh.mjs';
 
 /** Prepare outcomes the runner already handled (a verified already-done resolve PR; a needs-you hold): never failures. */
 const PREPARE_HANDLED_OUTCOMES = ['prepare-already-done', 'prepare-needs-you'];
@@ -400,7 +403,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ...prepareClaims.map(c => normNum(c.meta.num)),
     ...(bookkeeping.prepareGuards ?? []).filter(g => g.kind === 'prepare-item').map(g => normNum(g.num)),
     ...holds.filter(isPrepareHold).map(h => normNum(h.num))]);
-  try { await effects.primePrepareStatus?.({ nums: [...trackedPrepares], claims: prepareClaims }); }
+  // Parked: an unstamped park (a ledger hold remapped to its `needs-you:` reason included) with no claim, no live row,
+  // no guard and no stamp-recovery pin. Nothing of ours can open its PR, so its listing may be served from the
+  // reader's cross-tick cache (launch checks never use it).
+  const activePrepares = new Set([...prepareRows.map(r => normNum(r.num)), ...prepareClaims.map(c => normNum(c.meta.num)),
+    ...(bookkeeping.prepareGuards ?? []).filter(g => g.kind === 'prepare-item').map(g => normNum(g.num)),
+    ...(Array.isArray(bookkeeping.prepareRecoveryPins) ? bookkeeping.prepareRecoveryPins : []).map(p => normNum(p?.num))]);
+  const parkedPrepares = [...new Set(holds.filter(h => h.ledger === true || h.reason === 'prepare-unstamped').map(h => normNum(h.num)))]
+    .filter(num => !activePrepares.has(num));
+  try { await effects.primePrepareStatus?.({ nums: [...trackedPrepares], claims: prepareClaims, parked: parkedPrepares }); }
   catch { /* Individual reads retain their own failure handling and can load lazily. */ }
   // A stamp recovery the refusal probe started (no claim, no worker) is pinned to the PR it read, for as long as its
   // `prepare-stamp-pending` hold stands: the default "newest attempt's PR" read could see a newer closed duplicate,
@@ -1339,7 +1350,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     let refusal;
     try {
       if (typeof effects.listPreparePrs !== 'function') throw new Error('prepare PR listing unavailable');
-      const prs = await effects.listPreparePrs({ num, bornAs });
+      // `forLaunch`: a fresh listing (never the parked cache) that may spend the launch-only budget reserve.
+      const prs = await effects.listPreparePrs({ num, bornAs, forLaunch: true });
       if (!Array.isArray(prs)) throw new Error('prepare PR listing unavailable');
       refusal = prepareLaunchRefusal({ num, bornAs, prs,
         now: effects.now?.() ?? Date.now(), mergedGuardHours: preparePolicy.mergedGuardHours,
@@ -2193,22 +2205,56 @@ export const defaultExecAsync = (cmd, args, opts, run = execFile) => new Promise
 
 // Content-addressed statuses remain valid across ticks, even when origin/main advances.
 const prepareBlobStatuses = new Map();
+// Cross-tick listings of PARKED cards only (identity key -> { prs, at }); bounded by the reader's TTL.
+const parkedPrepareListings = new Map();
 
-/** Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw. */
-export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAsync = null, prefetchConcurrency = 8, maxPrListingCalls = 128 } = {}) {
+/**
+ * Tick-scoped main snapshot and prepare PR discovery. Unavailable observations always throw.
+ * `launchReserve` calls of `maxPrListingCalls` are spendable only by `listPrs({ forLaunch: true })`; every other read
+ * stops at `max - reserve`. The reserve leaves up to eight ordinary calls for settling two claims (four identity
+ * searches each); budgets of eight or less retain their full ordinary allowance. `parkedCacheMs` lets a card
+ * primed `parked: true` reuse a complete listing younger than the TTL; a launch read never uses that cache and
+ * always lists afresh.
+ */
+export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAsync = null, prefetchConcurrency = 8, maxPrListingCalls = 128,
+  launchReserve = 0, parkedCacheMs = 0, now = Date.now, parkedListings = parkedPrepareListings } = {}) {
   // maxBuffer is explicit: the default 1 MiB overflows on a large backlog tree / card batch (cf. 21ce5ea4b).
   const opts = { cwd: REPO_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000, maxBuffer: 64 * 1024 * 1024 };
   const ITEM_PR_LIMIT = 100;
   let tree, treeError;
   let listingCalls = 0;
   const queryResults = new Map();
-  function reserveListingCall() {
-    if (listingCalls >= maxPrListingCalls) throw new Error(`prepare PR listing call budget exhausted (${maxPrListingCalls})`);
-    listingCalls++;
+  const reserve = Math.min(Math.max(0, Number.isInteger(launchReserve) ? launchReserve : 0), Math.max(0, maxPrListingCalls - 8));
+  function reserveListingCall(forLaunch = false, count = 1) {
+    const cap = forLaunch ? maxPrListingCalls : maxPrListingCalls - reserve;
+    if (listingCalls + count > cap) throw new Error(`prepare PR listing call budget exhausted (${cap} of ${maxPrListingCalls}${forLaunch ? '' : `, ${reserve} reserved for launch checks`})`);
+    listingCalls += count;
   }
   const itemListings = new Map();
+  const parkedKeys = new Set();
+  const fromParkedCache = new Map(); // key -> the cached listing's `at`, re-checked on every use
+  const fresh = at => { const age = now() - at; return age >= 0 && age < parkedCacheMs; };
+  /** Serve a parked card's listing from the cross-tick cache only while it is younger than the TTL. */
+  function useParkedCache(key) {
+    if (fromParkedCache.has(key) && !fresh(fromParkedCache.get(key))) {
+      // Expired mid-tick: drop the tick-local copy too, so the read below lists afresh.
+      itemListings.delete(key); fromParkedCache.delete(key); parkedListings.delete(key);
+    }
+    if (itemListings.has(key) || !parkedKeys.has(key) || !(parkedCacheMs > 0)) return;
+    const hit = parkedListings.get(key);
+    if (!hit || !fresh(hit.at)) { parkedListings.delete(key); return; }
+    itemListings.set(key, hit.prs);
+    fromParkedCache.set(key, hit.at);
+  }
+  /** A fresh complete listing refreshes a parked card's cache entry and drops any other card's. */
+  function recordListing(key, prs) {
+    itemListings.set(key, prs);
+    fromParkedCache.delete(key);
+    if (parkedKeys.has(key) && parkedCacheMs > 0) parkedListings.set(key, { prs, at: now() });
+    else parkedListings.delete(key);
+  }
   function readTree() {
-    retryTransientGit(() => exec('git', ['fetch', '-q', 'origin', 'main'], opts));
+    retryTransientGit(() => fetchFresh({ cwd: opts.cwd, branches: ['main'], maxAgeMs: 0, run: (args) => exec('git', args, opts) }));
     const output = exec('git', ['ls-tree', '-r', 'origin/main', '--', 'backlog/'], opts);
     const cards = new Map();
     for (const line of output.trim().split('\n')) {
@@ -2246,10 +2292,11 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
   }
   const prListArgs = (search, limit) => ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'all',
     '--search', search, '--json', 'number,state,title,headRefName,headRefOid,createdAt,mergedAt,closedAt,isCrossRepository', '--limit', String(limit)];
-  function ghPrList(search, limit) {
+  function ghPrList(search, limit, forLaunch = false) {
     if (!queryResults.has(search)) {
+      // Outside the try: an exhausted budget is not cached, so a launch read can still spend its reserve.
+      reserveListingCall(forLaunch);
       try {
-        reserveListingCall();
         const list = JSON.parse(exec('gh', prListArgs(search, limit), opts));
         if (!Array.isArray(list)) throw new Error('prepare PR listing unavailable');
         queryResults.set(search, { list });
@@ -2273,22 +2320,29 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     ] };
   }
   const uniquePrs = prs => [...new Map(prs.map(pr => [pr.number ?? pr.headRefName, pr])).values()];
-  function itemPrs(num, bornAs) {
+  function itemPrs(num, bornAs, forLaunch = false) {
     const { key, searches } = itemQuery(num, bornAs);
+    // A launch never trusts a cross-tick listing: the card must not launch over a PR opened since it was cached.
+    if (forLaunch && fromParkedCache.has(key)) { itemListings.delete(key); fromParkedCache.delete(key); }
+    if (!forLaunch) useParkedCache(key);
     if (!itemListings.has(key)) {
       const prs = searches.flatMap(search => {
-        const found = ghPrList(search, ITEM_PR_LIMIT);
+        const found = ghPrList(search, ITEM_PR_LIMIT, forLaunch);
         if (found.length >= ITEM_PR_LIMIT) throw new Error(`prepare PR listing for #${normNum(num)} saturated at ${ITEM_PR_LIMIT}`);
         return found;
       });
-      itemListings.set(key, uniquePrs(prs));
+      recordListing(key, uniquePrs(prs));
     }
     return itemListings.get(key);
   }
   // Every identity component must be complete; unrelated repository PR volume never enters this read.
-  const prsFor = (num, claimedAt, bornAs) => itemPrs(num, bornAs);
-  const needsItemListing = (num, claimedAt, bornAs) => !itemListings.has(itemQuery(num, bornAs).key);
-  /** Prefetch independent card searches concurrently, sharing the tick's budget and cached failures. */
+  const prsFor = (num, claimedAt, bornAs, forLaunch = false) => itemPrs(num, bornAs, forLaunch);
+  const needsItemListing = (num, claimedAt, bornAs) => {
+    const { key } = itemQuery(num, bornAs);
+    useParkedCache(key);
+    return !itemListings.has(key);
+  };
+  /** Prefetch complete card searches concurrently, admitting active cards before parked cards. */
   async function prefetchItemListings(entries) {
     const todo = [...new Map(entries.flatMap(e => {
       const card = tree?.get(normNum(e.num));
@@ -2300,20 +2354,29 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
       if (!needsItemListing(e.num, e.claimedAt, bornAs)) return [];
       const query = itemQuery(e.num, bornAs);
       return [[query.key, query]];
-    })).values()];
+    })).values()].sort((a, b) => Number(parkedKeys.has(a.key)) - Number(parkedKeys.has(b.key)));
+    const reservedSearches = new Set();
+    const pendingSearches = new Map();
     let next = 0;
     const worker = async () => {
       while (next < todo.length) {
         const { key, searches } = todo[next++];
         try {
+          // Reserve the whole identity before yielding: interleaved partial listings must not consume
+          // the settlement allowance without completing any claim. Shared searches are charged once.
+          const missing = searches.filter(search => !queryResults.has(search) && !reservedSearches.has(search));
+          if (missing.length) reserveListingCall(false, missing.length);
+          for (const search of missing) reservedSearches.add(search);
           const prs = [];
           for (const search of searches) {
             if (!queryResults.has(search)) {
-              reserveListingCall();
-              try {
-                const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
-                queryResults.set(search, { list });
-              } catch (error) { queryResults.set(search, { error }); }
+              if (!pendingSearches.has(search)) pendingSearches.set(search, (async () => {
+                try {
+                  const list = JSON.parse(await execAsync('gh', prListArgs(search, ITEM_PR_LIMIT), opts));
+                  queryResults.set(search, { list });
+                } catch (error) { queryResults.set(search, { error }); }
+              })());
+              await pendingSearches.get(search);
             }
             const result = queryResults.get(search);
             if (result.error) throw result.error;
@@ -2321,11 +2384,14 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
             if (!Array.isArray(found) || found.length >= ITEM_PR_LIMIT) throw new Error('prepare PR listing unavailable or saturated');
             prs.push(...found);
           }
-          itemListings.set(key, uniquePrs(prs));
+          recordListing(key, uniquePrs(prs));
         } catch { /* the lazy read reports the cached component error or exhausted budget */ }
       }
     };
     await Promise.all(Array.from({ length: Math.min(prefetchConcurrency, todo.length) }, worker));
+    // An earlier component failure can leave reserved searches unissued. Return those calls for lazy reads
+    // only after all workers finish, since a sibling identity may still need the same reserved search.
+    for (const search of reservedSearches) if (!pendingSearches.has(search)) listingCalls--;
   }
   return {
     resolveCard({ num }) {
@@ -2336,6 +2402,11 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
     prime(items) {
       const entries = items.map(item => typeof item === 'object' ? item : { num: item });
       if (entries.length) loadBlobs(entries.map(item => loadTree().get(normNum(item.num))).filter(Boolean));
+      for (const e of entries.filter(e => e.parked === true)) {
+        const card = tree?.get(normNum(e.num));
+        const bornAs = e.bornAs ?? (card ? prepareBlobStatuses.get(card.sha)?.bornAs : undefined);
+        try { parkedKeys.add(itemQuery(e.num, bornAs).key); } catch { /* an invalid identity is never cached */ }
+      }
       return execAsync && entries.length ? prefetchItemListings(entries) : undefined;
     },
     /**
@@ -2349,7 +2420,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
       loadBlobs([card]);
       return prepareBlobStatuses.get(card.sha);
     },
-    listPrs({ num, bornAs }) {
+    listPrs({ num, bornAs, forLaunch = false }) {
       // Settlement callers and older claims carry only num; recover the identity from the main card.
       if (bornAs == null) {
         const card = loadTree().get(normNum(num));
@@ -2357,7 +2428,7 @@ export function createPrepareStatusReader({ exec = execFileSyncThrottled, execAs
         loadBlobs([card]);
         bornAs = prepareBlobStatuses.get(card.sha)?.bornAs;
       }
-      return prsFor(num, undefined, bornAs).filter(pr => isPreparePrFor(pr, { num, bornAs }));
+      return prsFor(num, undefined, bornAs, forLaunch === true).filter(pr => isPreparePrFor(pr, { num, bornAs }));
     },
     read({ num, bornAs, claimedAt, replacesStamp, prNumber }) {
       const card = loadTree().get(normNum(num));
@@ -2483,6 +2554,32 @@ function lastDraftAuthorActivity(candidate) {
   return dates.length ? Math.max(...dates) : NaN;
 }
 
+/** Attribute a diagnostic without filtering the whole log used by the CI-heal context pack.
+ * Missing/ambiguous step ownership returns no evidence; published summaries cannot establish attribution. */
+function firstFailedStepError(job, log) {
+  if (!Array.isArray(job?.steps) || !job.steps.some(step => step?.conclusion === 'failure')) return '';
+  const intervals = job.steps.filter(step => step?.conclusion !== 'skipped').map(step => ({
+    conclusion: step?.conclusion, start: Date.parse(step?.started_at), end: Date.parse(step?.completed_at),
+  }));
+  if (intervals.some(({ start, end }) => !Number.isFinite(start) || !Number.isFinite(end) || start > end)) return '';
+  // Step times have SECOND resolution while log stamps are fractional: a step owns the half-open range
+  // [start, completed_at + 1s). A line inside a shared boundary second is then owned by both neighbours,
+  // so it is ambiguous and never attributed to the failed step alone.
+  for (const interval of intervals) interval.end += 1000;
+  let failedStep = false;
+  for (const line of stripVTControlCharacters(log).split('\n')) {
+    const timestamp = /^\uFEFF?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))(?=\s|$)/.exec(line);
+    if (timestamp) {
+      const at = Date.parse(timestamp[1]);
+      const owners = intervals.filter(({ start, end }) => start <= at && at < end);
+      failedStep = owners.length > 0 && owners.every(step => step.conclusion === 'failure');
+    }
+    // Untimestamped continuations inherit the preceding timestamp's ownership.
+    if (failedStep && /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) return line;
+  }
+  return '';
+}
+
 /** Builder-only gate-failure recovery. Unknown liveness fails closed, including a crash between
  * reserving an attempt and recording its handle. The existing orphan retry policy supplies the cap.
  * State is PR-bound, never head-bound: a failed fix pushing another red head cannot reset its budget. */
@@ -2546,6 +2643,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     ...(io.isPidAlive ? { isPidAlive: io.isPidAlive } : {}),
   }).runs[0].live;
   const candidates = [];
+  const unattributed = [];
   const repo = CONSTELLATION_REPOS.we.slug;
   const api = io.api ?? (path => ghRestGetJson(`repos/${repo}/${path}`).json);
   const paged = io.paged ?? ghRestGetPaged;
@@ -2592,13 +2690,24 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
     const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
-    let firstError = annotations.find(a => a.annotation_level === 'failure')?.message
-      || failed.output?.summary || failed.output?.text || 'No error detail published by the check.';
-    // GitHub Actions often publishes no annotations; retrieve the job's actual first error.
+    let firstError = annotations.find(a => a?.annotation_level === 'failure'
+      && typeof a.message === 'string' && a.message.trim())?.message.trim() ?? '';
+    // A whole job log contains passing-step errors too. Diagnose only attributable failed-step
+    // evidence; the existing CI-heal context pack stages the whole log separately for the fixer.
     const job = /\/job\/(\d+)/.exec(failed.details_url ?? '')?.[1];
-    if (job && !annotations.some(a => a.annotation_level === 'failure')) {
-      const log = String(gh(['run', 'view', '--repo', repo, '--job', job, '--log-failed']));
-      firstError = log.split('\n').find(line => /##\[error\]|AssertionError|(?:^|\s)FAIL\s|Error:/.test(line)) || firstError;
+    if (job && !firstError) {
+      const result = readCiJobLog({ repo, jobId: job,
+        // Forward the helper's exec options: without its maxBuffer a log over Node's 1 MiB default is ENOBUFS.
+        exec: (_command, args, opts) => gh(args, opts) });
+      // A failed log read aborts recovery, as the raw `gh` throw did before: never fall back to a stale
+      // published "No error detail" and keep dispatching repair on evidence that could not be read.
+      if (!result.ok) throw new Error(`job ${job} log unreadable (${result.reason}): ${result.detail ?? ''}`);
+      // Step metadata that cannot be read aborts for the same reason: no attributable failed step, no repair.
+      firstError = firstFailedStepError(api(`actions/jobs/${job}`), result.text);
+    }
+    if (!firstError) {
+      unattributed.push({ pr: pr.number, num, action: 'unattributed', reason: 'no-attributable-failure-evidence' });
+      continue;
     }
     candidates.push({ pr: pr.number, num, itemNum: num, repo: 'we', laneRef: p.head.ref, headRefOid: p.head.sha,
       scope: (pr.files ?? []).map(f => `we:${f.path}`), isDraft: true, builderAuthored: true,
@@ -2608,7 +2717,7 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
   const path = pr => join(dir, `${pr}.json`);
   const route = c => ({ num: c.num, route: `red-draft-${c.pr}` });
   let lanes;
-  return recoverBuilderDrafts({ candidates, allowResume, dryRun, staleMinutes, effects: {
+  const recovered = await recoverBuilderDrafts({ candidates, allowResume, dryRun, staleMinutes, effects: {
     readState: pr => existsSync(path(pr)) ? JSON.parse(readFileSync(path(pr), 'utf8')) : null,
     writeState: (pr, state) => {
       mkdirSync(dir, { recursive: true });
@@ -2632,13 +2741,17 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
       gh(['pr', 'edit', String(c.pr), '--repo', repo, '--add-label', 'blocked:needs-human']);
     },
   } });
+  return [...unattributed, ...recovered];
 }
 
 /** Real IO adapters; exported for isolated tests against a temporary coordination root. */
 export function cliEffects() {
   let prepareReader;
-  const reader = () => createPrepareStatusReader({ execAsync: defaultExecAsync,
-    maxPrListingCalls: readPreparePolicy().maxPrListingCallsPerTick });
+  const reader = () => {
+    const policy = readPreparePolicy();
+    return createPrepareStatusReader({ execAsync: defaultExecAsync, maxPrListingCalls: policy.maxPrListingCallsPerTick,
+      launchReserve: policy.launchPrListingReserve, parkedCacheMs: policy.parkedPrListingCacheMinutes * 60_000 });
+  };
   return {
     loadGroupingCards: async () => (await loadRouteInputs()).loadItems(),
     completePrepareFailures,
@@ -2682,9 +2795,10 @@ export function cliEffects() {
     },
     listPrepareClaims: () => listBuildDispatchClaims({ lockRoot: prepareClaimRoot(), ignoreExpiry: true }),
     listSettledPrepares: () => cliListSettledBuilds({ launchKind: 'prepare-item' }),
-    primePrepareStatus: ({ nums, claims }) => {
+    primePrepareStatus: ({ nums, claims, parked = [] }) => {
       prepareReader = reader();
-      return prepareReader.prime(nums.map(num => ({ num,
+      const parkedSet = new Set(parked.map(normNum));
+      return prepareReader.prime(nums.map(num => ({ num, ...(parkedSet.has(normNum(num)) ? { parked: true } : {}),
         claimedAt: claims.find(c => normNum(c.meta.num) === normNum(num))?.meta?.claimedAt })));
     },
     listPreparePrs: args => (prepareReader ??= reader()).listPrs(args),

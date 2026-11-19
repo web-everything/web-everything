@@ -24,6 +24,8 @@ const stage = (root) => {
   copyFileSync(SOURCE, join(root, 'operations', 'operator-queue.mjs'));
   copyFileSync(LEAF, join(root, 'lib', 'advisory-labels.mjs'));
   copyFileSync(join(dirname(LEAF), 'constellation-repos.mjs'), join(root, 'lib', 'constellation-repos.mjs'));
+  // R945 — constellation-repos imports the repo-name setting; an unstaged import fails the copy before `main()` runs.
+  copyFileSync(join(dirname(LEAF), 'repo-names.mjs'), join(root, 'lib', 'repo-names.mjs'));
   mkdirSync(join(root, 'conveyor'));
   copyFileSync(join(dirname(LEAF), '../conveyor/unsupported-repo.mjs'), join(root, 'conveyor/unsupported-repo.mjs'));
   // The queue also reads its STOOD DOWN section off `../conveyor/stand-down.mjs` (we:backlog/x6cjgz5) — stage it
@@ -42,7 +44,7 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'marker-authorship.mjs'), join(root, 'lib/marker-authorship.mjs'));
   // PR #4834 — `marker-authorship.mjs` / `stand-down.mjs` now import `../lib/github-app-identity.mjs` (the
   // automation-login list), which pulls in more leaves — stage the whole chain, same failure mode as above.
-  for (const f of ['github-app-identity.mjs', 'settings-files.mjs', 'policy-cascade.mjs', 'under-test.mjs', 'under-test.cjs', 'github-app-installations.mjs']) {
+  for (const f of ['github-app-identity.mjs', 'settings-files.mjs', 'policy-cascade.mjs', 'operator-override-reader.mjs', 'under-test.mjs', 'under-test.cjs', 'github-app-installations.mjs']) {
     copyFileSync(join(dirname(LEAF), f), join(root, 'lib', f));
   }
   // card 89 S1 — daemon-last-good.mjs now imports the daemon-clone-layout leaf (logical clone identity).
@@ -55,6 +57,10 @@ const stage = (root) => {
     copyFileSync(join(dirname(LEAF), '../conveyor', f), join(root, 'conveyor', f));
   }
   copyFileSync(join(dirname(LEAF), 'secret-scrub.mjs'), join(root, 'lib/secret-scrub.mjs'));
+  // PR #6622 — red-team-gate.mjs reads the sealed stored evidence through this leaf, which resolves the runs dir via
+  // `../operations/coordination-root.mjs` — stage both, or the staged copy fails to import and `main()` never runs.
+  copyFileSync(join(dirname(LEAF), 'red-team-sealed-status.mjs'), join(root, 'lib/red-team-sealed-status.mjs'));
+  copyFileSync(join(dirname(LEAF), '../operations/coordination-root.mjs'), join(root, 'operations/coordination-root.mjs'));
   // #4077 continuation — `health-watch-core.mjs` now imports `./health-smells-notify-list.mjs` (the ONE
   // declared place for the notify-in-shadow list; a plain data file, no further leaf needs staging) — stage
   // it too, or the staged copy fails to import and `main()` silently never runs (same failure mode as every
@@ -71,6 +77,8 @@ const stage = (root) => {
   // Link review-escalation like gh-throttle above so its larger graph resolves from the source tree;
   // the queue's optional readers remain absent from this partial copy.
   copyFileSync(join(dirname(LEAF), 'red-team-gate.mjs'), join(root, 'lib/red-team-gate.mjs'));
+  // The gate's finding-class policy reader is a required dependency (imports policy-cascade, staged above).
+  copyFileSync(join(dirname(LEAF), 'finding-class-policy.mjs'), join(root, 'lib/finding-class-policy.mjs'));
   // The gate's ruling-precedence resolver is a required, import-free dependency.
   copyFileSync(join(dirname(LEAF), 'red-team-disposition.mjs'), join(root, 'lib/red-team-disposition.mjs'));
   // The disposition reader's operator identity helper imports marker-authorship and red-team-gate, both staged here.

@@ -170,6 +170,7 @@ import { reviewSessionSlug } from '../conveyor/review-session-slug.mjs';
 import { ADVISORY_LENSES, MANDATE_LENSES } from '../lib/jury-core.mjs';
 import { REVIEW_SEAT_PROVIDERS, selectReviewSeatProvider, workerTierFor, AGY_CLAUDE_MODEL_BY_TIER } from '../lib/provider-routing.mjs';
 import { careLevelFromReasons } from '../lib/review-core.mjs';
+import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
@@ -201,17 +202,19 @@ export const EXTRA_JUROR_MANDATE = MANDATE_LENSES.CORRECTNESS;
 
 /** The pinned model + effort per provider for an added seat — never left to a CLI's implicit default. Card
  *  xn2wf9t split the old single `gemini` entry into the `agy` CLI's two real backends (see
- *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` keeps the exact model/effort the old
- *  `gemini` entry ran, byte for byte; `agy-claude` is new. */
+ *  `provider-routing.mjs#REVIEW_SEAT_PROVIDERS`'s own note): `agy-gemini` uses the shared Gemini pin;
+ *  `agy-claude` selects the Claude backend. */
+// Module pins inherit task routing only. Resolve the live coordinator, including
+// model/effort compatibility, when an applicable seat is actually routed below.
 const codexReviewDefault = resolveCodexTaskRoute({ kind: 'review', log: false });
 export const REVIEW_SEAT_MODELS = Object.freeze({
   codex: Object.freeze({ model: codexReviewDefault.model, effort: codexReviewDefault.effort }),
-  // `gemini-3.1-pro` offers only `low`/`high` (agy refused `medium` live, 2026-09-26); `low` is the combination
-  // the review-pr Antigravity seat already runs (`ANTIGRAVITY_REVIEW_EFFORT`).
-  'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'low' }),
+  // Argon high effort is baked into ANTIGRAVITY_MODEL. The launchers omit --effort for suffixed ids,
+  // so a separately requested routing effort cannot override the pinned tier.
+  'agy-gemini': Object.freeze({ model: ANTIGRAVITY_MODEL, effort: 'high' }),
   // The `agy` CLI running a Claude-family model — untried live at this effort for a review seat, so it starts
-  // at the same effort Codex's own seat runs rather than assuming the Gemini backend's `low`/`high`-only quirk
-  // carries over; the first live runs are the proof either way (see the plist/backlog note this card leaves).
+  // at the same effort Codex's own seat runs, independently of the Gemini model's effort suffix.
+  // The first live runs are the proof either way (see the plist/backlog note this card leaves).
   'agy-claude': Object.freeze({ model: AGY_CLAUDE_MODEL_BY_TIER.sonnet, effort: 'medium' }),
 });
 
@@ -229,11 +232,20 @@ export function reviewSeatKey(seat) {
  * `callsRemaining` is the day's remaining non-Claude call budget. One provider is one call (its seats share a
  * prompt), so with 0 left every seat is skipped (`daily-cap`) and with 1 left every seat goes to the provider
  * the first seat picked.
- * @param {{available?: string[], scorecards?: Array<object>, callsRemaining?: number}} [o]
+ * @param {{available?: string[], providerAvailable?: (provider:string, seatKey:string)=>boolean, scorecards?: Array<object>, callsRemaining?: number}} [o]
  * @returns {{routes: Array<{seat:string, lens:string, key:string, provider:string, model:string, effort:string, reasoning:string}>,
  *   skipped: Array<{seat:string, lens:string, key:string, reason:string}>}}
  */
-export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards = [], callsRemaining = Infinity, routingPolicy = readRoutingPolicy() } = {}) {
+export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, providerAvailable = () => true, scorecards = [], callsRemaining = Infinity, routingPolicy, operatorKeys, aiRouting = aiRoutingInputs('review', resolveAiRouting()).coordinator } = {}) {
+  // runExtraSeats supplies the live policy snapshot without operatorKeys. Repo
+  // operation keys are defaults, not evidence that the operator owns every seat.
+  if (routingPolicy === undefined) {
+    routingPolicy = readRoutingPolicy();
+    operatorKeys ??= readRoutingPolicy.operatorKeys();
+  }
+  operatorKeys ??= readRoutingPolicy.operatorKeys();
+  // An operator-owned review-seat entry keeps the Codex pin too, not just the operation route.
+  const protectedByOperator = key => ['review-seat:' + key, 'review-seat', 'review', '*'].some(k => operatorKeys.includes(k));
   const seats = [
     { seat: 'extra-juror', lens: EXTRA_JUROR_MANDATE },
     ...ROUTED_ADVISORY_LENSES.map((lens) => ({ seat: 'advisory-lens', lens })),
@@ -246,17 +258,19 @@ export function reviewSeatRoutes({ available = REVIEW_SEAT_PROVIDERS, scorecards
   let usable = [...available];
   const plannedLoad = {};
   for (const s of seats) {
+    const seatAvailable = usable.filter(provider => providerAvailable(provider, s.key));
+    const seatAiRouting = protectedByOperator(s.key) ? undefined : aiRouting;
     let configured;
-    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: usable, policy: routingPolicy }); }
+    try { configured = resolveOperationRoute({ operation: 'review-seat', taskType: s.key, available: seatAvailable, policy: routingPolicy, aiRouting: seatAiRouting, operatorKeys }); }
     catch (error) { skipped.push({ ...s, reason: error.message }); continue; }
-    const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: usable, scorecards, plannedLoad });
+    const pick = configured ? { provider: configured.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: s.key, available: seatAvailable, scorecards, plannedLoad });
     if (!pick.provider) { skipped.push({ ...s, reason: pick.reasoning }); continue; }
     plannedLoad[pick.provider] = (plannedLoad[pick.provider] ?? 0) + 1;
     // One call left: every later seat rides the call this first pick already costs.
     if (callsRemaining < 2) usable = [pick.provider];
     // These added advisory seats have no care input or mandatory-lens seat; use the ordinary review route.
     const { model, effort } = pick.provider === 'codex'
-      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false })
+      ? resolveCodexTaskRoute({ kind: 'review', model: configured?.model, effort: configured?.effort, log: false, aiRouting: seatAiRouting })
       : REVIEW_SEAT_MODELS[pick.provider];
     routes.push({ ...s, provider: pick.provider, model: configured?.model ?? model, effort: configured?.effort ?? (pick.provider === 'codex' ? effort : resolveOperationEffort("review-seat", pick.provider, s.key, routingPolicy)), reasoning: pick.reasoning });
   }
@@ -454,11 +468,15 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // (the same one review-set-label.mjs's approval-time filing already used) instead of driving `file-item`
   // in-process; a new direct import of the review-loop-cli entry file.
   'scripts/lib/prevention-landing-job.mjs',
+  // review-loop-cli's post-accept advisory policy cascade is a direct review dependency.
+  'scripts/lib/post-accept-advisory-settings.mjs',
   // card xq1xbsl — review-loop-cli resumes a ruled, parked review; it reads the complete PR thread to find it.
   'scripts/conveyor/pr-comments-complete.mjs',
   // review-job.mjs (the default dispatch mode, which the daemon runs) — its own direct imports. review-job is
   // matched by REVIEW_CODE_PATH_RE; the rest of its imports (dispatch-lane-io, review-dispatch, review-independence,
   // review-extra-seats, jury-core, write-all-sync) are covered above.
+  // Review child heap caps and the settings the helper reads at runtime must stay current together.
+  'scripts/lib/node-heap-cap.mjs', 'scripts/settings/node-heap-cap.json',
   // red-team skip settlement, run evidence and status liveness: direct imports of review-job.mjs
   'scripts/lib/red-team-skip-outcome.mjs', 'scripts/lib/red-team-run-result.mjs',
   'scripts/lib/pid-alive.mjs', 'scripts/operations/needs-you-feed.mjs',
@@ -523,8 +541,9 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
   }
   const repoStr = String(repo ?? '').trim();
   const repoKey = repoKeyForSlug(repoStr);
-  if (repoKey === null) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
-  const laneRepo = repoProfile(repoKey, { home }).lanePoolRepo;
+  const profile = repoKey === null ? null : repoProfile(repoKey, { home });
+  if (!profile?.capabilities?.review) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
+  const laneRepo = profile.lanePoolRepo;
   if (repoKey !== 'we' && !checkoutExists(laneRepo)) {
     throw new Error(`unsupported-repo: ${repoKey} checkout does not exist at ${laneRepo}`);
   }

@@ -170,7 +170,7 @@ export function planLabelInputRows({ repo, pr, items = [], liveLabels = [], self
     // GitHub timestamps describe a whole second. Only a strictly later second proves a clearance
     // followed this addition. Same-second ambiguity tightens; connection order keeps a re-add latest.
     if (it.change === 'added' && clearances.some((e) => Math.floor(Date.parse(e.at) / 1000) > Math.floor(Date.parse(it.createdAt) / 1000)
-      && (approvalValid(e, now) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
+      && ((approvalValid(e, now) && !e.delegation) || ((e.type === EVENT_TYPES.VERDICT || e.type === undefined)
         && verdictClears(e.verdict) && acceptanceCovers(e, headSha))))) continue;
     const dup = events.some((e) => e?.type === EVENT_TYPES.LABEL_INPUT && e.pr === pr && String(e.repo).toLowerCase() === String(repo).toLowerCase()
       && e.label === it.label && e.change === it.change && (it.id && e.timelineId ? it.id === e.timelineId
@@ -243,7 +243,7 @@ export async function runMirrorApply({
     } catch (e) { fail(`labels-unreadable: ${firstLine(e)}`); continue; }
     try { facts = await readFacts(p.number, { repo }); } catch (e) { fail(`facts-unreadable: ${firstLine(e)}`); continue; }
     if (!facts || !facts.head?.sha || (facts.probeErrors ?? []).length) { fail('facts-unreadable: missing head or failed probe'); continue; }
-    const fresh = await readEvents(repo, { store }); // idempotency refresh; baseline starts before the timeline read
+    const fresh = await readEvents(repo, { store, fresh: true }); // idempotency refresh; baseline starts before the timeline read
     if (fresh.status !== 'ok') { fail(`ledger-unreadable: ${fresh.reason}`); continue; }
     let toAppend;
     try { toAppend = planLabelInputRows({ repo, pr: p.number, items: tl.items, liveLabels: liveNames(current), selfLogin: self, events: fresh.rows, observedEvents: events, headSha: facts.head.sha, now: facts.now ?? Date.now() }); } catch (e) {
@@ -260,7 +260,7 @@ export async function runMirrorApply({
     if (!ok) continue;
     // The add was planned from the snapshot taken at the start of the pass: a `clear-human` that landed since must win.
     // Re-derive both owned families from the fresh ledger before publishing their rendering.
-    const latest = await readEvents(repo, { store });
+    const latest = await readEvents(repo, { store, fresh: true });
     const again = latest.status === 'ok' ? buildRows({ repo, prs: [current], events: latest.rows, readFacts: () => facts })[0] : null;
     if (!again || again.status === 'unreadable') { fail(`rederive-unreadable: ${latest.status === 'ok' ? 'facts' : latest.reason}`); continue; }
     // Never infer absence of the advisory from a failed derive (which returns a holding lifecycle).

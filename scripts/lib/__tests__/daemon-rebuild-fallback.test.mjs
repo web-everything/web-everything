@@ -30,6 +30,12 @@ import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Same precedent as daemon-rebuild.test.mjs:43. Every case here drives real `git` through rebuildClone (about 40 git
+// calls per rebuild: worktree add/remove/prune/list, rev-parse, merge-base), measured at 2-4s per case at load ~30 and
+// 7-12s at load ~70, so the 5s default timed out on a loaded CI shard (main red @ 4535653df). Cached fixtures and
+// splitting the slowest case did not help (rebuildClone itself is the cost). 60s stays a hang guard.
+vi.setConfig({ testTimeout: 60_000 });
+
 // ── fixture helpers — copied from daemon-rebuild.test.mjs (never imported from it) ──────────────────────────
 
 const tempDirs = [];
@@ -828,6 +834,16 @@ describe('rebuild smoke budget and fail-fast', () => {
 });
 
 describe('budgetedRunChild', () => {
+  it('honors a per-call floor, strips it, and keeps the default floor for other children', async () => {
+    const base = vi.fn(async (_cmd, _args, opts) => opts);
+    const run = budgetedRunChild({ runChild: base, deadline: 1275, now: () => 0 });
+    await expect(run('node', [], { timeoutMs: 45000, minChildMs: 10000 }))
+      .rejects.toThrow('skipped: rebuild smoke budget exhausted (1275ms left)');
+    expect(base).not.toHaveBeenCalled();
+    expect(await run('git', [], { timeoutMs: 45000 })).toEqual({ timeoutMs: 1275 });
+    expect(await run('node', [], { timeoutMs: 500, minChildMs: 500 })).toEqual({ timeoutMs: 500 });
+  });
+
   it('caps each child timeout at the time left, and refuses to start one once the budget is spent', async () => {
     let t = 0;
     const base = vi.fn(async (_cmd, _args, opts) => opts.timeoutMs);

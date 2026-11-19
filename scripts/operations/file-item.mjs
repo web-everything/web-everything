@@ -58,6 +58,7 @@
  */
 import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
+import { overlapScore } from '../capability-search.mjs';
 import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
 import { BACKLOG_KINDS } from '../check-standards-rules.mjs';
@@ -82,6 +83,63 @@ export function planFileItem(read, input) {
   verdict.content = setFrontmatterField(verdict.content, 'preparedDate', JSON.stringify(read.today));
   verdict.content = setFrontmatterField(verdict.content, 'preparedAgainstSha', JSON.stringify(read.originMainSha));
   return verdict;
+}
+
+function completeDuplicateSearch(search) {
+  return search && Array.isArray(search.backlog)
+    && (search.malformed === undefined || (Array.isArray(search.malformed) && search.malformed.length === 0))
+    && search.backlog.every(hit => hit && typeof hit.id === 'string' && hit.id.trim()
+      && Number.isFinite(hit.score) && hit.score >= 0 && hit.score <= 1);
+}
+
+/** Words too common across the backlog to evidence a duplicate; stripped before title scoring. */
+const GENERIC_WORDS = new Set(('a an and are as at be by for from in into is it of on or the to with that this '
+  + 'fix review red team redteam daemon pr test tests add make use via per not no new item card cards backlog '
+  + 'file files script scripts check checks run runs').split(' '));
+const DUPLICATE_LIST_MAX = 5;
+const FULL_COVERAGE = 0.95;
+const wordsOf = (text) => String(text ?? '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/**
+ * Re-score a real search hit on its TITLE against the filed title+scope, generic words removed. Raw search
+ * scores cover the whole card body, so common words alone could push ~300 cards over the threshold. Hits
+ * without a body (`text`) keep their raw score; an all-generic query keeps raw scores too.
+ */
+function rescoreOnTitle(hit, queryWords, scopeWords = []) {
+  if (typeof hit.text !== 'string' || typeof hit.title !== 'string' || !queryWords.length) return hit;
+  const titleWords = wordsOf(hit.title).filter(w => !GENERIC_WORDS.has(w));
+  // Scope words may only add evidence: an identical title must still score 1 when the scope is unrelated.
+  const score = Math.max(overlapScore(queryWords, titleWords).score, overlapScore([...queryWords, ...scopeWords], titleWords).score);
+  // A full-coverage raw match (every query word in the card) is kept: only partial body overlap is the flood.
+  return { ...hit, score: hit.score >= FULL_COVERAGE ? Math.max(hit.score, score) : score };
+}
+
+/** Refuse incomplete search evidence before declaring either effect. */
+function admitDuplicates(read, input) {
+  const related = input.relatedTo?.trim();
+  const relatedReason = input.relatedReason?.trim();
+  const reason = input.notDuplicateReason?.trim();
+  // Flag spellings are the CLI's own (camelCase, like --workItem); a kebab hint would be rejected as unknown.
+  if (related && !relatedReason) throw new Error('file-item: --relatedTo requires --relatedReason=...');
+  if (relatedReason && !related) throw new Error('file-item: --relatedReason requires --relatedTo=<id>');
+  const fallback = '--relatedTo=<id> --relatedReason=... or --notDuplicateReason="..."';
+  // Same default as capability-search EXACT_THRESHOLD; production resolves it through operatorTask policy.
+  const threshold = read.operatorTask?.duplicateThreshold ?? 0.7;
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error('file-item: invalid duplicateThreshold; repair the operatorTask policy before filing');
+  }
+  const search = read.duplicateSearch;
+  const complete = completeDuplicateSearch(search);
+  if (!complete && !reason) {
+    throw new Error('file-item: duplicate search unavailable or incomplete; manually check the backlog and use --notDuplicateReason="..."');
+  }
+  const matches = complete
+    ? search.backlog.filter(hit => hit.score >= threshold).sort((a, b) => b.score - a.score).slice(0, DUPLICATE_LIST_MAX)
+    : [];
+  if (matches.length && !reason && !(related && relatedReason)) {
+    throw new Error(`file-item: possible duplicate backlog cards ${matches.map(hit => hit.id).join(', ')}; use ${fallback}`);
+  }
+  return { related, reason: [relatedReason, reason].filter(Boolean).join('\n\n') };
 }
 
 export const FILE_ITEM_OP = 'file-item';
@@ -135,7 +193,7 @@ export function planQueueing(verdict, input = {}) {
  * Build the declaration. Both readers/sinks are injected — `./file-item-io.mjs` supplies the real bindings,
  * reusing `we:scripts/operations/scaffold-io.mjs`'s own reader + write sink rather than re-deriving either.
  */
-export function fileItemOperation({ readScaffoldContext } = {}) {
+export function fileItemOperation({ readScaffoldContext, searchDuplicates } = {}) {
   if (typeof readScaffoldContext !== 'function') {
     throw new TypeError(
       'file-item: needs a `readScaffoldContext()` reader — the io is INJECTED so the declaration stays '
@@ -154,6 +212,9 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
       size: { type: 'string', required: false, default: '' },
       slug: { type: 'string', required: false, default: '' },
       digest: { type: 'string', required: false, default: '' },
+      relatedTo: { type: 'string', required: false, default: '' },
+      relatedReason: { type: 'string', required: false, default: '' },
+      notDuplicateReason: { type: 'string', required: false, default: '' },
       parent: { type: 'string', required: false, default: '' },
       blockedBy: { type: 'string', required: false, default: '' },
       scope: { type: 'string', required: false, default: '' },
@@ -169,10 +230,29 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     declaresOver: DECLARED_HOMES['file-item'],
 
     read: compute({
-      reads: ['input.operatorTask'],
+      reads: ['input.operatorTask', 'input.title', 'input.digest', 'input.scope'],
       fn: (view) => {
         const raw = readScaffoldContext();
-        return { ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
+        let duplicateSearch;
+        try {
+          const search = searchDuplicates ?? raw.searchDuplicates;
+          // Scores measure query-token coverage: a long body must never dilute an identical title.
+          // The title-only query remains the fallback when even the bounded lead differs completely.
+          const lead = view.input.digest.trim().split(/\r?\n[\t ]*\r?\n/, 1)[0].slice(0, 500);
+          const results = [view.input.title, `${view.input.title}\n${lead}`].map(query => search(query));
+          if (results.every(completeDuplicateSearch)) {
+            const best = new Map();
+            for (const result of results) {
+              for (const hit of result.backlog) {
+                if (!best.has(hit.id) || hit.score > best.get(hit.id).score) best.set(hit.id, hit);
+              }
+            }
+            const queryWords = wordsOf(view.input.title).filter(w => !GENERIC_WORDS.has(w));
+            const scopeWords = wordsOf(view.input.scope).filter(w => !GENERIC_WORDS.has(w));
+            duplicateSearch = { backlog: [...best.values()].map(hit => rescoreOnTitle(hit, queryWords, scopeWords)) };
+          }
+        } catch { duplicateSearch = null; }
+        return { duplicateSearch, ...shapeScaffoldRead(raw), operatorTask: raw.operatorTask, sessionRole: raw.sessionRole,
           originMainSha: view.input.operatorTask ? raw.originMainSha : undefined };
       },
     }),
@@ -183,9 +263,15 @@ export function fileItemOperation({ readScaffoldContext } = {}) {
     plan: compute({
       reads: [
         'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
-        ...OPERATOR_TASK_READS, 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
+        ...OPERATOR_TASK_READS, 'input.relatedTo', 'input.relatedReason', 'input.notDuplicateReason', 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
       ],
-      fn: (view) => planFileItem(view.findings.read, view.input),
+      fn: (view) => {
+        const admission = admitDuplicates(view.findings.read, view.input);
+        const verdict = planFileItem(view.findings.read, view.input);
+        if (admission.related) verdict.content = setFrontmatterField(verdict.content, 'related', JSON.stringify([admission.related]));
+        if (admission.reason) verdict.content += `\n## Duplicate admission\n\n${admission.reason}\n`;
+        return verdict;
+      },
     }),
 
     // THE QUEUEING DECISION, kept OFF the verdict deliberately: `verdictFrom: 'plan'` means every existing

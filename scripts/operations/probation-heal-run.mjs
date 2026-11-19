@@ -43,6 +43,7 @@ import {
 } from '../lib/probation-launcher.mjs';
 
 import { resolveOperationRoute, resolvePolicyModel, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { PROBATION_WORKERS, PROVEN_TASK_ENVELOPES } from '../lib/provider-routing.mjs';
 
 import { DISPATCH_LISTING_GRACE_MINUTES } from './dispatch-lane.mjs';
@@ -54,6 +55,7 @@ import { withCompletionLock, newCompletionRecord, applyCompletionUpdate, writeCo
 import { releaseFixDispatchClaim } from '../conveyor/fix-dispatch-claim.mjs';
 import { buildCiHealComment, handBackCiHealReview, redactSecrets } from '../conveyor/ci-heal-mark.mjs';
 import { recordOwedWrite, clearOwedWrite, owedWriteAlreadyLive, postPrComment } from '../conveyor/ci-heal-owed.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 
 const LISTING_GRACE_MS = DISPATCH_LISTING_GRACE_MINUTES * 60_000;
 /** The slowest honest attempt: lane acquire (15m) + gate (20m) + worker (70m) + a margin. Past it no liveness probe is trusted. */
@@ -248,7 +250,8 @@ const REPO_SLUG = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 const GATE_TIMEOUT_MS = 20 * 60 * 1000;
 
 /** Parse `--k=v` flags. PURE. */
-export function parseArgs(argv) {
+export function parseArgs(argv, { readPolicy = readRoutingPolicy, resolveRoute = resolveOperationRoute,
+  resolveRouting = resolveAiRouting, log = message => console.error(message) } = {}) {
   const flags = {};
   for (const a of argv) {
     if (!a.startsWith('--')) continue;
@@ -256,8 +259,20 @@ export function parseArgs(argv) {
     if (eq === -1) flags[a.slice(2)] = true;
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   }
-  const policy = readRoutingPolicy();
-  const configured = flags.worker ? null : resolveOperationRoute({ operation: 'ci-heal', taskType: flags.taskType ?? 'ci-heal', policy, gateClosed: false, available: ['codex', 'antigravity'] });
+  const policy = readPolicy();
+  const options = { operation: 'ci-heal', taskType: flags.taskType ?? 'ci-heal', policy, gateClosed: false, available: ['codex', 'antigravity'] };
+  let configured = null;
+  if (!flags.worker) {
+    let routed = false;
+    try {
+      const { coordinator } = aiRoutingInputs('ci-heal', resolveRouting({ log }));
+      if (coordinator !== undefined) {
+        configured = resolveRoute({ ...options, aiRouting: coordinator, operatorKeys: readPolicy.operatorKeys?.() });
+        routed = true;
+      }
+    } catch (error) { log(`ci-heal aiRouting unavailable; using existing route: ${error.message}`); }
+    if (!routed) configured = resolveRoute(options);
+  }
   const worker = typeof flags.worker === 'string' ? JSON.parse(flags.worker) : configured ? { ...PROBATION_WORKERS[configured.provider === 'codex' ? 'codex' : configured.model.startsWith('claude-') ? 'antigravity-claude' : 'antigravity-gemini'], model: configured.model, effort: configured.effort, taskType: flags.taskType ?? 'ci-heal' } : null;
   if (worker) worker.model = resolvePolicyModel(worker.provider, worker.model, policy);
   return {
@@ -491,7 +506,7 @@ export function realIo({ session, env = process.env, run = trySh } = {}) {
       return { state: 'unknown', reason: r.out.trim() || 'remote probe did not establish presence or absence' };
     },
     rebaseOntoMain: (dir) => {
-      if (!trySh('git', ['-C', dir, 'fetch', 'origin', 'main'], { env: laneEnv }).ok) return false;
+      try { fetchFresh({ cwd: dir, branches: ['main'], maxAgeMs: 0, run: (args) => sh('git', ['-C', dir, ...args], { env: laneEnv }) }); } catch { return false; }
       if (trySh('git', ['-C', dir, 'rebase', 'origin/main'], { env: laneEnv }).ok) return true;
       trySh('git', ['-C', dir, 'rebase', '--abort'], { env: laneEnv });
       return false;

@@ -34,6 +34,12 @@ describe('deriveScopeCRoutes — scope-C filter over sitemap pathnames (#847/#77
     expect(new Set(groups)).toEqual(new Set(['intents', 'blocks', 'backlog', 'cases']));
   });
 
+  it('keeps the resolved-backlog archive sampled as an index surface (split off /backlog/)', () => {
+    const r = deriveScopeCRoutes([...sitemap, '/backlog/resolved/']);
+    expect(r).toContain('/backlog/resolved/');
+    expect(r).toContain('/backlog/100-foo/');
+  });
+
   it('picks the lexicographically-first detail per group (deterministic)', () => {
     expect(routes).toContain('/backlog/100-foo/'); // not /backlog/846-…/
     expect(routes).toContain('/blocks/accordion/'); // not /blocks/wizard/

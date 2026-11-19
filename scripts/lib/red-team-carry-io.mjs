@@ -8,6 +8,15 @@ import { parseReviewedSha, REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { isLaterVerdictBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
+const RESTAMP_HEADLINE = '📌 review — acceptance re-stamped after a rebase (no new review)';
+function isCurrentHeadRestamp(comment, head) {
+  if (!isTrustedMarkerAuthor(comment) || typeof comment.body !== 'string'
+    || !comment.body.startsWith(RESTAMP_HEADLINE) || isLaterVerdictBody(comment.body)) return false;
+  // Match the reviewed-sha parser's marker shape, but require every marker, not just its last match.
+  const markers = [...comment.body.matchAll(/<!--\s*reviewed-sha:\s*([0-9a-fA-F]{7,40})\s*-->/g)];
+  return markers.length > 0 && markers.every(([, sha]) => sha.toLowerCase() === head);
+}
+
 export function createRedTeamCarryIo({ env = process.env, readEvidence = readDrainRedTeamEvidence,
   readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readLive, readComments,
   proveMove = proveCardOnlyHeadMove, skipPolicy = () => readRedTeamProbes({ env }).value.skipCardOnly,
@@ -30,8 +39,9 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
         const reviewed = parseReviewedSha([comments[i]]);
         if (reviewed === from) anchor = i;
       }
-      if (comments.slice(anchor + 1).some(comment => parseReviewedSha([comment])
-        || (isTrustedMarkerAuthor(comment) && isLaterVerdictBody(comment.body)))) return false;
+      if (comments.slice(anchor + 1).some(comment => !isCurrentHeadRestamp(comment, state.head)
+        && (parseReviewedSha([comment])
+          || (isTrustedMarkerAuthor(comment) && isLaterVerdictBody(comment.body))))) return false;
       witness = createHash('sha256').update(JSON.stringify(comments.filter(comment => parseReviewedSha([comment])
         || (isTrustedMarkerAuthor(comment) && isLaterVerdictBody(comment.body))).map(comment => comment.body))).digest('hex');
       if (state.reviewWitness !== undefined && state.reviewWitness !== witness) return false;

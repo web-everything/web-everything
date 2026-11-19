@@ -12,6 +12,7 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, trustedDrainAuthors, trustedDrainSubject } from './queue-branch-numbering.mjs';
 import { parseMergeTree } from './rebase-drop-manifest.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
+import { fetchFresh } from './git-fetch-fresh.mjs';
 // The watcher imports reconcile-pass, which imports this module. Load it only when refreshing.
 async function refreshOntoMain(...args) {
   const watcher = await import('../conveyor/ci-red-recovery-watch.mjs');
@@ -195,11 +196,11 @@ export async function runRenamedPrRefresh({ prs, slug, root = process.cwd(), set
     let accepts = false;
     if (lanes.length) {
       // A failed fetch cannot establish either the current main contract or a current conflict verdict.
-      successful(['fetch', 'origin', 'main']);
+      fetchFresh({ cwd: root, branches: ['main'], maxAgeMs: 0, run: successful });
       accepts = typeof mainAccepts === 'function' ? mainAccepts({ cwd: root }) : mainAccepts;
       if (enabled(settings.refreshEvidenceOnlyConflicts)) {
         const missing = lanes.filter(pr => { try { return successful(['rev-parse', `origin/${pr.headRefName}`]) !== pr.headRefOid; } catch { return true; } });
-        if (missing.length) successful(['fetch', 'origin', ...new Set(missing.map(pr => `+refs/heads/${pr.headRefName}:refs/remotes/origin/${pr.headRefName}`))]);
+        if (missing.length) fetchFresh({ cwd: root, branches: [...new Set(missing.map(pr => pr.headRefName))], maxAgeMs: 0, run: successful });
         for (const pr of lanes) {
           try {
             if (successful(['rev-parse', `origin/${pr.headRefName}`]) !== pr.headRefOid) throw new Error('remote head moved; conflict verdict deferred');

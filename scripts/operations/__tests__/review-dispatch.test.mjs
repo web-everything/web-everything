@@ -65,6 +65,15 @@ describe('planReviewDispatch', () => {
     expect(() => planReviewDispatch({ pr: 1, repo: 'not-a-slug' })).toThrow(/not a constellation repo/);
     expect(() => planReviewDispatch({ pr: 1, repo: '' })).toThrow(/not a constellation repo/);
   });
+
+  it('refuses longshore without review capability even when its checkout exists', () => {
+    expect(() => planReviewDispatch({ pr: 1, repo: repoProfile('longshore').slug, checkoutExists: () => true }))
+      .toThrow(/not a constellation repo/);
+  });
+
+  it.each(['we', 'frontierui', 'plateau-app'])('still accepts review-capable %s', (key) => {
+    expect(planReviewDispatch({ pr: 1, repo: repoProfile(key).slug, checkoutExists: () => true }).repoKey).toBe(key);
+  });
 });
 
 describe('reviewSessionSlug', () => {
@@ -629,6 +638,12 @@ describe('isReviewCodePath (#4387)', () => {
       }
     }
     expect(missing).toEqual([]);
+  });
+  it('puts the review child heap-cap helper and its runtime settings on the path', () => {
+    const closure = { files: new Set(), complete: true, bareDeps: false, jsonNames: new Set() };
+    for (const path of ['scripts/lib/node-heap-cap.mjs', 'scripts/settings/node-heap-cap.json']) {
+      expect(isReviewCodePath(path, { closure })).toBe(true);
+    }
   });
   // PR #2916 review, round 2: the credential sandbox sits one import deeper than the entry files (dispatch-lane-io
   // → gh-app-shim; review-core → mandate-fence; judge-spawn → session-role), so direct imports alone missed it.

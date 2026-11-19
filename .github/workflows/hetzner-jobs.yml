@@ -1,0 +1,183 @@
+# Trusted merge-group and main-push suites run on persistent Hetzner runners.
+# Runner labels: [self-hosted, hetzner, we]; the runner hook wipes the workspace.
+# Required checks stay in their hosted workflows: ci.yml (test, smoke, daemon-soak),
+# soak-replay-gate.yml and merge-gate.yml.
+# Called jobs appear as hetzner / test-shard (N) and hetzner / integration;
+# those are not required contexts.
+name: Hetzner jobs
+
+on:
+  workflow_call:
+    secrets:
+      WE_APP_PRIVATE_KEY:
+        required: false
+      FUI_READ_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  test-shard:
+    runs-on: [self-hosted, hetzner, we]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      # Sibling layout under $GITHUB_WORKSPACE so WE's `../frontierui` resolves — both the vitest/vite
+      # `@frontierui/*` alias (dev/test-time; `we:vitest.config.ts` → `../frontierui/plugs`) AND the pinned
+      # component-render CLI the gate/build call. #2165 (single-repo CI has neither the sibling nor a
+      # published `@frontierui/*` package), mirroring the #1137 deploy.yml workaround:
+      #   $GITHUB_WORKSPACE/web-everything  (this repo)
+      #   $GITHUB_WORKSPACE/frontierui      (the sibling)
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: web-everything
+          persist-credentials: false
+          # Fetch branch history during authenticated checkout; later steps have no stored token.
+          fetch-depth: 0 # tests that shell check-standards need origin/main history for the backlog scope guards
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: ${{ (vars.WE_APP_ID != '') }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      # FUI first (ratified #1946/#2016 ordering): install its deps (the `@frontierui/*` alias resolves to
+      # sibling source that imports them) + build the pinned component-render CLI the gate/build call.
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        working-directory: web-everything
+        run: npm ci
+
+      # Card 11: files are assigned to a shard by MEASURED time (scripts/ci/shard-assign.mjs +
+      # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
+      # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
+      # only those run under --coverage, so the covered files' numbers are unchanged.
+      - name: Unit suite shard ${{ matrix.shard }}/9 (coverage, no per-shard bar)
+        if: ${{ (matrix.shard != 10) }}
+        working-directory: web-everything
+        run: |
+          # Capture first, then split: reading the list through a process substitution drops the producer's exit status, so a failing
+          # assignment would leave `files` empty and run the WHOLE suite. (scripts/ci/__tests__/ci-shard-steps.test.mjs)
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/9) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+          echo "unit shard ${{ matrix.shard }}/9: ${#files[@]} files"
+          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+
+      - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
+        if: ${{ (matrix.shard == 10) }}
+        working-directory: web-everything
+        run: |
+          # Same capture-then-split shape as the coverage shard step above (see its comment).
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
+          files=()
+          while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
+          echo "unit no-coverage group: ${#files[@]} files"
+          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+
+      # Upload this shard's partial coverage for the `coverage-merge` job to merge. `if-no-files-found: error`
+      # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
+      # is the second line of defence. The no-coverage group (shard 10) produces none.
+      - name: Upload shard coverage
+        if: ${{ (matrix.shard != 10) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: web-everything/coverage/coverage-final.json
+          if-no-files-found: error
+
+      # Per-file durations for refreshing scripts/ci/test-timings.json (`node scripts/ci/shard-assign.mjs
+      # --suite=unit --update=<these>`). Weekly ci-timings-refresh.yml automates the refresh. Evidence only; never gates.
+      - name: Upload shard timings
+        if: ${{ (always()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-unit-${{ matrix.shard }}
+          path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+
+  integration:
+    runs-on: [self-hosted, hetzner, we]
+    timeout-minutes: 20
+    steps:
+      # Same sibling layout as the shards.
+      - name: Checkout WE
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: web-everything
+          persist-credentials: false
+          # Fetch branch history during authenticated checkout; later steps have no stored token.
+          fetch-depth: 0
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: vars.WE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Checkout FUI (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: frontier-ui/frontierui
+          token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
+          path: frontierui
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-everything/package-lock.json
+            frontierui/package-lock.json
+
+      - name: Install + build FUI tools
+        working-directory: frontierui
+        run: |
+          npm ci
+          npm run build:tools
+
+      - name: Install
+        working-directory: web-everything
+        run: npm ci
+
+      - name: Real-git integration suite (lane-pool, operations transport)
+        working-directory: web-everything
+        run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
+

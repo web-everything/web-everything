@@ -88,6 +88,7 @@ export const DEFAULT_ARRIVAL_WINDOW_MINUTES = 10;
 
 /** Review runs no heavy command; the prepare family is charged (operator decision 2026-10-06). */
 export const EXEMPT_DISPATCH_KINDS = Object.freeze(['review']);
+export const P1_DISPATCH_KINDS = Object.freeze(['fix', 'ci-heal']);
 export const PREPARE_DISPATCH_KINDS = Object.freeze(['prepare', 'prepare-scope', 'prepare-decision', 'prepare-item', 'investigate']);
 export const PREPARE_ADMISSION_ENV = 'WE_QUEUE_ADMISSION_PREPARE';
 
@@ -417,6 +418,41 @@ function hasLaneSplit(b) {
   return !!b && Number.isFinite(b.heavySlots) && Number.isFinite(b.heavyBacklogMinutes) && Number.isFinite(b.shortBacklogMinutes);
 }
 
+/** Pure P1 view, gated by the baseline producer's explicit `p1OrderingEnabled: true` capability.
+ *  Part B must wire live P1 ordering and marker classes before the producer may set it; until then FIFO
+ *  waiters all stay counted. This is internal baseline metadata, never a caller name or environment override.
+ *  Only explicit P2/P3 waiters can be behind P1. Unknown classes, unreadable rows/costs, held work and pending
+ *  work stay counted. Compare classes locally to keep the VM-backed classifier out of this pure import graph. */
+export function waitersAheadOf(baseline, dispatchKind) {
+  if (baseline?.p1OrderingEnabled !== true || !P1_DISPATCH_KINDS.includes(dispatchKind) || baseline?.bypassed || !Array.isArray(baseline?.waiting)) return baseline;
+  let excludedBehindCount = 0;
+  let excludedBehindMinutes = 0;
+  let heavyMinutes = 0;
+  let heavyCount = 0;
+  const waiting = baseline.waiting.filter((row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return true;
+    const cls = row.priorityClass ?? row.priority;
+    if (cls !== 'P2' && cls !== 'P3') return true;
+    if (!Number.isFinite(row.expectedMinutes) || row.expectedMinutes < 0) return true;
+    excludedBehindCount++;
+    excludedBehindMinutes += row.expectedMinutes;
+    if (queueLaneOf(row.kind) === 'slow') {
+      heavyMinutes += row.expectedMinutes;
+      heavyCount++;
+    }
+    return false;
+  });
+  const ahead = { ...baseline, waiting, excludedBehindCount, excludedBehindMinutes: round1(excludedBehindMinutes) };
+  for (const [key, removed] of [
+    ['waitingMinutes', excludedBehindMinutes], ['backlogMinutes', excludedBehindMinutes],
+    ['heavyBacklogMinutes', heavyMinutes], ['shortBacklogMinutes', excludedBehindMinutes - heavyMinutes],
+    ['waitingHeavyCount', heavyCount],
+  ]) {
+    if (Number.isFinite(baseline[key])) ahead[key] = round1(Math.max(0, baseline[key] - removed));
+  }
+  return ahead;
+}
+
 /**
  * A running ADMISSION BUDGET over one queue baseline — one per tick / per daemon pass, so several dispatches in
  * quick succession each see the demand of the ones admitted before them (the whole point: the 4th of 4 quick
@@ -438,10 +474,11 @@ export function createQueueBudget(baseline, { extraMinutes = 0 } = {}) {
   let added = Number.isFinite(extraMinutes) ? extraMinutes : 0;
   const decisions = [];
   /** Projected wait (minutes) a dispatch of `demandMinutes` would see if started right now. */
-  const projectFor = (demandMinutes = 0) => {
+  const projectFor = (demandMinutes = 0, kind) => {
     if (!active) return null;
-    if (split) return laneProjection({ ...baseline, extraShortMinutes: added + demandMinutes }).shortWaitMinutes;
-    return projectedWaitMinutes({ backlogMinutes: baseline.backlogMinutes, extraMinutes: added + demandMinutes, slots: baseline.slots });
+    const ahead = waitersAheadOf(baseline, kind);
+    if (split) return laneProjection({ ...ahead, extraShortMinutes: added + demandMinutes }).shortWaitMinutes;
+    return projectedWaitMinutes({ backlogMinutes: ahead.backlogMinutes, extraMinutes: added + demandMinutes, slots: ahead.slots });
   };
   return {
     active,
@@ -457,15 +494,17 @@ export function createQueueBudget(baseline, { extraMinutes = 0 } = {}) {
         size, standardMinutes: baseline?.standardMinutes, dispatchMinutes: baseline?.dispatchMinutes, prepareAdmission: baseline?.prepareAdmission ?? 'charge',
       });
       const exempt = EXEMPT_DISPATCH_KINDS.includes(kind) || (PREPARE_DISPATCH_KINDS.includes(kind) && baseline?.prepareAdmission === 'exempt');
+      const ahead = waitersAheadOf(baseline, kind);
+      const priorityDetails = ahead !== baseline ? { aheadOnly: true, excludedBehindCount: ahead.excludedBehindCount } : {};
       if (!active || exempt) {
-        const d = { id, kind, admit: true, exempt, demandMinutes, projectedMinutes: projectFor(demandMinutes), maxWaitMinutes: maxWait };
+        const d = { id, kind, admit: true, exempt, demandMinutes, projectedMinutes: projectFor(demandMinutes, kind), maxWaitMinutes: maxWait, ...priorityDetails };
         decisions.push(d);
         return d;
       }
-      const projectedMinutes = projectFor(demandMinutes);
+      const projectedMinutes = projectFor(demandMinutes, kind);
       const admit = projectedMinutes <= maxWait;
       if (admit) added += demandMinutes;
-      const d = { id, kind, admit, exempt: false, demandMinutes, projectedMinutes, maxWaitMinutes: maxWait };
+      const d = { id, kind, admit, exempt: false, demandMinutes, projectedMinutes, maxWaitMinutes: maxWait, ...priorityDetails };
       decisions.push(d);
       return d;
     },

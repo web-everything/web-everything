@@ -541,7 +541,7 @@ export const EVENT_TYPES = Object.freeze({
   SEND_BACK: 'send-back',   // the PR goes back to its author
   AUTHOR: 'author',         // who opened the PR
   LABEL_INPUT: 'label-input', // a hand-applied label seen by the mirror
-  FINDING: 'finding',       // card 5469: one finding's stable identity + its status on a reviewed head (non-bearing)
+  FINDING: 'finding',       // stable finding identity + review status or red-team disposition (non-bearing)
 });
 
 /** Every event type, as an array. */
@@ -552,10 +552,16 @@ export const REVIEW_RUN_PHASES = Object.freeze(['started', 'completed']);
 export const APPROVAL_KINDS = Object.freeze(['clear-human', 'clear-operator', 'judge']);
 export const SEND_BACK_CAUSES = Object.freeze(['block-ruling', 'changes']);
 export const LABEL_INPUT_CHANGES = Object.freeze(['added', 'removed']);
-/** Card 5469 — a finding's status on one reviewed head: `raised` (it held the verdict), `tolerated` (reported, did
+/** Card 5469 — a finding's review status or red-team disposition: `raised` (it held the verdict), `tolerated` (reported, did
  *  not hold it), `fixed` (raised on an earlier head, not reported now, and the fix range changed code at it),
- *  `carded` (set aside as a card suggestion). Written only by the review role (`source: review-pr`). */
-export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded']);
+ *  `carded` (set aside as a card suggestion) are written by the review role (`source: review-pr`). R883 adds
+ *  `open` / `not-real` dispositions, which require `source: red-team` and do not establish a reviewed head. */
+export const FINDING_STATUS_VALUES = Object.freeze(['raised', 'tolerated', 'fixed', 'carded', 'open', 'not-real']);
+/** R883 slice 1 — dispositions, written with `source: red-team` (a red-team finding that is still `open`, or ruled
+ *  `not-real`). Appended AFTER the old statuses so their positions never move. Review status and reviewed-head
+ *  readers skip them; the separate disposition fold feeds no round decision yet. */
+export const FINDING_DISPOSITION_VALUES = Object.freeze(['open', 'not-real']);
+export const FINDING_SOURCE_RED_TEAM = 'red-team';
 /** Card 5469 — a stable finding id: `fi-` + 12 hex of sha256(repo, pr, path, symbol, defect class). Distinct from the
  *  #76a referral `f-` id, which also hashes the claim text and the first-seen head. */
 export const STABLE_FINDING_ID_PATTERN = /^fi-[0-9a-f]{12}$/;
@@ -601,6 +607,8 @@ const EVENT_PAYLOAD = Object.freeze({
   [EVENT_TYPES.APPROVAL]: [
     ['approval', oneOf(APPROVAL_KINDS), (v) => v],
     ['delegation', (v) => delegationOrNull(v) !== undefined, delegationOrNull],
+    ['headSha', (v) => v === undefined || shaOrNull(v) !== null, (v) => v === undefined ? undefined : shaOrNull(v)],
+    ['basis', (v) => v === undefined || (Array.isArray(v) && v.length > 0 && v.every(id => typeof id === 'string' && /^[A-Za-z0-9:._-]{8,128}$/.test(id))), (v) => v === undefined ? undefined : [...v]],
   ],
   [EVENT_TYPES.SEND_BACK]: [
     ['cause', oneOf(SEND_BACK_CAUSES), (v) => v],
@@ -701,8 +709,17 @@ export function validateLedgerEvent(raw) {
   if (!Number.isInteger(raw.pr) || raw.pr <= 0) errors.push(`bad \`pr\`: ${JSON.stringify(raw.pr)}`);
   if (typeof raw.at !== 'string' || !ISO_RE.test(raw.at)) errors.push(`bad \`at\`: ${JSON.stringify(raw.at)}`);
   if (!isStr(raw.source)) errors.push('bad `source`: a row must name its writer');
+  if (raw.type === EVENT_TYPES.FINDING && FINDING_DISPOSITION_VALUES.includes(raw.status)
+    && raw.source !== FINDING_SOURCE_RED_TEAM) {
+    errors.push('bad `source`: a finding disposition requires red-team');
+  }
   for (const [name, check] of spec) {
     if (!check(raw[name])) errors.push(`bad \`${name}\`: ${JSON.stringify(raw[name])}`);
+  }
+  // A delegated approval's optional head witness must identify the full commit, never a prefix.
+  if (raw.type === EVENT_TYPES.APPROVAL && raw.delegation && raw.headSha !== undefined
+    && (typeof raw.headSha !== 'string' || shaOrNull(raw.headSha)?.length !== 40)) {
+    errors.push('bad `headSha`: a delegated approval requires a full 40-character SHA');
   }
   if (errors.length) return { valid: false, errors, record: null };
   const actor = raw.actor && typeof raw.actor === 'object' ? raw.actor : {};
@@ -1223,6 +1240,71 @@ export function appendVerdict(record, opts = {}) {
   return step.value;
 }
 
+/**
+ * Append many records with ONE git push for the holding rows. Same F4 policy as {@link appendVerdict}, row by row:
+ * a CLEARING row is never deferred (git first, per row, exactly as before); a HOLDING row writes home first and
+ * its git row joins a single flush at the end. If that flush misses, EVERY deferred row is flagged
+ * `ledgerWriteMiss: true` (the home rows stay, so each hold still stands). Returns one result per input, in order.
+ * A caller that appends N rows serially pays N git transport round trips; this pays one.
+ *
+ * @param {VerdictRecord[]} records
+ * @param {object} [opts] - as {@link appendVerdict}.
+ * @returns {object[]}
+ */
+export function appendVerdictBatch(records, opts = {}) {
+  const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
+  const results = [];
+  let deferred = []; // { index, record, board }
+  const gitSeam = opts.gitAppend ? { appendRows: opts.gitAppend } : undefined;
+  // Flush the deferred holding rows in ONE push; on a miss flag every one (home rows stay, so each hold stands).
+  const flush = () => {
+    const groups = new Map();
+    for (const d of deferred) {
+      const k = `${d.board}\0${d.record.repo}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(d);
+    }
+    deferred = [];
+    for (const group of groups.values()) {
+      const r = appendGitRowsSync(group.map((d) => d.record), { board: group[0].board, repo: group[0].record.repo }, gitSeam);
+      if (r.ok) continue;
+      loud(`verdict-ledger: GIT WRITE MISS (batch of ${group.length}) for ${group[0].record.repo}: ${r.error} — holds still apply; ledger-write-miss`);
+      for (const d of group) {
+        results[d.index] = { ...results[d.index], ledgerWriteMiss: true, git: { status: 'miss', error: r.error } };
+      }
+    }
+  };
+  for (const record of records ?? []) {
+    const plan = verdictWritePlan(record, opts);
+    const index = results.length;
+    let homed = false;
+    let step = plan.next();
+    while (!step.done) {
+      const op = step.value;
+      let result;
+      if (op.name === 'home') {
+        try { result = (opts.homeAppend ?? appendVerdictHome)(op.record); }
+        catch (e) { result = homeWriteFailure(e); }
+        homed = result?.ok === true;
+      } else if (op.name === 'git') {
+        // Defer only a HOLDING row whose home row already exists (dual): a git-only row has no home fallback to
+        // fall back on, and a CLEARING row must stay git-first. Both first flush what is queued, so git order = call order.
+        if (op.board && homed && !eventClears(op.record)) { deferred.push({ index, record: op.record, board: op.board }); result = { ok: true }; }
+        else {
+          flush();
+          result = op.board ? appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo }, gitSeam) : noBoardWriteMiss();
+        }
+      } else {
+        result = { ok: false, appended: 0, error: `plugged store ${op.name} is async; use appendVerdictAsync` };
+      }
+      step = plan.next(result);
+    }
+    results.push(step.value);
+  }
+  flush();
+  return results;
+}
+
 /** Async entry point with the identical F4 policy, using store contracts for every built-in and plugged store. */
 export async function appendVerdictAsync(record, opts = {}) {
   const plan = verdictWritePlan(record, opts);
@@ -1329,16 +1411,31 @@ function finishGitMiss({ home, g, store, loud, record }) {
   return { ...home, ok: home.ok, store, git: g, ledgerWriteMiss: true, errors: [...(home.errors ?? [])] };
 }
 
+/** The operator-facing cause of a refused ledger write: the first line of the git text, credential-scrubbed BEFORE it
+ *  is truncated. Raw git text can carry secrets in URL authority, query strings, fragments or headers, so each is
+ *  dropped, and a credential-looking keyword drops the rest of the line (fail closed). */
+export function ledgerWriteErrorSummary(error) {
+  return String(error ?? 'unknown ledger write failure').split(/\r?\n/)[0]
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '')
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/\s]*/gi, '$1[redacted]')
+    .replace(/[?#]\S*/g, '[redacted]')
+    .replace(/\b(gh[pousr]_|github_pat_|glpat-|xox[abprs]-|sk-)[A-Za-z0-9_-]+/g, '[redacted]')
+    .replace(/(?:authorization|bearer|basic\s|token|passw|secret|credential|api[_-]?key|signature|cookie)[\s\S]*$/i, '[redacted]')
+    .replace(/[A-Za-z0-9+/_=-]{32,}/g, '[redacted]')
+    .slice(0, 200);
+}
+
 /** The F4 write-miss posture, CLEARING half. A clearing verdict that missed git does NOT clear, and it leaves NO
  *  home row behind: home is what every fold reads, so a row there would stand in for the missing git row (the fold
  *  says "already decided", the retry never reaches git). Nothing is lost: the caller keeps the operation resumable
  *  (`ok: false`, `ledgerWriteMiss: true`) and a retry is a clean re-append. Every caller must honour `ok` before it
  *  swaps a label (`review-pr-io`, `merge-ai-prs` and `review-set-label` do). */
 function refuseClearingOnGitMiss({ g, store, loud, record }) {
-  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; the git transport write failed (cause above), a retry re-appends cleanly`);
+  const cause = ledgerWriteErrorSummary(g.error);
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${cause} — clearing event does NOT clear (F4) and NO home row was written; the git transport write failed (cause above), a retry re-appends cleanly`);
   return {
     ok: false, path: null, record: null, locked: false, store, git: g, ledgerWriteMiss: true,
-    errors: [`ledger-write-miss: ${g.error}`],
+    errors: [`ledger-write-miss: ${cause}`],
   };
 }
 

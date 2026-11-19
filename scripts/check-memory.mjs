@@ -17,13 +17,14 @@
  * Memory dir is derived from the repo root (the per-project key is the abs path with '/' → '-'); if it
  * doesn't exist (different machine / layout) the gate is a no-op rather than a failure.
  */
+import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeLineSync } from './lib/write-all-sync.mjs';
 import { scrubPublish } from './lib/secret-scrub.mjs';
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const ROOT = hookRoot(import.meta.url);
 
 // Budget — keep in sync with docs/agent/memory-management.md.
 const MAX_BYTES = 22 * 1024;   // hard ceiling, headroom under the ~24.4 KB harness truncation limit

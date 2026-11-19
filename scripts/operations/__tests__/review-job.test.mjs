@@ -6,15 +6,16 @@ import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
  * store (we:scripts/operations/review-job-store.mjs). Every effect is faked: no lane pool, no `claude`, no `gh`.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  BLOCKED_ON_INFRA, DEFERRED_NO_LANE, MAX_LANE_DEFERRALS, REVIEW_JOB_KIND, REVIEW_JOB_LANE_WAIT_MS,
-  classifyReviewLoopOutcome, crashLabelFromLoop, loopFailureLabel, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
+  installReviewJobExitHooks, BLOCKED_ON_INFRA, DEFERRED_NO_LANE, MAX_LANE_DEFERRALS, REVIEW_JOB_KIND, REVIEW_JOB_LANE_WAIT_MS,
+  classifyReviewLoopOutcome, crashLabelFromLoop, loopFailureLabel, createReviewJobIo, decideJobClaim, dispatchReviewByMode, dispatchReviewJob,
   jobRecordToAgentRow, laneCooloffActive, listAgentsWithReviewJobs, listReviewJobAgents, nextLaneDeferral,
   parseReviewLoopStdout, readJobRecord, resolveReviewDispatchMode, runReviewJob, writeJobRecord,
 } from '../review-job.mjs';
@@ -134,10 +135,12 @@ describe('job records — liveness by pid, without a transcript', () => {
     expect(assessLiveness(bindAgents(pr, [{ ...row, pidAlive: false }], 'we'))).toBeNull();
   });
 
-  it('listAgentsWithReviewJobs merges the listing with the job rows, and a job-read failure costs nothing', () => {
+  it('listAgentsWithReviewJobs merges job rows and marks a failed job read incomplete', () => {
     const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'fix-3' }], listJobs: () => [{ name: 'review-4' }], listWrapped: () => [] });
     expect(merged.map((a) => a.name)).toEqual(['fix-3', 'review-4']);
-    expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] })).toEqual([{ name: 'x' }]);
+    const partial = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] });
+    expect(partial).toEqual([{ name: 'x' }]);
+    expect(partial.incomplete).toEqual(['review-jobs-unreadable']);
   });
   // PR #4462 review: a wrapped fixer is a live-session population readers decide on by absence, so a failed listing of it
   // aborts the read (like a failed `claude agents`) instead of showing "no fixer".
@@ -180,6 +183,27 @@ function fakeIo(over = {}) {
 }
 
 describe('runReviewJob — the arc, no Claude wrapper session', () => {
+  it.each(['unreadable', 'oversized', 'rewrite-removal'])('scrub %s failure prevents fetching and writes its reason to the terminal record', failure => {
+    const exec = vi.fn((file, args) => {
+      if (file === 'gh') return JSON.stringify({ headRefOid: 'a'.repeat(40) });
+      if (args[0] === 'config') {
+        if (failure === 'unreadable') throw Error('config read failed');
+        if (failure === 'oversized') throw Object.assign(Error('config output exceeded maxBuffer'), { code: 'ENOBUFS' });
+        if (args.includes('--unset-all')) throw Error('config is read-only');
+        return 'local\0url.review-marker::fixture.insteadof\nhttps://github.com/\0';
+      }
+      throw Error('must not reach transport');
+    });
+    const prepareLane = createReviewJobIo({ exec, readConfig: () => ({ status: 1, stdout: '', stderr: '' }), env: {}, log: () => {} }).prepareLane;
+    const { io, calls } = fakeIo({ prepareLane });
+    const out = runReviewJob({ pr: 229, repo: 'web-everything/web-everything' }, io);
+    const label = 'review lane setup failed: review lane config scrub failed; inspect and repair lane configuration before retrying; inspect the PR head and retry';
+    expect(out).toMatchObject({ outcome: BLOCKED_ON_INFRA, label });
+    expect(calls.filter(c => c[0] === 'report' && c[1] === 'done').map(c => c[2]))
+      .toEqual([expect.objectContaining({ status: 'done', outcome: BLOCKED_ON_INFRA, label })]);
+    expect(exec.mock.calls.some(([, args]) => args.includes('fetch'))).toBe(false);
+    expect(calls.some(c => c[0] === 'loop')).toBe(false);
+  });
   it('claims, reports started, acquires, runs the loop ONCE under a fresh actor id, reports done, releases, unclaims', () => {
     const { io, calls } = fakeIo();
     const out = runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io);
@@ -404,7 +428,7 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
     let headReads = 0;
     let spawns = 0;
     let sessionWrites = 0;
-    const ciGate = ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: { startAfter: 'ci-green' },
+    const ciGate = ({ repo, pr }) => readReviewCiGate({ repo, pr, policy: { startAfter: 'ci-green', startEarly: 'off' },
       readHead: args => { reads.push(['head', args]); return state === 'head-moved' && headReads++ ? 'b'.repeat(40) : headSha; },
       readRequired: args => { reads.push(['required', args]); return { source: ['stale-cache', 'fallback'].includes(state) ? state : 'live', checks: ['test', 'daemon-soak'] }; },
       readChecks: args => {
@@ -428,6 +452,7 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
 });
 
 it('x6n7c2p required checks before review — default job four-tick soak spends one round', () => {
+  // Replay the original strict-CI policy, independently of the shipped push/early-review timing.
   let spawns = 0;
   const rounds = [];
   const dispatched = [];
@@ -438,7 +463,7 @@ it('x6n7c2p required checks before review — default job four-tick soak spends 
       acquirableLanes: () => 1, tagRound: row => rounds.push(row.round), tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
       dispatch: options => dispatchReviewByMode({ ...options, mode: 'job', root: '/daemon', dir,
         checkStaleness: FRESH, readCompletion: () => null, resolveSettingsEnv: () => ({}),
-        ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
+        ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green', startEarly: 'off' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
           readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
         }), spawnJob: () => { spawns++; return 4242; },
@@ -556,5 +581,34 @@ describe('loopFailureLabel — the loop\'s own error is recorded, never swallowe
   it('is null on a clean exit and a bare exit code when the payload has no error', () => {
     expect(loopFailureLabel({ stopped: 'complete' }, 0)).toBeNull();
     expect(loopFailureLabel({ stopped: 'confirm' }, 2)).toBe('exit 2');
+  });
+});
+
+
+describe('CLI exit evidence', () => {
+  const marker = () => JSON.parse(readFileSync(join(dir, 'diagnostics', 'review-we-42.exit.json'), 'utf8'));
+  function hooks() {
+    const proc = new EventEmitter();
+    proc.pid = 123;
+    proc.kill = vi.fn();
+    const setSlug = installReviewJobExitHooks({ proc, dir });
+    return { proc, setSlug };
+  }
+  it('skips an unknown slug, then synchronously records normal exit', () => {
+    const { proc, setSlug } = hooks();
+    proc.emit('exit', 1);
+    expect(readdirSync(dir)).not.toContain('diagnostics');
+    setSlug('review-we-42');
+    proc.emit('exit', 7);
+    expect(marker()).toEqual({ pid: 123, exitCode: 7, signal: null, endedAt: expect.any(String) });
+  });
+  it.each(['SIGTERM', 'SIGHUP', 'SIGINT'])('installs no %s handler, so a signal still terminates the job', signal => {
+    const { proc } = hooks();
+    expect(proc.listenerCount(signal)).toBe(0);
+  });
+  it('never throws on an unwritable marker', () => {
+    const { proc, setSlug } = hooks();
+    setSlug('../invalid');
+    expect(() => proc.emit('exit', 1)).not.toThrow();
   });
 });

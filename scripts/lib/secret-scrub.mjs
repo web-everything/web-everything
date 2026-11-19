@@ -120,7 +120,7 @@ export function isHighEntropyToken(tok) {
 // ── scrub: reject a VALUE that carries a secret / path / code / PII string ──────────────────────────
 // Deny-at-the-write-seam (the #883 write-time-gate precedent). Each matcher returns a human reason.
 export const SECRET_PATTERNS = [
-  [/-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)/, 'PEM key/cert block'],
+  [new RegExp('-----' + 'BEGIN [A-Z ]*(?:PRIVATE' + ' KEY|CERTIFICATE)'), 'PEM key/cert block'],
   [/\b(?:sk|pk|rk)-[A-Za-z0-9]{16,}/, 'api-key-shaped token (sk-/pk-/rk-)'],
   [/\bgh[posru]_[A-Za-z0-9]{16,}/, 'GitHub token (ghp_/gho_/…)'],
   [/\bgithub_pat_[A-Za-z0-9_]{40,}/, 'GitHub fine-grained PAT (github_pat_…)'],

@@ -2,12 +2,16 @@
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { spawnTimeoutMs } from './lib/spawn-timeout.mjs';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import * as drain from '../merge-ai-prs.mjs';
+
+// Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
+const CLI_TEST_TIMEOUT_MS = Math.max(180_000, spawnTimeoutMs()) + 10_000;
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const source = readFileSync(script, 'utf8');
@@ -67,7 +71,7 @@ function runCli({ failAll = false, watch = false } = {}) {
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json',
       ...(watch ? ['--watch', '--interval=1', '--max-idle=1'] : [])], {
-      cwd: dir, encoding: 'utf8', timeout: 30000,
+      cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(),
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, ISOLATION_FIXTURE: fixture,
         ISOLATION_HOME: dir, ISOLATION_FAIL_ALL: failAll ? '1' : '0' },
     });
@@ -113,7 +117,7 @@ describe('#4389 merge failure isolation', () => {
     expect(result.failed[0]).toMatchObject({ num: 2879, detail: expect.stringContaining('not mergeable') });
     expect(result.ok).toBe(true);
     expect(status).toBe(0);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('still exits 2 when both merges fail', () => {
     const { status, result, attempts } = runCli({ failAll: true });
@@ -121,7 +125,7 @@ describe('#4389 merge failure isolation', () => {
     expect(result.merged).toEqual([]);
     expect(result.failed.map(p => p.num)).toEqual([2879, 2880]);
     expect(status).toBe(2);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it('watch uses all landed PRs even when the final pass only fails', () => {
     const { status, result, attempts } = runCli({ watch: true });
@@ -131,7 +135,7 @@ describe('#4389 merge failure isolation', () => {
     expect(result.lastFailed).toHaveLength(1);
     expect(result.lastFailed[0].detail).toContain('not mergeable');
     expect(status).toBe(0);
-  }, 30000);
+  }, CLI_TEST_TIMEOUT_MS);
 
   it.each([
     [{ dup: [1], failed: [], mergedCount: 0 }, 3],

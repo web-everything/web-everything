@@ -1,0 +1,5 @@
+{
+  "backlog": {
+    "cardNumbering": { "mode": "rename-before-enqueue" }
+  }
+}

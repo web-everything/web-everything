@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
  * @description #3870 (epic #3383) — the FIRST daemon pulled out of the single conveyor runner.mjs: a
@@ -51,7 +52,8 @@ import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
 import { decideParkToHuman } from '../../scripts/lib/review-escalation.mjs';
 import { hostname } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   RUNNER_LOCK_ROOT, makeOwner,
@@ -66,14 +68,21 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
+import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
+import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
-import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
-import { unlinkSync } from 'node:fs';
+import { resolveFixSettings, resolveFixDispatchSettings } from '../../scripts/conveyor/fix-takeover.mjs';
+import { unlinkSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
+import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
+import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
 import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
+import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_STANDARD } from '../../scripts/lib/ai-routing.mjs';
 import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
@@ -84,6 +93,7 @@ import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconci
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
+import { readCompletePrComments } from '../../scripts/conveyor/pr-comments-complete.mjs';
 import { excusePrMergeGateHolds } from '../../scripts/lib/merge-gate-hold-class.mjs';
 import { ciGreenForEscalation, contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
 import { buildCiHealVerdictVoidComment, notCiBreakVerdictVoidState, needsHumanVoidState, latestCiHealEscalationForHead } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
@@ -91,10 +101,10 @@ import { getRequiredStatusChecks } from '../../scripts/lib/required-status-check
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
+import { sweepHungCiRecovery, sweepCiRedRecovery, sweepMissingRunRecovery, defaultReadOpenPrs, createFileApplyLedger } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import { runRulingResolvesStandDownPass } from '../../scripts/conveyor/ruling-resolved-stand-down.mjs';
 import { resolveReviewSettings, resolveReviewSettingSource } from '../../scripts/lib/review-settings.mjs';
-import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from '../../scripts/lib/constellation-repos.mjs';
 import { forEachRepo } from '../../scripts/lib/for-each-repo.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from '../../scripts/lib/github-app-auth-env.mjs';
 /** Per-owner App auth: this daemon fixes PRs in every org (live 2026-10-04: plateau-app calls failed with the
@@ -104,6 +114,7 @@ import { withSelfSync } from '../../scripts/lib/daemon-self-sync.mjs';
 import { withPrEvents } from '../../scripts/lib/pr-events.mjs';
 import { isStaleMainRefusalMessage } from '../../scripts/lib/main-staleness.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
+import { logDaemonHeap } from '../../scripts/lib/daemon-heap-log.mjs'; // R368 per-pass heap line (`WE_DAEMON_HEAP_LOG=0` = off)
 import { warmFixFacts, takeFixReadStats, formatFixReadStats } from '../../scripts/lib/fix-facts.mjs'; // perf C1d (`WE_FIX_FACTS=0` = off)
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Verify
@@ -112,6 +123,18 @@ export const RECONCILE_FIX_DISPATCH_LEASE_KEY = '<conveyor:reconcile-fix-dispatc
 
 /** Matches runner.mjs's own tick cadence (DEFAULT_TICK_INTERVAL_MS) — this pass ran at that rate as one of
  *  runner.mjs's mechanical passes; standing alone, there is no reason to run it faster or slower. */
+/** The fix role's aiRouting executors chain, or undefined (unset, inherit, or unreadable all keep today's routes). */
+export function resolveFixChainInput({ resolve = resolveAiRouting, log = console.error } = {}) {
+  try {
+    const resolved = resolve();
+    const executors = aiRoutingInputs('fix', resolved).executors;
+    // The chain resolver maps rung ids to its built-in rungs; a customised profile it cannot honour is refused, not ignored.
+    const customised = executors?.some(id => JSON.stringify(resolved.value.executorProfiles?.[id]) !== JSON.stringify(AI_ROUTING_STANDARD.executorProfiles[id]));
+    if (customised) { log('ai-routing-invalid · fix executors reference a customised executorProfile; holding the chain at Claude'); return ['claude']; }
+    return executors;
+  } catch { return undefined; }
+}
+
 export const DEFAULT_INTERVAL_MS = 120_000;
 
 // ── PURE CORE (no IO — every effect is injected; unit-tested directly) ─────────────────────────────────────
@@ -383,10 +406,18 @@ export function defaultParkToHuman({ repo, pr, addLabel, removeLabels, exec = ex
  */
 let loggedNeedsHumanVoidSetting = false;
 
+// A PR can carry several notes, so the notes cursor names the note (PR + kind + session), not the PR alone: resuming at
+// a bare PR number would restart that PR's first note every pass and starve its later ones. A bare number still
+// resumes at that PR's first note (older saved cursors).
+const noteCursorKey = n => `${n?.prNumber}:${n?.kind}:${n?.sessionId ?? ''}`;
+const noteMatchesCursor = (n, cursor) => (typeof cursor === 'string' ? noteCursorKey(n) === cursor : n?.prNumber === cursor);
+const cursorPrNumber = cursor => (typeof cursor === 'string' ? Number.parseInt(cursor, 10) : cursor);
+
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
   publish = publishAttention, safety = resolveFixSafety(), autoRoundGrant = defaultAutoRoundGrant, stuckAfterGrant = defaultStuckAfterGrant,
   dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
+  deadlineAt, cursor, now = Date.now,
   ...tickOpts
 } = {}) {
   process.stderr.write(`policy · fix.alertAtRoundCap=${safety.value.alertAtRoundCap} (${safety.sources.alertAtRoundCap})\n`);
@@ -394,21 +425,53 @@ export function runReconcileNotesAllRepos({
     process.stderr.write(`ciHealVerdict.voidNeedsHumanWhenCiGreen=${verdictSettings.voidNeedsHumanWhenCiGreen ? 'on' : 'off'} source=${verdictSettings.voidNeedsHumanSource ?? 'caller'}\n`);
     loggedNeedsHumanVoidSetting = true;
   }
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
+  const perRepo = [];
+  let handled = 0, deferred = [], deadlineSkipped = false, nextCursorKey = null;
+  const pastDeadline = () => deadlineAt != null && now() > deadlineAt;
+  // Discover one repo at a time: an overrun must not start the next blocking read.
+  function* readRepos() {
+    for (const repo of repos) {
+      if (pastDeadline()) {
+        deferred = cursor == null ? [] : [cursorPrNumber(cursor)];
+        if (cursor != null) nextCursorKey = cursor;
+        deadlineSkipped = true;
+        return;
+      }
+      const [entry] = forEachRepo([repo], repo => tick({ ...tickOpts, repo,
+        ...(deadlineAt != null || cursor != null ? { deadlineAt, cursor, now } : {}) }));
+      perRepo.push(entry);
+      yield entry;
+    }
+  }
   const notes = [];
   const refusals = [];
   const comments = [];
   const autoGrants = [];
-  for (const entry of perRepo) {
+  for (const entry of readRepos()) {
     if (entry.error) {
       refusals.push({ repo: entry.repo, prNumber: null, kind: 'tick-failed', why: entry.error });
       continue;
     }
     const { repo, result } = entry;
     const prsByNumber = result?.prsByNumber ?? new Map();
+    if (result?.deadlineSkipped) deadlineSkipped = true;
+    let repoNotes = result?.notes ?? [];
+    if (cursor != null) {
+      const start = repoNotes.findIndex(note => noteMatchesCursor(note, cursor));
+      if (start > 0) repoNotes = [...repoNotes.slice(start), ...repoNotes.slice(0, start)];
+    }
+    let repoHandled = 0;
     // PRs whose cap note a grant made moot (this pass's own, another worker's, or one being decided right now).
     const graceNotes = new Set();
-    for (const n of (result?.notes ?? [])) {
+    for (const n of repoNotes) {
+      // Always handle one note per started repo, so slow discovery cannot starve notes pass after pass.
+      if (repoHandled > 0 && pastDeadline()) {
+        deferred = repoNotes.slice(repoHandled).map(note => note.prNumber);
+        nextCursorKey = noteCursorKey(repoNotes[repoHandled]);
+        break;
+      }
+      repoHandled += 1;
+      handled += 1;
       const tagged = { ...n, repo };
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
@@ -502,8 +565,10 @@ export function runReconcileNotesAllRepos({
         catch (e) { process.stderr.write(`needs-you publication failed: ${redactedFirstLine(e)}\n`); }
       }
     }
+    if (deferred.length) break;
   }
-  return { repos: perRepo, notes, refusals, comments, autoGrants };
+  return { handled, deferred, nextCursor: nextCursorKey ?? deferred[0] ?? null, ...(deadlineSkipped ? { deadlineSkipped: true } : {}),
+    repos: perRepo, notes, refusals, comments, autoGrants };
 }
 
 /** The repo's live required-check set (branch protection, cached) — the SAME reader `reconcile-pass.mjs` uses. */
@@ -669,8 +734,11 @@ export function runHungCiRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, t
  *   refusals:Array<object>}} `dispatched`/`refusals` here are the pass's own `applied`/`dispatch`+`refusals`
  *   rows, repo-tagged the same way {@link runHungCiRecoveryAllRepos} tags its own.
  */
-export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, ...tickOpts } = {}) {
-  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true }));
+export function runMainRedRebaseAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = sweepCiRedRecovery, createLedger = createFileApplyLedger, ...tickOpts } = {}) {
+  // This daemon is the only live caller: without a per-repo file-backed fairness ledger the budget-capped apply
+  // loop restarts at the head of the queue every tick and slow/deferred PRs starve later recoverable ones.
+  // Built inside the per-repo callback so a ledger construction failure is isolated to that repo (tick-failed).
+  const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo, apply: true, applyLedger: tickOpts.applyLedger ?? createLedger({ repo }) }));
   const dispatched = [];
   const refusals = [];
   for (const entry of perRepo) {
@@ -725,6 +793,272 @@ export function runMissingRunRecoveryAllRepos({ repos = FIX_DISPATCH_DAEMON_REPO
   return { repos: perRepo, dispatched, refusals };
 }
 
+/** How long (ms) a pass-local reconcile plan may be reused. Older than this, the next phase recomputes. */
+export const RECONCILE_PLAN_MAX_AGE_MS = 15 * 60 * 1000;
+
+/** Key (not a PR number) under which the probe records main's CI state. */
+const MAIN_STATE_KEY = 'main-ci-state';
+
+/** Stable per-PR fingerprint of everything a phase's decision reads live: head, draft, merge state, labels, check state, last activity. */
+function prFingerprint(pr) {
+  const checks = (pr.statusCheckRollup ?? []).map((c) => [c?.name ?? c?.context ?? null, c?.workflowName ?? null, c?.status ?? c?.state ?? null,
+    c?.conclusion ?? null, c?.completedAt ?? c?.startedAt ?? null]).map((row) => JSON.stringify(row)).sort();
+  return JSON.stringify([pr.headRefOid, pr.isDraft, pr.mergeStateStatus ?? null, (pr.labels ?? []).map((l) => l?.name ?? l).sort(), checks, pr.updatedAt]);
+}
+
+/**
+ * The planner's OWN discovery read: it must be taken AFTER the baseline probe, so it may not use the host-shared PR snapshot
+ * (valid ~75 s). It used to force that with a WRAPPER `exec`, which also knocked it off the production path and made it run
+ * the heavy 200-row `gh pr list` (HTTP 504, 23 failed ticks, ci-heals unplanned, 2026-11-03). `fresh: true` skips the snapshot
+ * but keeps the small-page read, the 5xx retry and the fail-closed / deferred contract.
+ */
+export const planFreshReadPrs = (read) => (o = {}) => read({ ...o, fresh: true, attributionRepo: o.attributionRepo ?? o.repo });
+
+/**
+ * Default live probe for plan reuse: one light open-PR list per repo, read DIRECTLY from GitHub. It must never use the
+ * host-shared PR snapshot (valid for ~75 s): that could hide a stand-down comment posted after the plan was made.
+ * Throws when a row lacks `updatedAt`, so the cache fails closed to a full recompute.
+ */
+export function readPlanFingerprints(repo, { exec = (...args) => execFileSyncThrottled(...args) } = {}) {
+  // A wrapper `exec` (not the throttled function itself) makes defaultReadOpenPrs skip the shared snapshot.
+  const rows = defaultReadOpenPrs({ exec, repo: CONSTELLATION_REPOS[repo]?.slug ?? repo, extraFields: ['isDraft', 'labels', 'updatedAt', 'mergeStateStatus'] });
+  if (!Array.isArray(rows) || rows.some((pr) => !pr || typeof pr.updatedAt !== 'string')) throw new Error('plan fingerprint unreadable');
+  const map = new Map(rows.map((pr) => [pr.number, prFingerprint(pr)]));
+  // Main's own CI state feeds the planner's main-red attribution (ci-heal authorization): any change drops every row.
+  const slug = CONSTELLATION_REPOS[repo]?.slug ?? repo;
+  const runs = JSON.parse(String(exec('gh', ['run', 'list', '--branch', 'main', '--limit', '20', '--repo', slug,
+    '--json', 'databaseId,status,conclusion,headSha,attempt,updatedAt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60e3 }) || 'null'));
+  if (!Array.isArray(runs)) throw new Error('plan main-state unreadable');
+  map.set(MAIN_STATE_KEY, JSON.stringify(runs));
+  return map;
+}
+
+/**
+ * Default live probe for claims and sessions: `claim:<repo>:<pr>` for every live fix/ci-heal claim, and
+ * `agent:<id>` for every live agent session (the planner's liveness gate reads these).
+ */
+export function readPlanClaims({ readAgents = () => enrichAgents(defaultReadAgents()) } = {}) {
+  const out = new Set(listFixDispatchClaims(undefined, { liveOnly: true }).map((c) => `claim:${c.meta.repo}:${c.meta.pr}`));
+  const agents = readAgents();
+  if (!Array.isArray(agents)) throw new Error('plan agent probe unreadable');
+  // The WHOLE enriched session record is the key (identity, cwd, lane HEAD, pid liveness, hung / idle / self-reported
+  // flags, wait state): any change means the planner's liveness reading would differ. Only a growing counter
+  // (`hungAgeMs`) and, for a plain chat session outside a lane clone, its busy/idle flip are left out.
+  for (const a of agents) {
+    const { hungAgeMs: _age, ...record } = a ?? {};
+    const laneBound = a?.kind !== 'interactive' || /[\\/]\.lanes[\\/]/.test(String(a?.cwd ?? ''));
+    if (!laneBound) delete record.status;
+    out.add(`agent:${a?.sessionId ?? a?.pid ?? a?.name}:${JSON.stringify(Object.entries(record).sort(([x], [y]) => (x < y ? -1 : 1)))}`);
+  }
+  return out;
+}
+
+/**
+ * One reconcile plan per repo and compatible planner input per pass, reused by fix, ci-heal, promote-draft and notes.
+ * A READ CACHE only: it lives inside one `runTickAllRepos` call and dies with it. It never authorizes an action, and it fails closed:
+ *  - Every reuse re-probes the repo live (one light PR list plus the live claim set) and compares with the probe taken
+ *    just BEFORE the plan was computed. A PR whose head, draft state, labels or last activity (comments, stand-downs,
+ *    pushes) changed, or that gained a live claim, loses its dispatch/notes/owed rows from the reused plan; refusal
+ *    rows are kept (they only explain). Anything an earlier phase acted on is dropped the same way.
+ *  - A new, changed or removed session discards the cached plan and recomputes liveness. Merely dropping every
+ *    dispatch row would starve later phases whenever fix launches a session, including after auth recovery.
+ *  - A failed probe, a plan older than `maxAgeMs`, or one that cannot be cloned is recomputed in full.
+ *  - Each reader gets its own deep copy.
+ *  - Auto-proceed permission must match. Other planner overrides bypass reuse; their effects cannot be inferred
+ *    from the live fingerprint. `readPrs` alone is ignored because planning always replaces it with a direct read.
+ * Each phase still runs its own live gates (fix claim, fresh per-sha check read, stale-main guard) on top.
+ * @param {{reconcile?:Function, now?:Function, maxAgeMs?:number, readFingerprints?:Function, readClaims?:Function}} [o]
+ */
+export function createReconcilePlanCache({ reconcile = (input) => runReconcilePass(input), now = Date.now,
+  maxAgeMs = RECONCILE_PLAN_MAX_AGE_MS, readFingerprints = readPlanFingerprints, readClaims = readPlanClaims,
+  log = (line) => process.stderr.write(`${line}\n`) } = {}) {
+  const entries = new Map();
+  const touched = new Map();
+  // One line per prelude read: how long it took and when it started. Join startedAt..+ms against the gh-throttle call
+  // log (waitedMs per call) to tell a gh-slot wait from GitHub API time. Logging never fails or slows the read.
+  const timedRead = (kind, repo, fn, extra = '') => {
+    const startedAt = now();
+    try { return fn(); } finally {
+      try { log(`reconcile-fix-dispatch-daemon: prelude-read kind=${kind} repo=${repo} ms=${now() - startedAt}${extra} startedAt=${new Date(startedAt).toISOString()}`); } catch { /* best-effort */ }
+    }
+  };
+  const probe = (repo) => ({ prs: timedRead('fingerprints', repo, () => readFingerprints(repo)),
+    claims: timedRead('claims', repo, () => readClaims()) });
+  const filterRows = (plan, stale) => {
+    for (const key of ['dispatch', 'notes', 'owedTriggers']) if (Array.isArray(plan[key])) {
+      plan[key] = plan[key].filter(row => stale !== 'all' && !stale.has(row?.prNumber ?? row?.pr));
+    }
+    return plan;
+  };
+  // PRs whose live state differs from what the plan saw (or that an earlier phase acted on).
+  const staleSet = (repo, baseline) => {
+    const live = probe(repo);
+    const stale = new Set(touched.get(repo) ?? []);
+    // A session can bind by name or lane HEAD to any PR. Re-plan from live evidence rather than returning an
+    // empty plan: otherwise an unrelated fix session can suppress CI-heal on every pass, even after /login.
+    for (const key of new Set([...live.claims, ...baseline.claims])) {
+      if (key.startsWith('agent:') && live.claims.has(key) !== baseline.claims.has(key)) return 'recompute';
+    }
+    if (live.prs.get(MAIN_STATE_KEY) !== baseline.prs.get(MAIN_STATE_KEY)) return 'all';
+    for (const [pr, fp] of baseline.prs) if (live.prs.get(pr) !== fp) stale.add(pr);
+    for (const [pr] of live.prs) if (!baseline.prs.has(pr)) stale.add(pr);
+    for (const key of live.claims) {
+      if (baseline.claims.has(key)) continue;
+      stale.add(Number(key.split(':').pop()));
+    }
+    return stale;
+  };
+  const read = (repo, allowStandDownAutoProceed = false) => {
+    const entry = entries.get(repo);
+    if (!entry || entry.allowStandDownAutoProceed !== allowStandDownAutoProceed || now() - entry.at > maxAgeMs) return null;
+    try {
+      const stale = staleSet(repo, entry.baseline);
+      if (stale === 'recompute') { entries.delete(repo); return null; }
+      const plan = filterRows(structuredClone(entry.plan), stale);
+      const captured = structuredClone(entry.captured).filter((pr) => stale !== 'all' && !stale.has(pr?.number));
+      return { plan, captured };
+    } catch { entries.delete(repo); return null; }
+  };
+  return {
+    /** Same shape as `runReconcilePass`. Reuses only matching planner inputs, with live-validated copies. */
+    reconcile(input = {}) {
+      const repo = input.repo ?? null;
+      const allowStandDownAutoProceed = input.allowStandDownAutoProceed === true;
+      const cacheable = Object.entries(input).every(([key, value]) => value === undefined
+        || ['repo', 'readPrs', 'allowStandDownAutoProceed'].includes(key));
+      const readStart = now();
+      const hit = cacheable ? read(repo, allowStandDownAutoProceed) : null;
+      if (hit) {
+        try { log(`reconcile-fix-dispatch-daemon: prelude-read kind=plan repo=${repo} ms=${now() - readStart} cache=hit startedAt=${new Date(readStart).toISOString()}`); } catch { /* best-effort */ }
+        return hit.plan;
+      }
+      // Do not let notes reuse the preceding plan if an override or a failed recompute replaces it.
+      entries.delete(repo);
+      let baseline = null;
+      try { baseline = probe(repo); } catch { baseline = null; }
+      let captured = [];
+      const tap = (fn, fallback) => (...args) => { captured = (fn ?? fallback)(...args); return captured; };
+      // Always plan from a DIRECT read taken AFTER the baseline probe. A caller-supplied `readPrs` (the pass's earlier
+      // discovery snapshot) and the host-shared PR snapshot (valid ~75 s) can both predate the baseline, which would let
+      // a newer probe certify older evidence. A wrapper `exec` makes the default reader skip the shared snapshot; the
+      // attribution repo it would otherwise get by identity is passed explicitly. Later stages capture the hydrated
+      // rows for notes.
+      const { readPrs: _discovery, ...fresh } = input;
+      const planStart = now();
+      const readOpenPrs = tap(planFreshReadPrs(defaultReadPrs));
+      const plan = filterRows(reconcile({ ...fresh,
+        readPrs: (...args) => timedRead('open-pr-read', repo, () => readOpenPrs(...args)),
+        excuseMergeGateHolds: tap(input.excuseMergeGateHolds, excusePrMergeGateHolds),
+        enrichCodeQL: tap(input.enrichCodeQL, enrichPrsWithCodeQL) }), touched.get(repo) ?? new Set());
+      try { log(`reconcile-fix-dispatch-daemon: prelude-read kind=plan repo=${repo} ms=${now() - planStart} cache=miss startedAt=${new Date(planStart).toISOString()}`); } catch { /* best-effort */ }
+      try { if (baseline && cacheable) entries.set(repo, { at: now(), baseline, allowStandDownAutoProceed,
+        plan: structuredClone(plan), captured: structuredClone(captured) }); }
+      catch { entries.delete(repo); }
+      return plan;
+    },
+    /** Read-only notes view of a live-validated plan; never reuse an auto-proceed-enabled plan here. */
+    notes(repo) {
+      const hit = read(repo);
+      if (!hit) return null;
+      return { notes: Array.isArray(hit.plan.notes) ? hit.plan.notes : [],
+        prsByNumber: new Map((Array.isArray(hit.captured) ? hit.captured : []).map((pr) => [pr.number, pr])) };
+    },
+    /** Record PRs a phase acted on this pass; later phases will not reuse plan rows for them. */
+    markTouched(results) {
+      for (const d of results?.dispatched ?? results?.dispatch ?? []) {
+        const pr = d?.pr ?? d?.prNumber;
+        if (pr == null) continue;
+        const repos = d.repo == null ? [...entries.keys()] : [d.repo];
+        for (const key of repos) {
+          if (!touched.has(key)) touched.set(key, new Set());
+          touched.get(key).add(pr);
+        }
+      }
+    },
+  };
+}
+
+// R812: settings can narrow these bounds; only code can enlarge the outer limit.
+const FIX_PASS_LIMITS = {
+  fixMs: { defaultMs: 300000, maxMs: 1800000, env: 'WE_FIX_BUDGET_FIX_MS', phase: 'fix' },
+  notesMs: { defaultMs: 300000, maxMs: 1800000, env: 'WE_FIX_BUDGET_NOTES_MS', phase: 'notes' },
+  orphanGuardMs: { defaultMs: 300000, maxMs: 1800000, env: 'WE_FIX_BUDGET_ORPHAN_GUARD_MS', phase: 'orphan-guard' },
+  stuckFixersMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_STUCK_FIXERS_MS', phase: 'stuck-fixers' },
+  ciHealMs: { defaultMs: 180000, maxMs: 900000, env: 'WE_FIX_BUDGET_CI_HEAL_MS', phase: 'ci-heal' },
+  promoteDraftMs: { defaultMs: 120000, maxMs: 600000, env: 'WE_FIX_BUDGET_PROMOTE_DRAFT_MS', phase: 'promote-draft' },
+};
+
+/** `file` accepts a settings path or injected parsed data. Invalid overrides reset to standard,
+ * rather than inheriting a possibly larger lower-layer value. Unreadable files use standard. */
+export function resolveFixPassBudgets({ env = process.env,
+  file = resolve(DAEMON_REPO_ROOT, 'scripts/settings/fix-pass-budget.json'), readFile = readFileSync,
+} = {}) {
+  let raw;
+  try { raw = typeof file === 'string' || file instanceof URL ? JSON.parse(readFile(file, 'utf8')) : file; }
+  catch { raw = null; }
+  const standard = {}, tool = {}, envValues = {};
+  const parse = (v, maxMs, fromEnv = false) => {
+    if (fromEnv && typeof v === 'string' && /^\d+$/.test(v)) v = Number(v);
+    return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+      ? Math.min(maxMs, Math.max(1000, v)) : null;
+  };
+  for (const [key, rule] of Object.entries(FIX_PASS_LIMITS)) {
+    standard[key] = rule.defaultMs;
+    if (Object.hasOwn(raw?.fixPassBudget ?? {}, key)) {
+      const value = parse(raw.fixPassBudget[key], rule.maxMs);
+      if (value !== null) tool[key] = value;
+    }
+    if (Object.hasOwn(env, rule.env)) {
+      const value = parse(env[rule.env], rule.maxMs, true);
+      if (value === null) delete tool[key];
+      else envValues[key] = value;
+    }
+  }
+  const resolved = resolveCascade({ standard, tool, envValues });
+  return Object.fromEntries(Object.keys(FIX_PASS_LIMITS).map(key => [key,
+    { value: resolved.value[key], source: resolved.sources[key] }]));
+}
+
+const FIX_PASS_CURSORS_PATH = resolve(DAEMON_REPO_ROOT, '.conveyor/fix-pass-cursors.json');
+
+/** Missing or malformed state starts a fresh rotation; test imports never read live cursors. */
+export function loadFixPassCursors({ path, readFile = readFileSync } = {}) {
+  const empty = { rotation: {}, prCursors: {} };
+  if (process.env.VITEST && path == null) return empty;
+  try {
+    const state = JSON.parse(readFile(path ?? FIX_PASS_CURSORS_PATH, 'utf8'));
+    const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    if (state?.version !== 1 || !record(state.rotation) || !record(state.prCursors)
+      || !Object.values(state.rotation).every(value => typeof value === 'string')
+      || !Object.values(state.prCursors).every(cursors => record(cursors)
+        && Object.values(cursors).every(value => (Number.isSafeInteger(value) && value > 0)
+          || (typeof value === 'string' && value.length > 0)))) return empty;
+    return { rotation: state.rotation, prCursors: state.prCursors };
+  } catch { return empty; }
+}
+
+function writeFixPassCursors(path, content) {
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, content, { flag: 'wx' });
+    renameSync(temp, path);
+  } finally {
+    try { unlinkSync(temp); } catch { /* Renamed or never created. */ }
+  }
+}
+
+/** Cursor persistence is best effort; injected writes receive the final path and JSON. */
+export async function saveFixPassCursors({ path, rotation, prCursors, write = writeFixPassCursors } = {}) {
+  if (process.env.VITEST && path == null) return;
+  try {
+    await write(path ?? FIX_PASS_CURSORS_PATH, JSON.stringify({ version: 1, rotation, prCursors }) + '\n');
+  } catch { /* A persistence failure must not stop dispatch. */ }
+}
+
+// Load once for the daemon defaults; injected state stays independent.
+const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
  * daemon's WHOLE per-tick unit of work, composing BOTH halves this daemon now owns — the pre-existing `fix`
@@ -765,6 +1099,8 @@ export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
   authGateOverride,
   fixSettings = resolveFixSettings(),
+  // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
+  readPrs,
   // R123: resolve once per daemon pass, then carry permission through the fan-out and reconciliation.
   // An explicit boolean overrides policy for tests and read-only callers.
   allowStandDownAutoProceed = fixSettings.standDownAutoProceed,
@@ -786,15 +1122,96 @@ export async function runTickAllRepos({
   // default here would spend one for every dispatched row those fakes produce. The real daemon
   // (`buildCliDaemonEffects`, below) opts in via {@link defaultTagDispatchStatus}.
   tagDispatchStatus = null,
+  // Share compatible plans across fix/ci-heal/promote-draft/notes within this pass (see createReconcilePlanCache).
+  // Default on for the real daemon; injected-tick fixtures keep their historical arguments unless they opt in.
+  reuseReconcilePlan,
+  // Injectable planner under the cache (tests count invocations).
+  reconcilePass = (input) => runReconcilePass(input),
+  // Injectable live probes behind plan reuse (default: one light PR list per repo + the live claim set).
+  readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
+  passBudgets = resolveFixPassBudgets(),
+  budgetRotation = fixPassRotation,
+  prCursors = fixPassPrCursors,
+  // Optional path/write IO for hermetic persistence probes; state ownership stays with the defaults.
+  cursorPersistence = {},
+  adoptYieldProbe,
+  // Off under a test run unless injected (the real pass reads GitHub).
+  orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
+  const cursorsBefore = persistCursors ? JSON.stringify([budgetRotation, prCursors]) : null;
+  let yieldedForAdoption = false;
+  let completedRepo = false;
+  const shouldYield = () => (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
-  const phaseMs = {};
-  const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
-  const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
+  const planCache = (reuseReconcilePlan ?? !anyTickInjected)
+    ? createReconcilePlanCache({ reconcile: reconcilePass, now, readFingerprints: readPlanFingerprint, readClaims: readPlanClaimSet }) : null;
+  const budgets = Object.fromEntries(Object.entries(FIX_PASS_LIMITS).map(([key, rule]) =>
+    [rule.phase, { budgetMs: passBudgets[key].value, hit: false, skipped: [] }]));
+  // A generator lets the existing sequential fan-outs yield only BETWEEN complete repo ticks.
+  // `known` is every repo this pass could ever reach for the phase; `candidates` is the subset eligible NOW (the
+  // orphan guard can exclude a repo for one pass). A rotation head naming a known-but-excluded repo is kept, not
+  // cleared, or the repo it protects starves while the exclusion alternates.
+  function* budgetRepos(phase, candidates, known = repos) {
+    const start = now();
+    const budget = budgets[phase];
+    const parked = budgetRotation[phase];
+    const parkedAway = parked !== undefined && !candidates.includes(parked) && known.includes(parked);
+    const cursor = candidates.indexOf(parked);
+    const ordered = cursor > 0 ? [...candidates.slice(cursor), ...candidates.slice(0, cursor)] : [...candidates];
+    // A repo that deferred PRs keeps its PR cursor; when the loop finishes it must also head the next pass,
+    // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
+    // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
+    const retainedCursor = repo => prCursors[phase]?.[repo] != null;
+    for (let i = 0; i < ordered.length; i += 1) {
+      if (((completedRepo || yieldedForAdoption) && shouldYield()) || now() - start > budget.budgetMs) {
+        budget.hit = true;
+        budget.skipped.push(...ordered.slice(i));
+        budgetRotation[phase] = ordered[i];
+        return;
+      }
+      yield ordered[i];
+      completedRepo = true;
+    }
+    const deferredRepo = ordered.find(retainedCursor);
+    // A parked head survives only while no visited repo retains PR work: a permanently excluded parked repo must
+    // not keep a repo that deferred PRs from heading the next pass.
+    if (parkedAway && deferredRepo === undefined) return;
+    if (deferredRepo !== undefined) budgetRotation[phase] = deferredRepo;
+    else delete budgetRotation[phase];
+  }
+  const phaseMs = {}, phaseStarts = {}, phasePrCounts = {};
+  // Wrap both sync and async ticks without changing the synchronous fan-outs.
+  const boundedPrTick = (phase, tick) => options => {
+    const cursors = prCursors[phase] ??= {};
+    const record = result => {
+      if (result?.yieldedForAdoption) yieldedForAdoption = true;
+      const counts = phasePrCounts[phase] ??= { handled: 0, deferred: 0 };
+      counts.handled += result?.handled ?? 0;
+      counts.deferred += result?.deferred?.length ?? 0;
+      if (result?.nextCursor != null) {
+        cursors[options.repo] = result.nextCursor;
+        budgets[phase].hit = true;
+        budgets[phase].skipped.push(...(result.deferred ?? []));
+      } else delete cursors[options.repo];
+      if (result?.deadlineSkipped) budgets[phase].hit = true;
+      return result;
+    };
+    // shouldYield is only threaded when a probe exists, so probe-less ticks see the exact pre-S1 option shape.
+    const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
+      cursor: cursors[options.repo], now, ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}) });
+    return result && typeof result.then === 'function' ? result.then(record) : record(result);
+  };
+  const finishPhase = (name, start) => {
+    phaseMs[name] = now() - start;
+    if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
+  };
+  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return fn(); } finally { finishPhase(name, t); } };
+  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await fn(); } finally { finishPhase(name, t); } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
@@ -813,12 +1230,7 @@ export async function runTickAllRepos({
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = await timedAsync('await-verify', async () => (awaitVerifyTick ? awaitVerifyTick({ allowResume: !authGate.paused })
     : (realTick ? buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] })));
-  // card xccgzu5 — SECOND, still before any fresh dispatch: a fixer the watchdog flagged stuck (live 2026-10-08,
-  // ci-heal-4453 idle 1h on a verify for a commit it had already pushed) is stopped and its claims released here,
-  // so THIS tick's ci-heal/fix halves see the PR unowned and re-dispatch it, and its reserved slot frees up.
-  const stuckFixers = await timedAsync('stuck-fixers', async () => (stuckFixerTick ? stuckFixerTick()
-    : (realTick ? runFixerStuckReclaimPass() : { rows: [] })));
-  // card xiqtf7w — THIRD, before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
+  // card xiqtf7w — before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
   // stand-down now, so this tick's fix/ci-heal halves (and the review daemon) already read it as stood down.
   // No Claude session is spawned, so the auth gate never pauses it.
   const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
@@ -856,7 +1268,7 @@ export async function runTickAllRepos({
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
-  const chain = resolveFixExecutorChain();
+  const chain = resolveFixExecutorChain({ aiRouting: resolveFixChainInput() });
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
     setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
     criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,
@@ -865,7 +1277,7 @@ export async function runTickAllRepos({
     let entries = [];
     return runReconcileCiHealDispatch({ ...options,
       reconcile: (input) => {
-        const plan = runReconcilePass(input);
+        const plan = planCache ? planCache.reconcile(input) : runReconcilePass(input);
         entries = plan.dispatch ?? [];
         return plan;
       },
@@ -878,53 +1290,233 @@ export async function runTickAllRepos({
       }),
     });
   };
-  const fix = timed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, allowStandDownAutoProceed,
-      ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  // R242: share discovery only. Do not speculatively reconcile/hydrate active
+  // PRs: their owners still need those reads, and notes needs post-dispatch evidence.
+  const snapshots = new Map();
+  const skipEmptySteps = fixSettings.skipEmptySteps ?? resolveFixDispatchSettings().skipEmptySteps;
+  if (skipEmptySteps && (readPrs || realTick)) {
+    timed('snapshot', () => {
+      for (const repo of repos) {
+        try {
+          let commentsReadFailed = false;
+          const rows = (readPrs ?? defaultReadPrs)({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo,
+            // The default reader may omit a PR whose long thread is unreadable.
+            readComments: (...args) => {
+              try { return readCompletePrComments(...args); }
+              catch (error) { commentsReadFailed = true; throw error; }
+            },
+          });
+          // Missing/partial/truncated discovery runs the historical paths.
+          // defaultReadPrs coerces empty stdout and non-array JSON to [], so an
+          // empty snapshot is missing evidence, not proof that a step has no work.
+          const complete = !commentsReadFailed && Array.isArray(rows) && rows.length > 0 && rows.discoveryIncomplete !== true && rows.length < PR_LIST_LIMIT && rows.every(pr => pr && Number.isInteger(pr.number)
+            && typeof pr.headRefName === 'string' && typeof pr.headRefOid === 'string'
+            && typeof pr.baseRefName === 'string' && typeof pr.isDraft === 'boolean'
+            && typeof pr.body === 'string' && typeof pr.mergeStateStatus === 'string'
+            && Array.isArray(pr.labels) && Array.isArray(pr.statusCheckRollup)
+            && Array.isArray(pr.comments) && Array.isArray(pr.files));
+          if (complete) snapshots.set(repo, { rows });
+        } catch { /* Unknown discovery runs the historical paths. */ }
+      }
+    });
+  }
+  const skippedSteps = [];
+  const stepRepos = new Map();
+  for (const step of ['fix', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft']) {
+    const active = repos.filter(repo => snapshots.get(repo)?.rows.length !== 0);
+    stepRepos.set(step, active);
+    if (repos.length && !active.length) {
+      skippedSteps.push(step);
+      process.stderr.write(`reconcile-fix-dispatch-daemon: skipped ${step} — empty work list (no candidates in shared PR discovery)\n`);
+    }
+  }
+  const emptyResult = () => ({ repos: repos.map(repo => ({ repo, result: { dispatched: [], refusals: [] } })),
+    dispatched: [], refusals: [], reconcileRefusals: [], notes: [], comments: [], autoGrants: [] });
+  const stepTimed = (step, fn) => {
+    if (skippedSteps.includes(step)) { phaseMs[step] = 0; return emptyResult(); }
+    return timed(step, fn);
+  };
+  // Pass-local plan reuse for the two phases routed through sharedTick (ci-heal and notes are wired below).
+  // Fix keeps its net-scope and stack IO, which it only enables for the identity-equal planner.
+  const reuseOptions = (step, tick) => {
+    if (!planCache || (step !== 'fix' && step !== 'promote-draft')) return {};
+    return { reconcile: planCache.reconcile, ...(step === 'fix' && tick === runReconcileFixDispatch
+      ? { netScope: applyNetScopeToReconcile, prStack: readStacksForPass } : {}) };
+  };
+  const sharedTick = (step, tick) => options => {
+    if (step === 'fix' && tick === runReconcileFixDispatch) {
+      // Fix's existing `now` is a timestamp for capacity accounting, not a clock.
+      options = { ...options, clock: options.now, now: options.now() };
+    }
+    const snapshot = snapshots.get(options.repo);
+    if (!snapshot) return tick({ ...options, ...reuseOptions(step, tick) });
+    const sharedRead = () => structuredClone(snapshot.rows);
+    // Re-run each owner's reconciliation reads; only PR discovery is shared.
+    const reconcile = input => runReconcilePass({ ...input, readPrs: sharedRead });
+    if (step === 'fix' && tick === runReconcileFixDispatch) {
+      // Preserve reconcile's identity: fix uses it to enable net-scope and stack IO.
+      return tick({ ...options, readPrs: sharedRead, ...reuseOptions(step, tick) });
+    }
+    const readOpenPrs = input => {
+      const fields = input?.extraFields ?? [];
+      return snapshot.rows.every(pr => fields.every(field => Object.hasOwn(pr, field)))
+        ? sharedRead() : defaultReadOpenPrs(input);
+    };
+    return tick({ ...options, readPrs: sharedRead, readOpenPrs, reconcile, ...reuseOptions(step, tick) });
+  };
+  // The orphan-round guard (retry/escalation cap) stays BEFORE fix so a capped orphan is never re-dispatched first.
+  const requireOrphanGuard = !stuckFixerTick && realTick && !!orphanGuardTick;
+  const orphanGuardCompleted = new Set();
+  const orphanGuard = await timedAsync('orphan-guard', async () => {
+    if (!requireOrphanGuard) return { rows: [] };
+    try {
+      const result = await orphanGuardTick({ env: process.env, nowMs: now(),
+      repos: (function* () {
+        for (const repo of budgetRepos('orphan-guard', repos)) {
+          const key = repoKeyForSlug(repo);
+          if (!key) throw new Error(`orphan-guard: unknown repo ${repo}`);
+          yield { key, slug: CONSTELLATION_REPOS[key].slug };
+          // Iterator progress proves only that the repo was visited; returned rows may still report failure.
+          orphanGuardCompleted.add(repo);
+        }
+      })(),
+      });
+      if (!Array.isArray(result?.rows)) orphanGuardCompleted.clear();
+      else for (const row of result.rows) {
+        const key = row?.repo && repoKeyForSlug(row.repo);
+        if (!key) { orphanGuardCompleted.clear(); break; }
+        const success = { rearm: 're-armed', redispatch: 're-dispatched', escalate: 'escalated' };
+        if (!Object.hasOwn(success, row.decision)
+          || (row.result !== success[row.decision] && row.result !== 'report-only (WE_ORPHAN_FIX_GUARD=0)')) {
+          for (const repo of orphanGuardCompleted) {
+            if (repoKeyForSlug(repo) === key) orphanGuardCompleted.delete(repo);
+          }
+        }
+      }
+      return result ?? { rows: [] };
+    }
+    catch (e) {
+      orphanGuardCompleted.clear();
+      return { rows: [{ decision: 'error', reason: String(e?.message ?? e).split('\n')[0] }] };
+    }
+  });
+  const orphanGuardDeferred = requireOrphanGuard
+    ? stepRepos.get('fix').filter(repo => !orphanGuardCompleted.has(repo)) : [];
+  const guardedFixRepos = stepRepos.get('fix').filter(repo => !orphanGuardDeferred.includes(repo));
+  const fix = stepTimed('fix', () => (authGate.paused ? pausedDispatchResult()
+    : runReconcileFixDispatchAllRepos({ repos: budgetRepos('fix', guardedFixRepos), allowStandDownAutoProceed,
+      tick: boundedPrTick('fix', sharedTick('fix', fixTick ?? runReconcileFixDispatch)),
+      ...(fixTick ? {} : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
+  for (const repo of orphanGuardDeferred) fix.refusals.push({ repo, prNumber: null,
+    kind: 'orphan-guard-deferred', why: 'orphan-cap guard did not complete this repo; fix deferred until next pass' });
+  planCache?.markTouched(fix);
+  // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
+  // The hooks cannot interrupt in-flight work or bound discovery/endFix/release IO.
+  const stuckFixers = await timedAsync('stuck-fixers', async () => {
+    const start = now();
+    const overBudget = () => {
+      if (now() - start > budgets['stuck-fixers'].budgetMs) budgets['stuck-fixers'].hit = true;
+      return budgets['stuck-fixers'].hit;
+    };
+    if (stuckFixerTick) return stuckFixerTick();
+    if (!realTick) return { rows: [] };
+    return runFixerStuckReclaimPass({
+      stopSession: options => {
+        if (overBudget()) throw new Error('stuck-fixers pass budget exhausted; retry next tick');
+        return stopSession(options);
+      },
+      orphanPass: null, // ran before fix (orphan-guard phase)
+    });
+  });
+  if (orphanGuard.rows?.length && Array.isArray(stuckFixers?.rows)) {
+    stuckFixers.orphanRounds = orphanGuard;
+    for (const r of orphanGuard.rows) stuckFixers.rows.push({ ...r, kind: 'orphan-fix-round' });
+  }
+  // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
+  // ordering, and notes must write from fresh evidence, even on an empty snapshot.
+  // Neither step participates in snapshot sharing or empty-work skipping.
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
+    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick ? {} : { queueAdmission, dispatchThrottle }),
+      ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
+  ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
+  planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
-  const hungCi = timed('hung-ci', () => runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) }));
+  const hungCi = stepTimed('hung-ci', () => runHungCiRecoveryAllRepos({ repos: stepRepos.get('hung-ci'), tick: sharedTick('hung-ci', hungCiTick ?? sweepHungCiRecovery) }));
+  planCache?.markTouched(hungCi);
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = timed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos, ...(mainRedRebaseTick ? { tick: mainRedRebaseTick } : {}) }));
+  const mainRedRebase = stepTimed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos: stepRepos.get('main-red-rebase'), tick: sharedTick('main-red-rebase', mainRedRebaseTick ?? sweepCiRedRecovery) }));
+  planCache?.markTouched(mainRedRebase);
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const missingRun = timed('missing-run', () => runMissingRunRecoveryAllRepos({ repos, ...(missingRunTick ? { tick: missingRunTick } : {}) }));
+  const missingRun = stepTimed('missing-run', () => runMissingRunRecoveryAllRepos({ repos: stepRepos.get('missing-run'), tick: sharedTick('missing-run', missingRunTick ?? sweepMissingRunRecovery) }));
+  planCache?.markTouched(missingRun);
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = timed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos, ...(promoteDraftTick ? { tick: promoteDraftTick } : {}) }));
-  // #4191 (epic #4075/#3383) — the FIFTH half this daemon now owns: surface `planReconcile`'s own `notes`
-  // (`ci-heal-exhausted`/`awaiting-permission`) that neither `fix` nor `ci-heal` above ever forwards — see
-  // {@link runReconcileNotesAllRepos}'s own docblock for why this is a separate, independent read rather than a
-  // field threaded through either of those two.
-  const notes = timed('notes', () => runReconcileNotesAllRepos({
-    repos, ...(notesTick ? { tick: notesTick } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
-  }));
-  // #3383 follow-up — tag EVERY freshly-dispatched fix/ci-heal session's PR right away, `fix`+`ci-heal`
+  const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: boundedPrTick('promote-draft', sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch)) }));
+  promoteDraft.budgetSkipped = budgets['promote-draft'].skipped;
+  planCache?.markTouched(promoteDraft);
+  // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
+  // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
+  const notes = timed('notes', () => {
+    // Bound the complete note effects, not just the reader, so deferred notes keep their PR cursor.
+    const tick = boundedPrTick('notes', ({ repo, ...options }) => runReconcileNotesAllRepos({
+      ...options, repos: [repo], ...(planCache ? { reconcile: planCache.reconcile } : {}),
+      tick: notesTick ?? (planCache ? o => planCache.notes(o.repo) ?? defaultReadNotesForRepo(o) : defaultReadNotesForRepo),
+      ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
+    }));
+    const result = { repos: [], notes: [], refusals: [], comments: [], autoGrants: [] };
+    for (const repo of budgetRepos('notes', repos)) {
+      const part = tick({ repo });
+      for (const key of Object.keys(result)) result[key].push(...part[key]);
+    }
+    return result;
+  });
+  // #3383 follow-up — tag confirmed freshly-dispatched fix/ci-heal sessions, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound
   // to a `fix-<pr>`/`ci-heal-<pr>` name, so `review-status:*` (a label about a SESSION, not a mechanical patch)
   // has nothing to say about them. One try/catch per PR — the exact "cosmetic, never fails the tick" discipline
   // `we:scripts/conveyor/review-status-tag.mjs`'s own header already documents for this label family.
   const statusTags = [];
   if (typeof tagDispatchStatus === 'function') {
+    // Dispatch arrays also contain timeout requests and incomplete launch results. A minted slug alone
+    // proves nothing. Refusals from either half (including reconcile's no-findings) veto the same repo/PR.
+    const key = (row) => JSON.stringify([row.repo, String(row.pr ?? row.prNumber)]);
+    // A refusal that only says "a session is already live" (live-process / held / fix-claimed) is the echo of a
+    // launch that just succeeded, so it must not veto that launch's tag; every other kind is a real refusal.
+    const LIVE_ECHO = new Set(['live-process', 'held', 'fix-claimed']);
+    const refused = new Set([...fix.refusals, ...ciHeal.refusals,
+      ...(fix.reconcileRefusals ?? []), ...(ciHeal.reconcileRefusals ?? [])]
+      .filter(r => !LIVE_ECHO.has(r?.kind)).map(key));
+    const hasHandle = value => typeof value === 'string' && value.trim().length > 0 && !/^refused:/.test(value.trim());
+    const launched = d => d?.pr != null && d.kind !== 'ci-heal-salvage'
+      && !d.held && d.launched !== 'unverified' && d.ok !== false && !d.error && !d.refused && !d.failed
+      && !['failed', 'held', 'refused', 'error'].includes(d.status)
+      && !['failed', 'held', 'refused', 'error'].includes(d.outcome)
+      && d.claim?.ok !== false && !refused.has(key(d))
+      // Only the spawn handle (`agentId`, from the launcher's stdout) or a confirmed resume proves a session
+      // exists; a minted `sessionId` or an acquired claim both precede the launch and prove nothing.
+      && ((hasHandle(d.agentId) && d.agentId !== d.sessionId) || (d.resumed === true && hasHandle(d.sessionId)));
     for (const d of [...fix.dispatched, ...ciHeal.dispatched]) {
-      // A salvage push spawned no session — nothing for a session-status label to describe.
-      if (d?.pr == null || d.kind === 'ci-heal-salvage') continue;
+      if (!launched(d)) continue;
       try {
-        const result = tagDispatchStatus({ pr: d.pr, repo: d.repo });
+        const result = await tagDispatchStatus({ pr: d.pr, repo: d.repo });
         statusTags.push({ pr: d.pr, repo: d.repo, ...result });
       } catch (e) {
         statusTags.push({ pr: d.pr, repo: d.repo, changed: false, error: String((e && e.message) || e).split('\n')[0] });
       }
     }
   }
+  if (persistCursors && JSON.stringify([budgetRotation, prCursors]) !== cursorsBefore) {
+    await saveFixPassCursors({ ...cursorPersistence, rotation: budgetRotation, prCursors });
+  }
   return {
-    repos: fix.repos, // same repo list every half ticked — the shape onTick's log already reads from
+    repos: repos.map(repo => fix.repos.find(entry => entry.repo === repo)
+      ?? { repo, result: { dispatched: [], refusals: [] }, skipped: true }),
     dispatched: [...fix.dispatched, ...ciHeal.dispatched, ...hungCi.dispatched, ...mainRedRebase.dispatched, ...missingRun.dispatched, ...promoteDraft.dispatched],
     refusals: [...fix.refusals, ...ciHeal.refusals, ...hungCi.refusals, ...mainRedRebase.refusals, ...missingRun.refusals, ...promoteDraft.refusals, ...notes.refusals],
     reconcileRefusals: [...(fix.reconcileRefusals ?? []), ...(ciHeal.reconcileRefusals ?? []), ...(promoteDraft.reconcileRefusals ?? [])],
@@ -944,7 +1536,9 @@ export async function runTickAllRepos({
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
-    phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
+    ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}),
+    phasePrCounts, budgets, passBudgetSettings: passBudgets,
+    skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
 
@@ -1139,13 +1733,23 @@ export function formatPassTiming(result) {
   return `pass-timing total ${sec(result.passMs)} — ${parts.join(', ') || 'no phases'}`;
 }
 
+/** Keep the historical total line intact; emit each phase exactly once alongside it. */
+export function formatPassPhaseTiming(result) {
+  return Object.entries(result?.phaseMs ?? {}).filter(([, ms]) => Number.isFinite(ms))
+    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false} prs=${result?.phasePrCounts?.[name]?.handled ?? 0} deferred=${result?.phasePrCounts?.[name]?.deferred ?? 0}`);
+}
+
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, handoffDir } = {}) {
+  let heapPass = 0;
+  let adoptYieldProbe;
   return {
     intervalMs,
-    tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus }),
+    // withSelfSync supplies one boot-HEAD/spacing-aware probe for this process lifetime.
+    setAdoptYieldProbe: probe => { adoptYieldProbe = probe; },
+    tickOnce: () => runTickAllRepos({ tagDispatchStatus: defaultTagDispatchStatus, adoptYieldProbe }),
     // A send-back or CI-red label write signals the hand-off mailbox; this sleep wakes on it instead of the interval.
     sleep: createFixHandoffSleep(handoffDir ? { dir: handoffDir } : {}),
     heartbeat: () => heartbeatRunnerLease(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }),
@@ -1173,6 +1777,11 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       log.error(`reconcile-fix-dispatch-daemon: tick (${repos.map((r) => r.repo).join(', ')}) — dispatched ${dispatched.length}, refused ${refusals.length}`);
       const timing = formatPassTiming(result);
       if (timing) log.error(`reconcile-fix-dispatch-daemon: ${timing}`);
+      for (const line of formatPassPhaseTiming(result)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
+      if (result?.passBudgetSettings) log.error(`reconcile-fix-dispatch-daemon: fix-pass-budget ${Object.entries(result.passBudgetSettings)
+        .map(([key, setting]) => `${key}=${setting.value} source=${setting.source}`).join(', ')}`);
+      heapPass += 1;
+      logDaemonHeap({ daemon: 'reconcile-fix-dispatch-daemon', pass: heapPass, passMs: result?.passMs, log });
       // card x5kagse (epic #4075/#3383) — logged EVERY tick fix/ci-heal dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read; never merely implied by an
       // empty `dispatched` count.

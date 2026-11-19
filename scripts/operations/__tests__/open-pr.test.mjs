@@ -459,7 +459,7 @@ describe('the submit effect', () => {
 describe('the io shell — one spawn of the home, and no second route', () => {
   it('spawns pr-land.mjs with the planned argv and --json', () => {
     const calls = [];
-    const run = createPrLandRunner({
+    const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
       prePrReview: () => ({ action: 'pass' }),
       spawn: (cmd, argv) => { calls.push(argv); return { status: 0, stdout: JSON.stringify({ pr: 7, url: 'u' }) }; },
     });
@@ -626,7 +626,7 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     const env = resolveGhCredentialEnv({ env: { PATH: '/usr/bin' }, build: () => null, exists: () => true, orgShimDir: () => null });
     expect(env.PATH).toMatch(/gh-shim:\/usr\/bin$/);
     let seen;
-    createPrLandRunner({ prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
+    createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }), env, spawn: (_n, _a, o) => { seen = o.env; return { status: 0, stdout: '{"pr":1}' }; } })({ argv: ['--ref=lane/x'] });
     expect(seen.PATH).toBe(env.PATH);
   });
 
@@ -648,7 +648,7 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     const orig = process.stderr.write;
     process.stderr.write = (s) => { warned.push(String(s)); return true; };
     try {
-      createPrLandRunner({
+      createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
         prePrReview: () => ({ action: 'pass' }),
         dupBornAs: (opts) => checkDuplicateBornAs({ ...opts, exec }),
         spawn: () => ({ status: 0, stdout: '{"pr":4478}' }),
@@ -665,5 +665,17 @@ describe('items 79/81 — truthful label-on-green outcome, credential env, --bra
     expect(resolveRef({ ref: 'lane/r', branch: 'lane/a' })).toBe('lane/r');
     expect(resolveRef({ derive: () => deriveLaneRef({ read: () => '{"purpose":"items 79/81"}' }) })).toBe('lane/items-79-81');
     expect(deriveLaneRef({ read: () => { throw new Error('none'); } })).toBe('');
+  });
+});
+
+describe('R502: a parked PR whose review label did not apply is loud, not a clean open', () => {
+  const out = (extra) => JSON.stringify({ reason: 'parked', pr: 7, url: 'u', reviewLabel: 'review:pending', ...extra });
+  it('classifySubmit carries the missing label', () => {
+    expect(classifySubmit({ status: 0, stdout: out({ reviewLabelApplied: false }) })).toMatchObject({ outcome: 'opened', labelStep: 'missing', pr: 7 });
+    expect(classifySubmit({ status: 0, stdout: out({ reviewLabelApplied: true }) }).labelStep).toBeUndefined();
+  });
+  it('describeSubmit fails the call and names the repair', () => {
+    const d = describeSubmit({ outcome: 'opened', labelStep: 'missing', pr: 7, url: 'u', reviewLabel: 'review:pending' });
+    expect(d.failed).toBe(true); expect(d.line).toContain('NO review:pending label'); expect(d.line).toContain('gh pr edit 7 --repo <owner/repo> --add-label review:pending');
   });
 });

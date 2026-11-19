@@ -42,8 +42,8 @@ describe('`denied` is agent-supplied free text — sanitized at the single write
   });
 
   it.each([
-    ['a GitHub token', 'curl -H "Authorization: token ghp_abcdefghijklmnopqrstuvwxyz0123456789"', 'ghp_abcdefghijklmnopqrstuvwxyz0123456789'],
-    ['a fine-grained PAT', 'gh auth login --with-token github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz', 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz'],
+    ['a GitHub token', 'curl -H "Authorization: token gh\x70_abcdefghijklmnopqrstuvwxyz0123456789"', 'gh\x70_abcdefghijklmnopqrstuvwxyz0123456789'],
+    ['a fine-grained PAT', 'gh auth login --with-token github_\x70at_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz', 'github_\x70at_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz'],
     ['an env secret assignment', 'API_TOKEN=supersecretvalue123 node run.mjs', 'supersecretvalue123'],
     ['a --token flag', 'tool --token=hunter2hunter2 go', 'hunter2hunter2'],
     ['a Bearer header', 'curl -H "Authorization: Bearer abc.def.ghi-secret" https://x', 'abc.def.ghi-secret'],

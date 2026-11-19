@@ -5,11 +5,13 @@
  * and clock keep command tests isolated from the real GitHub host and shared registry.
  */
 import { pathToFileURL } from 'node:url';
-import { assessFreeScope, formatFreeScope, parseExcludePr, partitionRegistry, registerScope, releaseScope, DEFAULT_TTL_HOURS } from './free-scope.mjs';
-import { collectFreeScope, defaultRegistryPath, readRegistry, updateRegistry } from './free-scope-io.mjs';
+import { assessFreeScope, formatFreeScope, heartbeatScope, parseExcludePr, partitionRegistry, registerScope, releaseScope, DEFAULT_TTL_HOURS } from './free-scope.mjs';
+import { collectFreeScope, defaultRegistryPath, readRegistry, resolveFreeScopeSettings, updateRegistry } from './free-scope-io.mjs';
 const usage = `Usage: free-scope [check|register|release|list] [options]
   --files=a,b --card=<id> --exclude-agent=<name> [--exclude-owner=<token>] --exclude-pr=<n>|<repo>#<n>[,…] (repeatable) --json
-  register --agent=<name> [--owner=<token>] --purpose=<text> (--files=a,b | --card=<id>) [--ttl-hours=N]
+  register --agent=<name> [--owner=<token>] --purpose=<text> (--files=a,b | --card=<id>) [--ttl-hours=N] [--heartbeat]
+    --heartbeat: the entry goes stale freeScope.staleAfterMinutes (standard 45, env WE_FREE_SCOPE_STALE_AFTER_MINUTES)
+    after this owner's last register or check (--exclude-agent + --exclude-owner); the TTL stays the upper bound.
   release --agent=<name> [--owner=<token>]
   list [--json]
   --help
@@ -28,6 +30,7 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
         if (selected) throw new TypeError('free-scope: only one subcommand is allowed');
         command = arg.replace(/^--/, ''); selected = true;
       } else if (arg === '--json') options.json = true;
+      else if (arg === '--heartbeat') options.heartbeat = true;
       else {
         const match = /^--([^=]+)(?:=(.*))?$/.exec(arg);
         if (!match || !names.includes(match[1])) throw new TypeError(`free-scope: unknown argument ${arg}`);
@@ -54,19 +57,33 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
     const excludedPrs = (options['exclude-pr'] ?? []).map(parseExcludePr);
     const ttlHours = Number(options['ttl-hours'] ?? DEFAULT_TTL_HOURS);
     if (command === 'register' && (!Number.isFinite(ttlHours) || ttlHours <= 0)) throw new TypeError('free-scope: --ttl-hours must be positive');
+    if (options.heartbeat && command !== 'register') throw new TypeError('free-scope: --heartbeat applies to register only');
+    const staleAfterMinutes = options.heartbeat ? resolveFreeScopeSettings({ env }).staleAfterMinutes : undefined;
+    // A check naming its own agent AND owner token, or a re-register by the same owner, is that owner's heartbeat.
+    // It is written under the registry lock BEFORE the slow PR/git collection, so a live owner is refreshed at call
+    // time; a failed write is an error.
+    const beatAgent = command === 'check' ? options['exclude-agent'] : options.agent;
+    const beatOwner = command === 'check' ? options['exclude-owner'] : options.owner;
+    if (beatAgent && beatOwner) {
+      let refreshed = 0;
+      updateRegistry(registry, (entries) => { const r = heartbeatScope(entries, beatAgent, beatOwner, new Date(now()).toISOString()); refreshed = r.refreshed; return r.entries; });
+      if (!refreshed && command === 'check') stderr.write(`free-scope: no entry for agent ${options['exclude-agent']} with that owner to heartbeat — your reservation is gone (released, expired or taken); re-register before relying on it\n`);
+    }
     const snapshot = collect({ files: options.files ?? '', card: options.card ?? '', env, now });
     // Every excluded PR is dropped from the snapshot here, so the core's single-PR exclusion stays unused.
     const prs = (snapshot.prs ?? []).filter((pr) => !excludedPrs.some((x) => x.number === pr.number && x.repo === pr.repo));
-    const assess = (agents) => assessFreeScope({ ...snapshot, prs, agents,
+    const assess = (agents, nowMs = snapshot.nowMs) => assessFreeScope({ ...snapshot, nowMs, prs, agents,
       excludeAgent: command === 'register' ? options.agent : options['exclude-agent'] ?? '',
       // register ignores only its OWN entry; a check names its owner via --exclude-owner, else excludes every entry of that name
       excludeOwner: command === 'register' ? options.owner ?? null : options['exclude-owner'] });
     let check, registered;
     if (command === 'register') {
       updateRegistry(registry, (entries) => {
-        check = assess(entries);
+        // Judge and stamp with the clock read under the lock, after collection, so the entry is fresh when it commits.
+        const atMs = now();
+        check = assess(entries, atMs);
         // registerScope refuses a live entry held by a different owner BEFORE anything is printed or written
-        const updated = registerScope(entries, { agent: options.agent, purpose: options.purpose ?? '', files: snapshot.files, ttlHours, owner: options.owner }, new Date(snapshot.nowMs).toISOString());
+        const updated = registerScope(entries, { agent: options.agent, purpose: options.purpose ?? '', files: snapshot.files, ttlHours, owner: options.owner, staleAfterMinutes }, new Date(atMs).toISOString());
         if (!options.json) print(formatFreeScope(check));
         registered = updated.at(-1);
         return updated;

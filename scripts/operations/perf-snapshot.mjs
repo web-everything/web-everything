@@ -284,7 +284,7 @@ export function ciWallMetrics(runs) {
     const gate = jobs.filter((j) => /^test$/.test(j.name)).flatMap((j) => (Array.isArray(j.steps) ? j.steps : []))
       .filter((s) => s?.name === CI_GATE_STEP && Number.isFinite(s.ms) && s.ms > 0);
     if (gate.length) gateStep.push(gate[0].ms);
-    const shards = of(/^test-shard/);
+    const shards = of(/^(?:hetzner \/ )?test-shard \(\d+\)$/);
     if (!shards.length) { card.push(r.wallMs); continue; }
     code.push(r.wallMs);
     shard.push(Math.max(...shards));

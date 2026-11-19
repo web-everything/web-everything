@@ -136,6 +136,25 @@ describe('pure item-task policy', () => {
 });
 
 describe('classifyJob', () => {
+  it('expires a foreign heartbeat only past the 30-minute default backstop', () => {
+    expect(classifyJob(running(), { now: T0 + 30 * 60_000, liveness: 'foreign' })).toBe('foreign');
+    expect(classifyJob(running(), { now: T0 + 30 * 60_000 + 1, liveness: 'foreign' })).toBe('dead');
+  });
+
+  it('honors foreignStaleMs and skips foreign staleness after sleep', () => {
+    const options = { now: T0 + 1001, liveness: 'foreign', foreignStaleMs: 1000 };
+    expect(classifyJob(running(), options)).toBe('dead');
+    expect(classifyJob(running(), { ...options, sleepDetected: true })).toBe('foreign');
+  });
+
+  it('uses startedAt when a foreign heartbeat is absent, but retains unparseable evidence', () => {
+    const r = running();
+    const options = { now: T0 + 1001, liveness: 'foreign', foreignStaleMs: 1000 };
+    expect(classifyJob({ ...r, job: { ...r.job, heartbeatAt: null } }, options)).toBe('dead');
+    expect(classifyJob({ ...r, job: { ...r.job, heartbeatAt: 'invalid' } }, options)).toBe('foreign');
+    expect(classifyJob({ ...r, job: { ...r.job, heartbeatAt: null, startedAt: null } }, options)).toBe('foreign');
+  });
+
   it('live pid + fresh heartbeat = live; live pid + stale heartbeat = stalled', () => {
     const r = running();
     expect(classifyJob(r, { now: T0 + 10_000, liveness: 'alive', staleMs: 60_000 })).toBe('live');

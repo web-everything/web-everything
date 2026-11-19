@@ -11,7 +11,7 @@ import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
-  referralRecordState, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
+  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -22,10 +22,29 @@ import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
+import { isQuotaError } from '../lib/provider-quota-hold.mjs';
+import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { reverifyStaleReferrals } from './referral-reverify.mjs';
+
+/** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
+export const RESUME_MAX_ATTEMPTS = 3;
+
+/** Saved retry evidence must prove both counters; never coerce corrupt state into a fresh budget. */
+export function ciHeldRecordRetryCountersValid(evidence) {
+  return [evidence?.attempts, evidence?.resumeAttempts].every(n => Number.isSafeInteger(n) && n >= 0);
+}
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
-export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing']));
+/** The one set of run-level reasons `mandatoryReferralState` derives afresh from the live thread and PR body. They name
+ * no finding: `attempted`/`count` skip them, and a refused run's cached list never matches them to a record key — the
+ * live re-read (empty `pending`) is what answers them. Failure tokens are deliberately absent and stay fail-closed:
+ * `referral-persistence-failed` (nothing live re-derives a lost persist; it has its own retry path),
+ * `malformed-referral-record` and `unreadable-referral-result` (the run's own findings are unknown, so its cached keys
+ * cannot be trusted as complete), and `referral-overflow` (added after the live read for a withheld ruling; nothing
+ * live re-derives it). */
+export const PENDING_REASON_TOKENS = Object.freeze(new Set(['author-stamp-missing',
+  'malformed-operator-ruling', 'unavailable-reviewed-head', 'wrong-subject']));
 export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -35,47 +54,106 @@ const hash = value => createHash('sha256').update(JSON.stringify(value)).digest(
 export function reviewRunEvidence(run) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
-  const head = read?.netBasis?.rev;
+  const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
+  let retryableRecordEffect = false;
+  let ciHeldRecordRetry;
+  try {
+    if (run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
+      const outstanding = run.effects.filter(e => !['applied', 'declared'].includes(e?.status));
+      retryableRecordEffect = !run.resumeOf && outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
+        && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
+      if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
+        && e.status === 'failed' && (run.ciHeldRecord === true
+          || typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error)))) {
+        const resumeAttempts = Object.hasOwn(run, 'recordEffectResumeAttempts') ? run.recordEffectResumeAttempts : 0;
+        ciHeldRecordRetry = { attempts: outstanding.every(e => ciHeldRecordRetryCountersValid({
+          attempts: e.unknownAttempts, resumeAttempts,
+        })) ? Math.max(...outstanding.map(e => e.unknownAttempts)) : null, resumeAttempts };
+      }
+    }
+  } catch { /* Unreadable effects cannot prove a safe record retry. */ }
+  const head = read?.netBasis?.rev ?? (suspendedReferralEffect ? run.input?.head : undefined);
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
-  const ownAdvise = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
+  const ownAdvise = run.stepTimings?.find(t => t?.step === 'advise')?.finishedAt;
   const resuming = Boolean(run.resumeOf) && !ownAdvise;
   const ownReferral = resuming && run.findings?.referralVerdict
-    ? run.stepTimings?.find(t => t.step === 'referralVerdict')?.finishedAt : undefined;
+    ? run.stepTimings?.find(t => t?.step === 'referralVerdict')?.finishedAt : undefined;
   const savedReferral = resuming && !ownReferral;
+  const effects = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects;
+  const state = Array.isArray(effects) ? effects.find(e => e?.type === 'review.mandatory-referrals')?.result : undefined;
+  const records = Array.isArray(state?.records) ? state.records : [];
   const verdict = savedReferral ? run.resumeOf.verdict : run.findings?.referralVerdict ?? run.verdict;
   const finish = ownAdvise ?? ownReferral ?? run.resumeOf?.adviseFinishedAt;
   // A resumed run starts again at the resume: the rulings that woke it are answered. Only once the pass is finished,
   // though: an unfinished resume has answered nothing yet, and must stay wakeable by the ruling that started it.
-  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt),
-    resuming ? 0 : Date.parse(run.resumedAt ?? '') || 0);
+  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt),
+    resuming || suspendedReferralEffect ? 0 : Date.parse(run.resumedAt ?? '') || 0);
   // An interrupted persist retry still spends a slot. Start its next backoff at the latest resume, rather than
   // the original parked pass: after an outage that old deadline could spend every remaining slot on adjacent ticks.
   const completedAt = Math.max(Date.parse(finish),
     resuming && verdict?.pendingReferrals?.includes('referral-persistence-failed') ? Date.parse(run.resumedAt ?? '') || 0 : 0);
+  // Only unambiguous persisted quota evidence for every failed seat exempts an attempt.
+  // Unfinished seats, missing evidence, conflicting failures, and attempts that reached post-seat steps still count.
+  let quotaOnly = false;
+  try {
+    // Quota errors at the seats cannot explain a later crash or unreadable step evidence.
+    const validStepTimings = Number.isFinite(completedAt) || !run.stepTimings?.some(t => t == null
+      || (['reduce', 'mandatoryReferrals', 'referralVerdict', 'advise'].includes(t?.step) && t?.startedAt != null));
+    const validEffects = effects === undefined || (Array.isArray(effects) && effects.every(e => e != null));
+    const validRecords = state == null || (Array.isArray(state.records)
+      && records.every(r => r != null && typeof r === 'object' && !Array.isArray(r)));
+    const failures = records.filter(r => r?.failure != null).map(r => r.failure);
+    const failedSeats = Array.isArray(run.seatTimings) ? run.seatTimings.filter(t => t?.verdict === 'error') : [];
+    const telemetry = run.telemetry;
+    // Repeated calls to the same seat each need their own persisted quota row.
+    const failuresBySeat = new Map();
+    for (const t of failedSeats) failuresBySeat.set(t.seat, (failuresBySeat.get(t.seat) ?? 0) + 1);
+    quotaOnly = validStepTimings && validEffects && validRecords && failedSeats.length > 0 && Array.isArray(telemetry) && failures.every(isQuotaError)
+      && run.seatTimings.every(t => t?.verdict && t?.finishedAt)
+      && failedSeats.every(t => {
+        if (typeof t.seat !== 'string' || t.seat.length === 0) return false;
+        const rows = telemetry.filter(row => row?.step === t.seat);
+        return rows.length >= failuresBySeat.get(t.seat) && rows.every(row => row.failureKind === 'provider-quota');
+      });
+  } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
   if (!Number.isFinite(completedAt)) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
-      incomplete: true, parked: false, attempted: false, persistenceFailed: false, count: 0,
+      ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
+      ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
+      ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
+      incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
       pending: ['review-incomplete'], rulings: [] };
   }
-  const state = (savedReferral ? run.resumeOf.mandatoryReferrals : run.findings?.mandatoryReferrals)?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
   const pending = verdict?.pendingReferrals ?? [];
   const resumeAdvise = Boolean(resuming && ownReferral && !pending.includes('referral-persistence-failed'));
   const findingKeys = pending.filter(key => !PENDING_REASON_TOKENS.has(key));
-  const attempted = new Set((state?.records ?? [])
-    .filter(r => r.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
+  const attempted = new Set(records
+    .filter(r => r?.repo === read.repo && r.pr === Number(read.pr) && r.head === head && r.attempted)
     .flatMap(r => r.referrals.map(f => f.key)));
+  let ciHeld = false;
+  try {
+    ciHeld = Array.isArray(run.effects) && run.effects.some(e => e?.type === 'review.label-swap'
+      && e.status === 'failed' && typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error));
+  } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
+    quotaOnly,
+    ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
+    ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
+    // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
+    ...(pending.length && !run.pending && run.stepTimings?.some(t => t?.step === 'stageVerdict'
+      && t.startedAt && !t.finishedAt) ? { referralStageRefused: true } : {}),
+    ...(ciHeld ? { ciHeld: true } : {}),
     ...(resumeAdvise ? { resumeAdvise: true } : {}),
     parked: verdict?.verdict === 'needs-human' && pending.length > 0,
     // A list of only reason tokens names no referral, so it was never "attempted" (not vacuously true).
     pending, attempted: findingKeys.length > 0 && findingKeys.every(key => attempted.has(key)),
     persistenceFailed: pending.includes('referral-persistence-failed'),
     count: pending.includes('referral-persistence-failed') ? Math.max(1, verdict?.referrals?.length ?? 0) : findingKeys.length,
-    rulings: (state?.records ?? []).flatMap(r => r.rulings ?? []).map(r => JSON.stringify(r)),
+    rulings: records.flatMap(r => r?.rulings ?? []).map(r => JSON.stringify(r)),
     // How many times this run was already resumed to retry a failed referral persist (card 5752 below). Each such
     // resume is one spent slot of the 15/30/60 retry budget, though it stays the same run.
     persistRetries: Math.max(0, Number(run.resumeOf?.persistRetries) || 0),
@@ -91,7 +169,8 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).digest('hex').slice(0, 16);
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(ciHeldRecordRetryCountersValid))
+  .update(String(isQuotaError)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {
     const c = JSON.parse(readFileSync(file, 'utf8'));
@@ -157,7 +236,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
  */
 function wakeEvents(pr, run) {
   const knownRulings = new Set(run.rulings);
-  return (pr.comments ?? []).flatMap(c => {
+  return (Array.isArray(pr.comments) ? pr.comments : []).flatMap(c => {
     if (!isTrustedMarkerAuthor(c)) return [];
     const at = Date.parse(c.updatedAt ?? c.createdAt);
     if (!Number.isFinite(at)) return [];
@@ -196,6 +275,29 @@ export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;
 }
 
+/** Re-read standing rulings, never a timestamp heuristic or an empty/missing thread. Every cached pending finding key
+ * must occur in a valid live record on this repo/PR/head; otherwise a cleared thread could erase a lost referral.
+ * The record may belong to an EARLIER run: a run's pending list legitimately inherits that run's open referrals, and
+ * the record that raised a key is where its ruling lands (PR #6465 round 3). Every referral of the record counts,
+ * not only the active ones: a key the sink durably retired (`dropped`, `superseded`, `carried`) stays in the record's
+ * append-only `referrals`, so it is still provably the saved finding, and the empty live pending list says it is settled.
+ * Reason tokens (`author-stamp-missing`, …) are answered by the empty live pending list, never by a record key.
+ * This only authorizes a rewind: mandatoryReferrals still derives and persists the actual verdict. */
+export function refusedReferralsAreRuled(pr, run, { repo,
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  try {
+    if (!run?.referralStageRefused || !run.parked || run.head !== pr.headRefOid
+      || run.repo !== repo || run.pr !== Number(pr.number) || !Array.isArray(pr.comments)
+      || !Array.isArray(run.pending) || !run.pending.length) return false;
+    const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
+    if (live.pending.length) return false;
+    const keys = new Set(live.records.filter(r => r.repo === repo && r.pr === run.pr
+      && r.head === run.head).flatMap(r => r.referrals.map(f => f.key)));
+    const findingKeys = run.pending.filter(key => !PENDING_REASON_TOKENS.has(key));
+    return findingKeys.length > 0 && findingKeys.every(key => keys.has(key));
+  } catch { return false; }
+}
+
 /** A later attempt consumes a parked run's release even if it dies before advise. Keep completed
  * panel ordering, but never let an older park hide a newer incomplete attempt on that history. */
 function latestReviewAttempt(history) {
@@ -216,10 +318,17 @@ function latestReviewAttempt(history) {
  * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
-export function findResumableParkedRun(pr, runs, { repo } = {}) {
+export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
   const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  if ((!last?.parked && !last?.resumeAdvise) || last.head !== pr.headRefOid) return null;
+  const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
+    && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
+    && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;
+  if ((!last?.parked && !last?.resumeAdvise && !last?.suspendedReferralEffect && !last?.retryableRecordEffect && !ciHeldRetry) || last.head !== pr.headRefOid) return null;
+  // A saved record retry only replays its label swap, but an operator comment after the run began (e.g. "run a fresh
+  // review") asks for a fresh look on this head, so it is never answered by resuming the stale verdict (PR #6784).
+  // Automated wakes (the run's own write-up, a re-arm) do not count: they cannot turn a record retry into a panel.
+  if (last.retryableRecordEffect || ciHeldRetry) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   // A run whose referral persist failed already holds its panel's verdict; what it owes is the persist step again,
   // not a new panel (live 2026-10-20, #5752: two ledger-push misses on one head each cost a full panel, and the
   // operator's Accept was refused until a person noticed). The hold decides WHEN (its 15/30/60 retry budget); once a
@@ -229,6 +338,9 @@ export function findResumableParkedRun(pr, runs, { repo } = {}) {
   if (last.persistenceFailed || last.resumeAdvise) return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
   if (events.some(e => e.kind === 'fresh')) return null;
+  if (last.suspendedReferralEffect) return events.some(e => e.kind === 'ruling') ? { id: last.id, head: last.head } : null;
+  if (last.referralStageRefused) return refusedReferralsAreRuled(pr, last, { repo, cardReadable })
+    ? { id: last.id, head: last.head } : null;
   if (!last.attempted) return null;
   return events.length ? { id: last.id, head: last.head } : null;
 }
@@ -249,10 +361,14 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
   // replacing the obsolete persistence hold while the existing run retries its advisory step.
   if (last?.resumeAdvise && last.head === pr.headRefOid) return { hold: null, released: 'advisory-retry' };
   if (!last?.parked || last.head !== pr.headRefOid || (!last.attempted && !last.persistenceFailed)) return { hold: null, released: null };
+  const refusedRuled = last.referralStageRefused && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0'
+    && refusedReferralsAreRuled(pr, last, { repo, cardReadable });
+  if (refusedRuled) return { hold: null, released: 'live-release' };
   // A failed persist checks its retry budget BEFORE any wake (card 5752): a ruling or an automated re-arm cannot fix a
   // persist, so it neither skips the backoff nor revives a spent budget. Only the operator in person (the needs-you
   // answer) or a new push releases it then. Any other parked run wakes on any event, as before.
-  const wake = last.persistenceFailed ? operatorWakeTime(pr, last) : wakeTime(pr, last);
+  const wake = last.referralStageRefused ? Math.max(0, ...wakeEvents(pr, last).filter(e => e.kind === 'fresh').map(e => e.at))
+    : last.persistenceFailed ? operatorWakeTime(pr, last) : wakeTime(pr, last);
   if (wake > last.startedAt) return { hold: null, released: 'wake' };
   let streak = 0;
   for (const run of history) {
@@ -263,7 +379,7 @@ function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.
   const retryAt = last.persistenceFailed && streak <= REFERRAL_RETRY_MS.length
     ? last.completedAt + REFERRAL_RETRY_MS[streak - 1] : null;
   if (retryAt !== null && now >= retryAt) return { hold: null, released: 'retry' };
-  if (!last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
+  if (!last.referralStageRefused && !last.persistenceFailed && env.WE_REFERRAL_HOLD_LIVE_RELEASE !== '0') {
     // Read exactly as the gate reads it (readable-card rule, author stamp, PR body/createdAt): a release the
     // gate would immediately re-park loops the review on every tick, which this hold exists to prevent.
     const live = liveReferralState(pr, { repo, pr: Number(pr.number), cardReadable });
@@ -330,6 +446,8 @@ export function resolveNoVerdictRetry(env = process.env, { tool } = {}) {
 }
 /** A just-finished run gets this long for its verdict write-back to show up in the (cached) PR listing. */
 export const VERDICT_GRACE_MS = 10 * 60_000;
+/** CI-held publishes that do not spend a no-verdict retry, per head. */
+export const CI_HELD_FREE_RUNS = 4;
 const VERDICT_LABELS = ['review:accepted', 'review:changes', 'review:human'];
 
 /**
@@ -352,7 +470,7 @@ export function verdictNeverLanded(pr, last, now = Date.now()) {
 export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Date.now(), retry = resolveNoVerdictRetry(env) } = {}) {
   const max = resolveSameHeadMaxReviews(env);
   if (max === 0) return null;
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
+  const history = runs.filter(r => !(r.incomplete && r.quotaOnly) && r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid);
   // Newer incomplete attempts own retry accounting, including after an older parked review was released.
   // A fresh head can also crash on EVERY attempt and must still reach the exhausted needs-you hold.
   const last = latestReviewAttempt(history);
@@ -365,7 +483,13 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const noVerdict = verdictNeverLanded(pr, last, now);
   // Normal same-head and referral holds still require completed panels. A no-verdict retry spends its
   // budget as soon as read identifies the head, even if the process dies before advise can finish.
-  const attempts = history.filter(r => r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)));
+  // Waiting for CI to publish is transient and does not spend a lost write-back retry.
+  // Bounded: only the first CI_HELD_FREE_RUNS such runs are free, so a head whose CI never settles still reaches the cap.
+  let ciHeldFree = 0;
+  const attempts = history.filter(r => {
+    if (!(r.startedAt >= wake && (noVerdict || Number.isFinite(r.completedAt)))) return false;
+    return !(noVerdict && r.ciHeld && ciHeldFree++ < CI_HELD_FREE_RUNS);
+  });
   const count = attempts.length;
   if (count < max) return null;
   if (noVerdict && count < max + VERDICT_RETRY_EXTRA) return null;
@@ -702,7 +826,37 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
 /** Reserve before sending: an ambiguous transport failure must not create duplicate comments on every tick.
  * Known pre-send rate-limit failures can retry with bounded backoff; all other failures remain visible locally.
  */
-export function notifyReferralHold({ repo, prNumber, hold, comments = [],
+export function notifyReferralHold(args) {
+  notifyReferralHoldNotice(args);
+  if (args.hold.kind === 'same-head') return;
+  // The original notice stays synchronous. Even when its receipt suppresses a repeat notice,
+  // stale findings get their own bounded, best-effort advisory pass. Never write a ruling here.
+  return (async () => {
+    try {
+      const { repo, prNumber, hold, comments = [], pr = {}, env = process.env,
+        dir = join(dirname(resolveRunsDir()), 'review-referral-notices'),
+        log = line => console.error(line), reverifyPost, spawn, now } = args;
+      const live = liveReferralState({ ...pr, headRefOid: hold.head, comments }, {
+        repo, pr: prNumber, cardReadable: ref => referralCardReadable(ref, REPO_ROOT),
+      });
+      const table = findingIdentityTable(live.records.filter(r => r.repo === repo && r.pr === Number(prNumber)));
+      const pending = live.pendingFindings.map(f => {
+        const identity = table.find(e => e.keys.some(k => k.head === hold.head && k.runId === f.runId && k.key === f.key));
+        return { ...f, raisedHeads: identity
+          ? [identity.firstSeenHead, ...identity.heads.filter(h => h !== identity.firstSeenHead)] : [] };
+      });
+      // Nothing stale: no setting log, no spawn, no comment (same-head behaviour is unchanged).
+      if (!pending.some(f => /^[a-f0-9]{40}$/.test(f.raisedHeads[0] ?? '') && f.raisedHeads[0] !== hold.head)) return;
+      await reverifyStaleReferrals({ repo, prNumber, head: hold.head, pending, comments,
+        env, dir: join(dir, 'reverify'), log, ...(reverifyPost ? { post: reverifyPost } : {}), spawn, now });
+    } catch {
+      try { (args.log ?? console.error)('referral reverify unavailable; referrals kept for operator ruling'); }
+      catch { /* advisory must never throw out of notifyReferralHold */ }
+    }
+  })();
+}
+
+function notifyReferralHoldNotice({ repo, prNumber, hold, comments = [],
   dir = join(dirname(resolveRunsDir()), 'review-referral-notices'), now = Date.now(),
   log = line => console.error(line), publishNeedsYou,
   post = body => execFileSyncThrottled('gh', ['pr', 'comment', String(prNumber), '--repo', repo, '--body', body],

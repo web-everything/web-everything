@@ -8,8 +8,10 @@ import {
 } from './smoke-classify/index.mjs';
 import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
-import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate } from './state.mjs';
+import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
+import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
@@ -20,6 +22,7 @@ import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
+import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
@@ -125,6 +128,9 @@ export function attributeSmokeFailure({ git, files, overlays }) {
   return { culprits, unknown };
 }
 
+/** Refusals that leave the force-adopt request pending in `recordForcedAdoption`: another force watch (or an unpaid rollback) holds the clone. */
+const FORCE_REFUSED_CONSUMES = new Set(['watch-already-open', 'watch-unreadable', 'rollback-owed']);
+
 /** Did only EXTERNAL checks fail? Every failed row is one `daemon-live-smoke.mjs#SMOKE_CHECKS` marks
  *  `mayBeTransient` (it runs `gh`, not code from the tree under test). An empty list is not external-only. */
 export function isExternalOnlyFailure(failed) {
@@ -220,7 +226,7 @@ export function smokeCheckOfChild(cmd, args = []) {
 
 /**
  * The `runChild` every smoke of one build gets: each child's timeout capped at the time left before `deadline`, no
- * child started once less than `minChildMs` is left, and — when `failFast` names checks — every child after one of
+ * child started once less than the per-call `opts.minChildMs` (default `minChildMs`) is left, and — when `failFast` names checks — every child after one of
  * them fails is refused at once. Exposes `deadline` / `failFast` for the caller's log and tests.
  */
 export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.now, failFast = [], minChildMs = 1_000 }) {
@@ -228,11 +234,12 @@ export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.n
   let stopped = null;
   const run = async (cmd, args = [], opts = {}) => {
     if (stopped) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
+    const { minChildMs: childFloor = minChildMs, ...childOpts } = opts;
     const left = deadline - now();
-    if (!(left >= minChildMs)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
+    if (!(left >= childFloor)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
     const timeoutMs = Number.isFinite(opts?.timeoutMs) ? Math.min(opts.timeoutMs, left) : left;
     try {
-      return await runChild(cmd, args, { ...opts, timeoutMs });
+      return await runChild(cmd, args, { ...childOpts, timeoutMs });
     } catch (e) {
       const check = smokeCheckOfChild(cmd, args);
       if (check && ff.has(check)) stopped = check;
@@ -388,7 +395,15 @@ export async function smokeAndAdopt({
   // xhiqxz3 — which overlays of a build need the real dispatch smoke (none when the setting is off).
   const dsm = await resolveDispatchSmoke(dispatchSmoke, env);
   if (dsm.unavailable) alert('dispatch-smoke-unavailable', { error: dsm.unavailable });
-  const adoptedApplied = adoptedHead && adoptedHead === prevHead && Array.isArray(adoptedState?.applied) ? adoptedState.applied : null;
+  // R508: a force-adopted build's overlays never passed the real dispatch smoke (its smoke failed first), so they are not "already
+  // adopted and proven": every overlay stays a dispatch-smoke suspect until a build passes a smoke (`adoptedApplied: null` = all count).
+  const forceUnverifiedHead = (() => {
+    const trees = readRebuildState(root, stEnv).forceUnverifiedTrees;
+    if (!Array.isArray(trees) || !trees.length) return false;
+    const headTree = verifyRev(git, `${prevHead}^{tree}`);
+    return !headTree || trees.includes(headTree);
+  })();
+  const adoptedApplied = adoptedHead && adoptedHead === prevHead && !forceUnverifiedHead && Array.isArray(adoptedState?.applied) ? adoptedState.applied : null;
   const suspectsFor = (applied) => (dsm.on ? dispatchSmokeSuspects({
     git, applied, adoptedApplied, patterns: dsm.settings.dispatchPaths, match: dsm.match,
   }) : []);
@@ -427,10 +442,14 @@ export async function smokeAndAdopt({
     // A build adopted while a lane-pool probe was SKIPPED for a busy pool (`skipped: busy pool`) was never
     // live-verified on those checks, so "unchanged since the last live-verified build" does not hold for it:
     // the next smoke runs every check (null = full smoke), or a chain of busy skips would launder the pool code.
-    const busyTrees = readRebuildState(root, stEnv).busySkippedTrees;
-    if (Array.isArray(busyTrees) && busyTrees.length) {
-      const headTree = verifyRev(git, `${prevHead}^{tree}`);
-      if (!headTree || busyTrees.includes(headTree)) return null;
+    const rs = readRebuildState(root, stEnv);
+    // R508: a force-adopted build (adopted over a failed smoke) is likewise never a trusted baseline: full smoke until a build passes one.
+    // Unverified status is INHERITED by an unsmoked skip-unrelated successor (prepare.mjs), so a docs-only hop does not launder it.
+    for (const trees of [rs.busySkippedTrees, rs.forceUnverifiedTrees]) {
+      if (Array.isArray(trees) && trees.length) {
+        const headTree = verifyRev(git, `${prevHead}^{tree}`);
+        if (!headTree || trees.includes(headTree)) return null;
+      }
     }
     const d = git(['diff', '--name-only', prevHead, sha]);
     return d.status === 0 ? String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
@@ -554,13 +573,28 @@ export async function smokeAndAdopt({
   /** Adopt `p`, whose smoke just PASSED. fix-rebuild-finalize: the pass is recorded as the clone's ready candidate
    *  FIRST, so a lock refusal here never throws it away — the next write-lock holder (this process's next tick, or
    *  a sibling at its own tick start) adopts it without re-smoking (see prepareRebuild). */
-  const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null) => {
+  const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null, { overFailedSmoke = false } = {}) => {
     // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
     const busySkipped = busyPoolSkippedChecks(smokeResult);
     if (busySkipped.length) {
       const tree = verifyRev(git, `${p.finalSha}^{tree}`);
       alert('smoke-busy-pool-skipped', { checks: busySkipped, message: 'lane-pool probe(s) skipped under a busy pool; the next smoke re-runs every check' });
       if (tree) await locked((st) => { st.busySkippedTrees = [tree, ...(st.busySkippedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
+    }
+    // R508: a force-adopted build is adopted OVER a failed smoke, so it was never live-verified on the checks it failed. It must not become
+    // the trusted baseline `changedSince` reads, or a successor touching only unrelated files would skip those checks as "unchanged" and be
+    // adopted with the force-adopted build's defect (and the force watch would then clear as "superseded", with no rollback). Recorded
+    // BEFORE adopting; the next smoke runs the FULL smoke until a build passes one. (prepare's skip-unrelated path is unaffected on purpose:
+    // it adopts docs-only successors and carries the open force watch, which still guards the force-adopted code.)
+    // Fail closed: if the tree cannot be resolved or the record cannot be written, the force is not finalized (the caller aborts it).
+    // The same holds for EVERY adoption over a failed smoke, not only the operator's force: the harness-broken "adopted as no worse" path
+    // (`overFailedSmoke`) adopts a build that failed checks last-good also failed, so those checks were never passed by it either.
+    if (readyMeta?.forced === true || overFailedSmoke === true) {
+      const tree = verifyRev(git, `${p.finalSha}^{tree}`);
+      if (!tree) throw new Error('adopted over a failed smoke: tree unresolvable, cannot record it as unverified');
+      // `locked` returns null (it does not throw) when the write lock is refused: that must not finalize the adoption with no record.
+      const recorded = await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
+      if (!recorded) throw new Error('adopted over a failed smoke: could not record it as unverified (write lock refused)');
     }
     writeReadyCandidate(root, {
       ...readyMeta,
@@ -592,6 +626,7 @@ export async function smokeAndAdopt({
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
       root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
@@ -658,6 +693,61 @@ export async function smokeAndAdopt({
   }
 
   const failedA = failedRows(a.smokeResult);
+  // R508 operator force-adopt: the smoke above STILL ran; its failure is recorded alongside the force, never skipped.
+  // The operator's ruling vouches for ONE build (`forceRequestFor` fails closed on a missing/malformed/other sha). A request
+  // for another build stays pending for its own build until it expires, and THIS build falls through to the ordinary
+  // failed-smoke ladder below (reuse / environment verdicts / sticky rejection / fallback), exactly as if no request existed.
+  const forceReq = forceRequestFor(root, stEnv, plan.finalSha);
+  if (!forceReq) {
+    // Refused, and said so: a pending request that names another build (or no valid build) never authorizes this one.
+    const pending = readForceAdopt(root, stEnv);
+    if (pending) alert('force-adopt-sha-mismatch', { requested: pending.sha ?? null, target: plan.finalSha, ruling: pending.ruling });
+  }
+  if (forceReq) {
+    const forceSmoke = { verdict: a.smokeResult.verdict, failed: failedA.map((r) => r.name) };
+    alert('force-adopt-over-failed-smoke', { ruling: forceReq.ruling, quote: forceReq.quote, ...forceSmoke, target: plan.finalSha });
+    const lastGoodState = readRebuildState(root, stEnv).adopted;
+    const emit = (e) => appendDaemonEvent(e, { env: { WE_DAEMON_EVENTS: env?.WE_DAEMON_EVENTS } });
+    // Log + durable watch FIRST: a build that fails its smoke is never adopted without a record and a rollback watch.
+    const opened = await recordForcedAdoption({
+      root, env: stEnv, request: forceReq, sha: plan.finalSha, lastGood: lastGoodState ?? { head: prevHead }, smoke: forceSmoke, emit,
+    });
+    if (!opened.ok) {
+      // Refused because another force watch holds this clone (open / unreadable / a rollback still owed): `recordForcedAdoption` left the
+      // request pending, so it would stay pending (and, with no rejection recorded, keep this build re-smoking every tick) until it
+      // expired. Consume it and write the sticky rejection in the SAME lock as the hold; the operator re-requests once the watch is gone.
+      const consume = FORCE_REFUSED_CONSUMES.has(opened.reason);
+      if (consume) clearForceAdopt(root, stEnv);
+      alert('force-adopt-refused', {
+        reason: opened.reason,
+        ...(consume ? { requestConsumed: true, message: 'the force-adopt request was consumed and this build is rejected; request again once the open watch / owed rollback is settled' } : {}),
+      });
+      await hold('force-adopt-refused', failedA, {}, consume ? (st) => {
+        st.rejected = { inputsKey: plan.inputsKey, reason: failedA.map((r) => r.name).join(','), at: nowIso() };
+        if (isExternalOnlyFailure(failedA)) Object.assign(st.rejected, { externalOnly: true, attempts: 1, retryAt: new Date(now() + rejectRetryDelayMs(env, 1)).toISOString() });
+      } : undefined);
+      return { moved: false, reason: 'force-adopt-refused', detail: opened.reason, plan, alerts: [...prepAlerts, ...alertsList] };
+    }
+    const abort = async () => {
+      // A reset can land before finalization throws. Retire only with evidence that this build is not running;
+      // an unreadable HEAD also keeps the rollback watch until a later tick can observe it.
+      let head;
+      try { head = verifyRev(git, 'HEAD'); } catch { return; }
+      if (!head || head === plan.finalSha) return;
+      clearReadyCandidate(root, stEnv); // never leave the failed build adoptable unwatched
+      await abortForcedAdoption({ root, env: stEnv, request: forceReq, sha: plan.finalSha, emit });
+    };
+    let forced;
+    // `forced: true` pins the ready record to this exact sha: prepare never substitutes a same-tree or newer build for it, which
+    // would run with no rollback watch (the watch is keyed to this sha).
+    try { forced = await finalize(plan, undefined, { kind: 'candidate', forced: true }, a.smokeResult); } catch (e) { await abort(); throw e; }
+    // finalize keeps the build as the ready candidate when a reader holds the clone (tick-in-progress / reader-priority):
+    // the durable watch above already covers its later adoption. A sibling that adopted this exact build first
+    // (`already-adopted`: adopted but not moved) is running it too, so the watch stays. Only a real failure to adopt aborts.
+    const keptForLater = forced.readyRecorded === true || forced.reason === 'tick-in-progress' || forced.reason === 'reader-priority';
+    if (forced.moved !== true && forced.adopted !== true && !keptForLater) await abort();
+    return forced;
+  }
   if (a.reused) {
     await hold('smoke-reused-env-failed', failedA);
     return { moved: false, reason: 'smoke-reused-env-failed', plan, alerts: [...prepAlerts, ...alertsList] };
@@ -732,6 +822,7 @@ export async function smokeAndAdopt({
       const culpritRefs = new Set(culprits.map((ap) => ap.ref));
       const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
       const planA2 = await planRebuild({
+        auditedTip: makeAuditedTipGate(env),
         git, headSha: prevHead, mainRef: 'origin/main',
         overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -775,6 +866,7 @@ export async function smokeAndAdopt({
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
+      auditedTip: makeAuditedTipGate(env),
       git, headSha: prevHead, mainRef: 'origin/main', overlays: pinnedOverlays,
       edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
     });
@@ -874,7 +966,7 @@ export async function smokeAndAdopt({
         alsoFailedOn: bFailed ? ['plain-main', 'last-good'] : ['last-good'],
         message: 'last-good failed every check the candidate failed — adopting the candidate as no worse so a candidate harness fix can arrive',
       });
-      const fin = await finalize(plan, undefined, undefined, a.smokeResult);
+      const fin = await finalize(plan, undefined, undefined, a.smokeResult, { overFailedSmoke: true });
       return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
     }
     const prevAttempts = priorRejected?.harnessBroken ? (priorRejected.attempts || 1) : 0;

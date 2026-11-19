@@ -1,13 +1,17 @@
-/** Verify infrastructure recovery, resolved per leaf through the shared policy cascade. */
+/** Verify infrastructure and timeout-only load recovery, resolved per leaf through the shared policy cascade. */
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 
 export function loadVerifyRecoverySettings({ env = process.env, tool = readSettings().verify, platform } = {}) {
   return cascadePolicy('verify', tool, {
     env, platform,
-    standard: { infraRetry: { maxAttempts: 3, backoffMinutes: 15 }, gateCeiling: 'load-scaled' },
-    valid: { infraRetry: value => Number.isSafeInteger(value) && value >= 0,
+    standard: { loadRetry: { maxAttempts: 3 }, infraRetry: { maxAttempts: 3, backoffMinutes: 15 }, gateCeiling: 'load-scaled' },
+    valid: { loadRetry: value => {
+      const n = value && typeof value === 'object' ? value.maxAttempts : value;
+      return Number.isSafeInteger(n) && n >= 0;
+    }, infraRetry: value => Number.isSafeInteger(value) && value >= 0,
       gateCeiling: value => ['fixed', 'load-scaled'].includes(value) },
-    envValues: { gateCeiling: env.WE_VERIFY_GATE_CEILING || undefined },
+    envValues: { loadRetry: env.WE_VERIFY_LOAD_RETRY_MAX_ATTEMPTS?.trim()
+      ? { maxAttempts: Number(env.WE_VERIFY_LOAD_RETRY_MAX_ATTEMPTS) } : undefined, gateCeiling: env.WE_VERIFY_GATE_CEILING || undefined },
   });
 }

@@ -1,0 +1,292 @@
+/**
+ * @file Decide which prototype registrations can retire on their own.
+ * WHY (incident 2026-11-01, R310): the review and health-watch daemons froze for ~3h and ~9h on
+ * `pinned-overlay-conflict`. A superseded registration (#6056's `lane/unblock-dead-redteam-redispatch-m*`,
+ * replaced by merged #6132) and old combined tops conflicted with main. prototype-load registers with no
+ * `--pr`, so the rebuild's own `pr-merged` cleanup never saw them, and nothing else could drop them.
+ *
+ * A registration retires only on git-proved evidence:
+ *   - `in-main` / `pr-merged`: merging it onto main changes nothing (exact tree compare, so any history shape:
+ *     merged, squash-merged, or a loader `-m<N>` merge ref of a merged branch).
+ *   - `redundant-merge-sibling`: an unpinned loader merge ref with no recorded PR or edge resolution conflicts
+ *     with main, but every non-merge commit it carries is in its registered base's origin tip, whose PR is OPEN.
+ *     Every sibling merge must reproduce its parents' clean merge tree, proving it adds no resolution edits.
+ *   - `superseded`: its PR is CLOSED unmerged, a MERGED PR of the same repository, merged into main and reachable
+ *     from main, cross-references it and declares `Supersedes #N` in visible prose. Its author and any post-merge
+ *     body editor must be trusted (supersede-rule.mjs). Every non-merge commit the
+ *     registration carries beyond main is one of that closed PR's own commits (merges must be clean or the PR's own).
+ *     Those commits are not on main, but the merged superseder replaced them on main: that is the declared exception.
+ * A flag-pinned registration of a CLOSED PR is kept (as in the rebuild), and so is one with an approved edge
+ * resolution. Anything else is kept. A registration with unique commits that are not on main and not replaced on main is
+ * never dropped. An unreadable git or GitHub answer keeps it too.
+ * All IO is injected: `git(args)` and `gh(args)` return `{ code, stdout }`.
+ */
+import { parseSupersedes, isTrustedSupersedeAuthor, isBodyEditedAfterMergeByUntrusted } from '../conveyor/supersede-rule.mjs';
+
+const SHA = /^[a-f0-9]{40}$/;
+const lines = (text) => String(text || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+/** Bind evidence to origin's repository AND host, regardless of GH_REPO, GH_HOST or gh's defaults. */
+export function resolveOriginRepository({ git, gh }) {
+  const unknown = { repo: '', gh: () => ({ code: 1, stdout: '' }) };
+  try {
+    const origin = git(['remote', 'get-url', 'origin']);
+    const url = String(origin.stdout || '').trim();
+    if (origin.code !== 0 || !url || url.startsWith('-') || /[\r\n\0]/.test(url)) return unknown;
+    const result = ghJson(gh, ['repo', 'view', url, '--json', 'nameWithOwner,url']);
+    const repo = result.value?.nameWithOwner;
+    if (!result.ok || typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return unknown;
+    const page = new URL(result.value.url);
+    if (page.protocol !== 'https:' || page.username || page.password || page.search || page.hash
+      || page.pathname.toLowerCase() !== `/${repo}`.toLowerCase()) return unknown;
+    const boundGh = (args) => {
+      if (args[0] === 'api') return gh([...args, '--hostname', page.host]);
+      const index = args.indexOf('--repo');
+      if (index < 0) return { code: 1, stdout: '' };
+      const bound = [...args];
+      bound[index + 1] = `${page.host}/${repo}`;
+      return gh(bound);
+    };
+    return { repo, gh: boundGh };
+  } catch { return unknown; }
+}
+
+/** Use the same visible declaration target list as the conveyor; code and trailing prose confer no authority. */
+export function declaresSupersedes(body, pr) {
+  if (!Number.isInteger(pr)) return false;
+  return parseSupersedes(body).includes(pr);
+}
+
+/** The branch a loader merge ref (`<branch>-m<N>`) was built from, or null. */
+export function mergeRefBase(ref) {
+  const match = /^(.+)-m\d+$/.exec(ref || '');
+  return match ? match[1] : null;
+}
+
+/**
+ * What the registration carries beyond `mainRef`, proved with git.
+ * @returns {{ok:boolean, tip?:string, unique?:string[], merges?:string[], uncleanMerges?:string[], cleanMerges?:boolean,
+ *   contentInMain?:boolean, reason?:string}}
+ */
+export function carriedBeyondMain({ git, ref, mainRef = 'origin/main' }) {
+  const tipRes = git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`]);
+  const tip = String(tipRes.stdout || '').trim();
+  if (tipRes.code !== 0 || !SHA.test(tip)) return { ok: false, reason: 'tip-unresolved' };
+  const mainTreeRes = git(['rev-parse', '--verify', `${mainRef}^{tree}`]);
+  const mainTree = String(mainTreeRes.stdout || '').trim();
+  if (mainTreeRes.code !== 0 || !SHA.test(mainTree)) return { ok: false, reason: 'main-unresolved' };
+  // Every non-merge commit not reachable from main. Patch equivalence is not used: patch ids ignore whitespace,
+  // even inside string literals, so an "equivalent" commit can still differ from what main has.
+  const uniqueRes = git(['rev-list', '--no-merges', `${mainRef}..${tip}`]);
+  const mergesRes = git(['rev-list', '--merges', `${mainRef}..${tip}`]);
+  if (uniqueRes.code !== 0 || mergesRes.code !== 0) return { ok: false, reason: 'history-unreadable' };
+  const unique = lines(uniqueRes.stdout);
+  const merges = lines(mergesRes.stdout);
+  if (![...unique, ...merges].every((sha) => SHA.test(sha))) return { ok: false, reason: 'history-unreadable' };
+  // A merge counts as carrying nothing of its own only when git recomputes the same tree from its parents.
+  const uncleanMerges = merges.filter((merge) => {
+    const parents = lines(git(['rev-list', '--parents', '-n', '1', merge]).stdout)[0]?.split(/\s+/).slice(1) || [];
+    if (parents.length !== 2) return true;
+    const recomputed = git(['merge-tree', '--write-tree', '--no-messages', parents[0], parents[1]]);
+    const actual = git(['rev-parse', '--verify', `${merge}^{tree}`]);
+    return recomputed.code !== 0 || actual.code !== 0 || lines(recomputed.stdout)[0] !== String(actual.stdout || '').trim();
+  });
+  const cleanMerges = uncleanMerges.length === 0;
+  const onto = git(['merge-tree', '--write-tree', '--no-messages', mainRef, tip]);
+  const contentInMain = onto.code === 0 && lines(onto.stdout)[0] === mainTree;
+  return { ok: true, tip, unique, merges, uncleanMerges, cleanMerges, contentInMain };
+}
+
+function ghJson(gh, args) {
+  const result = gh(args);
+  if (result.code !== 0) return { ok: false };
+  try { return { ok: true, value: JSON.parse(String(result.stdout || 'null')) }; } catch { return { ok: false }; }
+}
+
+/** The registration's PR: its recorded number, else a PR whose head is the ref, else (for `-m<N>`) its base branch. */
+function findPr({ gh, row, repo }) {
+  if (Number.isInteger(row.pr)) {
+    const view = ghJson(gh, ['pr', 'view', String(row.pr), '--repo', repo, '--json', 'number,state,headRefName,isCrossRepository']);
+    return view.ok && view.value ? { ok: true, pr: view.value, via: 'registration' } : { ok: false };
+  }
+  for (const [head, via] of [[row.ref, 'head'], [mergeRefBase(row.ref), 'merge-ref-base']]) {
+    if (!head) continue;
+    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', head, '--state', 'all', '--json', 'number,state,headRefName,isCrossRepository', '--limit', '5']);
+    if (!list.ok || !Array.isArray(list.value)) return { ok: false };
+    const exact = list.value.filter((pr) => pr?.headRefName === head);
+    if (exact.length > 1) return { ok: false, ambiguous: true };
+    if (exact.length === 1) return { ok: true, pr: exact[0], via };
+  }
+  return { ok: true, pr: null };
+}
+
+/** A trusted MERGED PR of this repo, on `mainRef`, that cross-references `pr` and declares `Supersedes #pr`. */
+function findSuperseder({ gh, git, pr, repo, mainRef }) {
+  const [owner, name] = String(repo || '').split('/');
+  if (!owner || !name) return { ok: false };
+  const query = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){'
+    + 'timelineItems(itemTypes:[CROSS_REFERENCED_EVENT],first:100){nodes{... on CrossReferencedEvent{source{'
+    + '... on PullRequest{number merged body author{login} mergedAt lastEditedAt editor{login} '
+    + 'baseRefName repository{nameWithOwner} mergeCommit{oid}}}}}}}}}';
+  const refs = ghJson(gh, ['api', 'graphql', '-f', `query=${query}`, '-F', `o=${owner}`, '-F', `r=${name}`, '-F', `n=${pr}`]);
+  const nodes = refs.ok ? refs.value?.data?.repository?.pullRequest?.timelineItems?.nodes : null;
+  if (!Array.isArray(nodes)) return { ok: false };
+  const mainBranch = mainRef.replace(/^origin\//, '');
+  const hit = nodes.map((node) => node?.source).find((src) => src?.merged === true && Number.isInteger(src.number)
+    && isTrustedSupersedeAuthor(src) && !isBodyEditedAfterMergeByUntrusted(src)
+    && src.number !== pr && declaresSupersedes(src.body, pr)
+    // `#N` in another repository's PR names that repository's PR N, not this one.
+    && String(src.repository?.nameWithOwner || '').toLowerCase() === String(repo).toLowerCase()
+    && src.baseRefName === mainBranch && SHA.test(src.mergeCommit?.oid || '')
+    // The replacement must actually be on the main this registration is compared against.
+    && git(['merge-base', '--is-ancestor', src.mergeCommit.oid, mainRef]).code === 0);
+  return { ok: true, supersededBy: hit ? hit.number : null, ...(hit ? { mergeCommit: hit.mergeCommit.oid } : {}) };
+}
+
+/** The commit shas of `pr`, or null when unreadable. */
+function prCommits({ gh, pr, repo }) {
+  const view = ghJson(gh, ['pr', 'view', String(pr), '--repo', repo, '--json', 'commits']);
+  const commits = view.ok && Array.isArray(view.value?.commits) ? view.value.commits.map((c) => c?.oid) : null;
+  return commits && commits.every((sha) => SHA.test(sha || '')) ? new Set(commits) : null;
+}
+
+/**
+ * Decide, per registration, whether it retires. Never mutates anything.
+ * `proofRows` are registrations that may be CITED as evidence (a redundant sibling's base) but are never decided
+ * here: a caller that withholds a registration from `rows` (the loader's own candidate) still passes it as proof.
+ * @param {{rows:Array<{ref:string, pr?:number|null}>, proofRows?:Array<{ref:string, pr?:number|null}>, git:Function, gh:Function, repo:string, mainRef?:string}} o
+ * @returns {Array<{ref:string, action:'retire'|'keep', reason:string, tip?:string, pr?:number|null, evidence?:object}>}
+ */
+export function planRetirements({ rows, proofRows = [], git, gh, repo, mainRef = 'origin/main' }) {
+  return rows.map((row) => {
+    const keep = (reason, extra = {}) => ({ ref: row.ref, action: 'keep', reason, ...extra });
+    const carried = carriedBeyondMain({ git, ref: row.ref, mainRef });
+    if (!carried.ok) return keep(carried.reason);
+    const { tip } = carried;
+    const evidence = { unique: carried.unique.length, merges: carried.merges.length, cleanMerges: carried.cleanMerges,
+      contentInMain: carried.contentInMain };
+    // Every GitHub question names the repository; an unknown one keeps the registration.
+    if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo || ''))) return keep('repo-unknown', { tip, evidence });
+    const found = findPr({ gh, row, repo });
+    if (!found.ok) return keep(found.ambiguous ? 'pr-ambiguous' : 'pr-state-unknown', { tip, evidence });
+    const pr = found.pr;
+    const prNumber = pr ? pr.number : null;
+    const baseRef = mergeRefBase(row.ref);
+    const baseRow = baseRef && row.pr == null && !row.pinned && !row.edgeResolution
+      ? [...rows, ...proofRows].find((entry) => entry.ref === baseRef) : null;
+    // Ancestry alone cannot preserve edits introduced by merge commits. Unverifiable or edited merge
+    // trees must stay registered; only reproducible clean merges can be ignored for containment.
+    // A sibling with its OWN open PR keeps its registration however that PR was found (recorded or by head lookup):
+    // only the base's PR, found via `merge-ref-base`, is not the sibling's own.
+    const ownOpenPr = pr?.state === 'OPEN' && found.via !== 'merge-ref-base';
+    if (baseRow && carried.cleanMerges && !ownOpenPr) {
+      const baseFound = findPr({ gh, row: baseRow, repo });
+      // A base registration's `pr:N` may point at an unrelated PR: the PR must actually be the base branch's own.
+      // Identity is repo plus branch: a fork PR heading a same-named branch is not the origin base's PR.
+      if (baseFound.ok && baseFound.pr?.state === 'OPEN' && baseFound.pr.headRefName === baseRef
+        && baseFound.pr.isCrossRepository === false) {
+        const baseCarried = carriedBeyondMain({ git, ref: baseRow.ref, mainRef });
+        if (baseCarried.ok && carried.unique.every((sha) =>
+          git(['merge-base', '--is-ancestor', sha, baseCarried.tip]).code === 0)) {
+          // Exit 1 proves conflicts; other failures are unreadable evidence. Merge commits do not enter
+          // the containment check: the registered base preserves the sibling's non-merge work.
+          const onto = git(['merge-tree', '--write-tree', '--no-messages', mainRef, tip]);
+          if (onto.code === 1) {
+            return { ref: row.ref, action: 'retire', reason: 'redundant-merge-sibling', tip, pr: prNumber,
+              evidence: { ...evidence, basePr: baseFound.pr.number, baseRef, baseTip: baseCarried.tip } };
+          }
+        }
+      }
+    }
+    // An open PR may still receive commits that belong on the prototype.
+    if (pr && pr.state === 'OPEN') return keep('pr-open', { tip, pr: prNumber, evidence });
+    // Same rule as the rebuild (plan.mjs refuses a CLOSED PR with `pinned:true` before anything else).
+    if (pr?.state === 'CLOSED' && row.pinned === true) return keep('pinned-closed-pr', { tip, pr: prNumber, evidence });
+    // An approved edge resolution can carry conflict-resolution commits that neither the ref nor main has.
+    if (row.edgeResolution) return keep('edge-resolution-recorded', { tip, pr: prNumber, evidence });
+    // On main = merging it onto main changes nothing (exact trees, any history shape).
+    if (carried.contentInMain) {
+      return { ref: row.ref, action: 'retire', reason: pr?.state === 'MERGED' ? 'pr-merged' : 'in-main', tip, pr: prNumber,
+        evidence: { ...evidence, ...(pr ? { prVia: found.via, prState: pr.state } : {}) } };
+    }
+    if (pr?.state === 'CLOSED') {
+      const sup = findSuperseder({ gh, git, pr: prNumber, repo, mainRef });
+      if (!sup.ok) return keep('superseder-unknown', { tip, pr: prNumber, evidence });
+      if (sup.supersededBy == null) return keep('unique-commits-not-on-main', { tip, pr: prNumber, evidence });
+      const own = prCommits({ gh, pr: prNumber, repo });
+      if (!own) return keep('pr-commits-unknown', { tip, pr: prNumber, evidence });
+      // The closed PR's own commits (merges included) are what the superseder replaced. Anything else must be a
+      // clean merge, or the registration carries work that nothing on main replaced.
+      const foreign = [...carried.unique, ...carried.uncleanMerges].filter((sha) => !own.has(sha));
+      if (foreign.length) {
+        return keep('carries-more-than-superseded-pr', { tip, pr: prNumber, evidence: { ...evidence, foreign: foreign.slice(0, 10) } });
+      }
+      return { ref: row.ref, action: 'retire', reason: 'superseded', tip, pr: prNumber,
+        evidence: { ...evidence, prVia: found.via, supersededBy: sup.supersededBy, supersederCommit: sup.mergeCommit } };
+    }
+    return keep('unique-commits-not-on-main', { tip, pr: prNumber, evidence });
+  });
+}
+
+const ZERO_SHA = '0'.repeat(40);
+const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+
+/**
+ * The deleted branch's authoritative last tip, from GitHub's ref activity log: the NEWEST event for the ref must be
+ * a `branch_deletion`, and its `before` is the tip the branch had when it was deleted. A historical PR head alone
+ * proves nothing, because a registration tracks a mutable name that may have been reused (and deleted again)
+ * after the PR merged. The request pins newest-first order, so the newest event is always in the page; unreadable,
+ * empty, malformed, foreign-ref or tied-newest answers return null.
+ */
+function deletedBranchTip({ gh, repo, ref }) {
+  const limit = 10;
+  const res = ghJson(gh, ['api', `repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${ref}`)}&direction=desc&per_page=${limit}`]);
+  if (!res.ok || !Array.isArray(res.value) || !res.value.length) return null;
+  // Every event must be for this exact ref: a loosened or case-folded server filter could surface another branch's deletion.
+  if (res.value.some((e) => e?.ref !== `refs/heads/${ref}`)) return null;
+  const events = res.value.map((e) => ({ type: e?.activity_type, before: e?.before, after: e?.after, at: Date.parse(e?.timestamp) }));
+  if (events.some((e) => typeof e.type !== 'string' || !SHA.test(e.before || '') || !SHA.test(e.after || '') || !Number.isFinite(e.at))) return null;
+  events.sort((a, b) => b.at - a.at);
+  if (events.length > 1 && events[1].at === events[0].at) return null; // order of simultaneous events is unknown
+  const [newest] = events;
+  return newest.type === 'branch_deletion' && newest.after === ZERO_SHA && newest.before !== ZERO_SHA ? newest.before : null;
+}
+
+/**
+ * A registration whose branch could not be fetched. Retire it only when the deleted branch's LAST tip is proved
+ * to be the head of the one origin PR that merged it: exactly one PR ever headed the ref in origin, it is MERGED
+ * (matching any recorded PR number), its merge commit is an ancestor of `mainRef`, and GitHub's ref activity log
+ * shows the ref's newest event was a deletion at that PR's head commit. Anything unreadable, ambiguous or
+ * different (a reused name deleted at another tip, a full result page, a fork's same-named PR) keeps it.
+ * @returns {{ref:string, action:'retire'|'keep', reason:string, tip?:string, pr?:number, evidence?:object}}
+ */
+export function planFetchFailed({ row, git, gh, repo, mainRef = 'origin/main' }) {
+  const keep = () => ({ ref: row.ref, action: 'keep', reason: 'fetch-failed' });
+  try {
+    if (typeof git !== 'function' || typeof gh !== 'function') return keep();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo || '')) || row.edgeResolution) return keep();
+    const limit = 10;
+    const list = ghJson(gh, ['pr', 'list', '--repo', repo, '--head', row.ref, '--state', 'all', '--json',
+      'number,state,headRefName,headRefOid,mergeCommit,headRepository,isCrossRepository', '--limit', String(limit)]);
+    if (!list.ok || !Array.isArray(list.value) || list.value.length >= limit) return keep();
+    const named = list.value.filter((pr) => pr?.headRefName === row.ref);
+    // A PR whose head repository cannot be classified could be this branch's reuse: refuse rather than guess.
+    const origin = [];
+    for (const pr of named) {
+      const head = pr.headRepository?.nameWithOwner;
+      if (pr.isCrossRepository === false && sameRepo(head, repo)) origin.push(pr);
+      else if (!(pr.isCrossRepository === true && typeof head === 'string' && !sameRepo(head, repo))) return keep();
+    }
+    if (origin.length !== 1) return keep();
+    const [pr] = origin;
+    if (pr.state !== 'MERGED' || !Number.isInteger(pr.number)) return keep();
+    if (row.pr != null && row.pr !== pr.number) return keep();
+    const mergeCommit = pr.mergeCommit?.oid;
+    if (!SHA.test(pr.headRefOid || '') || !SHA.test(mergeCommit || '')) return keep();
+    if (git(['merge-base', '--is-ancestor', mergeCommit, mainRef]).code !== 0) return keep();
+    const deletedTip = deletedBranchTip({ gh, repo, ref: row.ref });
+    if (deletedTip !== pr.headRefOid) return keep();
+    return { ref: row.ref, action: 'retire', reason: 'pr-squash-merged', tip: deletedTip, pr: pr.number,
+      evidence: { refGone: true, prState: 'MERGED', mergeCommit, prVia: 'head-ref', deletedTip } };
+  } catch { return keep(); }
+}

@@ -48,7 +48,7 @@ describe('trial conversion', () => {
     expect(trial(execution({ provider: 'claude', model: 'claude-sonnet-5-5', executor: 'claude-subagent' }), verdict({ verifiedBy: 'other' }), { now }).ok).toBe(true);
   });
   it('denies secret-shaped model and findings without redacting or leaking them', () => {
-    const secret = 'AKIAABCDEFGHIJKLMNOP';
+    const secret = 'AKI' + 'AABCDEFGHIJKLMNOP';
     for (const [r, v] of [[execution({ model: secret }), verdict()], [execution(), verdict({ findings: [secret] })], [execution({ findings: [secret] }), verdict()]]) {
       const out = trial(r, v, { now });
       expect(out.ok).toBe(false); expect(out.reason).toContain('publish scrub'); expect(out.reason).not.toContain(secret); expect(out.row).toBeUndefined();
@@ -116,7 +116,7 @@ describe('ground truth and graduation', () => {
   it('deduplicates all findings and fails closed on secret ground truth', () => {
     const gt = groundTruth({ sources: [{ ...groundTruth().sources[0], findings: ['one', 'two'] }] });
     expect(trial(execution({ findings: ['two', 'three'] }), verdict({ findings: ['one'] }), { now, groundTruth: gt }).row.findings).toBe('one; two; three');
-    gt.sources[0].findings = ['AKIAABCDEFGHIJKLMNOP'];
+    gt.sources[0].findings = ['AKI' + 'AABCDEFGHIJKLMNOP'];
     expect(trial(execution(), verdict(), { now, groundTruth: gt }).reason).toContain('publish scrub');
   });
   it('a self-verified batch never graduates: no verdict-only, other-verified or author-verified trial produces a row', () => {

@@ -484,6 +484,10 @@ function writeDamagedStamp(dir, mode, problems) {
   try { writeFileSync(tmp, JSON.stringify(problems)); renameSync(tmp, file); }
   catch { try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ } } // the stamp only throttles
 }
+// An earlier check recorded this clone as damaged inside the window: keep the existing retry/noise guard (no per-sync re-heal).
+function damagedThrottled(dir, intervalMs, now, mode) {
+  return stampAge(damagedStamp(dir, mode), now) < intervalMs && recordedProblems(dir, mode).length > 0;
+}
 function deepCheckDue(dir, intervalMs, now, mode) {
   if (stampAge(deepStamp(dir), now) < intervalMs) return false;
   return !(stampAge(damagedStamp(dir, mode), now) < intervalMs && recordedProblems(dir, mode).length);
@@ -544,9 +548,14 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
   // dangling NON-remote ref stays put and is reported once; it must not force the deep checks on every sync.)
   const pruneFailedEarly = out.reported.some((r) => r.includes('prune failed'));
   const mode = allowReclone ? 'reclone' : 'prune';
-  if (!probeFailed && !out.pruned.length && !pruneFailedEarly && !deepCheckDue(dir, deepIntervalMs, now, mode)) {
+  // A fresh deep-check stamp must not hide a corrupt commit-graph: the read-only rebuild job re-verifies it every run and
+  // defers the heal to the tick, so a throttled tick that never looked loops the job forever (live 2026-11-02, fix daemon
+  // 48 behind). Cheap: only a clone that HAS a graph pays one `commit-graph verify`.
+  const graphBroken = isStandaloneClone(dir) && (existsSync(join(dir, '.git', 'objects', 'info', 'commit-graph'))
+    || existsSync(join(dir, '.git', 'objects', 'info', 'commit-graphs'))) && !verifyCommitGraph(dir).ok;
+  if (!probeFailed && !out.pruned.length && !pruneFailedEarly && !(graphBroken && !damagedThrottled(dir, deepIntervalMs, now, mode)) && !deepCheckDue(dir, deepIntervalMs, now, mode)) {
     // Throttled because an earlier check found it damaged (not because it was healthy): replay that, never report healthy.
-    const known = stampAge(deepStamp(dir), now) < deepIntervalMs ? [] : recordedProblems(dir, mode);
+    const known = stampAge(deepStamp(dir), now) < deepIntervalMs && !graphBroken ? [] : recordedProblems(dir, mode);
     if (known.length) { out.ok = false; out.problems = known; }
     return out;
   }
@@ -564,6 +573,9 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
   }
 
   const problems = diagnoseLane(dir).problems.filter((p) => !/ref\(s\) point at missing objects/.test(p));
+  // Fail closed: a graph that is still unreadable after the heal attempt (swallowed error, denied lock) is a problem,
+  // never a healthy clone to stamp.
+  if (standalone && graphBroken && !verifyCommitGraph(dir).ok) problems.push('commit-graph still unreadable after heal attempt');
   const pruneFailed = out.reported.some((r) => r.includes('prune failed'));
   if (!problems.length && !pruneFailed) {
     if (probeFailed) return out; // never stamp a clone whose ref probe failed

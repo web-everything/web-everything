@@ -12,6 +12,7 @@
  *     3. TOOL / repo override (Longshore settings) — the reader's settings file block (`we:scripts/settings/*.json`
  *        or its own per-feature file). Only when this repo deliberately differs from the team.
  *     4. ENV — the reader's existing env override (unchanged; each reader keeps its own env parsing).
+ *     5. OPERATOR DB — capacity-only host overrides, above env (source: operator-db).
  *
  *   Each LEAF resolves independently: the tool value when it is set AND valid, else the platform's, else the
  *   reader's standard default. An invalid value never overrides a lower layer; it is named in `invalid`.
@@ -25,8 +26,10 @@
  *   Never throws. A missing platform file is "layer not set"; an unreadable one is skipped and named in `errors`.
  */
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readOperatorOverrides, CAPACITY_LEAVES, failClosedCapacity } from './operator-override-reader.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -34,26 +37,49 @@ export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferenc
 /** The older platform-layer file (deliveryPriority). Read under the main file; the main file wins per key. */
 export const LEGACY_PLATFORM_PREFERENCES_PATHS = Object.freeze([join(HERE, 'delivery-priority-settings.json')]);
 export const PLATFORM_PREFERENCES_ENV = 'WE_PLATFORM_PREFERENCES_FILE';
+/** Operator-owned final platform layer; never written inside a checkout. */
+export function operatorPreferencesPath(env = process.env) {
+  return String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim() || join(homedir(), '.claude', 'platform-preferences.json');
+}
 export const POLICY_CASCADE_LOG_ENV = 'WE_POLICY_CASCADE_LOG';
-export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env']);
+export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env', 'operator-db']);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
 
+function mergeLeaves(base, over) {
+  const out = { ...base };
+  for (const [k, v] of Object.entries(over)) {
+    if (UNSAFE.has(k)) continue;
+    out[k] = isObj(out[k]) && isObj(v) ? mergeLeaves(out[k], v) : v;
+  }
+  return out;
+}
+
 /**
- * IO: every platform preference, keyed by policy. Never throws.
+ * IO: every platform preference, keyed by policy. routingOverrides and findingClasses are operator-only;
+ * repo platform copies are ignored with a warning. Never throws.
  * @returns {{prefs:object, errors:string[]}}
  */
-export function readPlatformPreferences({ env = process.env, readFile = readFileSync } = {}) {
+export function readPlatformPreferences({ env = process.env, readFile = readFileSync, warn = message => console.error(message) } = {}) {
   const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
-  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH];
+  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(env)];
   const prefs = {};
   const errors = [];
   for (const path of paths) {
     try {
       const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
-      for (const [k, v] of Object.entries(data)) if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = v;
+      for (const [k, v] of Object.entries(data)) {
+        if (['routingOverrides', 'findingClasses'].includes(k) && (path !== operatorPreferencesPath(env)
+          || [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH].some(repoPath => resolve(repoPath) === resolve(path)))) {
+          warn(`policy-cascade: ${path}: ignoring ${k}; only the operator-owned preferences file may set it`);
+          continue;
+        }
+        // Per-leaf merge: a later file (the operator's) overrides only the leaves it sets; it never drops the
+        // earlier file's other leaves of the same policy (an operator `build.priority` must not erase `build.finalGate`).
+        if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = isObj(prefs[k]) && isObj(v) ? mergeLeaves(prefs[k], v) : v;
+      }
     } catch (e) {
       if (e?.code !== 'ENOENT') errors.push(`${path}: ${String(e?.message ?? e).split('\n')[0]}`);
     }
@@ -86,7 +112,8 @@ function setLeaf(obj, parts, value) {
 }
 
 /**
- * PURE: resolve one policy through the four layers.
+ * PURE: resolve one policy through the five layers. A null operatorOverride means the store is unreadable;
+ * capacityLeaves retain the stricter lower-layer value or finite code fallback.
  * @param {{standard?:unknown, platform?:unknown, tool?:unknown, envValues?:Record<string,unknown>,
  *   valid?:Record<string,(v:unknown)=>boolean>|((v:unknown)=>boolean)}} layers
  *   `standard` / `platform` / `tool` are blocks of the same shape (or scalars). `envValues` maps a TOP-LEVEL key ('' for
@@ -95,8 +122,8 @@ function setLeaf(obj, parts, value) {
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {} } = {}) {
-  const check = (path, v) => (typeof valid === 'function' ? valid(v) : (valid?.[path[0]] ? valid[path[0]](v) : true));
+export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, log = console.error } = {}) {
+  const check = (path, v) => (typeof valid === 'function' ? valid(v) : ((valid?.[path.join('.')] ?? valid?.[path[0]])?.(v) ?? true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
   const invalid = [];
@@ -104,17 +131,64 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
   for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
     if (layer === undefined || layer === null) continue;
     for (const [key, { path, v }] of leaves(layer)) {
+      if (name === 'tool' && path[0] === 'findingClasses') {
+        console.error('policy-cascade: ignoring tool findingClasses; only the operator-owned preferences file may set it');
+        continue;
+      }
       if (!check(path, v)) { invalid.push(`${name}${at(path)}=${JSON.stringify(v)}`); continue; }
       eff.set(key, { path, v, layer: name });
     }
   }
-  for (const [k, v] of Object.entries(envValues ?? {})) {
+  for (const [k, raw] of Object.entries(envValues ?? {})) {
+    let v = raw;
     if (v === undefined) continue;
+    if (k === 'findingClasses' || (k === '' && isObj(v) && Object.hasOwn(v, 'findingClasses'))) {
+      console.error('policy-cascade: ignoring env findingClasses; only the operator-owned preferences file may set it');
+      if (k === 'findingClasses') continue;
+      const { findingClasses: _ignored, ...rest } = v;
+      v = rest;
+    }
     const path = k === '' ? [] : [k];
     if (!check(path, v)) { invalid.push(`env${at(path)}=${JSON.stringify(v)}`); continue; }
     // An env value replaces the whole top-level key (drop the nested leaves it shadows).
     for (const key of [...eff.keys()]) if (path.length && eff.get(key).path[0] === k) eff.delete(key);
     eff.set(path.join(SEP), { path, v, layer: 'env' });
+  }
+  const defaults = leaves(standard);
+  const paths = capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
+    Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
+  const specKeyFor = leaf => Object.keys(CAPACITY_LEAVES).find(key => key === leaf || key.endsWith(`.${leaf}`));
+  const operatorEntries = [];
+  let operatorInvalid = operatorOverride !== undefined && operatorOverride !== null && !isObj(operatorOverride);
+  for (const { path: rawPath, v } of leaves(operatorOverride ?? undefined).values()) {
+    // Preserve dotted schema keys used by flat readers; otherwise expand dotted override paths.
+    const path = rawPath.flatMap(k => k.split('.'));
+    const flat = rawPath.join('.');
+    const actual = eff.has(flat) ? [flat] : path;
+    const specKey = specKeyFor(flat);
+    if (actual.some(k => UNSAFE.has(k)) || !paths.includes(flat) || !specKey || !CAPACITY_LEAVES[specKey].validate(v) || !check(actual, v)) {
+      invalid.push(`operator-db${at(actual)}=${JSON.stringify(v)}`);
+      operatorInvalid = true;
+      continue;
+    }
+    operatorEntries.push({ actual, v });
+  }
+  if (!operatorInvalid) for (const { actual, v } of operatorEntries) {
+    eff.set(actual.join(SEP), { path: actual, v, layer: 'operator-db' });
+  }
+  if (operatorOverride === null || operatorInvalid) {
+    for (const leaf of paths) {
+      const specKey = specKeyFor(leaf);
+      if (!specKey) continue;
+      const path = eff.has(leaf) ? [leaf] : leaf.split('.');
+      const key = path.join(SEP);
+      const entry = eff.get(key);
+      const current = entry?.v ?? leaf.split('.').reduce((v, part) => v?.[part],
+        Object.fromEntries([...eff.values()].filter(e => e.path.length === 1).map(e => [e.path[0], e.v])));
+      const codeDefault = [...defaults.values()].find(e => e.path.join('.') === leaf)?.v;
+      const v = failClosedCapacity(specKey, current, { codeDefault, log });
+      eff.set(key, { path, v, layer: v === current ? entry?.layer ?? 'standard' : 'standard' });
+    }
   }
   const sources = {};
   const leafValues = {};
@@ -173,15 +247,56 @@ export function logCascadeSources(policy, resolved, { env = process.env, log = (
  * @param {{standard?:unknown, envValues?:Record<string,unknown>, valid?:object|Function, platform?:unknown,
  *   env?:object, log?:Function}} [o]
  */
-export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, env = process.env, log } = {}) {
+export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, operatorOverride, env = process.env, log } = {}) {
+  if (policy === 'findingClasses') {
+    if (tool != null || Object.values(envValues ?? {}).some(v => v !== undefined))
+      console.error('policy-cascade: ignoring tool/env findingClasses; only the operator-owned preferences file may set it');
+    tool = undefined;
+    envValues = {};
+  }
   let plat = platform;
   if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid });
+  if (operatorOverride === undefined) operatorOverride = readOperatorPolicy(policy, { env, log });
+  const capacityLeaves = capacityPolicyLeaves(policy);
+  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, log });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
-  const layered = resolveCascade({ platform: plat, tool, valid }).value;
+  const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
+    platform: plat, tool, valid, operatorOverride, capacityLeaves, log }).value;
   return { ...resolved, platform: plat, layered };
+}
+
+/** Read each call, filtering the exact policy prefix. Null means unreadable; {} means missing/empty.
+ * Tests isolate the store through the explicit file seam, never environment flags. */
+export function readOperatorPolicy(policy, { file, log } = {}) {
+  const { readable, values, invalidPolicies = [] } = readOperatorOverrides({ ...(file !== undefined ? { file } : {}), ...(log ? { log } : {}) });
+  if (!readable || invalidPolicies.includes(policy) || invalidPolicies.includes('*')) return null;
+  const prefix = `${policy}.`;
+  return Object.fromEntries(Object.entries(values).filter(([key]) => key.startsWith(prefix)).map(([key, value]) => [key.slice(prefix.length), value]));
 }
 
 /** Test seam: forget what was logged. @test-only-export-ok */
 export function resetCascadeLogForTest() { logged.clear(); }
+
+/** Card naming policy (#6121). Shadow keeps the current rename path authoritative. */
+export function resolveCardNumbering({ env = process.env, readFile = readFileSync, tool, platform, log } = {}) {
+  if (tool === undefined) {
+    try { tool = JSON.parse(readFile(join(HERE, '../settings/card-numbering.json'), 'utf8'))?.backlog?.cardNumbering; }
+    catch { tool = {}; }
+  }
+  return cascadePolicy('backlog.cardNumbering', tool, {
+    standard: { mode: 'rename-after-land', ledgerAuth: 'none', shadow: true, readMaxBytes: 8 * 1024 * 1024, historyBudget: 256 },
+    platform, env, log,
+    envValues: { mode: env.WE_CARD_NUMBERING_MODE, ledgerAuth: env.WE_CARD_LEDGER_AUTH,
+      shadow: env.WE_CARD_LEDGER_SHADOW === undefined ? undefined : ({ true: true, false: false, '1': true, '0': false })[env.WE_CARD_LEDGER_SHADOW] ?? env.WE_CARD_LEDGER_SHADOW },
+    valid: { mode: v => ['rename-before-enqueue', 'rename-after-land', 'ledger-only'].includes(v),
+      ledgerAuth: v => ['none', 'signed'].includes(v), shadow: v => typeof v === 'boolean',
+      readMaxBytes: v => Number.isSafeInteger(v) && v > 0 && v <= 64 * 1024 * 1024,
+      historyBudget: v => Number.isSafeInteger(v) && v > 0 && v <= 4096 },
+  });
+}
+
+/** The closed capacity paths for a policy (relative dotted keys). */
+export function capacityPolicyLeaves(policy) {
+  return Object.keys(CAPACITY_LEAVES).filter(key => key.startsWith(`${policy}.`)).map(key => key.slice(policy.length + 1));
+}

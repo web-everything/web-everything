@@ -20,7 +20,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSyn
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-export const PR_SNAPSHOT_VERSION = 1;
+export const PR_SNAPSHOT_VERSION = 2;
 export const PR_SNAPSHOT_DIR_ENV = 'WE_PR_SNAPSHOT_DIR';
 export const PR_SNAPSHOT_DISABLE_ENV = 'WE_PR_SNAPSHOT';
 const ALL_DIRTY = '_all';

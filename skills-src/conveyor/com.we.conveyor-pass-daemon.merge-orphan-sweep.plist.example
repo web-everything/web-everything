@@ -54,6 +54,8 @@
   <dict>
     <key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
     <string>120000</string>
+    <key>PASS_DAEMON_SELF_SYNC</key>
+    <string>1</string>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 </dict>

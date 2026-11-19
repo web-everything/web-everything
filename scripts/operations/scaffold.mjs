@@ -18,9 +18,9 @@
  * valid locus prefix is: that scan fired three times while cards were being filed on 2026-08-21, each time
  * fail-closed with nothing written, which is exactly the behaviour to preserve rather than reimplement.
  *
- * The IO reader reserves a final numeric id under the shared allocator lock. The
- * pure plan consumes that id, refuses collisions, and retains a hash as bornAs.
- * If allocation is disabled or fails, the existing hash path remains available.
+ * The IO reader defaults to hash ids for new cards; the drain numbers at land (#2288).
+ * An injected allocator may supply a numeric id, which the pure plan consumes,
+ * refusing collisions and retaining a hash as bornAs.
  *
  * THE LEGACY FLAG SHAPE IS PRESERVED DELIBERATELY. `--type`/`--workitem` predate the single `kind` axis
  * (#466/#487) and every skill and doc in the repo still passes them — including the 45 calls that motivated

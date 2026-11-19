@@ -1,13 +1,16 @@
 {
-  "$comment": "ghThrottleSlotWait is the tool layer of that cascade (standard → platform → this file → env). callerWaitMs maps a caller regex to its BACKGROUND slot wait in ms (integer 0..120000; invalid values are ignored and the standard backgroundWaitMs of 8000 applies). The caller stays in the background class. Operator 2026-10-20: parked-pr-conflict-watch waits up to 120 s for a slot.",
+  "$comment": "ghThrottleSlotWait is the tool layer of that cascade (standard → platform → this file → env). callerWaitMs maps a caller regex to its BACKGROUND slot wait in ms (integer 0..120000; invalid values are ignored and the standard backgroundWaitMs of 8000 applies). The caller stays in the background class. Operator 2026-10-20: parked-pr-conflict-watch waits up to 120 s for a slot. 2026-11-12: health-watch (hosts the pr-stall-sweep PR-list read) and advisory-label-sweep (red-team withheld publish) wait up to 60 s, under the 90 s maxHold. ghThrottle.cap resolves code default 6 → this file → WE_GH_THROTTLE_CAP (integer 1..50; invalid values warn and fall back). Evidence 2026-11-16 primary host: shared 6 slots, calls ~0.9 s but slot waits 39-89 s, planner passes 6 s → 89 s with idle CPU; GraphQL points 228/10000; GitHub secondary limit 100 concurrent. cap = 12; revert = 6.",
   "ghThrottle": {
+    "cap": 12,
     "maxHoldSeconds": 90,
     "reapGraceSeconds": 15,
     "perCallerMax": 4
   },
   "ghThrottleSlotWait": {
     "callerWaitMs": {
-      "^parked-pr-conflict-watch": 120000
+      "^parked-pr-conflict-watch": 120000,
+      "^health-watch$": 60000,
+      "^advisory-label-sweep": 60000
     }
   }
 }

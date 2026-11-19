@@ -19,6 +19,7 @@ function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
   if (pr.evidenceErrors?.length) return yes('evidence-unavailable: inspect PR evidence and rerun');
   // A mandatory referral awaits a ruling even when a worker or CI is making progress.
   if (pr.openReferrals?.some(r => r.ruled === false && r.superseded !== true)) return yes('unruled-referral');
+  if (pr.suspendedReferralRun) return yes('suspended-referral-run');
   if (Number.isFinite(pr.infraFailStreak) && pr.infraFailStreak >= limits.fixerInfraLoop) return yes('fixer-infra-loop');
   const headAge = Number.isFinite(pr.minutesSinceHeadChange) ? pr.minutesSinceHeadChange : pr.minutesSinceUpdate;
   if (labels.some(l => ['review-status:needs-human', 'status:needs-human'].includes(l))

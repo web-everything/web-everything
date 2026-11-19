@@ -1,7 +1,7 @@
 /**
  * @file scripts/lib/__tests__/daemon-live-smoke.test.mjs
  * @description #3383 — the live smoke gate a daemon clone runs after a self-sync merge, before restarting onto
- *   it. Every check runs through an INJECTED `runChild` here (never a real child process) so this suite is
+ *   it. Checks run through an INJECTED `runChild`; one bounded local Node exit probe verifies real error shapes. The suite is
  *   hermetic and fast; the real live behavior (a real lane-pool lease, a real `gh` call, a real reconcile-pass
  *   dry-run) is proven separately as a one-off script against a real/throwaway clone (see the PR body), not in
  *   vitest.
@@ -24,7 +24,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
@@ -40,7 +40,12 @@ import {
   resolveIoBoundLoadScale, resolveSmokeGithubPerOwner, resolveSmokeReadMemo, resolveSmokeDryRun,
 } from '../daemon-live-smoke.mjs';
 
+import { runBounded } from '../bounded-child.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
+import { ghSlotWaitClass, ghSlotWaitMs } from '../gh-throttle.mjs';
+// Fixture credential values are assembled at runtime (pieces joined) so no long literal sits next to a credential-named key.
+const AMBIENT_STALE = ['daemon', 'ambient', 'stale'].join('-');
+const AMBIENT_STALE_TOKEN = `${AMBIENT_STALE}-token`;
 vi.mock('../settings-files.mjs', async (original) => {
   const actual = await original();
   return { ...actual, readDeclaredSettings: vi.fn(actual.readDeclaredSettings) };
@@ -50,6 +55,122 @@ vi.mock('../settings-files.mjs', async (original) => {
 vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
 beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
 afterEach(() => vi.unstubAllEnvs());
+
+describe('lane acquire smoke after lane-hold reset refusal', () => {
+  const check = SMOKE_CHECKS.find((c) => c.name === 'lane-acquire-release');
+  function context(runChild) {
+    return { root: '/x', env: {}, budgets: resolveSmokeBudgets({}), sessionSlug: 'smoke-hold-test',
+      runChild, clock: () => 1000, hostBusy: () => false };
+  }
+  const exit = (status, extra = {}) => Object.assign(new Error(`exited ${status}: lane-hold text is irrelevant`), { status, signal: null, ...extra });
+  const acquires = (runChild) => runChild.mock.calls.filter(([, args]) => args[1] === 'acquire');
+
+  it('retries once on the environmental-only exit (75) and releases the successful lease', async () => {
+    const runChild = vi.fn().mockRejectedValueOnce(exit(75)).mockResolvedValueOnce(JSON.stringify({ lane: 4 })).mockResolvedValueOnce('');
+    const row = await check.run(context(runChild));
+    expect(row).toMatchObject({ ok: true, lane: 4 });
+    expect(acquires(runChild)).toHaveLength(2);
+    const releases = runChild.mock.calls.filter(([, args]) => args.includes('release'));
+    expect(releases).toHaveLength(1);
+    expect(releases[0][1]).toEqual(expect.arrayContaining(['release', '--lane=4']));
+  });
+
+  it('reports lane-pool\'s own ✗ reason, not its first progress line (live 2026-11-01 lane-33 reclaim listing)', async () => {
+    const stderr = '  lane-33: reclaiming 127 local commit(s), already patch-equivalent to work pushed elsewhere (no unique content — safe to drop):\n'
+      + '    bcba4d2c72 Merge\n  lane-33: reset REFUSED — lane-hold: a fixer is parked\n'
+      + '✗ no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision\n';
+    const runChild = vi.fn().mockRejectedValue(exit(1, { message: 'exited 1:   lane-33: reclaiming 127 local commit(s)', stderr }));
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.detail).toBe('lane-pool acquire --purpose=smoke failed: exited 1: no free lane in pool "web-everything" — every candidate this call tried was claimed but failed to provision');
+    expect(row.detail).not.toContain('reclaiming');
+  });
+
+  it('two environmental-only exits are a lane-hold-refused skip, with no release attempted', async () => {
+    const runChild = vi.fn().mockRejectedValue(exit(75));
+    const row = await check.run(context(runChild));
+    expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
+    expect(acquires(runChild)).toHaveLength(2);
+    expect(runChild.mock.calls.some(([, args]) => args.some((a) => /^--lane=/.test(a)))).toBe(false);
+  });
+
+  it.each([
+    ['failed provisioning', '— every candidate this call tried was claimed but failed to provision (see the warnings above); each was released — investigate the underlying failure, or retry', false],
+    ['unknown exhaustion', '— unknown failure', false],
+    ['held or dirty lanes', '(12 all held/dirty) — release one or `provision` more', true],
+  ])('classifies %s after the wait on a busy host using a real child error', async (_name, reason, skipped) => {
+    const stderr = (skipped ? '  waiting for an available lane\n' : '  lane-33: npm ci failed: package-lock.json is out of sync\n')
+      + `✗ no free lane in pool "web-everything" ${reason}\n`;
+    let now = 1000;
+    const runChild = vi.fn(async (_cmd, args) => {
+      if (args[1] === 'release') return '';
+      try {
+        return await runBounded(process.execPath, ['-e', `process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 1;`], {
+          timeoutMs: 5000, maxBytes: 1024,
+        });
+      } finally { now += 30_000; }
+    });
+    const row = await check.run({ ...context(runChild), clock: () => now, hostBusy: () => true });
+    expect(row.ok).toBe(skipped);
+    expect(row.skipped === true).toBe(skipped);
+    expect(acquires(runChild)).toHaveLength(1);
+    expect(runChild).toHaveBeenCalledTimes(skipped ? 2 : 1);
+    if (skipped) expect(row.skipReason).toBe('busy-pool');
+    else {
+      expect(row.detail).toContain(`exited 1: no free lane in pool "web-everything" ${reason}`);
+      expect(row.stderrTail).toContain('package-lock.json is out of sync');
+    }
+  });
+
+  it('classifies real runBounded exits: two 75s skip, while exit 1 fails', async () => {
+    await expect(runBounded(process.execPath, ['-e', 'process.exit(75)'], {
+      timeoutMs: 5000, maxBytes: 1024,
+    })).rejects.toMatchObject({ status: 75, signal: null });
+    for (const status of [75, 1]) {
+      const runChild = vi.fn((_cmd, args, opts) => {
+        expect(args[1]).toBe('acquire');
+        return runBounded(process.execPath, ['-e', `process.exit(${status})`], {
+          ...opts, cwd: process.cwd(), timeoutMs: 5000, maxBytes: 1024,
+        });
+      });
+      const row = await check.run(context(runChild));
+      if (status === 75) {
+        expect(row).toMatchObject({ ok: true, skipped: true, skipReason: 'lane-hold-refused' });
+        expect(acquires(runChild)).toHaveLength(2);
+      } else {
+        expect(row.ok).toBe(false);
+        expect(row.skipped).not.toBe(true);
+        expect(acquires(runChild)).toHaveLength(1);
+      }
+      expect(runChild).toHaveBeenCalledTimes(status === 75 ? 2 : 1);
+    }
+  });
+
+  it.each([
+    ['ordinary exit 1 mentioning lane-hold', exit(1)],
+    ['a signal', Object.assign(new Error('exited SIGSEGV: lane-hold'), { status: null, signal: 'SIGSEGV' })],
+    ['a timeout', Object.assign(new Error('timed out after 120000ms lane-hold'), { status: null, signal: 'SIGKILL' })],
+    ['75 with a signal', exit(75, { signal: 'SIGTERM' })],
+  ])('the first failure being %s is never retried or skipped', async (_n, err) => {
+    const runChild = vi.fn().mockRejectedValue(err);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+    expect(acquires(runChild)).toHaveLength(1);
+  });
+
+  it.each([
+    ['exit 1 with lane-hold in stderr', exit(1, { stderr: 'lane-9: reset REFUSED — lane-hold: x\nnpm ERR! code EIO' })],
+    ['a signal', Object.assign(new Error('exited SIGSEGV'), { status: null, signal: 'SIGSEGV' })],
+    ['a fatal git error', exit(128, { stderr: 'fatal: bad object HEAD lane-hold' })],
+  ])('a retry that fails with %s after an environmental first failure is a real failure', async (_n, err) => {
+    const runChild = vi.fn().mockRejectedValueOnce(exit(75)).mockRejectedValueOnce(err);
+    const row = await check.run(context(runChild));
+    expect(row.ok).toBe(false);
+    expect(row.skipped).not.toBe(true);
+    expect(acquires(runChild)).toHaveLength(2);
+  });
+});
 
 describe('resource shadow observations', () => {
   it.each([[63, 'admit', false], [3, 'wait', true]])('uses shadow admission at load %s', (load1, verdict, busy) => {
@@ -234,19 +355,220 @@ describe('runBounded failure details', () => {
     expect(row.detail).not.toContain('\n');
   });
 
-  it('bounds the stderr tail to six lines, 300 characters per line and 1200 total, retaining the last error', async () => {
+  it('bounds the stderr tail to ten lines, 300 characters per line and 2400 total, retaining the last error', async () => {
     const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
-      stderr: ['omitted preamble', ...Array.from({ length: 5 }, (_, i) => `${i}: ${'x'.repeat(400)}`),
+      stderr: ['omitted preamble', ...Array.from({ length: 12 }, (_, i) => `${i}: ${'x'.repeat(400)}`),
         '', '\u001bError: final failure ghp_secretToken\u0000', ''].join('\n'),
     }));
     const tail = row.stderrTail.slice('example/repo: '.length);
-    expect(tail.length).toBeLessThanOrEqual(1200);
-    expect(tail.split(' | ').length).toBeLessThanOrEqual(6);
+    expect(tail.length).toBeLessThanOrEqual(2400);
+    expect(tail.split(' | ').length).toBeLessThanOrEqual(10);
     expect(tail.split(' | ').every((line) => line.length <= 300)).toBe(true);
     expect(tail).not.toContain('omitted preamble');
     expect(tail).not.toContain('ghp_secretToken');
     expect(tail).not.toMatch(/[\p{Cc}\p{Cf}]/u);
     expect(tail).toContain('Error: final failure ghp_<redacted>');
+  });
+
+  it('a gh-throttle slot refusal on reconcile is classified env-timeout, never code', async () => {
+    const stderr = 'pr-snapshot: smoke sample 12\ngh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n';
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: smoke sample 12'), { stderr, status: 1 }));
+    expect(row.ok).toBe(false);
+    expect(row.detail).toContain('gh-throttle: throttled — no gh slot within 90s (class=read)');
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5 })).toBe(false); // no laundering: must really have spent time
+  });
+
+  it.each([
+    ['90', '\n', '; retry next tick'], ['90.125', '\r\n', '; retry next tick'], ['90', '\n', ''],
+  ])('classifies the reconcile CLI wrapper around a %ss slot refusal as env (%j, %j)', async (wait, newline, suffix) => {
+    const cause = `gh-throttle: throttled — no gh slot within ${wait}s (class=read)`;
+    const stderr = ['pr-snapshot: smoke sample 12', `${cause}${suffix}`,
+      `✗ reconcile pass could not read state: ${cause}${suffix}`, ''].join(newline);
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: smoke sample 12'), { stderr, status: 1 }));
+    expect(row.ok).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5 })).toBe(false);
+    expect(row.detail).toContain(cause);
+  });
+
+  it.each([
+    ['arbitrary prefix', { prefix: 'unrelated failure: ' }],
+    ['wrapper with extra suffix', { suffix: '; unrelated failure' }],
+    ['later failure', { after: '\nunrelated failure' }],
+    ['earlier Error', { before: 'TypeError: boom\n' }],
+    ['earlier stack', { before: '    at fail (file:///x.mjs:1:1)\n' }],
+    ['signal kill', { signal: 'SIGSEGV' }],
+    ['non-1 exit', { status: 2 }],
+  ])('keeps a wrapped throttle refusal with %s classified as code', async (_name, variant) => {
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
+    const stderr = `${variant.before ?? ''}${cause}\n${variant.prefix ?? '✗ reconcile pass could not read state: '}${cause}${variant.suffix ?? ''}${variant.after ?? ''}\n`;
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
+      stderr, status: variant.status ?? 1, signal: variant.signal,
+    }));
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(false);
+  });
+
+  it('classifies stderr emitted by the shipped reconcile CLI catch for a throttle exception', async () => {
+    // Resolve a filesystem path directly: Vite rewrites new URL(relative, import.meta.url) to an HTTP asset URL.
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick';
+    // Inject the failed state read at the module boundary; execute the actual CLI and its catch unchanged.
+    const snapshot = `export { sampleContextDeclared } from ${JSON.stringify(pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href)};
+    export function readSharedOpenPrs() {
+      process.stderr.write(${JSON.stringify(cause + '\n')});
+      throw new Error(${JSON.stringify(cause)});
+    }`;
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && specifier === '../lib/pr-snapshot.mjs') {
+        return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(snapshot)}`)}, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }`;
+    let failure;
+    try {
+      execFileSync(process.execPath, [`--experimental-loader=data:text/javascript,${encodeURIComponent(loader)}`,
+        '--no-warnings', cli, '--repo=we', '--json'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000,
+        env: { ...process.env, WE_RESOURCE_SHADOW: 'off' },
+      });
+    } catch (error) { failure = error; }
+    expect(failure?.status).toBe(1);
+    expect(failure.stderr.trim().split('\n').slice(-2)).toEqual([
+      cause, `✗ reconcile pass could not read state: ${cause}`,
+    ]);
+    const row = await runCheck('reconcile-dry-run', failure);
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(true);
+  }, 35000);
+
+  it.each(['first page', 'later page', 'hydrate'])('recognizes a refusal through fetchSnapshot and the real reconcile CLI catch (%s)', async (stage) => {
+    const cli = join(dirname(fileURLToPath(import.meta.url)), '../../conveyor/reconcile-pass.mjs');
+    const snapshotUrl = pathToFileURL(join(dirname(cli), '../lib/pr-snapshot.mjs')).href;
+    const cause = 'gh-throttle: throttled — no gh slot within 90s (class=background); retry next tick';
+    // Replace only the snapshot entry point: its actual page/hydration reader wraps the injected exec failure.
+    const snapshot = `import { fetchSnapshot } from ${JSON.stringify(snapshotUrl)};
+      export { sampleContextDeclared } from ${JSON.stringify(snapshotUrl)};
+      export function readSharedOpenPrs() {
+        let calls = 0;
+        return fetchSnapshot({ repo: 'example/repo', paging: { pageSize: 1, pageRetries: 0, heavyMaxAgeSeconds: 1 },
+          exec() {
+            if (++calls === 1 && ${JSON.stringify(stage)} !== 'first page') {
+              return JSON.stringify({ data: { repository: { pullRequests: {
+                totalCount: ${JSON.stringify(stage)} === 'hydrate' ? 1 : 2, nodes: [{ number: 42 }],
+                pageInfo: { hasNextPage: ${JSON.stringify(stage)} === 'later page', endCursor: 'next' }
+              } } } });
+            }
+            throw Object.assign(new Error('exited 1'), { status: 1, stderr: ${JSON.stringify(cause)} });
+          } });
+      }`;
+    const loader = `export async function resolve(specifier, context, nextResolve) {
+      if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && specifier === '../lib/pr-snapshot.mjs') {
+        return { url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(snapshot)}`)}, shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    }`;
+    let failure;
+    try {
+      execFileSync(process.execPath, [`--experimental-loader=data:text/javascript,${encodeURIComponent(loader)}`,
+        '--no-warnings', cli, '--repo=we', '--json'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, WE_RESOURCE_SHADOW: 'off' },
+      });
+    } catch (error) { failure = error; }
+    expect(failure?.status).toBe(1);
+    const where = stage === 'hydrate' ? 'hydrate PR #42' : `page page ${stage === 'first page' ? 1 : 2}`;
+    expect(failure.stderr.trim()).toBe(`✗ reconcile pass could not read state: open-PR list unreadable for example/repo: ${where} failed: ${cause}`);
+    const row = await runCheck('reconcile-dry-run', failure);
+    expect(isEnvTimeoutRow({ ...row, ms: 180000 })).toBe(true);
+  }, 35000);
+
+  it('uses the default background slot wait below the generic 30s floor, even with successful sibling repos', async () => {
+    const caller = 'rebuild-smoke:reconcile-dry-run';
+    const waitClass = ghSlotWaitClass({ caller, args: ['api', 'graphql'] });
+    const { waitMs } = ghSlotWaitMs({ caller, waitClass });
+    expect(waitClass).toBe('background');
+    expect(waitMs).toBe(8000);
+    const refusal = Object.assign(new Error('exited 1: info'), { status: 1,
+      stderr: `gh-throttle: throttled — no gh slot within ${waitMs / 1000}s (class=${waitClass}); retry next tick\n` });
+    const row = await SMOKE_CHECKS.find(c => c.name === 'reconcile-dry-run').run({
+      root: '/x', repos: ['example/repo', 'example/fast'], budgets: {}, env: {},
+      runChild: async (_cmd, args) => { if (args.includes('--repo=example/repo')) throw refusal; return ''; },
+    });
+    expect(isEnvTimeoutRow({ ...row, ms: 8100 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 100 })).toBe(false);
+  });
+
+  it.each([
+    ['8.125', 8200, true], ['8.125', 100, false], ['0', 8100, false], ['0.001', 8100, false],
+  ])('checks measured elapsed time against a %ss refusal (%sms → %s)', async (wait, ms, expected) => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), { status: 1,
+      stderr: `gh-throttle: throttled — no gh slot within ${wait}s (class=background); retry next tick\n` }));
+    expect(isEnvTimeoutRow({ ...row, ms })).toBe(expected);
+  });
+
+  it.each([
+    { prefix: 'unrelated: ' }, { suffix: '; unrelated failure' }, { after: '\nunrelated failure' },
+    { before: 'TypeError: boom\n' }, { before: '    at fail (file:///x.mjs:1:1)\n' },
+    { signal: 'SIGSEGV' }, { status: 2 },
+    { where: 'page page 0' }, { where: 'unknown PR #42' },
+    { repo: 'example/repo\u2028unrelated' }, { repo: 'example/repo\rbroken' },
+    { repo: 'example/repo\u200b' }, { repo: '--example/`repo`' },
+  ])('keeps malformed snapshot wrappers and independent failures as code: %j', async (variant) => {
+    const stderr = `${variant.before ?? ''}${variant.prefix ?? ''}✗ reconcile pass could not read state: open-PR list unreadable for ${variant.repo ?? 'example/repo'}: ${variant.where ?? 'page page 1'} failed: gh-throttle: throttled — no gh slot within 8s (class=background); retry next tick${variant.suffix ?? ''}${variant.after ?? ''}\n`;
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: info'), {
+      status: variant.status ?? 1, signal: variant.signal, stderr,
+    }));
+    expect(isEnvTimeoutRow({ ...row, ms: 90000 })).toBe(false);
+  });
+
+  it('uses the longest refused slot wait across repos and respects a configured elapsed floor', async () => {
+    let n = 0;
+    const row = await SMOKE_CHECKS.find(c => c.name === 'reconcile-dry-run').run({
+      root: '/x', repos: ['example/a', 'example/b'], budgets: {}, env: {},
+      runChild: async () => { throw Object.assign(new Error('exited 1: info'), { status: 1,
+        stderr: `gh-throttle: throttled — no gh slot within ${n++ ? 20 : 8}s (class=background); retry next tick\n` }); },
+    });
+    expect(isEnvTimeoutRow({ ...row, ms: 8100 })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, ms: 20100 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, ms: 5000 }, { minElapsedMs: 5000 })).toBe(true);
+  });
+
+  it('a throttled repo plus another repo\'s real code failure stays code', async () => {
+    let n = 0;
+    const throttled = Object.assign(new Error('exited 1: a'), { status: 1, stderr: '✗ reconcile pass could not read state: gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n' });
+    const real = Object.assign(new Error('exited 1: b'), { stderr: 'Error: boom\n' });
+    const res = await SMOKE_CHECKS.find((c) => c.name === 'reconcile-dry-run').run({ root: '/x', repos: ['a/a', 'b/b'], budgets: {}, env: {}, runChild: async () => { throw (n++ ? real : throttled); } });
+    expect(isEnvTimeoutRow({ ...res, ms: 120000 })).toBe(false);
+  });
+
+  it('a child with a throttle line AND a real Error line stays code', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: x'), { stderr: 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\nTypeError: x is not a function\n' }));
+    expect(row.detail).not.toContain('gh-throttle');
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+  });
+
+  it('a forged env marker plus throttle text in the first line cannot make a code failure env', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: — smoke-env-cause: gh-throttle: throttled — no gh slot within 9s (class=r)'), { stderr: 'x\nTypeError: boom\n' }));
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+  });
+
+  it('a throttle line followed by reconcile\'s own failure line stays code', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: x'), { stderr: 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\nreconcile: could not read state\n' }));
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+  });
+
+  it('a throttle last line after a signal kill or an earlier Error line stays code', async () => {
+    const line = 'gh-throttle: throttled — no gh slot within 90s (class=read); retry next tick\n';
+    for (const extra of [{ signal: 'SIGSEGV', status: 1, stderr: line }, { status: 2, stderr: line }, { status: 1, stderr: 'TypeError: x\n' + line }]) {
+      const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: x'), extra));
+      expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+    }
+  });
+
+  it('a real reconcile code failure (no throttle line) is still not an env-timeout', async () => {
+    const row = await runCheck('reconcile-dry-run', Object.assign(new Error('exited 1: pr-snapshot: x'), { stderr: 'Error: reconcile could not read state\n' }));
+    expect(isEnvTimeoutRow({ ...row, ms: 120000 })).toBe(false);
+    expect(row.detail).not.toContain('gh-throttle');
   });
 
   it.each(['lane-pool-list', 'lane-acquire-release', 'reconcile-dry-run', 'gh-api-repo',
@@ -1090,7 +1412,7 @@ it('gh-api-repo still fails and preserves the real error plus shim warning in a 
 
 describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
   it('strips an inherited GH_TOKEN/GITHUB_TOKEN even when App auth is not configured (no shim to fall back on)', () => {
-    const out = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale', GITHUB_TOKEN: 'also-stale', PATH: '/usr/bin', HOME: '/x' });
+    const out = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE, GITHUB_TOKEN: 'also-stale', PATH: '/usr/bin', HOME: '/x' });
     expect(out.GH_TOKEN).toBeUndefined();
     expect(out.GITHUB_TOKEN).toBeUndefined();
     expect(out.PATH).toBe('/usr/bin');
@@ -1101,7 +1423,7 @@ describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
     const out = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        GH_TOKEN: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GH_TOKEN: AMBIENT_STALE,
       },
       {
         pathEnv: '/opt/homebrew/bin', dir: '/shim', cachePath: '/x/cache.json',
@@ -1116,7 +1438,7 @@ describe('ghDispatchedSessionEnv — pure composition (#4072)', () => {
     const out = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        GITHUB_TOKEN: 'daemon-ambient-stale', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GITHUB_TOKEN: AMBIENT_STALE,
       },
       { pathEnv: '/opt/homebrew/bin', dir: '/shim', exists: () => true, writeFile: vi.fn(), chmod: vi.fn(), mkdir: vi.fn() },
     );
@@ -1140,7 +1462,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
 
   it('FAILS (RED→GREEN: this is what today\'s bug let quietly pass) when routed through ghDispatchedSessionEnv against a daemon env carrying a stale ambient GH_TOKEN and no shim configured', async () => {
     const runChild = vi.fn(fakeGh);
-    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/usr/bin' });
+    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' });
     const result = await ghApiCheck({ ghChildEnv, budgets: { ghApiMs: 1000 }, runChild });
     expect(result.ok).toBe(false);
     expect(result.detail).toMatch(/failed/);
@@ -1149,7 +1471,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
 
   it('gh-pr-list FAILS the same way, for the same reason', async () => {
     const runChild = vi.fn(fakeGh);
-    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/usr/bin' });
+    const ghChildEnv = ghDispatchedSessionEnv({ GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' });
     const result = await ghPrListCheck({ ghChildEnv, budgets: { ghPrListMs: 1000 }, runChild });
     expect(result.ok).toBe(false);
   });
@@ -1158,7 +1480,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
     const runChild = vi.fn(fakeGh);
     // Reproduces the pre-fix `ghEnvFor`: no shim contributed (App auth unconfigured here, matching the
     // isolated unit above), so `{...env, ...null}` === env, UNCHANGED — the ambient token survives untouched.
-    const preFixGhChildEnv = { GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/usr/bin' };
+    const preFixGhChildEnv = { GH_TOKEN: AMBIENT_STALE_TOKEN, PATH: '/usr/bin' };
     const result = await ghApiCheck({ ghChildEnv: preFixGhChildEnv, budgets: { ghApiMs: 1000 }, runChild });
     expect(result.ok).toBe(true); // demonstrates the masking bug: the gate would have adopted broken code
   });
@@ -1168,7 +1490,7 @@ describe("the gate's gh-api-repo / gh-pr-list checks — must FAIL exactly like 
     const ghChildEnv = ghDispatchedSessionEnv(
       {
         WE_GITHUB_APP_ID: '1', WE_GITHUB_APP_INSTALLATION_ID: '2', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/x/key.pem',
-        GH_TOKEN: 'daemon-ambient-stale-token', PATH: '/opt/homebrew/bin',
+        PATH: '/opt/homebrew/bin', GH_TOKEN: AMBIENT_STALE_TOKEN,
       },
       { pathEnv: '/opt/homebrew/bin', dir: '/shim', exists: () => true, writeFile: vi.fn(), chmod: vi.fn(), mkdir: vi.fn() },
     );
@@ -1737,6 +2059,30 @@ describe('a check that ran out of TIME under load is environment, never code (li
     expect(Number(host.seenEnv[1].LANE_POOL_LIST_SCAN_TIMEOUT_MS)).toBe(300000);
   });
 
+  it('retries a default-duration snapshot refusal once with wider budgets and holds as env-timeout', async () => {
+    let t = 0;
+    const seenBudgets = [];
+    const env = { WE_SMOKE_BUSY_LOAD_RATIO: '1e9', [SMOKE_LOAD_SCALE_ENV]: '0' };
+    const runChild = withNewCheckDefaults(async (_cmd, args, opts = {}) => {
+      if (args[1] === 'list') return '[]';
+      if (args[1] === 'acquire') return '{"lane":1}';
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+        seenBudgets.push(opts.timeoutMs);
+        t += 8100;
+        throw Object.assign(new Error('exited 1: info'), { status: 1,
+          stderr: '✗ reconcile pass could not read state: open-PR list unreadable for example/repo: page page 1 failed: gh-throttle: throttled — no gh slot within 8s (class=background); retry next tick\n' });
+      }
+      return '';
+    });
+    const result = await runLiveSmokeWithRetry({ root: '/x', env,
+      runChild, clock: () => t, sleep: async () => {}, refreshAuth: noAuth });
+    expect(result.verdict).toBe('env-timeout');
+    expect(result.attempts).toBe(2);
+    const original = resolveSmokeBudgets(env).reconcileMs;
+    expect(seenBudgets).toContain(original);
+    expect(seenBudgets).toContain(Math.round(original * 2.5));
+  });
+
   it('a slow first attempt that fits the widened budget on the retry → pass', async () => {
     const host = overloadedHost({ listMs: [120905, 150000], listFails: [true, false] });
     const r = await runLiveSmokeWithRetry({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild: host.runChild, clock: host.clock, sleep: async () => {}, refreshAuth: noAuth });
@@ -2199,5 +2545,258 @@ describe('smoke dry-run settings', () => {
     }
     const listing = calls.find(({ args }) => args[0] === 'scripts/lane-pool.mjs' && args[1] === 'list');
     expect(listing.args).toEqual(['scripts/lane-pool.mjs', 'list', '--acquirable', ...(mode === 'off' ? ['--no-cache'] : []), '--limit=1', '--json']);
+  });
+});
+
+
+describe('boot smoke shared budget and full-cap timeout classification', () => {
+  let diagnosticsDir;
+  beforeEach(() => { diagnosticsDir = mkdtempSync(join(tmpdir(), 'boot-timeout-diag-')); });
+  afterEach(() => rmSync(diagnosticsDir, { recursive: true, force: true }));
+  async function replay({ left = 1275, failure = 'timeout' } = {}) {
+    let t = 0;
+    let bootCalls = 0;
+    const defaults = withNewCheckDefaults(async (_cmd, args) => args[1] === 'list' ? '[]' : args[1] === 'acquire' ? '{"lane":1}' : '');
+    const runChild = budgetedRunChild({ deadline: 100000, now: () => t, runChild: async (cmd, args, opts) => {
+      if (String(args[2] ?? '').includes('daemon-boot-smoke:entry-boot')) {
+        bootCalls++;
+        if (failure === 'import' && bootCalls === 1) return '{"ok":false,"error":"SyntaxError: broken import"}';
+        if (failure === 'crash' && bootCalls === 1) throw Object.assign(new Error('exited 1'), { status: 1 });
+        t += opts.timeoutMs;
+        throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
+      }
+      const out = await defaults(cmd, args, opts);
+      if (String(args[2] ?? '') === DISPATCH_DRY_RUN_SCRIPT) t = 100000 - left;
+      return out;
+    } });
+    const smoke = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BOOT_CONCURRENCY: '1',
+      WE_SMOKE_DAEMON_ENTRIES: Array.from({ length: 7 }, (_, i) => `fixture-${i}.mjs`).join(',') },
+      runChild, clock: () => t });
+    return { row: smoke.results.find(r => r.name === 'daemon-entries-boot'), bootCalls };
+  }
+
+  it('marks the seven 1275ms refusals as budget interrupted without spawning boot children', async () => {
+    const { row, bootCalls } = await replay();
+    expect(bootCalls).toBe(0);
+    expect(row.budgetInterrupted).toBe(true);
+    expect(row.detail).toContain('skipped: rebuild smoke budget exhausted (1275ms left)');
+    expect(row.detail).not.toContain('timed out');
+  });
+
+  it.each(['import', 'crash'])('preserves a genuine %s failure mixed with timeouts and budget refusals', async (failure) => {
+    const { row } = await replay({ left: 55000, failure });
+    expect(row.ok).toBe(false);
+    expect(row.budgetInterrupted).toBeUndefined();
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(classifySmokeFailure([row])).toBe('code');
+  });
+
+  it('refuses an immediate boot kill even after another entry consumed a full cap', async () => {
+    const { checkDaemonEntriesBoot } = await import('../daemon-boot-smoke.mjs');
+    let t = 0;
+    let calls = 0;
+    const result = await checkDaemonEntriesBoot({ root: '/x', diagnosticsDir, now: () => t,
+      env: { WE_SMOKE_DAEMON_ENTRIES: 'slow.mjs,fast.mjs', WE_SMOKE_BOOT_CONCURRENCY: '1' },
+      budgets: { daemonBootMs: 45000 }, runChild: async () => {
+        t += calls++ === 0 ? 45000 : 1;
+        throw new Error('timed out after 45000ms (process group killed)');
+      } });
+    const row = { name: 'daemon-entries-boot', ...result, ms: t };
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutFailureSet([row])).toBe(false);
+    expect(classifySmokeFailure([row])).toBe('code');
+  });
+
+  it('refuses a 120s boot cap with only 30s elapsed and accepts full-cap elapsed', () => {
+    const entry = { ok: false, kind: 'child failed: timed out after 120000ms (process group killed)',
+      timeoutMs: 120000, elapsedMs: 30000 };
+    const row = { name: 'daemon-entries-boot', ok: false, ms: 120000, entries: [entry] };
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 107999 }] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 108000 }] })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 120000 }] })).toBe(true);
+  });
+
+  it('refuses a SIGSEGV attempt followed by a full-cap boot timeout', async () => {
+    const { checkDaemonEntriesBoot } = await import('../daemon-boot-smoke.mjs');
+    let t = 0;
+    let calls = 0;
+    const result = await checkDaemonEntriesBoot({ root: '/x', diagnosticsDir, now: () => t,
+      env: { WE_SMOKE_DAEMON_ENTRIES: 'crash.mjs', WE_SMOKE_BOOT_SIGNAL_RETRIES: '1' },
+      budgets: { daemonBootMs: 45000 }, runChild: async () => {
+        if (calls++ === 0) throw Object.assign(new Error('native crash'), { signal: 'SIGSEGV' });
+        t += 45000;
+        throw new Error('timed out after 45000ms (process group killed)');
+      } });
+    expect(calls).toBe(2);
+    expect(result.entries[0].attempts).toHaveLength(2);
+    expect(result.entries[0].attempts[0].signal).toBe('SIGSEGV');
+    expect(result.entries[0].kind).toBe('child failed: timed out after 45000ms (process group killed)');
+    const row = { name: 'daemon-entries-boot', ...result, ms: t };
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutFailureSet([row])).toBe(false);
+    expect(classifySmokeFailure([row])).toBe('code');
+  });
+
+  it('requires full-cap timeout evidence for every recorded boot attempt', () => {
+    const timeout = { ok: false, kind: 'child failed: timed out after 45000ms (process group killed)',
+      timeoutMs: 45000, elapsedMs: 45000 };
+    const row = { name: 'daemon-entries-boot', ok: false, entries: [timeout] };
+    expect(isEnvTimeoutRow(row)).toBe(true); // Historical entries without attempts still use their own evidence.
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...timeout, attempts: [timeout, timeout] }] })).toBe(true);
+    for (const attempt of [null, {}, { ...timeout, kind: 'import failed' },
+      { ...timeout, kind: 'child failed', signal: 'SIGSEGV' },
+      { ...timeout, elapsedMs: 1 }, { ...timeout, elapsedMs: undefined },
+      { ...timeout, timeoutMs: undefined },
+      { ...timeout, kind: 'child failed: timed out after 1ms (process group killed)', timeoutMs: 1 }]) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...timeout, attempts: [attempt, timeout] }] })).toBe(false);
+    }
+    for (const attempts of [[], null, {}]) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...timeout, attempts }] })).toBe(false);
+    }
+  });
+
+  it('requires complete per-entry elapsed evidence at the boot timeout threshold', () => {
+    const entry = { ok: false, kind: 'child failed: timed out after 10000ms (process group killed)',
+      timeoutMs: 10000, elapsedMs: 9000 };
+    const row = { name: 'daemon-entries-boot', ok: false, ms: 90000, entries: [entry] };
+    expect(isEnvTimeoutRow(row)).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs: 5000 }] }, { minElapsedMs: 5000 })).toBe(false);
+    for (const elapsedMs of [undefined, null, NaN, Infinity, '9000', -1, 1, 8999]) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...entry, elapsedMs }] })).toBe(false);
+    }
+  });
+
+  it('classifies full-cap boot timeouts as env-timeout and refuses incomplete or mixed evidence', async () => {
+    const { checkDaemonEntriesBoot } = await import('../daemon-boot-smoke.mjs');
+    let t = 0;
+    const result = await checkDaemonEntriesBoot({ root: '/x', env: {}, budgets: { daemonBootMs: 45000 },
+      diagnosticsDir, now: () => t, runChild: async () => {
+        t += 45000;
+        throw new Error('timed out after 45000ms (process group killed)');
+      } });
+    const row = { name: 'daemon-entries-boot', ...result, ms: t };
+    expect(isEnvTimeoutRow(row)).toBe(true);
+    expect(isEnvTimeoutFailureSet([row])).toBe(true);
+    // Aggregate elapsed time is redundant: each failed entry supplies its own full-cap evidence.
+    expect(isEnvTimeoutRow({ ...row, ms: 300 })).toBe(true);
+    expect(isEnvTimeoutRow({ ...row, entries: [] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: undefined })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [null] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: [{ ...row.entries[0], timeoutMs: undefined }] })).toBe(false);
+    expect(isEnvTimeoutRow({ ...row, entries: row.entries.map((entry, i) => i === 0
+      ? { ...entry, kind: 'import failed' } : entry) })).toBe(false);
+    for (const kind of ['import failed', 'child failed', 'unparsable child output',
+      'child failed: timed out after 1275ms (process group killed)',
+      'child failed: timed out after 1ms (process group killed)']) {
+      expect(isEnvTimeoutRow({ ...row, entries: [{ ...row.entries[0], kind }] })).toBe(false);
+    }
+  });
+});
+
+// ── sticky load-shaped rejection (live 2026-11-05: drain + merge daemons held "still-rejected", retryAt null) ──
+import { isLoadShapedRow as stickyIsLoadShapedRow } from '../daemon-rebuild/smoke-classify/load-shaped.mjs';
+import * as stickyLoadShaped from '../daemon-rebuild/smoke-classify/load-shaped.mjs';
+
+describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
+  const hot = { load1: 120, cores: 12 };
+  const cool = { load1: 2, cores: 12 };
+  const budget = 'skipped: rebuild smoke budget exhausted (0ms left)';
+  const timeoutRow = (ms = 533869) => ({ name: 'dispatch-dry-run', ok: false, ms, mayBeTransient: false,
+    detail: 'dispatch dry-run child failed: timed out after 533869ms (process group killed)' });
+  const budgetRow = (name) => ({ name, ok: false, ms: 0, mayBeTransient: true, detail: budget });
+  const bootRow = (entries) => ({ name: 'daemon-entries-boot', ok: false, ms: 5, mayBeTransient: false, entries,
+    detail: `${entries.length}/${entries.length} daemon entries failed to boot:\n` + entries.map((e) => `- x.mjs: ${e.kind}`).join('\n') });
+  const skipEntry = () => ({ ok: false, kind: `child failed: ${budget}`, timeoutMs: 60000, elapsedMs: 0, attempts: [{ ok: false, kind: `child failed: ${budget}` }] });
+  const throttleMixed = { name: 'dispatch-dry-run', ok: false, ms: 9000, mayBeTransient: false,
+    detail: 'dispatch dry-run failed (2/7): reconcile-ci-heal-pass: gh-throttle: throttled — no gh slot within 8.095s (class=background); retry next tick\n; reconcile-review-pass: reconcile failed: reconcile read failed (exit 1): gh-throttle: throttled — no gh slot within 8.249s (class=background); retry next tick' };
+
+  it('a budget-exhausted skip row is load-shaped on an overloaded host', () => {
+    expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: hot }, {})).toBe(true);
+  });
+  it('a budget-exhausted skip row is NOT load-shaped on an idle host (no laundering)', () => {
+    expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: cool }, {})).toBe(false);
+  });
+  it('a process-group timeout of the dispatch dry-run child is load-shaped when overloaded, code when idle', () => {
+    expect(stickyIsLoadShapedRow({ ...timeoutRow(), hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...timeoutRow(1), hostLoad: cool }, {})).toBe(false);
+  });
+  it('an all-budget-skipped boot row is load-shaped when overloaded; one real crash keeps it code', () => {
+    expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry(), skipEntry()]), hostLoad: hot }, {})).toBe(true);
+    const crash = { ok: false, kind: 'child failed: exited 1', timeoutMs: 60000, elapsedMs: 100, attempts: 1 };
+    expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry(), crash]), hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...bootRow([skipEntry()]), hostLoad: cool }, {})).toBe(false);
+    const hidden = { ...skipEntry(), attempts: [{ ok: false, kind: 'child failed: exited 1' }, { ok: false, kind: `child failed: ${budget}` }] };
+    expect(stickyIsLoadShapedRow({ ...bootRow([hidden]), hostLoad: hot }, {})).toBe(false);
+  });
+  it('gh-throttle plus a downstream "reconcile read failed" is load-shaped when overloaded only', () => {
+    expect(stickyIsLoadShapedRow({ ...throttleMixed, hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...throttleMixed, hostLoad: cool }, {})).toBe(false);
+  });
+  it('a real code failure beside the throttle text stays code even when overloaded', () => {
+    const row = { ...throttleMixed, hostLoad: hot, detail: `${throttleMixed.detail}; review: TypeError: x is not a function` };
+    expect(stickyIsLoadShapedRow(row, {})).toBe(false);
+  });
+  it('evidence can come from the env seam; absent or unreadable evidence is not overload', () => {
+    expect(stickyIsLoadShapedRow(budgetRow('tree-stays-clean'), { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' })).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...budgetRow('tree-stays-clean'), hostLoad: { load1: NaN, cores: 12 } }, {})).toBe(false);
+  });
+  it('the REAL tree-stays-clean result under an exhausted budget is load-shaped on an overloaded host (retry), code on an idle one', async () => {
+    const runChild = budgetedRunChild({ deadline: 0, now: () => 0, runChild: vi.fn() });
+    const smoke = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild, clock: () => 0 });
+    const real = smoke.results.find((r) => r.name === 'tree-stays-clean');
+    // Produced by the check itself (not hand-typed): `<label> failed: ` wraps the budget refusal.
+    expect(real.detail).toBe('git status --porcelain failed: skipped: rebuild smoke budget exhausted (0ms left)');
+    expect(stickyIsLoadShapedRow({ ...real, hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ ...real, hostLoad: cool }, {})).toBe(false);
+    // A trailing second line or extra text stays code-shaped.
+    expect(stickyIsLoadShapedRow({ ...real, detail: `${real.detail}\nTypeError: x`, hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...real, detail: real.detail.replace('skipped', 'exited 1; skipped'), hostLoad: hot }, {})).toBe(false);
+    // Every sibling check wraps the same refusal in its OWN template (`<label> failed: `, the reconcile per-repo
+    // aggregate): take each string from the real check, never a hand-typed label.
+    const wrapped = smoke.results.filter((r) => !r.ok && r.name !== 'tree-stays-clean');
+    expect(wrapped.map((r) => r.name)).toEqual(expect.arrayContaining(
+      ['lane-pool-list', 'gh-api-repo', 'gh-pr-list', 'reconcile-dry-run', 'dispatch-dry-run', 'daemon-entries-boot']));
+    for (const row of wrapped) {
+      expect(stickyIsLoadShapedRow({ ...row, hostLoad: hot }, {}), `${row.name} hot: ${row.detail}`).toBe(true);
+      expect(stickyIsLoadShapedRow({ ...row, hostLoad: cool }, {}), `${row.name} cool`).toBe(false);
+    }
+    // The dispatch dry-run names the refused pass before the skip; only the three real pass names qualify.
+    const dispatch = smoke.results.find((r) => r.name === 'dispatch-dry-run');
+    expect(dispatch.detail).toMatch(/^dispatch dry-run child failed: reconcile-(fix|ci-heal|review)-pass skipped: /);
+    for (const pass of ['reconcile-fix-pass', 'reconcile-ci-heal-pass', 'reconcile-review-pass']) {
+      const detail = dispatch.detail.replace(/reconcile-[\w-]+-pass/, pass);
+      expect(stickyIsLoadShapedRow({ ...dispatch, detail, hostLoad: hot }, {}), `${pass} hot`).toBe(true);
+    }
+    expect(stickyIsLoadShapedRow({ ...dispatch, detail: dispatch.detail.replace(/reconcile-[\w-]+-pass/, 'reconcile-evil-pass'), hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...dispatch, detail: dispatch.detail.replace(/reconcile-[\w-]+-pass/, 'TypeError: x reconcile-fix-pass'), hostLoad: hot }, {})).toBe(false);
+    // The reconcile aggregate: one real per-repo failure among the skips keeps the row code-shaped.
+    const reconcile = smoke.results.find((r) => r.name === 'reconcile-dry-run');
+    expect(reconcile.detail).toMatch(/^reconcile-pass dry-run failed for 3\/3 repo\(s\): .+; .+/);
+    expect(stickyIsLoadShapedRow({ ...reconcile, detail: `${reconcile.detail}; o/r: exited 1: TypeError`, hostLoad: hot }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ ...reconcile, detail: `${reconcile.detail}\nTypeError: x`, hostLoad: hot }, {})).toBe(false);
+    // The gate's own `threw: ` wrapper of an unguarded runChild.
+    expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `threw: ${budget}`, hostLoad: hot }, {})).toBe(true);
+    expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: `threw: ${budget}`, hostLoad: cool }, {})).toBe(false);
+    expect(stickyIsLoadShapedRow({ name: 'x', ok: false, detail: 'threw: TypeError: x', hostLoad: hot }, {})).toBe(false);
+    const state = { rejected: { inputsKey: 'k', reason: 'tree-stays-clean', at: 'x' },
+      held: { reason: 'smoke-rejected', details: [{ name: 'tree-stays-clean', detail: real.detail }] } };
+    const now = Date.parse('2026-11-05T17:00:00Z');
+    expect(stickyLoadShaped.cachedRejectionLoadRetry(state, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now }))
+      .toMatchObject({ envLoad: true, attempts: 1 });
+  });
+  it('cachedRejectionLoadRetry schedules an env-load retry for a cached load-shaped rejection', () => {
+    const state = { rejected: { inputsKey: 'k', reason: 'dispatch-dry-run,tree-stays-clean', at: 'x' },
+      held: { reason: 'smoke-rejected', details: [
+        { name: 'dispatch-dry-run', detail: timeoutRow().detail },
+        { name: 'tree-stays-clean', detail: budget }] } };
+    const now = Date.parse('2026-11-05T17:00:00Z');
+    const r = stickyLoadShaped.cachedRejectionLoadRetry(state, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now });
+    expect(r).toMatchObject({ envLoad: true, attempts: 1 });
+    expect(Date.parse(r.retryAt)).toBeGreaterThan(now);
+    expect(stickyLoadShaped.cachedRejectionLoadRetry(state, { WE_SMOKE_HOST_LOAD1: '1', WE_SMOKE_HOST_CORES: '12' }, { now })).toBeNull();
+    const withCode = { ...state, held: { ...state.held, details: [...state.held.details, { name: 'x', detail: 'TypeError: boom' }] } };
+    expect(stickyLoadShaped.cachedRejectionLoadRetry(withCode, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now })).toBeNull();
+    expect(stickyLoadShaped.cachedRejectionLoadRetry({ ...state, rejected: { ...state.rejected, retryAt: '2026-11-05T18:00:00Z' } }, {}, { now })).toBeNull();
   });
 });

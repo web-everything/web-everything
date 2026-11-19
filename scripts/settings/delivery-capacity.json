@@ -1,0 +1,19 @@
+{
+  "$comment": "S1 read-only delivery capacity: standard -> platform -> tool -> environment (WE_DELIVERY_CAPACITY_MODE). Defaults live in scripts/lib/delivery-capacity.mjs; count mode preserves the existing open-PR rule. Units mode weighs proven card-only diffs, sizes, accepted and bounded held PRs. Unknown evidence falls back to count mode and holds starts. Enforcement consumers are unchanged.",
+  "deliveryCapacity": {
+    "autoTune": {
+      "mode": "shadow",
+      "everyMin": 60,
+      "windowH": 6,
+      "minMerges": 10,
+      "ttmTargetH": 6,
+      "backoffFactor": 1.5,
+      "roundsTarget": 2.0,
+      "increase": 2,
+      "decrease": 0.8,
+      "minUnits": 12,
+      "maxUnits": 48,
+      "raiseOnlyIfBinding": true
+    }
+  }
+}

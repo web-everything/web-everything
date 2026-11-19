@@ -47,6 +47,7 @@ import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync, lstatSync, c
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { admittedArgv } from './heavy-admission.mjs';
 import {
   findingFiles,
   GENERIC_STEM, idsForPath, MAX_LINKED_HITS_PER_ID, linkedFilesFor,
@@ -246,7 +247,33 @@ export function summarize(rows) {
     fullCpuAvg, scopedCpuAvg,
     realSavingsPct: fullRealAvg ? (1 - scopedRealAvg / fullRealAvg) * 100 : null,
     cpuSavingsPct: fullCpuAvg ? (1 - scopedCpuAvg / fullCpuAvg) * 100 : null,
-    pass: totalMissed === 0,
+    // A replay where no diff ran (every row errored, e.g. every run deferred by the admission queue) checked
+    // nothing, so it cannot pass (self-review of #6461 round 5).
+    pass: totalMissed === 0 && n > 0,
+  };
+}
+
+/**
+ * One diff's {@link ReplayRow} from its full and scoped runner results. A run that produced no JSON (the admission
+ * queue deferred it with exit 75, or it crashed) checked nothing, so its empty error list must not read as a clean
+ * comparison: the row is an error row naming that run (review #6461 round 5). Pure.
+ */
+export function replayRow({ diff, linked = [], full, scoped }) {
+  const unrun = [['full', full], ['scoped', scoped]].find(([, r]) => !r || r.parseError);
+  if (unrun) {
+    const [name, r] = unrun;
+    return { sha: diff.sha, subject: diff.subject, error: `${name} check-standards run produced no result (exit ${r?.status ?? 'none'}): ${r?.parseError ?? 'no runner result'}` };
+  }
+  const laneFiles = Array.from(new Set([...diff.changedFiles, ...linked])).sort();
+  const cmp = compareFindings({ fullErrors: full.errors, scopedErrors: scoped.errors, laneFiles });
+  return {
+    sha: diff.sha, subject: diff.subject, head: diff.head,
+    changedCount: diff.changedFiles.length, linkedCount: linked.length,
+    full: { realSec: full.realSec, userSec: full.userSec, sysSec: full.sysSec, maxRssBytes: full.maxRssBytes, errors: full.errors.length, warnings: full.warnings.length },
+    scoped: { realSec: scoped.realSec, userSec: scoped.userSec, sysSec: scoped.sysSec, maxRssBytes: scoped.maxRssBytes, errors: scoped.errors.length, warnings: scoped.warnings.length },
+    missedCount: cmp.missedCount,
+    laneRelevantCount: cmp.laneRelevantCount,
+    missed: cmp.missed.slice(0, 20).map((f) => ({ message: f.message, descriptor: f.descriptor })),
   };
 }
 
@@ -301,7 +328,11 @@ function gitGrepIn(cwd) {
  *  `/usr/bin/time -l`. Never throws — a non-zero exit is a normal "errors found" result, not a harness failure;
  *  only an unparseable/absent JSON payload is reported as an error string. */
 function runCheckStandards(worktreePath, extraArgs) {
-  const res = spawnSync('/usr/bin/time', ['-l', 'node', 'scripts/check-standards.mjs', '--json', ...extraArgs], {
+  // A full check-standards run is a heavy run: it takes a host admission slot like every other (review #6461
+  // round 5 — the spawn lint now sees through the path-qualified `/usr/bin/time`). `time` wraps only the child,
+  // so the queue wait is not in the measured time.
+  const run = admittedArgv('/usr/bin/time', ['-l', 'node', 'scripts/check-standards.mjs', '--json', ...extraArgs]);
+  const res = spawnSync(run.file, run.args, {
     cwd: worktreePath, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
   });
   const time = parseBsdTime(res.stderr);
@@ -423,19 +454,8 @@ function runCli(argv) {
 
       const full = runCheckStandards(worktreePath, []);
       const linked = linkedFilesFor(diff.changedFiles, { gitGrep: gitGrepIn(worktreePath) });
-      const laneFiles = Array.from(new Set([...diff.changedFiles, ...linked])).sort();
       const scoped = runCheckStandards(worktreePath, ['--local', `--files=${diff.changedFiles.join(',')}`]);
-      const cmp = compareFindings({ fullErrors: full.errors, scopedErrors: scoped.errors, laneFiles });
-
-      results.push({
-        sha: diff.sha, subject: diff.subject, head: diff.head,
-        changedCount: diff.changedFiles.length, linkedCount: linked.length,
-        full: { realSec: full.realSec, userSec: full.userSec, sysSec: full.sysSec, maxRssBytes: full.maxRssBytes, errors: full.errors.length, warnings: full.warnings.length },
-        scoped: { realSec: scoped.realSec, userSec: scoped.userSec, sysSec: scoped.sysSec, maxRssBytes: scoped.maxRssBytes, errors: scoped.errors.length, warnings: scoped.warnings.length },
-        missedCount: cmp.missedCount,
-        laneRelevantCount: cmp.laneRelevantCount,
-        missed: cmp.missed.slice(0, 20).map((f) => ({ message: f.message, descriptor: f.descriptor })),
-      });
+      results.push(replayRow({ diff, linked, full, scoped }));
     } catch (e) {
       results.push({ sha: diff.sha, subject: diff.subject, error: String(e?.message || e) });
     }

@@ -4,7 +4,9 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runAutoRebase, finishPendingSwaps } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
+import { ADMISSION_DEFERRED_EXIT, admittedArgv } from '../../../readiness/heavy-admission.mjs';
+import { runAutoRebase, finishPendingSwaps, heavyTestReport, runHeavyTests } from '../../../lib/daemon-rebuild/auto-rebase.mjs';
+import { scratchTestOutput } from './scratch-tests-forge-command.mjs';
 import { addOverlay, removeOverlay, readOverlays, overlayFilePath, persistStackBases } from '../../../lib/daemon-overlays.mjs';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '../../../../..');
@@ -14,8 +16,29 @@ const success = stdout => ({ status: 0, stdout: stdout ?? '' });
 const agent = lastMessage => success(JSON.stringify({ exitCode: 0, events: { terminal: 'turn.completed' }, lastMessage }));
 
 // The worker is real; Git is virtual so this probe never mutates repository metadata.
+/** Run cap for the real Vitest child, and the spawn options that keep the queue wait out of it. */
+export const INVENTORY_RUN_TIMEOUT_MS = 30_000;
+/** The admission wrapper's slot wait would otherwise count against the run cap and get the wrapper killed
+ *  mid-wait. Inside a held slot (test:unit / verify set WE_HEAVY_ADMISSION_HELD=1) the wrapper runs the child at
+ *  once; outside one, a zero wait budget makes a busy queue an explicit deferral exit with its reason on stderr
+ *  (reported by the callers' status assertion), never a silent timeout kill. */
+export function inventoryRunnerOptions(cwd, env) {
+  return { cwd, env: { ...env, WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0' }, encoding: 'utf8',
+    timeout: INVENTORY_RUN_TIMEOUT_MS, maxBuffer: 1024 * 1024 };
+}
+
+/** What the real Vitest child did: `ran`, `deferred` (the admission wrapper's busy-queue exit: the tests did not
+ *  run, so this is not a test failure) or `failed`, with the reason from stderr or the signal (review #6461 r4). */
+export function inventoryRunOutcome(result) {
+  if (!result) return { outcome: 'failed', reason: 'no runner result' };
+  if (result.status === 0) return { outcome: 'ran' };
+  const reason = String(result.stderr || '').trim() || result.signal || `exit ${result.status}`;
+  return { outcome: result.status === ADMISSION_DEFERRED_EXIT ? 'deferred' : 'failed', reason };
+}
+
 // realRunner exercises Vitest's actual file-filter/exclude behavior with the reported paths.
-export async function runTestInventoryCase({ mode = 'excluded', realRunner = false, rewriteBases, pendingFailure } = {}) {
+// `spawn` is injectable so a wrapper deferral exit can be exercised without a busy host queue.
+export async function runTestInventoryCase({ mode = 'excluded', realRunner = false, rewriteBases, pendingFailure, spawn = spawnSync } = {}) {
   const dir = fs.mkdtempSync(join(tmpdir(), 'soak-auto-inventory-'));
   const root = join(dir, 'clone');
   fs.mkdirSync(root);
@@ -51,27 +74,35 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
       if (args[0] === 'push') pushed = true;
       return success();
     },
-    async testRunner({ root: scratch, args }) {
+    async testRunner({ root: scratch, args, testReport }) {
       if (realRunner) {
         for (const file of files) {
           fs.mkdirSync(join(scratch, 'scripts/operations/__tests__'), { recursive: true });
-          fs.writeFileSync(join(scratch, file), `import { it, expect } from 'vitest'; it('assertion', () => expect(${file === integration ? 'false' : 'true'}).toBe(true));\n`);
+          fs.writeFileSync(join(scratch, file), mode === 'empty-suite'
+            ? "import { describe } from 'vitest'; describe('empty describe', () => {});\n"
+            : `import { it, expect } from 'vitest'; it('assertion', () => expect(${file === integration ? 'false' : 'true'}).toBe(true));\n`);
         }
         // Same exclusion as the repository's unit config; no project setup or external state.
-        fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
-        runnerResult = spawnSync(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(6)], {
-          cwd: scratch, env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
-        });
+        fs.writeFileSync(join(scratch, 'vitest.config.mjs'), `export default { test: { passWithNoTests: true, exclude: [${JSON.stringify(integration)}], poolOptions: { threads: { minThreads: 1, maxThreads: 1 } } } };\n`);
+        const admitted = admittedArgv(process.execPath, [join(REPO, 'node_modules/vitest/vitest.mjs'), ...args.slice(args.indexOf('--') + 3)]);
+        runnerResult = spawn(admitted.file, admitted.args, inventoryRunnerOptions(scratch, env));
+        if (runnerResult.status === 0) fs.writeFileSync(testReport, JSON.stringify(heavyTestReport(runnerResult.stdout, { root: fs.realpathSync(scratch), args })));
         return runnerResult;
       }
-      const reportArg = args.find(a => a.startsWith('--outputFile.json='));
-      if (reportArg && mode !== 'missing') {
+      if (mode === 'empty-suite') {
+        const stdout = await scratchTestOutput(files.map(name => ({ type: 'suite', name, mode: 'run',
+          result: { state: 'pass', duration: 0 }, tasks: [
+            { type: 'suite', name: 'empty describe', mode: 'run', result: { state: 'pass', duration: 0 }, tasks: [] },
+          ] })), { summary: args.includes('--reporter=basic') });
+        return runHeavyTests({ root: scratch, args, testReport, env }, { exec: async () => success(stdout) });
+      }
+      if (testReport && mode !== 'missing') {
         const reported = mode === 'excluded' ? [unit] : mode === 'all-excluded' ? [] : files;
         const report = { testResults: reported.map(file => ({
           name: join(mode === 'wrong-root' ? '/other-clone' : fs.realpathSync(scratch), file),
           assertionResults: mode === 'empty-assertions' ? [] : [{ status: mode === 'unknown-status' ? 'unknown' : mode === 'skipped' && file === integration ? 'pending' : 'passed' }],
         })) };
-        fs.writeFileSync(reportArg.slice('--outputFile.json='.length), mode === 'malformed' ? '{' : mode === 'oversized' ? ' '.repeat(8 * 1024 * 1024 + 1) : JSON.stringify(report));
+        fs.writeFileSync(testReport, mode === 'malformed' ? '{' : mode === 'oversized' ? ' '.repeat(8 * 1024 * 1024 + 1) : JSON.stringify(report));
       }
       return { status: mode === 'failed' ? 1 : 0 };
     },
@@ -87,8 +118,11 @@ export async function runTestInventoryCase({ mode = 'excluded', realRunner = fal
   };
   try {
     try { await runAutoRebase({ root, ref: REF, env, deps }); } catch (error) { failure = error.message; }
+    const runnerOutcome = realRunner ? inventoryRunOutcome(runnerResult) : null;
+    // A busy queue means the tests never ran: report that, not the repair's generic test failure.
+    if (runnerOutcome?.outcome === 'deferred') failure = `inventory runner deferred by the admission queue: ${runnerOutcome.reason}`;
     const pending = `${overlayFilePath(root, env)}.auto-rebase`;
-    return { failure, pushed, registered, audited, events, runnerResult,
+    return { failure, pushed, registered, audited, events, runnerResult, runnerOutcome,
       remaining: fs.existsSync(pending) ? fs.readdirSync(pending) : [],
       overlays: readOverlays(root, { env }).map(o => o.ref),
       cleaned: scratches.every(p => !fs.existsSync(p)),
@@ -161,10 +195,9 @@ export default {
           throw new Error(`unexpected Git operation: ${args[0]}`);
         },
         async codex() { if (phase === 'fixer') withdraw(); resolved = true; return agent(); },
-        async testRunner({ root: scratch, args }) {
+        async testRunner({ root: scratch, testReport }) {
           if (phase === 'tests') withdraw();
-          const report = args.find(a => a.startsWith('--outputFile.json='));
-          fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: [{
+          fs.writeFileSync(testReport, JSON.stringify({ testResults: [{
             name: join(fs.realpathSync(scratch), 'worker.test.mjs'), assertionResults: [{ status: 'passed' }],
           }] }));
           return success();

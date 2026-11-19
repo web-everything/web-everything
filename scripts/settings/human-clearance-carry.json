@@ -1,7 +1,10 @@
 {
-  "$comment": "Card xnqxtdy. review.humanClearanceCarryForward true|false: a recorded human clearance (clear-human) carries to a new head when the mechanical move and fingerprint equivalence are proven; otherwise a human re-approves. Tool override env WE_REVIEW_HUMAN_CLEARANCE_CARRY. See scripts/lib/human-clearance-carry.mjs. review.carryEquivalence contribution|strict (contribution = a clearance carries when the PR's own added/removed lines are identical and the cleared change replayed onto main reproduces the new head's tree; strict = byte-identical net diff only; env WE_REVIEW_CARRY_EQUIVALENCE; invalid fails closed to strict).",
+  "$comment": "Card xnqxtdy. review.humanClearanceCarryForward true|false: a recorded human clearance (clear-human) carries to a new head when the mechanical move and fingerprint equivalence are proven; otherwise a human re-approves. Tool override env WE_REVIEW_HUMAN_CLEARANCE_CARRY. See scripts/lib/human-clearance-carry.mjs. review.carryEquivalence contribution|strict (contribution = a clearance carries when the PR's own added/removed lines are identical and the cleared change replayed onto main reproduces the new head's tree; strict = byte-identical net diff only; env WE_REVIEW_CARRY_EQUIVALENCE; invalid fails closed to strict). R711: humanClearance.mechanicalCarry refuse|trust-drain-record (default refuse; env WE_HUMAN_CLEARANCE_MECHANICAL_CARRY) resolves standard \u2192 platform \u2192 tool \u2192 env; invalid fails closed to refuse. Only trust-drain-record permits changed reviewed-diff mechanical drain records citing the original human clearance.",
   "review": {
     "humanClearanceCarryForward": true,
     "carryEquivalence": "contribution"
+  },
+  "humanClearance": {
+    "mechanicalCarry": "refuse"
   }
 }

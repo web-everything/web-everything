@@ -3,7 +3,7 @@ bornAs: x9ipr5i
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/record-referral-ruling.mjs", "we:scripts/conveyor/run-scorecards.mjs"]
+scope: ["we:scripts/operations/record-referral-ruling.mjs", "we:scripts/conveyor/run-scorecards.mjs"]
 dateOpened: "2026-10-21"
 tags: []
 ---

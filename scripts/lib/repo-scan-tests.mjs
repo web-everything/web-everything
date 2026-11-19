@@ -133,6 +133,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs': 'false positive: its readdirSync calls only list scripts/ to symlink a throwaway pre-fix tree under mkdtemp for the break replay; it asserts a planner outcome, never a repo rule; the soak lane runs it',
+  'scripts/lib/__tests__/gh-ci-log.test.mjs': 'whole-tree structural check that every job-log reader under scripts/ and skills-src/ uses the shared gh-ci-log helper or is on its explicit deferred allowlist; it imports gh-ci-log.mjs so `vitest related` selects it when the helper changes, and CI runs it for any new bypass elsewhere',
+  'scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs': 'false positive: recursively snapshots only its mkdtemp cache fixture to assert zero writes, never the live repo; imports reconcile-pass.mjs, so vitest related already selects it when reconciliation changes',
+  'scripts/readiness/__tests__/forge-cache-prune-running-record.test.mjs': 'false positive: its `snapshotBinding` readdir walk enumerates only the mkdtemp fixture tree it builds, never the live repo; a hermetic prune-record test, not a repo rule scanner',
+  'scripts/__tests__/daemon-heavy-spawn-lint.test.mjs': 'repo scan: reads and TypeScript-parses every non-test .mjs under scripts/ (all subdirectories) plus skills-src/conveyor for unadmitted heavy child_process spawns; the lint helper is unit-tested hermetically and CI runs the full test',
+  'scripts/readiness/__tests__/forge-r352-sample-secret-files.test.mjs': 'false positive: reads a fixed list of 14 named files plus a readdirSync of backlog/ only to locate four cards by number; not a repo-wide rule scanner',
+  'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its `function walk(` is inside a string fixture and an in-memory snapshot checker; it enumerates only mkdtemp fixtures, never the live repo (also red on #6017)',
   'scripts/backlog/__tests__/number-at-birth-cli.test.mjs': 'false positive: readdirSync(join(root, ...)) enumerates only the mkdtempSync CLI fixture backlog, never the live repo; this is a hermetic CLI integration test, not a repo rule scanner',
   'scripts/__tests__/stdout-flush.test.mjs': 'its one-home drain-loop guard lives in a test the default vitest config excludes (runs under vitest.integration.config.ts with real child processes), so `vitest run <file>` cannot select it; CI runs it',
   'scripts/__tests__/check-standards.test.mjs': 'asserts over the real tracked tree via check-standards itself; the verify gate already runs `check:standards --local --files=<changed>`',
@@ -151,9 +158,11 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/operations/__tests__/unsized-kind-callers.test.mjs': 'greps scripts/ for a never-sized kind paired with a size (#x0h3pe4); cheap to run in CI, and every caller it guards also has its own wiring test',
   'scripts/lib/__tests__/settings-files.test.mjs': 'one test walks scripts/ to pin the direct readers of the legacy dispatch-settings.json to LEGACY_ONLY_READERS; it is a small walk, and it is also selected by `vitest related` whenever settings-files.mjs changes; a brand-new direct reader is caught by CI',
   'scripts/lib/__tests__/merge-queue-enqueue.test.mjs': 'one test greps scripts/ for any sender of the enqueue mutation other than merge-queue-enqueue.mjs (PR 4708); a small walk that is also selected by `vitest related` whenever merge-queue-enqueue.mjs changes, and a new sender elsewhere is caught by CI',
+  'scripts/operations/__tests__/audit-verdict.test.mjs': 'two cases read tracked modules: the review authorization family and its direct imports, and the settings files every audit-floor module names; bounded walks that `vitest related` selects whenever the audit rubric modules change, and a new unprotected import or settings file in another module is caught by CI',
   'scripts/operations/__tests__/run.test.mjs':'lists a throwaway run directory, not the repo',
   'scripts/operations/__tests__/review-loop-cli.test.mjs': 'lists a throwaway temp root, not the repo',
   'scripts/__tests__/review-set-label.approval-prevention-filing.test.mjs': 'lists a throwaway temp root, not the repo',
+  'scripts/readiness/__tests__/forge-exec-run.test.mjs': 'false positive: its fake npm walks the mkdtemp work directory it executes in (readdirSync of a throwaway fixture tree), never the live repo; a hermetic runner test, not a repo rule scanner',
 });
 
 /** The marker every manifest test must carry in its own header so a reader of the test sees it is a verify scanner. */

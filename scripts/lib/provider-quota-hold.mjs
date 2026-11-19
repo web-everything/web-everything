@@ -1,6 +1,22 @@
 /** Shared pre-launch quota hold; pure and independent of launcher imports. */
 export const QUOTA_COOLOFF_MS = 60 * 60 * 1000;
 export const CODEX_QUOTA_FULL_PERCENT = 98;
+
+export function isQuotaError(text) {
+  if (typeof text !== 'string') return false;
+  // Only this exact provider prefix proves exhaustion. Keep its case, spacing and
+  // reset separator intact; wrappers, generic rate limits and JSON are not evidence.
+  // Boundary coverage in __tests__/provider-quota-hold.test.mjs:
+  // "recognizes quota exhaustion: %s" and
+  // "rejects anything outside the exact anchored quota pattern: %s".
+  return /^You've hit your (?:weekly|daily|5-hour|session) limit · resets /.test(text);
+}
+
+export function quotaHoldRow({ provider, error, now = Date.now() }) {
+  if (!isQuotaError(error)) return null;
+  return { provider, status: 'quota-exhausted', scoredAt: new Date(now).toISOString(), quotaResetsAt: null };
+}
+
 export function providerQuotaHold(records, provider, now) {
   const rows = (Array.isArray(records) ? records : []).filter((r) => r.provider === provider)
     .sort((a, b) => String(b.scoredAt ?? '').localeCompare(String(a.scoredAt ?? '')));

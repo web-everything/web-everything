@@ -8,11 +8,23 @@ export const reviewScratchOwnerPath = dir => `${dir}.owner.json`;
 export const isReviewScratchName = name => Object.values(REVIEW_SCRATCH_PREFIXES)
   .some(prefix => name.startsWith(prefix) && /^[\w-]+$/.test(name.slice(prefix.length)));
 const owned = new Set();
+// A pooled seat checkout is released, never deleted: its slot stays warm for the next seat.
+const releasers = new Map();
+// Once pooled, a path is never deleted by this module, even by a repeated cleanup after its slot was handed on.
+const pooled = new Set();
 const retained = new Set();
 let installed = false;
 let stopSeats = () => {};
 export function removeReviewScratch(dir) {
   if (retained.has(dir)) return;
+  if (pooled.has(dir) && !releasers.has(dir)) return;
+  const release = releasers.get(dir);
+  if (release) {
+    releasers.delete(dir);
+    owned.delete(dir);
+    release();
+    return;
+  }
   rmSync(dir, { recursive: true, force: true });
   if (owned.has(dir)) rmSync(reviewScratchOwnerPath(dir), { force: true });
   owned.delete(dir);
@@ -21,7 +33,7 @@ export function removeReviewScratch(dir) {
 export function retainReviewScratch(dir) {
   for (const path of dir ? [dir] : owned) retained.add(path);
 }
-export function ownReviewScratch(dir, stop) {
+export function ownReviewScratch(dir, stop, { release = null } = {}) {
   if (stop) stopSeats = stop;
   owned.add(dir);
   if (!installed) {
@@ -65,6 +77,7 @@ export function ownReviewScratch(dir, stop) {
       process.on(signal, handler);
     }
   }
+  if (release) { releasers.set(dir, release); pooled.add(dir); return dir; }
   writeFileSync(reviewScratchOwnerPath(dir), JSON.stringify({ pid: process.pid }), { flag: 'wx' });
   return dir;
 }

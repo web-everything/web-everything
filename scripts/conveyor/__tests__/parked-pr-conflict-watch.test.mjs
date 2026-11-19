@@ -40,6 +40,7 @@ import {
   defaultListMainStatutePatchesSinceMergeBase,
   COMPARE_FILES_CAP,
   defaultComputeConflictDisposition,
+  gitMergeTreeParsed,
   CONFLICT_RETRY_WINDOW_MS,
   CONFLICT_ALERT_MARKER_RE,
   hasRecentConflictAlertComment,
@@ -2451,6 +2452,25 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   });
 
   describe('#xngv3vn — defaultComputeConflictDisposition (injected exec, no real git/network)', () => {
+    it('opt-in evidence rejects failed fetch while legacy callers retain best-effort classification', () => {
+      const exec = vi.fn((_cmd, args) => {
+        if (args[0] === 'fetch') throw new Error('offline');
+        return 'tree\n';
+      });
+      const pr = { headRefName: 'lane/x' };
+      expect(gitMergeTreeParsed({ pr, exec, includeRefEvidence: true })).toBeNull();
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(defaultComputeConflictDisposition({ pr, exec })).toBe('clean');
+    });
+
+    it('legacy non-zero output without parseable conflicts keeps its existing clean disposition', () => {
+      const exec = (_cmd, args) => {
+        if (args[0] === 'merge-tree') throw Object.assign(new Error('failed'), { status: 1, stdout: 'tree\n\ndiagnostic' });
+        return '';
+      };
+      expect(defaultComputeConflictDisposition({ pr: { headRefName: 'lane/x' }, exec })).toBe('clean');
+    });
+
     it('no headRefName → null, no git call made at all', () => {
       const exec = () => { throw new Error('must not be called'); };
       expect(defaultComputeConflictDisposition({ pr: {}, exec })).toBeNull();

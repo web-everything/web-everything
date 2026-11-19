@@ -42,6 +42,7 @@ import {
 } from '../stand-down.mjs';
 import { buildRoundExtensionComment } from '../round-extension-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+import { buildQueueCapRefusalComment } from '../queue-cap-refusal-count.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
@@ -62,6 +63,7 @@ import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { planNoteComment } from '../reconcile-note-comment.mjs';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -98,6 +100,36 @@ const pr1563 = (over = {}) => ({
   statusCheckRollup: greenRollup,
   comments: [finding()],
   ...over,
+});
+
+describe('live send-back supersedes stale accepted phase and verdict', () => {
+  const oldHead = 'a'.repeat(40), head = 'b'.repeat(40);
+  const accepted = { author: AUTOMATION, createdAt: '2026-08-26T15:00:00Z', body: buildReviewedShaMarker(oldHead) };
+  const sentBack = { ...finding(), createdAt: '2026-08-26T16:00:00Z' };
+  it.each([
+    ['review:changes', { name: 'ready-to-merge' }],
+    ['review:changes', { name: 'review:accepted' }],
+    ['review:changes', { name: 'review:human' }],
+  ])('uses the live changes label despite stale acceptance: %j', (...labels) => {
+    const plan = planReconcile({ prs: [pr1563({ labels, headRefOid: head, comments: [accepted, sentBack] })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced', headRefOid: head }]);
+    expect(plan.refusals).toEqual([]);
+  });
+  it.each(['label', 'merge-state'])('repairs a same-head conflict after acceptance using %s evidence', evidence => {
+    const plan = planReconcile({ prs: [pr1563({
+      labels: ['review:changes', { name: 'review:pending' }, ...(evidence === 'label' ? ['merge-status:conflicting'] : [])],
+      headRefOid: head, mergeStateStatus: evidence === 'merge-state' ? 'DIRTY' : 'CLEAN',
+      comments: [{ ...accepted, body: buildReviewedShaMarker(head) }, sentBack],
+    })], agents: [], now: NOW });
+    expect(plan.dispatch).toMatchObject([{ kind: 'fix', phase: 'bounced' }]);
+    expect(plan.dispatch[0].isConflict).toBe(evidence === 'label' ? true : undefined);
+    expect(plan.refusals).toEqual([]);
+  });
+  it('keeps the no-findings guard for a send-back without conflict evidence', () => {
+    const plan = planReconcile({ prs: [pr1563({ labels: ['review:changes'], comments: [] })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals[0].kind).toBe('no-findings');
+  });
 });
 
 /** The four PRs actually open at 17:34Z, with the labels and comment counts measured then. */
@@ -213,6 +245,57 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     expect(plan.refusals[0].kind).toBe('stood-down');
     expect(plan.refusals[0].prNumber).toBe(1563);
     expect(plan.refusals[0].standDowns).toBe(1);
+  });
+
+  it('escalates an unanswered stand-down once through trusted operator-note markers', () => {
+    const run = pr => planReconcile({ prs: [pr], agents: [], now: NOW });
+    const first = run(stoodDown);
+    expect(first.notes).toMatchObject([{ kind: 'stood-down', prNumber: 1563 }]);
+    const note = first.notes[0];
+    const publication = planNoteComment(note, stoodDown.comments);
+    expect(publication.alreadyPosted).toBe(false);
+    expect(publication.body).toContain('needs your decision');
+    const comments = [...stoodDown.comments, { author: AUTOMATION, body: publication.body }];
+    const next = run({ ...stoodDown, comments });
+    expect(next.dispatch).toEqual([]);
+    expect(next.refusals[0].kind).toBe('stood-down');
+    expect(planNoteComment(next.notes[0], comments).alreadyPosted).toBe(true);
+    expect(planNoteComment(note, [...stoodDown.comments, { author: { login: 'stranger' }, body: publication.body }]).alreadyPosted).toBe(false);
+  });
+
+  it('a cleared stand-down with only its operator note and bookkeeping refuses no-findings', () => {
+    const held = pr1563({ comments: [{ author: AUTOMATION,
+      body: buildStandDownComment({ reason: 'needs-judgment', head: pr1563().headRefOid }) }] });
+    const first = planReconcile({ prs: [held], agents: [], now: NOW });
+    expect(first.refusals[0].kind).toBe('stood-down');
+    const publication = planNoteComment(first.notes[0], held.comments);
+    const comments = [...held.comments, { author: AUTOMATION, body: publication.body }];
+    expect(countFindings(comments)).toBe(0);
+    const cleared = { ...held, headRefOid: 'f'.repeat(40), comments };
+    const plan = planReconcile({ prs: [cleared], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(r => r.kind)).toEqual(['no-findings']);
+    expect(countFindings([{ body: `> ${publication.body}\nThis still needs repair.` }])).toBe(1);
+  });
+
+  it('does not count a trusted published note as a finding', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Needs a decision.' }, []);
+    expect(countFindings([{ author: AUTOMATION, body }])).toBe(0);
+  });
+
+  it('counts an untrusted note lookalike containing a repair request even with a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    expect(countFindings([{ author: { login: 'stranger' }, body }])).toBe(1);
+    expect(countFindings([{ body }])).toBe(1);
+    expect(countFindings([body])).toBe(1);
+  });
+
+  it('counts a trusted note lookalike containing a repair request without a valid episode marker', () => {
+    const { body } = planNoteComment({ kind: 'stood-down', prNumber: 1563, text: 'Repair the broken guard.' }, []);
+    const withoutKey = body.replace(/^<!-- conveyor-note-key: .* -->$/m, '');
+    expect(countFindings([{ author: AUTOMATION, body: withoutKey }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: -->` }])).toBe(1);
+    expect(countFindings([{ author: AUTOMATION, body: `${withoutKey}\n<!-- conveyor-note-key: invalid -->` }])).toBe(1);
   });
 
   it('TERMINAL — a week later the answer is byte-identical: no decay, no clock', () => {
@@ -418,6 +501,36 @@ describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#32
 
 // ── CASE 4 — REFUSAL 3: THE CAP SURVIVES A RESTART, OR IT IS NOT A CAP ────────────────────────────────────────
 describe('case 4 — refusal 3: the round cap is derived from the PR and ONLY from the PR (#3296)', () => {
+  it('queue-cap comments spend zero real fix rounds; another failed repair still reaches capKind fix exhaustion', () => {
+    const capacity = Array.from({ length: 6 }, () => ({ author: AUTOMATION,
+      body: buildQueueCapRefusalComment('host busy', pr1563().headRefOid, NOW) }));
+    const round = () => ({ author: AUTOMATION, body: REARM_COMMENT_MARKER });
+    const run = rounds => planReconcile({
+      prs: [pr1563({ comments: [finding(), ...rounds, ...capacity] })], agents: [],
+      durableCounts: {}, roundCap: 3, roundCapAction: 'person', now: NOW,
+    });
+    // A saturated queue cannot exhaust the repair cap even with more capacity markers than the cap.
+    expect(run([]).dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', attempts: 0 }));
+    const prior = [round(), round()];
+    const below = run(prior);
+    expect(below.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix', attempts: 2 }));
+    expect(below.refusals.map(r => r.kind)).not.toContain('cap-exhausted');
+    // A real fix ran, released its claim and re-armed, but the original finding remains uncorrected.
+    const failed = [
+      { author: AUTOMATION, body: buildFixBeginComment({ who: 'fix-3', headSha: pr1563().headRefOid }) },
+      { author: AUTOMATION, body: buildFixEndComment({ who: 'fix-3', headSha: pr1563().headRefOid }) },
+      round(),
+    ];
+    const exhausted = run([...prior, ...failed]);
+    expect(exhausted.dispatch).toEqual([]);
+    expect(exhausted.refusals).toContainEqual(expect.objectContaining({
+      kind: 'cap-exhausted', prNumber: 1563, attempts: 3, cap: 3, capKind: 'fix',
+    }));
+    expect(exhausted.notes).toContainEqual(expect.objectContaining({
+      kind: 'round-cap-exhausted', capKind: 'fix', attempts: 3, cap: 3,
+    }));
+  });
+
   it('a fresh pass carrying NOTHING in refuses on the PR\'s own count', () => {
     // `durableCounts` is what the shell read back off the PR's comment thread. No in-process state exists here:
     // this pass is one-shot. #1563 ran to TWELVE rounds against a cap of 5 with a durable count of 0 — the cap
@@ -1724,6 +1837,30 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     ...over,
   });
 
+  it.each([
+    ['main', 'main', 'clean', true],
+    ['main', 'main', 'manifest-only', true],
+    ['main', 'lane/stacked-base', 'clean', false],
+    ['main', 'lane/stacked-base', 'manifest-only', false],
+    ['main', 'main', 'real', false],
+    ['main', 'main', 'unsupported', false],
+    ['main', 'main', undefined, false],
+    ['main', 'main', null, false],
+    ['main', undefined, 'clean', false],
+    ['trunk', 'trunk', 'clean', true],
+    ['trunk', 'main', 'manifest-only', false],
+  ])('conflictFixMechanical requires the default base and an allowed disposition (default=%s, base=%s, disposition=%s → %s)',
+    (defaultBranch, baseRefName, conflictDisposition, expected) => {
+      const plan = planReconcile({
+        prs: [prConflict({ baseRefName, conflictDisposition, comments: [finding()] })],
+        agents: [], now: NOW, defaultBranch,
+      });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({
+        kind: 'fix', prNumber: 2549, isConflict: true, conflictFixMechanical: expected,
+      })]);
+    });
+
   it('a conflict-labelled bounce with zero prior conflict-fix rounds is dispatched `fix`, even though the shared cap is fully spent', () => {
     // Flood the thread with REARM/advisory markers past `NEGOTIATION_ROUND_CAP` — the shared cap this bounce
     // would otherwise be refused on — and confirm it still dispatches, because the conflict-fix cap reads its
@@ -1817,6 +1954,35 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     // xilx617 — the generic REFUSAL 3 now names its OWN population (`capKind: OWED[phase]`) so its
     // `round-cap-exhausted` note can say WHICH auto-repair rounds were exhausted; a `bounced` phase owes `fix`.
     expect(plan.refusals[0].capKind).toBe('fix');
+  });
+
+  it.each([NEGOTIATION_ROUND_CAP, NEGOTIATION_ROUND_CAP + 1])('a DIRTY bounce without the conflict label refuses cap-exhausted after %i shared rounds', (attempts) => {
+    const shared = Array.from({ length: attempts }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
+    });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toEqual([expect.objectContaining({
+      kind: 'cap-exhausted', attempts, cap: NEGOTIATION_ROUND_CAP, capKind: 'fix',
+      why: expect.stringContaining('a person must take it'),
+    })]);
+  });
+
+  it('a DIRTY review:changes bounce with a live finding dispatches an ordinary fix at four shared rounds plus one completed conflict round', () => {
+    const shared = Array.from({ length: NEGOTIATION_ROUND_CAP - 1 }, () => ({ body: REARM_COMMENT_MARKER, author: AUTOMATION }));
+    const plan = planReconcile({
+      prs: [pr1563({ mergeStateStatus: 'DIRTY', comments: [finding(), ...shared,
+        { body: CONFLICT_FIX_COMMENT_MARKER, author: AUTOMATION },
+      ] })], agents: [], now: NOW,
+    });
+    expect(plan.refusals).toEqual([]);
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'fix', prNumber: 1563, phase: 'bounced', attempts: NEGOTIATION_ROUND_CAP - 1,
+    })]);
+    expect(plan.dispatch[0].isConflict).toBeUndefined();
+    expect(plan.dispatch[0].why).toContain(`${NEGOTIATION_ROUND_CAP - 1} of ${NEGOTIATION_ROUND_CAP} attempts are spent`);
   });
 
   it('`countConflictFixComments` narrows on the leading line, like every sibling counter', async () => {
@@ -2176,7 +2342,7 @@ describe('case 5g — advisory-fix dispatch on a `needs-human` PR carrying `advi
   describe.each(['stale-advisory', 'addressed-advisory'])('%s human clearance', branch => {
     const clearedHead = REAL_2766_HEAD;
     const commentsFor = () => [
-      { author: AUTOMATION, body: `${buildReviewedShaMarker(clearedHead)}\n${buildClearedHumanMarker('chalbert')}` },
+      { id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(clearedHead)}\n${buildClearedHumanMarker('chalbert')}` },
       ...(branch === 'stale-advisory' ? live2766Comments() : [
         advisoryNote, { author: AUTOMATION, body: buildAdvisoryFixComment({}) },
       ]),
@@ -2654,8 +2820,9 @@ describe('case 6 — the discovery queries, pinned literally (#3296)', () => {
     ]);
   });
 
-  it('an empty listing is an empty array, not a throw — and yields an empty plan, not a silent one', () => {
-    expect(defaultReadPrs({ exec: () => '' })).toEqual([]);
+  it('a real empty listing is an empty array, not a throw — and yields an empty plan, not a silent one', () => {
+    expect(defaultReadPrs({ exec: () => '[]' })).toEqual([]);
+    expect(() => defaultReadPrs({ exec: () => '' })).toThrow(/empty output/); // fail closed: silence is not an empty inventory
     expect(planReconcile({ prs: [], agents: [], durableCounts: {}, now: NOW }))
       .toEqual({ dispatch: [], refusals: [], notes: [] });
   });
@@ -3952,7 +4119,53 @@ describe('restore-review-label — open green PR with no review label (PR #3830)
   });
 });
 
+// R502 item 4 (PR #6319, 2026-11-03): only `review-status:fixing` left on the PR, no review:pending, no live fixer claim
+// and no verdict for the head - both daemons saw nothing owed. Reconcile re-arms review:pending.
+describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)', () => {
+  const timed = (rollup) => rollup.map((c) => ({ ...c, completedAt: new Date(NOW - 30 * 60_000).toISOString() }));
+  const settledPending = [...timed(greenRollup.slice(0, 1)), ...pendingRollup];
+  const orphan = (over = {}) => pr1563({ isDraft: false, labels: lbl('review-status:fixing'), statusCheckRollup: settledPending, comments: [], headRefName: 'lane/x-orphan', headRefOid: 'a'.repeat(40), ...over });
+  const planFor = (p, extra = {}) => planReconcile({ prs: [p], agents: [], durableCounts: {}, now: NOW, ...extra });
+  const owed = (p, extra) => planFor(p, extra).dispatch.filter((d) => d.kind === 'restore-review-label' && d.variant === 'orphaned-fixing');
+  const head = 'a'.repeat(40);
+  const bounceBody = `🔁 review — changes requested\n\nRecorded by agent (unattended review-loop) via ${REVIEW_PR_CHANNEL}.\n\n### Findings\n- bad\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${head}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.\n\n${REVIEW_PR_FOOTER}`;
+  it('re-adds review:pending when CI is not green (green is healed by the older rule), no live fixer holds the claim and no verdict exists for the head', () => {
+    expect(owed(orphan())).toEqual([expect.objectContaining({ prNumber: 1563, label: 'review:pending', variant: 'orphaned-fixing' })]);
+  });
+  it('a green orphan is already owed review:pending by the older green rule', () => {
+    expect(planFor(orphan({ statusCheckRollup: timed(greenRollup) })).dispatch).toEqual([expect.objectContaining({ kind: 'restore-review-label', label: 'review:pending' })]);
+  });
+  it('never while a fixer holds the claim', () => {
+    expect(owed(orphan({ fixClaim: { who: 'fix-1563', claimedAt: new Date(NOW - 5 * 60_000).toISOString() } }))).toEqual([]);
+  });
+  it('never when any verdict judging this head exists (accept, changes or advisory), or the head is unknown', () => {
+    for (const body of [`review\n<!-- reviewed-sha: ${head} -->`, bounceBody]) {
+      expect(owed(orphan({ comments: [{ body, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION }] }))).toEqual([]);
+    }
+    expect(owed(orphan({ headRefOid: undefined }))).toEqual([]);
+  });
+  it('never without a readable check timestamp, on a fresh finish, or when the heal policy is not stuck', () => {
+    expect(owed(orphan({ statusCheckRollup: pendingRollup }))).toEqual([]);
+    expect(owed(orphan({ statusCheckRollup: [{ ...greenRollup[0], completedAt: new Date(NOW - 60_000).toISOString() }, ...pendingRollup] }))).toEqual([]);
+    expect(owed(orphan(), { reviewLabelHeal: 'green' })).toEqual([]);
+    expect(owed(orphan(), { reviewLabelHeal: 'off' })).toEqual([]);
+  });
+  it('fails closed on unknowns: claim read failed, comments unreadable, no clock', () => {
+    expect(owed(orphan({ fixClaimUnknown: true }))).toEqual([]);
+    expect(owed(orphan({ comments: undefined }))).toEqual([]);
+    expect(planReconcile({ prs: [orphan()], agents: [], durableCounts: {}, now: 0 }).dispatch.some((d) => d.variant === 'orphaned-fixing')).toBe(false);
+  });
+  it('never for a draft, non-lane, review-labelled, ready-to-merge or untagged PR', () => {
+    for (const p of [orphan({ isDraft: true }), orphan({ headRefName: 'feature/human' }), orphan({ labels: lbl('review-status:fixing', 'review:pending') }),
+      orphan({ labels: lbl('review-status:fixing', 'ready-to-merge') }), orphan({ labels: lbl('review-status:stood-down') })]) {
+      expect(owed(p)).toEqual([]);
+    }
+  });
+});
+
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
+import { REVIEW_PR_FOOTER } from '../mechanical-round-cap.mjs';
+import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 it('legacy #3881 waits on host load, not a human', () => {
   const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
@@ -4211,6 +4424,9 @@ describe('stale required-job base repair (2026-10-19 live PRs)', () => {
     expect(repair()).toEqual({ missing: ['standards'] });
     expect(repair({ baseRefName: undefined })).toEqual({ missing: ['standards'] });
   });
+  it.each(['off', 'shadow', 'on'])('finds the missing job under startEarly=%s (early start must not hide it)', startEarly => {
+    expect(repair({ reviewTiming: { ...reviewTiming, startEarly } })).toEqual({ missing: ['standards'] });
+  });
   it.each([
     ['draft', { isDraft: true }], ['DIRTY', { mergeStateStatus: 'dirty' }],
     ['stacked base', { baseRefName: 'lane/other' }], ['empty rollup', { statusCheckRollup: [] }],
@@ -4316,7 +4532,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
       kind: 'review', attempts: NEGOTIATION_ROUND_CAP + 1, cap: NEGOTIATION_ROUND_CAP,
       mechanicalRound: expect.objectContaining({ ok: true, action: 'review' }),
     })]);
-    const refused = plan([{ author: AUTOMATION,
+    const refused = plan([{ id: 'IC_human_clearance', author: { login: 'chalbert' },
       body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` }, ...comments]);
     expect(refused.dispatch).toEqual([]);
     expect(refused.refusals).toEqual([expect.objectContaining({
@@ -4330,7 +4546,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
       const pr = prFor(branch);
       expect(run(pr).dispatch).toEqual([expect.objectContaining(expected(branch))]);
       // A later plain accept must not erase the earlier human clearance of this head.
-      pr.comments.unshift({ author: AUTOMATION,
+      pr.comments.unshift({ id: 'IC_human_clearance', author: { login: 'chalbert' },
         body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
       const plan = run(pr);
       expect(plan.dispatch).toEqual([]);
@@ -4341,13 +4557,13 @@ describe('human clearance and complete evidence before review dispatch (live #55
     });
 
     it.each([
-      ['current-head latest', HEAD, AUTOMATION, true],
-      ['current-head followed by plain accept', HEAD, AUTOMATION, true],
-      ['older-head', OLD, AUTOMATION, false],
+      ['current-head latest', HEAD, { login: 'chalbert' }, true],
+      ['current-head followed by plain accept', HEAD, { login: 'chalbert' }, true],
+      ['older-head', OLD, { login: 'chalbert' }, false],
       ['untrusted current-head', HEAD, { login: 'drive-by' }, false],
     ])('honors %s clearance before considering advisory dispatch', (_name, sha, author, cleared) => {
-      const clearance = { author, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('chalbert')}` };
-      expect(parseLatestHumanClearedSha([clearance])).toBe(author === AUTOMATION ? sha : null);
+      const clearance = { id: 'IC_human_clearance', author, body: `${buildReviewedShaMarker(sha)}\n${buildClearedHumanMarker('chalbert')}` };
+      expect(parseLatestHumanClearedSha([clearance])).toBe(author.login === 'chalbert' ? sha : null);
       const pr = prFor(branch);
       if (_name === 'current-head latest') pr.comments.push(clearance);
       else pr.comments.unshift(clearance); // A later plain accept cannot erase clearance.
@@ -4365,7 +4581,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
   it('refuses clearance for HEAD followed by a plain accept of another sha', () => {
     const pr = prFor('advisoryOwed');
     pr.comments = [
-      { author: AUTOMATION, body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` },
+      { id: 'IC_human_clearance', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` },
       { ...accept, body: `✅ review — accepted\n\n${buildReviewedShaMarker(OLD)}` },
     ];
     const plan = run(pr);
@@ -4379,7 +4595,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
   it('refuses a label-dropped cleared head without relabel dispatch', () => {
     const pr = prFor('relabelOwed');
     expect(run(pr).dispatch).toEqual([expect.objectContaining(expected('relabelOwed'))]);
-    pr.comments.unshift({ author: AUTOMATION,
+    pr.comments.unshift({ id: 'IC_human_clearance', author: { login: 'chalbert' },
       body: `${buildReviewedShaMarker(HEAD)}\n${buildClearedHumanMarker('chalbert')}` });
     const plan = run(pr);
     expect(plan.dispatch).toEqual([]);
@@ -4392,7 +4608,7 @@ describe('human clearance and complete evidence before review dispatch (live #55
 
   it('still reviews a different head after human clearance of an older head', () => {
     const pr = prFor('advisoryOwed');
-    pr.comments = [{ author: AUTOMATION,
+    pr.comments = [{ id: 'IC_human_clearance', author: { login: 'chalbert' },
       body: `${buildReviewedShaMarker(OLD)}\n${buildClearedHumanMarker('chalbert')}` }];
     const plan = run(pr);
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', prNumber: 5530 })]);
@@ -4561,5 +4777,63 @@ describe('released fix claim + live pid is not live work (PR #5492 replay)', () 
     expect(releasedFixClaim(pr1563({ comments: [end, { ...begin, createdAt: '2026-10-20T23:00:00Z' }] }))).toBeNull(); // ordered by createdAt, not array position
     expect(isReleasedClaimSession(spare(), null)).toBe(false);
     expect(assessLiveness([{ agent: spare(), cwd: '/d', sha: SHA }])).toMatchObject({ kind: 'live-process' });
+  });
+});
+
+
+describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () => {
+  const policy = { startAfter: 'ci-green', startBeforeCi: false, earlyStartShadow: true,
+    earlyStartCare: ['none', 'low'], earlyStartMaxLines: 400, earlyStartMaxFiles: 12, earlyStartKinds: ['code'] };
+  // An addressed advisory reaches refuseUnreviewable before reviewChecksAllow.
+  const fixture = over => pr1563({ labels: lbl('review:human', 'advisory:changes'),
+    comments: [{ body: `${ADVISORY_NOTE_MARKER}\n\ncurrent finding`, author: AUTOMATION },
+      { body: buildAdvisoryFixComment({}), author: AUTOMATION }],
+    statusCheckRollup: pendingRollup, careLevel: 'low', diffLines: 100, diffFiles: 3,
+    kinds: ['code'], verifyGreen: true, ...over });
+  const run = (pr, reviewTiming = policy) => planReconcile({ prs: [pr], reviewTiming, agents: [], now: NOW });
+
+  it.each([['draft', true], ['review-ci', false]])('attaches an eligible shadow to %s without dispatching', (kind, isDraft) => {
+    const pr = fixture({ isDraft });
+    const baseline = run(pr, { ...policy, earlyStartShadow: false });
+    const result = run(pr);
+    expect(baseline.refusals).toHaveLength(1);
+    expect(baseline.refusals[0].kind).toBe(kind);
+    if (isDraft) expect(baseline.refusals[0].why).toBe('PR is still a draft — no independent review is dispatched until it is promoted to ready for review');
+    expect(result.dispatch).toEqual(baseline.dispatch);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toEqual([{ ...baseline.refusals[0], earlyStartShadow: {
+      wouldStartEarly: true, reason: expect.any(String), mergeAllowed: false,
+    } }]);
+  });
+  it.each([true, false])('reads each PR input and waits when absent (draft=%s)', isDraft => {
+    for (const key of ['careLevel', 'diffLines', 'diffFiles', 'kinds', 'verifyGreen', 'headRefOid']) {
+      const result = run(fixture({ isDraft, [key]: undefined }));
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: isDraft ? 'draft' : 'review-ci',
+        earlyStartShadow: { wouldStartEarly: false, reason: expect.any(String), mergeAllowed: false } })]);
+      if (key === 'careLevel') expect(result.refusals[0].earlyStartShadow.reason).toBe('missing-care');
+    }
+  });
+  it.each([
+    { careLevel: 'high' }, { careLevel: 'elevated' }, { diffLines: 401 }, { diffFiles: 13 },
+    { kinds: ['code', 'docs'] }, { kinds: ['config'] }, { kinds: ['data'] }, { verifyGreen: false },
+  ])('uses PR evidence to report a wait: %j', over => {
+    for (const isDraft of [true, false]) {
+      const result = run(fixture({ isDraft, ...over }));
+      expect(result.dispatch).toEqual([]);
+      expect(result.refusals).toEqual([expect.objectContaining({ kind: isDraft ? 'draft' : 'review-ci',
+        earlyStartShadow: { wouldStartEarly: false, reason: expect.any(String), mergeAllowed: false } })]);
+    }
+  });
+  it.each([true, false])('leaves refusal objects identical when shadow is off (draft=%s)', isDraft => {
+    const pr = fixture({ isDraft });
+    const { earlyStartShadow, ...legacyPolicy } = policy;
+    const baseline = run(pr, legacyPolicy);
+    const off = run(pr, { ...policy, earlyStartShadow: false });
+    expect(off.refusals).toEqual(baseline.refusals);
+    expect(off.refusals).toHaveLength(1);
+    expect(off.refusals[0].kind).toBe(isDraft ? 'draft' : 'review-ci');
+    expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
+    expect(off.dispatch).toEqual(baseline.dispatch);
   });
 });

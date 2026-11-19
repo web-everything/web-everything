@@ -267,7 +267,7 @@ export function gateCause(marker) {
 
 const SOAK = /soak/i;
 export function ciCheckName(jobName, runName = '') {
-  const name = String(jobName || '');
+  const name = String(jobName || '').replace(/^hetzner \/ /, '');
   if (/codeql/i.test(name) || /codeql/i.test(runName)) return 'CodeQL';
   if (/daemon-soak/i.test(name)) return 'daemon-soak';
   if (SOAK.test(name) || SOAK.test(runName)) return 'soak-shard';
@@ -352,10 +352,12 @@ function summarizeLaunches(items, ticks) {
   return base;
 }
 const attemptTime = (row, tickAt) => [row?.recordedAt, row?.at, /\d{4}-\d\d-\d\dT[\d:.]+Z/.exec(String(row?.attempt ?? ''))?.[0], tickAt].find((v) => Number.isFinite(stamp(v)));
-/** Launch attempts: build/prevention-card from `dispatched`/`failures`; prepare from `prepare.launched`/`prepare.failures`. */
+/** Launch attempts from tick rows; prepare PR-list observation failures are counted separately per tick. */
 export function builderMetrics(ticks, window, cardNames = []) {
   const ordered = [...ticks].sort((x, y) => compare(x.at, y.at));
   const items = [], prepSeen = new Set(), headSeenAt = new Map();
+  const observationReasons = new Map();
+  let observationCount = 0;
   const list = (v) => Array.isArray(v) ? v : [];
   const failCause = (f) => /not confirmed/i.test(String(f.reason ?? f.evidence?.reason ?? '')) ? 'launch-not-confirmed' : 'failed';
   const headOf = (f) => `${f.num}|${f.stage ?? ''}|${String(f.reason ?? f.evidence?.reason ?? '').slice(0, 60)}`;
@@ -377,7 +379,23 @@ export function builderMetrics(ticks, window, cardNames = []) {
       const key = `l|${d.num ?? d}|${d.attempt ?? d.at ?? d.sessionSlug ?? ''}`;
       emit('launched', d, key, !prepSeen.has(key) && prepSeen.add(key));
     }
-    const failures = list(t.prepare?.failures).filter((f) => f && typeof f === 'object');
+    const observationSeen = new Set();
+    const failures = list(t.prepare?.failures).filter((f) => {
+      if (!f || typeof f !== 'object') return false;
+      const observationReason = String(f.reason ?? f.evidence?.reason ?? '');
+      if (f.cause !== 'daemon-observation' || f.stage !== 'retirement'
+        || !(/gh-throttle\.mjs pr list|PR listing call budget/.test(observationReason)
+          || (/^gh-throttle:.*throttl/i.test(observationReason) && /pr list/.test(observationReason)))) return true;
+      // No prepare launched: count each card + normalized reason once in this tick, independent of attempt metadata.
+      const reason = String(f.reason ?? f.evidence?.reason ?? '').replace(/\d+/g, 'N').slice(0, 90);
+      const key = `${f.num}|${reason}`;
+      if (live && !observationSeen.has(key)) {
+        observationSeen.add(key);
+        observationCount++;
+        observationReasons.set(reason, (observationReasons.get(reason) ?? 0) + 1);
+      }
+      return false;
+    });
     for (const f of [...failures.filter((x) => x.attempt), ...failures.filter((x) => !x.attempt)]) {
       const head = `h|${headOf(f)}`, key = f.attempt ? `f|${f.num}|${f.attempt}` : head, when = stamp(attemptTime(f, t.at));
       let fresh = !prepSeen.has(key) && prepSeen.add(key);
@@ -396,6 +414,7 @@ export function builderMetrics(ticks, window, cardNames = []) {
   const inTick = ordered.filter((t) => inWindow(t.at, window)).length;
   const main = summarizeLaunches(items.filter((i) => i.kind !== 'prepare'), inTick);
   main.byKind = Object.fromEntries(['build', 'prevention-card', 'prepare'].map((k) => [k, summarizeLaunches(items.filter((i) => i.kind === k), inTick)]));
+  if (observationCount) main.prepareObservationFailures = { count: observationCount, byReason: Object.fromEntries(observationReasons) };
   return main;
 }
 
@@ -445,16 +464,21 @@ export function parseBuildTicks(lines) {
 export function buildErrorRates({ window, notes = {}, prsOpened = [], prKinds = {}, cardNames = [], cutoff, gateRuns, killed, waitTimeouts, fixSessions, ciRuns, buildTicks, daemonEntries }) {
   const gateItems = [
     ...gateRuns.filter((g) => g.red).map((g) => ({ cause: g.cause, ref: g.ref, at: g.at, ms: g.ms })),
-    ...killed.map((k) => ({ cause: 'killed-superseded', ref: k.ref, at: k.at })),
     ...waitTimeouts,
   ];
-  const gateTotal = gateRuns.length + killed.length + waitTimeouts.length;
+  const gateTotal = gateRuns.length + waitTimeouts.length;
+  const gateMetric = rateMetric(gateItems, gateTotal, 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)', { flakyRescuedGreen: gateRuns.filter((g) => !g.red && g.cause === 'flaky-outside-diff').length, markerSample: 'each lane keeps only its last two markers' });
+  if (killed.length) {
+    gateMetric.causes['killed-superseded'] = { count: killed.length, examples: killed.filter((k) => k.ref).sort((a, b) => refCompare(b, a)).slice(0, 2).map(({ ref, at }) => ({ ref, at })) };
+    gateMetric.killedSuperseded = killed.length;
+    gateMetric.basis += '; killed-superseded runs are reported apart and excluded from the rate';
+  }
   const fixOutcomes = rateMetric(fixSessions.map((s) => ({ cause: s.outcome, ref: s.pr ? `PR #${s.pr}` : `session ${s.session}`, at: s.at, ms: s.ms })), fixSessions.length, 'fix/ci-heal sessions');
   const rounds = new Map();
   for (const s of fixSessions) if (s.pr) rounds.set(s.pr, (rounds.get(s.pr) ?? 0) + 1);
   const roundList = [...rounds].map(([pr, n]) => ({ pr, rounds: n })).sort((a, b) => b.rounds - a.rounds || a.pr - b.pr);
   return {
-    gateRuns: { ...rateMetric(gateItems, gateTotal, 'local gate attempts (lane markers + verify-daemon kills + wait-timeouts)', { flakyRescuedGreen: gateRuns.filter((g) => !g.red && g.cause === 'flaky-outside-diff').length, markerSample: 'each lane keeps only its last two markers' }) },
+    gateRuns: { ...gateMetric },
     ci: ciMetrics(ciRuns, window).runs,
     fixSessions: { ...fixOutcomes, rounds: { prs: roundList.length, multiRoundPrs: roundList.filter((r) => r.rounds > 1).length, max: roundList[0]?.rounds ?? 0, top: roundList.slice(0, 5) } },
     builderLaunches: builderMetrics(buildTicks, window, cardNames),

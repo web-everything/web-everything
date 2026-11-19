@@ -65,7 +65,7 @@ import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
 import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildPrioritySettings, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
-import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
+import { DEFAULT_BUILD_QUEUE_CACHE_MAX_AGE_MS, acquireBuildQueueLock, buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, waitForBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
 import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
 import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
 import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
@@ -81,6 +81,7 @@ import { createMemoryRunStore, newRunId } from './operations/run-store.mjs';
 import { claimOperation } from './operations/claim.mjs';
 import { createClaimReader, createClaimSinks } from './operations/claim-io.mjs';
 import { cardIndex, closedBlockersFor, closedDuplicatesBySurvivor } from './operations/close-items.mjs';
+import { fetchFresh } from './lib/git-fetch-fresh.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // #3445 — `--backlog-dir=<path>` points this CLI's own file reads (and, via `WE_BACKLOG_DIR`, the
@@ -205,8 +206,8 @@ function missingItemMessage(padded) {
     // Bounded + non-interactive: a stalled remote or a credential prompt must not hang the death path
     // (this also runs unattended in the drain). timeout → SIGTERM → the catch below returns `plain`.
     const gitEnv = { cwd: ROOT, timeout: 5000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } };
-    execFileSync('git', ['fetch', '--quiet', 'origin', 'main'], { ...gitEnv, stdio: 'ignore' });
-    const onOrigin = execFileSync('git', ['ls-tree', '--name-only', 'FETCH_HEAD', 'backlog/'], { ...gitEnv, encoding: 'utf8' })
+    fetchFresh({ cwd: ROOT, branches: ['main'], maxAgeMs: 0, run: (args) => execFileSync('git', args, { ...gitEnv, encoding: 'utf8', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }) });
+    const onOrigin = execFileSync('git', ['ls-tree', '--name-only', 'origin/main', 'backlog/'], { ...gitEnv, encoding: 'utf8' })
       .split('\n')
       .some((p) => p.startsWith(`backlog/${padded}-`));
     if (!onOrigin) return plain;
@@ -1149,24 +1150,45 @@ function buildQueue() {
   const mtimeOf = (p) => { try { return statSync(p).mtimeMs; } catch { return 'none'; } };
   const baseKey = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;
+  // Runtime age and its log line change on every read; only policy semantics invalidate cached output.
+  const priorityKey = { ids: buildPriority.ids, mode: buildPriority.mode, only: buildPriority.only,
+    held: buildPriority.held, source: buildPriority.source,
+    runtime: { hash: buildPriority.runtime?.hash, expired: buildPriority.runtime?.expired } };
   const key = baseKey === null ? null
-    : JSON.stringify([baseKey, buildPriority, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
+    : JSON.stringify([baseKey, priorityKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
       process.env.WE_PLATFORM_PREFERENCES_FILE,
       mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
       // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
       // set it too: key on the merged value itself, not only on the one file's mtime.
       JSON.stringify(readSettings().buildQueuePriority ?? null)]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
-  const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
-  const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
+  const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? DEFAULT_BUILD_QUEUE_CACHE_MAX_AGE_MS);
+  const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : DEFAULT_BUILD_QUEUE_CACHE_MAX_AGE_MS;
+  let releaseLock;
   if (key !== null) {
     const stdout = readBuildQueueCache({ file, key, now: at, maxAgeMs });
     if (stdout !== null) { writeAllSync(1, stdout); process.exit(0); }
+    // Single-flight: the lock winner computes; losers poll the cache in short slices and re-try the lock, so a winner
+    // that finishes (or dies) without writing OUR key hands over within a slice instead of stalling 30 s.
+    const waitUntil = Date.now() + 30_000;
+    for (;;) {
+      releaseLock = acquireBuildQueueLock({ file });
+      if (releaseLock) {
+        // Re-check under the lock: a prior holder may have published our key between our miss and the acquire.
+        const fresh = readBuildQueueCache({ file, key, now: Date.now(), maxAgeMs });
+        if (fresh !== null) { releaseLock(); writeAllSync(1, fresh); process.exit(0); }
+        process.on('exit', releaseLock); break;
+      }
+      const cached = waitForBuildQueueCache({ file, key, timeoutMs: 250, maxAgeMs });
+      if (cached !== null) { writeAllSync(1, cached); process.exit(0); }
+      if (Date.now() >= waitUntil) break;
+    }
   }
   const emit = (payload, human) => {
     if (key === null) return ok(payload, human);
     const stdout = `${JSON.stringify({ ok: true, ...payload })}\n`;
-    writeBuildQueueCache({ file, key, at, stdout });
+    writeBuildQueueCache({ file, key, at, stdout, fence: releaseLock ? releaseLock.holds : () => false });
+    releaseLock?.();
     writeAllSync(1, stdout);
     process.exit(0);
   };

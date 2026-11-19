@@ -66,6 +66,7 @@ import { timestampedStderr } from '../lib/log-timestamp.mjs';
 // "clean, but still behind it" (reclaim must still run for the latter — see that function's own docblock).
 import { isLaneAlreadyClean } from '../lib/lane-whois-core.mjs';
 import { readdirSync as readdirSyncFs } from 'node:fs';
+import { scheduledLaneMaintenance } from '../lib/scheduled-lane-maintenance.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -585,9 +586,9 @@ export function lowPoolAlert(health, lowWater = DEFAULT_LOW_WATER) {
  * mutation from inside its own function body, with no separate pre-check here that could reopen the race
  * window (see `cleanLaneLitter`'s own docblock). Never throws on a per-lane reap failure — one bad lane must
  * not stop the sweep from reaping the rest.
- * #4025 — ALSO runs `trimPool` after the litter-reap above (a litter-only lane is already clean by the time
- * trim evaluates it, so trim never re-derives that decision): the periodic SHRINK half beside this pass's
- * existing periodic reap half. `trimMax` forwards to `trim`'s own `--max`; omitted, `trim` falls back to its
+ * After litter-reap, the default maintenance pass runs the existing trim + gc CLIs at most once per 24h
+ * (or the longer lanes.gc.schedule), using a locked per-pool attempt stamp. Injected `trimPool` callers
+ * retain their direct trim hook. `trimMax` forwards to `trim`'s own `--max`; omitted, `trim` falls back to its
  * own per-repo default cap (see `scripts/lane-pool.mjs`'s `TRIM_DEFAULT_CAP`).
  * #3383 gap 2 — ALSO runs the lane-whois-driven AUTO-RECLAIM pass after trim: a fast (`lane-whois.mjs`'s own
  * #3383-perf follow-up), read-only whois scan over the whole pool, then `reclaim --lane=N` for every
@@ -604,7 +605,8 @@ export function lowPoolAlert(health, lowWater = DEFAULT_LOW_WATER) {
 export function watchLanePoolHealth({
   repo = null, root = REPO_ROOT, listStatus = defaultListLaneStatus, readPorcelain = defaultReadPorcelain,
   reap = cleanLaneLitter, isLeasedNow = defaultIsLeasedNow, isLiveNow = defaultIsLiveNow, dryRun = false,
-  trimPool = defaultTrimPool, trimMax = null, listAcquirable = defaultListAcquirable,
+  trimPool = null, trimMax = null, listAcquirable = defaultListAcquirable,
+  maintenance = scheduledLaneMaintenance,
   listWhois = defaultListWhois, reclaimLane = defaultReclaimLane, reclaimEnabled = true,
   writeFreeLaneList = defaultWriteFreeLaneList, salvageEnabled = false, salvageMax = DEFAULT_SALVAGE_MAX_PER_TICK,
   lowWater = DEFAULT_LOW_WATER, retention = null, snapshotLane = laneStateSnapshot, journalLitter = defaultJournalLitter,
@@ -637,7 +639,9 @@ export function watchLanePoolHealth({
       } catch { /* best-effort — one bad reap never stops the rest of the sweep */ }
     }
   }
-  const trim = trimPool({ repo, root, max: trimMax, dryRun });
+  const trim = trimPool
+    ? trimPool({ repo, root, max: trimMax, dryRun })
+    : maintenance({ root, poolDir: status.root, repoPath: resolveLanePoolRepoPath(repo), max: trimMax, dryRun }).trim;
   // #3383 — read the REAL eligibility answer AFTER the litter-reap above (a lane just reaped to clean is
   // fresh again by the time this runs, and the real `list --acquirable` scan itself reaps dead ghost leases
   // first, #3449) — cross-checked into `summarizeHealth` so this report's "acquirable" count can never
@@ -786,7 +790,7 @@ if (IS_CLI) {
             `${trim.overCap > 0 ? ` — ⚠ still ${trim.overCap} over cap` : ''}\n`,
         );
       } else {
-        timestampedStderr('  pool trim: unavailable this tick (best-effort — see any error above)\n');
+        timestampedStderr('  pool trim: not due, dry-run, or unavailable (see maintenance log)\n');
       }
       // #3383 gap 2 — the auto-reclaim summary. `reclaim === null` means the sub-pass itself was disabled
       // (`WE_LANE_POOL_RECLAIM_DISABLED`), never "ran and found nothing" — those two report differently on

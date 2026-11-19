@@ -130,3 +130,83 @@ describe('replay proof with real git', () => {
     expect(proveReplayEquivalent({ exec: () => { throw new Error('missing'); }, fromSha: 'a'.repeat(40), toSha: 'b'.repeat(40) })).toMatchObject({ ok: false, reason: expect.stringContaining('not readable locally') });
   });
 });
+
+// R503 part 4 — the drain-mechanical set also covers the regenerated CI timing file, so a merge of main that only
+// moves it keeps an operator approval; any other change still invalidates.
+import { MECHANICAL_DIFF_PATHS, NOT_A_REFRESH_PREFIXES, isMechanicalDiffSection } from '../transient-paths.mjs';
+import { TRANSIENT_CARRY_PATHS } from '../carry-equivalence.mjs';
+import { normalizeDiffFingerprint, normalizeContributionFingerprint } from '../review-escalation.mjs';
+import { decideHumanClearanceCarry } from '../human-clearance-carry.mjs';
+
+describe('mechanical net-diff paths (R503)', () => {
+  const code = 'diff --git a/src/a.mjs b/src/a.mjs\n--- a/src/a.mjs\n+++ b/src/a.mjs\n@@ -1,1 +1,1 @@\n-a\n+b\n';
+  const timings = (n) => `diff --git a/scripts/ci/test-timings.json b/scripts/ci/test-timings.json\n--- a/scripts/ci/test-timings.json\n+++ b/scripts/ci/test-timings.json\n@@ -1,1 +1,1 @@\n-{"t":1}\n+{"t":${n}}\n`;
+  it('names the root manifest and the CI timing file only', () => {
+    expect([...MECHANICAL_DIFF_PATHS].sort()).toEqual(['.lane-manifest.json', 'scripts/ci/test-timings.json']);
+  });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint ignores a timings-only change', (_, fp) => {
+    expect(fp(code + timings(2))).toBe(fp(code + timings(3)));
+    expect(fp(code + timings(2))).toBe(fp(code));
+  });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint still moves for a one-character code change and a nested timings file', (_, fp) => {
+    expect(fp(code + timings(2))).not.toBe(fp(code.replace('+b', '+c') + timings(2)));
+    const nested = timings(2).replaceAll('scripts/ci/test-timings.json', 'x/scripts/ci/test-timings.json');
+    expect(fp(code + nested)).not.toBe(fp(code));
+  });
+  // One diff section per NOT_A_REFRESH_PREFIXES entry, each opened by exactly that header line (so dropping any one
+  // prefix from the list reddens its own row), plus the completeness check that a new prefix brings its own row.
+  const T = 'scripts/ci/test-timings.json';
+  const H = `diff --git a/${T} b/${T}\n`;
+  const NOT_A_REFRESH_VARIANTS = {
+    'deleted file mode': `${H}deleted file mode 100644\n`,
+    'new file mode': `${H}new file mode 100644\n`,
+    'old mode': `${H}old mode 100644\n`,
+    'new mode': `${H}new mode 100755\n`,
+    'rename ': `${H}rename from ${T}\n`,
+    'copy ': `${H}copy from ${T}\n`,
+    'similarity index': `${H}similarity index 90%\n`,
+    'dissimilarity index': `${H}dissimilarity index 100%\n`,
+    'Binary files': `${H}index 1..2\nBinary files a/${T} and b/${T} differ\n`,
+    'GIT binary patch': `${H}index 1..2\nGIT binary patch\nliteral 3\nKcmZ?l00000\n\n`,
+  };
+  it('has one timing-file variant per NOT_A_REFRESH prefix', () => {
+    expect(Object.keys(NOT_A_REFRESH_VARIANTS).sort()).toEqual([...NOT_A_REFRESH_PREFIXES].sort());
+  });
+  it.each(Object.entries(NOT_A_REFRESH_VARIANTS))('a timing-file section opened by "%s" is a real change, not a refresh', (_, v) => {
+    const lines = (code + v).split('\n');
+    expect(isMechanicalDiffSection(lines, lines.indexOf(H.trimEnd()))).toBe(false);
+    expect(normalizeDiffFingerprint(code + v)).not.toBe(normalizeDiffFingerprint(code));
+    expect(normalizeContributionFingerprint(code + v)).not.toBe(normalizeContributionFingerprint(code));
+  });
+  it.each([['strict', normalizeDiffFingerprint], ['contribution', normalizeContributionFingerprint]])('%s fingerprint treats a timing-file delete, add, rename, mode change or binary replacement as a real change', (_, fp) => {
+    const variants = [
+      `${H}deleted file mode 100644\nindex 1..0\n--- a/${T}\n+++ /dev/null\n@@ -1 +0,0 @@\n-{"t":1}\n`,
+      `${H}new file mode 100644\nindex 0..1\n--- /dev/null\n+++ b/${T}\n@@ -0,0 +1 @@\n+{"t":1}\n`,
+      `${H}old mode 100644\nnew mode 100755\n`,
+      `${H}similarity index 90%\nrename from ${T}\nrename to ${T}\n`,
+      `${H}index 1..2\nBinary files a/${T} and b/${T} differ\n`,
+      `${H}index 1..2\nGIT binary patch\nliteral 3\nKcmZ?l00000\n\nliteral 0\nHcmV?d00001\n\n`,
+    ];
+    for (const v of variants) expect(fp(code + v)).not.toBe(fp(code));
+  });
+  it.each(Object.entries(NOT_A_REFRESH_VARIANTS))('the root lane manifest keeps its every-kind exclusion: a section opened by "%s" is still skipped', (_, v) => {
+    const M = '.lane-manifest.json';
+    const mv = v.replaceAll(T, M);
+    const lines = (code + mv).split('\n');
+    expect(isMechanicalDiffSection(lines, lines.indexOf(`diff --git a/${M} b/${M}`))).toBe(true);
+    expect(normalizeDiffFingerprint(code + mv)).toBe(normalizeDiffFingerprint(code));
+    expect(normalizeContributionFingerprint(code + mv)).toBe(normalizeContributionFingerprint(code));
+  });
+  it('keeps replay equivalence manifest-only: the modify-only timing file is not a transient carry path', () => {
+    expect(TRANSIENT_CARRY_PATHS).toEqual(['.lane-manifest.json']);
+    expect(Object.isFrozen(TRANSIENT_CARRY_PATHS)).toBe(true);
+  });
+  it('an operator clearance carries across a merge of main that only moved the timing file', () => {
+    const cleared = liveCarryFingerprints(code + timings(2));
+    const base = { enabled: true, headSha: 'b'.repeat(40), mechanical: { ok: true, kind: 'merge', reason: '1 merge(s) of origin/main' } };
+    const clearance = { sha: 'a'.repeat(40), diff: cleared.diff, contribution: cleared.contribution, actor: 'operator' };
+    expect(decideHumanClearanceCarry({ ...base, clearance, headDiff: code + timings(9) })).toMatchObject({ carry: true });
+    expect(decideHumanClearanceCarry({ ...base, clearance, headDiff: code.replace('+b', '+c') + timings(9) })).toMatchObject({ carry: false });
+    expect(decideHumanClearanceCarry({ ...base, clearance, headDiff: null })).toMatchObject({ carry: false });
+  });
+});

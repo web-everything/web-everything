@@ -1,6 +1,6 @@
 // tmp-leak fix (2026-10-04): the run-scoped temp root that stops vitest runs leaking into `$TMPDIR`.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, existsSync, symlinkSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
@@ -40,6 +40,22 @@ describe('run root lifecycle', () => {
     const root = createRunTmpRoot({ baseTmp: base, pid: 4242 });
     expect(root.startsWith(join(base, RUN_ROOT_PARENT, '4242-'))).toBe(true);
     expect(existsSync(root)).toBe(true);
+  });
+
+  it('returns a canonical run root when the supplied temp base is a symlink alias', () => {
+    const alias = join(base, 'alias');
+    symlinkSync(base, alias, 'dir');
+    const root = createRunTmpRoot({ baseTmp: alias, pid: 4242 });
+    expect(root).toBe(realpathSync(root));
+    expect(root.startsWith(join(realpathSync(base), RUN_ROOT_PARENT, '4242-'))).toBe(true);
+    expect(existsSync(root)).toBe(true);
+  });
+
+  it('uses a different parent dir per uid', () => {
+    const a = createRunTmpRoot({ baseTmp: base, uid: 1001 });
+    const b = createRunTmpRoot({ baseTmp: base, uid: 1002 });
+    expect(a.startsWith(join(base, 'we-vitest-1001'))).toBe(true);
+    expect(b.startsWith(join(base, 'we-vitest-1002'))).toBe(true);
   });
 
   it('counts leftovers by prefix, then removes the root', () => {

@@ -61,7 +61,12 @@
             }
             return new Set(allValues.filter(function (s) { return defaultExclude.indexOf(s) === -1; }));
         }
-        function activeStatuses() { return statusChips.length ? readSet(statusKey, statusAll, ['resolved', 'closed']) : null; }
+        // Archive sections opt into showing resolved history. Their distinct heading also
+        // isolates saved facets from the pre-split "Tracked work" preferences.
+        const statusDefaultExclude = section.dataset.statusDefaultExclude === undefined
+            ? ['resolved', 'closed']
+            : section.dataset.statusDefaultExclude.split(' ').filter(Boolean);
+        function activeStatuses() { return statusChips.length ? readSet(statusKey, statusAll, statusDefaultExclude) : null; }
         function activeKinds() { return kindChips.length ? readSet(kindKey, kindAll, []) : null; }
         function activeSizes() { return sizeChips.length ? readSet(sizeKey, sizeAll, []) : null; }
         function activeTiers() { return tierChips.length ? readSet(tierKey, tierAll, []) : null; }
@@ -142,7 +147,7 @@
             });
         }
 
-        wireChips(statusChips, 'statusChip', statusKey, statusAll, ['resolved', 'closed'], activeStatuses);
+        wireChips(statusChips, 'statusChip', statusKey, statusAll, statusDefaultExclude, activeStatuses);
         wireChips(kindChips, 'kindChip', kindKey, kindAll, [], activeKinds);
         wireChips(sizeChips, 'sizeChip', sizeKey, sizeAll, [], activeSizes);
         wireChips(tierChips, 'tierChip', tierKey, tierAll, [], activeTiers);

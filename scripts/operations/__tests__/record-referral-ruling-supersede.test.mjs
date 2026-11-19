@@ -44,7 +44,7 @@ const pr = (fx, comments = fx.comments, labels = []) => ({ number: fx.pr, headRe
   createdAt: fx.createdAt, labels: labels.map((name) => ({ name })), comments });
 const readOf = (fx, comments = fx.comments) => {
   const o = openReferralFindings({ comments, ...ctxOf(fx) });
-  return { head: fx.headRefOid, open: o.open, ruled: o.ruled, malformed: o.malformed, card: CARD, now: NOW, clearerId: 'session-x' };
+  return { identity: { login: 'chalbert', type: 'User' }, head: fx.headRefOid, open: o.open, ruled: o.ruled, malformed: o.malformed, card: CARD, now: NOW, clearerId: 'session-x' };
 };
 const input = (fx, extra = {}) => ({ repo: fx.repo, pr: fx.pr, finding: 'all-open', ruling: 'card', actor: 'chalbert',
   channel: 'claude-code-chat', reason: 'Operator 2026-10-08 ~06:55 ET in chat: "Card"', ...extra });

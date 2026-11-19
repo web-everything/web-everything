@@ -210,6 +210,9 @@ export function normalizeInputSchema(schema, name = '<anonymous>') {
         + 'anything would read the canned answer instead of nothing.',
       );
     }
+    if (s.repeatable !== undefined && (typeof s.repeatable !== 'boolean' || s.repeatable && (s.type !== 'array' || atConfirm))) {
+      throw new TypeError(`operations: ${field}: repeatable requires an ordinary array field`);
+    }
     const members = normalizeEnum(s.enum, name, field, s.type);
     if (members && s.default !== undefined && !members.includes(s.default)) {
       throw new TypeError(
@@ -218,7 +221,7 @@ export function normalizeInputSchema(schema, name = '<anonymous>') {
         + 'dies on its own schema.',
       );
     }
-    out[field] = Object.freeze({ type: s.type, required, default: s.default, enum: members, atConfirm });
+    out[field] = Object.freeze({ type: s.type, required, default: s.default, enum: members, atConfirm, ...(s.repeatable ? { repeatable: true } : {}) });
   }
   return Object.freeze(out);
 }

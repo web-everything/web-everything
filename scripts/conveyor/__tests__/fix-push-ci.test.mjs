@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest';
-import { markFixPushAwaitingCi } from '../fix-push-ci.mjs';
+import { markFixPushAwaitingCi, filesToNumstat, FILES_JQ } from '../fix-push-ci.mjs';
 import { resolveHandoffSettings } from '../../lib/handoff-settings.mjs';
 it('creates missing CI labels before applying them and supports a same-head retry', () => {
   const labels = new Set();
@@ -25,7 +25,7 @@ it('creates missing CI labels before applying them and supports a same-head retr
     throw new Error(`unexpected command: ${args.join(' ')}`);
   };
   const push = { repo: 'o/r', pr: 7, head: 'abc' };
-  const deps = { run, recordPush: () => {} };
+  const deps = { run, readNumstat: () => '', recordPush: () => {} };
   expect(markFixPushAwaitingCi(push, deps)).toBe(true);
   expect(markFixPushAwaitingCi(push, deps)).toBe(true);
   expect(labels).toEqual(new Set(['checking', 'status:awaiting-ci']));
@@ -34,9 +34,9 @@ it('creates missing CI labels before applying them and supports a same-head retr
 it('labels the pushed head awaiting CI and removes stale red labels', () => {
   const calls = [];
   const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }] }); };
-  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {} })).toBe(true);
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, readNumstat: () => '', recordPush: () => {} })).toBe(true);
   expect(calls[3]).toEqual(expect.arrayContaining(['--add-label', 'checking', '--add-label', 'status:awaiting-ci', '--remove-label', 'ci:failed', '--remove-label', 'status:ci-red']));
-  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'moved' }, { run, recordPush: () => {} })).toBe(false);
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'moved' }, { run, readNumstat: () => '', recordPush: () => {} })).toBe(false);
   expect(calls).toHaveLength(5);
 });
 it('retains the push record and stops before editing when label creation fails', () => {
@@ -48,7 +48,7 @@ it('retains the push record and stops before editing when label creation fails',
     if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels: [] });
     throw new Error('label creation unavailable');
   };
-  expect(() => markFixPushAwaitingCi(push, { run, recordPush: value => recorded.push(value) })).toThrow('label creation unavailable');
+  expect(() => markFixPushAwaitingCi(push, { run, readNumstat: () => '', recordPush: value => recorded.push(value) })).toThrow('label creation unavailable');
   expect(recorded).toEqual([push]);
   expect(calls.map(args => args.slice(0, 2))).toEqual([['pr', 'view'], ['label', 'create']]);
 });
@@ -59,7 +59,7 @@ it('a same-head retry after a required check failed keeps the red verdict and dr
     { __typename: 'StatusContext', context: 'smoke', state: 'PENDING' },
   ];
   const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', statusCheckRollup: rollup, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }, { name: 'status:fixing' }] }); };
-  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {}, readRequired: () => ['test', 'smoke'] })).toBe(false);
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, readNumstat: () => '', recordPush: () => {}, readRequired: () => ['test', 'smoke'] })).toBe(false);
   expect(calls.map(a => a.slice(0, 2))).toEqual([['pr', 'view'], ['pr', 'edit']]);
   expect(calls[1]).toEqual(['pr', 'edit', '7', '--repo=o/r', '--remove-label', 'status:fixing']);
 });
@@ -67,7 +67,7 @@ it('a same-head retry after CI went green drops the previous head\'s red labels 
   const calls = [];
   const rollup = [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, { __typename: 'StatusContext', context: 'smoke', state: 'SUCCESS' }];
   const run = (cmd, args) => { calls.push(args); return JSON.stringify({ headRefOid: 'abc', statusCheckRollup: rollup, labels: [{ name: 'ci:failed' }, { name: 'status:ci-red' }] }); };
-  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, recordPush: () => {}, readRequired: () => ['test', 'smoke'] })).toBe(false);
+  expect(markFixPushAwaitingCi({ repo: 'o/r', pr: 7, head: 'abc' }, { run, readNumstat: () => '', recordPush: () => {}, readRequired: () => ['test', 'smoke'] })).toBe(false);
   expect(calls[1]).toEqual(['pr', 'edit', '7', '--repo=o/r', '--remove-label', 'ci:failed', '--remove-label', 'status:ci-red']);
 });
 it('headCiVerdict judges required checks only: partial, unknown and missing-status rows are pending', async () => {
@@ -123,4 +123,221 @@ it('ages missing CI from the push, preserving that time on a same-head retry', (
     expect(readFixPush({ ...key, head: 'other' }, { dir })).toBeNull();
     expect(recordFixPush({ ...key, head: 'other' }, { dir, now: () => 60_000 }).pushedAt).toBe(new Date(60_000).toISOString());
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+const sizePush = { repo: 'o/r', pr: 7, head: 'abc' };
+function sizeHarness({ labels = [], readNumstat, filesOutput, repo = 'o/r', fail, changedFiles } = {}) {
+  const calls = [];
+  const run = (cmd, args) => {
+    expect(cmd).toBe('gh');
+    calls.push(args);
+    if (fail?.(args)) throw new Error('size write failed');
+    if (args[0] === 'api' || (args[1] === 'view' && args.at(-1) === 'files')) return filesOutput;
+    if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels, ...(changedFiles === undefined ? {} : { changedFiles }) });
+    return '';
+  };
+  const invoke = () => markFixPushAwaitingCi({ ...sizePush, repo }, {
+    run, recordPush: () => {}, ...(readNumstat ? { readNumstat } : {}),
+  });
+  return { calls, invoke };
+}
+const sizeComments = calls => calls.filter(a => a[1] === 'comment');
+const sizeAdds = calls => calls.filter(a => a[1] === 'edit' && a.includes('--add-label') && a.includes('size:over-cap'));
+const expectCiHandoff = calls => expect(calls.at(-1)).toEqual([
+  'pr', 'edit', '7', '--repo=o/r', '--add-label', 'checking', '--add-label', 'status:awaiting-ci',
+]);
+
+it('crossing 300 lines labels and posts one visible split plan without closing the PR', () => {
+  const { calls, invoke } = sizeHarness({ readNumstat: () => '200\t0\tsrc/a.mjs\n101\t0\tdocs/b.md\n' });
+  expect(invoke()).toBe(true);
+  expect(calls[1]).toEqual(['label', 'create', 'size:over-cap', '--repo=o/r', '--color', 'd93f0b', '--description',
+    'PR grew over the 300 non-test line cap: split plan proposed — auto-managed', '--force']);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)).toHaveLength(1);
+  const comment = sizeComments(calls)[0];
+  expect(comment.slice(0, -1)).toEqual(['pr', 'comment', '7', '--repo=o/r', '--body']);
+  expect(comment.at(-1)).toContain('pr-size-over-cap');
+  expect(comment.at(-1)).toContain('301 non-test lines');
+  expect(comment.at(-1)).toContain('File groups:');
+  expect(comment.at(-1)).toContain('we:src/a.mjs: 200');
+  expect(comment.at(-1)).toContain('we:docs/b.md: 101');
+  expect(comment.at(-1)).toContain('Proposed: split into the file groups above; the PR is not closed and review continues.');
+  expect(calls.some(a => a.includes('close'))).toBe(false);
+  expectCiHandoff(calls);
+});
+it('already flagged growth does not post a second event or re-add the label', () => {
+  const { calls, invoke } = sizeHarness({ labels: ['size:over-cap'], readNumstat: () => '301\t0\tsrc/a.mjs\n' });
+  expect(invoke()).toBe(true);
+  expect(sizeComments(calls)).toEqual([]);
+  expect(sizeAdds(calls)).toEqual([]);
+  expectCiHandoff(calls);
+});
+it.each([299, 300])('at %s lines does not flag or comment', lines => {
+  const { calls, invoke } = sizeHarness({ readNumstat: () => `${lines}\t0\tsrc/a.mjs\n` });
+  expect(invoke()).toBe(true);
+  expect(calls).toHaveLength(4);
+  expect(sizeAdds(calls)).toEqual([]);
+  expect(sizeComments(calls)).toEqual([]);
+});
+it.each([
+  ['reader throws', () => { throw new Error('read failed'); }],
+  ['binary row', () => '-\t-\timage.png\n'],
+  ['truncated row', () => '1\t0\tsrc/a.mjs'],
+  ['failed read object', () => ({ status: 1, stdout: '' })],
+])('fails closed for %s with an unknown event and CI hand-off', (name, readNumstat) => {
+  const { calls, invoke } = sizeHarness({ readNumstat });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+  expect(sizeComments(calls)[0].at(-1)).toContain('unknown');
+  expect(sizeComments(calls)[0].at(-1)).toContain('human review of the full diff is required');
+  expectCiHandoff(calls);
+});
+it('removes the size label when back under cap', () => {
+  const { calls, invoke } = sizeHarness({ labels: ['size:over-cap'], readNumstat: () => '' });
+  expect(invoke()).toBe(true);
+  expect(calls[1]).toEqual(['pr', 'edit', '7', '--repo=o/r', '--remove-label', 'size:over-cap']);
+  expect(sizeComments(calls)).toEqual([]);
+  expectCiHandoff(calls);
+});
+it.each(['create', 'edit', 'comment'])('size %s failure still completes the CI hand-off before rethrowing', operation => {
+  const { calls, invoke } = sizeHarness({ readNumstat: () => '301\t0\tsrc/a.mjs\n',
+    fail: a => a[1] === operation && (a.includes('size:over-cap') || operation === 'comment'),
+  });
+  expect(invoke).toThrow('size write failed');
+  expectCiHandoff(calls);
+});
+it('size removal failure still completes CI hand-off', () => {
+  const { calls, invoke } = sizeHarness({ labels: ['size:over-cap'], readNumstat: () => '',
+    fail: a => a.includes('--remove-label') && a.includes('size:over-cap'),
+  });
+  expect(invoke).toThrow('size write failed');
+  expectCiHandoff(calls);
+});
+it.each([
+  ['over-cap', '301\t0\tsrc/a.mjs\n', 'pr-size-over-cap'],
+  ['unknown', '-\t-\timage.png\n', 'pr-size-unmeasurable'],
+])('retries a failed %s event comment before applying the size label', (name, numstatText, event) => {
+  const labels = new Set();
+  const delivered = [];
+  const calls = [];
+  let commentAttempts = 0;
+  const run = (cmd, args) => {
+    expect(cmd).toBe('gh');
+    calls.push(args);
+    if (args[1] === 'view') return JSON.stringify({ headRefOid: 'abc', labels: [...labels] });
+    if (args[1] === 'comment') {
+      if (++commentAttempts === 1) throw new Error('comment unavailable');
+      delivered.push(args.at(-1));
+    }
+    if (args[1] === 'edit') {
+      for (let i = 0; i < args.length; i += 1) {
+        if (args[i] === '--add-label') labels.add(args[i + 1]);
+        if (args[i] === '--remove-label') labels.delete(args[i + 1]);
+      }
+    }
+    return '';
+  };
+  const deps = { run, recordPush: () => {}, readNumstat: () => numstatText };
+  expect(() => markFixPushAwaitingCi(sizePush, deps)).toThrow('comment unavailable');
+  expectCiHandoff(calls);
+  expect(labels).toEqual(new Set(['checking', 'status:awaiting-ci']));
+  expect(delivered).toEqual([]);
+  expect(sizeAdds(calls)).toEqual([]);
+
+  // Retry against the actual labels persisted by the failed invocation.
+  expect(markFixPushAwaitingCi(sizePush, deps)).toBe(true);
+  expectCiHandoff(calls);
+  expect(labels).toEqual(new Set(['checking', 'status:awaiting-ci', 'size:over-cap']));
+  expect(commentAttempts).toBe(2);
+  expect(delivered).toHaveLength(1);
+  expect(delivered[0]).toContain(event);
+  expect(delivered[0]).toContain('Proposed: split into the file groups above; the PR is not closed and review continues.');
+  expect(calls.indexOf(sizeComments(calls)[1])).toBeLessThan(calls.indexOf(sizeAdds(calls)[0]));
+
+  expect(markFixPushAwaitingCi(sizePush, deps)).toBe(true);
+  expectCiHandoff(calls);
+  expect(commentAttempts).toBe(2);
+  expect(delivered).toHaveLength(1);
+  expect(sizeAdds(calls)).toHaveLength(1);
+});
+const fileRow = (filename, additions, deletions, hasPatch = true, previous_filename = null) => JSON.stringify({ additions, deletions, filename, previous_filename, hasPatch }) + '\n';
+it('default reader uses paginated API rows with the repo and PR', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 301, 0), changedFiles: 1 });
+  expect(invoke()).toBe(true);
+  expect(calls[1]).toEqual(['api', '--paginate', 'repos/o/r/pulls/7/files', '--jq', FILES_JQ]);
+  expect(FILES_JQ).toContain('hasPatch:(.patch != null)');
+  expect(sizeAdds(calls)).toHaveLength(1);
+});
+it('default reader treats a patch-less zero-change file (binary) as unmeasurable, never as a zero-sized diff', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 5, 0) + fileRow('image.png', 0, 0, false), changedFiles: 2 });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+  expectCiHandoff(calls);
+});
+it('filesToNumstat keeps measured zeros, marks binary rows unmeasurable and rejects malformed evidence', () => {
+  expect(filesToNumstat('')).toBe('');
+  expect(filesToNumstat(fileRow('a.mjs', 3, 4))).toBe('3\t4\ta.mjs\0');
+  // A patch-bearing zero row (e.g. an emptied-line edit) is a measured zero, not binary.
+  expect(filesToNumstat(fileRow('a.mjs', 0, 0))).toBe('0\t0\ta.mjs\0');
+  expect(filesToNumstat(fileRow('img.png', 0, 0, false))).toBe('-\t-\timg.png\0');
+  // A rename carries both paths (git -z shape); an unchanged-name previous_filename is not a rename.
+  expect(filesToNumstat(fileRow('b.mjs', 1, 2, true, 'a.mjs'))).toBe('1\t2\t\0a.mjs\0b.mjs\0');
+  expect(filesToNumstat(fileRow('a.mjs', 1, 2, true, 'a.mjs'))).toBe('1\t2\ta.mjs\0');
+  for (const bad of [
+    fileRow('a.mjs', 1, 0).slice(0, -1), // truncated last row (no final newline)
+    '{"additions":1,"deletions":0,"filen\n', // cut mid-row
+    '\n', // blank row
+    fileRow('a.mjs', null, 0), fileRow('a.mjs', -1, 0), fileRow('a.mjs', 1.5, 0), fileRow('', 1, 0),
+    JSON.stringify({ additions: 1, deletions: 0, filename: 'a' }) + '\n', // hasPatch missing
+    fileRow('a.mjs', 1, 0, true, 'x\ny'), fileRow('a.mjs', 1, 0, true, ''),
+    'null\n', '[]\n', 42,
+  ]) expect(() => filesToNumstat(bad)).toThrow();
+  // A path holding a tab/newline would forge extra numstat rows: it is rejected outright (fails closed).
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('a\n0\t0\tb', 1, 0), changedFiles: 1 });
+  expect(invoke()).toBe(true);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+});
+it.each([
+  ['an empty read while the PR has files', '', 3],
+  ['a short read', fileRow('src/a.mjs', 1, 0), 2],
+  ['extra rows', fileRow('src/a.mjs', 1, 0) + fileRow('b.mjs', 1, 0), 1],
+  ['an unknown PR file count', fileRow('src/a.mjs', 1, 0), undefined],
+])('default reader fails closed on %s (cross-check against the PR file count)', (name, filesOutput, changedFiles) => {
+  const { calls, invoke } = sizeHarness({ filesOutput, changedFiles });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+  expectCiHandoff(calls);
+});
+it('default reader accepts an empty read only when the PR has no files', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: '', changedFiles: 0 });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(0);
+  expectCiHandoff(calls);
+});
+it('a rename out of source into a test path is measured against its source, not as test-only (default reader)', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/__tests__/x.test.mjs', 200, 200, true, 'src/x.mjs'), changedFiles: 1 });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-over-cap');
+  expectCiHandoff(calls);
+});
+it('default reader without a repo is unmeasurable and fails closed (no implicit repo)', () => {
+  const { calls, invoke } = sizeHarness({ repo: '' });
+  expect(invoke()).toBe(true);
+  expect(calls.some(args => args.includes('files') || args.includes('files,changedFiles'))).toBe(false);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+});
+it('default reader fails closed at the 3000-file API cap with human review fallback', () => {
+  const { calls, invoke } = sizeHarness({ filesOutput: fileRow('src/a.mjs', 0, 0).repeat(3000), changedFiles: 3000 });
+  expect(invoke()).toBe(true);
+  expect(sizeAdds(calls)).toHaveLength(1);
+  expect(sizeComments(calls)[0].at(-1)).toContain('pr-size-unmeasurable');
+  expect(sizeComments(calls)[0].at(-1)).toContain('human review of the full diff is required');
+  expectCiHandoff(calls);
 });

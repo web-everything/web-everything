@@ -9,11 +9,19 @@
  */
 import { createHash } from 'node:crypto';
 import * as os from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
+import { collectHostCapacity } from '../readiness/host-capacity.mjs';
+import { LEASE_FILENAME } from './lane-lease.mjs';
+
+// GC has no reason to reclaim even a stale lease. Unknown markers/IO refuse work too.
+function gcLeaseProtected(lane) {
+  try { lstatSync(join(lane, '.git', LEASE_FILENAME)); return true; }
+  catch (error) { return error.code !== 'ENOENT'; }
+}
 /** Subprocess fixtures may supply a reading only under Vitest. Production always samples the host.
  * Keep the source injectable so tests can also prove the real-source fallback without sampling the host.
  */
@@ -116,17 +124,24 @@ export function readHostMemoryHeadroomMb(options = {}) {
   return readMemoryReading(options).mb ?? NaN;
 }
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
+  capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
   try {
     policy ??= loadHostOverloadSettings({ env, log });
+    if (policy.settings.host.capacitySignal === 'cpu-mem') {
+      const reading = capacity({ policy, env, log, includeQueue: false, includeForge: false });
+      loadVerdict = { admitted: reading.admitNewWorkers === true && ['high', 'medium'].includes(reading.headroom?.mac),
+        reason: `host capacity: ${reading.reason ?? 'unknown'}; host.capacitySignal=cpu-mem (${policy.sources?.['host.capacitySignal'] ?? 'standard'})` };
+    } else {
     const limit = policy.settings.host.maxLoadPerCore;
     const l = load()[0]; const c = cores();
     if (!Number.isFinite(l) || l < 0 || !Number.isFinite(c) || c <= 0 || !Number.isFinite(limit) || limit <= 0) throw Error('unknown host load');
     const ratio = l / c;
     loadVerdict = { admitted: ratio <= limit, reason: `host load ${l.toFixed(2)}/${c}=${ratio.toFixed(2)}; host.maxLoadPerCore=${limit} (${policy.sources['host.maxLoadPerCore']})` };
+    }
   } catch (e) { return { admitted: false, reason: `host load unknown: ${e.message}` }; }
   if (!loadVerdict.admitted) return loadVerdict;
   // Memory is checked only once load admits; unavailable readings fail closed.
@@ -164,14 +179,22 @@ export function scheduledLaneGc(lanes, { stateRoot = hostStateRoot(), exec = chi
       let ran = false;
       let failures = 0;
       for (const lane of lanes) {
+        if (gcLeaseProtected(lane)) { log(`gc skipped leased/unreadable lane: ${lane}`); continue; }
         const key = digest(resolve(lane));
         const last = cursor[key];
         if (last !== undefined && (!Number.isFinite(last) || last > nowMs)) throw Error('unknown gc cursor');
         if (last !== undefined && nowMs - last < schedule) continue;
         const host = admission({ env, log, interactive });
         if (!host.admitted) { log(`gc skipped: ${host.reason}`); return { ran, reason: host.reason }; }
+        if (gcLeaseProtected(lane)) { log(`gc skipped leased/unreadable lane: ${lane}`); continue; }
         try {
-          exec('git', ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'], { cwd: lane, timeout: 120000, stdio: 'pipe' });
+          const args = ['-c', 'gc.auto=0', '-c', 'gc.autoDetach=false', '-c', 'gc.pruneExpire=never', 'gc', '--no-detach'];
+          const options = { cwd: lane, timeout: 120000, stdio: 'pipe' };
+          try { exec('git', args, options); } catch (e) {
+            if (e.status !== 129 || !/unknown option [`']no-detach'/.test(String(e.stderr))) throw e;
+            // Git 2.43 has no detach option: explicit (non-auto) gc already runs in the foreground.
+            exec('git', args.slice(0, -1), options);
+          }
         } catch (e) {
           // A damaged or slow clone must not starve the rest of the pool. Leave it due for retry.
           failures++;

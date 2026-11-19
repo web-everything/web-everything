@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const files = ['ci.yml', 'deploy.yml', 'update-visual-baselines.yml'];
+const files = ['ci.yml', 'deploy.yml', 'update-visual-baselines.yml', 'test-selection-measure.yml'];
 
 // Split a workflow into "- name:" steps (text based, no YAML dependency).
 function steps(text) {

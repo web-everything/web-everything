@@ -263,6 +263,10 @@ export function planMainCiRerun({ runs, tipSha, reruns = {}, flake = null, setti
     && (newest.attempt == null || newest.attempt === 1) && unseen(newest.databaseId)) {
     return { runId: newest.databaseId, sha: newest.headSha, kind: 'cancelled-tip', reason: 'latest main run was cancelled' };
   }
+  if (settings.mainCiRedRerunCancelledTip && newest?.headSha === tipSha && RED.has(newest?.conclusion)
+    && newest.infraOnly === true && (newest.attempt == null || newest.attempt === 1) && unseen(newest.databaseId)) {
+    return { runId: newest.databaseId, sha: newest.headSha, kind: 'infra-tip', reason: 'latest main run failed only through cancelled/never-started jobs' };
+  }
   // A flake rerun that finished with no verdict (cancelled / skipped / infra-only) settled nothing: try it once more, then
   // leave the hold to the owner. Only runs we ledgered as a flake rerun qualify, and only up to FLAKE_RERUN_ROUNDS tries.
   const again = runs.find((r) => r.rerunInconclusive === true
@@ -629,7 +633,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
     '',
     'Steps:',
     `1. Take a lane: \`node "${weRoot}/scripts/lane-pool.mjs" acquire --purpose=main-fix-${sha9} --adopt\`. Work only in the lane path it prints.`,
-    `2. Find the cause in the merged range ${range} (\`git log --oneline ${lastGreenSha ? range : sha9}\`) and the failing job logs (\`gh run view ${Number.isInteger(runId) ? runId : 0} --log-failed\`).`,
+    `2. Find the cause in the merged range ${range} (\`git log --oneline ${lastGreenSha ? range : sha9}\`) and the failing job logs (use \`readCiJobLog\` from \`scripts/lib/gh-ci-log.mjs\` with repo + jobId from run ${Number.isInteger(runId) ? runId : 0}; the whole job log includes passing steps, filtered: false).`,
     '3. Main can have SEVERAL red causes on one commit (2026-10-08: a soak scenario AND a ledger-id test). You own them all, in ONE PR: fix every failing job listed above. If an open PR already fixes one cause, build ON its branch (`git merge origin/<its branch>` into yours) so your PR carries every fix, and name it in your PR body. Two PRs that each fix one cause DEADLOCK: each one\'s CI fails on the other\'s cause.',
     '4. Write or keep a failing test, then fix the ROOT CAUSE. Never delete, skip or loosen a test or a merge-gate guard to get green.',
     ...(policy.pushBeforeGate ? [

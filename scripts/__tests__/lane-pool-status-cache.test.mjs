@@ -14,6 +14,7 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, readFileSync, realpathSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { journalLaneEvent } from '../lib/lane-history.mjs';
 import { cachedGitFields, laneGitSignature, resolveStatusMaxAgeMs } from '../lib/lane-status-cache.mjs';
 
 const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
@@ -69,15 +70,25 @@ describe('status --max-age-ms (host churn cut)', () => {
     expect(strip(second.out)).toEqual(strip(first.out));
   });
 
-  it('default (no flag, no env) still probes every lane fresh and writes nothing — today\'s behaviour', () => {
-    expect(runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']).code).toBe(0);
-    rmSync(join(poolRoot, 'stcache', '.lane-status-cache.json'));
+  it('default (no flag, no env) is cached with a short TTL; --max-age-ms=0 probes every lane fresh', () => {
     expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
-    expect(existsSync(join(poolRoot, 'stcache', '.lane-status-cache.json'))).toBe(false);
-    expect(runPool(['status', ...poolArgs(), '--json', '--max-age-ms=600000']).code).toBe(0);
+    expect(existsSync(join(poolRoot, 'stcache', '.lane-status-cache.json'))).toBe(true);
     resetLog();
     expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
+    for (let n = 1; n <= N; n++) expect(spawnsIn(n)).toEqual([]);
+    resetLog();
+    expect(runPool(['status', ...poolArgs(), '--json', '--max-age-ms=0']).code).toBe(0);
     for (let n = 1; n <= N; n++) expect(spawnsIn(n).some((l) => l.includes('status --porcelain'))).toBe(true);
+  });
+
+  it('a lane mutation journal event drops only that lane\'s cached row', () => {
+    expect(runPool(['status', ...poolArgs(), '--json']).code).toBe(0);
+    const file = join(poolRoot, 'stcache', '.lane-status-cache.json');
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).lanes)).toContain('2');
+    journalLaneEvent(laneDirOf(2), { action: 'release', reason: 'test' });
+    const lanes = JSON.parse(readFileSync(file, 'utf8')).lanes;
+    expect(lanes['2']).toBeUndefined();
+    expect(lanes['1']).toBeDefined();
   });
 
   it('a commit in a lane invalidates its row at once, even inside the window', () => {
@@ -115,11 +126,12 @@ describe('lane-status-cache pure parts', () => {
     expect(cachedGitFields(cache, 1, null, 1500, 1000)).toBeNull();
     expect(cachedGitFields(cache, 2, 's1', 1500, 1000)).toBeNull();
   });
-  it('resolves the knob: flag, then env, then default 0', () => {
-    expect(resolveStatusMaxAgeMs(undefined, {})).toBe(0);
+  it('resolves the knob: flag, then env, then default 45s', () => {
+    expect(resolveStatusMaxAgeMs(undefined, {})).toBe(45000);
+    expect(resolveStatusMaxAgeMs('0', {})).toBe(0);
     expect(resolveStatusMaxAgeMs(undefined, { WE_LANE_STATUS_MAX_AGE_MS: '5000' })).toBe(5000);
     expect(resolveStatusMaxAgeMs('7', { WE_LANE_STATUS_MAX_AGE_MS: '5000' })).toBe(7);
-    expect(resolveStatusMaxAgeMs('junk', {})).toBe(0);
+    expect(resolveStatusMaxAgeMs('junk', {})).toBe(45000);
   });
   it('signature is null for a non-git dir', () => {
     expect(laneGitSignature(tmpdir(), 'main')).toBeNull();

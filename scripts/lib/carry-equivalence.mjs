@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint } from './review-escalation.mjs';
 import { LANE_MANIFEST } from './rebase-drop-manifest.mjs';
 
-/** Only the drain's root manifest is transient; nested files remain substantive. */
+/** Only the drain's root manifest is transient for replay (it compares names only, so the modify-only timing file is not); nested files remain substantive. */
 export const TRANSIENT_CARRY_PATHS = Object.freeze([LANE_MANIFEST]);
 const SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'human-clearance-carry.json');
 const ENV_KEY = 'WE_REVIEW_CARRY_EQUIVALENCE';

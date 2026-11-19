@@ -23,16 +23,30 @@
  * derived from the declaration — including which operations have a juror to point at a lane at all.
  */
 
+import { appendEntry } from './ruled-weakened-store.mjs';
+import { ruledWeakenedAddOperation, RULED_WEAKENED_ADD_OP, RULED_WEAKENED_ADD_EFFECT, finishRuledWeakenedAdd } from './ruled-weakened-add.mjs';
+import { OPERATOR_OVERRIDE_OPS, OPERATOR_OVERRIDE_EFFECT, operatorOverrideOperation } from './operator-override.mjs';
+import { lastOverrideReason, readOperatorOverrides, writeOperatorOverride, clearOperatorOverride } from '../lib/operator-override-store.mjs';
+import { aiRoutingOperation, AI_ROUTING_OP, finishAiRouting } from './ai-routing.mjs';
+import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_ROLES } from '../lib/ai-routing.mjs';
+import { routingOverrideOperation, ROUTING_OVERRIDE_OP } from './routing-override.mjs';
+import { createRoutingOverrideSinks } from './routing-override-file.mjs';
 import { execFileSync } from 'node:child_process';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readLatestDecisions } from '../conveyor/health-responder-state.mjs';
 import { healthRespondOperation, HEALTH_RESPOND_OP } from './health-respond.mjs';
-import { resolve } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { loadavg, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import { operatorSessionBootstrapOperation, finishBootstrap } from './operator-session-bootstrap.mjs';
 import { bootstrapPlan } from './operator-session-bootstrap-io.mjs';
-import { createRegistry } from './registry.mjs';
+import { createRegistry, op } from './registry.mjs';
+import { compute, effect } from './step-kinds.mjs';
+import { main as codexAuditMain } from './codex-audit.mjs';
+import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
+import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
 import { createFileCallLogStore } from './call-log-store.mjs';
 import {
@@ -74,13 +88,27 @@ import { createRunnerActivityReader, createRunnerActivityCliStores } from './run
 import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
+import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './host-capacity.mjs';
+import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
-import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
+import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
+import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
+import { resolveWorkerCapacitySettings } from '../lib/worker-capacity.mjs';
+import { deliveryCapacityOperation, finishDeliveryCapacity, DELIVERY_CAPACITY_OP } from './delivery-capacity.mjs';
+import { DELIVERY_CAPACITY_OVERRIDE_OPS, DELIVERY_CAPACITY_OVERRIDE_EFFECT, deliveryCapacityOverrideOperation } from './delivery-capacity-override.mjs';
+import { createDeliveryCapacityTune } from './delivery-capacity-tune-shell.mjs';
+import { resolveDeliveryCapacity, assessCapacity } from '../lib/delivery-capacity.mjs';
+import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
 import { createMaintenanceSinks } from './maintenance-io.mjs';
+import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from './update-branch.mjs';
+import { createUpdateBranchSinks } from './update-branch-io.mjs';
 import { freeScopeOperation, FREE_SCOPE_OP } from './free-scope.mjs';
 import { prototypeLoadOperation, PROTOTYPE_LOAD_OP, PROTOTYPE_LOAD_EFFECT } from './prototype-load.mjs';
 import { createPrototypeLoader, defaultDeps as prototypeLoadDeps } from './prototype-load-io.mjs';
@@ -114,6 +142,7 @@ import { createResolveReader, createResolveSinks } from './resolve-io.mjs';
 import { scaffoldOperation, SCAFFOLD_OP } from './scaffold.mjs';
 import { createScaffoldReader, createScaffoldSinks } from './scaffold-io.mjs';
 import { fileItemOperation, FILE_ITEM_OP } from './file-item.mjs';
+import { FILE_HELD_CARDS_OP, fileHeldCardsOperation, createFileHeldCardsSinks, finishFileHeldCards } from './file-held-cards.mjs';
 import { createFileItemReader, createFileItemSinks } from './file-item-io.mjs';
 import { graduateChainOperation, GRADUATE_CHAIN_OP, finishGraduateChain } from './graduate-chain.mjs';
 import { createGraduateChainSinks } from './graduate-chain-io.mjs';
@@ -127,6 +156,8 @@ import { verifyOperation, VERIFY_OP } from './verify.mjs';
 import { createChecksRunner } from './verify-io.mjs';
 import { prSizeOperation, PR_SIZE_OP, finishPrSize } from './pr-size.mjs';
 import { createPrSizeReader } from './pr-size-io.mjs';
+import { deliveryFlowOperation, DELIVERY_FLOW_OP, finishDeliveryFlow } from './delivery-flow.mjs';
+import { createDeliveryFlowReader } from './delivery-flow-io.mjs';
 import { mutationCheckOperation, MUTATION_CHECK_OP, revertRedCheckOperation, REVERT_RED_CHECK_OP } from './mutation-check.mjs';
 import { createMutationCheckSinks, createRevertRedCheckSinks } from './mutation-check-io.mjs';
 import { exploreOperation, EXPLORE_OP } from './explore.mjs';
@@ -185,7 +216,65 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
  * declaration is what {@link ./http-adapter.mjs} derives a route table from, with no third entry anywhere.
  */
 
+// Capture both audit streams as the operation result. The CLI adapter owns the JSON envelope;
+// plain mode prints the captured verdict/findings or refusal diagnostic, preserving the audit exit code.
+export function createCodexAuditSink({ auditMain = codexAuditMain, makeDeps } = {}) {
+  return async ({ base, head }) => {
+    let stdout = '', stderr = '';
+    const deps = makeDeps ? makeDeps() : (await import('./codex-audit-io.mjs')).createAuditDeps();
+    const code = await auditMain([`--base=${base}`, `--head=${head}`], {
+      ...deps,
+      stdout: text => { stdout += text; },
+      stderr: text => { stderr += text; },
+    });
+    return { ok: code === 0, code, stdout, stderr };
+  };
+}
+
+export function finishCodexAudit({ run, code, lines, json }) {
+  const v = run?.verdict;
+  const outCode = code !== 0 ? code : (v?.code ?? code);
+  if (json || !v) return { code: outCode, lines };
+  const saved = [v.stdout, v.stderr].filter(Boolean).map(text => text.trimEnd());
+  // A non-zero exit (e.g. `--resume=<completed run> --answer=accept` refusing, exit 2) must still show WHY:
+  // append the refusal/diagnostic lines the saved verdict does not already carry.
+  // Only when the CLI exit differs from the audit's own verdict code: a plain WEAKENED (same code) already says why.
+  const extra = code !== 0 && code !== v.code ? (lines ?? []).filter(l => l !== '' && !saved.some(s => s.includes(l))) : [];
+  return { code: outCode, lines: [...saved, ...extra] };
+}
+
+
+export const CLI_ONLY_OPERATIONS = Object.freeze({
+  [RULED_WEAKENED_ADD_OP]: () => ({ declaration: ruledWeakenedAddOperation(),
+    sinks: { [RULED_WEAKENED_ADD_EFFECT]: entry => appendEntry(entry) }, finish: finishRuledWeakenedAdd }),
+  ...Object.fromEntries(OPERATOR_OVERRIDE_OPS.filter(name => name !== 'operator-override-show').map(name => [name, () => ({
+    declaration: operatorOverrideOperation(name, { readOverrides: () => readOperatorOverrides() }),
+    sinks: {
+      [OPERATOR_OVERRIDE_EFFECT]: ({ clear, ...input }) => (clear ? clearOperatorOverride : writeOperatorOverride)(input),
+    },
+  })])),
+  ...Object.fromEntries(DELIVERY_CAPACITY_OVERRIDE_OPS.map(name => [name, () => ({
+    declaration: deliveryCapacityOverrideOperation(name),
+    sinks: {
+      [DELIVERY_CAPACITY_OVERRIDE_EFFECT]: ({ writes, clears, reason }) => {
+        const actor = userInfo().username;
+        for (const { key, value } of writes) writeOperatorOverride({ key, value, reason, actor });
+        for (const key of clears) clearOperatorOverride({ key, reason, actor });
+        return { writes, clears };
+      },
+    },
+  })])),
+});
+
 export const OPERATIONS = Object.freeze({
+  [AI_ROUTING_OP]: () => ({ declaration: aiRoutingOperation({ collect: () => {
+    const routing = resolveAiRouting();
+    return { settings: routing.value, sources: routing.sources, invalid: routing.invalid,
+      inputs: Object.fromEntries(AI_ROUTING_ROLES.map(role => [role, aiRoutingInputs(role, routing)])) };
+  } }), sinks: {}, finish: finishAiRouting }),
+  'operator-override-show': () => ({ declaration: operatorOverrideOperation('operator-override-show', { readOverrides: () => readOperatorOverrides() }), sinks: {} }),
+  [ROUTING_OVERRIDE_OP]: () => ({ declaration: routingOverrideOperation(), sinks: createRoutingOverrideSinks() }),
+  [MANUAL_DAEMON_PASS_OP]: () => ({ declaration: manualDaemonPassOperation(), sinks: createManualDaemonPassSinks() }),
   [PR_TRACE_OP]: () => ({ declaration: prTraceOperation({ readFacts: createPrTraceReader() }), sinks: {}, finish: finishPrTrace }),
   [JUDGE_SWEEP_FACTS_OP]: () => ({
     declaration: judgeSweepFactsOperation({ readFacts: createJudgeSweepFactsReader() }),
@@ -227,7 +316,7 @@ export const OPERATIONS = Object.freeze({
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
     if (resumeId) { try { savedRun = createFileRunStore().read(resumeId); } catch { savedRun = null; } }
-    const seatSettings = loadReviewSeatSettings();
+    const seatSettings = loadReviewSeatSettings({ aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator });
     const live = { codexAdvisory: codexAdvisoryFromEnv(), correctnessAdvisory: correctnessAdvisoryFromEnv(),
       antigravityReview: antigravityReviewFromEnv() };
     // A saved run keeps the roster it started with at every cursor position (`reviewSeatOptionsForRun`).
@@ -262,6 +351,11 @@ export const OPERATIONS = Object.freeze({
   [PR_SIZE_OP]: () => ({
     declaration: prSizeOperation({ readDiff: createPrSizeReader() }),
     finish: finishPrSize,
+  }),
+  [DELIVERY_FLOW_OP]: () => ({
+    declaration: deliveryFlowOperation({ readFlow: createDeliveryFlowReader() }),
+    sinks: {},
+    finish: finishDeliveryFlow,
   }),
   // #x4omld5 — put the bug back and prove the guard goes red. UNLIKE `verify` above it has a SINK, and that
   // is deliberate: its probe writes to a source file, so declaring the transaction as an `effect` keeps the
@@ -336,6 +430,11 @@ export const OPERATIONS = Object.freeze({
     declaration: fileItemOperation({ readScaffoldContext: createFileItemReader() }),
     sinks: createFileItemSinks(),
   }),
+  [FILE_HELD_CARDS_OP]: (opts = {}) => ({
+    declaration: fileHeldCardsOperation(),
+    sinks: createFileHeldCardsSinks(),
+    finish: outcome => finishFileHeldCards(outcome, opts.json),
+  }),
   [SUGGEST_NEXT_OP]: () => ({
     declaration: suggestNextOperation({
       loadBoard: createBoardReader(),
@@ -403,6 +502,12 @@ export const OPERATIONS = Object.freeze({
     declaration: daemonStatusOperation({ collect: collectDaemonStatus }),
     sinks: {},
   }),
+  // R258 — measured CPU/memory capacity; read-only, no effect sinks.
+  [HOST_CAPACITY_OP]: () => ({
+    declaration: hostCapacityOperation({ collect: collectHostCapacity }),
+    sinks: {},
+    finish: finishHostCapacity,
+  }),
   // Card xb0iuxq (epic #4075, under #3383) — the mechanical "who's holding/waiting on the heavy-admission pool"
   // report (the operator's own hand-built report, made mechanical). Read-only, same no-sinks reasoning as
   // `daemon-status`/`runner-activity`: every step is `compute`. `collectHeavyQueue`'s real `admissionStatus`/
@@ -417,6 +522,77 @@ export const OPERATIONS = Object.freeze({
     sinks: {},
     finish: finishResourceStatus,
   }),
+  // R313/R349 — SHADOW measured worker cap beside the step rule; reads resource history, logs one jsonl row per run.
+  [WORKER_CAPACITY_OP]: () => ({
+    declaration: workerCapacityOperation({ collect: () => {
+      const paths = resourcePaths();
+      let historyText = ''; try { historyText = readFileSync(paths.history, 'utf8'); } catch { /* no history yet */ }
+      return { historyText, load1: loadavg()[0], nowMs: Date.now(),
+        settings: resolveWorkerCapacitySettings({ settings: readSettings(), env: process.env }) };
+    } }),
+    sinks: {},
+    finish: finishWorkerCapacity({ log: (row) => appendResourceLog(join(dirname(resourcePaths().history), 'worker-capacity-shadow.jsonl'), row) }),
+  }),
+  [DELIVERY_CAPACITY_OP]: () => ({
+    declaration: deliveryCapacityOperation({ collect: () => {
+      const policy = resolveDeliveryCapacity();
+      const fields = 'number,headRefName,body,labels,files,additions,deletions,updatedAt';
+      const repo = ghRepoSlug(DEFAULT_REPO_KEY);
+      const failures = [];
+      let prs = null;
+      let host = null;
+      let incomplete = false;
+      try { prs = readSharedOpenPrs({ repo, fields }); }
+      catch { failures.push('shared PR reader failed'); }
+      if (prs === null) {
+        try {
+          prs = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
+            '--state', 'open', '--limit', '200', '--json', fields],
+          { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })));
+          incomplete = Array.isArray(prs) && prs.length >= 200;
+          if (!Array.isArray(prs) || incomplete) failures.push('PR list unreadable or at 200-PR limit; inspect full population');
+        } catch { failures.push('open PR collection failed'); }
+      }
+      try {
+        const probe = (file, args) => String(execFileSync(file, args,
+          { encoding: 'utf8', timeout: 5000, maxBuffer: 262144, stdio: ['ignore', 'pipe', 'pipe'] }));
+        const top = probe('top', ['-l', '2', '-s', '1', '-n', '0']);
+        const idle = [...top.matchAll(/CPU usage:.*?([\d.]+)% idle/g)].at(-1);
+        const vm = probe('vm_stat', []);
+        const load = /\{\s*([\d.]+)/.exec(probe('sysctl', ['-n', 'vm.loadavg']));
+        const pageSize = /page size of (\d+)/.exec(vm);
+        const free = /Pages free:\s*(\d+)/.exec(vm);
+        const inactive = /Pages inactive:\s*(\d+)/.exec(vm);
+        if (!idle || !pageSize || !free || !inactive || !load) throw new Error('incomplete host evidence');
+        host = { idlePct: Number(idle[1]), load1: Number(load[1]), memGb: (Number(free[1]) + Number(inactive[1])) * Number(pageSize[1]) / 2 ** 30 };
+        if (!Number.isFinite(host.idlePct) || !Number.isFinite(host.memGb) || !Number.isFinite(host.load1)) throw new Error('invalid host evidence');
+      } catch { failures.push('host CPU/memory/load collection failed; inspect top/vm_stat/sysctl'); }
+      let overrides = { readable: false, values: {} };
+      try {
+        overrides = { ...readOperatorOverrides(), holdReason: lastOverrideReason('deliveryCapacity.holdUntil') };
+      } catch { /* unreadable stays fail-closed */ }
+      const result = assessCapacity({ prs, host, policy, incomplete, overrides,
+        ...(failures.length ? { fallbackReason: `${failures.join('; ')}; count-mode fallback` } : {}) });
+      // Legacy throughput is informational: failed reads stay unknown and never imply zero merges.
+      result.mergedCount2h = null;
+      try {
+        const merged = JSON.parse(String(execFileSyncThrottled('gh', ['pr', 'list', '--repo', repo,
+          '--state', 'merged', '--limit', '60', '--json', 'mergedAt'],
+        { encoding: 'utf8', timeout: 30000, maxBuffer: 262144, stdio: ['ignore', 'pipe', 'pipe'] })));
+        const nowMs = Date.now();
+        if (Array.isArray(merged) && merged.every(pr => typeof pr?.mergedAt === 'string' && Number.isFinite(Date.parse(pr.mergedAt)))) {
+          result.mergedCount2h = merged.filter(pr => {
+            const ms = Date.parse(pr.mergedAt);
+            return ms >= nowMs - 2 * 3600000 && ms <= nowMs;
+          }).length;
+        }
+      } catch { /* unknown throughput */ }
+      // Reads never write: an expired override is ignored and shown in the readout until the next hold, pin or clear.
+      return result;
+    } }),
+    sinks: {},
+    finish: (args) => finishDeliveryCapacity(args, { tune: createDeliveryCapacityTune() }),
+  }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
   [PRE_PR_CHECK_OP]: () => ({
@@ -429,12 +605,33 @@ export const OPERATIONS = Object.freeze({
     declaration: maintenanceOperation(),
     sinks: createMaintenanceSinks(),
   }),
+  [UPDATE_BRANCH_OP]: () => ({
+    declaration: updateBranchOperation(),
+    sinks: createUpdateBranchSinks(),
+    finish: finishUpdateBranch,
+  }),
   // free-scope — rules 21/26 of the operator handoff: are these files free of every open PR and every running
   // agent's declared scope? Read-only (no sinks). Register/release live in free-scope-cli.mjs.
   'operator-session-bootstrap': () => ({ declaration: operatorSessionBootstrapOperation({ collect: bootstrapPlan }), sinks: {}, finish: finishBootstrap }),
   [FREE_SCOPE_OP]: () => ({
     declaration: freeScopeOperation({ collect: collectFreeScope }),
     sinks: {},
+  }),
+  'codex-audit': () => ({
+    declaration: op('codex-audit', {
+      input: { base: { type: 'string' }, head: { type: 'string' } },
+      verdictFrom: 'assess',
+      audit: effect({ reads: ['input.base', 'input.head'], effects: ({ input }) => [{
+        type: 'codex-audit.run', payload: input, idempotent: false,
+      }] }),
+      assess: compute({ reads: ['findings.audit'], fn: ({ findings }) => {
+        const entry = findings.audit?.effects?.[0];
+        if (entry?.status !== 'applied' || !entry.result) throw new Error('codex-audit: audit did not complete');
+        return entry.result;
+      } }),
+    }),
+    sinks: { 'codex-audit.run': createCodexAuditSink() },
+    finish: finishCodexAudit,
   }),
   [PROTOTYPE_LOAD_OP]: () => ({ declaration: prototypeLoadOperation(),
     sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => createPrototypeLoader(prototypeLoadDeps())(input) },
@@ -673,7 +870,8 @@ export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an
   // INHERITED function, which a `typeof … === 'function'` test then accepts as a real operation. Same hazard the
   // jury enums guard with null-prototype tables (`we:scripts/lib/jury-core.mjs`, #xdompzx).
-  const build = Object.hasOwn(OPERATIONS, String(name ?? '')) ? OPERATIONS[name] : undefined;
+  const table = opts.cli === true ? { ...OPERATIONS, ...CLI_ONLY_OPERATIONS } : OPERATIONS;
+  const build = Object.hasOwn(table, String(name ?? '')) ? table[name] : undefined;
   if (typeof build !== 'function') {
     throw new Error(
       `operations: no operation named ${JSON.stringify(name)} (known: ${Object.keys(OPERATIONS).sort().join(', ')})`
@@ -696,7 +894,7 @@ export function rootUsage() {
   return [
     'usage: run.mjs <operation> [--flags]',
     '',
-    `operations: ${Object.keys(OPERATIONS).sort().join(', ')}`,
+    `operations: ${Object.keys({ ...OPERATIONS, ...CLI_ONLY_OPERATIONS }).sort().join(', ')}`,
     '',
     'Run `run.mjs <operation> --help` for an operation\'s flags — they are derived from its declaration.',
   ].join('\n');
@@ -720,6 +918,11 @@ export function cliPreflight(name, { arm = armSelfReexecOnFastForward, assertFre
 
 /** Use the declared parser for both reader construction and CLI write policy. */
 export function operatorControlCliPolicy(name, argv) {
+  if (name === FILE_HELD_CARDS_OP) {
+    const parsed = parseOperationArgv(fileHeldCardsOperation(), argv);
+    if (!parsed.ok) throw new Error(parsed.errors.join('\n'));
+    return { zeroWrites: parsed.input['dry-run'], memoryStore: parsed.input['dry-run'] };
+  }
   if (!CONTROL_OPS.includes(name)) return { zeroWrites: false, memoryStore: false };
   const parsed = parseOperationArgv(operatorControlOperation(name), argv);
   if (!parsed.ok) throw new Error(parsed.errors.join('\n'));
@@ -732,6 +935,9 @@ export function operatorControlCliPolicy(name, argv) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
+  if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
+  if (name === 'await-checks') { const { main } = await import('./await-checks.mjs'); const code = main(rest); process.exit(code); } // worker CI wait (guard-bash refuses raw --watch)
+  if (name === 'await') { const { main } = await import('./await.mjs'); const code = main(rest); process.exit(code); }
   if (!name || name === '--help' || name === '-h') {
     writeAllSync(1, `${rootUsage()}\n`);
     process.exit(name ? 0 : 2);
@@ -748,7 +954,7 @@ if (IS_CLI) {
     const resumeId = name === REVIEW_PR_OP
       ? rest.findLast((a) => a === '--resume' || a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
     controlPolicy = rest.includes('--help') ? { zeroWrites: false, memoryStore: false } : operatorControlCliPolicy(name, rest);
-    resolved = resolveOperation(name, { preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
+    resolved = resolveOperation(name, { cli: true, preview: controlPolicy.zeroWrites, json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), resumeId });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);
@@ -763,7 +969,7 @@ if (IS_CLI) {
   try {
     cliPreflight(name);
     assertRunnerFreshness({ declaration, moduleUrl: import.meta.url,
-      zeroWrites: controlPolicy.zeroWrites || [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
+      zeroWrites: controlPolicy.zeroWrites || [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP].includes(name) });
   } catch (e) {
     writeAllSync(2, `${String(e?.message ?? e)}\n`);
     process.exit(1);
@@ -773,7 +979,7 @@ if (IS_CLI) {
   const controlPreview = controlPolicy.memoryStore;
   const cliStores = controlPreview ? { store: createMemoryRunStore(), callLog: undefined }
     : name === RUNNER_ACTIVITY_OP ? createRunnerActivityCliStores()
-    : [PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
+    : [DELIVERY_FLOW_OP, PR_TRACE_OP, ADOPTION_MATRIX_OP, JUDGE_SWEEP_FACTS_OP, STALE_STATE_OP, HEALTH_RESPOND_OP, ITEM_ACTIVITY_OP, WHY_OP, PR_SWEEP_OP, PR_SIZE_OP].includes(name) ? { store: createMemoryRunStore(), callLog: undefined }
     : { store: createFileRunStore(), callLog: createFileCallLogStore() };
   runOperationCli({
     declaration,

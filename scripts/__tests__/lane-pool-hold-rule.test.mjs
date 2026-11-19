@@ -99,6 +99,7 @@ describe('release (the reaper path: `release --force`)', () => {
     const r = runPool(['release', '--lane=1', '--force', '--reason=session-gone', ...poolArgs(), '--json'], { CLAUDE_CODE_SESSION_ID: 'reaper' });
     expect(r.code).toBe(0);
     expect(JSON.parse(r.out).released).toBe(0);
+    expect(JSON.parse(r.out).kept).toEqual([expect.objectContaining({ lane: 1, reason: 'held' })]);
     expect(existsSync(join(dir, '.git', '.lane-lease'))).toBe(true);
     const refusal = journal().find((e) => e.action === 'hold-refused');
     expect(refusal).toMatchObject({ hold: 'awaiting-verify' });
@@ -181,10 +182,11 @@ describe('acquire', () => {
     const r = runPool(['acquire', '--lane=1', '--session=smoke', ...poolArgs()], { CLAUDE_CODE_SESSION_ID: 'smoke' });
     expect(r.code).not.toBe(0);
     expect(git(['rev-parse', 'HEAD'], dir)).toBe(sha);
-    // The old 'any' rule hands the same lane out and resets it — the bug this guards.
+    // The old 'any' rule used to hand the same lane out and reset it — the bug this guards. Acquire's own
+    // unpushed-work guard (all branches, HEAD and stash tips) now refuses it even with the legacy rule on.
     const old = runPool(['acquire', '--lane=1', '--session=smoke', ...poolArgs()], { CLAUDE_CODE_SESSION_ID: 'smoke', WE_LANE_AHEAD_EQUIVALENCE: 'any' });
-    expect(old.code).toBe(0);
-    expect(git(['rev-parse', 'HEAD'], dir)).not.toBe(sha);
+    expect(old.code).not.toBe(0);
+    expect(git(['rev-parse', 'HEAD'], dir)).toBe(sha);
   });
 });
 

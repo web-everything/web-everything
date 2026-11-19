@@ -12,13 +12,14 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
   await withRealRepo(async ctx => {
     const head = ctx.head(), cacheDir = join(ctx.tmp, 'conveyor');
     const options = {
+      checkoutState: () => ({ behind: 0 }),
       gh: () => JSON.stringify([{ number: 1, title: 'cache fixture', headRefOid: head, baseRefOid: head,
         labels: [{ name: 'review:human' }], assignees: [], updatedAt: '2026-10-22T13:00:00Z',
         files: [{ path: 'README.md' }], changedFiles: 1 }]),
       now: () => Date.parse('2026-10-22T13:01:00Z'), readLedgerRows: () => [],
       readFixRows: () => [], readJobs: () => [], readComments: () => [],
     };
-    const first = createJudgeSweepFactsReader({ ...options, cache: createShapeCache({ cacheDir }) })().prs[0];
+    const first = createJudgeSweepFactsReader({ findSuspendedRuns: () => [], ...options, cache: createShapeCache({ cacheDir }) })().prs[0];
     expect(first.humanRequired).toBe(false);
     expect(first.evidenceErrors).toEqual([]);
     const file = join(cacheDir, 'judge-sweep-shape-cache.json');
@@ -27,7 +28,7 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
         .update(JSON.stringify(resolveHumanReviewSurfaces().categories)).digest('hex')}`]: false } });
     expect(statSync(file).mode & 0o077).toBe(0);
     expect(statSync(cacheDir).mode & 0o077).toBe(0);
-    const second = createJudgeSweepFactsReader({ ...options, cache: createShapeCache({ cacheDir }),
+    const second = createJudgeSweepFactsReader({ findSuspendedRuns: () => [], ...options, cache: createShapeCache({ cacheDir }),
       shape: () => { throw new Error('cache hit must not spawn shape'); } })().prs[0];
     expect(second.humanRequired).toBe(false);
     expect(second.evidenceErrors).toEqual([]);

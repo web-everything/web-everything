@@ -10,6 +10,9 @@
  * PURE CORE (limits, exemption, the refusal decision, override-state parsing) + a thin gh/fs IO shell,
  * mirroring `scripts/readiness/dispatch-pause.mjs`'s own split — same reasoning: a single small mechanism
  * like this earns one file, not a `-io.mjs` sibling, and every fs/gh boundary is injectable for tests.
+ * Exports: resolvePrLimitScope/readPrLimitScope resolve scope; countOpenPrsForRepo and decideOpenPr apply it.
+ * Settings: `prLimit.excludeFocus` (env `WE_PR_LIMIT_EXCLUDE_FOCUS`) and tool-only `prLimit.focusRefs`
+ * exempt operator R384 focus PRs by exact upstream head ref or the `focus` label, never their title.
  *
  * OVERRIDE STATE lives at `~/.claude/conveyor/pr-limit.json` (env override `WE_PR_LIMIT_STATE_FILE`) —
  * a HOME-relative path, deliberately NOT this repo's usual `.conveyor/` (repo-relative, so distinct per
@@ -69,12 +72,14 @@ export function resolvePrLimit(repoKey, env = process.env) {
 
 /** Built-in default: a card-only PR (every changed file under `backlog/`) is NOT counted — it costs the review
  *  system almost nothing (CI light path, no code review), so letting it fill the cap blocks real work for no gain. */
-export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true, excludeStackedAwaitingBase: true });
+export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true, excludeStackedAwaitingBase: true, excludeFocus: true });
 
 /** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeCardOnly. */
 export const PR_LIMIT_EXCLUDE_CARD_ONLY_ENV = 'WE_PR_LIMIT_EXCLUDE_CARD_ONLY';
 /** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeStackedAwaitingBase. */
 export const PR_LIMIT_EXCLUDE_STACKED_ENV = 'WE_PR_LIMIT_EXCLUDE_STACKED_AWAITING_BASE';
+/** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeFocus. */
+export const PR_LIMIT_EXCLUDE_FOCUS_ENV = 'WE_PR_LIMIT_EXCLUDE_FOCUS';
 /** The label the review-status tagger puts on a draft whose base is another open PR (we:scripts/conveyor/review-status-tag.mjs). */
 export const AWAITING_BASE_LABEL = 'review-status:awaiting-base';
 
@@ -114,7 +119,10 @@ export function resolvePrLimitScope({ platform = {}, tool = {}, env = {} } = {})
   };
   const [excludeCardOnly, cardSource] = resolveKey('excludeCardOnly', PR_LIMIT_EXCLUDE_CARD_ONLY_ENV);
   const [excludeStackedAwaitingBase, stackedSource] = resolveKey('excludeStackedAwaitingBase', PR_LIMIT_EXCLUDE_STACKED_ENV);
-  return { excludeCardOnly, excludeStackedAwaitingBase, source: { excludeCardOnly: cardSource, excludeStackedAwaitingBase: stackedSource } };
+  const [excludeFocus, focusSource] = resolveKey('excludeFocus', PR_LIMIT_EXCLUDE_FOCUS_ENV);
+  const focusRefs = Array.isArray(tool?.focusRefs) ? tool.focusRefs.filter((ref) => typeof ref === 'string' && ref.length > 0) : [];
+  return { excludeCardOnly, excludeStackedAwaitingBase, excludeFocus, focusRefs,
+    source: { excludeCardOnly: cardSource, excludeStackedAwaitingBase: stackedSource, excludeFocus: focusSource } };
 }
 
 /** Read the live scope (the settings files + env). Never throws: unreadable settings fall back to the default. */
@@ -125,6 +133,7 @@ export function readPrLimitScope({ env = process.env, read = readSettings } = {}
   const std = (layer) => (layer === 'default' ? 'standard' : layer);
   logCascadeSources('prLimit', { value: scope, sources: {
     excludeCardOnly: std(scope.source.excludeCardOnly), excludeStackedAwaitingBase: std(scope.source.excludeStackedAwaitingBase),
+    excludeFocus: std(scope.source.excludeFocus),
   } }, { env });
   return scope;
 }
@@ -262,14 +271,19 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const liveScope = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
   const { excludeCardOnly } = liveScope;
   const excludeStacked = liveScope.excludeStackedAwaitingBase ?? PR_LIMIT_SCOPE_DEFAULTS.excludeStackedAwaitingBase;
+  const excludeFocus = liveScope.excludeFocus ?? PR_LIMIT_SCOPE_DEFAULTS.excludeFocus;
+  const focusRefs = new Set(Array.isArray(liveScope.focusRefs) ? liveScope.focusRefs.filter((ref) => typeof ref === 'string' && ref.length > 0) : []);
   const limit = resolvePrLimit(repoKey, env);
   if (!meta) return { repoKey, slug: null, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
   const prs = fetchOpenPrs(meta.slug, { exec, localOnly, readShared });
   if (prs === null) return { repoKey, slug: meta.slug, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0, excludeCardOnly };
-  // Excluded BEFORE any commits read: an accepted or card-only PR never costs an authorship lookup.
+  // Excluded BEFORE any commits read: an accepted, card-only or focus PR never costs an authorship lookup.
   const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
   const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
   const cardOnlySet = new Set(cardOnlyPrs);
+  const focusPrs = excludeFocus ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr)
+    && ((pr?.isCrossRepository === false && focusRefs.has(pr.headRefName)) || hasLabel(pr, 'focus'))) : [];
+  for (const pr of focusPrs) cardOnlySet.add(pr); // focus bases cannot shield a stacked chain either
   // Only an UPSTREAM head can be a stacked PR's base (a base is always a branch of this repo), so a fork PR's
   // same-named head never counts as one. `isCrossRepository` must be exactly false: a row that does not say is no base.
   const upstreamPrs = prs.filter((pr) => pr?.isCrossRepository === false && typeof pr?.headRefName === 'string' && pr.headRefName);
@@ -309,8 +323,8 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
     return ai;
   };
   // A stacked PR is excluded only while its base chain ends at a root PR this limit COUNTS: an upstream, not accepted,
-  // not card-only, non-stacked PR whose authorship resolved to agent. A human-authored or unresolved root, an accepted
-  // or card-only base, or a cycle (the walk keeps a visited set) shields nobody — every PR on such a chain counts on
+  // not card-only or focus, non-stacked PR whose authorship resolved to agent. A human-authored or unresolved root, an accepted,
+  // card-only or focus base, or a cycle (the walk keeps a visited set) shields nobody — every PR on such a chain counts on
   // its own verdict. Roots are read first (they are counted anyway); an excluded candidate never costs a lookup.
   const byHead = new Map();
   for (const pr of upstreamPrs) byHead.set(pr.headRefName, [...(byHead.get(pr.headRefName) ?? []), pr]);
@@ -337,6 +351,7 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   return {
     repoKey, slug: meta.slug, count: counted.length, prNumbers: counted.map((p) => p.number), limit, unavailable: false, unresolved, apiFetches,
     excludeCardOnly, cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number),
+    focus: focusPrs.length, focusPrNumbers: focusPrs.map((p) => p.number),
     stacked: stackedPrs.length, stackedPrNumbers: stackedPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
   };
 }
@@ -410,8 +425,8 @@ export function countOpenPrsAllRepos(o = {}) {
 // ── THE DECISION — reused verbatim by pr-land's pre-create check AND the dispatcher's intake hold ─────────
 
 /**
- * The one refusal decision. PURE — every signal (count, limit, exemption, overrides) is passed in already
- * resolved, so this is unit-testable with no fs/gh at all, and the SAME function backs both enforcement
+ * The one refusal decision. Signals are passed in already resolved; omitted focus refs/toggle read one live scope.
+ * Supplying focus refs keeps this unit-testable with no fs/gh, and the SAME function backs both enforcement
  * points (#4's requirement: they must never drift). Order matters: exemption and overrides are checked
  * BEFORE the limit, so an infra fix or a deliberate override always gets through regardless of count.
  * @param {{repoKey:string, limit:number, openCount:(number|null), changedFiles?:string[], branch?:(string|null),
@@ -421,9 +436,10 @@ export function countOpenPrsAllRepos(o = {}) {
 export function decideOpenPr({
   repoKey, limit, openCount, changedFiles = [], branch = null, branchAllowed = false, globalOff = false, forceOpen = false, forceReason = null,
   cardOnlyExcluded = null, acceptedExcluded = null, stackedExcluded = null, excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly,
+  focusRefs = null, excludeFocus = null, focusExcluded = null,
 } = {}) {
-  const split = cardOnlyExcluded == null && acceptedExcluded == null && stackedExcluded == null ? ''
-    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${stackedExcluded ?? 0} stacked awaiting-base excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
+  const split = cardOnlyExcluded == null && acceptedExcluded == null && stackedExcluded == null && focusExcluded == null ? ''
+    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${stackedExcluded ?? 0} stacked awaiting-base excluded, ${acceptedExcluded ?? 0} accepted excluded${focusExcluded == null ? '' : `, ${focusExcluded} focus excluded`})`;
   if (isExemptChangeset(changedFiles)) {
     return { allowed: true, reason: 'exempt: conveyor/daemon infrastructure changeset (a fix to the review/land machinery itself always gets through)', exempt: true, overridden: false };
   }
@@ -432,6 +448,23 @@ export function decideOpenPr({
   // Only while the count excludes them: with `excludeCardOnly` OFF a card-only PR IS counted, so it meets the cap too.
   if (excludeCardOnly !== false && isCardOnlyDiff(changedFiles)) {
     return { allowed: true, reason: 'exempt: card-only changeset (not counted toward the limit)', exempt: true, overridden: false };
+  }
+  if (excludeFocus !== false && typeof branch === 'string' && branch.length > 0) {
+    let refs = focusRefs;
+    let focusEnabled = excludeFocus;
+    if (refs == null || focusEnabled == null) {
+      try {
+        const scope = readPrLimitScope();
+        refs ??= scope.focusRefs;
+        focusEnabled ??= scope.excludeFocus;
+      } catch {
+        refs ??= [];
+        focusEnabled ??= PR_LIMIT_SCOPE_DEFAULTS.excludeFocus;
+      }
+    }
+    if (focusEnabled !== false && Array.isArray(refs) && refs.includes(branch)) {
+      return { allowed: true, exempt: true, overridden: false, reason: 'exempt: focus branch (operator R384, not counted toward the limit)' };
+    }
   }
   if (globalOff) {
     return { allowed: true, reason: 'pr-limit is globally OFF (operator override)', exempt: false, overridden: true };

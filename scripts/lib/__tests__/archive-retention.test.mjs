@@ -1,0 +1,671 @@
+import { afterEach, beforeEach, expect, it } from 'vitest';
+import { mkdtemp, mkdir, writeFile, utimes, access, readdir, rm, rename, symlink, appendFile, readFile, open } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { archiveRetention, archiveSettings } from '../archive-retention.mjs';
+import { runArchiveRetentionTick } from '../../conveyor/archive-retention-tick.mjs';
+let root, drive, runs, sessions, stateDir;
+const now = Date.now(), old = new Date(now - 45 * 86400000);
+beforeEach(async () => {
+  root = await mkdtemp(join(tmpdir(), 'archive-retention-'));
+  [drive, runs, sessions, stateDir] = ['drive', 'runs', 'sessions', 'state'].map(n => join(root, n));
+  await Promise.all([drive, runs, sessions].map(p => mkdir(p)));
+});
+afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+async function file(path, date = old) { await mkdir(join(path, '..'), { recursive: true }); await writeFile(path, 'record'); await utimes(path, date, date); return path; }
+async function exists(p) { return access(p).then(() => true, () => false); }
+// Existing fixtures have one writer, so this provider owns their entire write lifecycle.
+// Tests with live/uncoordinated writers explicitly remove it.
+const fixtureWriterExclusion = async (_path, criticalSection) => criticalSection();
+const run = (extra = {}) => archiveRetention({ withSourceWriterExclusion: fixtureWriterExclusion, runEligible: () => true, kind: 'runs', driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir, now, emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, ...extra });
+it('missing Drive keeps every original and reports skipped', async () => {
+  const p = await file(join(runs, 'a.json'));
+  expect((await run({ driveRoot: join(root, 'missing') })).status).toBe('skipped');
+  expect(await exists(p)).toBe(true);
+});
+it('truncated bundle fails closed without removing originals', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const out = await run({ afterBundle: async p => writeFile(p, 'truncated') });
+  expect(out.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+});
+it('listing count mismatch keeps all originals', async () => {
+  const p = await file(join(runs, 'a.json'));
+  expect((await run({ listBundle: async () => [] })).errors.length).toBeGreaterThan(0);
+  expect(await exists(p)).toBe(true);
+});
+it('verified bundle removes originals, emits bytes, and daily stamp rate limits', async () => {
+  const p = await file(join(runs, 'a.json')); const events = [];
+  const out = await run({ emit: e => events.push(e) });
+  expect(out.filesArchived).toBe(1); expect(out.bytesFreed).toBe(6);
+  expect(await exists(p)).toBe(false); expect(events[0].bytesFreed).toBe(6);
+  expect((await run()).status).toBe('rate-limited');
+});
+it('recent files and dry-run originals are untouched', async () => {
+  const p = await file(join(runs, 'recent.json'), new Date(now - 60000));
+  const q = await file(join(runs, 'old.json'));
+  await run({ dryRun: true }); expect(await exists(q)).toBe(true);
+  await run(); expect(await exists(p)).toBe(true);
+});
+it('file modified after bundling is kept', async () => {
+  const p = await file(join(runs, 'a.json'));
+  await run({ afterBundle: async () => writeFile(p, 'changed') });
+  expect(await exists(p)).toBe(true);
+});
+it('rerun uses numbered parts and never overwrites a daily bundle', async () => {
+  await file(join(runs, 'a.json')); await run();
+  await file(join(runs, 'b.json')); await run({ now: now + 86400001 });
+  expect((await readdir(join(drive, 'runs'))).filter(n => n.endsWith('.tar.gz')).length).toBe(2);
+});
+it.each(['runs', 'sessions'])('unchanged retained sources are archived only once (%s)', async kind => {
+  const p = await file(kind === 'runs' ? join(runs, 'a.json') : join(sessions, 'project', 'old.jsonl'));
+  const options = { kind, withSourceWriterExclusion: undefined };
+  expect((await run(options)).filesArchived).toBe(1);
+  const second = await run({ ...options, now: now + 86400001 });
+  expect(second.filesArchived).toBe(0); expect(second.bundles).toEqual([]);
+  expect(await readFile(p, 'utf8')).toBe('record');
+  const dest = join(drive, kind === 'runs' ? 'runs' : 'claude-sessions');
+  expect((await readdir(dest)).filter(n => n.endsWith('.tar.gz'))).toHaveLength(1);
+});
+it('daily health ticks retain sources and skip their verified versions on the next day', async () => {
+  await file(join(runs, 'a.json')); await file(join(sessions, 'project', 'old.jsonl'));
+  const archive = request => archiveRetention({ driveRoot: drive, runsDir: runs, sessionsDir: sessions, stateDir,
+    emit: () => {}, env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json') }, runEligible: () => true, ...request });
+  const first = await runArchiveRetentionTick({ now, archive, log: () => {} });
+  expect(first.results.map(r => [r.filesArchived, r.filesRetained])).toEqual([[1, 0], [1, 1]]); // runs reclaim via the production writer-exclusion provider; sessions stay retain-only
+  const second = await runArchiveRetentionTick({ now: now + 86400001, archive, log: () => {} });
+  expect(second.results.map(r => r.bundles)).toEqual([[], []]);
+  expect(second.error).toBeNull();
+});
+it.each(['size', 'mtime', 'same-size restored-mtime'])('changed retained sources are archived again (%s)', async change => {
+  const p = await file(join(runs, 'a.json'));
+  const options = { withSourceWriterExclusion: undefined };
+  await run(options);
+  if (change !== 'mtime') await writeFile(p, change === 'size' ? 'longer record' : 'update');
+  const date = change === 'mtime' ? new Date(old.getTime() + 10000) : old;
+  await utimes(p, date, date);
+  const second = await run({ ...options, now: now + 86400001 });
+  expect(second.filesArchived).toBe(1); expect(second.bundles).toHaveLength(1);
+  const third = await run({ ...options, now: now + 2 * 86400001 });
+  expect(third.filesArchived).toBe(0); expect(third.bundles).toEqual([]);
+  expect((await readdir(join(drive, 'runs'))).filter(n => n.endsWith('.tar.gz'))).toHaveLength(2);
+});
+it('failed verification does not mark retained sources as archived', async () => {
+  await file(join(runs, 'a.json'));
+  const options = { withSourceWriterExclusion: undefined };
+  const failed = await run({ ...options, listBundle: async () => [] });
+  expect(failed.filesArchived).toBe(0); expect(failed.errors.join()).toMatch(/verification/);
+  const retry = await run({ ...options, now: now + 86400001 });
+  expect(retry.filesArchived).toBe(1);
+  expect((await run({ ...options, now: now + 2 * 86400001 })).filesArchived).toBe(0);
+});
+it('a changed session companion is archived without duplicating its retained transcript', async () => {
+  const project = join(sessions, 'project');
+  await file(join(project, 'old.jsonl'));
+  const companion = await file(join(project, 'old', 'agent.jsonl'));
+  await utimes(join(project, 'old'), old, old);
+  const options = { kind: 'sessions', withSourceWriterExclusion: undefined };
+  expect((await run(options)).filesArchived).toBe(2);
+  await writeFile(companion, 'updated companion'); await utimes(companion, old, old);
+  expect((await run({ ...options, now: now + 86400001 })).filesArchived).toBe(1);
+  expect((await run({ ...options, now: now + 2 * 86400001 })).filesArchived).toBe(0);
+});
+it('a source changed during bundling is eligible again after it ages', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const options = { withSourceWriterExclusion: undefined };
+  await run({ ...options, afterBundle: async () => { await writeFile(p, 'update'); await utimes(p, old, old); } });
+  expect((await run({ ...options, now: now + 86400001 })).filesArchived).toBe(1);
+});
+it('dry-run reads archived versions without changing the manifest or stamp', async () => {
+  await file(join(runs, 'a.json'));
+  await run({ withSourceWriterExclusion: undefined });
+  const manifest = join(stateDir, 'runs.manifest.json'), stamp = join(stateDir, 'runs.stamp');
+  const before = await Promise.all([readFile(manifest, 'utf8'), readFile(stamp, 'utf8')]);
+  expect((await run({ dryRun: true, now: now + 86400001 })).filesEligible).toBe(0);
+  expect(await Promise.all([readFile(manifest, 'utf8'), readFile(stamp, 'utf8')])).toEqual(before);
+});
+it('a different Drive destination does not reuse archived-source evidence', async () => {
+  await file(join(runs, 'a.json'));
+  await run({ withSourceWriterExclusion: undefined });
+  const otherDrive = join(root, 'other-drive'); await mkdir(otherDrive);
+  expect((await run({ driveRoot: otherDrive, now: now + 86400001 })).filesArchived).toBe(1);
+});
+it('an unreadable or oversized manifest fails closed with an operator fallback', async () => {
+  const p = await file(join(runs, 'a.json'));
+  await run({ withSourceWriterExclusion: undefined });
+  const manifest = join(stateDir, 'runs.manifest.json');
+  await writeFile(manifest, '{bad json');
+  const invalid = await run({ now: now + 86400001 });
+  expect(invalid.errors.join()).toMatch(/manifest.*operator/); expect(invalid.bundles).toEqual([]);
+  await writeFile(manifest, '{}');
+  const fd = await open(manifest, 'r+');
+  try { await fd.truncate(128 * 1024 * 1024 + 1); } finally { await fd.close(); }
+  const oversized = await run({ now: now + 86400001 });
+  expect(oversized.errors.join()).toMatch(/manifest.*operator/); expect(oversized.bundles).toEqual([]);
+  expect(await exists(p)).toBe(true);
+});
+it('manifest publication failure retains sources and retries without trusting partial state', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const manifest = join(stateDir, 'runs.manifest.json');
+  const failed = await run({ afterBundle: async () => mkdir(manifest) });
+  expect(failed.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+  expect((await readdir(stateDir)).filter(n => n.endsWith('.partial'))).toEqual([]);
+  await rm(manifest, { recursive: true });
+  const options = { withSourceWriterExclusion: undefined };
+  expect((await run({ ...options, now: now + 86400001 })).filesArchived).toBe(1);
+  expect((await run({ ...options, now: now + 2 * 86400001 })).filesArchived).toBe(0);
+});
+it.each(['read', 'write'])('manifest entry bound fails closed on %s', async mode => {
+  await file(join(runs, 'a.json')); await run();
+  let p = await file(join(runs, 'b.json'));
+  if (mode === 'read') {
+    expect((await run({ now: now + 86400001 })).filesArchived).toBe(1);
+    p = await file(join(runs, 'c.json'));
+  }
+  const manifest = join(stateDir, 'runs.manifest.json'), before = await readFile(manifest, 'utf8');
+  const out = await run({ maxFiles: 1, now: now + 2 * 86400001 });
+  expect(out.errors.join()).toMatch(/manifest.*operator/); expect(out.filesArchived).toBe(0);
+  expect(await readFile(manifest, 'utf8')).toBe(before); expect(await exists(p)).toBe(true);
+});
+it('verified manifest progress survives a failed stamp write', async () => {
+  await file(join(runs, 'a.json'));
+  const stamp = join(stateDir, 'runs.stamp');
+  const options = { withSourceWriterExclusion: undefined };
+  const first = await run({ ...options, afterBundle: async () => mkdir(stamp) });
+  expect(first.filesArchived).toBe(1); expect(first.errors.length).toBeGreaterThan(0);
+  await rm(stamp, { recursive: true });
+  expect((await run(options)).filesArchived).toBe(0);
+});
+it('sessions archive old transcript and subagents but keep memory, current and active families', async () => {
+  const project = join(sessions, 'project');
+  const p = await file(join(project, 'old.jsonl'));
+  const sub = await file(join(project, 'old', 'subagents', 'agent.jsonl'));
+  // Directory metadata must also age out.
+  await utimes(join(project, 'old', 'subagents'), old, old); await utimes(join(project, 'old'), old, old);
+  const memory = await file(join(project, 'memory', 'MEMORY.md'));
+  const current = await file(join(project, 'current.jsonl'));
+  const active = await file(join(project, 'active.jsonl'));
+  await file(join(project, 'active', 'subagents', 'agent.jsonl'), new Date(now));
+  await run({ kind: 'sessions', env: { CLAUDE_CODE_SESSION_ID: 'current' } });
+  expect(await exists(p)).toBe(false); expect(await exists(sub)).toBe(false);
+  for (const kept of [memory, current, active]) expect(await exists(kept)).toBe(true);
+});
+it('oversized scan fails closed with an operator fallback', async () => {
+  const p = await file(join(runs, 'a.json')); await file(join(runs, 'b.json'));
+  const out = await run({ maxFiles: 1 }); expect(out.errors.join()).toMatch(/operator/); expect(await exists(p)).toBe(true);
+});
+
+it('nonempty size mismatch with a valid listing keeps originals', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const out = await run({ listBundle: async () => ['./a.json'], afterBundle: async p => writeFile(p, 'wrong-size') });
+  expect(out.errors.join()).toMatch(/verification|tar -xzf/); expect(await exists(p)).toBe(true);
+});
+it('minimum ten minute write guard applies even with zero keepDays', async () => {
+  const p = await file(join(runs, 'writing.json'), new Date(now - 9 * 60000));
+  const q = await file(join(runs, 'idle.json'), new Date(now - 11 * 60000));
+  const out = await run({ keepDays: 0, minAgeDays: 0 });
+  expect(out.errors).toEqual([]); expect(await exists(p)).toBe(true); expect(await exists(q)).toBe(false);
+});
+it('runs use the Eastern day at the UTC boundary and preserve younger files', async () => {
+  const t = Date.parse('2026-09-01T02:00:00Z');
+  await file(join(runs, 'old.json'), new Date(t));
+  const recent = await file(join(runs, 'young.json'), new Date(now - 13 * 86400000));
+  const out = await run(); expect(out.errors).toEqual([]);
+  expect(await readdir(join(drive, 'runs'))).toEqual(['runs-2026-08-31.tar.gz']);
+  expect(await exists(recent)).toBe(true);
+});
+it('cascade resolves defaults, platform, tool and environment with provenance', async () => {
+  const policy = join(root, 'policy.json');
+  await writeFile(policy, JSON.stringify({ archive: { runs: { keepDays: 21 }, sessions: { keepDays: 40 } } }));
+  const lines = [];
+  const out = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: policy, WE_ARCHIVE_RUNS_KEEP_DAYS: '7', WE_ARCHIVE_DRIVE_ROOT: drive }, tool: { sessions: { keepDays: 35 } }, log: l => lines.push(l) });
+  expect(out.value.runs.keepDays).toBe(7); expect(out.value.sessions.keepDays).toBe(35);
+  expect(out.sources).toMatchObject({ 'runs': 'env', 'sessions.keepDays': 'tool', driveRoot: 'env' });
+  expect(lines.join()).toContain('(env)');
+});
+it('invalid policy fails closed before removing any source', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const out = await run({ tool: { runs: {} } });
+  expect(out.errors.join()).toMatch(/invalid archive policy/); expect(await exists(p)).toBe(true);
+});
+
+it('Drive disappearing after bundling retains all sources', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const out = await run({ afterBundle: async () => rename(drive, join(root, 'unmounted')), listBundle: async () => ['./a.json'] });
+  expect(out.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+});
+it('an unavailable Drive path that is a file retains sources', async () => {
+  const p = await file(join(runs, 'a.json')); const notDrive = await file(join(root, 'not-drive'));
+  expect((await run({ driveRoot: notDrive })).status).toBe('skipped'); expect(await exists(p)).toBe(true);
+});
+it('symlink archive destination fails closed', async () => {
+  const p = await file(join(runs, 'a.json')); const other = join(root, 'other'); await mkdir(other);
+  await symlink(other, join(drive, 'runs'));
+  expect((await run()).errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+});
+it('same-size replacement after bundling remains local', async () => {
+  const p = await file(join(runs, 'a.json'));
+  await run({ afterBundle: async () => { await rm(p); await file(p); } });
+  expect(await exists(p)).toBe(true);
+});
+it('dry-run creates neither archives nor rate-limit state', async () => {
+  await file(join(runs, 'a.json')); const out = await run({ dryRun: true });
+  expect(out.filesEligible).toBe(1); expect(await readdir(drive)).toEqual([]); expect(await exists(stateDir)).toBe(false);
+});
+
+it('same-size write with restored mtime remains local through ctime protection', async () => {
+  const p = await file(join(runs, 'a.json'));
+  await run({ afterBundle: async () => { await writeFile(p, 'update'); await utimes(p, old, old); } });
+  expect(await exists(p)).toBe(true);
+});
+it('concurrent invocation refuses a held lock without touching files', async () => {
+  const p = await file(join(runs, 'a.json'));
+  await mkdir(join(stateDir, 'runs.lock'), { recursive: true });
+  const out = await run(); expect(out.errors.join()).toMatch(/operator.*lock/);
+  expect(await exists(p)).toBe(true); expect(await readdir(drive)).toEqual([]);
+});
+it('session age window protects a transcript when a companion directory is recently modified', async () => {
+  const base = join(sessions, 'project'); const p = await file(join(base, 'active.jsonl'));
+  await file(join(base, 'active', 'subagents', 'old-agent.jsonl'));
+  const out = await run({ kind: 'sessions' }); expect(out.errors).toEqual([]); expect(await exists(p)).toBe(true);
+});
+
+it('append between final stat and removal survives without writer exclusion', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const out = await run({ withSourceWriterExclusion: undefined, afterSourceStat: async path => appendFile(path, '-late') });
+  expect(await exists(p)).toBe(true);
+  expect(await readFile(p, 'utf8')).toBe('record-late');
+  expect(out.bytesFreed).toBe(0);
+});
+it('an already-open transcript writer keeps late bytes without writer exclusion', async () => {
+  const p = await file(join(sessions, 'project', 'old.jsonl'));
+  const writer = await open(p, 'a');
+  try {
+    const out = await run({ kind: 'sessions', withSourceWriterExclusion: undefined, afterSourceStat: async () => writer.write('-late') });
+    expect(await exists(p)).toBe(true);
+    expect(await readFile(p, 'utf8')).toBe('record-late');
+    expect(out.bytesFreed).toBe(0);
+  } finally { await writer.close(); }
+});
+
+it('default retention reports that verified archives cannot reclaim uncoordinated sources', async () => {
+  const p = await file(join(runs, 'a.json')); const events = [];
+  const out = await run({ withSourceWriterExclusion: undefined, emit: event => events.push(event) });
+  expect(out.filesArchived).toBe(1); expect(out.filesRetained).toBe(1); expect(out.bytesFreed).toBe(0);
+  expect(out.status).toBe('partial'); expect(out.errors.join()).toMatch(/Operator must arrange exclusion/);
+  expect(await readFile(p, 'utf8')).toBe('record'); expect(events[0].bytesFreed).toBe(0);
+});
+it('unavailable writer exclusion never invokes removal and retains the original', async () => {
+  const p = await file(join(runs, 'a.json'));
+  const out = await run({ withSourceWriterExclusion: async () => {} });
+  expect(out.filesRetained).toBe(1); expect(out.bytesFreed).toBe(0);
+  expect(out.errors.join()).toMatch(/writer exclusion unavailable/); expect(await exists(p)).toBe(true);
+});
+it('coordinated writer arriving after final stat waits until removal and its new bytes survive', async () => {
+  const p = await file(join(runs, 'a.json'));
+  let tail = Promise.resolve(), pendingWrite, queued = false;
+  const exclusive = fn => { const work = tail.then(fn); tail = work.catch(() => {}); return work; };
+  const out = await run({
+    withSourceWriterExclusion: (_path, criticalSection) => exclusive(criticalSection),
+    afterSourceStat: async path => {
+      queued = true;
+      pendingWrite = exclusive(() => appendFile(path, '-late'));
+      // The writer has arrived but cannot run while verification/removal holds exclusion.
+      expect(await readFile(path, 'utf8')).toBe('record');
+    },
+  });
+  await pendingWrite;
+  expect(queued).toBe(true); expect(out.errors).toEqual([]); expect(out.bytesFreed).toBe(6);
+  expect(await readFile(p, 'utf8')).toBe('-late');
+});
+
+// R555: pluggable writer exclusion, batch cap, eligibility, fail-closed.
+import { newRunRecord } from '../../operations/run-record.mjs';
+const rec = JSON.stringify({ ...newRunRecord({ id: 'r1', op: 'review-pr' }), cursor: 2, verdict: { verdict: 'approve' } });
+const realRun = (extra = {}) => run({ runEligible: undefined, ...extra });
+it('batch cap archives only the oldest N files per run', async () => {
+  const mk = i => file(join(runs, `r${i}.json`), new Date(now - (60 - i) * 86400000));
+  const ps = await Promise.all([1, 2, 3, 4, 5].map(mk));
+  const out = await run({ batchCap: 2 });
+  expect(out.filesArchived).toBe(2);
+  expect(await Promise.all(ps.map(exists))).toEqual([false, false, true, true, true]);
+});
+it('settings default the runs batch cap with provenance, env overrides the cap', () => {
+  const a = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json') }, tool: {} });
+  expect(a.value.runsBatchCap).toBe(5000); expect(a.value).not.toHaveProperty('runsSchedule'); // the daily cadence is the 24h stamp, not a setting
+  const b = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_BATCH_CAP: '7' }, tool: {} });
+  expect(b.value.runsBatchCap).toBe(7); expect(b.sources.runsBatchCap).toBe('env');
+  expect(() => archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_BATCH_CAP: '0' }, tool: {} })).toThrow(/invalid archive policy/);
+});
+it('age threshold: records younger than keepDays stay', async () => {
+  const young = await file(join(runs, 'y.json'), new Date(now - 3 * 86400000));
+  const oldp = await file(join(runs, 'o.json'));
+  await realRun({ runEligible: () => true });
+  expect(await exists(young)).toBe(true); expect(await exists(oldp)).toBe(false);
+});
+it('unreadable, non-terminal and PR-evidence records are never eligible', async () => {
+  const bad = await file(join(runs, 'bad.json')); // 'record' is not JSON
+  const pending = join(runs, 'p.json'); await writeFile(pending, JSON.stringify({ ...JSON.parse(rec), effects: [{ status: 'pending' }] })); await utimes(pending, old, old);
+  const pr = join(runs, 'pr.json'); await writeFile(pr, JSON.stringify({ ...JSON.parse(rec), effects: [{ status: 'applied', result: { pr: 1 } }] })); await utimes(pr, old, old);
+  const ok = join(runs, 'ok.json'); await writeFile(ok, rec); await utimes(ok, old, old);
+  await realRun({ isComplete: () => true });
+  expect(await Promise.all([bad, pending, pr, ok].map(exists))).toEqual([true, true, true, false]);
+});
+it('a live writer pid skips the record; a dead pid is eligible; unreadable state is skipped', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const a = join(runs, 'a.json'), b = join(runs, 'b.json'), c = join(runs, 'c.json');
+  for (const p of [a, b, c]) { await writeFile(p, rec); await utimes(p, old, old); }
+  const u = '1700000000000.abc123';
+  await writeFile(join(runs, `a.json.111.${u}.tmp`), '{}');
+  await writeFile(join(runs, `b.json.222.${u}.tmp`), '{}');
+  await writeFile(join(runs, 'c.json.lock'), 'garbage');
+  const provider = createRunsWriterExclusion({ isPidAlive: pid => pid === 111 });
+  const out = await realRun({ withSourceWriterExclusion: provider, isComplete: () => true });
+  expect(await Promise.all([a, b, c].map(exists))).toEqual([true, false, true]);
+  expect(out.errors.join()).toMatch(/writer exclusion unavailable/);
+});
+it('a writer that appears after a first check is seen (no cached listing)', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const provider = createRunsWriterExclusion({ isPidAlive: () => true });
+  let n = 0; await provider(join(runs, 'a.json'), async () => { n++; });
+  await writeFile(join(runs, 'a.json.5.1700000000000.zz.tmp'), '{}');
+  await provider(join(runs, 'a.json'), async () => { n++; });
+  expect(n).toBe(1);
+});
+it('records with unknown effect statuses are not eligible', async () => {
+  const { runRecordEligible } = await import('../runs-writer-exclusion.mjs');
+  const base = newRunRecord({ id: 'r1', op: 'review-pr' });
+  expect(runRecordEligible(JSON.stringify({ ...base, effects: [{ status: 'weird' }] }))).toBe(false);
+  expect(runRecordEligible(JSON.stringify({ effects: [] }))).toBe(false); // schema-invalid
+  expect(runRecordEligible(rec)).toBe(false); // no completion proof: fail closed
+  expect(runRecordEligible(rec, () => true)).toBe(true);
+  expect(runRecordEligible(rec, () => false)).toBe(false); // verdict + cursor 2 but not at the declared last step
+  const fresh = newRunRecord({ id: 'r1', op: 'review-pr' });
+  expect(runRecordEligible(JSON.stringify(fresh))).toBe(false); // cursor 0, no verdict
+  expect(runRecordEligible(JSON.stringify({ ...fresh, cursor: 2 }))).toBe(false); // no verdict
+  expect(runRecordEligible(JSON.stringify({ ...fresh, verdict: { verdict: 'approve' } }))).toBe(false); // cursor 0
+});
+it('resumable and referred review records stay local (one rejecting clause per row, otherwise eligible)', async () => {
+  const { runRecordEligible } = await import('../runs-writer-exclusion.mjs');
+  const base = { ...newRunRecord({ id: 'r1', op: 'review-pr' }), cursor: 2, verdict: { verdict: 'approve' } };
+  const text = r => JSON.stringify(r);
+  const finishedAdvise = [{ step: 'advise', stepIndex: 1, startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:01:00.000Z', durationMs: 60000 }];
+  const unfinishedAdvise = [{ step: 'advise', stepIndex: 1, startedAt: '2026-01-01T00:00:00.000Z' }];
+  expect(runRecordEligible(text(base), () => true)).toBe(true); // control: the same record with no resumable shape leaves
+  const rows = {
+    'needs-human verdict': { ...base, verdict: { verdict: 'needs-human' } },
+    'pending referrals on the verdict': { ...base, verdict: { verdict: 'approve', pendingReferrals: [{}] } },
+    'needs-human referralVerdict': { ...base, findings: { referralVerdict: { verdict: 'needs-human' } } },
+    'pending referrals on the referralVerdict': { ...base, findings: { referralVerdict: { verdict: 'approve', pendingReferrals: [{ runId: 'x', key: 'k' }] } } },
+    'resumeOf with needs-human verdict': { ...base, resumeOf: { id: 'r0', verdict: { verdict: 'needs-human' } }, stepTimings: finishedAdvise },
+    'resumeOf with pending referrals': { ...base, resumeOf: { id: 'r0', verdict: { verdict: 'approve', pendingReferrals: [{}] } }, stepTimings: finishedAdvise },
+    'resumeOf without a finished advise step': { ...base, resumeOf: { id: 'r0' }, stepTimings: unfinishedAdvise },
+    'resumeOf without any advise step': { ...base, resumeOf: { id: 'r0' } },
+  };
+  for (const [name, r] of Object.entries(rows)) expect(runRecordEligible(text(r), () => true), name).toBe(false);
+  expect(runRecordEligible(text({ ...base, resumeOf: { id: 'r0' }, stepTimings: finishedAdvise }), () => true)).toBe(true); // finished advise lifts the resumeOf clause
+});
+it('finished-record clauses are independent: each rejects an otherwise-eligible record with completion proven', async () => {
+  const { runRecordEligible } = await import('../runs-writer-exclusion.mjs');
+  const finished = JSON.parse(rec); // review-pr, verdict approve, cursor 2
+  const eff = status => ({ key: `k-${status}`, type: 't', stepIndex: 0, index: 0, status });
+  const yes = () => true;
+  expect(runRecordEligible(JSON.stringify(finished), yes)).toBe(true); // control
+  expect(runRecordEligible(JSON.stringify({ ...finished, verdict: null }), yes), 'no verdict').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, cursor: 0 }), yes), 'cursor never advanced').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff('in-flight')] }), yes), 'in-flight effect').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff('pending')] }), yes), 'pending effect').toBe(false);
+  // Statuses the engine finalizes stay eligible. (An unknown status never reaches the whitelist: the run-record schema
+  // rejects it first, and the whitelist exists to keep a future schema status fail-closed.)
+  for (const s of ['declared', 'applied', 'failed']) expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff(s)] }), yes), s).toBe(true);
+  // PR evidence: the same schema-valid terminal effect is eligible without result.pr and ineligible with it, so the
+  // PR clause (not schema rejection) is what keeps the record local.
+  const withResult = result => JSON.stringify({ ...finished, effects: [{ ...eff('applied'), result }] });
+  expect(runRecordEligible(withResult({ note: 'x' }), yes), 'control: applied effect with a non-PR result').toBe(true);
+  expect(runRecordEligible(withResult({ pr: 1 }), yes), 'PR evidence').toBe(false);
+  expect(runRecordEligible(JSON.stringify({ ...finished, effects: [eff('applied'), { ...eff('failed'), key: 'k2', index: 1, result: { pr: 7 } }] }), yes), 'PR evidence on a later effect').toBe(false);
+});
+it('a crash between the manifest commit and the removal loop does not exclude the record forever', async () => {
+  const p = await file(join(runs, 'crash.json'));
+  const day1 = await run({ afterManifestCommit: async () => { throw Error('simulated crash'); } });
+  expect(day1.errors.join()).toMatch(/simulated crash/); expect(await exists(p)).toBe(true);
+  expect(await exists(join(stateDir, 'runs.removal-intent.json'))).toBe(true); // intent survived the "crash"
+  const day2 = await run({ now: now + 86400001 });
+  expect(day2.errors).toEqual([]); expect(await exists(p)).toBe(false);
+  expect(await exists(join(stateDir, 'runs.removal-intent.json'))).toBe(false); // consumed
+  const day3 = await run({ now: now + 2 * 86400001 });
+  expect(day3.filesArchived).toBe(0);
+});
+it('a later group does not overwrite the removal intent an earlier group left behind', async () => {
+  await file(join(runs, 'g1.json'), new Date(now - 30 * 86400000)); await file(join(runs, 'g2.json'), new Date(now - 40 * 86400000));
+  let calls = 0;
+  const out = await run({ afterManifestCommit: async () => { if (++calls === 1) throw Error('group 1 bookkeeping failed'); }, withSourceWriterExclusion: async () => {} });
+  expect(out.errors.join()).toMatch(/group 1 bookkeeping failed/);
+  // Groups run oldest first: g2 (40 days) is group 1 and fails its bookkeeping; g1 is group 2 and settles. Settling group 2
+  // must neither overwrite nor drop group 1's key.
+  expect(JSON.parse(await readFile(join(stateDir, 'runs.removal-intent.json'), 'utf8'))).toEqual(['g2.json']);
+});
+it('an unreadable retry state keeps the intent, so repairing it later still recovers the record', async () => {
+  const p = await file(join(runs, 'rs.json'));
+  await run({ afterManifestCommit: async () => { throw Error('simulated crash'); } });
+  const retries = join(stateDir, 'runs.removal-retries.json'), intent = join(stateDir, 'runs.removal-intent.json');
+  await writeFile(retries, '{not json');
+  const day2 = await run({ now: now + 86400001 });
+  expect(day2.errors.join()).toMatch(/removal-retry state unreadable/);
+  expect(await exists(intent)).toBe(true); expect(await exists(p)).toBe(true);
+  await rm(retries);
+  const day3 = await run({ now: now + 2 * 86400001 });
+  expect(day3.errors).toEqual([]); expect(await exists(p)).toBe(false); expect(await exists(intent)).toBe(false);
+});
+it('invalid retry counts (negative, non-number, __proto__ key) fail closed instead of granting unlimited retries', async () => {
+  for (const [i, bad] of ['{"neg.json":-5}', '{"neg.json":"x"}', '{"neg.json":1.5}'].entries()) {
+    await rm(runs, { recursive: true, force: true }); await mkdir(runs); await rm(stateDir, { recursive: true, force: true }); await rm(join(drive, 'runs'), { recursive: true, force: true });
+    const p = await file(join(runs, 'neg.json')), at = now + i * 10 * 86400001;
+    await run({ now: at, afterManifestCommit: async () => { throw Error('simulated crash'); } });
+    await writeFile(join(stateDir, 'runs.removal-retries.json'), bad);
+    const out = await run({ now: at + 86400001 });
+    expect(out.errors.join(), bad).toMatch(/ALERT: neg\.json archived but not removed/); expect(await exists(p), bad).toBe(true);
+  }
+  // A `__proto__` key is plain data: it neither throws nor changes another record's count.
+  await rm(runs, { recursive: true, force: true }); await mkdir(runs); await rm(stateDir, { recursive: true, force: true }); await rm(join(drive, 'runs'), { recursive: true, force: true });
+  const q = await file(join(runs, 'ok.json'));
+  await run({ now: now + 100 * 86400001, afterManifestCommit: async () => { throw Error('simulated crash'); } });
+  await writeFile(join(stateDir, 'runs.removal-retries.json'), '{"__proto__":{"ok.json":99}}');
+  const out = await run({ now: now + 101 * 86400001 });
+  expect(out.errors).toEqual([]); expect(await exists(q)).toBe(false);
+});
+it('a normal run leaves no removal-intent file behind', async () => {
+  await file(join(runs, 'clean.json'));
+  const out = await run();
+  expect(out.errors).toEqual([]);
+  expect(await exists(join(stateDir, 'runs.removal-intent.json'))).toBe(false);
+});
+it('an emitter that throws or rejects does not abort a finished run', async () => {
+  const p = await file(join(runs, 'em.json'));
+  const out = await run({ emit: () => { throw Error('sync emit boom'); } });
+  expect(out.errors.join()).toMatch(/event emit failed: sync emit boom/); expect(await exists(p)).toBe(false);
+  const q = await file(join(runs, 'em2.json'));
+  const out2 = await run({ emit: async () => { throw Error('async emit boom'); }, now: now + 86400001 });
+  expect(out2.errors.join()).toMatch(/event emit failed: async emit boom/); expect(await exists(q)).toBe(false);
+});
+it('the real review-pr completion check resolves the resume step count for the record id', async () => {
+  const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
+  const { OPERATIONS } = await import('../../operations/run.mjs');
+  const done = await loadRunCompletion();
+  const n = OPERATIONS['review-pr']({ resumeId: 'r1' }).declaration.steps.length;
+  expect(done({ op: 'review-pr', id: 'r1', cursor: n, pending: null })).toBe(true);
+  expect(done({ op: 'review-pr', id: 'r1', cursor: n - 1, pending: null })).toBe(false);
+  expect(done({ op: 'review-pr', id: 'r1', cursor: n, pending: { step: 'x' } })).toBe(false);
+}, 120000);
+it('a .lock sidecar: a live pid skips the record, a dead pid is eligible, a non-positive pid fails closed', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const provider = createRunsWriterExclusion({ isPidAlive: pid => pid === 111 });
+  const ran = {};
+  for (const [name, content] of [['live', '111'], ['dead', '222'], ['zero', '0'], ['negative', '-5']]) {
+    await writeFile(join(runs, `${name}.json.lock`), content);
+    ran[name] = false; await provider(join(runs, `${name}.json`), async () => { ran[name] = true; });
+  }
+  expect(ran).toEqual({ live: false, dead: true, zero: false, negative: false });
+});
+it('a record skipped for a live writer on one day is removed the next day once the writer is gone', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'w.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const tmp = join(runs, `w.json.111.1700000000000.abc.tmp`); await writeFile(tmp, '{}');
+  let alive = true; const provider = createRunsWriterExclusion({ isPidAlive: () => alive });
+  const day1 = await realRun({ isComplete: () => true, withSourceWriterExclusion: provider });
+  expect(await exists(p)).toBe(true); expect(day1.filesRetained).toBe(1);
+  alive = false;
+  const day2 = await realRun({ isComplete: () => true, withSourceWriterExclusion: provider, now: now + 86400001 });
+  expect(day2.errors).toEqual([]); expect(await exists(p)).toBe(false); expect(day2.filesArchived).toBe(1);
+});
+it('a provider that throws mid-removal does not leave the record excluded forever (retried next day)', async () => {
+  const p = await file(join(runs, 't.json')); let boom = true;
+  const provider = async (path, critical) => { if (boom) throw Object.assign(Error('EIO'), { code: 'EIO' }); return critical(); };
+  const day1 = await run({ withSourceWriterExclusion: provider });
+  expect(day1.errors.join()).toMatch(/EIO/); expect(await exists(p)).toBe(true);
+  boom = false;
+  const day2 = await run({ withSourceWriterExclusion: provider, now: now + 86400001 });
+  expect(day2.errors).toEqual([]); expect(await exists(p)).toBe(false);
+});
+it('a permanently skipped record is retried a bounded number of times, then alerts instead of duplicating bundles', async () => {
+  const p = await file(join(runs, 'stuck.json')); const errors = [];
+  for (let day = 0; day < 8; day++) errors.push(...(await run({ withSourceWriterExclusion: async () => {}, now: now + day * 86400001 })).errors);
+  const bundles = (await readdir(join(drive, 'runs'))).filter(n => n.endsWith('.tar.gz'));
+  expect(bundles).toHaveLength(4); // first archive + 3 retries, never one per day
+  expect(errors.join()).toMatch(/ALERT: stuck\.json archived but not removed after 3 retries/);
+  expect(await exists(p)).toBe(true);
+});
+it('only unremoved records are forgotten: a removed sibling is not re-archived', async () => {
+  const keep = await file(join(runs, 'keep.json')), gone = await file(join(runs, 'gone.json'));
+  const provider = async (path, critical) => { if (path === keep) return; return critical(); };
+  await run({ withSourceWriterExclusion: provider });
+  expect(await exists(keep)).toBe(true); expect(await exists(gone)).toBe(false);
+  const day2 = await run({ withSourceWriterExclusion: async (path, critical) => critical(), now: now + 86400001 });
+  expect(day2.filesArchived).toBe(1); expect(await exists(keep)).toBe(false);
+});
+it('a record atomically replaced after verification survives with the production provider', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'late.json'); await writeFile(p, rec); await utimes(p, old, old);
+  await realRun({ isComplete: () => true, withSourceWriterExclusion: createRunsWriterExclusion(),
+    afterSourceStat: async path => { await writeFile(path + '.n', 'late-writer-bytes'); await rename(path + '.n', path); } });
+  expect(await readFile(p, 'utf8')).toBe('late-writer-bytes');
+});
+it('bytes written through an already-open descriptor after quarantine verification survive (production provider)', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'fd.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const fh = await open(p, 'a'); // a writer that opened the record before the archiver started
+  let out;
+  try {
+    out = await realRun({ isComplete: () => true, withSourceWriterExclusion: createRunsWriterExclusion(),
+      afterQuarantineVerify: async () => { await fh.appendFile('LATE-FD-BYTES'); } });
+  } finally { await fh.close(); }
+  expect(await exists(p)).toBe(true); expect(await readFile(p, 'utf8')).toBe(rec + 'LATE-FD-BYTES');
+  expect(out.filesRetained).toBeGreaterThan(0); expect(out.bytesFreed).toBe(0);
+});
+it('a record replaced just before removal is restored, not deleted', async () => {
+  const p = await file(join(runs, 'r.json'));
+  const out = await run({ afterSourceStat: async path => { await writeFile(path + '.n', 'newer-bytes'); await rename(path + '.n', path); } });
+  expect(await exists(p)).toBe(true); expect(await readFile(p, 'utf8')).toBe('newer-bytes'); expect(out.filesRetained).toBeGreaterThan(0);
+});
+it('an unreadable runs directory snapshot fails closed', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  let ran = false;
+  await createRunsWriterExclusion({ list: async () => { throw Error('EIO'); } })(join(runs, 'x.json'), async () => { ran = true; });
+  expect(ran).toBe(false);
+});
+it('Drive verification failure never deletes the local record (runs, real provider)', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = join(runs, 'v.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const out = await realRun({ isComplete: () => true, withSourceWriterExclusion: createRunsWriterExclusion(), listBundle: async () => [] });
+  expect(out.errors.length).toBeGreaterThan(0); expect(await exists(p)).toBe(true);
+});
+it('migration-format temp (<name>.<pid>.<uuid>.tmp) of a live pid also blocks removal', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  await writeFile(join(runs, 'm.json.77.00000000-0000-0000-0000-000000000000.tmp'), '{}');
+  let ran = false;
+  await createRunsWriterExclusion({ isPidAlive: () => true })(join(runs, 'm.json'), async () => { ran = true; });
+  expect(ran).toBe(false);
+});
+it('same-inode rewrite with restored mtime is caught by the content hash at quarantine', async () => {
+  const p = join(runs, 'h.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const out = await realRun({ isComplete: () => true, afterSourceStat: async path => { await writeFile(path, rec.replace('r1', 'r2')); await utimes(path, old, old); } });
+  expect(await exists(p)).toBe(true); expect(out.filesRetained).toBeGreaterThan(0);
+});
+
+it('runsMinAgeDays (default 7, cascade) holds back records younger than it even with keepDays 0', async () => {
+  const a = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json') }, tool: {} });
+  expect(a.value.runsMinAgeDays).toBe(7);
+  const b = archiveSettings({ env: { WE_PLATFORM_PREFERENCES_FILE: join(root, 'p.json'), WE_ARCHIVE_RUNS_MIN_AGE_DAYS: '9' }, tool: {} });
+  expect(b.value.runsMinAgeDays).toBe(9); expect(b.sources.runsMinAgeDays).toBe('env');
+  const young = await file(join(runs, 'y.json'), new Date(now - 3 * 86400000));
+  const mid = await file(join(runs, 'm.json'), new Date(now - 8 * 86400000));
+  await run({ keepDays: 0 });
+  expect(await exists(young)).toBe(true); expect(await exists(mid)).toBe(false);
+});
+it('runsMinAgeDays environment override governs retention (not the default 7)', async () => {
+  const env = { WE_PLATFORM_PREFERENCES_FILE: join(root, 'policy.json'), WE_ARCHIVE_RUNS_MIN_AGE_DAYS: '9' };
+  const eight = await file(join(runs, 'eight.json'), new Date(now - 8 * 86400000));
+  const ten = await file(join(runs, 'ten.json'), new Date(now - 10 * 86400000));
+  const out = await run({ keepDays: 0, env });
+  expect(out.policy.value.runsMinAgeDays).toBe(9);
+  expect(await exists(eight)).toBe(true); // 8d < 9d override (would leave under the default 7)
+  expect(await exists(ten)).toBe(false);
+});
+it('a parked .retiring file is restored by the next runs scan, and a failed restore alerts', async () => {
+  const parked = join(runs, '.retiring-z.json.11111111-1111-1111-1111-111111111111');
+  await writeFile(parked, rec);
+  const out = await run({ keepDays: 100, batchCap: 1 });
+  expect(await exists(join(runs, 'z.json'))).toBe(true); expect(await exists(parked)).toBe(false); expect(out.errors).toEqual([]);
+  // canonical already exists -> restore fails loudly and the parked file stays discoverable
+  await writeFile(parked, rec); const events = [];
+  const out2 = await run({ keepDays: 100, now: now + 2 * 86400000, emit: e => events.push(e) });
+  expect(out2.errors.join()).toMatch(/ALERT/); expect(await exists(parked)).toBe(true);
+  expect(events.some(e => e.kind === 'archive-retention-alert')).toBe(true);
+});
+
+it.each([['sync-returning', e => 1], ['throwing', () => { throw Error('emit down'); }], ['rejecting', async () => { throw Error('emit down'); }]])('a failed restore with a %s emitter alerts and the scan continues', async (_n, alert) => {
+  const emit = e => (e.kind === 'archive-retention-alert' ? alert(e) : undefined); // only the alert path misbehaves
+  const parked = join(runs, '.retiring-z.json.11111111-1111-1111-1111-111111111111');
+  await writeFile(join(runs, 'z.json'), rec); await writeFile(parked, rec);
+  const p = await file(join(runs, 'next.json'));
+  const out = await run({ emit, runEligible: () => true });
+  expect(out.errors.join()).toMatch(/ALERT/); expect(out.errors.join()).not.toMatch(/TypeError|emit down|is not a function|catch/);
+  expect(await exists(parked)).toBe(true); expect(await exists(p)).toBe(false); // later retention work still ran
+});
+
+it('the live registry completion check treats cursor 1 of a multi-step op as unfinished', async () => {
+  const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
+  const done = await loadRunCompletion();
+  expect(done({ op: 'no-such-op', cursor: 1, pending: null })).toBe(false);
+});
+
+it('a Drive copy whose content differs from the judged bytes keeps the original', async () => {
+  const p = join(runs, 'c.json'); await writeFile(p, rec); await utimes(p, old, old);
+  const out = await realRun({ isComplete: () => true, afterBundle: async () => { await writeFile(join(runs, 'c.json'), rec); } });
+  expect(out.errors).toEqual([]); // sanity: unchanged content passes
+  const q = join(runs, 'd.json'); await writeFile(q, rec); await utimes(q, old, old);
+  const out2 = await realRun({ isComplete: () => true, now: now + 2 * 86400000, afterBundle: async f => {
+    const { execFileSync } = await import('node:child_process'); const t = join(root, 'swap'); await mkdir(t, { recursive: true });
+    await writeFile(join(t, 'd.json'), 'tampered'); execFileSync('tar', ['-czf', f, '-C', t, './d.json']);
+  } });
+  // The hash check runs before the size check, so this exact message is reachable only through the sha256 compare.
+  expect(out2.errors.join()).toMatch(/archive content mismatch/); expect(await exists(q)).toBe(true);
+});
+
+it('a PID probe error other than ESRCH counts as alive (fail closed)', async () => {
+  const { pidAlive } = await import('../runs-writer-exclusion.mjs');
+  expect(pidAlive(process.pid)).toBe(true);
+  expect(pidAlive(2 ** 31 - 1)).toBe(false); // ESRCH
+  expect(pidAlive(Number.NaN)).toBe(true); // invalid argument: unknown, not dead
+});
+it('registry completion: a known op is complete only at its declared last step', async () => {
+  const { loadRunCompletion } = await import('../runs-writer-exclusion.mjs');
+  const { OPERATIONS } = await import('../../operations/run.mjs');
+  const done = await loadRunCompletion();
+  let checked = 0;
+  for (const [op, make] of Object.entries(OPERATIONS)) {
+    let n; try { n = make()?.declaration?.steps?.length; } catch { continue; }
+    if (!Number.isInteger(n) || n < 2 || op === 'review-pr') continue;
+    expect(done({ op, cursor: n - 1, pending: null })).toBe(false); expect(done({ op, cursor: n, pending: null })).toBe(true); checked++; break;
+  }
+  expect(checked).toBe(1);
+});

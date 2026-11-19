@@ -34,6 +34,7 @@ import { classifySession } from '../conveyor/session-verdicts.mjs';
 import { makeEvidenceResolver } from '../conveyor/session-verdicts-io.mjs';
 import { listEscalations, buildEscalationPacket, writeEscalationPacket } from './land-advance-escalations.mjs';
 import { createItemReader, queueItemInto, reconcileHolds } from './land-advance-items-io.mjs';
+import { fetchFresh } from '../lib/git-fetch-fresh.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const runDefault = (program, args) => String(execFileSync(program, args, { cwd: ROOT, encoding: 'utf8', timeout: 30000, stdio: 'pipe' }));
 const missing = (fn, fallback) => { try { return fn(); } catch (e) { if (e.code === 'ENOENT') return fallback; throw e; } };
@@ -126,7 +127,7 @@ export function createLandAdvanceReader(ports = {}) {
       const path = join(jobsDir, n); return { path, provider: resultProvider(io.readFileSync(path, 'utf8')), mtime: io.statSync(path).mtime.toISOString() };
     }), []);
     const prototype = get('prototype', readPrototype ?? (() => {
-      if (refreshPrototype) run('git', ['fetch', 'origin']);
+      if (refreshPrototype) fetchFresh({ cwd: ROOT, branches: null, maxAgeMs: 0, run: (args) => run('git', args) });
       const [behind, ahead] = run('git', ['rev-list', '--left-right', '--count', 'origin/main...origin/lane/mechanical-dispatcher']).trim().split(/\s+/).map(Number);
       if (![ahead, behind].every(Number.isFinite)) throw new Error('Invalid branch counts');
       return { ahead, behind, refreshed: refreshPrototype, reason: refreshPrototype ? 'fetched origin' : 'cached refs; plan does not fetch' };

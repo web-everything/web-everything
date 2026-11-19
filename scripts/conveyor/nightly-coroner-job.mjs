@@ -1,6 +1,10 @@
 #!/usr/bin/env node
-/** Durable, deterministic nightly extraction. No agent session or judgment is launched. */
-import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpathSync } from 'node:fs';
+/** Durable nightly extraction, followed by bounded coverage judgment and NEW-only filing. */
+import { withPathLock } from '../readiness/with-lock.mjs';
+import { appendHeldCard } from '../held-cards.mjs';
+import { atomicWriteText } from '../held-cards-io.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -16,11 +20,15 @@ import { handoffHome } from '../operations/handoff-home.mjs';
 import { feedPath, appendLines, sanitizeForFeed } from '../operations/needs-you-feed.mjs';
 import { scrubText } from './health-watch-core.mjs';
 import { prSweepTickAllowed } from './pr-sweep-job.mjs';
+import { judgeFrictions, fileNewCards, rankFrictions, renderHeldEntry, validateCoronerCoverage } from '../operations/coroner-judge.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
+import { fenceUntrusted } from '../lib/mandate-fence.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SELF), '../..');
 const clocks = new Map();
-export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30 });
+// Judge defaults: enabled, five ranked causes, at most three NEW cards per night; stable-key dedup across nights.
+export const NIGHTLY_DEFAULTS = Object.freeze({ enabled: true, at: '22:17', laneWaitMs: 600000, attempts: 3, retryBackoffMin: 10, deadlineEt: '03:30', alertAfterProbeFailures: 3, runTimeoutMin: 30, judge: Object.freeze({ enabled: true, maxCards: 3 }) });
 const positiveInt = (v) => Number.isSafeInteger(v) && v > 0;
 const validTime = (v) => typeof v === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(v);
 export function resolveNightlyCoronerSettings({ config = {}, env = process.env, read = readFileSync, log = console.error } = {}) {
@@ -36,8 +44,23 @@ export function resolveNightlyCoronerSettings({ config = {}, env = process.env, 
     standard: NIGHTLY_DEFAULTS, platform: platform.prefs.coroner?.nightly ?? {}, envValues,
     valid: { enabled: (v) => typeof v === 'boolean', at: validTime, laneWaitMs: positiveInt, attempts: positiveInt, retryBackoffMin: positiveInt, deadlineEt: validTime, alertAfterProbeFailures: positiveInt, runTimeoutMin: positiveInt }, env,
   });
+  const judgeEnv = {};
+  if (env.WE_CORONER_NIGHTLY_JUDGE_ENABLED !== undefined) {
+    const v = env.WE_CORONER_NIGHTLY_JUDGE_ENABLED;
+    judgeEnv.enabled = ['1', 'true'].includes(v) ? true : ['0', 'false'].includes(v) ? false : v;
+  }
+  if (env.WE_CORONER_NIGHTLY_JUDGE_MAX_CARDS !== undefined) judgeEnv.maxCards = Number(env.WE_CORONER_NIGHTLY_JUDGE_MAX_CARDS);
+  const judge = cascadePolicy('coroner.nightly.judge', { ...tool.judge, ...config.coroner?.nightly?.judge }, {
+    standard: NIGHTLY_DEFAULTS.judge, platform: platform.prefs.coroner?.nightly?.judge ?? {}, envValues: judgeEnv,
+    valid: { enabled: (v) => typeof v === 'boolean', maxCards: positiveInt }, env,
+  });
+  out.value.judge = judge.value;
+  for (const key of Object.keys(out.sources)) if (key === 'judge' || key.startsWith('judge.')) delete out.sources[key];
+  for (const [key, value] of Object.entries(judge.sources)) out.sources[`judge.${key}`] = value;
+  for (const key of Object.keys(out.leafValues)) if (key === 'judge' || key.startsWith('judge.')) delete out.leafValues[key];
+  for (const [key, value] of Object.entries(judge.leafValues)) out.leafValues[`judge.${key}`] = value;
   log(formatCascadeSourcesLine('coroner.nightly', out));
-  return { ...out, errors: [...errors, ...platform.errors, ...out.invalid] };
+  return { ...out, errors: [...errors, ...platform.errors, ...out.invalid, ...judge.invalid] };
 }
 export const nightlyCoronerTickAllowed = prSweepTickAllowed;
 
@@ -205,6 +228,152 @@ const sweepCoronerLeases = (root, sourceRoot, session, run = command) => run([jo
 
 /** The exact argv both extractor CLIs receive; each declares --since, --until and --json (contract-tested). */
 export const coronerExtractorArgs = (since, until) => ['--since', since, '--until', until, '--json'];
+
+const COVERAGE_TOTAL_BYTES = 4 * 1024 * 1024;
+const HELD_CHUNK_BYTES = 512 * 1024;
+const CARD_CHUNK_BYTES = 32 * 1024;
+const coverageCeiling = () => { throw new Error('coroner coverage exceeds total ceiling; run manual /coroner'); };
+
+/** Production evidence is read only when the default judge port is invoked. Injected judges own their IO.
+ * recentCards covers only the newest 80 cards: this bounded-window limitation is unchanged by chunking.
+ * Missing files, saturated PR bound or the total evidence ceiling defer to manual /coroner.
+ */
+export function readJudgeCoverage(sourceRoot, home, gh = runGhSync) {
+  let bytes = 0;
+  const boundedRead = (path) => {
+    if (bytes + statSync(path).size > COVERAGE_TOTAL_BYTES) coverageCeiling();
+    const value = readFileSync(path, 'utf8');
+    bytes += Buffer.byteLength(value);
+    if (bytes > COVERAGE_TOTAL_BYTES) coverageCeiling();
+    return value;
+  };
+  let held = ''; // a missing held list means nothing is held yet
+  try { held = boundedRead(join(home, 'cards-to-file.md')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  const openPrs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--state', 'open', '--limit', '201', '--json', 'number,title'],
+    { cwd: sourceRoot, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 }));
+  if (!Array.isArray(openPrs) || openPrs.length > 200 || openPrs.some((p) => !Number.isSafeInteger(p.number) || typeof p.title !== 'string')) {
+    throw new Error('coroner PR coverage incomplete or exceeds 200; run manual /coroner');
+  }
+  bytes += Buffer.byteLength(JSON.stringify(openPrs));
+  if (bytes > COVERAGE_TOTAL_BYTES) coverageCeiling();
+  const backlog = join(sourceRoot, 'backlog');
+  const names = readdirSync(backlog).filter((name) => name.endsWith('.md'));
+  if (names.length > 20000) throw new Error('coroner backlog exceeds 20000 entries; run manual /coroner');
+  const recentCards = names.map((name) => ({ name, at: statSync(join(backlog, name)).mtimeMs }))
+    .sort((a, b) => b.at - a.at || a.name.localeCompare(b.name)).slice(0, 80)
+    .map(({ name }) => ({ id: name, content: boundedRead(join(backlog, name)) }));
+  return { held, openPrs, recentCards };
+}
+/** Stay below the held renderer's bound after escaping, with an equal preview budget per proposal. */
+function budgetCoronerProposals(proposals) {
+  const limit = 1499;
+  const fits = (text) => text.length <= limit && renderHeldEntry({ key: 'proposal-budget', proposedFix: text },
+    { night: '2000-01-01' }).body.match(/\nFix idea: ([^\n]*)\n/)[1].length <= limit;
+  const full = proposals.length === 1 ? proposals[0] : proposals.map((p, i) => `Proposal ${i + 1}: ${p}`).join('\n');
+  if (fits(full)) return full;
+  for (let count = proposals.length; count > 0; count--) {
+    const labels = Array.from({ length: count }, (_, i) => `Proposal ${i + 1}: `);
+    const omitted = count < proposals.length ? `\n+${proposals.length - count} more proposals omitted; see coroner report` : '';
+    const overhead = labels.join('\n').length + omitted.length;
+    if (!fits(labels.map((label) => label + '…').join('\n') + omitted)) continue;
+    // Escaping can expand previews, so measure them through the real renderer before accepting.
+    for (let budget = Math.floor((limit - overhead) / count); budget > 0; budget--) {
+      const text = labels.map((label, i) => label + (proposals[i].length <= budget ? proposals[i]
+        : proposals[i].slice(0, budget - 1).replace(/[\uD800-\uDBFF]$/, '') + '…')).join('\n') + omitted;
+      if (fits(text)) return text;
+    }
+  }
+  return `+${proposals.length} more proposals omitted; see coroner report`;
+}
+
+/** Pack complete entries; never separate identifying context from the covering fix. */
+function packCoverageEntries(entries, cap, content = (entry) => entry) {
+  const chunks = [];
+  let batch = [], bytes = 0;
+  for (const entry of entries) {
+    const size = Buffer.byteLength(content(entry));
+    if (size > cap) throw new Error('coroner coverage entry exceeds chunk cap; run manual /coroner');
+    if (batch.length && bytes + size > cap) { chunks.push(batch); batch = []; bytes = 0; }
+    batch.push(entry); bytes += size;
+  }
+  if (batch.length) chunks.push(batch);
+  return chunks;
+}
+
+function chunkJudgeCoverage(coverage) {
+  validateCoronerCoverage(coverage);
+  if (Buffer.byteLength(JSON.stringify(coverage)) > COVERAGE_TOTAL_BYTES) coverageCeiling();
+  // Each numbered heading owns all continuation lines up to the next numbered heading.
+  // Unnumbered preamble is also kept whole; array inputs already provide entry boundaries.
+  const entries = typeof coverage.held === 'string' ? coverage.held.split(/(?=^\d+\.\s)/m)
+    : coverage.held.map((entry, i) => JSON.stringify(entry) + (i < coverage.held.length - 1 ? '\n' : ''));
+  const held = packCoverageEntries(entries, HELD_CHUNK_BYTES).map((batch) => batch.join(''));
+  for (const card of coverage.recentCards) {
+    if (!card || typeof card.content !== 'string') throw new Error('coroner card coverage malformed; run manual /coroner');
+  }
+  const cards = packCoverageEntries(coverage.recentCards, CARD_CHUNK_BYTES, (card) => card.content);
+  const count = Math.max(1, held.length, cards.length);
+  if (count > 160) coverageCeiling();
+  return Array.from({ length: count }, (_, i) => ({ held: held[i] ?? '', openPrs: coverage.openPrs, recentCards: cards[i] ?? [] }));
+}
+const etTimeNy = (date) => { const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(date).map(({ type, value }) => [type, value])); return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`; };
+/** Held-list sink shared by fresh filings and crash recovery. The key line is the durable receipt. */
+export function appendHeldCoronerCard(input, { home = handoffHome(), night, maxCards = NIGHTLY_DEFAULTS.judge.maxCards } = {}) {
+  if (!positiveInt(maxCards) || !/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner nightly cap or night; run manual /coroner');
+  if (typeof input.key !== 'string' || !input.key || input.key !== input.key.trim() || input.key.length > 512 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.key)) throw new Error('invalid coroner filing key; run manual /coroner');
+  const path = join(home, 'cards-to-file.md');
+  const readHeld = () => { try { return readFileSync(path, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; return ''; } };
+  const inspectHeld = (held) => {
+    let number = 0, nightlyCount = 0, receipt;
+    for (const line of held.split('\n')) {
+      const heading = line.match(/^(\d+)\.\s/);
+      if (heading) {
+        number = Number(heading[1]);
+        if (line.includes(` (coroner-${night}, held) `) && /^\d+\. \*\*/.test(line)) nightlyCount++;
+      }
+      if (line.trim() === `Coroner key: ${input.key}`) {
+        if (!number) throw new Error('coroner held receipt lacks item number; run manual /coroner');
+        receipt ??= { id: `cards-to-file.md#${number}` };
+      }
+    }
+    return { receipt, nightlyCount };
+  };
+  // Existing append-only receipts need no write; only the locked read authorizes a new append.
+  const existing = inspectHeld(readHeld()).receipt;
+  if (existing) return existing;
+  mkdirSync(home, { recursive: true });
+  try {
+    // The shared held-list lock and card primitive (numbering, escaping, metadata round-trip) as `held-cards add`.
+    return withPathLock(path, ({ touch }) => {
+      // The appended list is the ledger, including writes whose state save failed.
+      const held = readHeld(), { receipt, nightlyCount } = inspectHeld(held);
+      if (receipt) return receipt;
+      if (nightlyCount >= maxCards) return { limitReached: true };
+      const { title, body, meta } = renderHeldEntry(input, { night });
+      const result = appendHeldCard(held, { title, body, meta, nowEt: etTimeNy(new Date()) });
+      touch(); // still the holder? Then commit.
+      atomicWriteText(path, result.md);
+      return { id: `cards-to-file.md#${result.num}` };
+    }, { timeoutMs: 0 });
+  } catch (e) {
+    if (e.code === 'ELOCKTIMEOUT') {
+      throw new Error('coroner held list busy; retry later or run manual /coroner', { cause: e });
+    }
+    throw e;
+  }
+}
+/** Refuse tool-bearing requests and provider failures; never substitute a read-only shell provider. */
+export async function spawnToolFreeCoronerJudge(request, { load = () => import('../lib/judge-spawn.mjs') } = {}) {
+  if ('allowedTools' in request) throw new Error('coroner refuses allowedTools: tool-free judgeSpawn is required; run manual /coroner');
+  try {
+    const { judgeSpawn } = await load();
+    if (typeof judgeSpawn !== 'function') throw new Error('judgeSpawn export unavailable');
+    const outcome = await judgeSpawn(request); // No allowedTools: judgeSpawn enforces --tools "".
+    return { value: outcome.value };
+  } catch (cause) {
+    throw new Error('coroner tool-free judgeSpawn unavailable or failed; retry later or run manual /coroner', { cause });
+  }
+}
 /** `signal` aborts the acquire and extractor subprocesses (a stop); the lane release is never given it. */
 export async function extractNightlyCoroner({ night, until, dir, settings, nightly = NIGHTLY_DEFAULTS, sourceRoot = ROOT, laneSession = CORONER_LANE_SESSION }, {
   root = ROOT, home = handoffHome(), statusFeed = feedPath(), run = command, signal,
@@ -212,6 +381,10 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
   release = async (lane) => run([join(root, 'scripts/lane-pool.mjs'), 'release', `--lane=${lane.lane}`, `--session=${lane.holder}`, `--repo=${sourceRoot}`], sourceRoot,
     signal?.aborted ? { timeout: RELEASE_TIMEOUT_MS } : {}),
   sweep = async () => sweepCoronerLeases(root, sourceRoot, laneSession, run),
+  loadJudgeSpawn = () => import('../lib/judge-spawn.mjs'),
+  judge, // Injected judges own their coverage IO.
+  readCoverage = readJudgeCoverage,
+  fileItem = async (input) => appendHeldCoronerCard(input, { home, night, maxCards: nightly.judge?.maxCards ?? NIGHTLY_DEFAULTS.judge.maxCards }),
 } = {}) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(night)) throw new Error('invalid coroner night');
   const cursorPath = join(dir, 'nightly-coroner-cursor.json');
@@ -256,14 +429,14 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
       const rate = (value) => value ? `${value.count}/${value.total} (${value.pct}%)` : 'unavailable';
       const fence = '```';
       const report = [`# Nightly coroner — ${night}`, '', `Window: ${since} → ${until}`, '',
-        'Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.', '',
+        'Deterministic extraction is ready. Automated coverage judgment follows publication; manual analysis remains available.', '',
         `Settings: ${JSON.stringify(settings?.value ?? {})}; sources: ${JSON.stringify(settings?.sources ?? {})}`, '',
         '## Summary', '',
-        `- Sessions observed: ${metrics.sessions?.count ?? 'unavailable'}`,
-        `- Gate failures: ${rate(metrics.errorRates?.gateRuns)}`,
-        `- CI failures: ${rate(metrics.errorRates?.ci)}`,
-        `- Code change-request rounds: ${metrics.changeRequests?.byKind?.code?.rounds ?? 'unavailable'}`,
-        `- Source warnings: ${metrics.sources?.warnings?.length ?? 0}`, '',
+        `- Sessions observed: ${metrics?.sessions?.count ?? 'unavailable'}`,
+        `- Gate failures: ${rate(metrics?.errorRates?.gateRuns)}`,
+        `- CI failures: ${rate(metrics?.errorRates?.ci)}`,
+        `- Code change-request rounds: ${metrics?.changeRequests?.byKind?.code?.rounds ?? 'unavailable'}`,
+        `- Source warnings: ${metrics?.sources?.warnings?.length ?? 0}`, '',
         '## Extraction (includes change-request rounds when available)', '', '```json', JSON.stringify(metrics, null, 2), '```', '',
         '## False findings', '', falseFindings === null ? 'Extractor not present.' : `${fence}json\n${JSON.stringify(falseFindings, null, 2)}\n${fence}`, '',
         `<!-- nightly-coroner ${JSON.stringify(window)} -->`, ''].join('\n');
@@ -276,7 +449,85 @@ export async function extractNightlyCoroner({ night, until, dir, settings, night
   let feed = '';
   try { feed = readFileSync(statusFeed, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
   if (!feed.split('\n').some((line) => line.startsWith(`${marker} `))) {
-    appendLines(statusFeed, [`${marker} — operator judgment pending ${JSON.stringify({ at: window.until, kind: 'coroner-ready', report: reportName, reason: 'Coroner report ready for judgment' })}`]);
+    appendLines(statusFeed, [`${marker} — ${JSON.stringify({ at: window.until, kind: 'coroner-ready', report: reportName, reason: 'Coroner extraction ready; automated coverage judgment follows when enabled' })}`]);
+  }
+  signal?.throwIfAborted();
+  const judgePath = join(dir, 'nightly-coroner-judge.json');
+  if (nightly.judge?.enabled !== false) {
+    try {
+      const state = readOptionalJson(judgePath) ?? { filed: {}, completed: {} };
+      if (!state || typeof state !== 'object' || Array.isArray(state) ||
+        (state.filed != null && (typeof state.filed !== 'object' || Array.isArray(state.filed))) ||
+        (state.completed != null && (typeof state.completed !== 'object' || Array.isArray(state.completed)))) throw new Error('invalid coroner judge state');
+      state.completed ??= {};
+      state.nights ??= {};
+      if (typeof state.nights !== 'object' || Array.isArray(state.nights) ||
+        (state.nights[night] !== undefined && !Array.isArray(state.nights[night]))) throw new Error('invalid coroner nightly filing state');
+      if (!Object.hasOwn(state.completed, night)) {
+        let report = readFileSync(reportPath, 'utf8');
+        const extraction = report.match(/## Extraction[^\n]*\n\s*```json\n([\s\S]*?)\n```/);
+        if (!extraction) throw new Error('coroner report lacks extraction evidence');
+        const metrics = JSON.parse(extraction[1]);
+        const coverage = judge && readCoverage === readJudgeCoverage ? { held: [], openPrs: [], recentCards: [] } : readCoverage(sourceRoot, home);
+        const chunks = chunkJudgeCoverage(coverage);
+        signal?.throwIfAborted();
+        // judgeSpawn enforces the schema and --tools ""; no provider fallback is permitted.
+        const judgePort = judge ?? ((request) => spawnToolFreeCoronerJudge({ ...request, timeoutMs: 5 * 60000 }, { load: loadJudgeSpawn }));
+        const priorKeys = new Set(Object.keys(state.filed ?? {}));
+        const save = () => {
+          state.nights[night] = [...new Set([...(state.nights[night] ?? []),
+            ...Object.keys(state.filed ?? {}).filter((key) => !priorKeys.has(key))])];
+          atomicWrite(judgePath, `${JSON.stringify(state)}\n`);
+        };
+        const cap = nightly.judge?.maxCards ?? NIGHTLY_DEFAULTS.judge.maxCards;
+        if (!positiveInt(cap)) throw new Error('invalid coroner judge maxCards');
+        // runCoronerJudge files immediately; use its judge-only path until all coverage is merged.
+        const ranked = rankFrictions(metrics);
+        const result = { ranked, verdicts: [], filed: [], error: null };
+        const byKey = new Map(), newCounts = new Map(), proposalsByKey = new Map();
+        if (ranked.length) for (const chunk of chunks) {
+          signal?.throwIfAborted();
+          const verdicts = await judgeFrictions({ ranked, judge: judgePort, ...chunk,
+            log: (message) => { result.error ??= message; } });
+          for (const verdict of verdicts) {
+            // Coverage found anywhere vetoes NEW, regardless of chunk order.
+            if (!byKey.has(verdict.key) || verdict.verdict === 'COVERED-BY') byKey.set(verdict.key, verdict);
+            if (verdict.verdict === 'NEW') {
+              newCounts.set(verdict.key, (newCounts.get(verdict.key) ?? 0) + 1);
+              if (!proposalsByKey.has(verdict.key)) proposalsByKey.set(verdict.key, new Set());
+              proposalsByKey.get(verdict.key).add(verdict.proposedFix);
+            }
+          }
+        }
+        signal?.throwIfAborted();
+        if (result.error) throw new Error(result.error);
+        // Omission is uncertainty, so NEW requires affirmative judgment from every chunk.
+        result.verdicts = [...byKey.values()].filter((v) => v.verdict === 'COVERED-BY' || newCounts.get(v.key) === chunks.length)
+          .map((verdict) => {
+            if (verdict.verdict !== 'NEW') return verdict;
+            const proposals = [...proposalsByKey.get(verdict.key)];
+            // Preserve every distinct suggestion; choosing between alternatives belongs to the operator.
+            return { ...verdict, proposedFix: budgetCoronerProposals(proposals) };
+          });
+        // Full suggestions remain available even when held-card previews must be shortened or omitted.
+        result.proposals = Object.fromEntries([...proposalsByKey].map(([key, proposals]) => [key, [...proposals]]));
+        result.filed = await fileNewCards({ ranked, verdicts: result.verdicts, state, fileItem, maxCards: cap, signal, save });
+        signal?.throwIfAborted();
+        report = report.replace('Deterministic extraction is ready. Operator judgment is pending; no agent session was launched.',
+          'Deterministic extraction is ready. Automated coverage judgment completed; manual analysis remains available.');
+        atomicWrite(reportPath, `${report}\n## Automated coverage judgment\n\n${fenceUntrusted('material', JSON.stringify(result))}\n`);
+        state.completed[night] = { until: window.until, filed: state.nights[night]?.length ?? 0 };
+        save();
+      }
+    } catch (e) {
+      signal?.throwIfAborted();
+      const failureMarker = `NEEDS-YOU nightly-coroner ${reportName} judge-failed`;
+      if (!readFileSync(statusFeed, 'utf8').split('\n').some((line) => line.startsWith(`${failureMarker} `))) {
+        appendLines(statusFeed, [`${failureMarker} — ${JSON.stringify({ at: window.until, kind: 'coroner-judge-failed', report: reportName,
+          error: sanitizeForFeed(scrubText(String(e.message ?? e)), 1000), reason: 'Judgment or filing incomplete; retry or run manual /coroner' })}`]);
+      }
+      throw e;
+    }
   }
   return { night, window, report: reportName };
 }

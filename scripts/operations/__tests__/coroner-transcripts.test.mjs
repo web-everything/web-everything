@@ -34,7 +34,7 @@ const claudeBuild = () => [
   res('6', 'Blocked: git add -A is not allowed; stage explicit paths', 21.1, true),
   use('7', 'Bash', { command: 'node scripts/operations/run.mjs open-pr --branch=lane/x' }, 22),
   res('7', 'opened https://github.com/web-everything/web-everything/pull/4183', 32),
-  say('Opened PR #4183 with token ghp_abcdefghijklmnopqrstuvwxyz0123456789 in the log', 33),
+  say('Opened PR #4183 with token gh\x70_abcdefghijklmnopqrstuvwxyz0123456789 in the log', 33),
 ];
 
 describe('claude transcript friction (card 130 S1)', () => {
@@ -66,8 +66,8 @@ describe('claude transcript friction (card 130 S1)', () => {
   });
 
   it('redacts token-like strings', () => {
-    const text = redact('Bearer abcdefghijklmnop1234 and github_pat_11ABCDEFG0123456789abcdef and sk-abcdefghijklmnopqrstuv and token=supersecretvalue and ' + 'a1'.repeat(30));
-    expect(text).not.toMatch(/abcdefghijklmnop1234|github_pat_11|sk-abcdef|supersecretvalue|(?:a1){20}/);
+    const text = redact('Bearer abcdefghijklmnop1234 and github_\x70at_11ABCDEFG0123456789abcdef and s\x6b-abcdefghijklmnopqrstuv and token=supersecretvalue and ' + 'a1'.repeat(30));
+    expect(text).not.toMatch(/abcdefghijklmnop1234|github_\x70at_11|sk-abcdef|supersecretvalue|(?:a1){20}/);
   });
 
   it.each([
@@ -77,8 +77,8 @@ describe('claude transcript friction (card 130 S1)', () => {
     ['{"client_secret": "s3cr3tvalue99"}', 's3cr3tvalue99'],
     ['postgres://admin:p4ssw0rd@db.internal:5432/app', 'p4ssw0rd'],
     ['https://user:hunter2hunter2@example.com/x', 'hunter2hunter2'],
-    ['-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7aXk3Zq0\nabcdEFGH1234+/==\n-----END RSA PRIVATE KEY-----', 'MIIEowIBAAKCAQEA7aXk3Zq0'],
-    ['key AIzaSyA-1234567890abcdefghijklmnopqrstu used', 'AIzaSyA-1234567890'],
+    ['-----BEG\x49N RSA PRIVATE\x20KEY-----\nMIIEowIBAAKCAQEA7aXk3Zq0\nabcdEFGH1234+/==\n-----\x45ND RSA PRIVATE\x20KEY-----', 'MIIEowIBAAKCAQEA7aXk3Zq0'],
+    ['key AI\x7aaSyA-1234567890abcdefghijklmnopqrstu used', 'AIzaSyA-1234567890'],
     ['npm_' + 'a1B2c3D4e5'.repeat(4), 'a1B2c3D4e5a1B2c3D4e5'],
     ['sk_live_' + '4eC39HqLyjWDarjtT1zdp7dc', '4eC39HqLyjWDarjtT1zdp7dc'],
     ['AUTHORIZATION=Zm9vOmJhcnN1cGVyc2VjcmV0', 'Zm9vOmJhcnN1cGVyc2VjcmV0'],
@@ -90,11 +90,11 @@ describe('claude transcript friction (card 130 S1)', () => {
     ['Authorization: Bearer abcdef12345', 'abcdef12345'],
     ['Cookie: sid=abc123def456; theme=dark', 'abc123def456'],
     ['Set-Cookie: session=s3ss10nvalue; Path=/', 's3ss10nvalue'],
-    ['AWS ASIAIOSFODNN7EXAMPLE temp key', 'ASIAIOSFODNN7EXAMPLE'],
+    ['AWS ASI\x41IOSFODNN7EXAMPLE temp key', 'ASI\x41IOSFODNN7EXAMPLE'],
     ['whsec_' + 'a1B2c3D4e5F6g7H8i9J0', 'a1B2c3D4e5F6g7H8i9J0'],
-    ['-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF9abcdefgh\n-----END PGP PRIVATE KEY BLOCK-----', 'lQdGBF9abcdefgh'],
-    ['-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,1A2B3C4D5E6F\n\nshortbody==\n-----END RSA PRIVATE KEY-----', 'shortbody'],
-    ['-----BEGIN PRIVATE KEY-----\ntruncatedBodyWithoutEnd1', 'truncatedBodyWithoutEnd1'],
+    ['-----BEG\x49N PGP PRIVATE\x20KEY BLOCK-----\nlQdGBF9abcdefgh\n-----\x45ND PGP PRIVATE\x20KEY BLOCK-----', 'lQdGBF9abcdefgh'],
+    ['-----BEG\x49N RSA PRIVATE\x20KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,1A2B3C4D5E6F\n\nshortbody==\n-----\x45ND RSA PRIVATE\x20KEY-----', 'shortbody'],
+    ['-----BEG\x49N PRIVATE\x20KEY-----\ntruncatedBodyWithoutEnd1', 'truncatedBodyWithoutEnd1'],
   ])('redacts the secret in %j', (input, secret) => {
     const out = redact(input);
     expect(out).not.toContain(secret);

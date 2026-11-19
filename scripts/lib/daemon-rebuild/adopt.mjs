@@ -11,6 +11,9 @@ import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
+import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
+import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -21,8 +24,8 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  *   - `candidate`: the same sha (`exact`); a different sha whose TREE is identical — overlay-list churn that does
  *     not change a single file (`same-tree`, adopts the current plan's commit); or an older build the plan has
  *     since moved past (`superseded`, adopts the verified build — still newer than HEAD; the newer plan is smoked
- *     on a later tick), but only while every overlay it carries is still registered or has landed on main, so an
- *     overlay the operator removed is never brought back.
+ *     on a later tick), but only while each carried tip is still wanted. A removed ref is refused even when
+ *     another overlay contains its tip. Newly wanted overlays and descendant tips are rebuilt on the next tick.
  *   - `fallback-main-moved`: a passed fallback whose failing inputs moved ONLY because main advanced — every
  *     suspect that is still registered is still at the sha that failed (`overlayTip`) — is adopted anyway and
  *     still drops the suspects, exactly as its own finalize would have.
@@ -31,17 +34,41 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
  * this module could have minted from the current main history and the registered overlay refs
  * ({@link readyBuildVerified}). Refuses by default.
  * @param {{ready:object|null, plan:object, prevHead:string, treeOf:(sha:string)=>string|null,
- *   stillWanted:(ref:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
+ *   stillWanted:(ref:string,sha?:string)=>boolean, verifyBuilt?:(adopt:object)=>boolean,
  *   overlayTip?:(ref:string)=>string|null, registered?:(ref:string)=>boolean, allowFallback?:boolean,
- *   rejected?:object|null, nowMs:number, maxAgeMs:number}} o — `registered`: still on the overlay list after this
- *   tick's own edits (defaults to `stillWanted`); `allowFallback: false` (a mainOnly rebuild) refuses any fallback.
+ *   rejected?:object|null, nowMs:number, maxAgeMs:number, forcedWatch?:(sha:string)=>'ok'|'missing'|'unreadable'|'owed'}} o —
+ *   `registered`: still on the overlay list after this tick's own edits (defaults to `stillWanted`); `allowFallback: false`
+ *   (a mainOnly rebuild) refuses any fallback; `forcedWatch` (R508): the state of the rollback watch a FORCED record needs
+ *   (default `'missing'`, so a forced record is never adopted without proof of its watch); `auditedTip`: the audit-evidence gate
+ *   ({@link makeAuditedTipGate}, null in follow mode) a record's own moving tips are re-judged against at adoption time
+ *   ({@link revokedAppliedTips}; `tipInMain(sha)` says main already has the tip; `plan.auditAdopted` lists the refs with an adopted history).
  */
 export function matchReadyCandidate({
   ready, plan, prevHead, treeOf, stillWanted, verifyBuilt = () => false, overlayTip = () => null,
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
+  removedForMain = () => false, retiredByOperator = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
+  tipInMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  // The live plan could not persist its audit pin. No ready/fallback path may replace that history with a build
+  // lacking the pin (even a same-tree candidate or a record claiming pinnedFrom for a different sha).
+  if (plan.reason === 'pinned-overlay-hold-marker-failed') return { adopt: null, reason: plan.reason };
+  // unaudited-tip — a ready record was smoked against the audit evidence of its own time. Audit evidence is judged per plan,
+  // so a record the live plan would NOT mint (a later red/WEAKENED record, or evidence gone) must not bypass the gate by
+  // being adopted from disk. The live plan says exactly which tips it holds back (`overlay-unaudited-tip` alerts, already
+  // exempting established, merged and never-adopted registrations): a record applying one of those tips at the tip itself is
+  // refused. Even an exact or same-tree match needs fresh evidence: records can change after the live plan was minted.
+  const heldTips = (plan.alerts ?? []).filter((x) => x?.kind === 'overlay-unaudited-tip' && x.detail?.ref && x.detail.newTip);
+  // The alert only names the tip the plan sees NOW (the latest); a record built on an EARLIER tip B of the same ref is not
+  // named when the branch fast-forwarded to C, so the record's OWN tips are re-judged against the evidence at adoption time
+  // too (fail closed: no gate result for a tip = refused). Exempt: a head applied with `pinnedFrom` (the audited adopted head),
+  // a tip the running head already carries (established) and a tip main already has (merged) — the gate's own exemptions.
+  // Follow mode (`auditedTip` null) has no gate and nothing to revoke.
+  const revokedAudit = (adopt) => revokedAppliedTips({
+    applied: adopt?.applied, auditedTip, held: heldTips, carries, inMain: tipInMain, prevHead, mainSha: plan.mainSha,
+    auditAdopted: plan.auditAdopted,
+  });
   const passedMs = Date.parse(ready.passedAt || '');
   if (!Number.isFinite(passedMs) || nowMs - passedMs > maxAgeMs) return { adopt: null, reason: 'expired' };
   if (ready.prevHead !== prevHead) return { adopt: null, reason: 'other-base' };
@@ -49,11 +76,23 @@ export function matchReadyCandidate({
   if (rejected && rejected.inputsKey === ready.adopt.inputsKey && Date.parse(rejected.at || '') > passedMs) {
     return { adopt: null, reason: 'rejected-since' };
   }
-  const carriesOnlyWanted = (ready.adopt.applied || []).every((a) => stillWanted(a.ref));
+  // R508: a forced record vouches for exactly ONE sha (its rollback watch is keyed to it). A same-tree or superseding
+  // build substituted for it would be adopted with no health watch, so only an exact match may adopt it.
+  if (ready.forced === true && plan.finalSha !== ready.adopt.finalSha) return { adopt: null, reason: 'forced-sha-pinned' };
+  // …and only while its rollback watch is really there: a forced build adopted with a missing, unreadable or already-owing watch would
+  // run with nothing to revert it. Unknown (no `forcedWatch` supplied) is not "ok": fail closed.
+  if (ready.forced === true) {
+    const watch = forcedWatch(ready.adopt.finalSha);
+    // Literal reasons (no template): the reason-classification test reads them statically.
+    if (watch !== 'ok') return { adopt: null, reason: watch === 'unreadable' ? 'forced-watch-unreadable' : watch === 'owed' ? 'forced-watch-owed' : 'forced-watch-missing' };
+  }
+  const applied = ready.adopt.applied || [];
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
-    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+    if (!applied.every((a) => stillWanted(a.ref))) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
+    const revokedFallback = revokedAudit(ready.adopt);
+    if (revokedFallback.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedFallback };
     if (plan.inputsKey === ready.forInputsKey) {
       return { adopt: ready.adopt, dropRefs: ready.dropRefs || [], failed: ready.failed || '', match: 'fallback' };
     }
@@ -64,29 +103,143 @@ export function matchReadyCandidate({
       ? { adopt: null, reason: 'fallback-inputs-moved' }
       : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved' };
   }
-  if (plan.finalSha === ready.adopt.finalSha) return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
+  // Each recorded tip must itself remain wanted. Successor ancestry cannot authorize a removed ref:
+  // the successor's current descendant may have retracted content present in this candidate.
+  const carriesOnlyWanted = applied.every((a) => a.sha && stillWanted(a.ref, a.sha));
+  if (plan.finalSha === ready.adopt.finalSha) {
+    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+    const revokedExact = revokedAudit(ready.adopt);
+    if (revokedExact.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedExact };
+    return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
+  }
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {
+    if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const adopt = {
       finalSha: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied,
     };
+    const revokedSameTree = revokedAudit(adopt);
+    if (revokedSameTree.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSameTree };
     return { adopt, dropRefs: [], match: 'same-tree' };
   }
-  if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
+  if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+  const revokedSuperseded = revokedAudit(ready.adopt);
+  if (revokedSuperseded.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSuperseded };
   // Live 2026-10-21 ~17:12 ET (review clone): a superseded build must never DROP an overlay the running build applies.
-  // Each one's applied sha must be an ancestor of the record's build. Unknown live set (`liveApplied` not given) refuses: fail closed.
+  // Each one's applied sha must be carried by ancestry or proven graduated into the record's own build.
+  // Unknown live set (`liveApplied` not given) refuses: fail closed.
   if (!Array.isArray(liveApplied)) return { adopt: null, reason: 'superseded-live-set-unknown' };
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
-  // No exemption for "landed on main": the CURRENT main having it says nothing about the record's (possibly older)
-  // main — the record itself must contain it (Codex round 2). A squash-landed overlay just refuses superseded (fail closed).
-  void leftForMain;
-  const omitted = liveApplied.filter((a) => a?.ref && !(a.sha && carries(a.sha, ready.adopt.finalSha)));
+  // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
+  // Separately, an overlay removed for main in this tick or its recorded history (`removedForMain`) is safe only
+  // with independent content proof. Current main containing an overlay alone never satisfies either path.
+  // An explicit operator retirement instead proves intentional removal of this exact live tip.
+  const retired = [];
+  const uniqueLiveApplied = [...new Map(liveApplied.map((a) => [JSON.stringify([a?.ref, a?.sha]), a])).values()];
+  const omitted = uniqueLiveApplied.filter((a) => {
+    if (!a?.ref) return false;
+    if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
+    if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
+    if (a.sha && removedForMain(a.ref, a.sha) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
+    return true;
+  });
   if (omitted.length > 0) {
     return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
   }
-  return { adopt: ready.adopt, dropRefs: [], match: 'superseded' };
+  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
+}
+
+/** Only authenticated operator auto-retirement retires its exact tip, after every recorded add. Unknown evidence refuses. */
+export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) {
+  try {
+    if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
+    const history = events.filter((e) => e?.ref === ref);
+    const removed = history.at(-1)?.kind === 'auto-retired' ? history.at(-1) : null; // `removed` never carries authenticated operator evidence; any later lifecycle event fails closed
+    const added = history.filter((e) => e.kind === 'added');
+    if (!removed || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+      || typeof removed.actor !== 'string' || !OPERATOR_LOGINS.includes(removed.actor.toLowerCase())
+      || typeof removed.at !== 'string' || !added.length) return false;
+    const removedAt = Date.parse(removed.at);
+    return Number.isFinite(removedAt)
+      && history.lastIndexOf(removed) > history.findLastIndex((e) => e.kind === 'added')
+      && added.every((e) => typeof e.at === 'string' && Number.isFinite(Date.parse(e.at)) && removedAt > Date.parse(e.at));
+  } catch { return false; }
+}
+
+// R790: one-time ruled weakening for this exact legacy drop; content/driver and time proof still apply.
+export const RULED_LEGACY_PR_MERGED_DROPS = Object.freeze([
+  Object.freeze({ ref: 'lane/redteam-pending-on-accept-m1', pr: 6554, at: '2026-11-09T11:58:41.018Z', ruling: 'R790' }),
+]);
+
+/** Prove a removed overlay graduated into this build, including squash-merged content. Unknown evidence refuses. */
+export function overlayGraduated({ ref, sha, build, registered, events, git, readyAt } = {}) {
+  try {
+    if (!ref || !sha || !build || registered(ref) !== false || !Array.isArray(events)) return false;
+    // Diagnostics (needs-you notes, main-sync/test telemetry, shadows) never change registration, so they must not mask
+    // the drop proof. Every OTHER kind (known or future) stays lifecycle evidence: unknown kinds fail closed.
+    const diagnostic = (kind) => typeof kind === 'string' && [
+      'overlay-main-red', 'overlay-main-test-selection', 'overlay-main-related-only', 'overlay-main-merge-conflict', 'overlay-main-synced',
+      'overlay-main-sync-shadow', 'overlay-main-flaky-retried',
+      'needs-you', 'quick-soak-needs-you', 'auto-rebase-needs-you', 'auto-retire-shadow',
+    ].includes(kind);
+    const timeMs = (value) => typeof value === 'number' ? value
+      : typeof value === 'string' ? Date.parse(value) : NaN;
+    // Diagnostics dated up to the candidate's readyAt were seen by its smoke, so they are ignored. One dated after it
+    // (or with no readable time) is new failure evidence the candidate never saw: it still vetoes graduation.
+    const readyAtMs = timeMs(readyAt);
+    const unseen = events.some((event) => event?.ref === ref && diagnostic(event.kind)
+      && !(Number.isFinite(readyAtMs) && timeMs(event.at) <= readyAtMs));
+    if (unseen) return false;
+    const last = events.findLast((event) => event?.ref === ref && !diagnostic(event.kind));
+    // An `auto-retired` event (prototype-load / daemon-overlay: PR merged or in main) is graduation only with its own
+    // proof: the event names this exact tip and records clean merges with the content in main. The tree check below
+    // still has to agree independently; anything else refuses (live 2026-11-04 author-lookup-defer-m2).
+    const retiredWithProof = last?.kind === 'auto-retired' && ['pr-merged', 'in-main'].includes(last.reason)
+      && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
+    const droppedWithProof = last?.kind === 'auto-dropped' && last.reason === 'pr-merged'
+      && last.tip === sha && last.evidence?.contentInMain === true && last.evidence?.cleanMerges === true;
+    const ruledLegacyDrop = last?.kind === 'auto-dropped' && last.reason === 'pr-merged'
+      && last.evidence === undefined && RULED_LEGACY_PR_MERGED_DROPS.some((entry) =>
+        last.ref === entry.ref && last.pr === entry.pr && last.at === entry.at);
+    if ((last?.kind === 'auto-dropped' && last.reason === 'in-main') || retiredWithProof || droppedWithProof || ruledLegacyDrop) {
+      const droppedMs = timeMs(last.at);
+      const readyMs = timeMs(readyAt);
+      if (!Number.isFinite(droppedMs) || !Number.isFinite(readyMs) || droppedMs >= readyMs) return false;
+    } else {
+      if (last?.kind !== 'removed' || typeof last.reason !== 'string') return false;
+      const merged = /^graduated #\d+ \(merged ([a-f0-9]{7,40})\)$/.exec(last.reason)?.[1];
+      if (!merged) return false;
+      const resolved = git(['rev-parse', '--verify', `${merged}^{commit}`]);
+      if (resolved?.status !== 0 || typeof resolved.stdout !== 'string') return false;
+      const mergeSha = resolved.stdout.trim();
+      if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
+      if (git(['merge-base', '--is-ancestor', mergeSha, build])?.status !== 0) return false;
+    }
+    // Custom drivers can discard overlay changes while reporting an unchanged merge tree.
+    if (git(['config', '--get-regexp', '^merge\\..*\\.driver$'])?.status !== 1) return false;
+    const tree = git(['rev-parse', `${build}^{tree}`]);
+    const mergedTree = git(['merge-tree', '--write-tree', '--no-messages', build, sha]);
+    if (tree?.status !== 0 || mergedTree?.status !== 0
+      || typeof tree.stdout !== 'string' || typeof mergedTree.stdout !== 'string') return false;
+    const buildTree = tree.stdout.trim();
+    return /^[a-f0-9]{40}$/.test(buildTree) && mergedTree.stdout.split('\n')[0].trim() === buildTree;
+  } catch { return false; }
+}
+
+/** Preserve the discard alert and escalate every refusal except routine candidate expiry/base churn. */
+export function reportDiscardedCandidate({ ready, match, alert, needsYou }) {
+  const detail = {
+    target: ready?.adopt?.finalSha,
+    reason: match?.reason,
+    refs: match?.omitted ?? (ready?.adopt?.applied ?? []).map((a) => a.ref),
+  };
+  try { alert('ready-candidate-discarded', detail); } catch { /* still attempt escalation */ }
+  if (!['expired', 'other-base', 'already-head'].includes(detail.reason)) {
+    try { needsYou({ kind: 'ready-candidate-discarded', ...detail }); } catch { /* best-effort reporting */ }
+  }
 }
 
 /**
@@ -108,7 +261,24 @@ export function readyBuildVerified({
   const headBase = prevHead ? String(git(['merge-base', prevHead, mainTip]).stdout ?? '').trim() : '';
   if (!headBase || !isAncestor(headBase, adopt.mainSha)) return false;
   const applied = Array.isArray(adopt.applied) ? adopt.applied : [];
-  let cur = adopt.finalSha;
+  // unaudited-tip — planRebuild mints tree-neutral bookkeeping commits (an identity marker for a set-aside stack base, or the
+  // pad before a hold record) that carry no overlay: step over exactly those (subject-tagged AND tree == first parent's tree),
+  // never any other commit, so the walk below still sees each applied overlay as its own merge.
+  const peelMarkers = (sha) => {
+    let c = sha;
+    for (let n = 0; n < 64; n += 1) {
+      const r = git(['log', '-1', '--format=%P%x09%s', c]);
+      if (r.status !== 0) return c;
+      const [parents = '', subject = ''] = String(r.stdout ?? '').replace(/\n$/, '').split('\t');
+      const first = parents.trim().split(/\s+/)[0];
+      if (!first || !/^daemon-rebuild: (hold marker for overlay |merge overlay \S+ (?:\(PR #\d+\) )?onto \S+ \(identity marker\)$)/.test(subject)) return c;
+      const tree = verifyRev(git, `${c}^{tree}`);
+      if (!tree || tree !== verifyRev(git, `${first}^{tree}`)) return c;
+      c = first;
+    }
+    return c;
+  };
+  let cur = peelMarkers(adopt.finalSha);
   for (let i = applied.length - 1; i >= 0; i -= 1) {
     const a = applied[i];
     if (!a?.ref || !a.sha) return false;
@@ -139,7 +309,7 @@ export function readyBuildVerified({
       minted = mt.status === 0 ? String(mt.stdout ?? '').split('\n')[0].trim() : '';
     }
     if (!minted || minted !== verifyRev(git, `${cur}^{tree}`)) return false;
-    cur = prev;
+    cur = peelMarkers(prev);
   }
   return verifyRev(git, `${cur}^{commit}`) === adopt.mainSha;
 }
@@ -194,8 +364,16 @@ export function staleAlertDetail(result, state) {
  * this module ever does, and writes `state.adopted`. On a FAILING smoke this is never called at all — `root`
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
-export async function finalizeRebuild({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted,
+/** I2: the pending-drop check and the HEAD reset must be atomic with retire/replace, which take the add-guard lock
+ *  (and never the clone write lock, so holding both here cannot deadlock). A retirement during finalize waits. */
+export async function finalizeRebuild(options) {
+  // Lazy: daemon-overlay.mjs pulls a heavy import graph that the backlog CLI (which reaches this module) must not load.
+  const { withAddGuardLock } = await import('../../daemon-overlay.mjs');
+  return withAddGuardLock(options.root, options.env ?? process.env, () => finalizeRebuildLocked(options));
+}
+
+async function finalizeRebuildLocked({
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -223,11 +401,27 @@ export async function finalizeRebuild({
     // fix-rebuild-finalize — an adopted build leaves nothing passed-but-unadopted behind.
     if (result.adopted) clearReadyCandidate(root, stEnv);
     // x5wbsbc — runs INSIDE this write-lock hold, only on an adoption (e.g. drop the overlay a fallback proved bad).
-    if (result.adopted && typeof onAdopted === 'function') {
+    // onAdopted can drop registrations (e.g. a fallback's bad overlay): never while a drop intent is unsettled.
+    let pendingDrops = false;
+    try { pendingDrops = readPendingDrops(root, env).length > 0; } catch { pendingDrops = true; }
+    if (result.adopted && typeof onAdopted === 'function' && pendingDrops) alert('on-adopted-skipped-drop-pending', {});
+    if (result.adopted && typeof onAdopted === 'function' && !pendingDrops) {
       try { onAdopted({ alert }); } catch (e) { alert('on-adopted-failed', { error: String(e?.message || e) }); }
     }
     return { ...result, alerts: alertsList };
   };
+
+  // I2: an unsettled drop intent (or an unreadable record) blocks a finalize that changes the applied registration set.
+  // A recovery/rollback that keeps the set unchanged still finalizes.
+  let dropsPending = false;
+  try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
+  const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
+  // The health-watch rollback to last-good only reverts HEAD; it never touches registrations, so it is never blocked.
+  const isRollback = lease?.token === 'force-adopt-rollback';
+  if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
+    alert('drop-pending-unsettled', { target: plan.finalSha });
+    return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or
@@ -249,6 +443,21 @@ export async function finalizeRebuild({
   if (headNow !== prevHead) {
     alert('root-changed-during-smoke', { expectedPrevHead: prevHead, headNow });
     return terminal({ moved: false, reason: 'root-changed-during-smoke', plan });
+  }
+
+  // unaudited-tip — the plan was minted BEFORE the (unlocked, minutes-long) smoke, so a red fix-ready record appended for a tip it
+  // applies during that window would still be adopted here. Only the direct smoke path passes the gate (a ready-candidate
+  // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
+  if (typeof auditedTip === 'function') {
+    const revoked = revokedAppliedTips({
+      applied: plan.applied, auditedTip, prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
+      carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
+      inMain: (sha) => gitTipInMain(git, plan.mainSha, sha),
+    });
+    if (revoked.length > 0) {
+      alert('ready-audit-revoked', { target: plan.finalSha, refs: revoked, message: 'audit evidence for an applied tip was revoked during the smoke; the build is NOT adopted' });
+      return terminal({ moved: false, reason: 'ready-audit-revoked', plan });
+    }
   }
 
   // Re-run the same safety gate `prepareRebuild` already passed — the tree could, in principle, have picked up

@@ -457,7 +457,10 @@ async function ensureFreshGithubAppEnvUnguarded({
       // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
       // github-app-config smell reads the caller file) — never a silent fallback.
       identity = identityOpt ?? readDeliveryIdentity({ env });
-      requested = resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
+      // An explicit `legacy` (the shim's on-demand refresh for a call that must author as today's App, #6535)
+      // refreshes today's App only; it is never a process role, so env and the caller map cannot select it.
+      requested = roleOpt === LEGACY_ROLE ? { role: LEGACY_ROLE, source: 'arg' }
+        : resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
       chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
       if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
     }

@@ -3,9 +3,10 @@ bornAs: xlgn7mo
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/settings/ledger.json", "we:scripts/lib/__tests__/ledger-observation.test.mjs", "we:backlog/xjdyood-prevention-enforce-ledger-observer-and-writer-test-contracts.md", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/ledger-observation.mjs", "we:scripts/lib/verdict-ledger.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/verdict-ledger.test.mjs"]
 dateOpened: "2026-10-17"
+dateResolved: "2026-11-14"
 tags: []
 ---
 

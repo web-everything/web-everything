@@ -7,7 +7,7 @@ metadata:
   originSessionId: 51356f9d-1251-40ec-985c-677fe9207056
 ---
 
-In Frontier UI (`/Users/nicolasgilbert/workspace/frontierui`), the Vite `bootstrapPatches()` plugin
+In Frontier UI (`~/workspace/frontierui`), the Vite `bootstrapPatches()` plugin
 in `vite.config.mts` auto-injects `<script src="/plugs/bootstrap.ts">` into every plugged
 `demos/*.html` — but it **bails if the HTML already contains the literal string `/plugs/bootstrap.ts`**
 (a double-injection guard: `if (html.includes('/plugs/bootstrap.ts')) return html;`).

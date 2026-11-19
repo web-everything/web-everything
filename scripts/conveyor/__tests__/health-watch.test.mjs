@@ -6,18 +6,19 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, readFileSync, existsSync, utimesSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 
 import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
   probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency, isRepeatAlert,
-  resolveLaneScanTarget,
+  resolveLaneScanTarget, resolveTickWatchdogLimit,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
-import { replay, unacknowledged } from '../../operations/needs-you-feed.mjs';
+import { replay, unacknowledged, publishAttention, diffFeed, sidecarsOf, REPORT_KINDS, GATE_KINDS } from '../../operations/needs-you-feed.mjs';
 import { sweepReviewTmp, probeDiskSpace } from '../review-tmp-health.mjs';
 import diskSpaceSmell from '../health-smells/disk-space.mjs';
 
@@ -32,8 +33,14 @@ vi.mock('../review-tmp-health.mjs', async original => {
 const episodeReplay = vi.hoisted(() => ({ probes: null, send: vi.fn(() => ({ ok: true })) }));
 vi.mock('../health-watch-core.mjs', async (original) => {
   const real = await original();
-  return { ...real, runHealthTick: (state, probes, ...args) =>
-    real.runHealthTick(state, episodeReplay.probes ?? probes, ...args) };
+  return { ...real, runHealthTick: (state, probes, smells, ...args) =>
+    real.runHealthTick(state, episodeReplay.probes ?? probes, smells.map((s) => s.id === 'daemon-build-stale'
+      // Keep the real detector, with a healthy host fixture independent of local daemon state.
+      ? { ...s, evaluate: (probes, ctx) => s.evaluate(probes, { ...ctx, io: {
+        listStates: () => [{ cloneKey: 'fixture-daemon', raw: JSON.stringify({ adopted: { mainSha: 'a'.repeat(40) } }) }],
+        mergesSince: () => [],
+      } }) }
+      : s), ...args) };
 });
 vi.mock('../branch-sync.mjs', async (original) => ({
   ...await original(), notifyDesktopChecked: episodeReplay.send,
@@ -51,6 +58,135 @@ vi.mock('../../operations/card-batch-seal-io.mjs', () => ({ sealDueBatches: card
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-watch-test-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+describe('tick() — Claude auth expired NEEDS-YOU delivery', () => {
+  const start = Date.parse('2026-11-07T01:52:00Z');
+  const key = 'claude-auth-expired::claude-auth';
+  const sessions = [
+    { name: 'ci-heal-6469', startedAt: Date.parse('2026-11-07T00:13:54Z') },
+    { name: 'ci-heal-6472', startedAt: Date.parse('2026-11-07T00:14:07Z') },
+    { name: 'fix-6467', startedAt: Date.parse('2026-11-07T01:49:00Z') },
+    { name: 'ci-heal-6469', startedAt: Date.parse('2026-11-07T01:51:00Z') },
+  ];
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockClear(); });
+  const setup = () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'),
+      'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const publishNeedsYou = vi.fn();
+    const run = (rows = sessions, offset = 0, extra = {}) => {
+      episodeReplay.probes = { authExpired: rows };
+      return tick({ ...flags, now: new Date(start + offset).toISOString(), ...extra }, { publishNeedsYou });
+    };
+    return { run, publishNeedsYou, statePath: join(healthDir(flags['state-root']), 'state.json') };
+  };
+
+  it('replays the four real sessions and publishes once across two ticks and a later reminder', async () => {
+    const { run, publishNeedsYou } = setup();
+    const first = await run();
+    expect(first.transitions).toContainEqual({ type: 'opened', key });
+    expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+    expect(publishNeedsYou.mock.calls[0][0]).toEqual({
+      key, repo: 'health-watch', kind: 'claude-auth-expired', pr: 0, head: `${key}:${start}`,
+      reason: 'Claude login expired — re-login', title: 'Claude login expired — re-login (run /login)',
+      at: new Date(start).toISOString(),
+    });
+    await run(sessions, 60_000);
+    const later = 5 * 3_600_000;
+    await run(sessions.map(s => ({ ...s, startedAt: s.startedAt + later })), later);
+    expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish for a single blip session', async () => {
+    const { run, publishNeedsYou } = setup();
+    const result = await run(sessions.slice(-1));
+    expect(result.transitions).not.toContainEqual({ type: 'opened', key });
+    expect(publishNeedsYou).not.toHaveBeenCalled();
+  });
+
+  it('publishes a new feed identity after recovery and reopening', async () => {
+    const { run, publishNeedsYou } = setup();
+    await run();
+    expect((await run([], 1_000)).transitions).toContainEqual({ type: 'closed', key });
+    await run(sessions, 2_000);
+    expect(publishNeedsYou).toHaveBeenCalledTimes(2);
+    expect(publishNeedsYou.mock.calls.map(([item]) => item.head)).toEqual([`${key}:${start}`, `${key}:${start + 2_000}`]);
+  });
+
+  it('reports the proposed item in dry-run without publishing or persisting', async () => {
+    const { run, publishNeedsYou, statePath } = setup();
+    const result = await run(sessions, 0, { 'dry-run': true });
+    expect(publishNeedsYou).not.toHaveBeenCalled();
+    expect(episodeReplay.send).not.toHaveBeenCalled();
+    expect(existsSync(statePath)).toBe(false);
+    expect(result.notifications).toContainEqual(expect.objectContaining({
+      key, channel: 'needs-you', dryRun: true,
+      item: expect.objectContaining({ head: `${key}:${start}`, reason: 'Claude login expired — re-login' }),
+    }));
+  });
+
+  it('honors no-notify for both delivery channels', async () => {
+    const { run, publishNeedsYou } = setup();
+    const result = await run(sessions, 0, { 'no-notify': true });
+    expect(publishNeedsYou).not.toHaveBeenCalled();
+    expect(episodeReplay.send).not.toHaveBeenCalled();
+    expect(result.notifications).toEqual([]);
+  });
+
+  it('logs a rejected publication and completes the tick', async () => {
+    const { run, publishNeedsYou } = setup();
+    publishNeedsYou.mockRejectedValueOnce(new Error('feed unavailable'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await run();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('feed unavailable'));
+      expect(result.notifications).toContainEqual(expect.objectContaining({ channel: 'needs-you', ok: false, error: 'feed unavailable' }));
+    } finally { log.mockRestore(); }
+  });
+
+  it('retries a rejected publication on the next tick and then stops', async () => {
+    const { run, publishNeedsYou } = setup();
+    publishNeedsYou.mockRejectedValueOnce(new Error('feed unavailable'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await run();
+      await run();
+      await run();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(2);
+    } finally { log.mockRestore(); }
+  });
+
+  it('keeps the published re-login alert open across a complete operator-queue feed refresh', async () => {
+    // Real feed publisher + the exact refresh arguments runOnce uses: an event-only alert must survive a
+    // refresh whose report does not mention it (the outage is owned by health-watch, not by the queue).
+    const feedPath = join(dir, 'feed', 'needs-you-events.jsonl');
+    const publish = item => publishAttention(item, { path: feedPath, now: start });
+    episodeReplay.probes = { authExpired: sessions };
+    await tick({ 'state-root': join(dir, 'state2'), 'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'),
+      'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true, now: new Date(start).toISOString() },
+    { publishNeedsYou: publish });
+    const openKeys = JSON.parse(readFileSync(sidecarsOf(feedPath).state, 'utf8')).openKeys;
+    expect(openKeys).toHaveLength(1);
+    const refreshed = diffFeed(openKeys, [], start + 60_000, { incomplete: false, clearKinds: REPORT_KINDS, alsoClear: GATE_KINDS });
+    expect(refreshed.lines.filter(l => l.startsWith('NEEDS-YOU-CLEARED'))).toEqual([]);
+    expect(refreshed.openKeys).toEqual(openKeys);
+  });
+
+  it('does not retry a rejected publication once an active silence tracks the episode', async () => {
+    const { run, publishNeedsYou, statePath } = setup();
+    publishNeedsYou.mockRejectedValueOnce(new Error('feed unavailable'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await run();
+      writeFileSync(join(dirname(statePath), 'silences.json'), JSON.stringify([
+        { smell: 'claude-auth-expired', subject: null, card: '1', expiresAt: start + 3_600_000 }]));
+      await run();
+      expect(publishNeedsYou).toHaveBeenCalledTimes(1);
+    } finally { log.mockRestore(); }
+  });
+});
 
 describe('lane scan cache target isolation', () => {
   it.each([
@@ -812,6 +948,95 @@ describe('tick() — #4079 filing-request dispatch plumbing', () => {
 });
 
 describe('runTickWithWatchdog', () => {
+  const settings = (options = {}) => resolveTickWatchdogLimit({
+    env: {}, platform: {}, log: () => {}, readLoad: () => ({ load1: 40, cores: 12 }), ...options,
+  });
+
+  async function simulatedTick(killAfterMs, durationMs) {
+    vi.useFakeTimers();
+    try {
+      const child = new EventEmitter();
+      child.kill = vi.fn(() => child.emit('exit', null));
+      const result = runTickWithWatchdog([], { dir, killAfterMs, spawnChild: () => child });
+      if (durationMs !== null) setTimeout(() => child.emit('exit', 0), durationMs);
+      await vi.advanceTimersByTimeAsync(durationMs ?? killAfterMs - 1);
+      if (durationMs === null) {
+        expect(child.kill).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      return { code: await result, kill: child.kill };
+    } finally { vi.useRealTimers(); }
+  }
+
+  it('at load 40 on 12 cores gives a healthy 174s tick more than 180s', async () => {
+    const { killAfterMs } = settings();
+    expect(killAfterMs).toBe(540_000);
+    const result = await simulatedTick(killAfterMs, 174_000);
+    expect(result.code).toBe(0);
+    expect(result.kill).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'overrun.json'))).toBe(false);
+  });
+
+  it('keeps the idle-load deadline at 180s', () => {
+    expect(settings({ readLoad: () => ({ load1: 2, cores: 12 }) }).killAfterMs).toBe(180_000);
+  });
+
+  it('kills a hung tick exactly at its scaled limit and records that actual limit', async () => {
+    const { killAfterMs } = settings({ readLoad: () => ({ load1: 24, cores: 12 }) });
+    expect(killAfterMs).toBe(360_000);
+    const result = await simulatedTick(killAfterMs, null);
+    expect(result.code).toBe(3);
+    expect(result.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(JSON.parse(readFileSync(join(dir, 'overrun.json'), 'utf8')).killedAfterMs).toBe(killAfterMs);
+  });
+
+  it.each(['oops', '', 'Infinity', '-1', '0'])('logs invalid max scale %j and falls back to standard', raw => {
+    const log = vi.fn();
+    const result = settings({ config: { tickKillLoadScaleMax: 2 }, env: { WE_HEALTH_TICK_KILL_LOAD_SCALE_MAX: raw }, log });
+    expect(result.killAfterMs).toBe(540_000);
+    expect(result.sources.tickKillLoadScaleMax).toBe('standard');
+    expect(log.mock.calls.flat().join('\n')).toMatch(/ignored invalid/);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/tickKillLoadScaleMax=3 \(standard\)/);
+  });
+
+  it('resolves standard, platform, tool and environment and logs effective sources', () => {
+    const log = vi.fn();
+    const result = settings({ platform: { tickKillLoadScaleMax: 2, tickKillCeilingMs: 500_000 },
+      config: { tickKillLoadScaleMax: 2.5 }, env: { WE_HEALTH_TICK_KILL_CEILING_MS: '400000' }, log });
+    expect(result.killAfterMs).toBe(400_000);
+    expect(result.sources).toMatchObject({ tickKillLoadScaleMax: 'tool', tickKillCeilingMs: 'env', tickBudgetMs: 'standard' });
+    expect(settings({ platform: { tickKillLoadScaleMax: 2 } }).sources.tickKillLoadScaleMax).toBe('platform');
+    expect(log.mock.calls.flat().join('\n')).toMatch(/tickKillCeilingMs=400000 \(env\)/);
+  });
+
+  it.each([0, -1, Infinity, 2_147_483_648, { nested: 1 }])('rejects invalid absolute ceiling %j', tickKillCeilingMs => {
+    const result = settings({ config: { tickKillCeilingMs, tickKillLoadScaleMax: 100 } });
+    expect(result.killAfterMs).toBe(540_000);
+    expect(result.sources.tickKillCeilingMs).toBe('standard');
+  });
+
+  it.each([0, -1, Infinity, 'bad'])('rejects invalid persisted tick budget %j', tickBudgetMs => {
+    expect(settings({ config: { tickBudgetMs } }).killAfterMs).toBe(540_000);
+  });
+
+  it('caps even an oversized budget and scale at the absolute ceiling', () => {
+    expect(settings({ config: { tickBudgetMs: 2_147_483_647, tickKillLoadScaleMax: 1e300 },
+      readLoad: () => ({ load1: 1e300, cores: 1 }) }).killAfterMs).toBe(540_000);
+  });
+
+  it.each([{ load1: NaN, cores: 12 }, { load1: 40, cores: 0 }, { load1: -1, cores: 12 }])(
+    'logs invalid load evidence %j and uses the bounded idle deadline', load => {
+      const log = vi.fn();
+      expect(settings({ readLoad: () => load, log }).killAfterMs).toBe(180_000);
+      expect(log.mock.calls.flat().join('\n')).toMatch(/load.*invalid/i);
+    });
+
+  it('logs an unreadable load and uses the bounded idle deadline', () => {
+    const log = vi.fn();
+    expect(settings({ readLoad: () => { throw new Error('unavailable'); }, log }).killAfterMs).toBe(180_000);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/load.*invalid/i);
+  });
+
   it('kills a tick that outlives its budget from OUTSIDE the tick process and records overrun.json', async () => {
     const stateRoot = join(dir, 'state');
     const hd = healthDir(stateRoot);

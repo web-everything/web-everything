@@ -445,3 +445,29 @@ describe('probeSessionWatchdog — interval cache in the health dir', () => {
     expect(r.cfg).toBe(CFG);
   });
 });
+
+describe('R502 item 3: stale claim (holder silent, head unmoved, claim old) — detection only', () => {
+  const NOW = T0;
+  const claim = (over = {}) => ({ meta: { repo: 'we', pr: 6300, kind: 'fixing', who: 'fix-6300', sessionId: 'sid-6', headSha: 'abc123', claimedAt: new Date(NOW - 120 * MIN).toISOString(), ...over } });
+  const row = (idle) => ({ name: 'fix-6300', id: 'h', sessionId: 'sid-6', kind: 'fix', class: CLASSES.ACTIVE, reason: 'x', evidence: idle == null ? {} : { idleMinutes: idle } });
+  const standardFor = () => ({ ms: 20 * MIN, minutes: 20 });
+  const plan = (rows, claims, head = 'abc123', cfg) => planWatchdog({ rows, claims, prHeadFor: () => head, standardFor, nowMs: NOW, ...(cfg ? { cfg } : {}) }).findings.filter((f) => f.type === 'stale-claim');
+  it('old claim + silent holder + unmoved head → one stale-claim finding with the thresholds in it', () => {
+    expect(plan([row(40)], [claim()])).toEqual([expect.objectContaining({ type: 'stale-claim', repo: 'we', pr: 6300, claimAgeMinutes: 120, holderIdleMinutes: 40, holderClass: CLASSES.ACTIVE, thresholdMinutes: 90, idleThresholdMinutes: 20 })]);
+  });
+  it('a holder missing from the rows might be an interactive session: it never alerts (fail closed)', () => {
+    expect(plan([], [claim()])).toEqual([]);
+  });
+  it('fails closed: young claim, active holder, moved head, unknown head or unknown idle never alert', () => {
+    expect(plan([row(40)], [claim({ claimedAt: new Date(NOW - 30 * MIN).toISOString() })])).toEqual([]);
+    expect(plan([row(5)], [claim()])).toEqual([]);
+    expect(plan([row(40)], [claim()], 'def456')).toEqual([]);
+    expect(plan([row(40)], [claim()], null)).toEqual([]);
+    expect(plan([row(null)], [claim()])).toEqual([]);
+  });
+  it('thresholds come from the (overridable) config', () => {
+    expect(plan([row(40)], [claim()], 'abc123', resolveSessionWatchdogConfig({ staleClaimMinutes: 200 }).config)).toEqual([]);
+    expect(plan([row(10)], [claim()], 'abc123', resolveSessionWatchdogConfig({ staleClaimIdleMinutes: 5 }).config)).toHaveLength(1);
+    expect(resolveSessionWatchdogConfig({ staleClaimMinutes: -1 }).error).toMatch(/staleClaimMinutes/);
+  });
+});

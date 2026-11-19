@@ -11,11 +11,15 @@
  *   being correct can never silently drift from what ships.
  */
 import { describe, it, expect } from 'vitest';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
+import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
+import { localChangedSet } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -42,6 +46,53 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } =
 
 /** Factor 1 = vitest's own timeouts, i.e. the exact pre-WE_VERIFY_TEST_TIMEOUT_FACTOR command. */
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
+
+it('R984 preserves whitespace in tracked, deleted and untracked changed-file names', () => {
+  const result = localChangedSet({ runGit: fakeGit(['notes.md ', ' leading.md'],
+    { deleted: ['deleted.md '], untracked: [' new.md '] }) });
+  expect(result.changedFiles).toEqual([' leading.md', ' new.md ', 'notes.md ']);
+  expect(result.deletedFiles).toEqual(['deleted.md ']);
+  expect(result.untrackedFiles).toEqual([' new.md ']);
+});
+
+// PR 7008 red team: Git C-quotes non-ASCII, quote, backslash and control-byte paths by default
+// (core.quotePath). Every changed-file reader must hand callers the real filename.
+it('decodes Git-quoted tracked, deleted and untracked changed-file names', () => {
+  const result = localChangedSet({ runGit: fakeGit(['"docs/caf\\303\\251.md"', '"a\\"b\\\\c.md"'],
+    { deleted: ['"gone\\tfile.md"'], untracked: ['"new\\nline.md"', 'plain.md'] }) });
+  expect(result.changedFiles).toEqual(['a"b\\c.md', 'docs/café.md', 'new\nline.md', 'plain.md']);
+  expect(result.deletedFiles).toEqual(['gone\tfile.md']);
+  expect(result.untrackedFiles).toEqual(['new\nline.md', 'plain.md']);
+});
+
+it('reads real Git output for Unicode changed files as paths that exist on disk', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quoted-path-'));
+  try {
+    const git = (args) => execSync(`git ${args.map((a) => `'${a}'`).join(' ')}`, { cwd: dir, encoding: 'utf8' });
+    git(['init', '-q']);
+    git(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'base']);
+    git(['config', 'core.quotePath', 'true']);
+    mkdirSync(join(dir, 'docs'));
+    writeFileSync(join(dir, 'docs', 'café.md'), 'neutral\n');
+    writeFileSync(join(dir, 'tracked-é.md'), 'one\n');
+    git(['add', 'tracked-é.md']);
+    const result = localChangedSet({ base: 'HEAD', runGit: git });
+    expect(result.changedFiles.map((f) => f.normalize('NFC'))).toEqual(['docs/café.md', 'tracked-é.md']);
+    for (const file of result.changedFiles) expect(readFileSync(join(dir, file), 'utf8')).toBeTruthy();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('classifies a Git-quoted Unicode backlog card by its real path', () => {
+  const runGit = (args) => {
+    if (args[0] === 'merge-base') return 'deadbeef';
+    if (args[0] === 'diff') return '"backlog/100-caf\\303\\251.md"\n';
+    if (args[0] === 'ls-files') return '';
+    throw new Error(`unexpected git invocation in test: ${args.join(' ')}`);
+  };
+  expect(localDiffIsCardOnly({ runGit })).toBe(true);
+});
 
 describe('#4540 — untracked lane scratch selection', () => {
   it('filters scratch before both related targets and reference discovery, preserving standards inputs', () => {
@@ -307,24 +358,26 @@ describe('resolveDefaultGate per-repo scripts (#3919) — only run the npm scrip
     expect(resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: FRONTIERUI_SCRIPTS }).command).toBe(legacy.command);
   });
 
-  it.each(cases)('a plateau-app checkout ($name) runs `npm test` and skips the missing check:standards', ({ files }) => {
+  it.each(cases)('a plateau-app checkout ($name) keeps related tests and skips the missing check:standards', ({ files }) => {
     const { command, gateReasons, decision } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(files), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
     if (decision.mode === 'blocked') { expect(command).toBeNull(); return; }
-    expect(command).toBe('npm test');
+    expect(command).toContain('npx vitest related ');
+    expect(command).not.toContain('npm test');
     expect(command).not.toContain('test:unit');
     expect(command).not.toContain('check:standards');
-    expect(gateReasons.join(' ')).toMatch(/no `test:unit`.*npm test/);
+    expect(gateReasons.join(' ')).toMatch(/no `test:unit`.*related/);
     expect(gateReasons.join(' ')).toMatch(/no `check:standards`/);
   });
 
-  it('a plateau-app checkout with an uncommitted edit also gets `npm test` (the selection is WE-shaped; script-aware)', () => {
+  it('a plateau-app checkout with an uncommitted edit also keeps related tests', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['docs/readme.md'], { untracked: ['src/x.ts'] }), env: TODAY, scripts: PLATEAU_APP_SCRIPTS });
-    expect(command).toBe('npm test');
+    expect(command).toContain('npx vitest related ');
+    expect(command).not.toContain('npm test');
   });
 
-  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after `npm test`', () => {
+  it('a checkout with check:standards but no test:unit keeps the (scoped) health gate after related tests', () => {
     const { command } = resolveDefaultGate({ fileConfig: null, runGit: fakeGit(['src/a.ts']), env: TODAY, scripts: ['test', 'check:standards'] });
-    expect(command).toBe("npm test && npm run check:standards -- --local --files='src/a.ts'");
+    expect(command).toBe("npx vitest related 'src/a.ts' --run --passWithNoTests && npm run check:standards -- --local --files='src/a.ts'");
   });
 
   it('a checkout with no test/test:unit/check:standards script skips BOTH halves with an explicit reason, never a missing-script failure', () => {
@@ -391,7 +444,9 @@ describe('laneRelevantChangeSince (#4296) — keys marker validity to what chang
    *   changed shape between record time and headSha (only the revert-scenario tests below need it to differ).
    */
   function fakeCommitGit({ sinceRecord, relevantAtHead, relevantAtRecord = relevantAtHead }) {
-    return (args) => {
+    return (rawArgs) => {
+      // The since-record diff now carries `--no-renames`; normalise it so the positional matches below still key on shas.
+      const args = rawArgs.filter((a) => a !== '--no-renames');
       if (args[0] === 'merge-base') return MERGE_BASE;
       if (args[0] === 'diff' && args[2] === RECORD_SHA && args[3] === HEAD_SHA) return sinceRecord.join('\n');
       if (args[0] === 'diff' && args[2] === MERGE_BASE && args[3] === HEAD_SHA) return relevantAtHead.join('\n');
@@ -434,6 +489,7 @@ describe('laneRelevantChangeSince (#4296) — keys marker validity to what chang
   it('nothing changed since the record at all → empty overlap, merge-base never consulted', () => {
     let mergeBaseCalled = false;
     const runGit = (args) => {
+      if (args[0] === 'merge-base' && args[1] === '--is-ancestor') return ''; // ancestry guard, not the relevance merge-base
       if (args[0] === 'merge-base') { mergeBaseCalled = true; return MERGE_BASE; }
       if (args[0] === 'diff') return '';
       throw new Error('unexpected');
@@ -494,7 +550,8 @@ describe('laneRelevantChangeSince (#4296) — keys marker validity to what chang
     // union fix (converge round 1's red-team), it ALSO computes the lane's relevance as of `recordSha`, which is
     // never the checkout's HEAD either.
     const mergeBaseCalls = [];
-    const runGit = (args) => {
+    const runGit = (rawArgs) => {
+      const args = rawArgs.filter((a) => a !== '--no-renames');
       if (args[0] === 'diff' && args[2] === RECORD_SHA && args[3] === HEAD_SHA) return 'scripts/a.mjs';
       if (args[0] === 'merge-base') { mergeBaseCalls.push(args); return MERGE_BASE; }
       if (args[0] === 'diff' && args[2] === MERGE_BASE) return '';
@@ -708,10 +765,7 @@ describe('explicitGateRefusal — an agent-supplied gate must be an affected-tes
     "npx vitest related 'scripts/a.test.mjs' 'scripts/b.mjs' --run --bail=1",
     'npx vitest run scripts/a.test.mjs',
     'vitest run',
-    'npm run test:unit',
-    'npm test',
     'npx vitest related scripts/a.mjs --run && npm run check:standards -- --local --files=scripts/a.mjs',
-    'npm run test:unit && npm run check:standards',
   ])('accepts %j', (gate) => expect(explicitGateRefusal(gate)).toBeNull());
 
   // The adversarial-review bypasses: each of these runs no real tests (or runs attacker-chosen code) yet records green.
@@ -1066,7 +1120,7 @@ describe('#5128 — bounded related-test selection', () => {
     const selectedTestCommand = new RegExp(pattern[1]);
     for (const mode of ['related', 'run']) expect(selectedTestCommand.test(`npx vitest ${mode} 'x.test.mjs'`)).toBe(true);
     expect(selectedTestCommand.test('npm run test:unit')).toBe(false);
-    expect(source).toMatch(/const retryableGate = SELECTED_TEST_COMMAND\.test\(resolvedGate\?\.testCommand \?\? ''\)/);
+    expect(source).toMatch(/const retryableGate = isSelectedTestCommand\(resolvedGate\?\.testCommand \?\? ''\)/);
   });
 });
 
@@ -1196,5 +1250,299 @@ describe('skipLocalForCardOnly — card-only diffs skip the local gate (CI keeps
   it('an untracked non-litter file breaks card-only; lane litter does not', () => {
     expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: ['scripts/new.mjs'] }) })).toBe(false);
     expect(localDiffIsCardOnly({ runGit: gitFor(['backlog/a.md'], { untracked: [LANE_RELEASE_LITTER_ALLOWLIST[0]] }) })).toBe(true);
+  });
+});
+
+describe('explicit-list sharding', () => {
+  it.each([
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", true],
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=3 -- npx vitest run 'a.test.mjs'", false],
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'b.test.mjs'", false],
+    ["node '/checkout A/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs' && true", false],
+    ["node '/checkout A/other/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", false],
+    ["node 'relative/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", false],
+    ["node '<checkout>/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'", false],
+  ])('normalizes only the absolute wrapper prefix: %s', (gate, matches) => {
+    const command = "node '/checkout B/scripts/lib/verify-shard-run.mjs' --shards=2 -- npx vitest run 'a.test.mjs'";
+    const resolved = { command, testCommand: command, decision: { changedFiles: ['scripts/hub.mjs'], relatedMode: 'all', testTimeoutFactor: 1 } };
+    expect(matchRequestedDefaultGate({ gate, env: TODAY, resolved, resolveUnder: () => resolved, variants: false })).toBe(matches ? resolved : null);
+  });
+
+  it.each(['checkout B', "checkout B's"])("recognizes a stamp from checkout A in executing %s and executes a failing always-run guard", executingName => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-cross-checkout-'));
+    try {
+      const checkoutA = join(root, "checkout A's", 'scripts/lib');
+      const checkoutB = join(root, executingName);
+      const copiedPaths = ['scripts/verify-lane.mjs', 'scripts/lib/verify-lane-gate.mjs', 'scripts/lib/verify-remote-routing.mjs'];
+      mkdirSync(join(checkoutB, 'scripts/lib'), { recursive: true });
+      // Run the real entry and both path-sensitive modules from B. Keep other dependencies
+      // at their original locations; preserve the dynamic admission-module lookup too.
+      symlinkSync(resolve('scripts/readiness'), join(checkoutB, 'scripts/readiness'), 'dir');
+      for (const path of copiedPaths) {
+        const originalUrl = pathToFileURL(resolve(path));
+        const copied = readFileSync(originalUrl, 'utf8').replace(/(from\s+|import\s+)'(\.\.?\/[^']+)'/g,
+          (_, prefix, specifier) => {
+            const dependency = new URL(specifier, originalUrl);
+            const local = copiedPaths.find(p => pathToFileURL(resolve(p)).href === dependency.href);
+            return prefix + JSON.stringify(local ? pathToFileURL(join(checkoutB, local)).href : dependency.href);
+          });
+        writeFileSync(join(checkoutB, path), copied);
+      }
+      const repo = join(root, 'target');
+      for (const directory of [checkoutA, repo, join(repo, 'scripts'), join(root, 'bin'), join(root, 'state')]) mkdirSync(directory, { recursive: true });
+      // Load the real resolver at another absolute root, keeping its dependencies unchanged.
+      const moduleUrl = pathToFileURL(resolve('scripts/lib/verify-lane-gate.mjs'));
+      const source = readFileSync(moduleUrl, 'utf8').replace(/from '(\.\.?\/[^']+)'/g,
+        (_, specifier) => `from '${new URL(specifier, moduleUrl).href}'`);
+      const copy = join(checkoutA, 'verify-lane-gate.mjs');
+      writeFileSync(copy, source);
+      const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/deep.test.mjs': "import './mid.mjs'", 'guard.test.mjs': '// guard' };
+      for (let i = 0; i < 24; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
+      for (const [file, content] of Object.entries(files)) writeFileSync(join(repo, file), content);
+      const env = { ...process.env, WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected',
+        WE_VERIFY_SELECTION: 'pr', WE_VERIFY_RELATED: 'all', WE_VERIFY_RELATED_MAX_TESTS: '1', WE_VERIFY_RELATED_DEPTH: '2',
+        WE_VERIFY_TEST_TIMEOUT_FACTOR: '1', WE_VERIFY_STANDARDS: 'ci-only', WE_VERIFY_REVERT_RED: 'off',
+        WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3',
+        WE_VERIFY_PHASE_TIMEOUT_MS: '10000', WE_VERIFY_ALWAYS_RUN_TESTS: 'guard.test.mjs', WE_VERIFY_PHASE_ADMISSION: '1',
+        WE_TOOLS_ROOT: '', PATH: `${join(root, 'bin')}:${process.env.PATH}`, TMPDIR: root, LANE_POOL_ROOT: join(root, 'pool') };
+      const git = fakeGit(['scripts/hub.mjs']);
+      const options = { env, fileConfig: null, scripts: ['test:unit'], readRepoFile: p => files[p],
+        runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) };
+      // Native Node preserves import.meta.url at A; Vite's module loader cannot load this temporary copy.
+      const stamp = spawnSync(process.execPath, ['--input-type=module', '-e', `
+import { resolveDefaultGate } from ${JSON.stringify(pathToFileURL(copy).href)};
+const files = ${JSON.stringify(files)};
+const runGit = args => {
+  if (args[0] === 'merge-base') return 'deadbeef';
+  if (args[0] === 'diff') return args.includes('--diff-filter=D') ? '' : 'scripts/hub.mjs';
+  if (args[0] === 'ls-files') return args.includes('--cached') ? Object.keys(files).join('\\n') : '';
+  throw Error('no grep matches');
+};
+process.stdout.write(JSON.stringify(resolveDefaultGate({ env: process.env, fileConfig: null, scripts: ['test:unit'], readRepoFile: p => files[p], runGit })));`],
+        { env, encoding: 'utf8', timeout: 10000 });
+      expect(stamp.status, stamp.stderr).toBe(0);
+      const stamped = JSON.parse(stamp.stdout);
+      const resolveUnder = env => resolveDefaultGate({ ...options, env });
+      const resolved = resolveUnder(env);
+      expect(stamped.command).not.toBe(resolved.command);
+      const resolvedGate = matchRequestedDefaultGate({ gate: stamped.command, env, resolved, resolveUnder });
+      expect.soft(resolvedGate).toBeTruthy();
+      expect.soft(resolvedGate?.testCommand).toBe(resolved.testCommand);
+
+      // Stub git reads and command execution only. No real repository or .git writes are needed.
+      const executable = (name, body) => writeFileSync(join(root, 'bin', name), `#!${process.execPath}\n${body}`, { mode: 0o755 });
+      const quote = s => `'${s.replaceAll("'", "'\\''")}'`;
+      writeFileSync(join(root, 'bin/git'), `#!/bin/sh
+case " $* " in
+  *' rev-parse '*) case " $* " in
+    *' --absolute-git-dir '*) printf '%s' ${quote(join(root, 'state'))};;
+    *) printf '%s' ${quote('a'.repeat(40))};; esac;;
+  *' merge-base '*) printf deadbeef;;
+  *' diff '*) case " $* " in
+    *' --diff-filter=D '*) :;;
+    *' --name-only '*) printf scripts/hub.mjs;;
+    *) printf 'changed hub';; esac;;
+  *' ls-files '*) case " $* " in
+    *' --cached '*) printf '%s' ${quote(Object.keys(files).join('\n'))};; esac;;
+  *' status '*) printf ' M scripts/hub.mjs';;
+  *) exit 1;;
+esac`, { mode: 0o755 });
+      const calls = join(root, 'calls.jsonl');
+      const logCall = `const fs = require('node:fs'); const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');`;
+      executable('node', `${logCall}\nprocess.exit(0);`);
+      executable('npx', `${logCall}
+const report = args.find(a => a.startsWith('--outputFile.json='));
+if (report) fs.writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: [{ name: ${JSON.stringify(join(repo, 'guard.test.mjs'))}, status: 'failed', assertionResults: [{ status: 'failed' }] }] }));
+process.exit(1);`);
+      writeFileSync(join(repo, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'vitest run' } }));
+      const preferences = join(root, 'preferences.json');
+      writeFileSync(preferences, JSON.stringify({ heavyAdmission: { cap: 1, fastSlots: 1, remote: { enabled: false } } }));
+      env.WE_PLATFORM_PREFERENCES = preferences;
+      const child = spawnSync(process.execPath, [join(checkoutB, 'scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${stamped.command}`, '--run-id=cross-checkout', '--json'],
+        { env, encoding: 'utf8', timeout: 60000 });
+      expect(child.error, child.stderr).toBeUndefined();
+      const result = JSON.parse(child.stdout.trim().split('\n').at(-1));
+      expect.soft(child.status, child.stderr).toBe(2);
+      // Phase admission proves the dispatcher's resolvedGate and retryableGate were both set.
+      expect.soft(result.phases?.admissionMode).toBe('phase');
+      expect.soft(result.phases?.alwaysRun).toMatchObject({ executed: true, result: 'failed', planned: ['guard.test.mjs'] });
+      const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
+      expect.soft(commands[0][0]).toBe(join(checkoutB, 'scripts/lib/verify-shard-run.mjs'));
+      expect(commands.some(args => args.includes('guard.test.mjs'))).toBe(true);
+
+      // #66: checkout A's sharded gate that B cannot match must still announce and record the whole-gate fallback,
+      // even though its wrapper root is not B's own.
+      const unmatched = stamped.command.replace(/--parallel=\d+/, '--parallel=1');
+      expect(unmatched).not.toBe(stamped.command);
+      const fallback = spawnSync(process.execPath, [join(checkoutB, 'scripts/verify-lane.mjs'), `--repo=${repo}`, `--gate=${unmatched}`, '--run-id=cross-checkout-unmatched', '--json'],
+        { env, encoding: 'utf8', timeout: 60000 });
+      expect(fallback.error, fallback.stderr).toBeUndefined();
+      expect(fallback.stderr).toContain('⚠ verify-lane: whole-gate admission');
+      const fallbackResult = JSON.parse(fallback.stdout.trim().split('\n').at(-1));
+      expect(fallbackResult.phases?.admissionMode).toBe('gate');
+      expect(fallbackResult.phases?.admissionFallback).toMatch(/not this checkout's default selection/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 90000);
+
+  function gate(count, settings = {}) {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'" };
+    for (let i = 0; i < count; i++) files[`scripts/direct${i}.test.mjs`] = "import './hub.mjs'";
+    files['scripts/deep.test.mjs'] = "import './mid.mjs'";
+    const git = fakeGit(['scripts/hub.mjs']);
+    return resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 1, relatedDepth: 2, phaseTimeoutMs: 10000, ...settings }, readRepoFile: p => files[p],
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
+  }
+  it('wraps at threshold, with 75 files producing seven shards and a 90% budget', () => {
+    const result = gate(75);
+    expect(result.testCommand).toMatch(/^node '[^']*\/scripts\/lib\/verify-shard-run\.mjs' --shards=7 --parallel=3 --budget-ms=9000 -- npx vitest run /);
+    expect(result.decision.selection.shards).toEqual({ count: 7, size: 12, parallel: 3 });
+    expect(describeGate(result)).toContain('7 shards');
+    expect(gate(24).testCommand).toContain('--shards=2');
+  });
+  it('below threshold and disabled commands are byte-identical', () => {
+    expect(gate(23).testCommand).toBe(gate(23, { shardMinTests: 0 }).testCommand);
+    expect(gate(75, { shardMinTests: 0 }).testCommand).toMatch(/^npx vitest run /);
+  });
+});
+
+
+describe('R913 selected gates', () => {
+  it.each(['npx vitest related x --run', "echo 'no remaining targets'"])(
+    'composeGate with only test preserves %s without npm test', vitestCmd => {
+      const gate = composeGate({ vitestCmd, checkStandardsCmd: null, scripts: ['test'] });
+      expect(gate.command).toBe(vitestCmd);
+      expect(gate.command).not.toContain('npm test');
+      expect(gate.gateReasons.join(' ')).toContain('related');
+    });
+  it.each(['npm run test:unit', 'npm test', 'npm run test:unit && npm run check:standards'])(
+    'refuses whole-suite explicit gate %s', gate => {
+      expect(explicitGateRefusal(gate)).toContain('vitest related|run <targets>');
+    });
+  it('accepts an explicit related gate', () => {
+    expect(explicitGateRefusal('npx vitest related x --run')).toBeNull();
+  });
+});
+
+// PR #6769 send-back (R895/R907): a `test`-only sibling checkout (plateau-app) now gets the related vitest command
+// instead of `npm test`. Remote routing must not rewrite it to WE's in-tree admission wrapper unless the TARGET
+// checkout really has `scripts/readiness/heavy-admission.mjs` — otherwise node fails before any test runs.
+describe('related gate routing in a sibling checkout without the WE admission wrapper', () => {
+  const WRAPPER = 'scripts/readiness/heavy-admission.mjs';
+  const related = "npx vitest related 'src/a.ts' --run --passWithNoTests";
+  const truncated = "npx vitest run 'src/a.test.ts' --passWithNoTests";
+  function checkout({ wrapper }) {
+    const dir = mkdtempSync(join(tmpdir(), 'vlg-sibling-'));
+    if (wrapper) {
+      mkdirSync(join(dir, 'scripts/readiness'), { recursive: true });
+      writeFileSync(join(dir, WRAPPER), '// stand-in for the WE admission wrapper\n');
+    }
+    return dir;
+  }
+
+  it('runs the unwrapped related command locally when the checkout has no wrapper, and it executes', () => {
+    const dir = checkout({ wrapper: false });
+    try {
+      const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
+      const plan = phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } });
+      expect(plan).toEqual({ command: related, takeLocalSlot: true, setHeld: true });
+      expect(localPhaseReason(testCommand, { cwd: dir })).toBe('no-checkout-admission-wrapper');
+      // Execute the planned command with a stand-in `npx` on PATH: it must reach the test runner, not die on a missing script.
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'npx'), '#!/bin/sh\necho "$@" > "$PWD/npx-args"\n', { mode: 0o755 });
+      const run = spawnSync('sh', ['-c', plan.command], { cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+      expect(run.stderr).not.toMatch(/Cannot find module|heavy-admission/);
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(dir, 'npx-args'), 'utf8').trim()).toBe('vitest related src/a.ts --run --passWithNoTests');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps every vitest rewrite local without the wrapper: truncated `vitest run`, env prefix, chains', () => {
+    const dir = checkout({ wrapper: false });
+    try {
+      for (const command of [truncated, `TZ=UTC ${related}`, `${truncated} && ${related}`,
+        `${related} && npm run check:standards -- --local --files=src/a.ts`]) {
+        expect(phaseAdmissionPlan({ command, cwd: dir, decision: { remote: true } })).toEqual({ command, takeLocalSlot: true, setHeld: true });
+        expect(localPhaseReason(command, { cwd: dir })).toBe('no-checkout-admission-wrapper');
+      }
+      // A package script is the checkout's own: its pass-through needs no WE file, so it is unchanged.
+      expect(phaseAdmissionPlan({ command: 'npm run check:standards', cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: 'npm run check:standards', takeLocalSlot: false, setHeld: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails closed to local when the wrapper probe throws', () => {
+    const fileExists = () => { throw new Error('EACCES'); };
+    expect(phaseAdmissionPlan({ command: related, cwd: '/nonexistent', decision: { remote: true }, fileExists }))
+      .toEqual({ command: related, takeLocalSlot: true, setHeld: true });
+  });
+
+  it('keeps the related command wrapped when the checkout has the wrapper', () => {
+    const dir = checkout({ wrapper: true });
+    try {
+      const { testCommand } = composeGate({ vitestCmd: related, checkStandardsCmd: null, scripts: ['test'] });
+      expect(phaseAdmissionPlan({ command: testCommand, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: `node ${WRAPPER} run -- ${related}`, takeLocalSlot: false, setHeld: false });
+      // No package.json proves no self-wrapped `test:unit`: the truncated run goes through the wrapper directly (PR #6772).
+      expect(phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: `node ${WRAPPER} run -- ${truncated}`, takeLocalSlot: false, setHeld: false });
+      expect(localPhaseReason(testCommand, { cwd: dir })).toBe('vitest-related-local-only');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  // PR #6772 red team: a checkout with the wrapper but no self-wrapped `test:unit` (plateau-app: `test` only) had its
+  // truncated `vitest run` rewritten to `npm run test:unit`, which died on "Missing script" before any test ran.
+  const direct = `node ${WRAPPER} run -- ${truncated}`;
+  const viaScript = "npm run test:unit -- 'src/a.test.ts' --passWithNoTests";
+  it.each([
+    { name: 'test script only', pkg: { scripts: { test: 'vitest run' } }, expected: direct },
+    { name: 'test:unit not self-wrapped', pkg: { scripts: { 'test:unit': 'vitest run' } }, expected: direct },
+    { name: 'test:unit names the wrapper but not first', pkg: { scripts: { 'test:unit': 'echo node scripts/readiness/heavy-admission.mjs run -- x && vitest run' } }, expected: direct },
+    { name: 'test:unit wraps another runner', pkg: { scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- jest' } }, expected: direct },
+    { name: 'test:unit wraps watch-mode vitest', pkg: { scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest' } }, expected: direct },
+    { name: 'test:unit wraps vitest run with its own config', pkg: { scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run --config x.ts' } }, expected: direct },
+    { name: 'oversized package.json', pkg: JSON.stringify({ scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run' }, pad: 'x'.repeat(70000) }), expected: direct },
+    { name: 'scripts not an object', pkg: { scripts: 'vitest' }, expected: direct },
+    { name: 'malformed package.json', pkg: '{ not json', expected: direct },
+    { name: 'self-wrapped test:unit', pkg: { scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run' } }, expected: viaScript },
+  ])('names `npm run test:unit` only when the checkout\'s own script wraps itself: $name', ({ pkg, expected }) => {
+    const dir = checkout({ wrapper: true });
+    try {
+      writeFileSync(join(dir, 'package.json'), typeof pkg === 'string' ? pkg : JSON.stringify(pkg));
+      expect(phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } }))
+        .toEqual({ command: expected, takeLocalSlot: false, setHeld: false });
+      // An env prefix and a chain keep the same choice per segment.
+      expect(phaseAdmissionPlan({ command: `TZ=UTC ${truncated} && ${related}`, cwd: dir, decision: { remote: true } }).command)
+        .toBe(`TZ=UTC ${expected} && node ${WRAPPER} run -- ${related}`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails closed to the direct wrapper when the package.json read throws', () => {
+    const readPackageJson = () => { throw new Error('EACCES'); };
+    expect(phaseAdmissionPlan({ command: truncated, cwd: '/nonexistent', decision: { remote: true }, fileExists: () => true, readPackageJson }))
+      .toEqual({ command: direct, takeLocalSlot: false, setHeld: false });
+  });
+
+  it('never reads package.json for a local decision or a related-only command', () => {
+    let reads = 0;
+    const readPackageJson = () => { reads += 1; return '{}'; };
+    phaseAdmissionPlan({ command: truncated, cwd: '/x', decision: { remote: false }, fileExists: () => true, readPackageJson });
+    phaseAdmissionPlan({ command: related, cwd: '/x', decision: { remote: true }, fileExists: () => true, readPackageJson });
+    expect(reads).toBe(0);
+  });
+
+  it('the planned command in a test-only checkout reaches the runner, not a missing npm script', () => {
+    const dir = checkout({ wrapper: true });
+    try {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }));
+      writeFileSync(join(dir, WRAPPER), "import { writeFileSync } from 'node:fs';\nwriteFileSync('wrapper-args', process.argv.slice(2).join(' '));\n");
+      const plan = phaseAdmissionPlan({ command: truncated, cwd: dir, decision: { remote: true } });
+      const run = spawnSync('sh', ['-c', plan.command], { cwd: dir, encoding: 'utf8' });
+      expect(run.stderr).not.toMatch(/Missing script/);
+      expect(run.status).toBe(0);
+      expect(readFileSync(join(dir, 'wrapper-args'), 'utf8')).toBe('run -- npx vitest run src/a.test.ts --passWithNoTests');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

@@ -2,7 +2,7 @@
 bornAs: xyfyxjk
 kind: task
 status: open
-humanGate: { kind: setup, what: "Mac Studio self-hosted runner (R112); resume remote verify once it is up" }
+humanGate: { kind: setup, what: "remote runner (R112); resume remote verify once it is up" }
 scope: ["we:.github/workflows/", "we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/remote-verify.test.mjs", "we:scripts/__tests__/check-standards-external-checkout.test.mjs"]
 dateOpened: "2026-10-24"
 tags: []
@@ -33,4 +33,4 @@ PR #5878 review requires CI-matching external-checkout authentication and one re
 6. **State over time** — Derive the expected expression from CI so future auth changes cannot silently leave remote verification behind.
 7. **Who wrote it** — Source checks cannot prove live credential availability; require the real run on the final repaired SHA before merge.
 
-Parked under operator ruling R112 (2026-10-25): resumes with the Mac Studio self-hosted runner. Code kept on branches lane/remote-verify-runner@25c401156c80c86be03d0f10880bde65e6846a47 and lane/remote-test-client@b46b3a004b209c4212a28b0d2f78a48a81a01af1 (PRs #5878, #5881 closed).
+Parked under operator ruling R112 (2026-10-25): resumes with the remote runner. Code kept on branches lane/remote-verify-runner@25c401156c80c86be03d0f10880bde65e6846a47 and lane/remote-test-client@b46b3a004b209c4212a28b0d2f78a48a81a01af1 (PRs #5878, #5881 closed).

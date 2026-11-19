@@ -2,16 +2,34 @@
  * @description Slice 2 of the automatic PR stall sweep: settings + kill switch, the shadow pass and its audit log, the
  *   rate limits, and the hard rule that shadow mode makes ZERO GitHub writes.
  */
+import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
+import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
+import { judgeRound } from '../../lib/round-judge.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
+import { assessPrSweep } from '../../operations/pr-sweep-core.mjs';
 import { runPrSweep } from '../pr-sweep.mjs';
 import { runPrSweepJob } from '../pr-sweep-job.mjs';
 import { publishStalledDigest } from '../pr-stall-digest.mjs';
 import { sidecarsOf, replay, runOnce, unacknowledged } from '../../operations/needs-you-feed.mjs';
+import { dispatchManualPass } from '../../operations/manual-daemon-pass-io.mjs';
+import { abandonStaleRedTeamRun, planRedTeamRecovery } from '../../lib/review-red-team-on-skip.mjs';
+import { readRecoveryWitness } from '../../lib/drain-red-team-evidence.mjs';
+
+// Keep the future default live-dispatch path hermetic as well as the injected seam.
+vi.mock('../../operations/manual-daemon-pass-io.mjs', () => ({ dispatchManualPass: vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 })) }));
+// The default abandonment seam is the shared stale-run abandonment; keep it hermetic but observable.
+vi.mock('../../lib/review-red-team-on-skip.mjs', async importOriginal => ({ ...await importOriginal(),
+  abandonStaleRedTeamRun: vi.fn(() => ({ ok: true })),
+  // The default post-abandonment re-plan seam and its witness reader stay hermetic but observable.
+  planRedTeamRecovery: vi.fn(() => ({ mode: 'fresh', abandon: false })) }));
+vi.mock('../../lib/drain-red-team-evidence.mjs', async importOriginal => ({ ...await importOriginal(),
+  readRecoveryWitness: vi.fn(() => ({})) }));
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -28,16 +46,24 @@ const PRS = [
   { number: 12, state: 'OPEN', title: 'at the cap', url: 'u', isDraft: false, headRefOid: 'b'.repeat(40), updatedAt: old, createdAt: old, body: '', labels: [{ name: 'status:at-round-limit' }], statusCheckRollup: [] },
 ];
 /** A fake `gh` that answers the read verbs and records every call. */
-function fakeGh({ prs = PRS, truncated = false } = {}) {
+function fakeGh({ prs = PRS, truncated = false, fileCount = 1, changedFiles = truncated ? 150 : fileCount } = {}) {
   const calls = [];
   const gh = (_bin, args) => {
     calls.push(args);
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify(prs);
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid')) {
+      return JSON.stringify({ headRefOid: prs.find(p => String(p.number) === String(args[2]))?.headRefOid });
+    }
     if (args[0] === 'pr' && args[1] === 'view' && args.includes('commits')) {
       const pr = prs.find((p) => String(p.number) === String(args[2]));
       return JSON.stringify({ commits: [{ oid: pr?.commitOid ?? pr?.headRefOid, committedDate: old }] });
     }
-    if (args[0] === 'pr' && args[1] === 'view' && args.some((x) => String(x).startsWith('files'))) return JSON.stringify({ files: [{ path: 'scripts/foo.mjs' }], changedFiles: truncated ? 150 : 1 });
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('changedFiles')) return JSON.stringify({ changedFiles });
+    if (args[0] === 'api' && /\/files\?/.test(String(args.at(-1)))) {
+      const page = Number(new URLSearchParams(args.at(-1).split('?')[1]).get('page'));
+      const start = (page - 1) * 100;
+      return JSON.stringify(Array.from({ length: Math.max(0, Math.min(100, fileCount - start)) }, (_, i) => ({ filename: `scripts/file-${start + i}.mjs` })));
+    }
     if (args[0] === 'api') return JSON.stringify([[]]);
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
@@ -60,11 +86,31 @@ const reader = (gh, unreadable = false) => {
 describe('settings', () => {
   const file = (block) => (path) => { if (String(path).endsWith('pr-stall-sweep.json')) return JSON.stringify({ prStallSweep: block }); const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; };
   const log = () => {};
+  it('repository shared ceiling resolves to one with tool provenance', () => {
+    const log = vi.fn();
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(result).toMatchObject({ value: { maxActionsPerPrHead: 1 }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain('maxActionsPerPrHead=1 (tool)');
+  });
+  it.each([3, Number.MAX_SAFE_INTEGER])('shared ceiling validator accepts %s without changing its safe-integer bound', cap => {
+    expect(resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: cap }), log }))
+      .toMatchObject({ value: { maxActionsPerPrHead: cap }, sources: { maxActionsPerPrHead: 'tool' }, errors: [] });
+  });
+  it('shared ceiling validator rejects values above the safe-integer bound', () => {
+    const result = resolveStallSweepSettings({ env: {}, read: file({ maxActionsPerPrHead: Number.MAX_SAFE_INTEGER + 1 }), log });
+    expect(result.value.maxActionsPerPrHead).toBe(1);
+    expect(result.errors.join(' ')).toContain('maxActionsPerPrHead');
+  });
   it('digest defaults to true in both the standard and the repository settings', () => {
     expect(STALL_SWEEP_DEFAULTS.digest).toBe(true);
     expect(resolveStallSweepSettings({ env: {}, read: file({}), log })).toMatchObject({ value: { digest: true }, sources: { digest: 'standard' } });
     const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
     expect(repo.prStallSweep.digest).toBe(true);
+  });
+  it('R452: repository settings keep the shared ceiling at one and allow two red-team restarts per head, then needs-you', () => {
+    const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
+    expect(repo.prStallSweep.maxActionsPerPrHead).toBe(1);
+    expect(repo.prStallSweep.maxRedTeamRestartsPerHead).toBe(2);
   });
   it.each([['false', false], ['0', false], ['true', true], ['1', true]])('parses WE_PR_STALL_SWEEP_DIGEST=%s as %s', (raw, value) => {
     expect(resolveStallSweepSettings({ env: { WE_PR_STALL_SWEEP_DIGEST: raw }, read: file({ digest: !value }), log }))
@@ -80,7 +126,7 @@ describe('settings', () => {
     expect(result.value.digest).toBe(true);
     expect(result.errors.join(' ')).toMatch(/digest/);
   });
-  it.each(Object.keys(STALL_SWEEP_DEFAULTS))('validates the %s setting and retains its standard value', key => {
+  it.each(Object.keys(STALL_SWEEP_DEFAULTS))('validates the %s setting and uses its closed fallback', key => {
     const standard = STALL_SWEEP_DEFAULTS[key];
     // The cascade flattens map leaves: the empty stateLanes standard is represented by an absent map.
     const effective = value => key === 'stateLanes' && value === undefined ? {} : value;
@@ -91,7 +137,7 @@ describe('settings', () => {
       ? Object.fromEntries((key === 'stateLanes' ? ['fixing'] : Object.keys(standard)).map(leaf => [leaf, 'invalid-setting-value']))
       : 'invalid-setting-value';
     const result = resolveStallSweepSettings({ env: {}, read: file({ [key]: invalid }), log });
-    expect(effective(result.value[key])).toEqual(standard);
+    expect(effective(result.value[key])).toEqual(key === 'maxRedTeamRestartsPerHead' ? 0 : standard);
     expect(result.errors.join(' ')).toContain(key);
   });
   it('is off by standard, and every leaf carries its source', () => {
@@ -162,7 +208,7 @@ describe('the shadow pass', () => {
     const { gh, calls } = fakeGh(); const dir = auditDir();
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir, log: () => {} });
     expectReadOnly(calls);
-    expect(calls.some((a) => a.includes('files,changedFiles'))).toBe(true); // the judged row read its file list
+    expect(calls.some((a) => a[0] === 'api' && /\/pulls\/12\/files\?per_page=100&page=1$/.test(a.at(-1)))).toBe(true); // the judged row read its file list
     const recs = lines(dir);
     expect(recs.map((r) => r.phase).sort()).toEqual(['operator', 'pass', 'would-do']);
     expect(recs.find((r) => r.phase === 'would-do')).toMatchObject({ lane: 'system', action: 'tooling-card', pr: 11, mode: 'shadow' });
@@ -205,6 +251,29 @@ describe('the shadow pass', () => {
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: dir2, log: () => {} });
     expect(out.act).toEqual([]); expect(out.incomplete).toBe(true);
   });
+  it('a referral hold with no findings block still runs the judge for its own trigger (never a null verdict)', async () => {
+    const pr = { ...PRS[0], number: 14, labels: [] };
+    const { gh } = fakeGh({ prs: [pr] });
+    const hold = [[{ user: { login: AUTOMATION_LOGINS[0] }, created_at: new Date(NOW - 2 * 3600_000).toISOString(), body: 'review paused: 2 referrals need a ruling; it resumes on a new push, a ruling, or a send-back\n\n<!-- review-referral-hold: a1b5166bcd74 -->' }]];
+    const wrapped = (bin, args, o) => (/\/comments\?/.test(String(args.at(-1))) ? JSON.stringify(hold) : gh(bin, args, o));
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(strictGh(wrapped)), dir: auditDir(), log: () => {} });
+    // the REAL judge ran (a verdict, not null) on empty evidence, so it fails closed to the operator with its own reason
+    expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'send-back' });
+    expect(out.act).toEqual([]);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
+  });
+  it('an at-round-limit PR runs the real judge for review-cap and fails closed to the operator (never a grant, never an action)', async () => {
+    // red-team-cap is not parameterised here: its waiting state needs a held round-cap gate record, which detectRoundCap
+    // always reads as that same trigger, so the empty-thread branch cannot be reached for it.
+    const { gh } = fakeGh({ prs: [PRS[1]] });
+    const calls = [];
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: auditDir(), log: () => {},
+      judge: (a) => { calls.push(a); return judgeRound(a); } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ trigger: 'review-cap', comments: [] });
+    expect(out.items[0]).toMatchObject({ state: 'at-round-limit', lane: 'operator', verdict: 'send-back' });
+    expect(out.act).toEqual([]);
+  });
   it('one unreadable PR row makes the whole pass plan nothing', async () => {
     const fresh = { ...PRS[0], number: 13, headRefOid: 'not-a-sha', updatedAt: new Date(NOW).toISOString(), labels: [] };
     const { gh } = fakeGh({ prs: [...PRS, fresh] }); const dir = auditDir();
@@ -229,6 +298,59 @@ describe('the shadow pass', () => {
     const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), dir: auditDir(), log: () => {} });
     expect(out.act).toEqual([]); expect(out.errors.join(' ')).toMatch(/truncated/);
   });
+  it('pages the file list past 100 files', async () => {
+    const { gh, calls } = fakeGh({ prs: [PRS[1]], fileCount: 129 });
+    const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), judge, dir: auditDir(), log: () => {} });
+    const expected = Array.from({ length: 129 }, (_, i) => `scripts/file-${i}.mjs`);
+    expect(judge).toHaveBeenCalledOnce();
+    expect(judge.mock.calls[0][0].files).toEqual(expected);
+    expect(calls.filter(a => /\/files\?/.test(String(a.at(-1)))).map(a => a.at(-1))).toEqual([
+      `repos/${REPO}/pulls/12/files?per_page=100&page=1`, `repos/${REPO}/pulls/12/files?per_page=100&page=2`,
+    ]);
+    expect(out.errors).toEqual([]);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
+    expectReadOnly(calls);
+  });
+  it('ends file pagination on an empty page after a full page', async () => {
+    const { gh, calls } = fakeGh({ prs: [PRS[1]], fileCount: 100 });
+    const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), judge, dir: auditDir(), log: () => {} });
+    expect(judge.mock.calls[0][0].files).toHaveLength(100);
+    expect(calls.filter(a => /\/files\?/.test(String(a.at(-1))))).toHaveLength(2);
+    expect(out.errors).toEqual([]);
+  });
+  it.each([3000, 3001, 2999])('surfaces a file list over the 3000-file cap as file-list-over-cap, not a null verdict', async changedFiles => {
+    // Counts at/above the ceiling park immediately; a list reaching it also parks even if the count was lower.
+    const { gh, calls } = fakeGh({ fileCount: 3000, changedFiles });
+    const dir = auditDir(); const judge = vi.fn(judgeRound);
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh, read: reader(gh), judge, dir, log: () => {} });
+    expect(judge).not.toHaveBeenCalled();
+    expect(out.incomplete).toBe(true);
+    expect(out.act).toEqual([]);
+    const item = out.items.find(i => i.pr === 12);
+    expect(item).toMatchObject({ repo: REPO, head: PRS[1].headRefOid, state: 'at-round-limit', title: 'at the cap',
+      lane: 'operator', action: 'ruling-needed', reason: expect.stringContaining('file-list-over-cap'),
+      fileList: { state: 'file-list-over-cap', cap: 3000, changedFiles, listedFiles: changedFiles >= 3000 ? 0 : 3000 } });
+    expect(item.key).toBe(`${item.prHead}:file-list-over-cap`);
+    expect(lines(dir).find(r => r.phase === 'pass')).toMatchObject({ incomplete: true, readFailed: true });
+    expect(lines(dir).find(r => r.phase === 'operator')).toMatchObject(item);
+    expect(out.records.find(r => r.phase === 'operator')).toMatchObject(item);
+    expect(JSON.stringify(out)).not.toMatch(/not an object/);
+    expect(calls.filter(a => /\/files\?/.test(String(a.at(-1))))).toHaveLength(changedFiles >= 3000 ? 0 : 30);
+    expectReadOnly(calls);
+  });
+  it.each([{}, [{ filename: 42 }], [{ path: 'scripts/foo.mjs' }], [{ filename: '' }], Array(101).fill({ filename: 'x' })].map(page => [page]))(
+    'a malformed file page fails closed through the strict gh seam (%j)', async page => {
+      const { gh } = fakeGh(); const judge = vi.fn(judgeRound);
+      const wrapped = (bin, args, opts) => /\/files\?/.test(String(args.at(-1))) ? JSON.stringify(page) : gh(bin, args, opts);
+      expect(() => strictGh(wrapped)('gh', ['api', `repos/${REPO}/pulls/12/files?per_page=100&page=1`])).toThrow(/malformed gh response/);
+      const out = await runStallSweep({ now: NOW, env: {}, settings: shadow(), gh: wrapped, read: reader(gh), judge, dir: auditDir(), log: () => {} });
+      expect(judge).not.toHaveBeenCalled();
+      expect(out.incomplete).toBe(true);
+      expect(out.act).toEqual([]);
+      expect(out.errors.join(' ')).toMatch(/malformed gh response/);
+    });
   it('a malformed drain skip row makes the drain log unreadable', () => {
     const line = (rows) => `x\n2026 merge-ai-prs · skip-reasons: ${JSON.stringify(rows)}\n`;
     expect(strictDrainText(() => line([{ num: 11, kind: 'not-certified' }]))('p')).toMatch(/skip-reasons/);
@@ -418,5 +540,767 @@ describe('stand-down routing default', () => {
   it('the repo file sends a stood-down fixer to the operator digest (auto would route it to the tooling check)', () => {
     const s = resolveStallSweepSettings({ env: {}, log: () => {} });
     expect(s.value.stateLanes).toMatchObject({ 'system:fix-stood-down': 'operator' });
+  });
+});
+
+
+describe('pending red-team watchdog in the shadow sweep', () => {
+  const prHead = `${REPO}#11@${HEAD}`;
+  const pendingPr = (patch = {}) => ({ ...PRS[0], labels: [{ name: 'red-team:pending' }], ...patch });
+  const owner = { host: 'watchdog-host', pidNamespace: 'watchdog-ns', pid: 12345, pidStart: 'owner-start' };
+  const statusFor = (patch = {}) => ({ repo: REPO, pr: 11, head: HEAD, ...owner, startedAt: new Date(NOW - 120 * 60_000).toISOString(), status: 'running', ...patch });
+  const restartRecord = (minutesAgo, patch = {}) => ({ ts: new Date(NOW - minutesAgo * 60_000).toISOString(),
+    phase: 'would-do', lane: 'system', action: 'restart-red-team', prHead,
+    key: `${prHead}:red-team-pending:restart-1`, ...patch });
+  const seed = (dir, records) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-10.jsonl'), records.map(r => JSON.stringify(r)).join('\n') + '\n');
+  };
+  const sweep = async ({ prs = [pendingPr()], status = null, alive = false, dir = auditDir(), ...options } = {}) => {
+    const { gh, calls } = fakeGh({ prs });
+    const log = vi.fn();
+    const readRedTeamStatus = vi.fn(() => status);
+    const probe = { host: owner.host, namespace: owner.pidNamespace, isAlive: vi.fn(() => alive),
+      readPidStart: vi.fn(() => owner.pidStart) };
+    const out = await runStallSweep({ now: NOW, env: {}, settings: shadow({ maxActionsPerPrHead: 3 }), gh, read: reader(gh),
+      dir, log, readRedTeamStatus, probe, readStatusAt: () => NOW, ...options,
+      // Advance the assessment clock together with the sweep clock on repeated passes.
+      read: options.read ?? (input => ({ ...reader(gh)(input), now: options.now ?? NOW })) });
+    return { out, dir, calls, log, readRedTeamStatus, probe };
+  };
+
+  it.each([0, 1, 2])('sweep uses configured restart cap %s and escalates at the ceiling', async cap => {
+    const dir = auditDir();
+    if (cap) seed(dir, Array.from({ length: cap }, (_, n) => restartRecord(120 + n * 60,
+      { key: `${prHead}:red-team-pending:restart-${n + 1}` })));
+    const { out } = await sweep({ dir, settings: shadow({ maxRedTeamRestartsPerHead: cap }) });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted', command: expect.any(String) }]);
+    expect(out.items[0].reason).toMatch(cap === 0 ? /disabled.*maxRedTeamRestartsPerHead=0.*operator/ : /exhausted.*operator/);
+  });
+  it.each(['would-do', 'intent'])('R452: a prior ordinary action at the shared ceiling does not hold the restart (prior %s)', async phase => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(120, { phase, action: 'ask-review-daemon', key: `${prHead}:daemon` })]);
+    const { out, calls } = await sweep({ dir, settings: shadow({ maxActionsPerPrHead: 1 }) });
+    expect(out.incomplete).toBe(false);
+    expect(out.held).toEqual([]);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+    expect(lines(dir).filter(r => r.phase === 'would-do' && r.action === 'restart-red-team')).toHaveLength(1);
+    expectReadOnly(calls);
+  });
+  it('pending over 60 minutes with no live run or result logs would restart-red-team in shadow', async () => {
+    const { out, dir, calls, log, readRedTeamStatus } = await sweep();
+    expect(out.act).toMatchObject([{ lane: 'system', action: 'restart-red-team', prHead,
+      key: `${prHead}:red-team-pending:restart-1` }]);
+    expect(readRedTeamStatus).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO, pr: 11, head: HEAD }));
+    expect(log.mock.calls.map(([line]) => line).join('\n'))
+      .toContain(`pr-stall-sweep (shadow) would restart-red-team ${prHead} [system]:`);
+    expect(lines(dir).filter(r => r.phase === 'would-do')).toMatchObject([{ action: 'restart-red-team', mode: 'shadow' }]);
+    expectReadOnly(calls);
+  });
+  it('a red-team-pending row with a liveJob yields no watchdog action even at 300 minutes', async () => {
+    const pendingAt = new Date(NOW - 300 * 60_000).toISOString();
+    const prs = [pendingPr({ updatedAt: pendingAt, createdAt: pendingAt })];
+    const { gh } = fakeGh({ prs });
+    const read = vi.fn(input => ({ ...reader(gh)(input),
+      liveJobs: [{ repo: REPO, pr: 11, kind: 'red-team' }] }));
+    const { out, readRedTeamStatus, probe } = await sweep({ prs, read });
+    expect(read).toHaveBeenCalledOnce();
+    expect(assessPrSweep(read.mock.results[0].value).prs).toMatchObject([
+      { waitingOn: 'red-team-pending', ageMinutes: 300, liveJob: 'red-team', stalled: false },
+    ]);
+    expect(out.incomplete).toBe(false);
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+    expect(readRedTeamStatus).not.toHaveBeenCalled();
+    expect(probe.isAlive).not.toHaveBeenCalled();
+  });
+  it.each(['queued', 'running'])('a live %s owner is probed and never restarted even after 120 minutes', async status => {
+    const { out, probe } = await sweep({ status: statusFor({ status }), alive: true });
+    expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  const foreignStatus = (patch = {}) => statusFor({ host: 'renamed-mac', startedAt: 'unreadable', ...patch });
+  const staleStatusAt = () => NOW - 121 * 60_000;
+  it.each(['queued', 'running'])('a stale foreign-named %s owner with a dead pid restarts despite unreadable run age', async status => {
+    const { out, probe } = await sweep({ status: foreignStatus({ status }), readStatusAt: staleStatusAt });
+    expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
+    expect(out.incomplete).toBe(false);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a stale foreign-named owner with a live matching pidStart holds without restarting', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus(), alive: true, readStatusAt: staleStatusAt });
+    expect(probe.readPidStart).toHaveBeenCalledWith(owner.pid);
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a stale foreign-named owner with a reused live pid restarts', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus({ pidStart: 'previous-owner-start' }),
+      alive: true, readStatusAt: staleStatusAt });
+    expect(probe.readPidStart).toHaveBeenCalledWith(owner.pid);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a foreign-named owner with fresh statusAt holds without restarting', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus(), readStatusAt: () => NOW - 29 * 60_000 });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a foreign-named dead owner silent past 30 but under 120 minutes still holds', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus(), readStatusAt: () => NOW - 45 * 60_000 });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+  });
+  it('a foreign-named owner whose pid probe is unknown (null) holds without restarting', async () => {
+    const { out } = await sweep({ status: foreignStatus(), alive: null, readStatusAt: staleStatusAt });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('an unreadable foreign-owner statusAt records an error and holds without restarting', async () => {
+    const { out } = await sweep({ status: foreignStatus(),
+      readStatusAt: () => { throw new Error('status mtime unreadable'); } });
+    expect(out.errors).toContain(`red-team owner ${REPO}#11: status mtime unreadable`);
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a stale foreign-named owner in a different pid namespace holds without restarting', async () => {
+    const { out, probe } = await sweep({ status: foreignStatus({ pidNamespace: 'other-ns' }), readStatusAt: staleStatusAt });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ action: 'red-team-owner-unknown' }]);
+  });
+  it('a stale dead foreign-named owner at the restart cap is exhausted rather than restarted', async () => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(150), restartRecord(70, { key: `${prHead}:red-team-pending:restart-2` })]);
+    const { out } = await sweep({ dir, status: foreignStatus(), readStatusAt: staleStatusAt,
+      settings: shadow({ maxRedTeamRestartsPerHead: 2 }) });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted' }]);
+  });
+  it('an owner on another host waits before the stale deadline and escalates after it', async () => {
+    const ninetyMinutesAgo = new Date(NOW - 90 * 60_000).toISOString();
+    const status = statusFor({ host: 'another-host', startedAt: ninetyMinutesAgo });
+    const young = await sweep({ status, prs: [pendingPr({ updatedAt: ninetyMinutesAgo, createdAt: ninetyMinutesAgo })] });
+    expect(young.out.items).toEqual([]);
+    expect(young.out.act).toEqual([]);
+    expect(young.probe.isAlive).not.toHaveBeenCalled();
+    const stale = await sweep({ status, now: NOW + 30 * 60_000 });
+    expect(stale.out.act).toEqual([]);
+    expect(stale.out.items).toMatchObject([{ lane: 'operator', action: 'red-team-owner-unknown',
+      reason: expect.stringMatching(/run age.*120.*ownership could not be proven.*needs-you/) }]);
+    expect(stale.probe.isAlive).not.toHaveBeenCalled();
+  });
+  it.each([undefined, 'unreadable', new Date(NOW + 1).toISOString()])('sweep escalates unknown-owner run timestamp %j at pending deadline without restarting', startedAt => {
+    const at = new Date(NOW - 120 * 60_000).toISOString();
+    return sweep({ status: statusFor({ host: 'remote', startedAt }),
+      prs: [pendingPr({ updatedAt: at, createdAt: at })] }).then(({ out }) => {
+      expect(out.incomplete).toBe(false);
+      expect(out.act).toEqual([]);
+      expect(out.records.filter(r => r.phase === 'operator')).toMatchObject([
+        { lane: 'operator', action: 'red-team-owner-unknown', reason: expect.stringMatching(/pending age.*120.*needs-you/) },
+      ]);
+    });
+  });
+  it('a finished real result with its label still pending is published instead of restarted', async () => {
+    const { out, calls, log } = await sweep({ status: statusFor({ status: 'finished', result: { status: 'ran', findings: [] } }) });
+    expect(out.act).toMatchObject([{ lane: 'system', action: 'publish-red-team-result', prHead }]);
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain(`would publish-red-team-result ${prHead}`);
+    expectReadOnly(calls);
+  });
+  it('finished without a ran result restarts rather than publishing', async () => {
+    const { out } = await sweep({ status: statusFor({ status: 'finished', result: { status: 'failed' } }) });
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a status read error fails closed with no action or daemon fallback', async () => {
+    const readRedTeamStatus = vi.fn(() => { throw new Error('status unreadable'); });
+    const { out, dir } = await sweep({ readRedTeamStatus });
+    expect(readRedTeamStatus).toHaveBeenCalledOnce();
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+    expect(lines(dir).filter(r => r.phase === 'would-do')).toEqual([]);
+  });
+  it('an explicitly unreadable status also waits', async () => {
+    const { out } = await sweep({ status: { unreadable: true } });
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('a young pending head does nothing', async () => {
+    const young = new Date(NOW - 59 * 60_000).toISOString();
+    const { out } = await sweep({ prs: [pendingPr({ updatedAt: young, createdAt: young })] });
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('spaces restart attempts using the latest same-head would-do or intent audit record', async () => {
+    for (const phase of ['would-do', 'intent']) {
+      const dir = auditDir();
+      seed(dir, [restartRecord(90, { action: 'ask-review-daemon', key: `${prHead}:daemon` }), restartRecord(30, { phase })]);
+      const { out } = await sweep({ dir });
+      expect(out.items).toEqual([]);
+      expect(out.act).toEqual([]);
+    }
+  });
+  it('allows exactly two spaced restarts then emits an exhausted operator item on the same head', async () => {
+    const dir = auditDir();
+    const first = await sweep({ dir });
+    expect(first.out.act).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-1` }]);
+    const tooSoon = await sweep({ dir, now: NOW + 59 * 60_000 });
+    expect(tooSoon.out.items).toEqual([]);
+    const second = await sweep({ dir, now: NOW + 60 * 60_000 });
+    expect(second.out.act).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
+    const exhausted = await sweep({ dir, now: NOW + 120 * 60_000 });
+    expect(exhausted.out.act).toEqual([]);
+    expect(exhausted.out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted' }]);
+    expect(exhausted.out.items[0].reason).toMatch(/2/);
+    expect(exhausted.out.items[0].reason).toMatch(/300/);
+    expect(lines(dir).filter(r => r.phase === 'would-do' && r.action === 'restart-red-team')).toHaveLength(2);
+    expect(lines(dir).filter(r => r.phase === 'operator')).toMatchObject([{ action: 'red-team-restart-exhausted' }]);
+  });
+  it.each(['would-do', 'intent'])('counts two prior %s restarts as exhausted and gives the operator age evidence', async phase => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(150, { phase }), restartRecord(70, { phase, key: `${prHead}:red-team-pending:restart-2` })]);
+    const { out } = await sweep({ dir });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action: 'red-team-restart-exhausted' }]);
+    expect(out.items[0].reason).toMatch(/2/);
+    expect(out.items[0].reason).toMatch(/180/);
+  });
+  it('ignores other heads, actions and non-spending audit phases when deriving restart count and spacing', async () => {
+    const dir = auditDir();
+    const otherHead = `${REPO}#11@${'b'.repeat(40)}`;
+    seed(dir, [restartRecord(90), restartRecord(5, { prHead: otherHead, key: `${otherHead}:restart-1` }),
+      restartRecord(5, { action: 'ask-review-daemon', key: `${prHead}:daemon` }),
+      restartRecord(5, { phase: 'would-skip', key: 'held' }), restartRecord(5, { phase: 'operator', key: 'operator' })]);
+    const { out } = await sweep({ dir });
+    expect(out.items).toMatchObject([{ action: 'restart-red-team', key: `${prHead}:red-team-pending:restart-2` }]);
+    expect(out.act).toEqual(out.items);
+    expect(out.held).toEqual([]);
+  });
+  it.each(['restart-red-team', 'publish-red-team-result'])('disabling %s yields an operator item in the sweep', async action => {
+    const { out } = await sweep({ settings: shadow({ systemActions: { ...STALL_SWEEP_DEFAULTS.systemActions, [action]: false } }),
+      status: action === 'publish-red-team-result' ? statusFor({ status: 'finished', result: { status: 'ran' } }) : null });
+    expect(out.act).toEqual([]);
+    expect(out.items).toMatchObject([{ lane: 'operator', action }]);
+  });
+  it('mode off reads no red-team evidence, probes no owners, and writes no audit', async () => {
+    const { out, dir, calls, readRedTeamStatus, probe } = await sweep({ settings: shadow({ mode: 'off' }) });
+    expect(out.skipped).toBe('off');
+    expect(readRedTeamStatus).not.toHaveBeenCalled();
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+    expect(lines(dir)).toEqual([]);
+  });
+  it('a restart storm holds extra PRs under both sweep and hour caps', async () => {
+    const prs = Array.from({ length: 8 }, (_, i) => pendingPr({ number: 11 + i }));
+    const dir = auditDir();
+    const first = await sweep({ prs, dir });
+    expect(first.out.act).toHaveLength(3);
+    expect(first.out.act.every(i => i.action === 'restart-red-team')).toBe(true);
+    expect(first.out.held).toHaveLength(5);
+    expect(first.out.held.every(i => i.held === 'per-sweep cap')).toBe(true);
+    const second = await sweep({ prs, dir, now: NOW + 15 * 60_000 });
+    expect(second.out.act).toHaveLength(3);
+    const third = await sweep({ prs, dir, now: NOW + 30 * 60_000 });
+    expect(third.out.act).toEqual([]);
+    expect(third.out.held).toHaveLength(2);
+    expect(third.out.held.every(i => i.held === 'per-hour cap')).toBe(true);
+    expect(lines(dir).filter(r => r.phase === 'would-do')).toHaveLength(6);
+  });
+  it('a proven-dead local owner restarts before the unknown-owner stale deadline', async () => {
+    const at = new Date(NOW - 90 * 60_000).toISOString();
+    const { out, probe } = await sweep({ status: statusFor(), alive: false,
+      prs: [pendingPr({ updatedAt: at, createdAt: at })] });
+    expect(probe.isAlive).toHaveBeenCalledWith(owner.pid);
+    expect(out.incomplete).toBe(false);
+    expect(out.act).toMatchObject([{ action: 'restart-red-team' }]);
+  });
+  it('a PID in another namespace is unknown and waits before the stale deadline', async () => {
+    const at = new Date(NOW - 90 * 60_000).toISOString();
+    const { out, probe } = await sweep({ status: statusFor({ pidNamespace: 'other-ns', startedAt: at }),
+      prs: [pendingPr({ updatedAt: at, createdAt: at })] });
+    expect(probe.isAlive).not.toHaveBeenCalled();
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+  it('uses the newest restart timestamp even when audit lines are out of chronological order', async () => {
+    const dir = auditDir();
+    seed(dir, [restartRecord(30), restartRecord(90, { action: 'ask-review-daemon', key: `${prHead}:daemon` })]);
+    const { out } = await sweep({ dir });
+    expect(out.incomplete).toBe(false);
+    expect(out.items).toEqual([]);
+    expect(out.act).toEqual([]);
+  });
+});
+
+describe('watchdog restart budgets', () => {
+  const limits = { maxActionsPerSweep: 10, maxActionsPerHour: 20, maxActionsPerPrHead: 3, maxRedTeamRestartsPerHead: 2 };
+  const prHead = `${REPO}#11@${HEAD}`;
+  const restart = n => ({ lane: 'system', action: 'restart-red-team', prHead, key: `${prHead}:restart-${n}` });
+  const record = (item, phase = 'would-do') => ({ ...item, phase, ts: new Date(NOW - 90 * 60_000).toISOString() });
+  it.each([0, 1, 2])('configured cap %s admits exactly that many restarts per head', cap => {
+    const result = planStallActions([restart(1), restart(2), restart(3)], {
+      now: NOW, limits: { ...limits, maxRedTeamRestartsPerHead: cap },
+    });
+    expect(result.act).toEqual([restart(1), restart(2)].slice(0, cap));
+    expect(result.held).toEqual([restart(1), restart(2), restart(3)].slice(cap)
+      .map(it => ({ ...it, held: expect.stringMatching(/restart per-head cap.*operator/) })));
+  });
+  it('a prior daemon nudge still permits the bounded restart allowance', () => {
+    const history = [record({ prHead, action: 'ask-review-daemon', key: 'daemon' })];
+    expect(planStallActions([restart(1)], { now: NOW, limits, history })).toEqual({ act: [restart(1)], held: [] });
+  });
+  it.each(['would-do', 'intent'])('R452: a second restart is not held by the shared one-action head cap after a prior %s', phase => {
+    expect(planStallActions([restart(2)], { now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 },
+      history: [record(restart(1), phase)] })).toEqual({ act: [restart(2)], held: [] });
+  });
+  it('caps its own action bucket at two including actions planned in this pass', () => {
+    const result = planStallActions([restart(1), restart(2), restart(3)], { now: NOW, limits });
+    expect(result.act).toEqual([restart(1), restart(2)]);
+    expect(result.held).toHaveLength(1);
+    expect(result.held[0].key).toBe(restart(3).key);
+  });
+  it('the two-restart head cap is lifetime, including old months', () => {
+    const history = [1, 2].map(n => ({ ...record(restart(n)), ts: '2026-01-01T00:00:00Z' }));
+    const result = planStallActions([restart(3)], { now: NOW, limits, history });
+    expect(result.act).toEqual([]);
+    expect(result.held).toHaveLength(1);
+  });
+  it('restart items still spend the common per-sweep and per-hour budgets', () => {
+    const items = [restart(1), { ...restart(1), prHead: 'other-head', key: 'other-restart' }];
+    const perSweep = planStallActions(items, { now: NOW, limits: { ...limits, maxActionsPerSweep: 1 } });
+    expect(perSweep.act).toHaveLength(1);
+    expect(perSweep.held).toMatchObject([{ held: 'per-sweep cap' }]);
+    const history = [{ ...record({ prHead: 'third-head', key: 'prior', action: 'tooling-card' }), ts: new Date(NOW - 60_000).toISOString() }];
+    const perHour = planStallActions(items, { now: NOW, limits: { ...limits, maxActionsPerHour: 2 }, history });
+    expect(perHour.act).toHaveLength(1);
+    expect(perHour.held).toMatchObject([{ held: 'per-hour cap' }]);
+  });
+  it('different PR heads receive separate restart buckets', () => {
+    const other = { ...restart(1), prHead: `${REPO}#12@${HEAD}`, key: 'other' };
+    expect(planStallActions([other], { now: NOW, limits, history: [record(restart(1)), record(restart(2))] }).act).toEqual([other]);
+  });
+  it('publication uses only the ordinary ceiling and remains idempotent', () => {
+    const publish = { ...restart(1), action: 'publish-red-team-result', key: `${prHead}:publish` };
+    expect(planStallActions([publish], { now: NOW, limits,
+      history: [record(restart(1)), record(restart(2))] })).toEqual({ act: [publish], held: [] });
+    expect(planStallActions([publish], { now: NOW, limits, history: [record(publish)] })).toEqual({ act: [], held: [] });
+    expect(planStallActions([publish], { now: NOW, limits: { ...limits, maxActionsPerPrHead: 1 },
+      history: [record({ prHead, action: 'ask-review-daemon', key: 'nudge' }), record(restart(1)), record(restart(2))] }))
+      .toEqual({ act: [], held: [{ ...publish, held: 'per-PR-head cap' }] });
+  });
+});
+
+describe('watchdog action settings defaults and provenance', () => {
+  it.each(['publish-red-team-result', 'restart-red-team'])('%s is enabled in both standard and persisted repo settings', action => {
+    expect(STALL_SWEEP_DEFAULTS.systemActions[action]).toBe(true);
+    const repo = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
+    expect(repo.prStallSweep.systemActions[action]).toBe(true);
+  });
+  it.each(['publish-red-team-result', 'restart-red-team'])('a tool-layer %s switch resolves with provenance', action => {
+    const log = vi.fn();
+    const read = path => String(path).endsWith('pr-stall-sweep.json')
+      ? JSON.stringify({ prStallSweep: { systemActions: { [action]: false } } }) : '{}';
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, read, log });
+    expect(result.value.systemActions[action]).toBe(false);
+    expect(result.sources[`systemActions.${action}`]).toBe('tool');
+    expect(log.mock.calls.map(([line]) => line).join('\n')).toContain(`systemActions.${action}=false (tool)`);
+  });
+});
+
+
+describe('restart budget settings cascade', () => {
+  const resolve = (tool = {}, platform = {}, env = {}) => {
+    resetCascadeLogForTest();
+    const log = vi.fn();
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1', ...env }, log,
+      read: path => JSON.stringify({ prStallSweep: String(path).endsWith('pr-stall-sweep.json') ? tool : platform }) });
+    return { ...result, logged: log.mock.calls.map(([line]) => line).join('\n') };
+  };
+  it('defaults to two in the standard, resolved settings and persisted repository settings', () => {
+    expect(STALL_SWEEP_DEFAULTS.maxRedTeamRestartsPerHead).toBe(2);
+    expect(JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'))
+      .prStallSweep.maxRedTeamRestartsPerHead).toBe(2);
+    expect(resolve()).toMatchObject({ value: { maxRedTeamRestartsPerHead: 2 }, sources: { maxRedTeamRestartsPerHead: 'standard' },
+      logged: expect.stringContaining('maxRedTeamRestartsPerHead=2 (standard)') });
+  });
+  it.each([0, 1, 2])('valid cap %s resolves and logs provenance at every override layer', cap => {
+    const setting = { maxRedTeamRestartsPerHead: cap };
+    for (const [result, source] of [[resolve({}, setting), 'platform'], [resolve(setting), 'tool'],
+      [resolve({ maxRedTeamRestartsPerHead: 2 }, { maxRedTeamRestartsPerHead: 1 },
+        { WE_PR_STALL_SWEEP_MAX_RED_TEAM_RESTARTS_PER_HEAD: String(cap) }), 'env']]) {
+      expect(result.value.maxRedTeamRestartsPerHead).toBe(cap);
+      expect(result.sources.maxRedTeamRestartsPerHead).toBe(source);
+      expect(result.logged).toContain(`maxRedTeamRestartsPerHead=${cap} (${source})`);
+    }
+  });
+  it.each(['off', -1, 3, 0.5, 9007199254740992, null, false, '1', {}, []])('invalid layer cap %j disables restarts with layer provenance', invalid => {
+    const tool = resolve({ maxRedTeamRestartsPerHead: invalid }, { maxRedTeamRestartsPerHead: 2 });
+    expect(tool.value.maxRedTeamRestartsPerHead).toBe(0);
+    expect(tool.sources.maxRedTeamRestartsPerHead).toBe('tool');
+    expect(tool.logged).toContain('maxRedTeamRestartsPerHead=0 (tool)');
+    expect(tool.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
+    const platform = resolve({}, { maxRedTeamRestartsPerHead: invalid });
+    expect(platform.value.maxRedTeamRestartsPerHead).toBe(0);
+    expect(platform.sources.maxRedTeamRestartsPerHead).toBe('platform');
+    expect(platform.logged).toContain('maxRedTeamRestartsPerHead=0 (platform)');
+    expect(platform.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
+  });
+  it.each(['off', '-1', '3', '0.5', 'NaN', 'Infinity', '', ' ', 'false', '9007199254740992'])('invalid env cap %j disables restarts with env provenance', raw => {
+    const result = resolve({ maxRedTeamRestartsPerHead: 2 }, {}, { WE_PR_STALL_SWEEP_MAX_RED_TEAM_RESTARTS_PER_HEAD: raw });
+    expect(result.value.maxRedTeamRestartsPerHead).toBe(0);
+    expect(result.sources.maxRedTeamRestartsPerHead).toBe('env');
+    expect(result.logged).toContain('maxRedTeamRestartsPerHead=0 (env)');
+    expect(result.errors.join(' ')).toContain('maxRedTeamRestartsPerHead');
+  });
+});
+
+describe('R804 restart-only live acceptance', () => {
+  const prHead = `${REPO}#11@${HEAD}`;
+  const key = `${prHead}:red-team-pending:restart-1`;
+  const owner = { host: 'r804-host', pidNamespace: 'r804-ns', pid: 12345, pidStart: 'r804-start' };
+  const pendingPr = { ...PRS[0], labels: [{ name: 'red-team:pending' }] };
+  const live = (patch = {}) => shadow({ actionModes: { 'restart-red-team': 'on' }, ...patch });
+  const record = (patch = {}) => ({ ts: new Date(NOW - 90 * 60_000).toISOString(), phase: 'intent',
+    action: 'restart-red-team', repo: REPO, pr: 11, head: HEAD, prHead, key, ...patch });
+  const append = (dir, records) => {
+    mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(join(dir, '2026-10.jsonl'), records.map(r => JSON.stringify(r)).join('\n') + '\n');
+  };
+  const run = async ({ dir = auditDir(), prs = [pendingPr], alive = false, status, ...options } = {}) => {
+    const { gh, calls } = fakeGh({ prs });
+    const dispatchRestart = options.dispatchRestart ?? vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 }));
+    const out = await runStallSweep({ now: NOW, env: {}, settings: live(), dir, gh, read: reader(gh), log: () => {},
+      readRedTeamStatus: () => status === undefined
+        ? { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old } : status,
+      probe: { host: owner.host, namespace: owner.pidNamespace, isAlive: () => alive, readPidStart: () => owner.pidStart },
+      dispatchRestart, ...options });
+    return { out, dir, dispatchRestart, calls };
+  };
+  afterEach(() => {
+    vi.restoreAllMocks(); vi.mocked(dispatchManualPass).mockClear();
+    vi.mocked(abandonStaleRedTeamRun).mockClear().mockImplementation(() => ({ ok: true }));
+    vi.mocked(planRedTeamRecovery).mockClear().mockImplementation(() => ({ mode: 'fresh', abandon: false }));
+    vi.mocked(readRecoveryWitness).mockClear().mockImplementation(() => ({}));
+  });
+
+  it.each([
+    ['replacement owner', { pid: 54321 }],
+    ['replacement birth time', { pidStart: 'new-owner' }],
+    ['finished result', { status: 'finished', result: { status: 'ran' } }],
+    ['missing status', null],
+    ['unreadable status', { unreadable: true }],
+  ])('execution refuses %s appearing after assessment inside the lock', async (_name, patch) => {
+    const dir = auditDir();
+    const status = { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old };
+    const readRedTeamStatus = vi.fn(() => {
+      if (!existsSync(join(dir, '.lock'))) return status;
+      return patch === null ? null : { ...status, ...patch };
+    });
+    const { dispatchRestart } = await run({ dir, readRedTeamStatus });
+    expect(readRedTeamStatus).toHaveBeenCalledTimes(2);
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/status changed.*operator/) }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it.each([true, null])('execution re-probes the same owner and refuses newly live or unknown liveness %s', async alive => {
+    const dir = auditDir();
+    const isAlive = vi.fn(() => existsSync(join(dir, '.lock')) ? alive : false);
+    const { dispatchRestart } = await run({ dir,
+      probe: { host: owner.host, namespace: owner.pidNamespace, isAlive, readPidStart: () => owner.pidStart } });
+    expect(isAlive).toHaveBeenCalledTimes(2);
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/owner death not proven.*operator/) }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it('execution detects a replacement owner even when the status reader reuses an object', async () => {
+    const dir = auditDir();
+    const status = { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old };
+    const { dispatchRestart } = await run({ dir, readRedTeamStatus: () => {
+      if (existsSync(join(dir, '.lock'))) status.pid = 54321;
+      return status;
+    } });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/status changed/) }));
+  });
+  it('execution fails closed when the locked status reread throws', async () => {
+    const dir = auditDir();
+    const readRedTeamStatus = () => {
+      if (existsSync(join(dir, '.lock'))) throw new Error('status unreadable');
+      return { ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old };
+    };
+    const { dispatchRestart } = await run({ dir, readRedTeamStatus });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/operator/) }));
+  });
+  it.each(['b'.repeat(40), null, 'bad', 'a'.repeat(41)])('execution refuses changed or unreadable live head %j', async head => {
+    const dir = auditDir();
+    const readPrHead = vi.fn(() => {
+      expect(existsSync(join(dir, '.lock'))).toBe(true);
+      return head;
+    });
+    const { out, dispatchRestart } = await run({ dir, readPrHead });
+    expect(readPrHead).toHaveBeenCalledWith({ repo: REPO, pr: 11 });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    // A readable but moved head only skips that candidate; an unreadable head stops the pass as incomplete.
+    expect(out.incomplete).toBe(head !== 'b'.repeat(40));
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', head: HEAD,
+      held: expect.stringMatching(/head (changed or )?unreadable.*operator/) }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it('execution refuses a failed live-head read without dispatch', async () => {
+    const { out, dir, dispatchRestart } = await run({ readPrHead: () => { throw new Error('head unavailable'); } });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(out.incomplete).toBe(true);
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: expect.stringMatching(/head unreadable.*operator/) }));
+  });
+  it('launch receipts and durable spend carry the assessed expected head', async () => {
+    const { dir, dispatchRestart } = await run();
+    expect(dispatchRestart).toHaveBeenCalledWith(expect.objectContaining({ expectedHead: HEAD }));
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase)))
+      .toEqual(['intent', 'did'].map(phase => expect.objectContaining({ phase, head: HEAD, expectedHead: HEAD, prHead })));
+  });
+  it.each(['would-do', 'intent', 'did'])('live shared ceiling counts prior %s restarts in planner and execution after spacing expires', async phase => {
+    const dir = auditDir();
+    const history = [record({ phase })];
+    append(dir, history);
+    const item = { ...record({ key: `${prHead}:red-team-pending:restart-2` }), lane: 'system' };
+    const limits = live().value;
+    expect(planStallActions([item], { history, now: NOW, limits }))
+      .toEqual({ act: [], held: [{ ...item, held: 'per-PR-head cap' }] });
+    const { dispatchRestart } = await run({ dir });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', held: 'per-PR-head cap' }));
+  });
+  it('latest exact-head reset clears older spend but retains a spaced post-reset restart', () => {
+    const reset = minutes => ({ phase: 'operator-reset', repo: REPO, pr: 11, head: HEAD, prHead,
+      actor: 'operator', reason: 'inspected', ruling: 'R804', ts: new Date(NOW - minutes * 60_000).toISOString() });
+    const older = record({ ts: new Date(NOW - 180 * 60_000).toISOString() });
+    const first = record();
+    const second = { ...first, key: `${prHead}:red-team-pending:restart-2`, lane: 'system' };
+    expect(planStallActions([second], { now: NOW, limits: live().value,
+      history: [older, reset(150), reset(120), first, { ...first, phase: 'did' }] }))
+      .toEqual({ act: [], held: [{ ...second, held: 'per-PR-head cap' }] });
+    expect(planStallActions([second], { now: NOW, limits: live().value,
+      history: [older, reset(150), first, reset(60)] }).act).toEqual([second]);
+  });
+  it('planner charges planned live restarts to both ceilings and counts intent/did only once', () => {
+    const first = { ...record(), lane: 'system' };
+    const second = { ...first, key: `${prHead}:red-team-pending:restart-2` };
+    expect(planStallActions([first, second], { history: [], now: NOW, limits: live().value }))
+      .toEqual({ act: [first], held: [{ ...second, held: 'per-PR-head cap' }] });
+    expect(planStallActions([second], { history: [record(), record({ phase: 'did' })], now: NOW,
+      limits: live({ maxActionsPerPrHead: 2 }).value }).act).toEqual([second]);
+  });
+  it.each([null, undefined, {}, { status: 'dispatched' }, { jobPid: null }, { jobPid: 0 },
+    { jobPid: -1 }, { jobPid: '123' }, { launched: true, jobPid: null }, { launched: false, jobPid: 123 }])(
+    'unproven launch %j records intent and error without did or retry', async result => {
+      const dir = auditDir();
+      const dispatchRestart = vi.fn(async () => result);
+      const options = { dir, dispatchRestart, prs: [pendingPr, { ...pendingPr, number: 12 }],
+        readRedTeamStatus: ({ pr }) => ({ ...owner, repo: REPO, pr, head: HEAD, status: 'running', startedAt: old }) };
+      const { out } = await run(options);
+      expect(out.incomplete).toBe(true);
+      expect(dispatchRestart).toHaveBeenCalledTimes(1);
+      expect(lines(dir).filter(r => r.action === 'restart-red-team').map(r => r.phase)).toEqual(['intent', 'error']);
+      expect(lines(dir).find(r => r.phase === 'error').error).toMatch(/launch unproven.*operator/);
+      await run({ dir, dispatchRestart });
+      expect(dispatchRestart).toHaveBeenCalledTimes(1);
+      expect(lines(dir).filter(r => r.phase === 'did')).toEqual([]);
+    });
+  it('an explicit launched flag proves dispatch without a PID receipt', async () => {
+    const { dir, out } = await run({ dispatchRestart: vi.fn(async () => ({ launched: true })) });
+    expect(out.incomplete).toBe(false);
+    expect(lines(dir).filter(r => r.action === 'restart-red-team').map(r => r.phase)).toEqual(['intent', 'did']);
+  });
+
+  it('R804 shipped settings opt in only restart-red-team while global mode stays shadow', () => {
+    const { prStallSweep } = JSON.parse(readFileSync(join(process.cwd(), 'scripts/settings/pr-stall-sweep.json'), 'utf8'));
+    expect(prStallSweep.mode).toBe('shadow');
+    expect(prStallSweep.actionModes).toEqual({ 'restart-red-team': 'on' });
+  });
+  it.each(['off', 'shadow', 'on'])('R804 resolves actionModes restart-red-team=%s with provenance', mode => {
+    const log = vi.fn();
+    resetCascadeLogForTest();
+    const result = resolveStallSweepSettings({ env: { WE_POLICY_CASCADE_LOG: '1' }, log,
+      read: path => JSON.stringify({ prStallSweep: String(path).endsWith('pr-stall-sweep.json')
+        ? { mode: 'shadow', actionModes: { 'restart-red-team': mode } } : {} }) });
+    expect(result.value).toMatchObject({ mode: 'shadow', actionModes: { 'restart-red-team': mode } });
+    expect(result.errors).toEqual([]);
+    expect(result.sources['actionModes.restart-red-team']).toBe('tool');
+    expect(log.mock.calls.flat().join('\n')).toContain(`actionModes.restart-red-team="${mode}" (tool)`);
+  });
+  it.each([
+    { 'unknown-action': 'on' }, { 'restart-red-team': 'yes' }, { 'restart-red-team': null },
+    { 'restart-red-team': {} }, { 'restart-red-team': 'on', 'unknown-action': 'on' },
+  ])('R804 rejects invalid actionModes %j and fails closed to shadow', actionModes => {
+    const result = resolveStallSweepSettings({ env: {}, log: () => {},
+      read: path => JSON.stringify({ prStallSweep: String(path).endsWith('pr-stall-sweep.json')
+        ? { mode: 'shadow', actionModes } : {} }) });
+    expect(result.errors.join(' ')).toMatch(/actionModes/);
+    expect(result.value.actionModes?.['restart-red-team'] ?? 'shadow').toBe('shadow');
+    expect(result.value.actionModes?.['unknown-action']).toBeUndefined();
+  });
+
+  it('R804 proven dead owner dispatches once under lock after durable intent then appends did; other actions stay shadow', async () => {
+    const dir = auditDir();
+    const dispatchRestart = vi.fn(async input => {
+      expect(input).toEqual({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD, redTeamMode: 'fresh' });
+      expect(input.reason.trim()).not.toBe('');
+      expect(existsSync(join(dir, '.lock'))).toBe(true);
+      expect(lines(dir).filter(r => r.action === 'restart-red-team')).toMatchObject([{ phase: 'intent', prHead, key }]);
+      return { status: 'dispatched', jobPid: 24680 };
+    });
+    // The first PR produces tooling-card; the pending PR produces the sole live action.
+    const { out, calls } = await run({ dir, prs: [{ ...PRS[0], number: 13 }, pendingPr], dispatchRestart });
+    expect(out.incomplete).toBe(false);
+    expect(dispatchRestart).toHaveBeenCalledTimes(1);
+    expect(lines(dir).filter(r => r.action === 'restart-red-team').map(r => ({ phase: r.phase, prHead: r.prHead, key: r.key })))
+      .toEqual([{ phase: 'intent', prHead, key }, { phase: 'did', prHead, key }]);
+    expect(lines(dir).filter(r => r.action === 'tooling-card')).toMatchObject([{ phase: 'would-do', pr: 13 }]);
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase)).every(r => r.action === 'restart-red-team')).toBe(true);
+    expect(dispatchManualPass).not.toHaveBeenCalled();
+    expectReadOnly(calls);
+  });
+  it('R804 default restart seam delegates to dispatchManualPass with daemon repo pr and reason', async () => {
+    const { gh } = fakeGh({ prs: [pendingPr] });
+    await runStallSweep({ now: NOW, env: {}, settings: live(), dir: auditDir(), gh, read: reader(gh), log: () => {},
+      readRedTeamStatus: () => ({ ...owner, repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old }),
+      probe: { host: owner.host, namespace: owner.pidNamespace, isAlive: () => false, readPidStart: () => owner.pidStart } });
+    expect(dispatchManualPass).toHaveBeenCalledTimes(1);
+    expect(dispatchManualPass).toHaveBeenCalledWith({ daemon: 'red-team', repo: REPO, pr: 11, reason: expect.any(String), expectedHead: HEAD, redTeamMode: 'fresh' });
+    // It re-plans the abandoned run the way queued admission will, and dispatches that plan's mode.
+    expect(readRecoveryWitness).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
+    expect(planRedTeamRecovery).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(planRedTeamRecovery).mock.calls[0][1]).toMatchObject({ env: {}, deadlineMs: expect.any(Number) });
+    expect(vi.mocked(abandonStaleRedTeamRun).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(planRedTeamRecovery).mock.invocationCallOrder[0]);
+    // The default seam abandons the dead owner's run through the shared recovery helper first, as recovery does.
+    expect(abandonStaleRedTeamRun).toHaveBeenCalledWith({ repo: REPO, pr: 11, head: HEAD, env: {} });
+    expect(vi.mocked(abandonStaleRedTeamRun).mock.invocationCallOrder[0])
+      .toBeLessThan(vi.mocked(dispatchManualPass).mock.invocationCallOrder[0]);
+  });
+  it.each([true, null])('R804 ownerAlive=%s cannot dispatch a restart', async alive => {
+    const { out, dir, dispatchRestart } = await run({ alive });
+    expect(out.incomplete).toBe(false);
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it('R804 absent status is unknown ownership and cannot dispatch', async () => {
+    const { dispatchRestart, dir } = await run({ status: null });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it.each(['off', 'shadow'])('R804 restart action mode %s never dispatches', async mode => {
+    const { dispatchRestart, dir } = await run({ settings: live({ actionModes: { 'restart-red-team': mode } }) });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir).filter(r => ['intent', 'did'].includes(r.phase))).toEqual([]);
+  });
+  it('R804 global off overrides the live restart action', async () => {
+    const { dispatchRestart, out, dir } = await run({ settings: live({ mode: 'off' }) });
+    expect(out.skipped).toBe('off');
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    expect(lines(dir)).toEqual([]);
+  });
+
+  it.each(['maxActionsPerPrHead', 'maxRedTeamRestartsPerHead', 'maxActionsPerHour'])(
+    'R804 execute-time %s cap re-reads competing history inside the lock and records would-skip', async cap => {
+      const dir = auditDir();
+      let injected = false;
+      const open = fs.openSync;
+      vi.spyOn(fs, 'openSync').mockImplementation((path, ...args) => {
+        const fd = open(path, ...args);
+        if (String(path) === join(dir, '.lock') && args[0] === 'wx' && !injected) {
+          injected = true;
+          const competingHead = cap === 'maxActionsPerHour' ? `${REPO}#99@${HEAD}` : prHead;
+          append(dir, cap === 'maxRedTeamRestartsPerHead'
+            ? [record(), record({ key: `${prHead}:red-team-pending:restart-2` })]
+            : [record({ action: 'ask-review-daemon', prHead: competingHead, key: `${competingHead}:ask-review-daemon`,
+              ts: new Date(NOW - 10 * 60_000).toISOString() })]);
+        }
+        return fd;
+      });
+      const { dispatchRestart, out } = await run({ dir, settings: live({ [cap]: cap === 'maxRedTeamRestartsPerHead' ? 2 : 1 }) });
+      expect(injected).toBe(true);
+      expect(out.incomplete).toBe(false);
+      expect(dispatchRestart).not.toHaveBeenCalled();
+      expect(lines(dir)).toContainEqual(expect.objectContaining({ phase: 'would-skip', action: 'restart-red-team', prHead,
+        held: expect.stringMatching(/cap|ceiling|exhaust/i) }));
+      expect(lines(dir).filter(r => r.phase === 'did')).toEqual([]);
+    });
+  it('R804 same tick and key with durable intent and did never dispatches twice', async () => {
+    const dir = auditDir();
+    const dispatchRestart = vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 }));
+    await run({ dir, dispatchRestart });
+    expect(dispatchRestart).toHaveBeenCalledTimes(1);
+    await run({ dir, dispatchRestart, force: true });
+    expect(dispatchRestart).toHaveBeenCalledTimes(1);
+    expect(lines(dir).filter(r => r.phase === 'intent' && r.key === key)).toHaveLength(1);
+    expect(lines(dir).filter(r => r.phase === 'did' && r.key === key)).toHaveLength(1);
+  });
+  it('R804 dispatch rejection leaves intent and error without did or same-pass retry', async () => {
+    const dispatchRestart = vi.fn(async () => { throw new Error('restart refused'); });
+    const { dir } = await run({ dispatchRestart });
+    expect(dispatchRestart).toHaveBeenCalledTimes(1);
+    const records = lines(dir).filter(r => r.action === 'restart-red-team');
+    expect(records.map(r => r.phase)).toEqual(['intent', 'error']);
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'intent', key, prHead }), expect.objectContaining({ phase: 'error', key, prHead }),
+    ]));
+    expect(JSON.stringify(records.find(r => r.phase === 'error'))).toContain('restart refused');
+  });
+  it.each(['PR read', 'audit history', 'red-team status'])('R804 incomplete %s fails closed without dispatch', async kind => {
+    const dir = auditDir();
+    const options = {};
+    if (kind === 'PR read') {
+      const { gh } = fakeGh({ prs: [pendingPr] });
+      options.read = reader(gh, true);
+    }
+    if (kind === 'audit history') { mkdirSync(dir, { recursive: true }); writeFileSync(join(dir, '2026-10.jsonl'), '{torn\n'); }
+    if (kind === 'red-team status') options.readRedTeamStatus = () => { throw new Error('unreadable status'); };
+    const { out, dispatchRestart } = await run({ dir, ...options });
+    expect(out.incomplete).toBe(true);
+    expect(dispatchRestart).not.toHaveBeenCalled();
+    // A torn history deliberately cannot be parsed with the fixture's JSONL reader.
+    expect(readFileSync(join(dir, '2026-10.jsonl'), 'utf8')).not.toMatch(/"phase":"(?:intent|did)"/);
+  });
+
+  it.each(['same head', 'another head', 'another PR', 'another repo'])(
+    'R804 latest operator reset clears only its exact repo PR head counter: %s', async scope => {
+      const dir = auditDir();
+      append(dir, [record(), record({ key: `${prHead}:red-team-pending:restart-2` })]);
+      const before = readFileSync(join(dir, '2026-10.jsonl'), 'utf8');
+      const modulePath = '../pr-stall-reset.mjs';
+      const { resetRestartCounter } = await import(/* @vite-ignore */ modulePath);
+      await resetRestartCounter({ dir, repo: scope === 'another repo' ? 'other/repo' : REPO,
+        pr: scope === 'another PR' ? 12 : 11, head: scope === 'another head' ? 'b'.repeat(40) : HEAD,
+        actor: 'operator', reason: 'owner repaired', ruling: 'R804', now: NOW - 30 * 60_000 });
+      expect(readFileSync(join(dir, '2026-10.jsonl'), 'utf8').startsWith(before)).toBe(true);
+      const { dispatchRestart } = await run({ dir });
+      expect(dispatchRestart).toHaveBeenCalledTimes(scope === 'same head' ? 1 : 0);
+      if (scope === 'same head') expect(lines(dir).filter(r => r.phase === 'did')).toMatchObject([{ key, prHead }]);
+    });
+  it('R804 a restart after the latest reset still counts and retains its spacing hold', async () => {
+    const dir = auditDir();
+    append(dir, [record(), record({ key: `${prHead}:red-team-pending:restart-2` })]);
+    const modulePath = '../pr-stall-reset.mjs';
+    const { resetRestartCounter } = await import(/* @vite-ignore */ modulePath);
+    await resetRestartCounter({ dir, repo: REPO, pr: 11, head: HEAD, actor: 'operator', reason: 'inspected', ruling: 'R804', now: NOW - 30 * 60_000 });
+    append(dir, [record({ ts: new Date(NOW - 10 * 60_000).toISOString() }),
+      record({ phase: 'did', ts: new Date(NOW - 10 * 60_000).toISOString() })]);
+    const { dispatchRestart } = await run({ dir });
+    expect(dispatchRestart).not.toHaveBeenCalled();
+  });
+  it('R804 the latest of multiple resets clears older shadow and intent/did restart records', async () => {
+    const dir = auditDir();
+    append(dir, [record({ phase: 'would-do', ts: new Date(NOW - 150 * 60_000).toISOString() })]);
+    const modulePath = '../pr-stall-reset.mjs';
+    const { resetRestartCounter } = await import(/* @vite-ignore */ modulePath);
+    const input = { dir, repo: REPO, pr: 11, head: HEAD, actor: 'operator', reason: 'inspected', ruling: 'R804' };
+    await resetRestartCounter({ ...input, now: NOW - 120 * 60_000 });
+    append(dir, [record(), record({ phase: 'did' })]);
+    await resetRestartCounter({ ...input, now: NOW - 30 * 60_000 });
+    const { dispatchRestart } = await run({ dir });
+    expect(dispatchRestart).toHaveBeenCalledTimes(1);
+    expect(lines(dir).filter(r => r.phase === 'did' && r.ts === new Date(NOW).toISOString())).toMatchObject([{ key, prHead }]);
   });
 });

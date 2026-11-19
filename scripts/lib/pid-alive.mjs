@@ -52,13 +52,33 @@ export function pidIdentityStamp(pid, exec = execFileSync) {
   return { runnerStart: row.runnerStart ?? null, runnerArgv: row.runnerArgv ?? null };
 }
 
+export const PID_START_SLACK_MS = 120_000;
+
+/** The `startedBy` bound for a listing row's pid, or null when the row's start time cannot bound it. A wrapped worker
+ *  keeps its ORIGINAL launch time in `startedAt` while a harness resume spawns a new child (new pid, started later),
+ *  so that start time proves nothing about the current process: arming the guard would call the live resumed child a
+ *  reused pid. null skips only the started-after-holder check; unknown identity still retains the claim.
+ *  @param {{kind?:string, startedAt?:*}} row
+ *  @param {(startedAt:*) => number} toMs   the shared startedAt parser (`reconcile-core.mjs#startedAtMs`) */
+export function holderStartedBy(row, toMs) {
+  if (row?.kind === 'wrapped-worker') return null;
+  const ms = toMs(row?.startedAt);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
 /** Three-valued identity: only positive evidence of death may reclaim a runner's claim. */
-export function pidIdentity(pid, { expectStart = null, expectArgv = null, exec = execFileSync } = {}) {
+export function pidIdentity(pid, { expectStart = null, expectArgv = null, startedBy = null, exec = execFileSync } = {}) {
   const row = readPidIdentity(pid, exec);
   if ('alive' in row) return row;
   if (row.stat.startsWith('Z')) return { alive: false, reason: 'zombie' };
   // Working Claude sessions can retain their pre-warmed bg-spare argv. That command alone
   // cannot prove recycling: require a stored start/argv mismatch, zombie, or gone evidence.
+  // A holder can only start BEFORE (or just at) the moment it registered: a process that started later than
+  // `startedBy` (+ slack for clock/listing lag) is a different process that reused the pid.
+  if (Number.isFinite(startedBy)) {
+    const procMs = Date.parse(`${row.runnerStart} UTC`);
+    if (Number.isFinite(procMs) && procMs > startedBy + PID_START_SLACK_MS) return { alive: false, reason: 'started-after-holder' };
+  }
   if (expectStart && row.runnerStart !== String(expectStart).trim().replace(/\s+/g, ' ')) {
     return { alive: false, reason: 'start-mismatch' };
   }

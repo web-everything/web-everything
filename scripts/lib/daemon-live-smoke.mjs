@@ -118,10 +118,11 @@ export const SMOKE_BUDGET_ENV = Object.freeze({
   // to free a lane, instead of failing instantly on a momentary flicker. See `checkLaneAcquireRelease`.
   laneAcquireWaitMs: 'WE_SMOKE_LANE_ACQUIRE_WAIT_MS',
   // xp4lw2v (epic #4075/#3383) — the two new checks below. `dispatchDryRunMs` covers three direct dispatch
-  // fills (no IO) plus three real reconcile passes over LIVE open `we` PRs (each a `gh pr list`, plus a `gh pr
-  // diff`/`gh api` per PR needing a diff-derived scope fallback) — see `checkDispatchDryRun`.
+  // fills (no IO). Each real reconcile pass over LIVE open `we` PRs has its own dispatchPassMs cap
+  // (each reads `gh pr list`, plus diff-derived scope fallbacks) — see `checkDispatchDryRun`.
   // `treeStaysCleanMs` is one bare `git status --porcelain`, always fast.
   dispatchDryRunMs: 'WE_SMOKE_DISPATCH_DRY_RUN_MS',
+  dispatchPassMs: 'WE_SMOKE_DISPATCH_PASS_MS',
   treeStaysCleanMs: 'WE_SMOKE_TREE_STAYS_CLEAN_MS',
   // #4468 — {@link checkDaemonEntriesBoot}'s own budget; see `daemon-boot-smoke.mjs`.
   daemonBootMs: 'WE_SMOKE_DAEMON_BOOT_MS',
@@ -218,11 +219,16 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
     if (key === 'lanePoolBusyCapMs' || key === 'laneAcquireBusyCapMs' || key === 'laneAcquireWaitMs') continue;
     if (envMs(env, SMOKE_BUDGET_ENV[key], null) === null) budgets[key] = Math.round(budgets[key] * (IO_BOUND_BUDGET_KEYS.has(key) ? ioFactor : factor));
   }
+  // Preserve the enumerable legacy check-budget shape for callers that scale or compare it. The per-pass
+  // wall-clock cap is independent of host load and still participates in SMOKE_BUDGET_ENV retry widening.
+  Object.defineProperty(budgets, 'dispatchPassMs', {
+    value: envMs(env, SMOKE_BUDGET_ENV.dispatchPassMs, 600_000), enumerable: false,
+  });
   return budgets;
 }
 
 // Live 2026-10-10 (wev-fix-daemon): with x9xkupj's admission, `admit` (CPU 16–28% idle) left reconcile/dispatch at
-// 120s/180s at load 30–46 on 12 cores. Both wait on gh/git children, so CPU idle says nothing about them: they were
+// 120s/180s at load 30–46 against the host core count. Both wait on gh/git children, so CPU idle says nothing about them: they were
 // killed, and plain main and last-good failed identically. These two keep the load factor through the cascade.
 const IO_BOUND_BUDGET_KEYS = new Set(['reconcileMs', 'dispatchDryRunMs']);
 export const SMOKE_IO_LOAD_SCALE_ENV = 'WE_SMOKE_IO_LOAD_SCALE';
@@ -266,11 +272,26 @@ const failureLine = (e) => {
   return err && err !== lines[0] ? `${lines[0]} — ${err.trim()}` : lines[0];
 };
 
+const DIAG_LINES = 10;
+const DIAG_LINE_CHARS = 300;
+const DIAG_TOTAL_CHARS = 2400;
+// A gh-throttle slot refusal is the cause of a child's exit 1, but lives only in stderr; the classifier reads detail.
+const GH_THROTTLE_REFUSAL = /^(?:✗ reconcile pass could not read state: (?:open-PR list unreadable for [A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+: (?:page page [1-9]\d*|hydrate PR #[1-9]\d*) failed: )?)?(gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[^)]*\))(?:; retry next tick)?$/;
+// Only the LAST stderr line may be a refusal, bare or echoed by reconcile-pass's CLI catch,
+// including PrListUnreadableError's page/hydration context. Unknown wrappers or later failures stay code.
+const throttleCause = (e) => {
+  // A signal/crash exit, a non-1 exit code, or any Error/crash line anywhere in stderr is a code failure.
+  if (e?.signal || e?.status !== 1) return undefined;
+  if (/\b[A-Za-z]*Error\b[:\s]|Cannot find module|\bat \S+ \(|\bSIG[A-Z]+\b/.test(String(e?.stderr ?? ''))) return undefined;
+  const last = String(e?.stderr ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).pop() ?? '';
+  return GH_THROTTLE_REFUSAL.exec(last)?.[1];
+};
+
 // Diagnostic stderr is separate from detail: classifiers must see only the original summary.
 const childFailureDiagnostics = (e) => {
   const tail = String(e?.stderr ?? '').split(/\r?\n/)
-    .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean).slice(-6)
-    .map((line) => redactDetail(line).slice(0, 300)).join(' | ').slice(-1200);
+    .map((line) => line.replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).filter(Boolean).slice(-DIAG_LINES)
+    .map((line) => redactDetail(line).slice(0, DIAG_LINE_CHARS)).join(' | ').slice(-DIAG_TOTAL_CHARS);
   return tail ? { stderrTail: tail } : {};
 };
 
@@ -301,10 +322,12 @@ const childFailureDiagnostics = (e) => {
  *  verify-dispatch ENOTDIR fix) and dropped it twice while no gate ran host-wide. */
 export const LOCK_CONTENTION_SIGNATURE = /scan was still running when this call's --wait-ms elapsed \(lock contention\)|gave up waiting for the shared acquirability-scan lock/;
 export const BUSY_POOL_SIGNATURES = Object.freeze([
-  /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
+  /^[^:]+ failed: (?:reconcile-(?:fix|ci-heal|review)-pass )?timed out after \d+ms \(process group killed\)$/,
   /scan exceeded its \d+ms budget/,
   /gave up waiting for the shared acquirability-scan lock/,
-  /no free lane/i,
+  // The other "no free lane" reasons include failed provisioning and incomplete scans, neither of
+  // which proves pool exhaustion. Only the completed all-held/dirty result is a busy-pool signature.
+  /no free lane in pool "[^"\r\n]+" \(\d+ all held\/dirty\)/i,
   LOCK_CONTENTION_SIGNATURE,
 ]);
 export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
@@ -367,6 +390,17 @@ async function checkLanePoolList(ctx) {
   }
 }
 
+/** lane-pool acquire exits 75 (EX_TEMPFAIL) only when a parked lane-hold refusal was seen and no other failure kind was (the rest of the pool was busy). */
+const LANE_POOL_ENV_ONLY_EXIT = 75;
+const isEnvOnlyAcquireExit = (e) => e?.status === LANE_POOL_ENV_ONLY_EXIT && !e?.signal;
+// lane-pool's own reason is its LAST `✗ ` stderr line; the first line is often just progress (a reclaim
+// listing, a config scrub). Live 2026-11-01: the detail showed "lane-33: reclaiming 127 … safe to drop" for an
+// acquire that actually failed on a lane-hold + busy pool, so the busy-pool classifier never saw "no free lane".
+export const lanePoolFailureLine = (e) => {
+  const reason = String(e?.stderr ?? '').split(/\r?\n/).filter((l) => l.startsWith('✗ ')).pop();
+  return reason && Number.isInteger(e?.status) ? `exited ${e.status}: ${reason.slice(2)}` : firstLine(e);
+};
+
 async function checkLaneAcquireRelease(ctx) {
   const { root, budgets, sessionSlug, runChild, env } = ctx;
   let laneNum = null;
@@ -382,17 +416,34 @@ async function checkLaneAcquireRelease(ctx) {
     // killed mid-flight expires by itself.
     // #4139 — see {@link checkLanePoolList}'s own comment just above: `env` must reach every lane-pool child
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
-    const out = await runChild('node', [
+    const acquire = () => runChild('node', [
       'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
       `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
     ], {
       cwd: root, timeoutMs: acquireCapMs, env,
     });
+    let out;
+    try {
+      out = await acquire();
+    } catch (e) {
+      if (!isEnvOnlyAcquireExit(e)) throw e;
+      try {
+        out = await acquire();
+      } catch (retryError) {
+        // Structural, not textual: only lane-pool's own environmental-only exit (75) twice in a row is a skip.
+        if (!isEnvOnlyAcquireExit(retryError)) {
+          return { ok: false, detail: `lane-pool acquire --purpose=smoke failed: ${lanePoolFailureLine(retryError)}`,
+            ...childFailureDiagnostics(retryError) };
+        }
+        return { ok: true, skipped: true, skipReason: 'lane-hold-refused',
+          detail: `skipped: acquire found only lane-hold refusals after one retry: ${lanePoolFailureLine(retryError)}` };
+      }
+    }
     const parsed = JSON.parse(out);
     laneNum = Number.isInteger(parsed?.lane) ? parsed.lane : null;
     if (laneNum == null) return { ok: false, detail: 'lane-pool acquire returned no lane number' };
   } catch (e) {
-    const detail = `lane-pool acquire --purpose=smoke failed: ${firstLine(e)}`;
+    const detail = `lane-pool acquire --purpose=smoke failed: ${lanePoolFailureLine(e)}`;
     const skip = busyPoolSkip({ what: 'lane-pool acquire', detail, elapsedMs: (ctx.clock ?? Date.now)() - t0, capMs: budgets.laneAcquireWaitMs, ctx });
     if (!skip) return { ok: false, detail, ...childFailureDiagnostics(e) };
     // A killed acquire may have written a lease just before it died: release this smoke session's leases (best-effort).
@@ -468,13 +519,15 @@ async function checkGhPrList({ ghChildEnv, budgets, runChild }) {
 async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
   const failures = [];
   const stderrTails = [];
+  const causes = [];
   for (const slug of repos) {
     try {
       // x5wbsbc — `env` too (like every lane-pool check, #4139): a candidate smoke's env carries the LIVE
       // clone's pool root / dispatch root (`daemon-rebuild.mjs#candidateSmokeEnv`), never the candidate path's.
       await runChild('node', ['scripts/conveyor/reconcile-pass.mjs', `--repo=${slug}`, '--json'], { cwd: root, timeoutMs: budgets.reconcileMs, env });
     } catch (e) {
-      failures.push(`${slug}: ${firstLine(e)}`);
+      causes.push(throttleCause(e));
+      failures.push(`${slug}: ${firstLine(e).replaceAll('smoke-env-cause', 'smoke-env-cause\u200b')}`);
       const { stderrTail } = childFailureDiagnostics(e);
       if (stderrTail) stderrTails.push(`${slug}: ${stderrTail}`);
     }
@@ -483,6 +536,10 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
   const kills = failures.map((f) => /^([^:]+): (timed out after \d+ms \(process group killed\))$/.exec(f));
   if (failures.length && kills.every(Boolean)) {
     return { ok: false, detail: `reconcile-pass dry-run (${failures.length}/${repos.length} repo(s) — ${kills.map((m) => m[1]).join(', ')}) failed: ${kills[0][2]}` };
+  }
+  // Name the throttle only when EVERY failing repo was throttled: one real code failure among them keeps the row 'code'.
+  if (failures.length && causes.every(Boolean)) {
+    return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.map((f, i) => `${f} — smoke-env-cause: ${causes[i]}`).join('; ')}`, ...(stderrTails.length ? { stderrTail: stderrTails.join('; ') } : {}) };
   }
   if (failures.length) {
     return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.join('; ')}`, ...(stderrTails.length ? { stderrTail: stderrTails.join('; ') } : {}) };
@@ -557,6 +614,9 @@ const DISPATCH_DRY_RUN_LINES = [
   "const WE_SLUG = CONSTELLATION_REPOS.we.slug; // repo-explicit, never a literal slug (multi-repo-checks)",
   "",
   "const results = [];",
+  "const only = process.env.WE_SMOKE_DRYRUN_ONLY;",
+  "const selected = kind => !only || only === kind;",
+  "if (only && !['reconcile-fix-pass', 'reconcile-ci-heal-pass', 'reconcile-review-pass'].includes(only)) throw new Error('unknown smoke pass: ' + only);",
   "const noopAcquire = () => ({ ok: true });",
   "const noopRelease = () => ({ released: true });",
   "const skipStaleness = () => ({ fresh: true, behind: 0 });",
@@ -582,6 +642,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "",
   "// 1. review — direct dispatchReview call. review-dispatch never derives an item/scope, so any positive PR",
   "// number is legal input to it; the PR need not exist for the brief to fill (no gh read happens here).",
+  "if (!only || only === 'reconcile-fix-pass') {",
   "record('review', 900001, () => {",
   "  let captured = null;",
   "  const spawn = (argv) => { captured = argv[argv.length - 1]; return 'stub-review-900001'; };",
@@ -631,36 +692,47 @@ const DISPATCH_DRY_RUN_LINES = [
   "  checkFilled(captured, 'ci-heal-ordinary PR #900004', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal']);",
   "});",
   "",
+  "}",
   "// 4. pass level — the REAL planner (reconcile-pass.mjs) over LIVE open 'we' PRs (real gh reads); dispatch",
   "// stubbed so nothing is ever spawned. Lane selection and (for fix) the resume-candidate check are stubbed",
   "// too — neither needs a real pool/agents read for this dry run. WE_SMOKE_DISPATCH_PASSES=0 skips this part",
   "// (a unit test with no GitHub credential runs only the direct dispatch calls above).",
   "if (process.env.WE_SMOKE_DISPATCH_PASSES !== '0') {",
-  "record('reconcile-fix-pass', null, () => {",
+  "if (selected('reconcile-fix-pass')) record('reconcile-fix-pass', null, () => {",
   "  const stubDispatch = (planned) => ({ agentId: null, sessionSlug: 'stub-fix', pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane, unknownTokens: [], resumed: false });",
   "  const r = runReconcileFixDispatch({",
   "    allowStandDownAutoProceed: false, // A smoke never writes R123 cursors, reservations or answers.",
+  "    unsupportedPath: (process.env.TMPDIR || '/tmp') + '/smoke-unsupported-fix-' + process.pid + '.json',",
   "    repo: WE_SLUG, dispatch: stubDispatch, tryResume: () => ({ resumed: false, resumeAttempt: null }),",
+  "    tryResumeRound: () => ({ resumed: false, resumeAttempt: null }),",
+  "    postQueueCapComment: () => {}, notifyQueueCapOperator: () => {},",
+  "    listBuildClaims: () => [], listFixClaims: () => [], writeStacks: null, priorityShadow: null,",
+  "    shadowDeps: { hermetic: true, mode: 'off', appendLine: () => {} },",
   "    pickFreeLanes: () => [90201, 90202, 90203, 90204, 90205], checkStaleness: skipStaleness,",
   "  });",
   "  if (!Array.isArray(r.dispatched) || !Array.isArray(r.refusals)) throw new Error('runReconcileFixDispatch returned an unexpected shape');",
   "});",
   "",
-  "await recordAsync('reconcile-ci-heal-pass', null, async () => {",
+  "if (selected('reconcile-ci-heal-pass')) await recordAsync('reconcile-ci-heal-pass', null, async () => {",
   "  const stubDispatch = async (planned) => ({ agentId: null, sessionSlug: 'stub-ci-heal', pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane, unknownTokens: [] });",
   "  const r = await runReconcileCiHealDispatch({",
+  "    unsupportedPath: (process.env.TMPDIR || '/tmp') + '/smoke-unsupported-ciheal-' + process.pid + '.json',",
   "    repo: WE_SLUG, dispatch: stubDispatch, pickFreeLanes: () => [90301, 90302, 90303, 90304, 90305], checkStaleness: skipStaleness,",
   "    // #4352 — the owed-write flush POSTS PR comments; a smoke never writes to GitHub, same as its stubbed dispatch.",
   "    flushOwed: () => ({ posted: [], cleared: [], dropped: [], kept: [] }),",
+  "    pollAttempts: () => [], flushTimeouts: async () => [],",
+  "    retryTimeout: async () => ({ status: 'refused', reason: 'smoke-dry-run' }),",
+  "    salvage: async () => null, postParkComment: () => {},",
   "  });",
   "  if (!Array.isArray(r.dispatched) || !Array.isArray(r.refusals)) throw new Error('runReconcileCiHealDispatch returned an unexpected shape');",
   "});",
   "",
-  "record('reconcile-review-pass', null, () => {",
+  "if (selected('reconcile-review-pass')) record('reconcile-review-pass', null, () => {",
   "  const stubDispatch = () => ({ agentId: null });",
   "  const r = runReviewTick({",
   "    repo: WE_SLUG, dispatch: stubDispatch,",
   "    tagRound: () => {}, tagStatus: () => {}, holdReconcile: () => [], statusCandidates: () => [],",
+  "    notifyReferral: () => {},",
   "  });",
   "  if (r.reconcileError) throw new Error('reconcile failed: ' + r.reconcileError);",
   "  if (!Array.isArray(r.dispatched) || !Array.isArray(r.failed)) throw new Error('runReviewTick returned an unexpected shape');",
@@ -683,30 +755,39 @@ export const DISPATCH_DRY_RUN_CODE_ENTRIES = Object.freeze([
 ]);
 
 async function checkDispatchDryRun({ root, budgets, runChild, env }) {
-  let out;
+  const parsed = [];
   // The stubbed dispatchers still reach the real fix-loop ledger append; an isolated ledger keeps the smoke's
   // stub sessions from counting as real repair attempts on live PRs (#4194: 3 stub rows => fix-loop-hold).
   const ledgerDir = mkdtempSync(join(tmpdir(), 'smoke-fix-loop-'));
+  let pass;
   try {
     const childEnv = { ...env, WE_FIX_LOOP_LEDGER: join(ledgerDir, 'ledger.jsonl') };
     // Injected spawners must own every dry-run launch unless real workers were deliberately enabled.
     if (!resolveSmokeRealWorker({ env }).allowSentinel) childEnv.WE_WORKER_WRAPPER = 'off';
-    out = await runChild('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
-      cwd: root, timeoutMs: budgets.dispatchDryRunMs, env: childEnv,
-    });
+    // Direct-only callers retain one child and the original brief-fill budget.
+    const passes = env?.WE_SMOKE_DISPATCH_PASSES === '0' ? [null]
+      : ['reconcile-fix-pass', 'reconcile-ci-heal-pass', 'reconcile-review-pass'];
+    for (pass of passes) {
+      const out = await runChild('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
+        cwd: root, timeoutMs: pass ? (budgets.dispatchPassMs ?? resolveSmokeBudgets(env).dispatchPassMs) : budgets.dispatchDryRunMs,
+        env: { ...childEnv, WE_SMOKE_DRYRUN_ONLY: pass ?? '' },
+      });
+      let rows;
+      try {
+        rows = JSON.parse(out);
+      } catch (e) {
+        return { ok: false, detail: `dispatch dry-run produced unparsable output (${pass ?? 'direct'}): ${firstLine(e)}` };
+      }
+      if (!Array.isArray(rows) || !rows.length) {
+        return { ok: false, detail: `dispatch dry-run reported no rows (${pass ?? 'direct'}) — refusing to treat "nothing ran" as a pass` };
+      }
+      // A row is one (kind, pr) fact; a child repeating an earlier child's row never doubles the count.
+      for (const row of rows) if (!parsed.some((seen) => seen.kind === row.kind && seen.pr === row.pr)) parsed.push(row);
+    }
   } catch (e) {
-    return { ok: false, detail: `dispatch dry-run child failed: ${failureLine(e)}`, ...childFailureDiagnostics(e) };
+    return { ok: false, detail: `dispatch dry-run child failed: ${pass ? `${pass} ` : ''}${failureLine(e)}`, ...childFailureDiagnostics(e) };
   } finally {
     try { rmSync(ledgerDir, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(out);
-  } catch (e) {
-    return { ok: false, detail: `dispatch dry-run produced unparsable output: ${firstLine(e)}` };
-  }
-  if (!Array.isArray(parsed) || !parsed.length) {
-    return { ok: false, detail: 'dispatch dry-run reported no rows — refusing to treat "nothing ran" as a pass' };
   }
   const timings = parsed.map((r) => `${r.kind} ${Number.isFinite(r.ms) ? (r.ms < 1000 ? `${r.ms}ms` : `${Math.round(r.ms / 100) / 10}s`) : 'unknown'}`).join(', ');
   const failures = parsed.filter((r) => !r.ok);
@@ -862,6 +943,8 @@ export async function runLiveSmoke({
       console.error(`daemon-live-smoke: io-bound-load-scale ${JSON.stringify({ ...io, verdict: admission.verdict, reconcileMs: budgets.reconcileMs, dispatchDryRunMs: budgets.dispatchDryRunMs })}`);
     }
     if (!process.env.VITEST) {
+      console.error(`daemon-live-smoke: dispatch-pass-budget ${JSON.stringify({ dispatchPassMs: budgets.dispatchPassMs,
+        source: envMs(env, SMOKE_BUDGET_ENV.dispatchPassMs, null) === null ? 'default' : SMOKE_BUDGET_ENV.dispatchPassMs })}`);
       console.error(`daemon-live-smoke: smoke-read-memo ${JSON.stringify(readMemo)}`);
       console.error(`daemon-live-smoke: smoke-dry-run ${JSON.stringify(dryRun)}`);
     }
@@ -908,7 +991,7 @@ export async function runLiveSmoke({
       const trackedRunChild = async (cmd, args, opts) => {
         childCalls++;
         const start = clock();
-        const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < 1_000;
+        const outOfBudget = Number.isFinite(runChild.deadline) && runChild.deadline - start < (opts?.minChildMs ?? 1_000);
         try {
           const out = await runChild(cmd, args, opts);
           if (check.name === 'daemon-entries-boot') {
@@ -987,7 +1070,7 @@ export const TRANSIENT_FAILURE_PATTERNS = Object.freeze([
   // NOT a bare /timeout|timed out/: those match ordinary code-failure text ("timed out waiting for #submit",
   // an assertion naming a `timeout` option) and would launder a real regression through the retry path. A child
   // that merely PRINTS this text reaches `detail` as `<prefix> failed: exited N: …`, so it cannot match.
-  /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
+  /^[^:]+ failed: (?:reconcile-(?:fix|ci-heal|review)-pass )?timed out after \d+ms \(process group killed\)$/,
   /no free lane/i, // lane-pool.mjs#cmdAcquire's exhausted-pool message, e.g. `no free lane in pool "we" (12 all held/dirty) — release one or \`provision\` more`
   /all lanes (are )?busy/i,
   /pool (is )?(full|exhausted)/i,
@@ -1181,9 +1264,12 @@ export async function runLiveSmokeWithRetry({
 /** Signatures of "ran out of time". The first is `runBounded`'s own kill (external); the rest are lane-pool's
  *  bounded-scan give-ups (tree text — hence the elapsed-time floor in {@link isEnvTimeoutRow}). */
 export const ENV_TIMEOUT_PATTERNS = Object.freeze([
-  /^[^:]+ failed: timed out after \d+ms \(process group killed\)$/,
+  /^[^:]+ failed: (?:reconcile-(?:fix|ci-heal|review)-pass )?timed out after \d+ms \(process group killed\)$/,
   /scan exceeded its \d+ms budget/,
   /gave up waiting for the shared acquirability-scan lock/,
+  // gh-throttle refused the child a gh slot (`slot_throttled`, gh-throttle.mjs#slotTimeoutMessage): the pool was
+  // full, a host fact. Live 2026-11-01 20:28Z: reconcile-pass exited 1 with this line, plain last-good failed the same.
+  / — smoke-env-cause: gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s/,
 ]);
 export const SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV = 'WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS';
 export const DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS = 30_000;
@@ -1198,16 +1284,46 @@ const LANE_POOL_DEFAULT_SCAN_TIMEOUT_MS = 120_000;
 /** PURE: did this failed row run out of time (signature AND the gate's own measured elapsed time)? */
 export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS } = {}) {
   if (!row || row.ok) return false;
+  // Boot summaries aggregate several children. Use gate-owned per-entry outcomes rather than a timeout
+  // substring: one import failure/crash or missing outcome, including a retried attempt, must keep
+  // the whole row a code failure.
+  if (row.name === 'daemon-entries-boot') {
+    if (!Array.isArray(row.entries) || !row.entries.length
+      || row.entries.some(r => !r || typeof r.ok !== 'boolean')) return false;
+    const failures = row.entries.filter(r => !r.ok);
+    if (!failures.length) return false;
+    const isFullCapTimeout = r => {
+      if (!r || r.ok !== false) return false;
+      const killed = /^child failed: timed out after (\d+)ms \(process group killed\)$/.exec(r.kind);
+      const cap = Number(killed?.[1]);
+      // A shared-budget slice is not a full-cap timeout. Refuse tiny caps and early/fabricated kills too.
+      return killed && cap >= MIN_OWN_CAP_MS && cap === r.timeoutMs
+        && Number.isFinite(r.elapsedMs) && r.elapsedMs >= cap * 0.9;
+    };
+    return failures.every(r => {
+      const attempts = r.attempts === undefined ? [r] : r.attempts;
+      return isFullCapTimeout(r) && Array.isArray(attempts) && attempts.length > 0
+        && attempts.every(isFullCapTimeout);
+    });
+  }
   const detail = String(row.detail ?? '');
   if (!ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail))) return false;
   // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the
   // row really spent its whole cap N. A cheap probe has a cap far under the 30s floor (live 2026-10-03 22:01 ET,
-  // load 31 on 12 cores: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
+  // load 31 against the host core count: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
   // load-induced kill as a code failure and rejected a good build. Judge such a kill against its own cap — but only
   // a cap that is a real budget: one under {@link MIN_OWN_CAP_MS} is a starved harness (the soak break
   // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
   const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
   if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  // Background gh slots normally give up after 8s. Only markers emitted after throttleCause's exit/stderr
+  // checks qualify; check elapsed time against their own wait, as for a bounded kill. With several failed
+  // repos use the longest wait, so one short refusal cannot excuse a longer one that failed too quickly.
+  const slotWaits = [...detail.matchAll(/ — smoke-env-cause: gh-throttle: throttled — no gh slot within (\d+(?:\.\d+)?)s \(class=[^)]*\)/g)]
+    .map(match => Number(match[1]) * 1000);
+  if (slotWaits.length && slotWaits.every(ms => Number.isFinite(ms) && ms >= MIN_OWN_CAP_MS)) {
+    return Number(row.ms) >= Math.min(minElapsedMs, Math.max(...slotWaits) * 0.9);
+  }
   return Number(row.ms) >= minElapsedMs;
 }
 

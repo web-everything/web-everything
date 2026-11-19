@@ -45,7 +45,12 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'red-pr-unattended',
   'repeated-pr-attempts', // Operator rule, 2026-09-30: surface repeated trials per PR.
   'pr-no-owner',
+  // Operator order R437, 2026-11-02: PR movement and stage stalls notify in shadow.
+  'pr-no-movement',
+  'pr-stage-stall',
   'daemon-silent',
+  'forge-disk-prune', // Operator R951, 2026-11-15: Forge / hit 100% (prune refused 469x, 4 days) with no alert.
+  'forge-share-below-target', // Operator R497, 2026-11-03: "all tests on Forge" is a measured share with an alarm.
   'build-session-idle',    // Operator order, 2026-10-06: supervise build/prepare so models never spin for nothing.
   'build-session-overrun',
   'build-session-looping',
@@ -67,4 +72,8 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   // #5653: an operator-only hold on a PR (cap-exhausted, stood-down, review-referrals-pending, ruling-dispute) sat for
   // hours with no per-hold alarm; the opening alert fires once the hold has been observed past the age threshold.
   'operator-hold-aged',
+  // R179 (2026-10-28): all four daemons sat days behind main unflagged; a stale daemon build must reach the operator.
+  'daemon-build-stale',
+  // R502 (2026-11-03): a claim held by a silent holder on an unmoved head must reach the operator (detection only).
+  'stale-claim-or-binding',
 ]);

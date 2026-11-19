@@ -4,7 +4,7 @@ kind: story
 size: 5
 parent: "3443"
 status: resolved
-blockedBy: ["3902", "3893", "3906", "3917", "3915", "3907", "4180"]
+blockedBy: ["3902", "3893", "3917", "3915", "3907", "4180"]
 scope: ["we:scripts/operations/__tests__/completion-cli.test.mjs", "we:scripts/operations/__tests__/completion-record.test.mjs", "we:skills-src/conveyor/delivery-agent-brief-v2.md", "we:skills-src/conveyor/delivery-agent-brief.md", "we:scripts/operations/__tests__/open-pr.test.mjs", "we:scripts/operations/__tests__/dispatch-lane-build-wiring.test.mjs", "we:scripts/operations/run.mjs", "we:scripts/operations/__tests__/dispatch-lane-routing-record.test.mjs", "we:scripts/operations/__tests__/dispatch-task.test.mjs"]
 dateOpened: "2026-09-22"
 dateResolved: "2026-09-26"

@@ -120,3 +120,25 @@ it('a reviewer set aside for a CI heal past the join cap releases only the heal,
     expect(result.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
   }
 });
+
+it('starts review early only with verified head evidence and preserves the off path', () => {
+  const row = pr({ statusCheckRollup: [check('test', null)], verifyGreen: true });
+  expect(plan(row, { reviewTiming: { startBeforeCi: true } }).dispatch.map(d => d.kind)).toContain('review');
+  expect(plan({ ...row, verifyGreen: false }, { reviewTiming: { startBeforeCi: true } }).dispatch).toEqual([]);
+  expect(plan(row).dispatch).toEqual([]);
+});
+it('holds red-main CI before consulting exhausted fix rounds with early review enabled', () => {
+  const row = pr({ labels: labels('review:changes', 'ci:failed'), comments: [finding],
+    statusCheckRollup: [check('test', 'FAILURE')], requiredCheckName: 'test',
+    requiredCheckCompletedAt: new Date(now - 60000).toISOString(), aheadByOnMain: 1 });
+  const result = plan(row, { reviewTiming: { startBeforeCi: true }, durableCounts: { 7: 100 },
+    mainRedWindows: [{ start: new Date(now - 120000).toISOString(), end: null }] });
+  expect(result.dispatch.filter(d => ['ci-heal', 'fix'].includes(d.kind))).toEqual([]);
+  expect(result.refusals.some(r => r.kind === 'cap-exhausted')).toBe(false);
+});
+
+it('still charges and caps own-code CI failures when early review is enabled', () => {
+  const row = pr({ labels: labels('review:changes', 'ci:failed'), comments: [finding], statusCheckRollup: [check('test', 'FAILURE')] });
+  const result = plan(row, { reviewTiming: { startBeforeCi: true }, durableCounts: { 7: 100 } });
+  expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+});

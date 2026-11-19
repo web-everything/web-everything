@@ -1,3 +1,4 @@
+import { pinnedFixture } from '../hooks/__tests__/pinned-fixture.mjs';
 /** Pure decisions and the real stdin/JSON boundary of PreToolUse(Monitor). */
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -68,9 +69,16 @@ describe('guard-monitor-subagent — CLI and hook wiring', () => {
   });
   it('wires the Monitor matcher alongside the existing Bash guard', () => {
     const settings = JSON.parse(readFileSync(join(here, '../../.claude/settings.json'), 'utf8'));
+    const f = pinnedFixture();
+    try {
+      const hook = settings.hooks.PreToolUse.find(entry => entry.matcher === 'Monitor').hooks[0];
+      const output = f.command(f.lane, hook.command, event);
+      expect(output.status, output.stderr).toBe(0);
+      expect(JSON.parse(output.stdout)).toEqual(decide(event));
+    } finally { f.cleanup(); }
     for (const [matcher, script] of [['Monitor', 'guard-monitor-subagent'], ['Bash', 'guard-bash']]) {
       expect(settings.hooks.PreToolUse.find((entry) => entry.matcher === matcher).hooks).toContainEqual({
-        type: 'command', command: `node scripts/${script}.mjs`,
+        type: 'command', command: expect.stringContaining(`node "$launcher" scripts/${script}.mjs; code=$?`),
       });
     }
   });

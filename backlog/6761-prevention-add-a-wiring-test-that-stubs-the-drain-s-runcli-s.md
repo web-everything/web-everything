@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/ledger-readiness-daily.mjs", "we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/lib/pr-merge-gate.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/ledger-readiness-daily.test.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs", "we:scripts/lib/__tests__/pr-merge-gate.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/ledger-readiness-daily.mjs", "we:scripts/lib/drain-ledger-facts.mjs", "we:scripts/lib/pr-merge-gate.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/lib/__tests__/ledger-readiness-daily.test.mjs", "we:scripts/lib/__tests__/drain-ledger-facts.test.mjs", "we:scripts/__tests__/pr-merge-gate.test.mjs"]
 dateOpened: "2026-10-15"
 tags: []
 ---

@@ -112,6 +112,8 @@ export function isSalvageLanded(entry, { repoDir, branchRef = 'origin/main' }) {
   // A file the entry lists as changed but no tip carries (e.g. an untracked file held only in a `git stash`'s
   // third parent, from a hand-made salvage) cannot be proven landed — say "unknown", never "landed".
   if ((entry.changedFiles || []).some((f) => !covered.has(f))) return null;
+  // Nested-repo copies are plain files no git tip carries, so landing can never be proven for them.
+  if ((entry.nestedRepos || []).length) return null;
   return covered.size > 0 ? true : null;
 }
 

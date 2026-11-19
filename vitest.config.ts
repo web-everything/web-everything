@@ -126,6 +126,7 @@ export default defineConfig({
       'blocks/**/__tests__/**/*.test.{ts,tsx}',
       'src/**/__tests__/**/*.test.{ts,tsx}', // build-time data files (e.g. burndown accounting)
       'scripts/**/__tests__/**/*.test.mjs', // build/CI tooling (e.g. conformance auto-fix engine, #095)
+      'scripts/lib/red-team-gate-catchup.test.mjs', // Co-located Gap 1 regression suite.
       'skills-src/**/__tests__/**/*.test.mjs', // skill-local mechanism modules (e.g. the conveyor headless runner, #2702)
       'tools/**/__tests__/**/*.test.{ts,tsx}', // build-time Vite plugins (e.g. the trait-enforcer codegen, #484)
       'capabilities/**/__tests__/**/*.test.{ts,tsx}', // capability provider + static build-matrix (#204)
@@ -192,6 +193,10 @@ export default defineConfig({
       // Real origin/author/clone fixtures with multiple rebuilds per test. CI shard 4 hit the 5s deadline;
       // keep the assertions and deadline in the blocking integration tier's serial fork instead.
       'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
+      // Same real-git rebuild pattern: skip-unrelated's paired existing/added-file cases timed out in shard 5.
+      'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
+      // Fallback's harness-backoff case also drives three real-git rebuilds and timed out in unit shard 7.
+      'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
       'scripts/__tests__/publish-secret-gate.test.mjs',
@@ -251,6 +256,9 @@ export default defineConfig({
       // #4122 — same tier: real throwaway origin/reference/pool, real spawned `lane-pool.mjs acquire`/
       // `provision` children, a PATH git shim tracing lane git calls (proof of the free-lane-list fast path).
       'scripts/__tests__/lane-pool-acquire-free-list.test.mjs',
+      // Same tier: real throwaway origin/reference/pool and 10 real spawned `lane-pool.mjs` children (one 5-lane
+      // provision per file, then acquire/release/trim). It once ran ~30 and stalled unit shards 4 and 8 to the job cap.
+      'scripts/__tests__/lane-pool-free-list-event-refresh.test.mjs',
       // #x96v5hl — same `lane-pool-trim.test.mjs` barrier-plus-real-concurrent-spawn technique (a real
       // `release`/`acquire` child paused mid-run via an env-var test seam, a second real concurrent CLI child
       // racing into that exact window): proof of the release/reap and stale-reclaim TOCTOU fixes.

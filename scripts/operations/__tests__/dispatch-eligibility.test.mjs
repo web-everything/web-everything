@@ -15,6 +15,9 @@ import { runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { resolveOperation } from '../run.mjs';
 
+// These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
+process.env.WE_ROUTING_BUILDER = 'codex';
+
 // These admission regressions exercise the inherited evidence/probation router.
 // Pin its policy so changing production provider defaults cannot change the corpus.
 vi.mock('../../lib/dispatch-routing-policy-io.mjs', async (importOriginal) => {

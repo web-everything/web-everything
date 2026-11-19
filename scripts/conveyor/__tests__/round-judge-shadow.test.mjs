@@ -59,13 +59,13 @@ describe('observeRoundCap', () => {
   it('shadow logs one JSONL record with the line, source and evidence; a second look is skipped', () => {
     const dir = tmp(); const lines = [];
     const rec = observeRoundCap({ pr: 77, repo: 'web-everything/web-everything', subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21), log: (l) => lines.push(l) });
-    expect(rec).toMatchObject({ pr: 77, trigger: 'red-team-cap', mode: 'shadow', modeSource: 'env', verdict: 'send-back' });
+    expect(rec).toMatchObject({ pr: 77, trigger: 'red-team-cap', mode: 'shadow', modeSource: 'env', verdict: 'non-converging' });
     const file = join(dir, '2026-10.jsonl');
     const rows = readFileSync(file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(rows).toHaveLength(1);
-    expect(rows[0].line).toBe('round-judge-shadow: #77 verdict=send-back reasons=findings-changing-not-shrinking');
+    expect(rows[0].line).toBe('round-judge-shadow: #77 verdict=non-converging reasons=new-finding-class-each-round:2-rounds-1-new-findings;route-to-redesign-D-R451');
     expect(rows[0].evidence).toMatchObject({ latestCount: 1, prevCount: 1, trend: 'changing' });
-    expect(lines[0]).toMatch(/^round-judge-shadow: #77 verdict=send-back .*source=env/);
+    expect(lines[0]).toMatch(/^round-judge-shadow: #77 verdict=non-converging .*source=env/);
     expect(observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) })).toMatchObject({ skipped: 'already-logged' });
     expect(readFileSync(file, 'utf8').trim().split('\n')).toHaveLength(1);
   });
@@ -124,5 +124,17 @@ describe('observeRoundCap', () => {
     const dir = tmp();
     observeRoundCap({ pr: 77, subject: subject(), env: env(), dir, now: Date.UTC(2026, 9, 21) });
     expect(readdirSync(dir).sort()).toEqual(['2026-10.jsonl']);
+  });
+});
+
+describe('nonConverging setting', () => {
+  it('is off in the standard, on when the settings file turns it on, and ignores junk', () => {
+    const maxJunk = tmp(); const mp = join(maxJunk, 'm.json'); writeFileSync(mp, JSON.stringify({ rounds: { judge: { mode: 'shadow', maxGrants: true } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: mp, platform: null }).maxGrants).toBe(20);
+    expect(resolveRoundJudgeMode({ env: {}, path: '/nonexistent', platform: null }).nonConverging).toBe(false);
+    const d = tmp(); const p = join(d, 's.json'); writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow' }, nonConverging: { enabled: true } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).nonConverging).toBe(true);
+    writeFileSync(p, JSON.stringify({ rounds: { judge: { mode: 'shadow' }, nonConverging: { enabled: 'yes' } } }));
+    expect(resolveRoundJudgeMode({ env: {}, path: p, platform: null }).nonConverging).toBe(false);
   });
 });

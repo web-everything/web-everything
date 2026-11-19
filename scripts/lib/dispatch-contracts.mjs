@@ -1031,7 +1031,8 @@ export const DELIVERY_VENDOR_PROVIDERS = Object.freeze({ 'claude-restricted': 'c
 /** The launch kinds whose dispatch honours the marker (`build`, `fix`, `ci-heal` — the three provider modules that
  *  read it). A marker on an item the tick launches as a `prepare`/`investigate` is not read: it is not an override
  *  of anything there, so it is neither recorded nor refused. */
-const MARKER_KINDS = Object.freeze(['build', 'fix', 'ci-heal']);
+// @wired-by-3717: has a runtime caller — the G2 dispatcher wiring (see `decideDispatchRoute`)
+export const MARKER_KINDS = Object.freeze(['build', 'fix', 'ci-heal']);
 
 /**
  * WHICH VENDOR ACTUALLY EXECUTES A DISPATCH, given what the criteria `routed` and what #3840's `deliveryAgent:`
@@ -1372,8 +1373,13 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
       scorecards: routingRecords(options.scorecards), vetoes: criticalMissesFor(options.scorecards ?? [], record.taskType),
       availability });
     record.auditTrail.push(...picked.auditTrail);
-    if (!picked.worker) return { ...record, probationWorker: null, outcome: 'refused', refusal: picked.reason };
-    record.probationWorker = picked.worker;
+    if (picked.worker) record.probationWorker = picked.worker;
+    // routing.builder=claude (resolveDispatchRoute) asks for native Claude when the whole roster is held; the caller
+    // has already checked native Claude is not held. A held native pool is re-checked here and still refuses.
+    else if (options.ciHealNativeFallback === true && !availability.claude) {
+      record.probationWorker = null;
+      record.auditTrail.push({ criterion: 'ci-heal-native-claude-fallback', result: 'native-claude', dataConsulted: picked.reason, reasoning: 'routing.builder=claude: no probation worker is eligible and native Claude is not held' });
+    } else return { ...record, probationWorker: null, outcome: 'refused', refusal: picked.reason };
   }
   // Every policy-routed kind needs a verdict, including roles and future operation names.
   // Keep the inherited evidence router unchanged when no explicit policy route exists.

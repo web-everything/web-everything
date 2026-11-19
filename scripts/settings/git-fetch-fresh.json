@@ -1,0 +1,4 @@
+{
+  "$comment": "Shared git fetch freshness window. Standard/platform/tool/env cascade; WE_GIT_FETCH_FRESH_SECONDS overrides maxAgeSeconds (0..3600; 0 = always fetch). Default 60 s: a decision needing current main sees a fetch at most this old. See scripts/lib/git-fetch-fresh.mjs.",
+  "gitFetchFresh": { "maxAgeSeconds": 60 }
+}

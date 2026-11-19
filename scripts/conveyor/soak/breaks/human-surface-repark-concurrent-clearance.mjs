@@ -31,7 +31,8 @@ export default {
       readComments() {
         // Snapshot the old comments, then let the operator complete the ceremony.
         const old = [...state.comments];
-        state.comments.push({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
+        // A clearance counts only from the human operator (R706), with a comment id.
+        state.comments.push({ id: 'IC_clearance_late', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
         return old;
       },
       provider: {
@@ -102,7 +103,7 @@ export default {
         readPrState: () => ({ ...live, labels: [...live.labels], comments: [...live.comments] }),
         readPrFiles: () => ['.github/workflows/ci.yml'],
         postComment() {
-          live.comments.push({ author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
+          live.comments.push({ id: 'IC_clearance_inflight', author: { login: 'chalbert' }, body: `${buildReviewedShaMarker(head)}\n${buildClearedHumanMarker('operator')}` });
         },
         setLabels(_repo, _pr, { add, remove = [] }) {
           live.labels = [...new Set([...live.labels.filter(label => !remove.includes(label)), add])];

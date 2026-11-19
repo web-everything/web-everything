@@ -178,7 +178,7 @@ describe('materializeCandidate', () => {
     let lease;
     try {
       const state = readRebuildState(ROOT, ENV);
-      lease = claimBuildLease({ state, plan: { finalSha: 'abc', inputsKey: 'inputs' }, root: ROOT, run, env: ENV, nowMs: Date.now() });
+      lease = claimBuildLease({ state, plan: { finalSha: 'abc', inputsKey: 'inputs' }, root: ROOT, run, env: ENV, nowMs: Date.now(), startTimeOf: () => null });
       expect(lease).not.toBeNull();
       writeRebuildState(ROOT, state, ENV);
       const r = materializeCandidate({ root: ROOT, sha: 'abc', run, env: ENV, path: lease.path, pidAlive: () => alive, rm: () => {} });

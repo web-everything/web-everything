@@ -1,0 +1,399 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { planGateRefresh, refreshMergeGateAfterRestamp, toggleMergeGateRefresh } from '../merge-gate-refresh.mjs';
+
+const head = 'a'.repeat(40);
+const restampedAtMs = Date.parse('2026-11-15T15:58:24Z');
+const gate = (extra = {}) => ({ id: 10, name: 'merge-gate', head_sha: head,
+  status: 'completed', conclusion: 'failure', started_at: '2026-11-15T15:58:03Z', ...extra });
+const plan = checkRuns => planGateRefresh({ checkRuns, head, restampedAtMs });
+function fixture(checkRuns = [gate()], liveHead = head, total = checkRuns.length, labels = []) {
+  let currentLabels = [...labels];
+  return vi.fn((_file, args) => {
+    if (args.includes('--add-label')) currentLabels = [{ name: 'gate:refresh' }];
+    if (args.includes('--remove-label')) currentLabels = [];
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ labels: currentLabels });
+    if (args[0] !== 'api') return '';
+    if (args[1].includes('/check-runs')) return JSON.stringify({ total_count: total, check_runs: checkRuns });
+    return JSON.stringify({ head: { sha: liveHead } });
+  });
+}
+const run = (gh, extra = {}) => refreshMergeGateAfterRestamp({ repo: 'o/r', pr: 7, head, gh,
+  restampedAtMs, sleep: vi.fn(), ...extra });
+let stateDir;
+beforeEach(() => {
+  stateDir = fs.mkdtempSync(join(tmpdir(), 'restamp-refresh-'));
+  vi.stubEnv('WE_COORDINATION_ROOT', stateDir);
+});
+afterEach(() => { fs.rmSync(stateDir, { recursive: true, force: true }); vi.unstubAllEnvs(); });
+afterEach(() => vi.restoreAllMocks());
+
+describe('merge-gate refresh after restamp', () => {
+  it.each(['denied', 'timeout', 'read-back', 'removal'])('reports returned %s failures with the retained-restamp operator hint', kind => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let added = false;
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--add-label')) {
+        added = true;
+        if (kind === 'denied') throw new Error('HTTP 403: add denied');
+        if (kind === 'timeout') throw new Error('add timed out');
+      }
+      if (added && args[1] === 'view' && kind === 'read-back') throw new Error('read-back offline');
+      if (args.includes('--remove-label') && kind === 'removal') throw new Error('removal offline');
+      return base(file, args, opts);
+    });
+    const result = run(gh);
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('acceptance restamp retained') });
+    expect(result.error).toContain('ask an operator');
+    expect(stderr.mock.calls.flat().join('')).toContain(result.error);
+    if (kind === 'removal') expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(1);
+  });
+  it('restamp reconciles an uncertain refresh without another add', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let firstPass = true;
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--add-label')) {
+        base(file, args, opts); // GitHub applied the timed-out write.
+        throw new Error('add timed out');
+      }
+      if (firstPass && args[1] === 'view' && gh.mock.calls.some(([, a]) => a.includes('--add-label'))) throw new Error('offline');
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toMatchObject({ ok: false, state: 'pending-unknown' });
+    const attemptPath = join(stateDir, 'restamp-gate-refresh', fs.readdirSync(join(stateDir, 'restamp-gate-refresh'))[0]);
+    expect(JSON.parse(fs.readFileSync(attemptPath, 'utf8'))).toMatchObject({ state: 'pending-unknown', confirmed: false });
+    firstPass = false;
+    expect(run(gh)).toMatchObject({ ok: true, refreshed: true });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    expect(run(gh)).toMatchObject({ ok: true, refreshed: false });
+  });
+  it.each([401, 403, 404, 410, 422, 408, 409, 429])('classifies HTTP %i without repeating an ambiguous write', status => {
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) throw new Error(`HTTP ${status}: response`);
+      return args[1] === 'view' ? '{"labels":[]}' : '';
+    });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh })).toMatchObject({
+      ok: false, state: [408, 409, 429].includes(status) ? 'pending-unknown' : 'denied',
+    });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
+  it.each([false, true])('reconciles persisted confirmed=%s when the label is absent', confirmed => {
+    const gh = vi.fn(() => '{"labels":[]}');
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending: { confirmed } }))
+      .toMatchObject({ ok: confirmed, state: confirmed ? 'confirmed' : 'pending-unknown' });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each(['integration', 'personal access token'])('releases a GraphQL %s denial so a later restamp can retry', actor => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let denied = true;
+    const gh = vi.fn((file, args, opts) => {
+      if (denied && args.includes('--add-label')) throw Object.assign(new Error('Command failed: gh pr edit'), {
+        status: 1,
+        stderr: Buffer.from(`GraphQL: Resource not accessible by ${actor} (addLabelsToLabelable)\n`),
+      });
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toMatchObject({ ok: false, state: 'denied' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    denied = false;
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(run(gh)).toEqual({ ok: true, refreshed: false });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(2);
+  });
+  it.each([
+    'GraphQL: Something went wrong while executing your query (addLabelsToLabelable)',
+    'GraphQL: API rate limit exceeded',
+    'GraphQL: Resource not accessible by integration (repository)',
+    'add timed out',
+  ])('retains unknown outcomes without another add: %s', message => {
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) throw Object.assign(new Error(message), { status: 1 });
+      return args[1] === 'view' ? '{"labels":[]}' : '';
+    });
+    const pending = toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh });
+    expect(pending).toMatchObject({ ok: false, state: 'pending-unknown', confirmed: false });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending })).toMatchObject({ state: 'pending-unknown' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
+  it('retains a confirmed removal when the subsequent GraphQL add is denied', () => {
+    let present = true;
+    const gh = vi.fn((_bin, args) => {
+      if (args[1] === 'view') return JSON.stringify({ labels: present ? [{ name: 'gate:refresh' }] : [] });
+      if (args.includes('--remove-label')) present = false;
+      if (args.includes('--add-label')) throw new Error('GraphQL: Resource not accessible by integration (addLabelsToLabelable)');
+      return '';
+    });
+    const pending = toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh });
+    expect(pending).toMatchObject({ ok: false, state: 'pending-unknown', confirmed: true });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending })).toEqual({ ok: true, state: 'confirmed' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
+  it.each([408, 409, 429])('confirms an applied add despite HTTP %i and never adds again', status => {
+    let present = false;
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) { present = true; throw new Error(`HTTP ${status}: ambiguous response`); }
+      if (args[1] === 'view') return JSON.stringify({ labels: present ? [{ name: 'gate:refresh' }] : [] });
+      if (args.includes('--remove-label')) present = false;
+      return '';
+    });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh })).toMatchObject({ ok: true, state: 'confirmed' });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    expect(present).toBe(false);
+  });
+  it.each(['null', '{}', 'bad JSON', 'oversized'])('refuses corrupt or oversized persisted attempt %s before any label mutation', contents => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const gh = fixture();
+    expect(run(gh)).toMatchObject({ ok: true });
+    const dir = join(stateDir, 'restamp-gate-refresh');
+    const path = join(dir, fs.readdirSync(dir).find(name => !name.endsWith('.lock')));
+    fs.writeFileSync(path, contents === 'oversized' ? ' '.repeat(4097) : contents);
+    gh.mockClear();
+    expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('ask an operator') });
+    expect(gh.mock.calls.some(([, args]) => args[0] === 'label' || args[1] === 'edit')).toBe(false);
+  });
+  it('permits a newer failed gate after a confirmed stale gate without losing the old bound', () => {
+    expect(run(fixture())).toEqual({ ok: true, refreshed: true });
+    const gh = fixture([gate({ id: 11 })]);
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(run(gh)).toEqual({ ok: true, refreshed: false });
+    expect(run(fixture())).toEqual({ ok: true, refreshed: false }); // Older API evidence cannot re-arm it.
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+  });
+  it('plans refresh for the newest failed gate before the restamp', () => {
+    expect(plan([gate({ id: 9 }), gate(), gate({ id: 11, name: 'tests' })])).toEqual({ checkRunId: 10 });
+  });
+  it.each([
+    { status: 'completed', conclusion: 'success' },
+    { status: 'queued', conclusion: null, started_at: null },
+    { head_sha: 'b'.repeat(40) },
+    { started_at: new Date(restampedAtMs).toISOString() },
+    { started_at: new Date(restampedAtMs + 1000).toISOString() },
+  ])('does not fall back past newer gate %j', extra => {
+    expect(plan([gate(), gate({ id: 11, ...extra })])).toBeNull();
+  });
+  it.each([null, [], [gate({ started_at: null })], [gate({ id: null })]])(
+    'refuses incomplete evidence %j', checks => expect(plan(checks)).toBeNull());
+  it.each([
+    { total: 101, gateIndex: 0 },
+    { total: 101, gateIndex: 100 },
+    { total: 250, gateIndex: 249 },
+  ])('refreshes with unrelated CI history %j by requesting only merge-gate checks', ({ total, gateIndex }) => {
+    const checkRuns = Array.from({ length: total }, (_, i) => gate({ id: i + 1, name: `ci-${i}` }));
+    checkRuns[gateIndex] = gate({ id: gateIndex + 1 });
+    const base = fixture();
+    const gh = vi.fn((file, args, options) => {
+      if (args[0] === 'api' && args[1].includes('/check-runs')) {
+        const query = new URL(args[1], 'https://api.github.test/').searchParams;
+        const selected = query.get('check_name') === 'merge-gate'
+          ? checkRuns.filter(check => check.name === 'merge-gate') : checkRuns;
+        return JSON.stringify({ total_count: selected.length, check_runs: selected.slice(0, 100) });
+      }
+      return base(file, args, options);
+    });
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(gh.mock.calls.at(-3)[1]).toContain('--add-label');
+    expect(gh.mock.calls.at(-1)[1]).toContain('--remove-label');
+    expect(gh).toHaveBeenCalledTimes(7);
+  });
+  it('creates the neutral label then adds and removes it after checking the live head', () => {
+    const gh = fixture();
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(gh.mock.calls.map(([, args]) => args)).toEqual([
+      ['api', `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`],
+      ['api', 'repos/o/r/pulls/7'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
+      ['label', 'create', 'gate:refresh', '--repo', 'o/r', '--color', 'ededed', '--description', 'Refresh merge-gate after acceptance restamp'],
+      ['pr', 'edit', '7', '--repo', 'o/r', '--add-label', 'gate:refresh'],
+      ['pr', 'view', '7', '--repo', 'o/r', '--json', 'labels'],
+      ['pr', 'edit', '7', '--repo', 'o/r', '--remove-label', 'gate:refresh'],
+    ]);
+  });
+  it('bounds all four reads to 2 MiB and a 30-second timeout', () => {
+    const gh = fixture();
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    const reads = gh.mock.calls.filter(([, args]) => args[0] === 'api' || args[1] === 'view');
+    expect(reads).toHaveLength(4);
+    expect(reads.map(([, args]) => args[1])).toEqual([
+      `repos/o/r/commits/${head}/check-runs?per_page=100&filter=all&check_name=merge-gate`,
+      'repos/o/r/pulls/7',
+      'view',
+      'view',
+    ]);
+    for (const [, , options] of reads) {
+      expect(options).toMatchObject({ maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
+    }
+  });
+  it.each(['check-runs', 'pulls'])('fails closed without label mutations when the %s API read exceeds its byte limit', phase => {
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    const gh = vi.fn((file, args, options) => {
+      const response = base(file, args, options);
+      if (args[0] === 'api' && args[1].includes(`/${phase}`)) {
+        // Exercise Node's real transport limit with a local child, never GitHub.
+        // Trailing JSON whitespace keeps the response valid if the bound breaks.
+        return execFileSync(process.execPath, ['-e',
+          "process.stdout.write(process.argv[1] + ' '.repeat(2 * 1024 * 1024))", response], options);
+      }
+      return response;
+    });
+    const result = run(gh);
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('ENOBUFS') });
+    expect(result.error).toContain('retry restamp');
+    expect(stderr.mock.calls.flat().join('')).toContain('ENOBUFS');
+    expect(gh).toHaveBeenCalledTimes(phase === 'check-runs' ? 1 : 2);
+    expect(gh.mock.calls.every(([, args]) => args[0] === 'api')).toBe(true);
+  });
+  it('continues when the neutral label already exists', () => {
+    const base = fixture();
+    const gh = vi.fn((file, args, opts) => {
+      if (args[0] === 'label') throw new Error('label already exists');
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(gh.mock.calls.at(-1)[1]).toContain('--remove-label');
+  });
+  it.each(['create'])('retries %s three times with backoff and reports failure without throwing', phase => {
+    const base = fixture();
+    const sleep = vi.fn();
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes(phase)) throw new Error('daemon token denied');
+      return base(file, args, opts);
+    });
+    expect(run(gh, { sleep })).toMatchObject({ ok: false, error: expect.stringContaining('daemon token denied') });
+    expect(gh.mock.calls.filter(([, args]) => args.includes(phase))).toHaveLength(3);
+    expect(sleep.mock.calls).toEqual([[1000], [2000]]);
+    expect(stderr.mock.calls.flat().join('')).toContain('daemon token denied');
+  });
+  it('label already present and uncertain pre-remove is held without retrying the removal or adding', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture([gate()], head, 1, [{ name: 'gate:refresh' }]);
+    const sleep = vi.fn();
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--remove-label')) throw new Error('pre-remove denied');
+      return base(file, args, opts);
+    });
+    expect(run(gh, { sleep })).toMatchObject({ ok: false, state: 'pending-unknown', error: expect.stringContaining('pre-remove denied') });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--remove-label'))).toHaveLength(1);
+    expect(gh.mock.calls.some(([, args]) => args.includes('--add-label'))).toBe(false);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+  it('label present and pre-remove ok makes the add trigger a real transition', () => {
+    let present = true;
+    const base = fixture([gate()], head, 1, [{ name: 'gate:refresh' }]);
+    const transitions = [];
+    const gh = vi.fn((file, args, opts) => {
+      if (args.includes('--remove-label')) { transitions.push('remove'); present = false; }
+      if (args.includes('--add-label')) {
+        expect(present).toBe(false);
+        transitions.push('add');
+        present = true;
+      }
+      return base(file, args, opts);
+    });
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+    expect(transitions).toEqual(['remove', 'add', 'remove']);
+    expect(present).toBe(false);
+  });
+  it.each(['unreadable', 'invalid JSON', 'missing labels', 'malformed labels', 'oversized'])(
+    'fails closed on %s PR label evidence before any label mutation', kind => {
+      vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const base = fixture();
+      const gh = vi.fn((file, args, opts) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          if (kind === 'unreadable') throw new Error('label read denied');
+          if (kind === 'invalid JSON') return '{';
+          if (kind === 'missing labels') return '{}';
+          if (kind === 'malformed labels') return JSON.stringify({ labels: [{}] });
+          return execFileSync(process.execPath, ['-e',
+            "process.stdout.write('{\"labels\":[]}' + ' '.repeat(2 * 1024 * 1024))"], opts);
+        }
+        return base(file, args, opts);
+      });
+      expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('operator to toggle gate:refresh') });
+      expect(gh.mock.calls).toHaveLength(3);
+      expect(gh.mock.calls.some(([, args]) => args[0] === 'label' || args[1] === 'edit')).toBe(false);
+    });
+  it.each([
+    ['confirmed', null, 'present', true, 'confirmed'],
+    ['denied 4xx', 'HTTP 403: denied', 'absent', false, 'denied'],
+    ['unknown timeout', 'add timed out', 'absent', false, 'pending-unknown'],
+    ['unreadable read-back', null, 'unreadable', false, 'pending-unknown'],
+    ['failed removal', null, 'remove-fails', false, 'pending-unknown'],
+  ])('%s never retries the add or claims false success', (_name, addError, evidence, ok, state) => {
+    let added = false;
+    const gh = vi.fn((_bin, args) => {
+      if (args.includes('--add-label')) { added = true; if (addError) throw new Error(addError); }
+      if (args.includes('--remove-label') && evidence === 'remove-fails') throw new Error('cleanup denied');
+      if (args[1] === 'view') {
+        if (added && evidence === 'unreadable') throw new Error('offline');
+        return JSON.stringify({ labels: added && evidence !== 'absent' ? [{ name: 'gate:refresh' }] : [] });
+      }
+      return '';
+    });
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh })).toMatchObject({ ok, state });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(1);
+    if (state === 'denied' || evidence === 'absent' || evidence === 'unreadable')
+      expect(gh.mock.calls.some(([, args]) => args.includes('--remove-label'))).toBe(false);
+  });
+  it('next-pass re-read of pending never removes and re-adds the label', () => {
+    const gh = vi.fn((_bin, args) => args[1] === 'view' ? JSON.stringify({ labels: [{ name: 'gate:refresh' }] }) : '');
+    expect(toggleMergeGateRefresh({ repo: 'o/r', pr: 7, gh, pending: { confirmed: false } })).toMatchObject({ ok: true });
+    expect(gh.mock.calls.map(([, args]) => args[1])).toEqual(['view', 'edit']);
+    expect(gh.mock.calls.some(([, args]) => args.includes('--add-label'))).toBe(false);
+  });
+  it('refreshes a still-running gate that began before the restamp (it may have read the old thread)', () => {
+    const gh = fixture([gate({ status: 'in_progress', conclusion: null })]);
+    expect(run(gh)).toEqual({ ok: true, refreshed: true });
+  });
+  it.each([0, 100])('accepts complete filtered evidence containing %i gates', count => {
+    const gh = fixture(Array.from({ length: count }, (_, i) => gate({ id: i + 1 })));
+    expect(run(gh)).toEqual({ ok: true, refreshed: count > 0 });
+  });
+  it('fails closed with an operator fallback when gate history itself exceeds the page bound', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const gh = fixture(Array.from({ length: 101 }, (_, i) => gate({ id: i + 1 })));
+    expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('operator to toggle gate:refresh') });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each(['moved', 'oversized', 'unreadable'])('fails closed on %s evidence and names operator fallback', phase => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const gh = phase === 'unreadable' ? vi.fn(() => { throw new Error('offline'); })
+      : fixture([gate()], phase === 'moved' ? 'b'.repeat(40) : head, phase === 'oversized' ? 101 : 1);
+    expect(run(gh)).toMatchObject({ ok: false, error: expect.stringContaining('retry restamp') });
+    expect(gh.mock.calls.every(([, args]) => args[0] === 'api')).toBe(true);
+  });
+  it('releases a definite denial so another restamp can retry, with no rerun request', () => {
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const base = fixture();
+    let failing = true;
+    const gh = vi.fn((file, args, opts) => {
+      if (failing && args.includes('--add-label')) throw new Error('HTTP 403: denied');
+      return base(file, args, opts);
+    });
+    expect(run(gh).ok).toBe(false);
+    failing = false;
+    expect(run(gh)).toMatchObject({ ok: true, refreshed: true });
+    expect(gh.mock.calls.filter(([, args]) => args.includes('--add-label'))).toHaveLength(2);
+    expect(gh.mock.calls.some(([, args]) => args.includes('POST') || args.includes('rerun'))).toBe(false);
+  });
+  it('wires only successful restamps after all writes and includes the helper result in JSON', () => {
+    const source = fs.readFileSync('scripts/review-set-label.mjs', 'utf8');
+    expect(source).toContain("import { refreshMergeGateAfterRestamp } from './lib/merge-gate-refresh.mjs'");
+    expect(source).toMatch(/for \(const step of order\) \{ steps\[step\]\(\); \}\s*const refreshFn = refreshGate \?\? \(liveGhProviders\.has\(provider\) \? refreshMergeGateAfterRestamp : null\);\s*const gateRefresh = to === 'restamp' && refreshFn\s*\? refreshFn\(\{ repo, pr, head: headSha, restampedAtMs: restampedAt \}\)/);
+    expect(source).toMatch(/\.\.\.successResult\(\{ pr: Number\(pr\), to, decision, labels: newLabels \}\),\s*\.\.\.\(gateRefresh \? \{ gateRefresh \} : \{\}\)/);
+  });
+  it('the workflow label-event filter lets gate:refresh through (else the toggle never re-runs the gate)', () => {
+    const yml = readFileSync(join(process.cwd(), '.github/workflows/merge-gate.yml'), 'utf8');
+    const filters = yml.split('\n').filter(l => /^\s*(name|if|group):/.test(l) && l.includes("!= 'ready-to-merge'"));
+    expect(filters.length).toBe(3);
+    for (const l of filters) expect(l).toContain("github.event.label.name != 'gate:refresh'");
+  });
+});

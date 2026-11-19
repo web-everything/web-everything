@@ -4,7 +4,7 @@ import { derivePrState, labelsToLedgerState, ledgerView } from '../../pr-state.m
 import { deriveReferrals, ledgerFindingKey } from '../referrals.mjs';
 import { evaluateHolds } from '../holds/index.mjs';
 import { LIFECYCLE_STATE_NAMES, renderLabels, HUMAN_HOLD_CI_RED } from '../../../conveyor/pr-lifecycle.mjs';
-import { buildVerdictRecord, buildLedgerEvent, VERDICTS } from '../../verdict-ledger.mjs';
+import { buildVerdictRecord, buildLedgerEvent, ledgerEventId, VERDICTS } from '../../verdict-ledger.mjs';
 
 const repo = 'web-everything/web-everything', PR = 4017;
 const H1 = 'a'.repeat(40), H2 = 'b'.repeat(40), H3 = 'c'.repeat(40);
@@ -95,8 +95,8 @@ describe('hold rules', () => {
     expect(state([added, verdict(VERDICTS.ACCEPTED, 9)], facts()).holds).toEqual([]);
   });
   it('an approval lifts a human hold unless its delegation expired', () => {
-    const approval = d => ev('approval', 5, { approval: 'judge', delegation: d });
     const human = verdict(VERDICTS.HUMAN, 1);
+    const approval = d => ev('approval', 5, { approval: 'judge', delegation: d, headSha: H1, basis: [ledgerEventId(human)] });
     expect(state([human, approval(null)], facts()).lifecycleState).toBe('READY-TO-MERGE');
     const expired = { by: 'op', scope: 'pr', expires: at(10) };
     expect(state([human, approval(expired)], facts({ now: at(60) })).lifecycleState).toBe('NEEDS-OPERATOR');
@@ -180,7 +180,7 @@ describe('replays: no ruling needed', () => {
 });
 
 describe('fail closed: every hold rule defaults to deny (review of PR #4326)', () => {
-  const approval = (m, d) => ev('approval', m, { approval: 'judge', delegation: d });
+  const approval = (m, d, hold = verdict(VERDICTS.HUMAN, 1)) => ev('approval', m, { approval: 'judge', delegation: d, headSha: H1, basis: [ledgerEventId(hold)] });
   const expired = { by: 'op', scope: 'pr', expires: at(10) };
   const live10 = { by: 'op', scope: 'pr', expires: at(600) };
   const held = out => expect(out.lifecycleState).toBe('NEEDS-OPERATOR');
@@ -189,14 +189,14 @@ describe('fail closed: every hold rule defaults to deny (review of PR #4326)', (
     const humanVerdict = [verdict(VERDICTS.HUMAN, 1)];
     const handLabel = [verdict(VERDICTS.ACCEPTED, 1), ev('label-input', 4, { label: 'review:human', sender: 'someone', change: 'added' })];
     it.each([['verdict-based human hold', humanVerdict], ['hand-added human label', handLabel]])('%s: an expired delegation keeps the hold, a live one lifts it', (_n, base) => {
-      held(state([...base, approval(5, expired)], facts({ now: at(60) })));
-      expect(state([...base, approval(5, live10)], facts({ now: at(60) })).lifecycleState).toBe('READY-TO-MERGE');
-      expect(state([...base, approval(5, null)], facts({ now: at(60) })).lifecycleState).toBe('READY-TO-MERGE');
+      held(state([...base, approval(5, expired, base.at(-1))], facts({ now: at(60) })));
+      expect(state([...base, approval(5, live10, base.at(-1))], facts({ now: at(60) })).lifecycleState).toBe('READY-TO-MERGE');
+      expect(state([...base, approval(5, null, base.at(-1))], facts({ now: at(60) })).lifecycleState).toBe('READY-TO-MERGE');
     });
     it.each([['verdict-based human hold', humanVerdict], ['hand-added human label', handLabel]])('%s: a missing or unparseable now, or a non-finite expiry, never lifts a delegated approval', (_n, base) => {
-      held(state([...base, approval(5, expired)], facts({ now: undefined })));
-      held(state([...base, approval(5, expired)], facts({ now: 'not a time' })));
-      const hand = { ...approval(5, expired), delegation: { ...expired, expires: 'garbage' } }; // the builder refuses this; a raw ledger row might not
+      held(state([...base, approval(5, expired, base.at(-1))], facts({ now: undefined })));
+      held(state([...base, approval(5, expired, base.at(-1))], facts({ now: 'not a time' })));
+      const hand = { ...approval(5, expired, base.at(-1)), delegation: { ...expired, expires: 'garbage' } }; // the builder refuses this; a raw ledger row might not
       held(state([...base, hand], facts()));
     });
     it('an approval that PRECEDES the human verdict lifts nothing', () => {

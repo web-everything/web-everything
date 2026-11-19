@@ -1253,11 +1253,17 @@ export const MISSING_RUN_COMMENT_MARKER = '🚦 conveyor missing-run-recovery';
  */
 export function isStalledPartialRollup(roll, names) {
   if (!Array.isArray(names) || !names.length || !Array.isArray(roll) || !roll.length) return false;
-  const reported = new Set(roll.map((c) => c?.name || c?.context).filter(Boolean));
+  const reported = new Set(roll.filter(c => !isStartupFailure(c)).map((c) => c?.name || c?.context).filter(Boolean));
   if (names.every((n) => reported.has(n))) return false;
   return roll.every((c) => (c?.__typename === 'StatusContext' || (c?.state && !c?.status))
     ? !['PENDING', 'EXPECTED'].includes(String(c?.state).toUpperCase())
     : String(c?.status ?? '').toUpperCase() === 'COMPLETED');
+}
+
+/** A startup failure produced no job execution; every other verdict remains reported. */
+export function isStartupFailure(row) {
+  return String(row?.status).toUpperCase() === 'COMPLETED'
+    && String(row?.conclusion).toUpperCase() === 'STARTUP_FAILURE';
 }
 
 /**
@@ -1308,16 +1314,29 @@ export function buildMissingRunCandidates(prs, {
     // #2793 — a real git conflict can never produce a merge ref, so it can never produce a required-check run
     // either; leave it entirely to the conflict-resolution path rather than burning this pass's own retry cap.
     if (['CONFLICTING', 'UNKNOWN'].includes(String(pr?.mergeable ?? '').toUpperCase())) continue;
-    const roll = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+    const roll = Array.isArray(pr?.statusCheckRollup) ? [...pr.statusCheckRollup] : [];
+    // A successful workflow can precede its rollup row. Count its context too,
+    // so startup failures mixed with an executed run are never startup-only.
+    for (const run of Array.isArray(pr?.workflowRuns) ? pr.workflowRuns : []) {
+      if (isStartupFailure(run)) continue;
+      const contexts = [run?.name, typeof run?.name === 'string' ? run.name.toLowerCase().replace(/\s+/g, '-') : null,
+        typeof run?.path === 'string' ? run.path.split('/').at(-1).replace(/\.ya?ml(?:@.*)?$/, '') : null];
+      for (const name of contexts.filter(Boolean)) roll.push({ name, status: run.status, conclusion: run.conclusion });
+    }
     const allMissing = unknown
       ? !roll.some((c) => c?.workflowName === workflowName)
       : (() => {
-        const reported = new Set(roll.map((c) => c?.name || c?.context).filter(Boolean));
+        const reported = new Set(roll.filter(c => !isStartupFailure(c)).map((c) => c?.name || c?.context).filter(Boolean));
         return names.every((n) => !reported.has(n));
       })();
     if (!allMissing && !isStalledPartialRollup(roll, stalledPartialContexts ?? (unknown ? null : names))) {
       continue; // at least one required context has SOME entry — not this pass's population.
     }
+    // A missing rollup row cannot hide a workflow that is still running or really
+    // failed. Preserve the older listing contract when no workflow evidence exists.
+    if (Array.isArray(pr?.workflowRuns) && pr.workflowRuns.some(run =>
+      !isStartupFailure(run) && (String(run?.status).toUpperCase() !== 'COMPLETED'
+        || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(run?.conclusion).toUpperCase())))) continue;
     out.push({ prNumber, headRefName: pr?.headRefName ?? null, headSha: pr?.headRefOid ?? null, baseRefName: pr?.baseRefName ?? null });
   }
   return out;

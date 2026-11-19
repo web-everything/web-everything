@@ -48,6 +48,8 @@ export const ENFORCED_ROUTES: ReadonlySet<string> = new Set([
   '/governance/',
   '/research/',
   '/backlog/',
+  // Resolved archive shares the tracked-work markup; gate it alongside the current backlog.
+  '/backlog/resolved/',
   // Promoted 2026-07-28 (#2378): measured green in the same enforce run.
   '/adapters/declarative-component/',
   '/author/',
@@ -83,6 +85,10 @@ const segments = (p: string): string[] => p.replace(/^\/|\/$/g, '').split('/').f
  * representative sample per collection-template, keyed by first path segment). Pure + deterministic
  * (sorted output, stable "first" pick) so the gate's route set can't drift run-to-run.
  */
+/** Two-segment pages that are index surfaces in their own right (not collection details), so scope-C
+ *  must keep sampling them: the resolved-backlog archive holds the tiles split off `/backlog/`. */
+const ARCHIVE_INDEX_SURFACES: ReadonlySet<string> = new Set(['/backlog/resolved/']);
+
 export function deriveScopeCRoutes(paths: string[]): string[] {
   const indexSurfaces = new Set<string>();
   const firstDetailByGroup = new Map<string, string>();
@@ -91,7 +97,7 @@ export function deriveScopeCRoutes(paths: string[]): string[] {
     if (!raw || !raw.startsWith('/')) continue;
     const path = withSlash(raw);
     const segs = segments(path);
-    if (segs.length <= 1) {
+    if (segs.length <= 1 || ARCHIVE_INDEX_SURFACES.has(path)) {
       indexSurfaces.add(path); // '/', '/intents/', '/mission/', …
     } else {
       const group = segs[0];

@@ -1,4 +1,8 @@
-import { reviewStartGate, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
+import { admitMqFailureRoute } from './mq-failure-intake.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
+import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from './dispatch-eligibility-shadow.mjs';
 /**
  * reconcile-core.mjs — the PURE reconcile pass (#3296): compare DESIRED delivery state against ACTUAL, for
  * every open PR, and return what to dispatch plus every refusal and the fact each turned on.
@@ -112,6 +116,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
+import { decideReviewChurn } from './review-churn.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, verdictKind, reviewedHeadsOf, basisLineOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
@@ -126,7 +131,10 @@ import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-sta
 import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
+import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
@@ -183,6 +191,7 @@ import {
 import {
   parseReviewedSha, headEverHumanCleared, planConvertSupersededVerdict, targetedCheckQuestion, findAcceptVerdictComment, REVIEW_LABELS,
 } from '../lib/review-escalation.mjs';
+import { loadExternalCheckApps, isExternalAppCheck } from './external-check-apps.mjs';
 // live incident, web-everything/web-everything PR #2752 (#4034/#2748) — a PR whose own content is ALREADY on `main`,
 // carried there by a different PR that stacked on its branch and merged first, never owes a fix or a review.
 // The verdict itself (`pr.alreadyLandedInMain`, per-file blob-identity evidence) is computed by the IO shell
@@ -306,6 +315,8 @@ export const REFUSAL_KINDS = Object.freeze([
   'ci-heal-escalated', 'waiting-on-system-fix', 'review-hold-red',
   // A CI re-run this system requested whose result is not observed yet: held, not escalated, until the window.
   'ci-timeout-rerun-in-flight', 'timeout-evidence-unknown',
+  // Incomplete inventory recovery exhausted its rerun; no active stale path can fall through to a bounded heal.
+  'starved-capacity-alert',
   // `draft` (draft-first PRs, operator-approved 2026-09-27) — the PR is still a GitHub draft: no review is
   // dispatched, whatever `review:*` label it carries, until the `promote-draft` DISPATCH_KIND (above) has
   // un-drafted it. See {@link dispatchReviewRow}'s own gate.
@@ -377,6 +388,7 @@ export function concurrentAuthorPauseState({ comments, headRefOid = null, now = 
  * it raises no finding.
  */
 export const BOOKKEEPING_MARKERS = Object.freeze([
+  '<!-- mq-failure-recovery:',
   REFERRAL_HOLD_MARKER,
   REARM_COMMENT_MARKER, CI_HEAL_COMMENT_MARKER, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER, OPERATOR_ANSWER_MARKER,
   // #xkmu3gv — the two new completed-round markers. Neither is a reviewer speaking, so neither may ever count as
@@ -417,7 +429,7 @@ const OWED_ELSEWHERE = Object.freeze({
 export { CI_HEAL_ROUND_CAP, CI_HEAL_ATTEMPT_CAP_ENV, CI_HEAL_RESET_ON_FIX_HEAD_ENV, resolveCiHealBudget, ciHealBudgetResetAt };
 
 /**
- * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
+ * Pure durable review-round evidence. Each trusted fix re-arm (never a same-head wake) closes (start, rearmAt], where
  * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
  * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
  * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
@@ -449,7 +461,7 @@ export function countRealFixRounds(pr) {
     if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
   }
   const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
-  const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
+  const rearms = comments.filter(isFixRoundRearmComment);
   const begins = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_MARKER)
     && /^fix-\d+$/.test(FIX_MARKER_WHO_RE.exec(c.body)?.[1] ?? ''));
   const time = (c) => Date.parse(c.createdAt);
@@ -541,8 +553,9 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
   if (!rows.length || rows.some(row =>
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
     || String(row?.state).toLowerCase() === 'expected')) return null;
-  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, policy: pr.reviewTiming });
-  if (gate.allowed || gate.reason !== 'required-checks-not-successful' || !gate.affected.length
+  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
+  // 'ci-not-registered' is the early-start gate's name for the same all-missing shape (startEarly shadow/on).
+  if (gate.allowed || !['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason) || !gate.affected.length
       || gate.affected.some(row => row.reason !== 'missing')) return null;
   return { missing: gate.affected.map(row => row.name) };
 }
@@ -652,7 +665,8 @@ export function startedAtMs(startedAt) {
 /**
  * we:scripts/conveyor/reconcile-core.mjs#countFindings — how many comments on this PR are a REVIEWER speaking,
  * rather than the conveyor talking to itself. A comment whose LEADING line is one of
- * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Pure.
+ * {@link BOOKKEEPING_MARKERS} is this loop's own record and is not a finding. Note comments additionally
+ * require the same trusted-author gate as `hasPostedNoteComment` and a valid episode-key line. Pure.
  *
  * The leading-line narrowing matches `countRearmComments`'s, and for the same reason: a human who QUOTES a
  * marker comment in their reply is raising a finding, not posting a marker, and must not be discounted.
@@ -667,6 +681,8 @@ export function countFindings(comments) {
     if (typeof body !== 'string') continue;
     const head = body.trimStart();
     if (BOOKKEEPING_MARKERS.some((m) => head.startsWith(m))) continue;
+    if (head.split(/\r?\n/, 1)[0] === NOTE_COMMENT_MARKER && isTrustedMarkerAuthor(c)
+      && /^<!-- conveyor-note-key: [a-z][a-z0-9-]*:(?:\d+|unknown)(?::[^\r\n<>]*)? -->$/m.test(body)) continue;
     n += 1;
   }
   return n;
@@ -1176,14 +1192,14 @@ export function markIdleFinishedSessions(agents, idleFinishedInfoFor, nowMs, thr
  *   - every marker names a non-blank identity (`**Who:**` for begin, release line for end).
  * Earlier releases at this head remain evidence for their own sessions, until that session claims again.
  * @param {object} pr
- * @returns {{releasedAtMs:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
+ * @returns {{releasedAtMs:number, index:number, head:string, who:string, releases:Array<{releasedAtMs:number, head:string, who:string}>}|null}
  */
 export function releasedFixClaim(pr) {
   const head = String(pr?.headRefOid ?? '');
   if (!head) return null;
   const markers = (Array.isArray(pr?.comments) ? pr.comments : [])
-    .filter((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string')
-    .map((c) => ({ c, body: c.body.trimStart(), at: Date.parse(c.createdAt) }))
+    .flatMap((c, index) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
+      ? [{ c, index, body: c.body.trimStart(), at: Date.parse(c.createdAt) }] : [])
     .filter((m) => m.body.startsWith(FIX_BEGIN_MARKER) || m.body.startsWith(FIX_END_MARKER));
   if (!markers.length || markers.some((m) => !Number.isFinite(m.at))) return null;
   markers.sort((a, b) => a.at - b.at);
@@ -1191,7 +1207,7 @@ export function releasedFixClaim(pr) {
   // Equal timestamps are ambiguous ordering: array order must never decide, so fail closed.
   if (markers.some((m, i) => i > 0 && markers[i - 1].at === m.at)) return null;
   if (!last.body.startsWith(FIX_END_MARKER)) return null; // a later fix-begin = claim held again
-  const named = /at `([0-9a-f]{7,40})`/.exec(last.body)?.[1];
+  const named = fixClaimReleaseHead(last.c.body);
   if (!named || !sameHeadSha(named, head)) return null;
   const who = /^`([^`\r\n]*)` released the fix claim\b/m.exec(last.body)?.[1];
   if (!who?.trim()) return null;
@@ -1203,12 +1219,18 @@ export function releasedFixClaim(pr) {
       : /^\*\*Who:\*\* `([^`\r\n]*)`/m).exec(marker.body)?.[1];
     if (!identity?.trim()) return null; // cannot safely attribute a later claim to a session
     releasesBySession.delete(identity); // a renewed claim or invalid release supersedes its earlier evidence
-    const releaseHead = isEnd && /at `([0-9a-f]{7,40})`/.exec(marker.body)?.[1];
+    const releaseHead = isEnd && fixClaimReleaseHead(marker.c.body);
     if (releaseHead && sameHeadSha(releaseHead, head)) {
       releasesBySession.set(identity, { releasedAtMs: marker.at, head, who: identity });
     }
   }
-  return { releasedAtMs: last.at, head, who, releases: [...releasesBySession.values()] };
+  return { releasedAtMs: last.at, index: last.index, head, who, releases: [...releasesBySession.values()] };
+}
+
+/** Match the strict producer sentence used by operator-send-backs.mjs; quoted heads grant nothing. */
+function fixClaimReleaseHead(body) {
+  const release = /^🔓 conveyor fix-end — fix claim released\r?\n\r?\n`([^`\r\n]+)` released the fix claim at `([a-f0-9]{7,40})`\.(?:[ \t]|\r?\n|$)/i.exec(body);
+  return release?.[1].trim() ? release[2] : null;
 }
 
 /**
@@ -1477,15 +1499,23 @@ function refuseHumanClearedHead({ pr, refuse, withPhase, extra = {} }) {
   return true;
 }
 
+/** Optional diagnostics only; callers retain their existing refusal and dispatch decisions. */
+function earlyStartShadowFields(pr, requiredChecks) {
+  return pr?.reviewTiming?.earlyStartShadow === true ? { earlyStartShadow: earlyStartShadow({
+    headSha: pr.headRefOid, checks: pr.statusCheckRollup, requiredChecks, verifyGreen: pr.verifyGreen,
+    care: pr.careLevel, lines: pr.diffLines, files: pr.diffFiles, kinds: pr.kinds, policy: pr.reviewTiming,
+  }) } : {};
+}
+
 /**
  * The pre-review gates a review emission that does NOT go through {@link dispatchReviewRow} must still honour: a draft
  * PR, a scope-bloated diff and a human-cleared head are never reviewed. The direct
  * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
  * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
  */
-function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
+function refuseUnreviewable({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   if (pr?.isDraft) {
-    refuse('draft', { ...withPhase, ...extra, why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
+    refuse('draft', { ...withPhase, ...extra, ...earlyStartShadowFields(pr, requiredChecks), why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
     return true;
   }
   if (pr?.scopeBloat) {
@@ -1531,24 +1561,20 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, policy: pr.reviewTiming });
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
   const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
   if (!allowed) refuse('review-ci', {
-    ...withPhase, ...extra, ci,
+    ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
   });
   return allowed;
 }
 
-/** Positive integer cap override; malformed or absent configuration keeps the shared default. */
-export function resolveRoundCap(env = {}) {
-  const value = env.WE_REVIEW_ROUND_CAP;
-  return typeof value === 'string' && /^\d+$/.test(value.trim())
-    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : NEGOTIATION_ROUND_CAP;
-}
+// The shared resolver (card 8062): every round-cap reader goes through we:scripts/lib/round-cap.mjs.
+export { resolveRoundCap };
 
 function advisoryHeadState(pr) {
   const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
@@ -1569,6 +1595,40 @@ function advisoryHeadState(pr) {
   return { headSha, latest, advisoryIsCurrent, alreadyReviewed, unpinnedAdvisory };
 }
 
+/** Unreadable or unpinned history grants nothing; cross-head chronology must agree with thread order. */
+function latestHeadReview(pr, { currentHeadOnly = false } = {}) {
+  const reviews = (Array.isArray(pr?.comments) ? pr.comments : [])
+    .map((c, index) => ({ c, index }))
+    .filter(({ c }) => isTrustedMarkerAuthor(c) && (isReviewVerdictComment(c) || latestAdvisory([c])))
+    // Operator send-backs are requests, not finished reviews of a head.
+    .filter(({ c }) => !isOperatorAuthored(c) || !openOperatorSendBacks({ comments: [c] }).length)
+    .map(({ c, index }) => ({ index, head: reviewedHeadsOf(c).at(-1) ?? latestAdvisory([c])?.head, at: Date.parse(c.createdAt) }));
+  if (!reviews.length || reviews.some(r => !r.head || !Number.isFinite(r.at))) return null;
+  const current = reviews.filter(r => sameHeadSha(r.head, pr.headRefOid));
+  if (currentHeadOnly) {
+    // Other heads' clocks cannot hide a newer operator request on this head.
+    if (current.some((r, i) => i > 0 && r.at <= current[i - 1].at)) return null;
+    return current.at(-1) ?? null;
+  }
+  // Coverage is independent of chronology: a skewed old-head review cannot reopen this head.
+  if (current.length || reviews.some((r, i) => i > 0 && r.at <= reviews[i - 1].at)) return null;
+  return reviews.at(-1);
+}
+
+/** A fresh operator request takes ownership even when this head already has its advisory. */
+function operatorSendBackAfterReview(pr) {
+  const review = latestHeadReview(pr, { currentHeadOnly: true });
+  if (!review || !sameHeadSha(review.head, pr.headRefOid)) return null;
+  const item = openOperatorSendBacks(pr).at(-1);
+  if (!item?.body || !Number.isFinite(Date.parse(item.at)) || Date.parse(item.at) <= review.at
+    || item.index <= review.index
+    || (item.head && !sameHeadSha(item.head, pr.headRefOid))) return null;
+  // Reuse the same one-shot consumption check as the existing send-back route, with the original ID type.
+  if (!item.id || !operatorSendBackRearm(pr, { verdictId: pr.comments[item.index].id })) return null;
+  // `item.body` is bounded for review prompts; the fixer needs every must-fix line.
+  return { verdictId: item.id, login: item.login, body: item.fullBody };
+}
+
 /**
  * Common review decision. Allow the last fix its review at the cap; refuse only above it.
  * Preserve draft, reviewed-head and advisory conversion semantics;
@@ -1577,7 +1637,7 @@ function advisoryHeadState(pr) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
-  advisoryReview = null,
+  advisoryReview = null, reviewAfterFix = null,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1692,15 +1752,26 @@ function dispatchReviewRow({
       return;
     }
   }
+  // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
+  // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
+  // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.
+  // The same-tree skip never applies to an owed advisory / relabel / human-handoff review (those are not re-reviews of content).
+  const churnRaw = decideReviewChurn(pr);
+  const churn = churnRaw?.kind === 'same-tree' && (withPhase?.phase === 'needs-human' || extra.advisoryOwed || extra.relabelOwed || advisoryReview) ? null : churnRaw;
+  if (churn?.mode === 'shadow') extra = { ...extra, churnShadow: churn };
+  // The loop cap never skips a review of changed code: the review still runs, and the row carries `churnCap` so a
+  // needs-you note tells a person the fix/review ping-pong is not converging (added to `notes` at the end of the plan).
+  if (churn?.mode === 'on' && churn.kind === 'loop-cap') extra = { ...extra, churnCap: churn };
   // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
   // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
   // the CI gate: it is this function's review, never a second hand-rolled copy of it.
-  if (advisoryReview) {
-    if ((advisoryReview.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+  if (advisoryReview || reviewAfterFix) {
+    if ((advisoryReview?.ciWaived !== true || pr.reviewTiming?.startAfter !== 'ci-green') && !reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
     dispatch.push({
       ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
-      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
-        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) }, why: advisoryReview.why,
+      ...(advisoryReview ? { advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason,
+        ...(advisoryReview.ciWaived === true ? { ciWaived: true } : {}) } } : {}),
+      why: advisoryReview?.why ?? reviewAfterFix,
     });
     return;
   }
@@ -1957,12 +2028,39 @@ function operatorSendBackRearm(pr, operatorBudget) {
  *  truncated hydration, `rollupIncomplete`) so a live run past the page limit cannot be seen. GitHub rejects (HTTP 422) a re-run of a workflow that is still
  *  running, and the executor counts that rejection against the head's retry budget — so every mechanical re-run
  *  branch (`owed-ci-rerun`, `stale-ci-rerun`) must hold while this is true, never dispatch. Case-insensitive. */
-const hasLiveCheck = (pr) => pr?.rollupIncomplete === true || (pr?.statusCheckRollup ?? []).some(c => {
-  if (!c) return false;
-  if (c.status) return String(c.status).toUpperCase() !== 'COMPLETED';
-  // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
-  return c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
-});
+const EXTERNAL_CHECK_APPS = loadExternalCheckApps();
+const liveCheckNames = (pr, { requiredChecks, now = 0, externalCheckApps = EXTERNAL_CHECK_APPS } = {}) => {
+  if (pr?.rollupIncomplete === true) return ['<rollup incomplete>'];
+  const rollup = pr?.statusCheckRollup ?? [];
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? new Set(requiredChecks) : null;
+  // GitHub rejects a re-run only while a run of the SAME workflow is live, so an auxiliary check (red-team,
+  // review-gate, CodeQL) that is not required and runs in a different named workflow never defers it.
+  const workflows = new Set(rollup.filter(c => c && required?.has(c.name) && c.workflowName).map(c => c.workflowName));
+  // Proof must cover EVERY required check on the head (one workflow-less required check leaves the retried run unknown),
+  // and a live check linking to the same run as any required check is part of that run, whatever workflow it names.
+  const requiredRows = rollup.filter(c => c && required?.has(c.name));
+  // EVERY configured required check must be in the rollup and name its workflow; a missing one leaves the proof incomplete.
+  const proven = workflows.size > 0 && !!required && [...required].every(n => { const rows = requiredRows.filter(c => c.name === n); return rows.length > 0 && rows.every(c => c.workflowName); });
+  const runOf = (c) => /\/actions\/runs\/(\d+)/.exec(String(c?.detailsUrl ?? c?.targetUrl ?? ''))?.[1];
+  const requiredRuns = new Set(requiredRows.map(runOf).filter(Boolean));
+  return rollup.filter(c => {
+    if (!c) return false;
+    const live = c.status ? String(c.status).toUpperCase() !== 'COMPLETED'
+      // No `status`: a CheckRun that lost it is unknown (fail closed); a commit status is live while PENDING/EXPECTED.
+      : c.__typename === 'CheckRun' || ['PENDING', 'EXPECTED'].includes(String(c.state ?? '').toUpperCase());
+    if (!live) return false;
+    // Fail closed unless the required workflow is PROVEN (some required check names it) and this check names another.
+    if (!(required && c.status && !required.has(c.name) && proven)) return true;
+    if (runOf(c) && requiredRuns.has(runOf(c))) return true;
+    // A check naming a different workflow is not a live run of ours. A check with NO workflow (an app/API check such as
+    // red-team) is external only when its check-suite app (id or slug) is the configured poster of that exact check
+    // name (fix.externalCheckApps). A name or link alone, or missing app metadata, keeps the hold.
+    if (c.workflowName) return workflows.has(c.workflowName);
+    return !isExternalAppCheck(c, externalCheckApps);
+  }).map(c => String(c.name ?? c.context ?? '?'));
+};
+const hasLiveCheck = (pr, opts) => liveCheckNames(pr, opts).length > 0;
+const liveWhy = (pr, opts) => ` (live: ${liveCheckNames(pr, opts).slice(0, 5).join(', ')})`;
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#planReconcile — THE PASS. Given every open PR, every live session, and
@@ -2136,6 +2234,7 @@ export function planReconcile({
   // every queue that consumes this plan in order), is promoted from draft at once, and is never told to wait for main
   // (`owed-ci-rerun`) — it is the one PR main is waiting for. `null` (default) = before this card, byte-identical.
   mainRedPriority = null,
+  shadowDeps,
 } = {}) {
   // Fast checks are per repo: a repo whose CI does not publish them (null) waits on its required checks instead.
   const repoReviewTiming = { ...reviewTiming, fastChecks: fastChecksFor(reviewTiming?.fastChecks, repo) };
@@ -2236,6 +2335,7 @@ export function planReconcile({
     const realFixRounds = countRealFixRounds(pr);
     const openSendBacks = openOperatorSendBacks(pr);
     const base = {
+      ...(pr.timeoutRetry?.reason === 'log-unreadable' ? { ciLogEvidenceReason: 'log-unreadable' } : {}),
       ...(openSendBacks.length ? { openOperatorSendBacks: openSendBacks } : {}),
       ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions, roundExtensionAnchor: {
@@ -2374,7 +2474,7 @@ export function planReconcile({
       const grant = allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') ? pastCapGrant(extra) : null;
       if (grant?.action === 'review') {
         if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
-        if (refuseUnreviewable({ pr, refuse: refuseFn, withPhase: extra })) return;
+        if (refuseUnreviewable({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
         if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
         dispatch.push({ ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), ...grant.row, why: grant.why });
         return;
@@ -2530,6 +2630,12 @@ export function planReconcile({
         standDowns: stoodDown,
         why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,
       });
+      // Use the shared operator-note publisher: its trusted episode marker posts once,
+      // while the refusal continues to hold until an explicit answer. Count all historical
+      // stand-downs so a later question on the same head starts a new episode.
+      notes.push({ kind: 'stood-down', prNumber,
+        text: `PR #${prNumber}: needs your decision — unanswered stand-down on head ${pr.headRefOid ?? 'unknown'}`
+          + ` (question ${standDownComments(pr.comments).length}). Record an explicit operator answer with stand-down-answer.mjs.` });
       continue;
     }
 
@@ -2695,7 +2801,9 @@ export function planReconcile({
 
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
     const phase = classifyPr({
-      state: pr?.state, labels: pr?.labels, mergeStateStatus: pr?.mergeStateStatus,
+      // The planner accepts strings and GraphQL label objects; the board classifier
+      // accepts objects only. Never let a live send-back disappear behind an older accept.
+      state: pr?.state, labels: labelNames(pr?.labels).map(name => ({ name })), mergeStateStatus: pr?.mergeStateStatus,
       statusCheckRollup: pr?.statusCheckRollup,
     }, requiredChecks);
     const check = reduceCheckState(pr?.statusCheckRollup, requiredChecks);
@@ -2805,6 +2913,33 @@ export function planReconcile({
       });
       continue;
     }
+    // ── `restore-review-label`, ORPHANED-FIXING variant (R502 item 4; LIVE 2026-11-03, PR #6319). A fixer set
+    // `review-status:fixing`, then died or finished without pushing or re-arming: the PR carries that tag and NO
+    // `review:*` / `ready-to-merge` label, no live fixer holds the claim (a live session or `pr.fixClaim` refused
+    // above), and no verdict names the current head - so no daemon owned it and the old rules skipped it (phase is
+    // not `open`). Owed: the neutral `review:pending`. Not gated on CI state (ownership, not readiness: review itself
+    // waits on CI via reviewChecksAllow) but only under policy `stuck`, past the same grace as the sibling variants and
+    // only with a readable check timestamp. Unknown head fails closed; any verdict judging the head (accept, changes,
+    // advisory) means a verdict exists.
+    if (reviewLabelHeal === 'stuck' && !pr?.isDraft && (pr?.state ?? 'OPEN') === 'OPEN'
+        && String(pr?.headRefName ?? '').startsWith('lane/')
+        && withPhase.labels.includes('review-status:fixing')
+        && !withPhase.labels.some((l) => l.startsWith('review:') || l === 'ready-to-merge')
+        && !(pr?.fixClaim && pr.fixClaim.who) && !pr?.fixClaimUnknown
+        && Array.isArray(pr?.comments) && Number.isFinite(now) && now > 0
+        && typeof pr?.headRefOid === 'string' && pr.headRefOid
+        && parseReviewedSha(pr?.comments) !== pr.headRefOid.toLowerCase()
+        && !(Array.isArray(pr?.comments) && pr.comments.some((c) => isReviewVerdictComment(c) && verdictJudged(c, pr.headRefOid.toLowerCase())))
+        // Fail closed on the grace: with no readable check timestamp the PR's age is unknown, so it is not yet an orphan.
+        && (Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []).some((c) => Number.isFinite(Date.parse(c?.completedAt)))
+        && greenSettledForRestoreGrace(pr?.statusCheckRollup, now)) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'restore-review-label', label: 'review:pending', variant: 'orphaned-fixing',
+        why: 'review-status:fixing is the only tag left: no review:* label, no live fixer claim and no verdict for the '
+          + 'current head - nothing owns this PR; re-arm review:pending so the review path picks it up',
+      });
+      continue;
+    }
     // ── `restore-review-label`, STUCK variant (LIVE 2026-10-04, PR #3902). A `ready-to-merge` lane PR with NO
     // review:* label skipped review only because the drain's escalation pass would score it at land time — but
     // that pass scores MERGE CANDIDATES (every required check green). #3902 got `ready-to-merge` from the drain's
@@ -2892,8 +3027,34 @@ export function planReconcile({
     // guard / timeout-evidence refusal then held with nobody working it). Authenticated by comment author in
     // {@link operatorFixBudget}, never by text; one-shot; counted against the round grants; the loop guard stays
     // for automatic ci-heals.
-    const sendBack = (ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
-      ? operatorSendBackRearm(pr, operatorBudget) : null;
+    // Only an authenticated, current-head marker creates this finding. All earlier safety/liveness
+    // holds still win. Diff uncertainty preserves fixer admission but never authorizes refresh.
+    // The holds that are NOT an earlier `continue` are checked here: a PR that is not OPEN, is a draft, is parked
+    // for a human (`review:human`) or is held by red team gets no MQ recovery and falls through to its ordinary rule.
+    const mqHeld = String(pr?.state ?? 'OPEN').toUpperCase() !== 'OPEN' || pr?.isDraft === true
+      || withPhase.labels.some(label => ['review:human', 'red-team:blocked', 'red-team:pending'].includes(label));
+    const mqIdentity = { repo: ghRepoSlug(repo), pr: prNumber, head: pr.headRefOid };
+    const mqRoute = mqHeld ? null : (Array.isArray(pr.comments) ? pr.comments : [])
+      .map(comment => parseMqFailureRoute({ comment, expected: mqIdentity }))
+      .filter(route => route && !route.stale).at(-1);
+    const mqRecovery = admitMqFailureRoute({ ...mqIdentity, route: mqRoute,
+      changedFiles: { ...mqIdentity, files: base.files, complete: Array.isArray(base.files) && pr.filesComplete === true } });
+    if (mqRecovery) {
+      const attempts = roundAttempts();
+      if (attempts >= effectiveRoundCap) {
+        refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
+          why: 'MQ failure recovery fix rounds exhausted; operator inspection required' }, { allowTakeover: false });
+      } else {
+        dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'mq-failure-recovery', findings: 1,
+          attempts, cap: effectiveRoundCap, mqFailureRecovery: mqRecovery,
+          why: 'Authenticated current-head merge-queue failure evidence requires recovery' });
+      }
+      continue;
+    }
+
+    const sendBack = (phase === 'needs-human' ? operatorSendBackAfterReview(pr) : null)
+      ?? ((ciRepairOwed || (phase === 'bounced' && !withPhase.labels.includes(CONFLICT_LABEL)))
+        ? operatorSendBackRearm(pr, operatorBudget) : null);
     if (sendBack) {
       const attempts = roundAttempts();
       if (attempts >= effectiveRoundCap) {
@@ -2906,7 +3067,7 @@ export function planReconcile({
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', mode: 'operator-send-back', findings: 1, attempts, cap: effectiveRoundCap,
         operatorSendBack: sendBack,
-        why: `operator send-back by @${sendBack.login} with a must-fix body on a red-CI PR — re-armed once as a fix (operator re-arm), not a ci-heal`,
+        why: `operator send-back by @${sendBack.login} with a must-fix body — re-armed once as a fix (operator re-arm)`,
       });
       continue;
     }
@@ -3081,7 +3242,7 @@ export function planReconcile({
         let owedRerunSpent = false;
         const retry = pr.owedCiRerunRetry;
         // Same still-running guard as the `stale-ci-rerun` branch: a live run rejects the re-run and burns the budget.
-        const rerunLive = hasLiveCheck(pr);
+        const rerunLive = hasLiveCheck(pr, { requiredChecks, now });
         if (owedCiRerun.rerun === 'on' && pr.mainGreenNow?.red === false && !rerunLive
             && retry?.eligible && retry.head === pr.headRefOid && retry.pr === prNumber) {
           const foldReview = row => {
@@ -3276,15 +3437,18 @@ export function planReconcile({
       // ever started. The failed jobs of an unchanged head are re-run once (budget shared with the timeout re-run),
       // only when main is green and nothing on the head is still running (a re-run of a live run is rejected).
       const staleRetry = pr.owedCiRerunRetry;
-      if (!pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
-          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
+      const incompleteFailureInventory = pr.timeoutRetry && !pr.timeoutRetry.eligible
+        && String(pr.timeoutRetry.reason).includes('incomplete-failure-inventory');
+      const staleRerunActive = !pr.timeoutRetry?.cancelledShard && staleCiRerun === 'once-per-head' && pr.mainGreenNow?.red === false && staleRetry?.eligible
+        && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber;
+      if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
-        const staleCap = staleRetry.jobs.length;
-        if (staleSpent < staleCap && hasLiveCheck(pr)) {
+        const staleCap = incompleteFailureInventory ? 1 : staleRetry.jobs.length;
+        if (staleSpent < staleCap && hasLiveCheck(pr, { requiredChecks, now })) {
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
-            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' });
+            why: 'another check on this head is still running — the one-time re-run of the failed required jobs waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
           continue;
         }
         if (staleSpent < staleCap) {
@@ -3304,8 +3468,39 @@ export function planReconcile({
           why: `PR #${prNumber}: evidence read timed out; unknown, not ineligible — will re-read next tick (${unknownEvidence.reason})` });
         continue;
       }
-      if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
+      const inventorySpent = retryBudget?.confirmed === undefined ? undefined
+        : retryBudget.confirmed + (retryBudget.rejected ?? 0);
+      // Turning off stale reruns on green main retains the legacy ineligible-row/ci-heal path.
+      // Red main likewise never authorizes a mechanical recovery rerun; absent main evidence can use recovery.
+      const staleRerunDisabled = staleCiRerun === 'off' && pr.mainGreenNow?.red === false;
+      const partialFailureInventory = incompleteFailureInventory && !staleRerunActive && !staleRerunDisabled && inventorySpent === 0;
+      if (incompleteFailureInventory && inventorySpent >= 1) {
+        const why = `PR #${prNumber}: incomplete failure inventory on head ${String(pr.headRefOid).slice(0, 8)}; the one-time recovery rerun is spent — `
+          + (staleRerunActive ? 'ordinary ci-heal remains bounded by its heal budget' : 'operator investigation required');
+        notes.push({ kind: 'starved-capacity-alert', prNumber, text: why });
+        if (!staleRerunActive) {
+          refusals.push({ kind: 'starved-capacity-alert', prNumber, why });
+          continue;
+        }
+      }
+      if (partialFailureInventory && pr.mainGreenNow?.red !== true && staleRetry?.eligible
+          && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
+        if (hasLiveCheck(pr, { requiredChecks, now })) {
+          refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+            why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
+          continue;
+        }
+        const variant = 'incomplete-inventory-rerun';
+        dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant,
+          timeoutRetry: { ...staleRetry, variant, cap: 1 },
+          why: 'incomplete failure inventory; one recovery rerun on this head before operator investigation, no heal budget' });
+        continue;
+      }
+      if (pr.timeoutRetry && !pr.timeoutRetry.eligible && !partialFailureInventory) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
+      // Known ineligibility falls through to the shared heal budget; unknown evidence and incomplete-inventory
+      // recovery keep their own guards above. Tag the heal and surface its reason only when it is dispatched.
+      const timeoutRetryFallback = pr.timeoutRetry?.eligible === false && !pr.timeoutRetry.unknown && !partialFailureInventory;
       // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
       // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
       // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
@@ -3349,11 +3544,17 @@ export function planReconcile({
       } else {
         dispatch.push({
           ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
+          ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),
           why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
             + ` (cap from ${ciHealCapSource})`
             + (owedMainRuleFact.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${owedMainRuleFact.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
+        });
+        if (timeoutRetryFallback) notes.push({
+          kind: 'timeout-retry-fallback-heal', prNumber, reason: pr.timeoutRetry.reason,
+          text: `PR #${prNumber}: timeout retry ineligible (${pr.timeoutRetry.reason}); falling back to ordinary ci-heal (${ciHealAttempts} of ${ciHealCap} attempts spent)`,
         });
       }
       continue;
@@ -3440,6 +3641,29 @@ export function planReconcile({
         attempts, cap: effectiveRoundCap, blockRuledReferrals: pr.blockRuledReferrals,
         why: `${pr.blockRuledReferrals.length} mandatory referral(s) on this head were ruled block and nothing live is working it`
           + ' — the fix that changes the head is owed, not another review of the same head',
+      });
+      continue;
+    }
+
+    // A pushed repair owes its review even if fix-end left the old findings/advisory labels in place.
+    // Claims and live reviewers already refused above; completed red CI still belongs to its repair path.
+    // Both the timestamp and original thread index must put the release after that review.
+    // A released fix does not supersede a conflict still owed its existing repair route and cap.
+    const lastReview = latestHeadReview(pr);
+    const release = releasedFixClaim(pr);
+    if (OWED[phase] && lastReview && release && release.releasedAtMs > lastReview.at
+      && !withPhase.labels.includes(CONFLICT_LABEL) && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
+      && release.index > lastReview.index
+      && !sameHeadSha(lastReview.head, pr.headRefOid)
+      // A base that predates a newly required job can only be unblocked by the stale-base rebase below; a review
+      // of this head could never start (its CI never publishes the job), so that repair keeps priority.
+      && !(['needs-review', 'needs-human'].includes(phase) && staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }))) {
+      const why = 'the fixer released a new head after the last review — its review is owed before another repair';
+      dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
+        roundCap: effectiveRoundCap, refuse, refuseCapExhausted, dispatch, now,
+        ...(withPhase.labels.includes(REVIEW_LABELS.human)
+          ? { advisoryReview: { head: pr.headRefOid, reason: 'fix-pushed', why } }
+          : { reviewAfterFix: why }),
       });
       continue;
     }
@@ -3536,7 +3760,7 @@ export function planReconcile({
           if (advisoryIsStale) {
             if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
             if (refuseReferralHold({ pr, refuse, withPhase })) continue;
-            if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+            if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -3595,7 +3819,7 @@ export function planReconcile({
       const advisoryFindingsHere = countFindings(pr?.comments);
       if (reviewHoldRed) { humanHandoffAdvisory('review-hold'); continue; }
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
-      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -3614,7 +3838,7 @@ export function planReconcile({
       ? staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) : null;
     if (staleBase) {
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
-      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
       const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
         currentRef: defaultBranch, currentSha: mainSha,
       });
@@ -3767,6 +3991,7 @@ export function planReconcile({
     // floor below, which a PR can independently have already exhausted on real review negotiation (CONFIRMED
     // LIVE: `web-everything/web-everything#2549`, `review-round:5` against the shared cap of 5, zero conflict-fix
     // rounds ever run). See that constant's own docblock for the full incident.
+    // DIRTY alone stays on the ordinary review-repair path and consumes its shared allowance.
     const isConflictBounce = phase === 'bounced' && withPhase.labels.includes(CONFLICT_LABEL);
     if (isConflictBounce) {
       // #2787-live-incident — `currentRef` is `defaultBranch` (this population is, by definition, a main-base
@@ -3797,6 +4022,7 @@ export function planReconcile({
       const advisoryAlsoPending = withPhase.labels.includes(ADVISORY_LABELS.CHANGES);
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', isConflict: true, advisoryPending: advisoryAlsoPending,
+        conflictFixMechanical: pr.baseRefName === defaultBranch && ['clean', 'manifest-only'].includes(pr.conflictDisposition),
         findings, attempts: conflictAttempts, cap: conflictFixCapHere,
         why: `bounced with ${findings} finding(s) via a mechanical conflict-resolution route (merge-status:conflicting),`
           + ` nothing live is working it, and ${conflictAttempts} of ${conflictFixCapHere} conflict-fix attempts are spent`
@@ -3878,6 +4104,17 @@ export function planReconcile({
         joinedInputs: { head: pr.headRefOid, ciFailures: facts.ciFailures, reviewFindings: facts.findings.map(c => c.body) } });
     } else timedDispatch.push(entry);
   }
+  for (const d of timedDispatch) {
+    if (d.kind !== 'review' || !d.churnCap || notes.some(n => n.kind === 'review-churn' && n.prNumber === d.prNumber)) continue;
+    notes.push({ kind: 'review-churn', prNumber: d.prNumber, loops: d.churnCap.loops, cap: d.churnCap.cap,
+      text: `PR #${d.prNumber}: ${d.churnCap.loops} reviews of distinct heads (review.reviewChurn.maxLoopsPerPr=${d.churnCap.cap}) — the fix/review loop is not converging; the new head is still reviewed, and a person should look at the PR` });
+  }
+  try {
+    const { mode, appendLine, readLocals, ...deps } = eligibilityShadowDeps({
+      ...(shadowDeps ? { hermetic: true } : {}), ...shadowDeps,
+    });
+    runEligibilityShadow({ ...deps, dispatch: timedDispatch, prs, mode, appendLine, pathId: 'reconcile-core', readLocals });
+  } catch (error) { reportShadowError(error); }
   return { dispatch: timedDispatch, refusals, notes };
 }
 

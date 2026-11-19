@@ -6,6 +6,8 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import {
   appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
   resolveLedgerReadSettings, formatLedgerReadSettings, sizedLedgerRun, DEFAULT_LEDGER_READ_MAX_BYTES, LEDGER_READ_MAX_BYTES_ENV,
@@ -19,6 +21,7 @@ const row = (pr, extra = {}) => buildVerdictRecord({
   repo: REPO, pr, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test', ...extra,
 });
 const noSleep = () => {};
+const noLock = (_key, fn) => fn();
 
 describe('readLedgerFromGit: unreadable is never empty', () => {
   it('returns unreadable when the git call throws (transport unreachable)', () => {
@@ -43,6 +46,47 @@ describe('readLedgerFromGit: unreadable is never empty', () => {
   });
 });
 
+describe('readLedgerFromGit: every read is fresh unless the caller opts into the TTL cache', () => {
+  const mkRun = (dir, calls) => (args) => { calls.push(args[0]); return args[0] === 'rev-parse' ? `${dir}\n` : ''; };
+  const fetchCount = (calls) => calls.filter((c) => c === 'fetch').length;
+  it('fresh: true fetches every time; only an explicit fresh: false coalesces', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const cached = []; const fresh = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached), fresh: false });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, cached), fresh: false });
+    expect(fetchCount(cached)).toBe(1);
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, fresh), fresh: true });
+    expect(fetchCount(fresh)).toBe(2);
+  });
+  // PR #6489 red team: pr-label-mirror reads with no `fresh` flag and re-added a cleared review:human from a
+  // 30s-stale ledger. Ledger rows drive labels, holds and merges, so a read that names no flag must fetch.
+  it('a read that passes no fresh flag fetches every time, even with a warm stamp', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const calls = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), fresh: false }); // warm the stamp
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls) });
+    expect(fetchCount(calls)).toBe(3);
+  });
+  it('the shared git store (label mirror, holds, every store reader) fetches on each read by default', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vlio-ttl-'));
+    const calls = [];
+    readLedgerFromGit({ board: '/board', repo: REPO, run: mkRun(dir, calls), fresh: false }); // warm the stamp
+    const store = createGitLedgerStore();
+    expect(await store.read({ board: '/board', repo: REPO, run: mkRun(dir, calls) })).toMatchObject({ status: 'ok' });
+    expect(await store.read({ board: '/board', repo: REPO, run: mkRun(dir, calls) })).toMatchObject({ status: 'ok' });
+    expect(fetchCount(calls)).toBe(3);
+  });
+});
+
+describe('the merge gate is a decision reader', () => {
+  it('merge-gate-check reads the ledger with fresh: true (never the TTL cache)', () => {
+    const src = readFileSync(join(import.meta.dirname, '../../merge-gate-check.mjs'), 'utf8');
+    expect(src).toMatch(/readLedgerFromGit\(\{[^}]*fresh: true/);
+  });
+});
+
 describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
   const failing = (n) => {
     let pushes = 0;
@@ -53,8 +97,62 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     return { run, pushes: () => pushes };
   };
   const base = (over) => ({
-    board: '/board', repo: REPO, records: [row(1)], sleep: noSleep,
+    board: '/board', repo: REPO, records: [row(1)], sleep: noSleep, clock: () => 0,
     mkdir: () => {}, write: () => {}, rm: () => {}, read: () => null, now: () => 1, ...over,
+  });
+
+  it.each(['stderr', 'message'])('retains the rejection hint from quiet push %s', (field) => {
+    const run = (args) => {
+      if (args[0] === 'push') {
+        const text = 'error: failed to push some refs to origin\nhint: Updates were rejected because the tip of your current branch is behind';
+        const error = new Error(field === 'message' ? text : 'git push failed');
+        if (field === 'stderr') error.stderr = Buffer.from(text);
+        throw error;
+      }
+      return args[0] === 'diff' ? 'verdict-ledger/x.jsonl' : '';
+    };
+    // Transport preserves stderr; message-only errors are also accepted by the diagnostic.
+    const fail = field === 'stderr'
+      ? () => appendLedgerRows(base({ run, attempts: 1 }))
+      : () => { throw new LedgerAppendExhaustedError({ repo: REPO, attempts: 1, errors: [
+        new Error('error: failed to push some refs to origin\nhint: Updates were rejected because the tip of your current branch is behind'),
+      ] }); };
+    expect(fail).toThrow(/last error: hint: Updates were rejected.*behind/);
+  });
+
+  it('locks every transport attempt with the same repo and branch key', () => {
+    const f = failing(1);
+    const keys = [];
+    let locked = false;
+    appendLedgerRows(base({
+      run: (args) => { expect(locked).toBe(true); return f.run(args); },
+      withAppendLock: (key, fn) => {
+        keys.push(key);
+        locked = true;
+        try { return fn(); } finally { locked = false; }
+      },
+    }));
+    expect(keys).toEqual([JSON.stringify([REPO, LEDGER_TRANSPORT_BRANCH]), JSON.stringify([REPO, LEDGER_TRANSPORT_BRANCH])]);
+  });
+
+  it('exhausts loudly without touching git when the writer queue stays busy', () => {
+    let calls = 0;
+    expect(() => appendLedgerRows(base({
+      attempts: 2,
+      run: () => { throw new Error('must not reach git'); },
+      withAppendLock: () => { calls++; throw new Error('ledger writer queue is busy; retry later'); },
+    }))).toThrow(/ledger writer queue is busy; retry later/);
+    expect(calls).toBe(2);
+  });
+
+  it('never reports appended when a lock seam skips the write callback', () => {
+    expect(() => appendLedgerRows(base({ attempts: 1, run: () => { throw new Error('must not reach git'); }, withAppendLock: () => {} })))
+      .toThrow(/did not run the write/);
+  });
+
+  it('never reports appended when a lock seam swallows a transport failure', () => {
+    expect(() => appendLedgerRows(base({ attempts: 1, run: () => { throw new Error('fetch failed'); },
+      withAppendLock: (_k, fn) => { try { fn(); } catch { /* swallowed */ } } }))).toThrow(/did not run the write|fetch failed/);
   });
 
   it('retries a rejected push and then succeeds', () => {
@@ -139,6 +237,37 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     expect(sleeps).toHaveLength(2);
   });
 
+  it.each([0, 0.5, 1])('slow failed attempts set the jitter floor even beyond 6400ms (random=%s)', (random) => {
+    let elapsed = 0;
+    const waits = [];
+    const f = failing(Infinity);
+    const run = (args, opts) => {
+      if (args[0] === 'fetch') elapsed += 20_000;
+      return f.run(args, opts);
+    };
+    expect(() => appendLedgerRows(base({
+      run, attempts: 3, clock: () => elapsed, random: () => random,
+      sleep: (ms) => { waits.push(ms); elapsed += ms; },
+    }))).toThrow(LedgerAppendExhaustedError);
+    expect(waits).toEqual([20_000 * (1 + random), 20_000 * (1 + random)]);
+    expect(f.pushes()).toBe(3);
+  });
+
+  it('the duration-scaled backoff is capped at 60s so the retry never waits unboundedly', () => {
+    let elapsed = 0;
+    const waits = [];
+    const f = failing(Infinity);
+    const run = (args, opts) => {
+      if (args[0] === 'fetch') elapsed += 600_000;
+      return f.run(args, opts);
+    };
+    expect(() => appendLedgerRows(base({
+      run, attempts: 3, clock: () => elapsed, random: () => 1,
+      sleep: (ms) => { waits.push(ms); elapsed += ms; },
+    }))).toThrow(LedgerAppendExhaustedError);
+    expect(waits).toEqual([60_000, 60_000]);
+  });
+
   it('accepts a v2 event row (ruling, send-back) with the same validation', () => {
     const f = failing(0);
     const at = '2026-10-07T12:00:00.000Z';
@@ -195,6 +324,63 @@ const cloneOf = (ctx, name) => {
 };
 
 describe('real git', () => {
+  it.each([false, true])('slow repeated push races: duration-aware waits=%s', async (adaptive) => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const rival = cloneOf(ctx, 'slow-rival');
+      // Model loaded attempt time without sleeping on the host. Git operations and push
+      // rejections are real; only elapsed time and the competing writers' quiet window
+      // are controlled. Rivals keep arriving until we yield one whole attempt duration.
+      const duration = 10_000;
+      let elapsed = 0;
+      let quiet = 0;
+      let pushes = 0;
+      const rejected = [];
+      const waits = [];
+      const run = (args, opts) => {
+        if (args[0] === 'fetch') elapsed += duration;
+        if (args[0] === 'push') {
+          pushes++;
+          expect(args).toEqual(['push', '--quiet', 'origin', 'HEAD:refs/heads/ops/review-requests']);
+          if (quiet < duration) {
+            appendLedgerRows({ board: rival, repo: REPO, records: [row(100 + pushes)], sleep: noSleep });
+          }
+        }
+        try { return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }); }
+        catch (e) { if (args[0] === 'push') rejected.push(String(e.stderr)); throw e; }
+      };
+      const append = () => appendLedgerRows({
+        board: ctx.clone, repo: REPO, records: [row(200)], run, withAppendLock: noLock,
+        clock: () => elapsed, random: () => 0,
+        sleep: (ms) => {
+          // Retain an executable witness of the old policy: its longest wait is
+          // still shorter than one loaded attempt, so all eight real pushes lose.
+          quiet = adaptive ? ms : Math.min(ms, 3200);
+          waits.push(quiet);
+          elapsed += quiet;
+        },
+      });
+      if (adaptive) {
+        expect(append()).toMatchObject({ status: 'appended', attempts: 2 });
+        expect(waits[0]).toBeGreaterThanOrEqual(duration);
+      } else {
+        let failure;
+        try { append(); } catch (e) { failure = e; }
+        expect(failure).toBeInstanceOf(LedgerAppendExhaustedError);
+        expect(appendGitRowsSync([row(200)], { repo: REPO }, {
+          appendRows: () => { throw failure; },
+        })).toMatchObject({ ok: false, appended: 0, error: expect.stringMatching(/\[rejected\].*fetch first/) });
+        expect(pushes).toBe(8);
+      }
+      expect(rejected).toHaveLength(adaptive ? 1 : 8);
+      for (const error of rejected) expect(error).toMatch(/rejected/);
+      const landed = ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO))
+        .trim().split('\n').map(JSON.parse);
+      expect(landed.map(({ pr }) => pr)).toEqual(adaptive ? [101, 200] : [101, 102, 103, 104, 105, 106, 107, 108]);
+      expect(new Set(landed.map(({ id }) => id)).size).toBe(landed.length);
+    });
+  }, 30_000);
+
   it('appends, and reads back through a different clone', async () => {
     await withBareOrigin(async (ctx) => {
       ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
@@ -229,7 +415,7 @@ describe('real git', () => {
         }
       };
       const retries = [];
-      const r = appendLedgerRows({ board: clientB, repo: REPO, records: [row(200)], run, sleep: noSleep, onRetry: (x) => retries.push(x.attempt) });
+      const r = appendLedgerRows({ board: clientB, repo: REPO, records: [row(200)], run, withAppendLock: noLock, sleep: noSleep, onRetry: (x) => retries.push(x.attempt) });
 
       expect(rejected).toBe(1);
       expect(retries).toEqual([1]);
@@ -267,7 +453,7 @@ describe('real git', () => {
       const retries = [];
       // Leave attempts omitted: sustained contention must succeed under the default policy.
       const result = appendLedgerRows({
-        board: ctx.clone, repo: REPO, records: [records[6]], run, sleep: noSleep,
+        board: ctx.clone, repo: REPO, records: [records[6]], run, withAppendLock: noLock, sleep: noSleep,
         onRetry: ({ attempt }) => retries.push(attempt),
       });
       expect(result).toMatchObject({ status: 'appended', attempts: 7, rows: 1, duplicates: 0 });
@@ -341,7 +527,7 @@ describe('idempotent git writes', () => {
         }
         return git(args, opts);
       };
-      const result = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], run, sleep: noSleep });
+      const result = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], run, withAppendLock: noLock, sleep: noSleep });
       expect(result).toEqual({ status: 'appended', attempts: 2, rows: 0, duplicates: 1 });
       expect(pushes).toBe(1);
       expect(readLedgerFromGit({ board: other, repo: REPO }).records).toHaveLength(1);

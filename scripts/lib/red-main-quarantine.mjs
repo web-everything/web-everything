@@ -74,11 +74,13 @@ export function testArea(entry) {
   return dir || null;
 }
 
-const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(name);
+/** Actions reports reusable jobs as `<caller> / <job>`; CI passes the local job name. */
+const localJobName = (name) => typeof name === 'string' ? name.split(' / ').at(-1) : name;
+const isUnitShard = (name) => /^test-shard \(\d+\)$/.test(localJobName(name));
 /** Legacy untagged entries apply only to unit shards, just as they do in CI. */
 const entryCoversJob = (entry, job) => job === null
   ? entry.job === undefined || isUnitShard(entry.job)
-  : entry.job === undefined ? isUnitShard(job) : entry.job === job;
+  : entry.job === undefined ? isUnitShard(job) : localJobName(entry.job) === localJobName(job);
 
 /** Adding coverage for another job must not renew this file's quarantine for the same red. */
 function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
@@ -93,11 +95,23 @@ function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
  */
 export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null, job, proof }) {
   if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+  job = localJobName(job);
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   const entries = [...base.entries];
   const events = [];
   for (const test of tests) {
-    if (entries.some((e) => e.test === test && now < e.expiresAt && (job === undefined ? e.job === undefined : entryCoversJob(e, job)))) continue;
+    const same = (e) => e.test === test && now < e.expiresAt && (job === undefined ? e.job === undefined : entryCoversJob(e, job));
+    const idx = entries.findIndex(same);
+    if (idx >= 0) {
+      // Already listed: a different brokenSha re-keys it (brokenSha/reason/expiresAt); the same sha stays a no-op.
+      if (entries[idx].brokenSha === brokenSha) continue;
+      // Total lifetime stays bounded from the ORIGINAL addedAt: a re-key can never keep an entry alive past the max TTL.
+      const exp = Math.min(now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS), (Number.isFinite(entries[idx].addedAt) ? entries[idx].addedAt : now) + QUARANTINE_MAX_TTL_MS);
+      const e = { ...entries[idx], brokenSha, reason, expiresAt: exp };
+      entries[idx] = e;
+      events.push({ type: 'quarantine-rekeyed', at: now, actor, from: base.entries[idx]?.brokenSha ?? null, ...e });
+      continue;
+    }
     const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: fileExpiry(entries, { test, brokenSha, now, ttlMs }), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}) };
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
@@ -105,6 +119,9 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}), ...(base.mode !== undefined ? { mode: base.mode } : {}) };
   const v = validateQuarantineList(next);
   if (!v.ok) return { ok: false, error: v.errors.join('; ') };
+  // The cap is global across every live entry and job, for manual adds as well as the safety net.
+  const liveFiles = new Set(activeEntries(next, { now }).map((e) => testFileOf(e.test)));
+  if (liveFiles.size > QUARANTINE_SAFETY_NET_DEFAULTS.maxTests) return { ok: false, error: `quarantine cap ${QUARANTINE_SAFETY_NET_DEFAULTS.maxTests} reached (${liveFiles.size} live files)` };
   return { ok: true, list: next, events };
 }
 
@@ -181,9 +198,9 @@ export function parseVitestFailures(logText) {
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
 export const QUARANTINE_SAFETY_NET_DEFAULTS = Object.freeze({
   /** A failed job matching this is a unit-test job: its log must name every failing test file. */
-  unitJobPattern: '^(?:test-shard \\(\\d+\\)|integration|soak-shard \\(\\d+\\))$',
+  unitJobPattern: '^(?:hetzner / )?(?:test-shard \\(\\d+\\)|integration|soak-shard \\(\\d+\\))$',
   /** Aggregator jobs that fail only because a unit job did (`test` gates on `needs.test-shard`). */
-  derivedJobs: Object.freeze(['test', 'daemon-soak']),
+  derivedJobs: Object.freeze(['test', 'daemon-soak', 'coverage-merge']),
   /** Accept repeated failures with unchanged test files as an alternative proof (R157). */
   repeatFailureProof: true,
   repeatFailureCount: 2,
@@ -302,7 +319,8 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
           }
           proof = repeat.proof;
         }
-        origins.set(JSON.stringify([file, job]), { test: file, job, proof });
+        const localJob = localJobName(job);
+        origins.set(JSON.stringify([file, localJob]), { test: file, job: localJob, proof });
       }
       files.push(...f.files);
       names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));
@@ -368,6 +386,7 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   const changed = new Set(changedFiles);
   const touched = tests.filter((t) => changed.has(testFileOf(t)));
   const rest = tests.filter((t) => !changed.has(testFileOf(t)));
+  // Every shard uses file exclusions: named cases must run rather than suppress unrelated assertions.
   const { args, unsupported } = vitestExcludeArgs(rest);
   const skip = args.map((a) => a.slice('--exclude='.length));
   return { skip, unsupported, why: `skipping ${skip.length} quarantined test file(s)${touched.length ? `; running ${touched.length} this PR changes` : ''}` };
@@ -451,7 +470,10 @@ export function classifyQuarantinedFailure({ failedTests, list, now }) {
  */
 export function decideQuarantineHold({ num, files, signal, list, fixFiles, now }) {
   if (signal.fixPrs.includes(Number(num))) return { hold: false, fix: true };
-  const live = activeEntries(list, { now }).filter((e) => !signal.firstRedSha || String(signal.firstRedSha).startsWith(e.brokenSha) || e.brokenSha.startsWith(String(signal.firstRedSha)));
+  // An entry keyed to the streak's first OR latest red sha covers it (the latest run is where failures are read). Only the
+  // sha match widens; unknown files, fix-PR overlap and area overlap below are unchanged.
+  const shas = [signal.firstRedSha, signal.latestRedSha].filter(Boolean).map(String);
+  const live = activeEntries(list, { now }).filter((e) => !shas.length || shas.some((s) => s.startsWith(e.brokenSha) || e.brokenSha.startsWith(s)));
   if (!live.length) return { hold: true, fallback: 'stop', reason: 'red-main-hold: main is red and no quarantine entry covers it — stop mode until one is published' };
   if (!Array.isArray(files)) return { hold: true, reason: 'red-main-hold: main is red (quarantine) and this PR\'s files are unknown — held (fail closed)' };
   const fixSet = new Set(fixFiles ?? []);

@@ -44,6 +44,8 @@ function assertSlug(slug) {
 }
 export function jobRecordPath(slug, dir = reviewJobsDir()) { assertSlug(slug); return join(dir, `${slug}.json`); }
 export function jobLogPath(slug, dir = reviewJobsDir()) { assertSlug(slug); return join(dir, `${slug}.log`); }
+/** Exit marker / ended diagnosis live in a subdirectory so no valid slug can collide with a live record name. */
+export function diagnosticPath(slug, dir, kind) { assertSlug(slug); return join(dir, 'diagnostics', `${slug}.${kind}.json`); }
 
 /** @returns {object|null} the record, or null when absent/unparseable (an unparseable record is not a live job). */
 export function readJobRecord(slug, dir = reviewJobsDir()) {
@@ -102,20 +104,30 @@ export function jobRecordToAgentRow(record) {
 /**
  * Every live review job, as listing rows. A record whose pid is dead is PRUNED (the job crashed or was killed
  * before its own cleanup) and never returned — a dead job must not keep a PR looking busy forever.
- * NEVER throws: an unreadable directory answers `[]` (no jobs), the same "absence is not liveness" direction.
+ * NEVER throws: missing directories mean no jobs; unreadable evidence carries an incomplete marker.
  */
-export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive } = {}) {
+export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive, readOnly = false } = {}) {
   let names;
-  try { names = readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.json')); } catch (error) {
+    return error?.code === 'ENOENT' ? [] : incompleteListing('review-jobs-unreadable');
+  }
   const rows = [];
+  const incomplete = [];
   for (const name of names) {
     const slug = name.slice(0, -'.json'.length);
     const rec = SLUG_RE.test(slug) ? readJobRecord(slug, dir) : null;
-    if (!rec || !Number.isInteger(rec.pid)) continue;
-    if (!isAlive(rec.pid)) { try { rmSync(join(dir, name), { force: true }); } catch { /* best effort */ } continue; }
+    if (!rec || rec.slug !== slug || !Number.isInteger(rec.pid) || rec.pid <= 0) { incomplete.push('review-job-unreadable'); continue; }
+    let alive;
+    try { alive = isAlive(rec.pid); } catch { /* Unknown liveness is incomplete evidence. */ }
+    if (typeof alive !== 'boolean') { incomplete.push('review-job-liveness-unknown'); continue; }
+    if (!alive) { if (!readOnly) try { rmSync(join(dir, name), { force: true }); } catch { /* best effort */ } continue; }
     rows.push(jobRecordToAgentRow(rec));
   }
-  return rows;
+  return incomplete.length ? Object.defineProperty(rows, 'incomplete', { value: incomplete }) : rows;
+}
+
+function incompleteListing(reason) {
+  return Object.defineProperty([], 'incomplete', { value: [reason] });
 }
 
 /**
@@ -124,16 +136,21 @@ export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive 
  * completion record stands in for one (`worker-wrapper-launch.mjs#listWrappedWorkerAgents`).
  */
 export function listAgentsWithReviewJobs({
-  listAgents = () => defaultListAgents(), listJobs = () => listReviewJobAgents(), listWrapped = () => listWrappedWorkerAgents(),
+  readOnly = false, listAgents = () => defaultListAgents(), listJobs = opts => listReviewJobAgents(opts), listWrapped = () => listWrappedWorkerAgents(),
 } = {}) {
   const listed = listAgents();
-  const agents = Array.isArray(listed) ? listed : [];
+  const agents = Array.isArray(listed) ? listed : incompleteListing('agents-unreadable');
   let jobs = [];
-  try { jobs = listJobs() ?? []; } catch { jobs = []; }
+  try { jobs = readOnly ? listJobs({ readOnly: true }) : listJobs(); }
+  catch { jobs = incompleteListing('review-jobs-unreadable'); }
+  if (!Array.isArray(jobs)) jobs = incompleteListing('review-jobs-unreadable');
   // Not swallowed, unlike `jobs`: a wrapped fix / ci-heal / review is a live-session population readers decide on by its
   // ABSENCE (no live fixer -> dispatch one), so a failed listing aborts the read exactly as a failed `claude agents` does.
-  const wrapped = listWrapped() ?? [];
+  const wrappedResult = listWrapped();
+  const wrapped = Array.isArray(wrappedResult) ? wrappedResult : incompleteListing('wrapped-workers-unreadable');
   const merged = [...agents, ...jobs, ...wrapped];
-  // A spread drops the wrapped listing's non-enumerable `incomplete` (records it could not read): carry it over.
-  return wrapped.incomplete?.length ? Object.defineProperty(merged, 'incomplete', { value: wrapped.incomplete }) : merged;
+  // A spread drops non-enumerable evidence from every source, not only wrapped workers.
+  const gaps = [agents, jobs, wrapped].filter(rows => Object.hasOwn(rows, 'incomplete'))
+    .map(rows => rows.incomplete?.length ? rows.incomplete : ['agents-incomplete']);
+  return gaps.length ? Object.defineProperty(merged, 'incomplete', { value: gaps.length === 1 ? gaps[0] : gaps.flat() }) : merged;
 }

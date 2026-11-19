@@ -1,12 +1,23 @@
 import { beforeEach, afterEach, afterAll, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import os, { tmpdir } from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
 import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
 import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepalive.mjs';
+
+// Host-store isolation: scripts/lib/operator-override-reader.mjs resolves the live operator-override store from
+// os.userInfo().homedir (account database, deliberately not $HOME). Point that at an empty path in every test
+// worker so no test reads the host's live overrides. Production code is untouched; a test passes `file`
+// explicitly or mocks node:os itself to opt into disk evidence.
+const realUserInfo = os.userInfo.bind(os);
+// Unique per test file (this setup runs once per file) and never pre-created; removed in afterAll below.
+const TEST_HOMEDIR = join(tmpdir(), `we-test-home-${process.pid}-${Math.random().toString(36).slice(2)}`);
+os.userInfo = ((...args: unknown[]) => ({ ...(realUserInfo as (...a: unknown[]) => object)(...args), homedir: TEST_HOMEDIR })) as typeof os.userInfo;
+syncBuiltinESMExports();
 
 const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
 // Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell
@@ -155,7 +166,10 @@ fixtureRootKeys.push('WE_DAEMON_EVENTS');
 // Set AFTER the sandbox strip above (it removes every WE_* key), and unconditionally: an outer runner's anchor
 // must not outlive this one's.
 process.env[KEEPALIVE_ANCHOR_ENV] = String(process.pid);
-afterAll(() => killKeepAlives());
+afterAll(() => {
+  killKeepAlives();
+  try { rmSync(TEST_HOMEDIR, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 // Admission tests and their child CLIs must not wait on the machine running the suite.
 // Tests of overload set their own reading; production ignores this Vitest-only seam.
@@ -253,3 +267,7 @@ afterEach(() => {
     if (!(key in process.env)) process.env[key] = snap[key];
   }
 });
+
+// unaudited-tip — the audited-only overlay default needs fix-ready evidence that rebuild fixtures do not write.
+// The gate has its own test (daemon-rebuild-audited-tip.test.mjs, explicit env); every other suite keeps tip-following.
+process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP ||= 'follow';

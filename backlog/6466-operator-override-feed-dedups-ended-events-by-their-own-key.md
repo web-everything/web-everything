@@ -2,9 +2,10 @@
 bornAs: xtip243
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:backlog/6265-we-operator-override-slice-4-needs-you-flag-for-confirmed-lo.md"]
 dateOpened: "2026-10-18"
+dateResolved: "2026-11-09"
 tags: []
 ---
 

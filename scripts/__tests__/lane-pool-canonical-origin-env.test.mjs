@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
@@ -186,7 +186,8 @@ describe('lane-pool canonical origin env', () => {
         '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '--allow-empty', '-m', 'private work']);
       const sha = git(lane, ['rev-parse', 'HEAD']).trim();
       const marker = join(lane, '.git', '.lane-lease');
-      writeFileSync(marker, JSON.stringify({ session: 'origin-env-holder', acquiredAt: new Date().toISOString() }));
+      const lease = JSON.stringify({ session: 'origin-env-holder', acquiredAt: new Date().toISOString() });
+      writeFileSync(marker, lease);
       // Neither inherited environment nor lane-controlled config can authorize this destination.
       git(lane, ['remote', 'set-url', 'origin', callerOrigin]);
       const selection = selector === 'sweep' ? ['--all-pools']
@@ -198,15 +199,21 @@ describe('lane-pool canonical origin env', () => {
         encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024,
       });
       expect(result.error).toBeUndefined();
-      expect(result.status, result.stderr).toBe(0);
-      expect(JSON.parse(result.stdout).released).toBe(1);
-      expect(existsSync(marker)).toBe(false);
       expect(git(base, ['ls-remote', '--heads', callerOrigin, 'refs/heads/salvage/*']).trim()).toBe('');
       const salvaged = git(base, ['ls-remote', '--heads', otherOrigin, 'refs/heads/salvage/*']).trim();
       if (state === 'configured') {
+        expect(result.status, result.stderr).toBe(0);
+        expect(JSON.parse(result.stdout).released).toBe(1);
+        expect(existsSync(marker)).toBe(false);
         expect(result.stderr).not.toContain('SALVAGE PUSH FAILED');
         expect(salvaged).toMatch(new RegExp(`^${sha}\\s+refs/heads/salvage/lane-1-`));
       } else {
+        expect(result.status, result.stderr).toBe(1);
+        expect(JSON.parse(result.stdout).released).toBe(0);
+        expect(readFileSync(marker, 'utf8')).toBe(lease);
+        expect(result.stderr).toContain('UNPUSHED_WORK');
+        expect(result.stderr).toContain(sha.slice(0, 12));
+        expect(result.stderr).toContain('--discard');
         expect(result.stderr).toContain('canonical origin unresolved');
         expect(salvaged).toBe('');
         expect(git(lane, ['rev-parse', 'HEAD']).trim()).toBe(sha);

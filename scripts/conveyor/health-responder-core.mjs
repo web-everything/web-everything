@@ -40,6 +40,8 @@ export const OBSERVATION_ONLY = Object.freeze({
   "fix-claim-held-no-progress": "A slow fix claim is not proof of a stuck holder; report only, never release the claim or push to the branch.",
   "fixer-stuck": "Never kill the fixer or release its claim from the responder; the session watchdog and reaper own the stuck-session path.",
   "fixer-verify-never-settles": "Never reset/re-request a marker or kill a waiter; fix the verify-daemon pass that is not dispatching.",
+  "forge-disk-prune": "Forge disk pressure and prune refusals require operator inspection; the responder never deletes caches, runs prune or repairs the Forge host.",
+  "forge-share-below-target": "Fallback to local runs is fixed via the named fallback reasons through normal delivery; the responder never reroutes runs, raises the Forge target or edits heavy admission.",
   "gh-call-failures": "Inhibit responder GitHub actions, honor existing throttle; do not amplify failed writes.",
   "gh-graphql-budget": "Inhibit GitHub actions until the existing budget read permits them; no new poll/retry loop.",
   "build-session-idle": "Silence does not prove death; detection only. The owning watchdog/reaper alone acts on the worker, never the responder.",
@@ -55,7 +57,9 @@ export const OBSERVATION_ONLY = Object.freeze({
   "heavy-run-ungated": "Route the named program's runs through heavy admission; never kill the run or raise the cap.",
   "lane-destructive-unpushed": "Possible loss needs recovery judgment; preserve reflogs and do not clean anything.",
   "lane-pool-growth": "Dirty/unleased is not proof of abandoned work; no trim/reset/provision.",
+  "lane-stale-checkout": "Stale pool checkouts are refreshed through the owning lane-pool refresh/reclaim path; the responder never resets, refreshes or reclaims a lane.",
   "lane-worker-without-lease": "A live worker needs ownership investigation, never release or fabricated adoption.",
+  "launchd-ops-copy-drift": "The job owner must inspect script drift; never refresh ops copies, rewrite plists or restart launchd jobs from the responder.",
   "ledger-readiness-regressed": "Report the readiness regression and inspect replay evidence; never promote the ledger, change review authority or relax readiness thresholds from the responder.",
   "live-process-stale-transcript": "Silence does not prove death; owning job watchdog/reaper alone handles the worker.",
   "machine-overload": "Inhibit new responder jobs; no process kill, cap increase or automatic global pause overwrite.",
@@ -74,7 +78,8 @@ export const OBSERVATION_ONLY = Object.freeze({
   "ruling-needed-waiting": "A ruling is the operator's judgment; never record, infer or auto-answer one.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
   "session-stuck": "Silence or repetition is a warning, not proof of death; the session watchdog and reaper alone act on the worker.",
-  "stood-down-prs": "Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
+  "stale-claim-or-binding": "Alert only; a slow or silent holder is not proof of death, so never release the claim or binding from the responder.",
+  "stood-down-prs":"Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
   "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed."
 });
 export const CATALOGUE = Object.freeze({ ...OBSERVATION_ONLY,

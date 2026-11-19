@@ -15,11 +15,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { acquireRunnerLease, makeOwner, heartbeatRunnerLease, RUNNER_LEASE_MINUTES } from '../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../../skills-src/conveyor/verify-daemon.mjs';
 import { LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
+import { pidIdentity } from '../lib/pid-alive.mjs';
+// A killed process whose parent died too is adopted by its reaper. On Linux that can be a PR_SET_CHILD_SUBREAPER
+// ancestor that reaps only when its own task ends (the Forge runner supervisor), so the corpse stays a zombie and
+// `kill(pid, 0)` still succeeds. Dead means gone or zombie; an unreadable probe is not proof of death.
+const expectDead = (pid, message) => expect(pidIdentity(pid), message).toMatchObject({ alive: false });
 import { admissionLockRoot, slotPath } from '../readiness/heavy-admission.mjs';
 import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
@@ -50,6 +56,12 @@ beforeEach(() => {
   seedVerifyServer(lockRoot);
   process.env.CONVEYOR_RUNNER_LOCK_ROOT = lockRoot;
   dir = mkdtempSync(join(tmpdir(), 'verify-lane-race-'));
+  // Remote routing depends on host load: a long whole-file run pushes load over the host threshold, so child gates
+  // would wrap vitest segments in a relative `node scripts/readiness/heavy-admission.mjs` that the temp repo lacks.
+  // Pin every child to a remote-disabled preferences file (tests needing their own still override the env).
+  const noRemote = join(lockRoot, 'no-remote-preferences.json');
+  writeFileSync(noRemote, JSON.stringify({ heavyAdmission: { remote: { enabled: false } } }));
+  vi.stubEnv('WE_PLATFORM_PREFERENCES', noRemote);
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'x'], { cwd: dir });
 });
@@ -61,6 +73,10 @@ afterEach(() => {
 });
 
 const marker = () => join(dir, '.git', '.lane-verify');
+/** The env a child verify-lane should see: this test run may itself be inside a verify gate, whose own admission,
+ *  selection and standards variables would otherwise leak into the child processes and change what they decide. */
+const GATE_ONLY_ENV = /^(WE_HEAVY_|WE_VERIFY_|VERIFY_|WE_BUILD_FINAL_|WE_LOAD_|WE_QUEUE_|WE_REQUIRE_VERIFIED$|WE_LAND_UNVERIFIED$|WE_FORGE_|FORGE_)/;
+const gateScrubbedEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !GATE_ONLY_ENV.test(k)));
 const headSha = () => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
 
 /** Run verify-lane in the temp repo with a custom gate; return { code, json }. Never throws on non-zero exit. */
@@ -120,6 +136,40 @@ describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () =>
 });
 
 describe('verify-lane — hard per-phase timeout (verify-admission, 2026-10-20)', () => {
+  it.each(['commonjs', 'module'])('can stop local heartbeat watchdogs during module startup from a %s entry without crashing Node', (inputType) => {
+    // Run outside Vitest's process: terminating a worker while its heartbeat import evaluates
+    // a top-level await used to abort the entire Node process, not merely reject the worker.
+    // Resolve filesystem paths first so Vite cannot turn child imports into HTTP asset URLs.
+    const scriptsDir = dirname(dirname(fileURLToPath(import.meta.url)));
+    const script = `
+(async () => {
+const { startTreeWatchdog } = await import(${JSON.stringify(pathToFileURL(join(scriptsDir, 'lib/tree-watchdog.mjs')).href)});
+for (let round = 0; round < 24; round++) {
+  const watchdog = startTreeWatchdog({
+    pid: process.pid, timeoutMs: 60000,
+    warn: message => { throw new Error(message); },
+    heartbeat: {
+      module: ${JSON.stringify(pathToFileURL(join(scriptsDir, 'readiness/heavy-admission.mjs')).href)},
+      exportName: 'heartbeatOwnedSlot',
+      args: { lockRoot: ${JSON.stringify(join(dir, 'watchdog-pool'))}, cap: 1, owner: 'startup-probe' },
+      everyMs: 300000,
+    },
+  });
+  await new Promise(resolve => setTimeout(resolve, 50 + (round % 8) * 25));
+  watchdog.stop();
+}
+console.log('watchdogs stopped');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`;
+    const result = spawnSync(process.execPath, ['--input-type=' + inputType, '-e', script], {
+      encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error, result.stderr).toBeUndefined();
+    expect(result.signal, result.stderr).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('watchdogs stopped\n');
+  }, 25000);
+
   it('non-leader timeout does not sweep unrelated group orphans', () => {
     // Isolate the shared group from Vitest/the agent shell. The supervisor leads it; verify-lane and an
     // unrelated, reparented sleeper share it. Removing the caller's leader guard kills this survivor.
@@ -131,13 +181,15 @@ const orphan = Number(sleeper.stdout.trim());
 if (sleeper.status !== 0 || !Number.isInteger(orphan) || orphan <= 1) throw new Error('could not start unrelated sleeper');
 let verify;
 try {
+  // Its parent exited, so the reaper adopted it: init, or on Linux the nearest subreaper (Forge's runner supervisor).
   let before;
   const deadline = Date.now() + 10_000;
   do {
     before = snapshot(orphan);
-    if (Number(before[1]) === 1) break;
+    if (Number(before[1]) !== sleeper.pid) break;
     await new Promise((r) => setTimeout(r, 20));
   } while (Date.now() < deadline);
+  const reaper = snapshot(Number(before[1]));
   verify = spawn(process.execPath, [${JSON.stringify(VERIFY_LANE)}, '--gate=sleep 120', '--json'], {
     cwd: ${JSON.stringify(dir)}, detached: false, stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -149,7 +201,7 @@ try {
   const result = await closed;
   let after = null;
   try { process.kill(orphan, 0); after = snapshot(orphan); } catch {}
-  console.log(JSON.stringify({ leader: process.pid, before, verifier, after, ...result, stdout, stderr }));
+  console.log(JSON.stringify({ leader: process.pid, spawner: sleeper.pid, before, reaper, verifier, after, ...result, stdout, stderr }));
 } finally {
   try { process.kill(orphan, 'SIGKILL'); } catch {}
   if (verify && verify.exitCode === null) { try { verify.kill('SIGKILL'); } catch {} }
@@ -157,13 +209,18 @@ try {
 `);
     const r = spawnSync(process.execPath, [supervisor], {
       cwd: dir, detached: true, encoding: 'utf8', timeout: 60_000,
-      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+      env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
         WE_VERIFY_PHASE_TIMEOUT_MS: '2000' },
     });
     expect(r.error).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
     const result = JSON.parse(r.stdout.trim());
-    expect(Number(result.before[1])).toBe(1);
+    // Reparented out of the group, to init or (Linux) a subreaper outside it. Where init reaps (macOS) this is exactly
+    // what the leader's ppid-1 orphan sweep targets, so the test proves the leader guard. Under a subreaper (Forge) that
+    // sweep never targets it; there the test proves only that no other sweep (env marker, output pipes) kills it.
+    expect(Number(result.before[1])).not.toBe(result.spawner);
+    expect(Number(result.reaper[0])).toBe(Number(result.before[1]));
+    expect(Number(result.reaper[2])).not.toBe(result.leader);
     expect(Number(result.before[2])).toBe(result.leader);
     expect(Number(result.verifier[2])).toBe(result.leader);
     expect(Number(result.verifier[0])).not.toBe(result.leader);
@@ -182,7 +239,7 @@ try {
     writeFileSync(gateScript, `import { spawn } from 'node:child_process';\nimport { writeFileSync } from 'node:fs';\nconst g = spawn('sleep', ['120'], { stdio: 'ignore' });\nwriteFileSync(${JSON.stringify(pidFile)}, String(g.pid));\n${keepAliveScript()}\n`);
     const started = Date.now();
     const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
-      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+      env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
     expect(Date.now() - started).toBeLessThan(45_000);
     expect(r.stderr).toContain('phase timeout 2000ms (phaseTimeoutMs, env)');
     expect(r.stderr).toMatch(/phase exceeded phaseTimeoutMs=2000 \(env\)/);
@@ -193,7 +250,21 @@ try {
     expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout', ceilingMs: 2000, signal: 'SIGKILL' });
     expect(onDisk.infrastructure.detail).toContain('verify-lane killed the process tree');
     const grandchild = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(grandchild, 0)).toThrow();
+    expectDead(grandchild);
+  }, 70_000);
+
+  it('records the last output lines of a timed-out phase so the next timeout names the running test file', () => {
+    const gateScript = join(dir, 'hang-tail.mjs');
+    writeFileSync(gateScript, "console.log('RUN scripts/__tests__/the-slow-one.test.mjs'); console.log('token=' + 'Ab3' + 'xY9zQ7wK2mN');\n" + keepAliveScript() + '\n');
+    const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
+      env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+    const onDisk = JSON.parse(readFileSync(marker(), 'utf8'));
+    expect(onDisk.infrastructure).toMatchObject({ reason: 'verify-timeout' });
+    const tail = onDisk.infrastructure.outputTail;
+    expect(Array.isArray(tail) && tail.length <= 200).toBe(true);
+    expect(tail.join('\n')).toContain('the-slow-one.test.mjs');
+    expect(tail.join('\n')).not.toContain('xY9zQ7wK2mN');
+    expect(r.status).not.toBe(0);
   }, 70_000);
 
   it('also kills a descendant reparented out of the tree that still holds the output pipe (audit finding 1)', () => {
@@ -204,11 +275,11 @@ try {
     writeFileSync(gateScript, `( sleep 120 & echo $! > ${JSON.stringify(pidFile)} ) ; sleep 120\n`);
     const started = Date.now();
     const r = spawnSync('node', [VERIFY_LANE, `--gate=sh ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, detached: true,
-      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+      env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
     expect(Date.now() - started).toBeLessThan(45_000);
     expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
     const orphan = Number(readFileSync(pidFile, 'utf8'));
-    expect(() => process.kill(orphan, 0)).toThrow();
+    expectDead(orphan);
     expect(r.status).not.toBe(0);
   }, 70_000);
 
@@ -234,12 +305,12 @@ ${keepAliveScript()}
     try {
       const started = Date.now();
       const r = spawnSync('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
-        env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
+        env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } });
       expect(Date.now() - started).toBeLessThan(45_000);
       detached = Number(readFileSync(pidFile, 'utf8'));
       expect(r.status).not.toBe(0);
       expect(JSON.parse(readFileSync(marker(), 'utf8')).infrastructure).toMatchObject({ reason: 'verify-timeout' });
-      expect(() => process.kill(detached, 0), 'the detached descendant must not survive the timeout').toThrow();
+      expectDead(detached, 'the detached descendant must not survive the timeout');
     } finally {
       if (detached) { try { process.kill(detached, 'SIGKILL'); } catch { /* gone */ } }
     }
@@ -257,7 +328,7 @@ const chunk = 'x'.repeat(64 * 1024);
 for (let i = 0; i < 64; i++) process.stdout.write(chunk);
 ${keepAliveScript()}
 `);
-    const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+    const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
       WE_VERIFY_PHASE_TIMEOUT_MS: '4000', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' };
     const slotLockRoot = admissionLockRoot(dir, env);
     const verify = spawn('node', [VERIFY_LANE, `--gate=node ${gateScript}`, '--json'], { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -279,10 +350,20 @@ ${keepAliveScript()}
       gate = Number(readFileSync(pidFile, 'utf8'));
       await pause(100);
       const early = heartbeatAt();
-      await pause(2_900);
-      const beforeCeiling = heartbeatAt();
-      const aliveBeforeCeiling = alive(gate);
-      await pause(3_000);
+      // Poll for the heartbeat to advance while the gate is still alive instead of sampling one fixed instant: on a
+      // loaded coverage shard the watchdog thread can start late, and a single sample at 2.9s then reads the
+      // acquire-time value (CI red 34c309b3d). The ceiling (4s) still bounds the poll, so a heartbeat that never
+      // runs while stdout is unread still fails; and the gate must still be alive when the advance is seen.
+      let beforeCeiling = early;
+      let aliveBeforeCeiling = alive(gate);
+      for (let i = 0; i < 100 && aliveBeforeCeiling; i++) {
+        await pause(50);
+        const seen = heartbeatAt();
+        aliveBeforeCeiling = alive(gate);
+        if (seen && seen !== early && aliveBeforeCeiling) { beforeCeiling = seen; break; }
+      }
+      // Let the ceiling fire (it is 4s from the gate start), then check the gate was killed while stdout is unread.
+      for (let i = 0; i < 120 && alive(gate); i++) await pause(100);
       const aliveWhileBlocked = alive(gate);
       const afterKill = heartbeatAt();
       await pause(1_500);
@@ -325,7 +406,7 @@ writeFileSync(${JSON.stringify(samples)}, JSON.stringify({ first: first?.heartbe
 `);
     // Replace the gate shell so process.ppid identifies verify-lane on shells that do not exec the last command.
     const r = spawnSync('node', [VERIFY_LANE, `--gate=exec node ${gateScript}`, '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000,
-      env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
+      env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, LANE_POOL_ROOT: join(dir, '.git', 'pool'),
         WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' } });
     expect(r.stderr).toContain('slot heartbeat every 1000ms (slotHeartbeatMs, env)');
     const { first, second } = JSON.parse(readFileSync(samples, 'utf8'));
@@ -337,7 +418,7 @@ writeFileSync(${JSON.stringify(samples)}, JSON.stringify({ first: first?.heartbe
 
 describe('verify-lane — card-only diff skips the local gate (skipLocalForCardOnly)', () => {
   const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
-  const verify = (extra = []) => spawnSync('node', [VERIFY_LANE, 'verify', '--json', ...extra], { cwd: dir, encoding: 'utf8', env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
+  const verify = (extra = []) => spawnSync('node', [VERIFY_LANE, 'verify', '--json', ...extra], { cwd: dir, encoding: 'utf8', env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
   const commitFile = (rel) => { mkdirSync(join(dir, rel.split('/').slice(0, -1).join('/')), { recursive: true }); writeFileSync(join(dir, rel), 'x\n'); git('add', '-A'); git('commit', '-qm', rel); };
   it('records a green marker for HEAD without running any gate, for a backlog-only diff', () => {
     git('update-ref', 'refs/remotes/origin/main', 'HEAD');
@@ -353,7 +434,7 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
   it('a green records the ledger and the next round selects only the delta since it', () => {
     const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
     try {
-      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
+      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       // A REAL default-gate green (code diff, so no card-only skip): a stub `vitest` on the checkout's own
       // node_modules/.bin stands in for the test runner, and `.gitignore` keeps the tree clean (the ledger needs that).
@@ -379,7 +460,7 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
   it('a card-only skip writes the marker but records nothing in the green ledger', () => {
     const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
     try {
-      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
+      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       commitFile('backlog/zz3-card.md');
       const first = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env });
@@ -394,7 +475,7 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
   it('`run` mode is NOT skipped on a card-only diff: the real gate command is resolved and no skip marker is written', () => {
     git('update-ref', 'refs/remotes/origin/main', 'HEAD');
     commitFile('backlog/zz1-card.md');
-    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, env: { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
+    const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', timeout: 60_000, env: { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot } });
     const out = `${r.stdout}\n${r.stderr}`;
     expect(out).not.toContain('card-only-skip');
     expect(out).not.toContain('local gate skipped');
@@ -648,6 +729,41 @@ describe('verify-lane check --wait= (#4358) — a bounded internal wait, one CLI
     expect(json.waited.ms).toBeGreaterThanOrEqual(200);
   });
 
+  it('warns on stderr when --wait exceeds 170000ms (agent Bash calls over ~180s are backgrounded) but still waits', () => {
+    runVerify('true');
+    const long = runCheckWait(200_000);
+    expect(long.code).toBe(0);
+    expect(long.stderr).toMatch(/170000/);
+    expect(long.stderr).toMatch(/--wait=150000/);
+    const ok = runCheckWait(150_000);
+    expect(ok.code).toBe(0);
+    expect(ok.stderr).not.toMatch(/170000/);
+  });
+
+  it('warns above 170000ms without shortening the actual CLI wait budget', () => {
+    runRequestOnly(); // keep the marker running, so the deadline must be consumed
+    const preload = `
+      let now = Date.now();
+      Date.now = () => now;
+      const timer = globalThis.setTimeout;
+      globalThis.setTimeout = (callback, ms, ...args) => {
+        now += ms;
+        return timer(callback, 0, ...args);
+      };`;
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      VERIFY_LANE, 'check', '--wait=200000', '--json'], {
+      cwd: dir, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(2);
+    expect(child.stderr).toContain('exceeds 170000 ms');
+    expect(child.stderr).toContain('--wait=150000');
+    expect(child.stderr).not.toContain('clamped');
+    const result = JSON.parse(child.stdout);
+    expect(result).toMatchObject({ status: 'timeout', lastStatus: 'running', settled: false,
+      waited: { ms: 200000 } });
+  });
+
   it('rejects a non-positive/non-numeric --wait as a usage error (exit 3), never a silent 0ms wait', () => {
     for (const bad of ['0', '-5', 'nope']) {
       const { code, json } = runCheckWait(bad);
@@ -726,7 +842,7 @@ describe('verify-lane check --wait= (#4358) — a bounded internal wait, one CLI
       '};',
     ].join('\n'));
     // The child must see the strict defaults: no opt-out and no break-glass.
-    const env = { ...process.env };
+    const env = { ...gateScrubbedEnv() };
     delete env.WE_REQUIRE_VERIFIED;
     delete env.WE_LAND_UNVERIFIED;
     const child = spawn('node', ['--require', preload, VERIFY_LANE, 'check', '--wait=60000', '--json'], {
@@ -1134,7 +1250,7 @@ describe('verify-lane reset (x4jcqm4) — clearing a stale marker without a leas
   const leaseFile = () => join(dir, '.git', '.lane-lease');
   function runReset(env = {}) {
     try {
-      const out = execFileSync('node', [VERIFY_LANE, 'reset', '--json'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env } });
+      const out = execFileSync('node', [VERIFY_LANE, 'reset', '--json'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...gateScrubbedEnv(), ...env } });
       return { code: 0, json: JSON.parse(out.trim().split('\n').pop()) };
     } catch (e) {
       return { code: e.status ?? null, json: (() => { try { return JSON.parse(String(e.stdout).trim().split('\n').pop()); } catch { return null; } })() };
@@ -1274,8 +1390,39 @@ describe('red diagnostics transport', () => {
   const gate = `printf ' FAIL  example.test.ts > outer > broken\n'; exit 1`;
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
-    return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout };
+    return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
   }
+  it.each([['marker', []], ['run', ['run']]])('exit 75 without FAIL output is unsettled through the real collector: %s', (_label, mode) => {
+    for (const gate of ['exit 75', "printf 'verify-shards: UNSETTLED\\n'; exit 75"]) {
+      const result = invoke([...mode, `--gate=${gate}`]);
+      expect(result.code).toBe(3);
+      expect(result.stderr).not.toContain('confirming on Forge');
+      expect(result.stderr).not.toContain('confirming locally');
+      expect(JSON.stringify(result.json.ranOn ?? {})).not.toContain('remoteRedConfirmed');
+      expect(result.json).toMatchObject({ status: 'infrastructure-failure', exitCode: 75,
+        infrastructure: { reason: 'verify-unsettled' } });
+      if (!mode.length) {
+        expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'infrastructure-failure',
+          infrastructure: { reason: 'verify-unsettled' } });
+        expect(invoke(['check']).json).toMatchObject({ status: 'infrastructure-failure', reason: 'verify-unsettled' });
+      }
+    }
+  });
+  it.each([['marker', []], ['run', ['run']]])('exit 75 with recorded failures stays red with details: %s', (_label, mode) => {
+    const result = invoke([...mode, `--gate=printf ' FAIL  example.test.ts > outer > broken\\n'; exit 75`]);
+    expect(result.code).toBe(2);
+    expect(result.stderr).not.toContain('confirming on Forge');
+    expect(result.stderr).not.toContain('confirming locally');
+    expect(JSON.stringify(result.json.ranOn ?? {})).not.toContain('remoteRedConfirmed');
+    expect(result.json).toMatchObject({ status: 'red', exitCode: 75,
+      failureDetails: { tests: [{ file: 'example.test.ts', name: 'outer > broken' }] } });
+    expect(result.json.infrastructure).toBeUndefined();
+    if (!mode.length) {
+      const record = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(record).toMatchObject({ status: 'red', exitCode: 75, failureDetails: result.json.failureDetails });
+      expect(record.infrastructure).toBeUndefined();
+    }
+  });
   it('streams the evidence and round trips marker, check and wait; green clears', () => {
     const ran = invoke([`--gate=${gate}`]);
     expect(ran.code).toBe(2);
@@ -1374,7 +1521,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, outputLines = 148 } = {}) {
     const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1403,9 +1550,11 @@ it('first attempt times out', async () => {
     if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'vitest run', 'check:standards': 'true' } }));
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
+import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
@@ -1415,17 +1564,17 @@ if (${live} && args[0] === 'vitest') {
   process.exit(result.status ?? 2);
 }
 if (args[0] === 'vitest' && args[1] === 'related') {
-  process.stdout.write('passed file\\n'.repeat(148));
-  process.stderr.write(${JSON.stringify(stderr)});
-  process.stdout.write(${JSON.stringify(stdout)});
+  writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
+  writeAllSync(2, ${JSON.stringify(stderr)});
+  writeAllSync(1, ${JSON.stringify(stdout)});
   process.exit(1);
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('conformance'))) {
-  if (${scanExit}) process.stderr.write(' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
+  if (${scanExit}) writeAllSync(2, ' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
   process.exit(${scanExit});
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
-  if (${guardExit}) process.stderr.write(' FAIL  guard.test.mjs > repo-wide guard\\n');
+  if (${guardExit}) writeAllSync(2, ' FAIL  guard.test.mjs > repo-wide guard\\n');
   const report = args.find(a => a.startsWith('--outputFile.json='));
   if (report && ${guardReport}) {
     const names = args.filter(a => a.endsWith('.test.mjs') && !a.includes('excluded')).map(a => process.cwd() + '/' + a);
@@ -1434,25 +1583,46 @@ if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
   process.exit(${guardExit});
 }
 if (args[0] === 'vitest') process.exit(${retryExit});
-if (${standardsExit}) process.stdout.write('  error  invisible-characters: U+200B in source.mjs\\n');
+if (${standardsExit}) writeAllSync(1, '  error  invisible-characters: U+200B in source.mjs\\n');
 process.exit(${standardsExit});
 `;
     for (const name of ['npx', 'npm']) {
       writeFileSync(join(dir, 'bin', name), fake); chmodSync(join(dir, 'bin', name), 0o755);
     }
+    // Pin the local slot layout instead of inheriting host admission preferences.
+    const preferences = join(dir, 'admission-preferences.json');
+    writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
+      cap: 1, fastSlots: 1, fastScale: { maxSlots: 1 }, remote: { enabled: false },
+    } }));
     // Keep fixture infrastructure out of the change's own edited set.
     writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\n*.attempt\n');
     execFileSync('git', ['add', '.'], { cwd: dir });
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
+    const env = { ...gateScrubbedEnv(), PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
-      return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stdout: result.stdout, stderr: result.stderr };
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.signal, result.stderr).toBeNull();
+      const terminal = result.stdout.trim().split('\n').at(-1);
+      let json;
+      try { json = JSON.parse(terminal); } catch { /* the assertion below reports the full child diagnostics */ }
+      expect(json, `missing verification verdict (exit ${result.status}): ${result.stdout}\n${result.stderr}`).toHaveProperty('sha', headSha());
+      return { code: result.status, json, stdout: result.stdout, stderr: result.stderr };
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  it('drains phase output larger than a pipe buffer before the terminal JSON verdict', () => {
+    const outputLines = 24000;
+    const f = fixture({ outputLines });
+    const result = f.invoke();
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.json).toMatchObject({ status: 'green', retriedTimeouts: f.files });
+    expect(result.stdout.split('passed file\n')).toHaveLength(outputLines + 1);
+    expect(f.calls()).toHaveLength(3);
+  });
 
   // #verify-phase-admission — real slots across the related run, retry, and standards.
   it.each([undefined, '0'])('records phase admission or the opt-out (%s)', phaseAdmission => {
@@ -1566,7 +1736,8 @@ process.exit(${standardsExit});
     const req = f.invoke(['request']);
     expect(req.code, req.stdout + req.stderr).toBe(0); // always
     const stamped = JSON.parse(readFileSync(marker(), 'utf8')).suites;
-    expect(stamped).toContain('npm test');
+    expect(stamped).toContain('npx vitest related ');
+    expect(stamped).not.toContain('npm test');
     expect(stamped).toContain('check:standards');
     const result = f.invoke([`--gate=${stamped}`, '--run-id=full-policy'], { WE_VERIFY_STANDARDS: 'ci-only' });
     expect(result.code, result.stdout + result.stderr).toBe(0);
@@ -1966,9 +2137,10 @@ describe('build finalGateStandards preview', () => {
     writeFileSync(join(dir, path), 'fixture\n');
   }
   function preview(finalGate, standards, extra = {}) {
-    const env = { ...process.env, WE_BUILD_FINAL_GATE: finalGate,
+    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate,
       WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
       WE_VERIFY_SELECTION: 'pr', ...extra };
+    if (finalGate === undefined) delete env.WE_BUILD_FINAL_GATE;
     if (standards === undefined) delete env.WE_BUILD_FINAL_GATE_STANDARDS;
     else env.WE_BUILD_FINAL_GATE_STANDARDS = standards;
     const result = spawnSync('node', [VERIFY_LANE, '--dry-run'], { cwd: dir, env, encoding: 'utf8', timeout: 20_000 });
@@ -1977,6 +2149,22 @@ describe('build finalGateStandards preview', () => {
     expect(existsSync(join(dir, '.git', '.lane-verify.previous'))).toBe(false);
     return JSON.parse(result.stdout);
   }
+  it('standard-default full source yields related tests and a downgrade reason', () => {
+    seed(); change('scripts/example.mjs');
+    const gate = preview(undefined, 'always');
+    expect(gate.command).toContain('npx vitest related ');
+    expect(gate.command).not.toContain('npm run test:unit');
+    expect(gate.reasons.join(' ')).toMatch(/full.*standard.*related/);
+  });
+  it('explicit full without test:unit yields related tests, never npm test', () => {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'exit 99' } }));
+    git('add', '-A'); git('commit', '-qm', 'test-only checkout');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    change('scripts/example.mjs');
+    const gate = preview('full', 'always');
+    expect(gate.command).toContain('npx vitest related ');
+    expect(gate.command).not.toMatch(/npm (test|run test:unit)/);
+  });
   it.each(['always', 'selected'])('full is unchanged with %s', (standards) => {
     seed(); change('scripts/example.mjs');
     expect(preview('full', standards).command).toBe('npm run test:unit && npm run check:standards');
@@ -2044,21 +2232,18 @@ describe('full build gate default', () => {
     writeFileSync(preferences, '{}');
     vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
   });
-  it('runs both whole-unit and standards scripts without a gate flag', () => {
-    const scripts = {
+  it('standard full without a known diff fails closed instead of running the whole suite', () => {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
-      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
-    };
-    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
-    const env = { ...process.env };
+      'check:standards': 'exit 0',
+    } }));
+    const env = { ...gateScrubbedEnv() };
     delete env.WE_BUILD_FINAL_GATE;
-    delete env.WE_BUILD_FINAL_GATE_STANDARDS;
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
-    expect(r.status, r.stderr).toBe(0);
+    expect(r.status, r.stderr).toBe(3);
     expect(r.stderr).toContain('finalGate="full" (standard)');
-    expect(r.stderr).toContain('finalGateStandards="always" (standard)');
-    expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
-    expect(readFileSync(join(dir, 'standards-ran'), 'utf8')).toBe('yes');
+    expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(false);
+    expect(JSON.parse(r.stdout).status).toBe('selection-required');
   });
 
   // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
@@ -2070,7 +2255,7 @@ describe('full build gate default', () => {
       'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
     };
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
-    const env = { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
+    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate };
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
     expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);
     expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
@@ -2093,8 +2278,7 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
       writeFileSync(join(dir, 'scripts', 'lib', 'zz-full.mjs'), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'full gate fixture');
-      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir };
-      delete env.WE_BUILD_FINAL_GATE;
+      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_BUILD_FINAL_GATE: 'full' };
       delete env.WE_BUILD_FINAL_GATE_STANDARDS;
       const r = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
       expect(JSON.parse(r.stdout.trim().split('\n').pop()), r.stderr).toMatchObject({ status: 'green' });
@@ -2118,6 +2302,8 @@ describe('full build gate default', () => {
   it.each([['related', 'full', /mode=pr /], ['full', 'related', /mode=full /]])(
     'a child under finalGate=%2$s recognizes a default gate stamped under %1$s', (requester, child, mode) => {
       const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'exit 0', 'check:standards': 'exit 0' } })); // base commit carries it; an explicit full needs a real test:unit script
+      git('add', 'package.json'); git('commit', '-qm', 'base scripts');
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
       writeFileSync(join(dir, 'node_modules', '.bin', 'vitest'), '#!/bin/sh\nexit 0\n');
@@ -2126,7 +2312,7 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
       writeFileSync(join(dir, 'scripts', 'lib', 'zz-cross.mjs'), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'cross-policy fixture');
-      const env = (finalGate) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate });
+      const env = (finalGate) => ({ ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate });
       const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester), timeout: 60_000 });
       const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
       expect(suites, request.stderr).toBeTruthy();
@@ -2135,6 +2321,49 @@ describe('full build gate default', () => {
       expect(run.stderr).not.toContain('mode=explicit');
       expect(run.stderr).not.toContain('whole-gate admission');
     });
+
+  // PR #6769 send-back (judge sweep): a full gate stamped under an explicit finalGate=full, dispatched to a child under
+  // `related` whose default selection is BLOCKED (a dependency-file diff), was refused (exit 3) before the cross-policy
+  // recognition could see it is the requester's default gate. It must be recognized and run, never gate-refused.
+  // Red-team round 3: a child with WE_BUILD_FINAL_GATE UNSET resolves the standard `full`, which runs related selection
+  // (only a tool/env full is the whole tier). Recognition keyed on the setting's VALUE probed "full" (standard, i.e.
+  // related) and explicit related, never an explicit full, so the stamped full gate was refused there too.
+  function expectStampedFullGateRuns(childGate) {
+    const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
+    const scripts = { 'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`, 'check:standards': 'exit 0' };
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
+    writeFileSync(join(dir, '.gitignore'), 'whole-unit-ran\n');
+    git('add', '-A'); git('commit', '-qm', 'base scripts');
+    git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    // A dependency-file change: the related default selection is blocked for this diff.
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts, description: 'dependency-surface change' }));
+    git('add', 'package.json'); git('commit', '-qm', 'touch package.json');
+    const env = (finalGate) => {
+      const e = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate };
+      if (finalGate === null) delete e.WE_BUILD_FINAL_GATE;
+      return e;
+    };
+    const blocked = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(childGate), timeout: 60_000 });
+    expect(JSON.parse(blocked.stdout.trim().split('\n').pop()), blocked.stderr).toMatchObject({ status: 'selection-required' });
+    const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env('full'), timeout: 60_000 });
+    const suites = JSON.parse(readFileSync(marker(), 'utf8')).suites;
+    expect(suites, request.stderr).toBe('npm run test:unit && npm run check:standards');
+    const run = spawnSync('node', [VERIFY_LANE, 'verify', '--json', '--run-id=full-under-related', `--gate=${suites}`], { cwd: dir, encoding: 'utf8', env: env(childGate), timeout: 60_000 });
+    const result = JSON.parse(run.stdout.trim().split('\n').pop());
+    expect(result.status, run.stderr).not.toBe('gate-refused');
+    expect(result, run.stderr).toMatchObject({ status: 'green' });
+    expect(readFileSync(join(dir, 'whole-unit-ran'), 'utf8')).toBe('yes');
+    expect(run.stderr).toMatch(/selection @ \w+ mode=full /);
+    expect(run.stderr).not.toContain('mode=explicit');
+  }
+
+  it('a full gate stamped under finalGate=full runs in a related child whose default selection is blocked', () => {
+    expectStampedFullGateRuns('related');
+  });
+
+  it('a full gate stamped under finalGate=full runs in a standard (unset) child whose default selection is blocked', () => {
+    expectStampedFullGateRuns(null);
+  });
 
   // #5831 red team: a gate stamped under finalGateStandards=selected omits standards (or, on a card-only diff, is the
   // skip echo). A child under `always` — or one with the card-only skip off — must still recognize it as the default
@@ -2159,7 +2388,7 @@ describe('full build gate default', () => {
       mkdirSync(join(dir, path.split('/').slice(0, -1).join('/')), { recursive: true });
       writeFileSync(join(dir, path), 'export {};\n');
       git('add', '-A'); git('commit', '-qm', 'standards policy fixture');
-      const env = (standards, skip) => ({ ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: 'related',
+      const env = (standards, skip) => ({ ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: 'related',
         WE_BUILD_FINAL_GATE_STANDARDS: standards, WE_VERIFY_STANDARDS: 'auto', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: skip, WE_VERIFY_SELECTION: 'pr' });
       const request = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: env(requester, '1'), timeout: 60_000 });
       expect(request.status, request.stderr).toBe(0);
@@ -2198,4 +2427,54 @@ describe('full build gate default', () => {
         expect(existsSync(join(dir, 'standards-ran'))).toBe(true);
       }
     });
+});
+
+describe('verify-lane — the deferred-to-ci record follows the terminal verdict (R893, PR #6674 round 2)', () => {
+  const deferredFile = () => join(dir, '.git', '.lane-verify-deferred');
+  const readJson = (p) => JSON.parse(readFileSync(p, 'utf8'));
+  function runReset() {
+    try {
+      const out = execFileSync('node', [VERIFY_LANE, 'reset', '--json'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      return JSON.parse(out.trim().split('\n').pop());
+    } catch (e) { return JSON.parse(String(e.stdout).trim().split('\n').pop()); }
+  }
+  const killedGate = `node -e 'process.kill(process.pid, "SIGKILL")'`;
+
+  it('a signal-killed gate writes infrastructure-failure AND the deferred record for HEAD; a later green clears it', () => {
+    const killed = runVerify(killedGate);
+    expect(killed.json.status).toBe('infrastructure-failure');
+    expect(readJson(marker())).toMatchObject({ sha: headSha(), status: 'infrastructure-failure' });
+    expect(readJson(deferredFile())).toMatchObject({ status: 'deferred-to-ci', sha: headSha(), reason: 'verify-signal' });
+
+    expect(runVerify('true').json.status).toBe('green');
+    expect(existsSync(deferredFile())).toBe(false);
+  });
+
+  it('reset removes the deferred record with the marker', () => {
+    runVerify(killedGate);
+    expect(existsSync(deferredFile())).toBe(true);
+    expect(runReset().status).toBe('reset');
+    expect(existsSync(marker())).toBe(false);
+    expect(existsSync(deferredFile())).toBe(false);
+  });
+
+  it('reset with no marker (a manual rm) still removes an orphaned deferred record', () => {
+    runVerify(killedGate);
+    rmSync(marker());
+    expect(runReset().status).toBe('noop');
+    expect(existsSync(deferredFile())).toBe(false);
+  });
+});
+
+
+describe('R913 build gate opt-in provenance', () => {
+  it.each(['tool', 'env'])('explicit %s full keeps the whole unit gate', source => {
+    const src = readFileSync(VERIFY_LANE, 'utf8');
+    const body = src.slice(src.indexOf('function resolveBuildDefaultGate(env) {'), src.indexOf('// Preview resolves the same default'));
+    const resolve = new Function('resolveBuildPolicy', 'readCheckoutScripts', 'localChangedSet', 'git',
+      body + '; return resolveBuildDefaultGate({});');
+    const gate = resolve(() => ({ finalGate: 'full', sources: { finalGate: source } }),
+      () => ['test:unit', 'check:standards'], () => ({ changedFiles: ['scripts/x.mjs'], untrackedFiles: [] }), () => '');
+    expect(gate.command).toBe('npm run test:unit && npm run check:standards');
+  });
 });

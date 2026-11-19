@@ -22,6 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { admittedArgv } from '../readiness/heavy-admission.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '../..');
@@ -113,9 +114,10 @@ function makeRealRunVitest() {
       }
       writeFileSync(configPath, cfg);
       // `-t` takes a regex, so the prefix's parentheses are escaped.
-      spawnSync(join(REPO_ROOT, 'node_modules/.bin/vitest'), [
+      const admitted = admittedArgv(join(REPO_ROOT, 'node_modules/.bin/vitest'), [
         'run', TEST_FILE, '-t', NAMED_PREFIX.replace(/[()]/g, '\\$&'), '--config', configPath, '--reporter=json', `--outputFile=${outFile}`,
-      ], { cwd: REPO_ROOT, stdio: 'ignore' });
+      ]);
+      spawnSync(admitted.file, admitted.args, { cwd: REPO_ROOT, stdio: 'ignore' });
       try { return JSON.parse(readFileSync(outFile, 'utf8')); } catch { return {}; }
     } finally {
       rmSync(mutantPath, { force: true });

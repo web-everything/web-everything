@@ -1,0 +1,49 @@
+{
+  "break": 7,
+  "title": "relative directories refuse and worker env is idempotent",
+  "input": {
+    "home": "/home/test",
+    "env": {
+      "XPC_SERVICE_NAME": "com.we.worker"
+    },
+    "map": {
+      "accounts": {
+        "a": {
+          "configDir": "/home/test/.claude"
+        },
+        "b": {
+          "configDir": "~/claude-b"
+        }
+      },
+      "daemons": {
+        "com.we.worker": "b"
+      },
+      "routing": {
+        "accountB": true
+      }
+    },
+    "existing": [
+      "/home/test/.claude",
+      "/home/test/claude-b"
+    ],
+    "listings": {
+      "/home/test/.claude": [
+        {
+          "sessionId": "abcdef01-1234-4567-89ab-123456789abc",
+          "id": "job-a"
+        }
+      ],
+      "/home/test/claude-b": [
+        {
+          "sessionId": "abcdef02-1234-4567-89ab-123456789abc",
+          "id": "job-b"
+        }
+      ]
+    },
+    "relative": "profiles/b"
+  },
+  "expect": {
+    "validRelative": false,
+    "store": "/home/test/claude-b"
+  }
+}

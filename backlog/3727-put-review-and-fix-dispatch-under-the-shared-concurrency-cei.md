@@ -12,7 +12,7 @@ tags: []
 
 # Put review and fix dispatch under the shared concurrency ceiling so re-armed PRs are dispatched staggered, not in a burst
 
-The reconcile path dispatches one review per owed PR with no admission check. Re-arming many `review:pending` PRs at once therefore launches that many reviewers together; on 2026-09-19 the machine load reached 28 on 12 cores.
+The reconcile path dispatches one review per owed PR with no admission check. Re-arming many `review:pending` PRs at once therefore launches that many reviewers together; on 2026-09-19 the machine load reached 28 against the host core count.
 
 ## What exists and what does not
 

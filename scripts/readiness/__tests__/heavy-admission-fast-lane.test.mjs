@@ -17,6 +17,8 @@ import {
 
 const roots = [];
 beforeEach(() => vi.stubEnv('WE_TEST_HOST_LOAD1', '0'));
+// Tests that pin the default fastSlots/cap pass this as `env` so they never read the host's real platform preferences.
+const NO_PREFS = { WE_PLATFORM_PREFERENCES: join(tmpdir(), 'heavy-fast-lane-no-such-platform-preferences.json') };
 afterEach(() => vi.unstubAllEnvs());
 function tempRoot() {
   const r = mkdtempSync(join(tmpdir(), 'heavy-fast-lane-'));
@@ -79,7 +81,7 @@ describe('fast lane — the fast slot is ADDED ON TOP of the heavy cap (operator
   it('when the fast slot is busy, a short job may take a free heavy slot', async () => {
     const lockRoot = tempRoot();
     holdSlot(lockRoot, 2, 'lane-short-busy', 'selected', 2);
-    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-fixer-check', kind: 'files', env: {}, canDefer: true, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-fixer-check', kind: 'files', env: NO_PREFS, canDefer: true, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
     expect(r).toMatchObject({ ok: true, slot: 0 });
   });
 
@@ -206,7 +208,7 @@ describe('resolveQueueBaseline — held + waiting + dispatched-not-yet-queued', 
       { repo: '/p/we/lane-6', lease: { purpose: 'review-juror', session: 'review-5', acquiredAt: iso(NOW - 60_000), ttlMinutes: 240 } }, // review: 0
       { repo: '/p/we/lane-7', lease: { purpose: 'hermetic-host-tests', session: 'Mac:1', acquiredAt: iso(NOW - 60_000), ttlMinutes: 240 } }, // not a dispatch
     ];
-    const b = resolveQueueBaseline({ lockRoot, cap: 2, nowMs: NOW, env: {}, readLeases: () => leases, isLiveWaiter: () => true });
+    const b = resolveQueueBaseline({ lockRoot, cap: 2, nowMs: NOW, env: NO_PREFS, readLeases: () => leases, isLiveWaiter: () => true });
     expect(b.pending.map((p) => [p.lane, p.dispatchKind, p.demandMinutes])).toEqual([['3', 'fix', 3.25], ['4', 'build', 6.5]]);
     // FULL held 6m of 18 → 12 left; one selected waiter 3; pending 3.25 + 6.5 → 24.75 slot-min over 2 slots.
     expect(b).toMatchObject({ heldRemainingMinutes: 12, waitingMinutes: 3, pendingMinutes: 9.75, backlogMinutes: 24.75, maxWaitMinutes: 30 });

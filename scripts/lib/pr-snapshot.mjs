@@ -39,7 +39,7 @@
 import { isUnderTest } from './under-test.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
 import { resolveSmokeDryRun } from './smoke-dry-run-settings.mjs';
-import { listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
+import { assertInventoryComplete, listOpenPrsLightPaged, hydrateHeavyFields, resolvePrListPaging } from './pr-list-paged.mjs';
 import { mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -55,7 +55,7 @@ import {
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
   'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
-  'labels', 'files', 'comments', 'statusCheckRollup',
+  'labels', 'files', 'comments', 'statusCheckRollup', 'rowsHead', 'rowsComplete',
 ]);
 
 /** Smoke-only controls; unset keeps the normal snapshot read unchanged. */
@@ -99,7 +99,28 @@ function candidateSmokeEnv(env, smokeChild) {
   return effective;
 }
 
+/** A capped snapshot must not read as a complete inventory: carry the flag (non-enumerable) on the projected rows. */
+/** True only when the caller DECLARED a smoke sample (WE_PR_SNAPSHOT_SAMPLE) — smoke/dry-run, never a normal read. */
+export function sampleDeclared(env = process.env) { return positiveInteger(env?.[WE_PR_SNAPSHOT_SAMPLE]) > 0; }
+
+/** The smoke/dry-run context where a sampled snapshot is legitimate: the sample env is set, or this is a rebuild-smoke
+ *  child (WE_SMOKE_LIVE_CLONE — the sample is then injected from settings, not present in process.env). */
+export function sampleContextDeclared(env = process.env) { return sampleDeclared(env) || Boolean(env?.WE_SMOKE_LIVE_CLONE); }
+
+/** A declared sample is NOT truncation: mark it `sampled` (non-enumerable) so readers accept it only while the sample
+ *  env is set. Real truncation (`snap.truncated`) always fails closed; a shortfall with no declared sample too. */
 function smokeProjection(snap, fields, env) {
+  const rows = smokeProjectionRows(snap, fields, env);
+  if (!Array.isArray(rows)) return rows;
+  const declared = sampleDeclared(env);
+  if (declared && rows.length < (snap?.prs?.length ?? 0)) Object.defineProperty(rows, 'sampled', { value: true });
+  if (snap?.truncated === true || (!declared && Array.isArray(snap?.prs) && rows.length < snap.prs.length)) {
+    Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
+  }
+  return rows;
+}
+
+function smokeProjectionRows(snap, fields, env) {
   const sample = positiveInteger(env[WE_PR_SNAPSHOT_SAMPLE]);
   if (!sample) return projectPrs(snap.prs, fields);
   if (!sampleLogged) {
@@ -169,9 +190,13 @@ function normalizeFields(fields) {
 /** Fetch complete light pages and hydrate stale heavy fields. Failed reads throw PrListUnreadableError. */
 export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyncThrottled, nowMs = Date.now(),
   deferrable = false, env = process.env, paging = resolvePrListPaging({ env }) }) {
+  // The refresher may be a new process: carry bounded lookup progress and immutable check-app identities
+  // in the snapshot already protected by readSharedOpenPrs' lock and atomic publication.
+  const checkAppState = { ...(prev?.repo === repo ? prev.checkAppState : {}) };
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize, pageRetries: paging.pageRetries,
-    maxRows: MAX_LIMIT, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
+    maxRows: MAX_LIMIT, checkAppState, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
   if (light.deferred) return light.deferred;
+  assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
   const cache = {};
   for (const p of prev?.prs ?? []) {
     if (prev.heavyMeta?.[p.number]) {
@@ -183,7 +208,7 @@ export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyn
   const heavyMeta = Object.fromEntries(Object.entries(heavy.cache).map(([n, { updatedAt, headRefOid, fetchedAtMs }]) =>
     [n, { updatedAt, headRefOid, fetchedAtMs }]));
   return { v: PR_SNAPSHOT_VERSION, repo, fetchedAtMs: nowMs, fields: [...SNAPSHOT_FIELDS], limit: MAX_LIMIT,
-    count: heavy.rows.length, truncated: light.truncated, prs: heavy.rows, heavyMeta,
+    count: heavy.rows.length, truncated: light.truncated, prs: heavy.rows, heavyMeta, checkAppState,
     paging: { pageSize: paging.pageSize, source: paging.source?.pageSize ?? 'standard', pages: light.pages,
       bytes: light.bytes, ms: light.ms, hydrated: heavy.fetched, reused: heavy.reused } };
 }

@@ -27,7 +27,7 @@ genuinely stuck process is caught sooner.
 
 ## What made this concrete
 
-On 2026-08-27 five `verify-lane` runs were started concurrently on a 12-core machine. All five failed, and
+On 2026-08-27 five `verify-lane` runs were started concurrently on the machine. All five failed, and
 **every failure was a spawn killed by its own deadline** — `errno: -60, code: 'ETIMEDOUT', signal: 'SIGKILL',
 stdout: '', stderr: ''`, with no output from the child at all. The failures landed exclusively on the four
 test files that spawn real processes (`we:scripts/operations/__tests__/wake-cli.test.mjs`,

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { readPauseState, writePauseState, setPause, clearPause } from '../readiness/dispatch-pause.mjs';
 import { fixDispatchKillFile } from '../conveyor/fix-loop-ledger.mjs';
 import { readMaintenanceMarker, writeMaintenanceMarker, clearMaintenanceMarker } from '../conveyor/maintenance-marker.mjs';
+import { markWorkerEnv } from './session-role.mjs';
 import { defaultListAgents } from './dispatch-lane-io.mjs';
 import { MAINTENANCE_EFFECT, runMaintenance } from './maintenance.mjs';
 
@@ -26,7 +27,7 @@ export function loadMaintenancePolicy({ path = POLICY_PATH } = {}) {
 export function runTestSession({ exec = execFileSync, policy = loadMaintenancePolicy() } = {}) {
   try {
     const out = String(exec('claude', ['-p', policy.prompt, '--model', policy.model], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: policy.timeoutSeconds * 1000, killSignal: 'SIGKILL',
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: policy.timeoutSeconds * 1000, killSignal: 'SIGKILL', env: markWorkerEnv(process.env),
     }));
     return out.includes(policy.expect) ? { ok: true, detail: out.trim().slice(0, 200) } : { ok: false, detail: `unexpected reply: ${out.trim().slice(0, 200)}` };
   } catch (e) {

@@ -11,6 +11,7 @@ const now = Date.parse('2026-10-27T23:00:00Z');
 const integrationFile = 'scripts/__tests__/lane-pool-acquire-base.test.mjs';
 const soakFile = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs';
 const otherFile = 'scripts/conveyor/soak/breaks/other.soak.test.mjs';
+const soakName = '50 real daemon ticks: every invariant holds after every tick';
 
 function skip(job, file, overrides = {}) {
   const list = addEntries(null, { tests: [file], job, brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
@@ -29,12 +30,19 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
     expect(step.run).toContain(`$(node scripts/ci/quarantine-skip.mjs --job="${job}")`);
     expect(step.run).toMatch(new RegExp(`npm run ${script} -- `));
     const resolved = job.replace('${{ matrix.shard }}', '1');
-    expect(skip(resolved, file).line).toBe(`--exclude=${file}`);
+    expect(skip(resolved, file).line).toBe(id === 'soak-shard' ? `--exclude=${file} --quarantined=${file}` : `--exclude=${file}`);
   });
 
-  it('soak checkout includes ancestry so quarantine can prove changed files', () => {
-    const checkout = jobs['soak-shard'].steps.find((s) => s.uses?.startsWith('actions/checkout@'));
-    expect(checkout.with?.['fetch-depth']).toBe(0);
+  it('soak checkout is depth 50 plus blobless main so quarantine can prove changed files (else it fails closed)', () => {
+    const steps = jobs['soak-shard'].steps;
+    const i = steps.findIndex((s) => s.uses?.startsWith('actions/checkout@'));
+    expect(steps[i].with?.['fetch-depth']).toBe(50);
+    const fetch = steps[i + 1];
+    expect(fetch.run).toBe('sh scripts/ci/fetch-main-history.sh');
+    expect(fetch['timeout-minutes']).toBe(4);
+    expect(fetch['continue-on-error']).toBeUndefined();
+    const helper = readFileSync(new URL('../fetch-main-history.sh', import.meta.url), 'utf8');
+    expect(helper).toMatch(/--filter=blob:none --depth=1000000 origin '\+refs\/heads\/main:refs\/remotes\/origin\/main'/);
   });
 
   it.each([['integration', integrationFile], ['soak-shard (1)', soakFile]])('%s retains fail-closed guards', (job, file) => {
@@ -48,6 +56,10 @@ describe('CI consumes quarantine for every automatically quarantined suite', () 
       { job, event: 'pull_request', ref: 'refs/pull/6010/merge' },
     ]) expect(skip(job, file, { flags }).skip).toEqual([]);
     expect(skip(job, `${file}::named failure`).skip).toEqual([]);
+  });
+
+  it.each(['integration', 'test-shard (1)', 'soak-shard (1)'])('%s never excludes a named entry even for a matching single test', (job) => {
+    expect(skip(job, `${soakFile}::${soakName}`).skip).toEqual([]);
   });
 });
 
@@ -80,11 +92,35 @@ describe('soak CLI quarantine consumption', () => {
     expect(io.files).toHaveBeenCalledWith({ shard: 1, total: 8 });
     expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', otherFile]);
   });
-  it('a fully quarantined baseline shard succeeds without invoking Vitest on an empty file list', async () => {
+  it('a named soak quarantine keeps every assigned file running, including unrelated assertions', async () => {
+    const { line } = skip('soak-shard (1)', `${soakFile}::${soakName}`);
+    expect(line).toBe('');
+    await runSoak(line ? [line] : []);
+    expect(io.spawn.mock.calls[0][1]).toEqual(['vitest', 'run', '--config', 'vitest.soak.config.ts', soakFile, otherFile]);
+  });
+  it('a shard emptied by a generic --exclude FAILS (no green shard without assertions) and never invokes Vitest', async () => {
     await runSoak([`--exclude=${soakFile}`], [soakFile]);
     expect(io.spawn).not.toHaveBeenCalled();
-    expect(process.exitCode).toBe(0);
+    expect(process.exitCode).toBe(1);
     expect(process.stdout.write).toHaveBeenCalledWith(expect.stringContaining('quarantined'));
+  });
+  it('a shard emptied ONLY by active job-tagged quarantine entries PASSES and names each file', async () => {
+    const tagged = skip('soak-shard (1)', soakFile).line;
+    expect(tagged).toBe(`--exclude=${soakFile} --quarantined=${soakFile}`);
+    await runSoak(tagged.split(' '), [soakFile]);
+    expect(io.spawn).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(0);
+    expect(process.stdout.write).toHaveBeenCalledWith(expect.stringContaining(soakFile));
+  });
+  it('an untagged or expired entry yields no quarantined flag, so the emptied shard FAILS', async () => {
+    const untagged = addEntries(null, { tests: [soakFile], brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
+      reason: 'repeat failures', actor: 'red-main-safety-net', now: now - 1000 }).list;
+    const read = { ok: true, list: { ...untagged, mode: 'quarantine', fixPrs: [6010] } };
+    const flags = { job: 'soak-shard (1)', event: 'pull_request', ref: 'refs/pull/6014/merge' };
+    expect(quarantineSkip({ env: {}, now, changed: [], read, flags }).line).not.toContain('--quarantined=');
+    expect(skip('soak-shard (1)', soakFile, { now: now + 10 * 24 * 3600 * 1000 }).line).not.toContain('--quarantined=');
+    await runSoak([`--exclude=${soakFile}`], [soakFile]);
+    expect(process.exitCode).toBe(1);
   });
   it('with no skips it runs the original assignment and preserves failures', async () => {
     await runSoak([], [soakFile, otherFile], 1);

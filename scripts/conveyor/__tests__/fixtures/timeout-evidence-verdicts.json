@@ -1,0 +1,197 @@
+[
+  {
+    "case": "eligible",
+    "pr": {
+      "number": 7100,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": true,
+      "signature": "recorded-timeout",
+      "jobs": [
+        {
+          "run": 410,
+          "job": 411,
+          "attempt": 1
+        }
+      ]
+    }
+  },
+  {
+    "case": "infra-cancelled",
+    "pr": {
+      "number": 7101,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": true,
+      "infraCancelled": true,
+      "cancelledShard": false,
+      "signature": "recorded-infra",
+      "jobs": [
+        {
+          "run": 420,
+          "job": 421,
+          "attempt": 1
+        }
+      ]
+    }
+  },
+  {
+    "case": "cancelled-shard",
+    "pr": {
+      "number": 7102,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": true,
+      "infraCancelled": true,
+      "cancelledShard": true
+    }
+  },
+  {
+    "case": "missing-check-origin",
+    "pr": {
+      "number": 7103,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": null
+        }
+      ]
+    },
+    "raw": null
+  },
+  {
+    "case": "incomplete-failure-inventory",
+    "pr": {
+      "number": 7104,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": false,
+      "reason": "timeout-evidence:incomplete-failure-inventory"
+    }
+  },
+  {
+    "case": "mixed-failure",
+    "pr": {
+      "number": 7105,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": false,
+      "reason": "mixed-infra-cancelled-and-real-failure"
+    }
+  },
+  {
+    "case": "classifier-ineligible",
+    "pr": {
+      "number": 7106,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": false,
+      "reason": "changed-dependency:unit.mjs"
+    }
+  },
+  {
+    "case": "unknown",
+    "pr": {
+      "number": 7107,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": false,
+      "unknown": true,
+      "reason": "timeout-evidence-unknown:read timed out"
+    }
+  },
+  {
+    "case": "deadline",
+    "pr": {
+      "number": 7108,
+      "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "requiredCheckName": "test",
+      "statusCheckRollup": [
+        {
+          "name": "test",
+          "status": "COMPLETED",
+          "conclusion": "FAILURE",
+          "detailsUrl": "https://github.com/fixture/repo/actions/runs/410/job/411"
+        }
+      ]
+    },
+    "raw": {
+      "eligible": false,
+      "reason": "timeout-evidence:evidence-read-deadline"
+    }
+  }
+]

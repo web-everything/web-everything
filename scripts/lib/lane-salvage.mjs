@@ -47,7 +47,7 @@ import {
   readFileSync, readdirSync, lstatSync, copyFileSync, symlinkSync, readlinkSync, constants as fsConstants,
 } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
-import { join, resolve, sep, dirname } from 'node:path';
+import { join, resolve, sep, dirname, relative } from 'node:path';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 
@@ -220,10 +220,11 @@ export function listLitterWorktrees(dir) {
   let cur = null;
   for (const line of git(dir, ['worktree', 'list', '--porcelain']).split('\n')) {
     if (line.startsWith('worktree ')) { cur = { path: line.slice(9) }; out.push(cur); }
+    else if (cur && line.startsWith('HEAD ')) cur.head = line.slice(5);
   }
   return out
     .filter((w) => w.path.startsWith(root + sep))
-    .map((w) => ({ path: w.path, name: w.path.slice(root.length + 1) }));
+    .map((w) => ({ path: w.path, name: w.path.slice(root.length + 1), head: w.head }));
 }
 
 /** Does `dirAbs` (a real, absolute path) have any registered worktree root somewhere beneath it? PURE-ish
@@ -398,18 +399,27 @@ export function laneLivenessGate({
 /**
  * Snapshot ONE working tree (lane or worktree) into refs WITHOUT touching its working tree or real index: a
  * throwaway index gets HEAD + every tracked change + every untracked (non-ignored) file, written as a `wip`
- * commit whose parent is HEAD. Returns what it saved.
+ * commit whose parent is HEAD. Untracked nested repositories are excluded and returned as `nestedRepos`
+ * (relative paths) for the caller to copy verbatim, including their git metadata and ignored content.
  */
 export function snapshotWorkTree(dir, { refs, branchRef }) {
   const headSha = git(dir, ['rev-parse', 'HEAD']).trim();
   const paths = dirtyPaths(dir);
+  const nestedRepos = git(dir, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0')
+    .filter((p) => p.endsWith('/') && !isWorktreeLitterPath(p))
+    .map((p) => p.slice(0, -1))
+    .filter((p) => {
+      try { lstatSync(join(dir, p, '.git')); return true; }
+      catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+    });
   let wipSha = null;
   if (paths.length) {
     const tmp = mkdtempSync(join(tmpdir(), 'lane-salvage-idx-'));
     try {
       const env = { ...process.env, GIT_INDEX_FILE: join(tmp, 'index') };
       git(dir, ['read-tree', 'HEAD'], { env });
-      git(dir, ['add', '-A', '--', '.', `:(exclude)${WORKTREE_LITTER_PREFIX.slice(0, -1)}`], { env });
+      git(dir, ['add', '-A', '--', '.', `:(exclude)${WORKTREE_LITTER_PREFIX.slice(0, -1)}`,
+        ...nestedRepos.map((p) => `:(exclude,literal)${p}`)], { env });
       const tree = git(dir, ['write-tree'], { env }).trim();
       wipSha = git(dir, ['-c', 'user.name=lane-salvage', '-c', 'user.email=lane-salvage@noreply.local',
         'commit-tree', tree, '-p', headSha, '-m', `lane-salvage: uncommitted + untracked state of ${dir}`], { env }).trim();
@@ -420,7 +430,7 @@ export function snapshotWorkTree(dir, { refs, branchRef }) {
   // Refs always go into the lane's shared repo (a worktree shares it), so one bundle carries everything.
   git(dir, ['update-ref', refs.head, headSha]);
   if (wipSha) git(dir, ['update-ref', refs.wip, wipSha]);
-  return { dir, headSha, wipSha, aheadCount, dirtyCount: paths.length, refs: { head: refs.head, wip: wipSha ? refs.wip : null } };
+  return { dir, headSha, wipSha, aheadCount, dirtyCount: paths.length, refs: { head: refs.head, wip: wipSha ? refs.wip : null }, nestedRepos };
 }
 
 /**
@@ -460,6 +470,68 @@ function copyLitterTreeSync(src, dest) {
 }
 
 /**
+ * Where a nested repository keeps its git metadata when that is NOT inside the tree we copy verbatim: a `.git`
+ * FILE (`gitdir: <path>`, as `git init --separate-git-dir` and submodules write) or a `.git` symlink. Returns the
+ * absolute external directory, or `null` when the metadata is a real `.git` directory (or lies inside the nested
+ * tree), which the tree copy already carries. Fail closed: an unreadable/unparseable pointer or a missing target
+ * THROWS, so `salvageLane` aborts and the caller never resets/deletes a clone whose staged objects were not saved.
+ */
+export function externalGitdir(repoDir) {
+  const g = nestedGitdir(repoDir);
+  return g.external ? g.dir : null;
+}
+
+/** The directory holding a nested repo's git metadata, and whether it lies outside the nested tree. */
+function nestedGitdir(repoDir) {
+  const dotGit = join(repoDir, '.git');
+  const st = lstatSync(dotGit);
+  if (st.isDirectory()) return { dir: dotGit, external: false, rel: '.git' };
+  let target;
+  if (st.isSymbolicLink()) {
+    target = realpathSync(dotGit);
+  } else {
+    const m = /^gitdir:[ \t]*(.+?)[ \t]*$/m.exec(readFileSync(dotGit, 'utf8'));
+    if (!m) throw new Error(`nested repo ${repoDir}: ${dotGit} is not a "gitdir: <path>" pointer — not salvaging`);
+    target = resolve(repoDir, m[1]);
+  }
+  if (!statSync(target).isDirectory()) throw new Error(`nested repo ${repoDir}: gitdir ${target} is not a directory — not salvaging`);
+  target = realpathSync(target);
+  // The pointer is lane-written text: refuse a target that is not shaped like a git dir (HEAD plus either
+  // objects/+refs/ or a `commondir` for a linked worktree) so `gitdir: /` or `gitdir: ~/.ssh` is never copied.
+  const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
+  const hasHead = existsSync(join(target, 'HEAD'));
+  if (!hasHead || !((isDir(join(target, 'objects')) && isDir(join(target, 'refs'))) || existsSync(join(target, 'commondir')))) {
+    throw new Error(`nested repo ${repoDir}: gitdir ${target} does not look like a git directory — not salvaging`);
+  }
+  const root = realpathSync(repoDir);
+  const external = !(target === root || target.startsWith(root + sep));
+  return { dir: target, external, rel: external ? null : relative(root, target) };
+}
+
+/**
+ * Fail-closed check of one nested repo's metadata, returning the common dir to copy too (or null). A linked
+ * worktree's gitdir (`<repo>/.git/worktrees/x`) holds only HEAD + index; its objects and refs live in the dir its
+ * `commondir` file names, so copying the gitdir alone would lose the staged blobs. A repo whose objects depend on
+ * `objects/info/alternates` (`git clone --shared|--reference`) keeps them in ANOTHER repo that is not copied, so
+ * the salvage would be incomplete — THROW rather than report a salvage that cannot restore the work.
+ */
+export function nestedGitMeta(repoDir) {
+  const g = nestedGitdir(repoDir);
+  const guardAlternates = (d) => {
+    if (existsSync(join(d, 'objects', 'info', 'alternates'))) throw new Error(`nested repo ${repoDir}: ${d} borrows objects via objects/info/alternates — not salvaging`);
+  };
+  guardAlternates(g.dir);
+  let commondir = null;
+  const cf = join(g.dir, 'commondir');
+  if (existsSync(cf)) {
+    commondir = realpathSync(resolve(g.dir, readFileSync(cf, 'utf8').trim()));
+    if (!statSync(commondir).isDirectory()) throw new Error(`nested repo ${repoDir}: commondir ${commondir} is not a directory — not salvaging`);
+    guardAlternates(commondir);
+  }
+  return { gitdir: g.external ? g.dir : null, inTreeRel: g.external ? null : g.rel, commondir };
+}
+
+/**
  * Salvage a whole lane: snapshot the lane + every litter worktree, copy every UNREGISTERED
  * `.claude/worktrees/` item verbatim (#4273 — it cannot be captured as a git ref; it isn't one), write
  * bundle/patch/unpushed files, VERIFY the bundle carries every salvage ref, and append an index line. Throws
@@ -475,7 +547,20 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
   const litter = listUnregisteredWorktreeLitter(dir);
   const snapshots = [snapshotWorkTree(dir, { refs: salvageRefNames({ lane, stamp }), branchRef })];
   for (const w of worktrees) {
-    snapshots.push({ worktree: w.name, ...snapshotWorkTree(w.path, { refs: salvageRefNames({ lane, stamp, worktree: w.name }), branchRef }) });
+    const refs = salvageRefNames({ lane, stamp, worktree: w.name });
+    try { lstatSync(w.path); } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      // Stale registration: its recorded HEAD can still live in the lane's shared object database.
+      if (!w.head) continue;
+      try { git(dir, ['cat-file', '-e', w.head]); } catch (e) { if (e?.status === 1) continue; throw e; } // only a genuinely absent object is skippable
+      const aheadCount = Number(git(dir, ['rev-list', '--count', `${branchRef}..${w.head}`]).trim());
+      if (aheadCount > 0) {
+        git(dir, ['update-ref', refs.head, w.head]);
+        snapshots.push({ worktree: w.name, dir: w.path, headSha: w.head, wipSha: null, aheadCount, dirtyCount: 0, refs: { head: refs.head, wip: null }, nestedRepos: [] });
+      }
+      continue;
+    }
+    snapshots.push({ worktree: w.name, ...snapshotWorkTree(w.path, { refs, branchRef }) });
   }
   // Only refs with content not already on origin/<branch> go in the bundle (an all-prerequisite ref would make
   // git refuse or silently drop it). Prerequisites are origin/<branch> commits — never force-pushed, always fetchable.
@@ -500,6 +585,29 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
     }
   }
   const prefix = join(outDir, `lane-${lane}`);
+  const nestedCopies = snapshots.flatMap((s) => (s.nestedRepos || []).map((p) => {
+    // Keep the lane-relative layout for worktree content too, avoiding collisions with the main tree.
+    const rel = s.worktree ? join(WORKTREE_LITTER_PREFIX, s.worktree, p) : p;
+    const dest = join(`${prefix}.nested-repos`, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    const src = join(s.dir, p);
+    // A `.git` pointer file leads OUTSIDE the tree (e.g. <clone>/.git/nested-db): the verbatim copy alone would
+    // keep only the pointer and lose every staged object once the stray clone is deleted. Resolve it BEFORE any
+    // copy so an unresolvable pointer aborts the salvage with nothing half-written for this repo.
+    const { gitdir, inTreeRel, commondir } = nestedGitMeta(src);
+    copyLitterTreeSync(src, dest);
+    const out = { rel, dest };
+    if (gitdir) { out.gitdir = `${dest}.gitdir`; copyLitterTreeSync(gitdir, out.gitdir); }
+    if (commondir) {
+      // A linked-worktree gitdir names its common dir relatively; the copy sits elsewhere, so point the copy at
+      // the copied common dir by absolute path (git accepts one) — the salvaged gitdir then opens as a repo.
+      out.commondir = `${dest}.commondir`;
+      copyLitterTreeSync(commondir, out.commondir);
+      const gitdirCopy = out.gitdir || join(dest, inTreeRel);
+      writeFileSync(join(gitdirCopy, 'commondir'), `${out.commondir}\n`);
+    }
+    return out;
+  }));
   // #4273 — copy every unregistered `.claude/worktrees/` item BEFORE the caller's `git clean -fd` can delete
   // it. Mirrors each item's own relative path under `.claude/worktrees/` (never a sanitized/collapsed name),
   // so distinct items can never collide on a shared destination. A symlink is copied as itself, never
@@ -541,7 +649,7 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
   }
   let branch = null;
   try { branch = git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(); } catch { branch = null; }
-  const worktreeBranches = worktrees.map((w) => { try { return git(w.path, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(); } catch { return null; } }).filter(Boolean);
+  const worktreeBranches = worktrees.filter((w) => existsSync(w.path)).map((w) => { try { return git(w.path, ['rev-parse', '--abbrev-ref', 'HEAD']).trim(); } catch { return null; } }).filter(Boolean);
   const record = buildSalvageRecord({
     now, pool, lane, dir, stamp, outDir, bundle, reason, branch, meta: { ...meta, worktreeBranches: [...(meta.worktreeBranches || []), ...worktreeBranches] },
     refs: bundleRefs.map((r) => r.ref),
@@ -551,6 +659,7 @@ export function salvageLane({ dir, lane, pool, branchRef, salvageRoot = resolveS
     patches: snapshots.map((s) => `${s.worktree ? `${prefix}.wt-${String(s.worktree).replace(/[^A-Za-z0-9._-]/g, '_')}` : prefix}.uncommitted.patch`),
     litter: litterCopies,
   });
+  record.nestedRepos = nestedCopies;
   appendSalvageIndex(salvageRoot, record);
   return { ...record, worktrees };
 }

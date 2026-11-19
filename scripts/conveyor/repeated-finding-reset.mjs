@@ -5,6 +5,7 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
 import { createHash } from 'node:crypto';
+import { parseOperatorAnswer, operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 
 export function resolveFixSafety({ env = process.env, tool = readSettings().fix, platform } = {}) {
   const bool = v => v === undefined ? undefined : /^(true|1|on)$/i.test(v) ? true : /^(false|0|off)$/i.test(v) ? false : v;
@@ -94,6 +95,25 @@ export function repeatedFindingPlan(comments, { enabled = true } = {}) {
       const marker = c.body.match(/^(?:<!--\s*)?scope-baseline:\s*([0-9a-f]{40})(?:\s*-->)?\s*$/m);
       if (marker) baseline = marker[1];
     }
+    // stand-down-answer.mjs quotes the operator's reason, so its scope-baseline is never alone on a line.
+    // Read it from the verified answer record (trusted poster + exact rebuild checked by parseOperatorAnswer).
+    // Operator-authored only, naming a stand-down present in this thread, with the marker ending the reason
+    // (so quoted/negated prose such as "do not use scope-baseline: <sha>; rejected" cannot grant a reset).
+    // Any trusted poster's verified answer is read (the ceremony relays operator answers through the automation
+    // login, and latestOperatorAnswer accepts both); only an operator-authored one may SET a baseline, but any may clear it.
+    const answer = parseOperatorAnswer(raw);
+    const list = comments ?? [];
+    // Any verified answer to the stand-down counts, so a later correction replaces the first answer's baseline
+    // (latestOperatorAnswer picks the newest; this must agree). `answer` itself follows the stand-down and
+    // names it, so a non-null answer record for that index proves the stand-down is terminal.
+    const named = answer && list.slice(0, list.indexOf(raw)).some((x, i) => x?.id && String(x.id) === answer.standDownId
+      && operatorAnswerForStandDown(list, i) !== null);
+    // The marker must be its own final sentence: nothing but the baseline after the last . ! ? or newline.
+    const inAnswer = named && answer.reason.match(/(?:^|[.!?\n]\s*)scope-baseline:\s*([0-9a-f]{40})\s*$/);
+    // The newest verified answer rules (as in latestOperatorAnswer): one with a valid final-sentence baseline sets it,
+    // one without (a revocation, "do not reset", a negated or quoted marker) clears any earlier authorization.
+    // An unrelated verified answer to the same thread (e.g. "use approach B") also clears an earlier plain baseline: fail closed.
+    if (named) baseline = inAnswer && c.operator ? inAnswer[1] : null;
     if (/^🔓 conveyor fix-end/.test(c.body)) {
       if (!c.body.includes(FIX_END_INFRA_STALL_PREFIX)) fix++;
       continue;

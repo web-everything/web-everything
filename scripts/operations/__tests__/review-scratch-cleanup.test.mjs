@@ -27,7 +27,10 @@ it('keeps ownership metadata outside a pinned tree containing the former marker 
     env: { ...process.env, TMPDIR: tmp, PATH: `${bin}:${process.env.PATH}` }, encoding: 'utf8', timeout: 15000,
   });
   expect(r.status, r.stderr).toBe(0);
-  expect(readdirSync(tmp)).toEqual(['bin']);
+  // A failed pool setup falls back to a full copy and leaves nothing behind: no held lock, no slot, no scratch.
+  expect(readdirSync(tmp).sort()).toEqual(['bin', 'we-seat-pool']);
+  expect(readdirSync(join(tmp, 'we-seat-pool', 'locks'))).toEqual([]);
+  expect(readdirSync(join(tmp, 'we-seat-pool', 'slots'))).toEqual([]);
 });
 it('removes a checkout whose pinned fetch fails before makeScratch returns', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'we-seat-failure-test-')); roots.push(tmp);
@@ -90,7 +93,7 @@ it.each(['codex', 'agy-gemini'].flatMap(provider =>
       writeFileSync(${JSON.stringify(termCheckout)}, String(existsSync(${JSON.stringify(dir)})));
     });
     const work = ${execName}({ dir: ${JSON.stringify(dir)}, task: 'inert test',
-      model: ${JSON.stringify(provider === 'codex' ? 'gpt-5.4' : 'gemini-3.1-pro')}, effort: 'high',
+      model: ${JSON.stringify(provider === 'codex' ? 'gpt-5.4' : 'gemini-4-argon-high')}, effort: 'high',
       review: true, timeoutMs: 60000, stream: false, logFile: ${JSON.stringify(join(tmp, 'model.log'))},
       spawnFn: (_cli, _argv, opts) => spawn(process.execPath,
         ['--input-type=module', '-e', ${JSON.stringify(modelCode)}], opts) });

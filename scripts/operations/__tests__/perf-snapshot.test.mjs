@@ -160,6 +160,19 @@ describe('perf-snapshot pure metrics', () => {
     });
   });
 
+  it('classifies Hetzner shards as code CI and measures their durations', () => {
+    const jobs = [
+      { name: 'hetzner / test-shard (1)', ms: 120000 },
+      { name: 'hetzner / test-shard (2)', ms: 300000 },
+      { name: 'hetzner / integration', ms: 600000 },
+      { name: 'test', ms: 60000 },
+    ];
+    const result = ciWallMetrics([{ wallMs: 900000, jobs }]);
+    expect(result).toMatchObject({ 'ci.code.runs': m(1, 'runs'), 'ci.code.wallMedianMin': m(15),
+      'ci.slowestShardMedianMin': m(5), 'ci.shardSpreadMedianMin': m(3), 'ci.testJobMedianMin': m(1) });
+    expect(result['ci.cardOnly.runs']).toBeUndefined();
+  });
+
   it('counts idle free ticks, caps long gaps and excludes busy/outside ticks', () => {
     const tick = (time, extra = {}) => ({ at: at(time), capacity: { free: true }, dispatched: [], inFlight: [], ...extra });
     expect(builderStarvation([

@@ -156,19 +156,27 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
     expect(site).toBeGreaterThan(-1);
     const guard = src.indexOf('if (!mechanicalPark) {', site);
     const row = src.indexOf('recordDrainVerdict({ repo:', site);
-    const add = src.indexOf("'--add-label', parkDecision.addLabel]", site);
+    const add = src.indexOf("addPrLabel(v.repo, v.num, parkDecision.addLabel)", site);
     expect(guard).toBeGreaterThan(site);
     expect(row).toBeGreaterThan(guard);
     expect(add).toBeGreaterThan(row);
   });
 
-  it('the call sits inside the shouldApplyReviewLabel guard, AHEAD of the `gh pr edit --add-label` transport call', () => {
-    const guardStart = src.indexOf('if (shouldApplyReviewLabel(gate.applyLabel, v.prLabels)) {');
-    expect(guardStart).toBeGreaterThan(-1);
-    const ledgerCallAt = src.indexOf('recordDrainVerdict({ repo:', guardStart);
-    const ghCallAt = src.indexOf("execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', gate.applyLabel]", guardStart);
-    expect(ledgerCallAt).toBeGreaterThan(guardStart);
-    expect(ghCallAt).toBeGreaterThan(ledgerCallAt);
+  it('the call sits inside the applyDrainParkLabel onBeforeAdd hook, AHEAD of the `gh pr edit --add-label` transport call', () => {
+    // runCli hands the ledger write to applyDrainParkLabel as onBeforeAdd; the helper runs it only inside the
+    // shouldApplyReviewLabel guard and strictly before its own gh add-label call.
+    const callStart = src.indexOf('applyDrainParkLabel({ gate, labels: v.prLabels');
+    expect(callStart).toBeGreaterThan(-1);
+    expect(src.indexOf('onBeforeAdd: () => {', callStart)).toBeGreaterThan(callStart);
+    expect(src.indexOf('recordDrainVerdict({ repo:', callStart)).toBeGreaterThan(callStart);
+    const fnStart = src.indexOf('export function applyDrainParkLabel(');
+    expect(fnStart).toBeGreaterThan(-1);
+    const guardAt = src.indexOf('if (shouldApplyReviewLabel(gate.applyLabel, labels)) {', fnStart);
+    const hookAt = src.indexOf('onBeforeAdd?.();', fnStart);
+    const ghAt = src.indexOf("'--add-label', gate.applyLabel]", fnStart);
+    expect(guardAt).toBeGreaterThan(fnStart);
+    expect(hookAt).toBeGreaterThan(guardAt);
+    expect(ghAt).toBeGreaterThan(hookAt);
   });
 
   it('the wired call passes the SAME label the gate decided and the drain\'s own headSha — never a re-derived value', () => {
@@ -237,6 +245,16 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
     expect(r.ok).toBe(false);
   });
 
+  it('freeze unreadable records a drain hold without a PR verdict and deduplicates it', () => {
+    const reason = 'freeze-unreadable-hold: freeze unreadable — nothing lands until readable';
+    expect(recordDrainHold({ repo: 'o/n', pr: 704, reason })).toMatchObject({ ok: true, appended: true });
+    expect(recordDrainHold({ repo: 'o/n', pr: 704, reason })).toMatchObject({ ok: true, appended: false });
+    expect(events('o/n').filter(e => e.type === 'hold')).toEqual([expect.objectContaining({
+      pr: 704, reasonCode: 'freeze-unreadable-hold', holdSource: 'drain', source: 'merge-ai-prs',
+    })]);
+    expect(foldRepo('o/n').get(704)).toBeUndefined();
+  });
+
   it('drainHoldReasonCode masks numbers and shas so a counter change is not a reason change', () => {
     expect(drainHoldReasonCode('pending (2/5) abcdef1234')).toBe(drainHoldReasonCode('pending (3/5) 0123456789'));
     expect(drainHoldReasonCode('')).toBe('unspecified');
@@ -249,7 +267,7 @@ describe('E3 #3929 — re-park rows, producer rows and drain-hold events', () =>
       const at = src.indexOf(marker);
       const guard = src.indexOf('if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {', at);
       const led = src.indexOf('recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel', guard);
-      const gh = src.indexOf("'--add-label', parkDecision.addLabel]", guard);
+      const gh = src.indexOf("addPrLabel(v.repo, v.num, parkDecision.addLabel)", guard);
       expect(guard).toBeGreaterThan(at);
       expect(led).toBeGreaterThan(guard);
       expect(gh).toBeGreaterThan(led);

@@ -4,23 +4,33 @@
  * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
 import { withBareOrigin } from './helpers/real-repo.mjs';
 import { createPrototypeLoader, defaultDeps } from '../prototype-load-io.mjs';
-import { changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
+import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
+import * as prototypeLoad from '../prototype-load.mjs';
+import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
+import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
-import { parseOperationArgv } from '../cli-adapter.mjs';
+import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { overlaySafetySettings } from '../../lib/daemon-load-overlay.mjs';
+import { checkPendingAdoptions, readPendingAdoptions, recordPendingAdoption } from '../../lib/overlay-adoption.mjs';
+// Exercise the real runner binding without spawning an auditor or writing audit records.
+vi.mock('../codex-audit.mjs', async (importOriginal) => ({
+  ...await importOriginal(), main: vi.fn(async () => 0),
+}));
 const SHA = 'a'.repeat(40), TREE = 'b'.repeat(40), MERGE = 'c'.repeat(40);
-const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control' };
+const BASE = { branch: 'lane/new', sha: SHA, daemon: 'control', waitAdoptionMs: 30 };
 const settings = {
   daemons: { control: { label: 'com.we.control', clone: 'wev-control' }, review: { label: 'com.we.review-daemon' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } },
   workspaceRoot: '~/workspace', launchAgentsDir: '~/Library/LaunchAgents', recordPath: '~/records', readyRecordPath: '~/ready',
@@ -28,7 +38,7 @@ const settings = {
 };
 function fixture(options = {}) {
   const candidateSha = options.sha || SHA;
-  const calls = [], records = [], sleeps = [], reads = [], cloneRoots = [];
+  const calls = [], records = [], readyWrites = [], sleeps = [], reads = [], cloneRoots = [];
   let clock = 0;
   let remoteTip = candidateSha;
   let tipReads = 0;
@@ -44,11 +54,18 @@ function fixture(options = {}) {
   const fs = {
     readFileSync(p) {
       reads.push(p);
+      if (p === '/home/test/platform-preferences.json') return JSON.stringify({ prototypeLoad: options.platformSettings });
       if (options.readError && p === '/home/test/ready') throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      if (p.endsWith('/test-clone-key.json')) return options.registryRaw ?? (options.list ? JSON.stringify({ overlays: [...registrations.values()] }) : '');
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
+      if (p === '/home/test/canonical-audits.jsonl') {
+        if (options.auditReadError) throw Object.assign(new Error('audit file unreadable'), { code: options.auditReadError });
+        return options.audits ?? auditLines([auditRecord({ head: candidateSha, base: 'e'.repeat(40) })]);
+      }
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
       if (p.endsWith('.events.jsonl')) return options.events || '';
+      if (p.endsWith('.drop-pending') && options.pendingDrops) return options.pendingDrops;
       if (p.endsWith('.rebuild.json')) {
         if (options.rebuildStateReadError) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
         if (options.rebuildStateRaw !== undefined) return options.rebuildStateRaw;
@@ -56,7 +73,7 @@ function fixture(options = {}) {
       }
       const e = new Error('missing'); e.code = 'ENOENT'; throw e;
     },
-    mkdirSync() {}, appendFileSync(p, line) { records.push({ path: p, ...JSON.parse(line) }); },
+    mkdirSync() {}, appendFileSync(p, line) { (p === '/home/test/ready' ? readyWrites : records).push({ path: p, ...JSON.parse(line) }); },
   };
   const fail = (status, stdout = '', stderr = 'failed') => { throw Object.assign(new Error(stderr), { status, stdout, stderr }); };
   const exec = (cmd, args, config) => {
@@ -70,6 +87,25 @@ function fixture(options = {}) {
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
       if (action === 'list') return options.listRaw ?? JSON.stringify({ list: [...registrations.values()] });
+      if (action === 'recover-drops') return options.recoverRaw ?? JSON.stringify({ settled: [{ ref: 'lane/x', outcome: 'restored' }], pending: [] });
+      if (action === 'retire') {
+        if (options.retireRefuses === ref) return fail(3, JSON.stringify({ retired: false, refused: 'tip-moved' }));
+        registrations.delete(ref);
+        return JSON.stringify({ retired: true, refused: null });
+      }
+      if (action === 'replace') {
+        const old = args.find((a) => a.startsWith('--replaces='))?.slice(11);
+        const contained = (options.contained || []).includes(old);
+        const check = { ok: true, clean: true, candSha: remoteTip };
+        if (args.includes('--check')) {
+          return contained ? JSON.stringify({ check, containment: { ok: true, contained: true }, wouldReplace: true, refused: null })
+            : fail(3, JSON.stringify({ check: null, containment: { ok: true, contained: false }, wouldReplace: false, refused: 'not-contained' }));
+        }
+        admitted.push({ ref, replaces: old });
+        registrations.delete(old);
+        registrations.set(ref, { ref });
+        return JSON.stringify({ replaced: true, registered: true, conflictCheck: check, list: [...registrations.values()] });
+      }
       if (action === 'add' && overlaySafetySettings(config.env, { readSettings: () => options.safetySettings || {} }).noPr === 'refuse') {
         return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
       }
@@ -116,6 +152,7 @@ function fixture(options = {}) {
     if (args[0] === 'fetch') {
       const ref = args[2]?.replace(/^\+refs\/heads\//, '').split(':')[0];
       if (options.staleFetchFails === ref) return fail(1);
+      if (options.mainFetchFails && args.length === 3 && args[2] === 'main' || options.liveFetchFails && args.length > 3 && args[2] === 'main') return fail(1); // only the `origin main <branch>` fetch, not the bare `origin main`
       if (ref === BASE.branch && tipReads > 0 && options.advanceEstablishedBeforeSwap) establishedAdvanced = true;
       if (establishedTips.has(ref)) {
         const count = (establishedFetches.get(ref) || 0) + 1;
@@ -147,7 +184,7 @@ function fixture(options = {}) {
         if (options.staleDiffFails === ref) return fail(1);
         if (options.staleChanged?.[ref] !== undefined) return options.staleChanged[ref];
       }
-      return args.at(-1).startsWith('origin/main...') ? 'M\0x\0' : options.diff ?? 'M\0x\0';
+      return args.at(-1).startsWith('origin/main...') ? options.ownDiff ?? 'M\0x\0' : options.diff ?? 'M\0x\0';
     }
     if (args[0] === 'cherry') {
       expect(args.slice(1, 2)).toEqual(['origin/main']);
@@ -156,7 +193,13 @@ function fixture(options = {}) {
       return options.cherry?.[ref] ?? `+ ${SHA}\n`;
     }
     if (args[0] === 'merge-base') {
+      // Model repositories independently: a base known to WE is not proof for plateau-app.
+      if (options.auditBasesByRepo && args[1] === '--is-ancestor' && args[3] === 'origin/main') {
+        return options.auditBasesByRepo[config.cwd]?.includes(args[2]) ? '' : fail(1);
+      }
       if (args[2] === 'origin/main') return options.behind ? fail(1) : '';
+      if (args[2] === 'e'.repeat(40) && args[3] === 'origin/main') return '';
+      if (options.auditBaseInMain && args[3] === 'origin/main' && args[2] === options.auditBaseInMain) return '';
       if (args[2] === TREE) return options.advancedContained ? '' : fail(1);
       if ([...establishedTips.values()].includes(args[2])) {
         if (options.refreshError === 'ancestry') return fail(128);
@@ -197,12 +240,365 @@ function fixture(options = {}) {
     ? options.combinedTest(input)
     : options.combinedTest ?? { ok: false, command: 'fixture-related-tests', result: 'failed', reason: 'tests-failed' });
   if (options.combinedIO) Object.assign(fs, options.combinedIO.fs);
-  const load = createPrototypeLoader({ exec, fs, env, ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone(settings), now: () => clock,
+  if (options.pendingFs) {
+    const readFixture = fs.readFileSync;
+    const mkdirFixture = fs.mkdirSync;
+    for (const method of ['writeFileSync', 'renameSync', 'rmSync', 'rmdirSync', 'statSync']) fs[method] = options.pendingFs[method];
+    fs.readFileSync = (p, ...args) => String(p).endsWith('.pending')
+      ? options.pendingFs.readFileSync(p, ...args) : readFixture(p, ...args);
+    fs.mkdirSync = (p, ...args) => String(p).includes('/adoption-pending')
+      ? options.pendingFs.mkdirSync(p, ...args) : mkdirFixture(p, ...args);
+  }
+  // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
+  const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
+  const load = createPrototypeLoader({ exec, fs, env, retirePlanner,
+    // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
+    testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
+    dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
+const auditRecord = (overrides = {}) => ({
+  at: '2026-10-20T12:00:00Z', base: TREE, head: SHA, baseRef: 'origin/main',
+  questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], ...overrides,
+});
+const auditLines = (records) => records.map(record => JSON.stringify(record)).join('\n') + '\n';
+
+describe('prototype-load daemon code repository routing', () => {
+  const weRepo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
+  const plateauRepo = '/home/test/workspace/plateau-app';
+  const daemon = { repo: 'plateau-app', clone: 'plateau-drain-daemon' };
+  const routedSettings = { daemons: { ...settings.daemons, 'drain-plateau': daemon } };
+  const ancestryArgs = ['merge-base', '--is-ancestor', TREE, 'origin/main'];
+  const gitCalls = (f) => f.calls.filter(({ cmd }) => cmd === 'git');
+
+  it('accepts a canonical audit whose base is in plateau-app origin/main and runs every git call there', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]),
+      auditBasesByRepo: { [plateauRepo]: [TREE] } });
+    const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
+    expect(gitCalls(f)).toContainEqual(expect.objectContaining({ args: ancestryArgs,
+      config: expect.objectContaining({ cwd: plateauRepo }) }));
+    expect(out).toMatchObject({ ok: true, dryRun: true, canonicalAudit: { ok: true }, stopReason: null });
+    expect(gitCalls(f).every(({ config }) => config.cwd === plateauRepo)).toBe(true);
+  });
+
+  it('refuses drain-plateau when its canonical audit is missing', async () => {
+    const testCheck = vi.fn();
+    const f = fixture({ settings: routedSettings, audits: '', testCheck });
+    expect(await f.run({ daemon: 'drain-plateau', dryRun: true })).toMatchObject({
+      ok: false, registered: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false },
+    });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(testCheck).not.toHaveBeenCalled();
+    expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
+  });
+
+  it('refuses a base absent from plateau-app origin/main even when WE contains it', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]),
+      auditBasesByRepo: { [weRepo]: [TREE], [plateauRepo]: [] } });
+    const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(gitCalls(f)).toContainEqual(expect.objectContaining({ args: ancestryArgs,
+      config: expect.objectContaining({ cwd: plateauRepo }) }));
+    expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
+  });
+
+  it('refuses drain-plateau when changed paths match the WE dispatch-smoke paths (no skip for non-WE repos)', async () => {
+    const f = fixture({ settings: routedSettings, audits: auditLines([auditRecord()]), auditBasesByRepo: { [plateauRepo]: [TREE] },
+      ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    expect(await f.run({ daemon: 'drain-plateau', dryRun: true })).toMatchObject({ ok: false, registered: false, stopReason: 'dispatch-smoke-failed' });
+  });
+  it.each(['drain', 'review'])('keeps every git call in the WE repo for %s', async (key) => {
+    const f = fixture();
+    expect(await f.run({ daemon: key, dryRun: true })).toMatchObject({ ok: true, stopReason: null });
+    expect(gitCalls(f).length).toBeGreaterThan(0);
+    for (const { config } of gitCalls(f)) expect(config.cwd).toBe(weRepo);
+  });
+
+  it('keeps the overlay CLI path and cwd in WE for an explicitly supported non-WE daemon', async () => {
+    const f = fixture({ settings: routedSettings });
+    const out = await f.run({ daemon: 'drain-plateau', dryRun: true });
+    expect(out).toMatchObject({ ok: true, clone: '/home/test/workspace/plateau-drain-daemon' });
+    const overlays = f.calls.filter(({ cmd }) => cmd === 'node');
+    expect(overlays.length).toBeGreaterThan(0);
+    for (const { args, config } of overlays) {
+      expect(args[0]).toBe(join(weRepo, settings.loaderCli));
+      expect(args).toContain('--clone=/home/test/workspace/plateau-drain-daemon');
+      expect(config.cwd).toBe(weRepo);
+    }
+  });
+
+  describe.each(['drain-plateau', 'plateau-drain-daemon'])('shipped unsupported plateau target %s', (name) => {
+    it.each([
+      ['normal registration', { waitAdoptionMs: undefined }],
+      ['dry-run', { dryRun: true }],
+      ['explicit adoption wait', { waitAdoptionMs: 30 }],
+      ['retire-only', { retire: true }],
+    ])('refuses %s before any subprocess or overlay access', async (_mode, input) => {
+      const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
+      const f = fixture({ settings: { daemons: shipped.daemons, daemonAliases: shipped.daemonAliases } });
+      expect(await f.run({ daemon: name, ...input })).toMatchObject({
+        ok: false, daemon: 'drain-plateau', registered: false, adopted: false,
+        stopReason: 'unsupported-daemon', detail: 'unsupported-daemon:drain-plateau',
+        fallback: expect.stringMatching(/main-only.*normal PR/),
+      });
+      expect(f.calls).toEqual([]);
+      expect(f.cloneRoots).toEqual([]);
+      expect([...f.registrations]).toEqual([]);
+      expect(f.records).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ stopReason: 'unsupported-daemon' });
+    });
+
+    it('leaves an existing registration untouched when retirement is requested', async () => {
+      const shipped = JSON.parse(nodeFs.readFileSync(join(weRepo, 'scripts/settings/prototype-load.json'), 'utf8'));
+      const f = fixture({ list: [BASE.branch], settings: { daemons: shipped.daemons, daemonAliases: shipped.daemonAliases } });
+      expect(await f.run({ daemon: name, retire: true })).toMatchObject({ ok: false, stopReason: 'unsupported-daemon' });
+      expect(f.calls).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual([BASE.branch]);
+    });
+  });
+});
+
+function auditedFixture(mode, options = {}) {
+  // Historical warn-era success fixtures now supply real canonical evidence explicitly.
+  let audits = '';
+  if (options.ready) {
+    const ready = prototypeLoad.jsonLines(options.ready).at(-1);
+    audits = auditLines([auditRecord({ base: 'e'.repeat(40),
+      ...(ready?.audit === 'WEAKENED' ? { head: ready.sha, verdict: 'WEAKENED', findings: ready.auditDisclosed, fingerprint: ready.fingerprint } : {}) })]);
+  }
+  return fixture({ audits, ...options, settings: {
+    auditRecordPath: '~/canonical-audits.jsonl',
+    ...(mode === undefined ? {} : { canonicalAuditMode: mode }), ...options.settings,
+  } });
+}
+
+describe('codex-audit runner registration', () => {
+  it('declares base and head inputs and binds execution to codex-audit main', async () => {
+    vi.mocked(auditMain).mockClear();
+    const { declaration, registry, sinks } = resolveOperation('codex-audit');
+    expect(declaration.name).toBe('codex-audit');
+    expect(declaration.input).toMatchObject({ base: { type: 'string' }, head: { type: 'string' } });
+    const parsed = parseOperationArgv(declaration, ['--base=origin/main', `--head=${SHA}`]);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.input).toMatchObject({ base: 'origin/main', head: SHA });
+    await runOperationCli({ declaration, registry, sinks,
+      argv: ['--base=origin/main', `--head=${SHA}`],
+      store: createMemoryRunStore(), newRunId: () => 'canonical-audit-registration',
+    });
+    expect(auditMain).toHaveBeenCalledTimes(1);
+    const [argv] = vi.mocked(auditMain).mock.calls[0];
+    expect(argv).toEqual(expect.arrayContaining(['--base=origin/main', `--head=${SHA}`]));
+  });
+});
+
+describe('canonicalAuditEvidence', () => {
+  it('exports a pure selector returning the matching NOT WEAKENED record', () => {
+    const record = Object.freeze(auditRecord());
+    const records = Object.freeze([record]);
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: true, record });
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA).record).toBe(record);
+  });
+  it.each([
+    ['empty records', []],
+    ['foreign question hash', [auditRecord({ questionHash: 'foreign-question' })]],
+    ['other head', [auditRecord({ head: MERGE })]],
+    ['invalid date', [auditRecord({ at: 'not-a-date' })]],
+    ['missing date', [auditRecord({ at: undefined })]],
+  ])('returns no-record for %s', (_, records) => {
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('returns weakened for a matching WEAKENED record', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('the later-appended record decides, whatever timestamps it reports', () => {
+    const pass = auditRecord(), weak = auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' });
+    expect(prototypeLoad.canonicalAuditEvidence([pass, weak], SHA)).toEqual({ ok: false, reason: 'weakened' });
+    expect(prototypeLoad.canonicalAuditEvidence([weak, pass], SHA).ok).toBe(true);
+  });
+  it('a pass over another base never masks a WEAKENED audit of a different base (fail closed)', () => {
+    const later = auditRecord({ at: '2026-10-21T12:00:00Z', base: MERGE });
+    expect(prototypeLoad.canonicalAuditEvidence([later, auditRecord({ verdict: 'WEAKENED' })], SHA))
+      .toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('equal timestamps resolve by append order, so a later WEAKENED beats an earlier pass', () => {
+    const records = [auditRecord(), auditRecord({ verdict: 'WEAKENED' })];
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('ignores newer foreign hashes, other heads and invalid dates when selecting a canonical record', () => {
+    const record = auditRecord();
+    const newer = { at: '2026-10-22T12:00:00Z', verdict: 'WEAKENED' };
+    expect(prototypeLoad.canonicalAuditEvidence([record,
+      auditRecord({ ...newer, questionHash: 'foreign-question' }),
+      auditRecord({ ...newer, head: MERGE }),
+      auditRecord({ ...newer, at: 'not-a-date' }),
+    ], SHA)).toEqual({ ok: true, record });
+  });
+});
+
+describe('canonicalAuditEvidence hardening', () => {
+  it('ignores an empty-diff audit (base equals head) that would mask a WEAKENED audit of the real change', () => {
+    const weak = auditRecord({ verdict: 'WEAKENED' });
+    const empty = auditRecord({ base: SHA, at: '2026-10-22T12:00:00Z' });
+    expect(prototypeLoad.canonicalAuditEvidence([weak, empty], SHA)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('rejects a NOT WEAKENED record whose findings contradict the verdict', () => {
+    const bad = auditRecord({ findings: ['WEAKENED'] });
+    expect(prototypeLoad.canonicalAuditEvidence([bad], SHA)).toEqual({ ok: false, reason: 'no-record' });
+  });
+});
+
+describe('prototype-load ruled-WEAKENED admission', () => {
+  const findings = ['operator-disclosed weakening'];
+  const ready = {
+    ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED',
+    auditRuling: 'R396', auditDisclosed: findings,
+  };
+  const allowed = { ref: BASE.branch, sha: SHA, ruling: 'R396', findings };
+
+  it('loads an exact ruled-WEAKENED record and warns with its ruling, head and findings', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture('warn', {
+        ready: auditLines([ready]), settings: { ruledWeakened: [allowed] },
+      });
+      expect(await f.run()).toMatchObject({
+        ok: true, registered: true, adopted: true, stopReason: null,
+        gate: { source: 'ready-record', ruledWeakened: { ruling: 'R396', findings } },
+      });
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining(`RULED-WEAKENED EXCEPTION R396: loading ${BASE.branch}@${SHA}`),
+      );
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(`Disclosed findings: ${findings[0]}`));
+      expect(mutations(f, 'add')).toHaveLength(1);
+    } finally { warning.mockRestore(); }
+  });
+
+  it.each([
+    ['unlisted', []],
+    ['different ref', [{ ...allowed, ref: 'lane/other' }]],
+    ['different sha', [{ ...allowed, sha: TREE }]],
+    ['different ruling', [{ ...allowed, ruling: 'R999' }]],
+    ['different findings', [{ ...allowed, findings: ['unrelated'] }]],
+  ])('stops a %s WEAKENED record with no-ready before admission and without an exception warning', async (_, ruledWeakened) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture('warn', { ready: auditLines([ready]), settings: { ruledWeakened } });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready', gate: null });
+      expect(f.calls).toHaveLength(0);
+      expect(warning.mock.calls.flat().join('\n')).not.toMatch(/RULED-WEAKENED EXCEPTION/);
+    } finally { warning.mockRestore(); }
+  });
+});
+
+describe('prototype-load canonical audit admission', () => {
+  it('has no tool-file mode: admission always refuses without canonical evidence', () => {
+    const shipped = JSON.parse(nodeFs.readFileSync(join(process.cwd(), 'scripts/settings/prototype-load.json'), 'utf8'));
+    expect(shipped).not.toHaveProperty('canonicalAuditMode');
+  });
+  it.each([
+    ['explicit warn', 'warn', [], 'no-record'],
+    ['absent mode', undefined, [], 'no-record'],
+    ['weakened in warn', 'warn', [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
+    ['weakened with absent mode', undefined, [auditRecord({ verdict: 'WEAKENED' })], 'weakened'],
+    ['unreadable in warn', 'warn', [], 'no-record', 'EACCES'],
+    ['missing file with absent mode', undefined, [], 'no-record', 'ENOENT'],
+  ])('%s refuses failed canonical evidence without warn fallback', async (_, mode, records, reason, auditReadError) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const f = auditedFixture(mode, { audits: auditLines(records), auditReadError });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason } });
+      expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+      expect(warning).not.toHaveBeenCalled(); expect(mutations(f, 'add')).toHaveLength(0);
+      expect(f.calls).toEqual([]);
+    } finally { warning.mockRestore(); }
+  });
+  it.each([
+    ['no records', [], 'no-record'],
+    ['foreign question hash', [auditRecord({ questionHash: 'foreign-question' })], 'no-record'],
+    ['other head', [auditRecord({ head: MERGE })], 'no-record'],
+    ['invalid date', [auditRecord({ at: 'not-a-date' })], 'no-record'],
+    ['latest record weakened', [auditRecord(), auditRecord({ at: '2026-10-21T12:00:00Z', verdict: 'WEAKENED' })], 'weakened'],
+  ])('refuse stops before git or registration on %s and names the worker fallback', async (_, records, reason) => {
+    const f = auditedFixture('refuse', { audits: auditLines(records) });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+    expect(f.records[0]).toMatchObject({ stopReason: 'no-canonical-audit' });
+  });
+  it.each(['ENOENT', 'EACCES', 'EIO'])('refuse fails closed on unreadable audit records (%s)', async auditReadError => {
+    const f = auditedFixture('refuse', { auditReadError });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['warn', 'refuse'])('%s accepts a canonical NOT WEAKENED audit read from the configured JSONL path', async mode => {
+    const record = auditRecord();
+    const f = auditedFixture(mode, { auditBaseInMain: TREE, audits: `malformed json\n${auditLines([record])}` });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { mode: 'refuse', ok: true } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl');
+    expect(mutations(f, 'add')).toHaveLength(1);
+  });
+  it('refuse rejects a pass whose base is not in origin/main (it audited only part of the change)', async () => {
+    const f = auditedFixture('refuse', { audits: auditLines([auditRecord()]) });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('arguments cannot bypass missing readiness or canonical audits', async () => {
+    const f = auditedFixture('refuse', { ready: '', auditReadError: 'EACCES' });
+    expect(await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' })).toMatchObject({ stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(f.reads).toContain('/home/test/canonical-audits.jsonl'); expect(f.calls).toEqual([]);
+  });
+  it('uses input.sha rather than a fixed or unrelated audit head', async () => {
+    const f = auditedFixture('refuse', { sha: MERGE, audits: auditLines([auditRecord()]) });
+    const out = await f.run();
+    expect(out).toMatchObject({ stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`--head=${MERGE}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['invalid', '', null, false, 0, {}, { nested: {} }, { nested: 'warn' }, [], ['warn']].map(mode => [mode]))('unknown mode %j is treated as refuse', async mode => {
+    const f = auditedFixture(mode);
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { mode: 'refuse', ok: false, reason: 'no-record' } });
+    expect(out.fallback).toContain(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${SHA}`);
+    expect(f.calls).toEqual([]);
+  });
+  it.each([
+    ['platform empty object', {}, undefined, 'refuse'],
+    ['platform nested empty object', { nested: {} }, undefined, 'refuse'],
+    ['platform nested warn', { nested: 'warn' }, undefined, 'refuse'],
+    ['platform array', [], undefined, 'refuse'],
+    ['platform refuse', 'refuse', undefined, 'refuse'],
+    ['tool empty object over platform warn', 'warn', {}, 'refuse'],
+    ['tool empty object over platform refuse', 'refuse', {}, 'refuse'],
+    ['explicit tool warn over invalid platform', {}, 'warn', 'refuse'],
+    ['explicit tool refuse over invalid platform', {}, 'refuse', 'refuse'],
+  ])('%s preserves scalar mode precedence', async (_, platformMode, toolMode, expectedMode) => {
+    const f = auditedFixture(toolMode, {
+      env: { WE_PLATFORM_PREFERENCES_FILE: '/home/test/platform-preferences.json' },
+      platformSettings: { canonicalAuditMode: platformMode },
+    });
+    const out = await f.run();
+    expect(out.canonicalAudit).toMatchObject({ mode: expectedMode, ok: false, reason: 'no-record' });
+    if (expectedMode === 'refuse') {
+      expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit' });
+      expect(f.calls).toEqual([]);
+    } else {
+      expect(out).toMatchObject({ ok: true, registered: true });
+    }
+  });
+});
 describe('default combined-tree test proof', () => {
   const limits = { waitMs: 1234, timeoutMs: 5678, maxBuffer: 4096 };
   const report = { success: true, numFailedTests: 0, numFailedTestSuites: 0,
@@ -570,16 +966,24 @@ describe('default combined-tree test proof', () => {
 
 describe('prototype-load', () => {
   it.each([
-    ['missing', ''], ['wrong sha', JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' })],
+    ['missing', ''],
     ['weakened', JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED' })],
   ])('no-ready: %s stops before git and records', async (_, ready) => {
-    const f = fixture({ ready }); expect((await f.run()).stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(0); expect(f.records[0].stopReason).toBe('no-ready');
+    const f = fixture({ ready, testCheck: async () => null }); expect((await f.run()).stopReason).toBe('no-ready');
+    expect(f.calls).toHaveLength(ready ? 0 : 2); expect(f.records[0].stopReason).toBe('no-ready');
   });
-  it('accepts explicit tests-run and NOT WEAKENED pair', async () => {
-    const f = fixture({ ready: '' }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(true);
+  it('no-ready: a record for another sha is not evidence about this head, so the check-run path decides', async () => {
+    // Was pinned as a zero-call refusal (PR #6610 review): that stranded every iterated branch after its first load.
+    const stale = JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' });
+    const f = fixture({ ready: stale, testCheck: async () => null });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(f.calls).toHaveLength(2); expect(f.readyWrites).toEqual([]);
+  });
+  it('refuses explicit tests-run and NOT WEAKENED without a passing check-run', async () => {
+    const f = fixture({ ready: '', testCheck: async () => null }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(false);
   });
   it('refuses a branch tip mismatch before main checks', async () => {
-    const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r.stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(2);
+    const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r.stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(4);
   });
   it.each(['lane/../x', '-danger', 'lane/x.lock', 'main'])('bad-input: refuses unsafe ref %s', async (branch) => {
     const f = fixture(); expect((await f.run({ branch })).stopReason).toBe('bad-input'); expect(f.calls).toHaveLength(0);
@@ -862,6 +1266,7 @@ describe('prototype-load', () => {
         fs: { mkdtempSync: () => worktree, existsSync: () => false, rmSync: vi.fn(),
           readFileSync: (path) => {
             if (path === worktree + '/one.test.mjs') return '';
+            if (path === '/home/test/canonical-audits.jsonl') return auditLines([auditRecord({ base: 'e'.repeat(40) })]);
             if (path === '/home/test/ready') return JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
             throw Object.assign(new Error('missing'), { code: 'ENOENT' });
           } } } });
@@ -1183,14 +1588,14 @@ describe('prototype-load', () => {
   it.each([
     ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
     ['refusal event', { events: refusedAlert }, 'adoption-refused'],
-    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['timeout', { timeout: true }, null],
     ['probe error 128', { adoptionError: 128 }, 'check-unverifiable'],
     ['probe error -1', { adoptionError: -1 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
   ])('retains every clean prior registration until the replacement is adopted: %s', async (_, options, stopReason) => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(r).toMatchObject({ ok: stopReason === null, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
   });
@@ -1198,13 +1603,13 @@ describe('prototype-load', () => {
   it.each([
     ['refusal alert', { alerts: refusedAlert }, 'adoption-refused'],
     ['refusal event', { events: refusedAlert }, 'adoption-refused'],
-    ['timeout', { timeout: true }, 'adoption-timeout'],
+    ['timeout', { timeout: true }, null],
     ['probe error', { adoptionError: 128 }, 'check-unverifiable'],
     ['unreadable refusal trail', { alertsReadError: true }, 'check-unverifiable'],
   ])('retains stale and clean registrations through failed adoption: %s', async (_, options, stopReason) => {
     const f = fixture({ list: ['lane/old', 'lane/also'], contained: ['lane/old', 'lane/also'], conflicts: ['lane/old'], ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ ok: false, stopReason, registered: true, adopted: false, removed: [] });
+    expect(r).toMatchObject({ ok: stopReason === null, stopReason, registered: true, adopted: false, removed: [] });
     expect(mutations(f, 'remove')).toEqual([]);
     expect(r.fallback).toContain('Prior registrations retained: lane/old, lane/also.');
     expect(r.staleChecks['lane/old']).toEqual({ skipped: 'contained', included: true, landed: false });
@@ -1302,14 +1707,112 @@ describe('prototype-load', () => {
     const r = await f.run(); expect(r.stopReason).toBe('swap-remove-failed'); expect(r.registered).toBe(true); expect(r.adopted).toBe(true); expect(r.removed).toEqual([]); expect(r.swap.retained).toEqual(['lane/a', 'lane/b', 'lane/c']); expect(mutations(f, 'remove')).toHaveLength(0);
   });
   it('adoption-timeout bounds injected polling and retains registration', async () => {
-    const f = fixture({ timeout: true }); const r = await f.run(); expect(r.stopReason).toBe('adoption-timeout'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+    const f = fixture({ timeout: true }); const r = await f.run(); expect(r.result).toBe('registered-pending'); expect(r.registered).toBe(true); expect(r.adopted).toBe(false); expect(f.sleeps).toEqual([10, 10, 10]);
+  });
+  it('returns registered-pending at once by default: ok, not adopted, no polling, no FAIL', async () => {
+    const f = fixture({ timeout: true }); const r = await f.run({ waitAdoptionMs: undefined });
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false, stopReason: null });
+    expect(r.message).toContain('overlay-adopted');
+    expect(f.sleeps).toEqual([]);
+  });
+  it.each([[false, undefined], [true, undefined], [false, 30]])('wires loader registration to a rebuild adoption event (generated merge: %s, wait: %s)', async (behind, waitAdoptionMs) => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-pending-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: dir };
+    try {
+      const f = fixture({ timeout: true, behind, pendingFs: nodeFs, env });
+      const r = await f.run({ waitAdoptionMs });
+      expect(r).toMatchObject({ ok: true, result: 'registered-pending', adoptionEventTracked: true,
+        clone: '/home/test/workspace/wev-control', effectiveRef: behind ? 'lane/new-m1' : BASE.branch, effectiveSha: behind ? MERGE : SHA });
+      expect(r.message).toContain('up to 7 days');
+      expect(r.message).toContain('newest 128 registrations');
+      expect(r.message).toContain('check the daemon rebuild state');
+      expect(readPendingAdoptions(r.clone, { env })).toEqual([expect.objectContaining({ ref: r.effectiveRef, sha: r.effectiveSha, loadedBy: 'tester' })]);
+      const events = [];
+      const isAncestor = vi.fn(() => true);
+      await checkPendingAdoptions({ root: r.clone, env, now: () => 0, daemon: BASE.daemon, isAncestor, emit: (e) => events.push(e) });
+      expect(isAncestor).toHaveBeenCalledWith(r.clone, r.effectiveSha);
+      expect(events).toEqual([expect.objectContaining({ kind: 'overlay-adopted', daemon: BASE.daemon,
+        detail: expect.objectContaining({ ref: r.effectiveRef, sha: r.effectiveSha }) })]);
+      expect(readPendingAdoptions(r.clone, { env })).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('warns when the pending-adoption tracking write fails', async () => {
+    const r = await fixture({ timeout: true }).run({ waitAdoptionMs: undefined });
+    expect(r.adoptionEventTracked).toBe(false);
+    expect(r.message).toContain('pending-adoption record could not be written');
+    expect(r.message).toContain('no overlay-adopted event will follow');
+  });
+  it.each([
+    ['adoption-refused', { alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: BASE.branch, kind: 'conflict-dropped' }) }, false],
+    ['check-unverifiable', { adoptionError: 2 }, false],
+    ['adopted immediately', {}, true],
+    ['adopted in wait', { timeout: true }, true],
+    ['adopted before swap refusal', { list: ['lane/old'], contained: ['lane/old'] }, true],
+  ])('clears pending adoption on terminal outcome: %s', async (_, options, adopted) => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-terminal-'));
+    const env = { WE_DAEMON_OVERLAY_DIR: dir };
+    const clone = '/home/test/workspace/wev-control';
+    try {
+      recordPendingAdoption(clone, { ref: 'lane/unrelated', sha: TREE, at: new Date(0).toISOString() }, { env });
+      const writes = vi.fn(nodeFs.renameSync);
+      const loadOptions = { ...options, pendingFs: { ...nodeFs, renameSync: writes }, env };
+      if (options.timeout) loadOptions.onSleep = () => {
+        // Prove that this is adoption during the wait, with the registration already persisted.
+        expect(readPendingAdoptions(clone, { env })).toEqual(expect.arrayContaining([
+          expect.objectContaining({ ref: BASE.branch, sha: SHA }),
+        ]));
+        loadOptions.timeout = false;
+      };
+      const f = fixture(loadOptions);
+      const r = await f.run();
+      expect(r.registered).toBe(true);
+      expect(r.adoptionEventTracked).toBe(true);
+      expect(r.adopted).toBe(adopted);
+      expect(f.sleeps).toEqual(options.timeout ? [10] : []);
+      if (options.adoptionError) expect(r.stopReason).toBe('check-unverifiable');
+      if (options.alerts) expect(r.stopReason).toBe('adoption-refused');
+      expect(writes).toHaveBeenCalled();
+      expect(readPendingAdoptions(clone, { env }).map((rec) => rec.ref)).toEqual(['lane/unrelated']);
+      const events = [];
+      await checkPendingAdoptions({ root: clone, env, now: () => 16 * 60000, isAncestor: () => true, emit: (e) => events.push(e) });
+      expect(events.map((e) => e.detail.ref)).toEqual(['lane/unrelated']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['bad-sha', { sha: 'abc1234' }, {}, 'full 40-character sha'],
+    ['bad-branch', { branch: 'main' }, {}, 'Pass --branch=lane/<name>'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: -1, pollMs: 10 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: 30, pollMs: 0 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: Infinity, pollMs: 10 } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-adoption-settings', {}, { adoption: { timeoutMs: 30, pollMs: NaN } }, 'adoption.timeoutMs and adoption.pollMs'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: -1 }, {}, 'number of milliseconds'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: 'NaN' }, {}, 'number of milliseconds'],
+    ['bad-wait-adoption-ms', { waitAdoptionMs: 'Infinity' }, {}, 'number of milliseconds'],
+  ])('explains bad-input refusal %s (%j, %j)', async (detail, input, overrides, fallback) => {
+    const f = fixture({ settings: overrides });
+    expect(await f.run(input)).toMatchObject({ ok: false, stopReason: 'bad-input', detail, fallback: expect.stringContaining(fallback) });
+    expect(f.calls).toEqual([]);
+  });
+  it('--wait-adoption-ms opts into a bounded wait and is capped under 170 s', async () => {
+    const f = fixture({ timeout: true, settings: { adoption: { timeoutMs: 600000, pollMs: 50000 } } });
+    const r = await f.run({ waitAdoptionMs: 900000 });
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending' });
+    expect(f.sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(160000);
+    expect(f.sleeps.length).toBeGreaterThan(0);
+  });
+  it('explains refusals in plain words', async () => {
+    expect(await fixture({}).run({ sha: 'abc1234' })).toMatchObject({ stopReason: 'bad-input', fallback: expect.stringContaining('full 40-character sha') });
+    const noReady = await fixture({ ready: '', testCheck: async () => null }).run();
+    expect(noReady.stopReason).toBe('no-ready'); expect(noReady.fallback).toMatch(/Complete the test check-run on this SHA.*labels only/);
+    const moved = await fixture({ tip: 'e'.repeat(40) }).run();
+    expect(moved).toMatchObject({ stopReason: 'no-ready', fallback: expect.stringContaining(`branch tip is ${'e'.repeat(40)}`) });
   });
   it.each([undefined, '/custom/rebuild-state'])('adoption timeout reports the active build from the daemon state directory: %s', async (directory) => {
     const target = 'd'.repeat(40), startedAt = '2026-10-26T11:59:00.000Z';
     const f = fixture({ timeout: true, env: directory ? { WE_DAEMON_STATE_DIR: directory } : {},
       rebuildState: { building: { target, startedAt, pid: 123 } } });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'rebuild-building' } });
     expect(r.fallback).toContain(target.slice(0, 7));
     expect(r.fallback).toContain(startedAt);
@@ -1321,7 +1824,7 @@ describe('prototype-load', () => {
     const adoptedAt = '2026-10-26T11:00:00.000Z';
     const f = fixture({ timeout: true, rebuildState: { ...state, adopted: { at: adoptedAt, head: TREE } } });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'daemon-not-refreshing' } });
     expect(r.fallback).toContain('catch-up');
     expect(r.fallback).toContain(adoptedAt);
@@ -1334,7 +1837,7 @@ describe('prototype-load', () => {
   ])('adoption timeout reports unreadable rebuild evidence: %s', async (_, options) => {
     const f = fixture({ timeout: true, ...options });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'adoption-timeout', registered: true, adopted: false,
+    expect(r).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false,
       adoption: { reason: 'rebuild-state-unreadable' } });
     expect(r.fallback).toMatch(/rebuild.state.*unreadable|unreadable.*rebuild.state/i);
     expect(f.reads).toContain('/home/test/.claude/daemon-self-sync-state/test-clone-key.rebuild.json');
@@ -1346,7 +1849,7 @@ describe('prototype-load', () => {
   });
   it('a missing daemon commit remains pending until the adoption deadline', async () => {
     const f = fixture({ missingCandidate: true, missingForever: true });
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+    expect(await f.run()).toMatchObject({ ok: true, result: 'registered-pending', registered: true, adopted: false });
     expect(f.sleeps).toEqual([10, 10, 10]);
   });
   it.each([false, true])('real Git keeps a fresh origin commit pending until daemon fetch/adoption or deadline (adopts: %s)', async (adopts) => {
@@ -1361,7 +1864,7 @@ describe('prototype-load', () => {
       });
       expect(await f.run()).toMatchObject(adopts
         ? { ok: true, registered: true, adopted: true }
-        : { ok: false, registered: true, adopted: false, stopReason: 'adoption-timeout' });
+        : { ok: true, registered: true, adopted: false, result: 'registered-pending' });
       expect(f.sleeps).toEqual(adopts ? [10] : [10, 10, 10]);
     });
   });
@@ -1381,7 +1884,7 @@ describe('prototype-load', () => {
     } });
     expect(await f.run()).toMatchObject(retryCode === 0
       ? { ok: true, registered: true, adopted: true }
-      : { ok: false, stopReason: 'adoption-timeout', registered: true, adopted: false });
+      : { ok: true, result: 'registered-pending', registered: true, adopted: false });
     expect(probes).toBe(retryCode === 0 ? 2 : 5);
     expect(f.sleeps).toEqual(retryCode === 0 ? [] : [10, 10, 10]);
   });
@@ -1439,9 +1942,154 @@ describe('prototype-load', () => {
   it('ignores old refusals and unrelated events', async () => {
     const f = fixture({ events: JSON.stringify({ at: new Date(-1).toISOString(), ref: BASE.branch, event: 'removed' }), alerts: JSON.stringify({ at: new Date(0).toISOString(), ref: 'lane/else', event: 'refused' }) }); expect((await f.run()).ok).toBe(true);
   });
+  // R310 (incident 2026-11-01): a superseded registration and old tops froze two daemons for hours.
+  describe('auto-retire and replace (R310)', () => {
+    const retireOld = (extra = {}) => ({ retirePlan: ({ rows }) => rows.map((row) => (row.ref === 'lane/old'
+      ? { ref: 'lane/old', action: 'retire', reason: 'superseded', tip: TREE, pr: 6056, evidence: { supersededBy: 6132 }, ...extra }
+      : { ref: row.ref, action: 'keep', reason: 'unique-commits-not-on-main' })) });
+    it('retires a proved registration before staleness checks, so it no longer blocks the load', async () => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': 'M\0x\0' }, ...retireOld() });
+      const r = await f.run();
+      expect(r).toMatchObject({ ok: true, adopted: true, retired: [{ ref: 'lane/old', reason: 'superseded', tip: TREE, pr: 6056 }], stale: [] });
+      expect(f.retirePlanner).toHaveBeenCalledWith(expect.objectContaining({ rows: [{ ref: 'lane/old' }] }));
+      const [call] = mutations(f, 'retire');
+      expect(call.args).toEqual(expect.arrayContaining(['--ref=lane/old', `--expected-tip=${TREE}`, `--expected-entry=${JSON.stringify({ ref: 'lane/old' })}`, '--reason=superseded']));
+      expect(r.staleChecks).toEqual({});
+    });
+    it('the same blocked load without a proved retirement still stops on the stale registration', async () => {
+      const f = fixture({ list: ['lane/old'], conflicts: ['lane/old'], staleChanged: { 'lane/old': 'M\0x\0' } });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'stale-registration', retired: [] });
+      expect(mutations(f, 'retire')).toEqual([]);
+    });
+    it('settles drop intents left by an interrupted retire before planning', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], pendingDrops: '{"pending":[{"ref":"lane/x"}]}' });
+      await f.run();
+      expect(f.reads).toContain('/home/test/.claude/daemon-overlays/test-clone-key.json.drop-pending');
+      expect(mutations(f, 'recover-drops')).toHaveLength(1);
+      expect(f.records[0]).toMatchObject({ dropRecovery: { settled: [{ ref: 'lane/x', outcome: 'restored' }] } });
+      // The settle runs before the listing, so a restored registration takes part in every later check.
+      const settleAt = f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'recover-drops');
+      expect(settleAt).toBeLessThan(f.calls.findIndex((c) => c.cmd === 'node' && c.args[1] === 'list'));
+      const quiet = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      await quiet.run();
+      expect(mutations(quiet, 'recover-drops')).toEqual([]);
+    });
+    it('stops before planning or registering when drop intents stay unsettled', async () => {
+      const f = fixture({ list: ['lane/old'], pendingDrops: '{"pending":[{"ref":"lane/x"}]}', recoverRaw: JSON.stringify({ settled: [], pending: [{ ref: 'lane/x' }] }), ...retireOld() });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'drop-recovery-failed', registered: false });
+      expect(f.retirePlanner).not.toHaveBeenCalled();
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('dry-run reports wouldRetire and retires nothing', async () => {
+      const f = fixture({ list: ['lane/old'], ...retireOld() });
+      expect(await f.run({ dryRun: true })).toMatchObject({ ok: true, wouldRetire: [{ ref: 'lane/old', reason: 'superseded', tip: TREE }] });
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.registrations.has('lane/old')).toBe(true);
+    });
+    it('stops without registering when the loader refuses a proved retirement', async () => {
+      const f = fixture({ list: ['lane/old'], retireRefuses: 'lane/old', ...retireOld() });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'retire-refused', retireRefused: [{ ref: 'lane/old', refused: 'tip-moved' }], registered: false });
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('ignores planner decisions for unlisted refs, the candidate itself, or without a full tip', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], retirePlan: () => [
+        { ref: 'lane/ghost', action: 'retire', reason: 'in-main', tip: TREE },
+        { ref: 'lane/old', action: 'retire', reason: 'in-main', tip: 'short' },
+      ] });
+      await f.run();
+      expect(mutations(f, 'retire')).toEqual([]);
+      expect(f.retirePlanner.mock.calls[0][0].rows.map((row) => row.ref)).not.toContain(BASE.branch);
+    });
+    it('hands the planner the FULL registry as proof context while still never planning the candidate (R10)', async () => {
+      const f = fixture({ list: ['lane/old', BASE.branch], contained: ['lane/old'] });
+      await f.run({ dryRun: true });
+      const call = f.retirePlanner.mock.calls[0][0];
+      expect(call.rows.map((row) => row.ref)).toEqual(['lane/old']);
+      expect(call.proofRows.map((row) => row.ref)).toEqual(['lane/old', BASE.branch]);
+    });
+    it('retire-only mode drops proved registrations with no candidate and no ready record', async () => {
+      const f = fixture({ list: ['lane/old', 'lane/live'], ready: '', ...retireOld() });
+      const r = await f.run({ branch: '', sha: '', retire: true });
+      expect(r).toMatchObject({ ok: true, retired: [{ ref: 'lane/old' }], registered: false });
+      expect([...f.registrations.keys()]).toEqual(['lane/live']);
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    it('force-adopt (R508) is refused without a ruling id + quote and never registers or adopts anything', async () => {
+      const f = fixture({ list: [], ready: '' });
+      const r = await f.run({ forceAdopt: true });
+      expect(r).toMatchObject({ ok: false, stopReason: 'force-adopt-refused', forceAdopt: { requested: false, refused: 'no-ruling' } });
+      const r2 = await f.run({ forceAdopt: true, ruling: 'R508', quote: 'this quote is not in any ruling' });
+      expect(r2).toMatchObject({ ok: false, forceAdopt: { requested: false } });
+      expect(mutations(f, 'add')).toEqual([]);
+    });
+    describe('force-adopt (R508) positive and dry-run wiring', () => {
+      const QUOTE = 'adopt the build now even though smoke failed';
+      const forceFixture = (t) => {
+        const dir = mkdtempSync(join(tmpdir(), 'pl-force-'));
+        t.onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+        const rulings = join(dir, 'rulings.md');
+        writeFileSync(rulings, `## R508 — x\nOperator "Yes": ${QUOTE}.\n`);
+        const state = join(dir, 'state');
+        return { state, f: fixture({ list: [], ready: '', env: { WE_RULINGS_FILE: rulings, WE_DAEMON_STATE_DIR: state } }) };
+      };
+      const pending = (f, state) => {
+        const files = nodeFs.existsSync(state) ? nodeFs.readdirSync(state).filter((n) => n.endsWith('.force-adopt.json')) : [];
+        return files.map((n) => JSON.parse(nodeFs.readFileSync(join(state, n), 'utf8')));
+      };
+      it('a valid ruling + verbatim quote queues exactly one request and registers nothing', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE });
+        expect(r).toMatchObject({ ok: true, forceAdopt: { requested: true, dryRun: false, ruling: 'R508', sha: SHA } }); // echoes the bound build
+        expect(pending(f, state)).toMatchObject([{ ruling: 'R508', quote: QUOTE, sha: SHA }]); // bound to the build named on the command
+        expect(mutations(f, 'add')).toEqual([]);
+      });
+      it('a request that names no build is refused and arms nothing (no-sha)', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE, sha: '' });
+        expect(r).toMatchObject({ ok: false, stopReason: 'force-adopt-refused', forceAdopt: { requested: false, refused: 'no-sha' } });
+        expect(pending(f, state)).toEqual([]);
+      });
+      it('--dry-run validates but arms nothing (requested:false, dryRun:true, no request file)', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: QUOTE, dryRun: true });
+        expect(r).toMatchObject({ ok: true, forceAdopt: { requested: false, dryRun: true, ruling: 'R508' } });
+        expect(pending(f, state)).toEqual([]);
+      });
+      it('a dry run with a bad quote is still refused', async (t) => {
+        const { f, state } = forceFixture(t);
+        const r = await f.run({ forceAdopt: true, ruling: 'R508', quote: 'this quote is not in any ruling', dryRun: true });
+        expect(r).toMatchObject({ ok: false, forceAdopt: { requested: false, refused: 'quote-not-in-ruling' } });
+        expect(pending(f, state)).toEqual([]);
+      });
+    });
+    it('declares the force-adopt operation inputs', () => {
+      const op = prototypeLoadOperation();
+      expect(Object.keys(op.input)).toEqual(expect.arrayContaining(['force-adopt', 'ruling', 'quote']));
+    });
+    it('replace swaps a contained old top in one loader command, with no retained-registration stop', async () => {
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      const r = await f.run({ replace: 'lane/old' });
+      expect(r).toMatchObject({ ok: true, adopted: true, replaced: 'lane/old', registered: true, stopReason: null });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+      expect(mutations(f, 'replace')[0].args).toEqual(expect.arrayContaining(['--ref=lane/new', '--replaces=lane/old', `--expected-sha=${SHA}`]));
+      expect([...f.registrations.keys()]).toEqual(['lane/new']);
+    });
+    it('replace refuses an old top whose commits the new top lacks, and changes nothing', async () => {
+      const f = fixture({ list: ['lane/old'] });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, stopReason: 'replace-not-contained', registered: false });
+      expect(mutations(f, 'replace')).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual(['lane/old']);
+    });
+    it('replace refuses an unregistered old ref', async () => {
+      const f = fixture({ list: [] });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, stopReason: 'bad-input' });
+      expect(mutations(f, 'replace')).toEqual([]);
+    });
+  });
   it('happy path pins full command sequence, safe env and recorded provenance', async () => {
     const f = fixture(); const r = await f.run({ why: 'load tested patch' }); expect(r).toMatchObject({ ok: true, registered: true, adopted: true, stopReason: null, cloneSource: 'settings:prototype-load.json#daemons.control.clone' });
-    expect(f.calls.map((c) => c.cmd === 'node' ? `${c.args[1]}${c.args.includes('--check') ? ':check' : ''}` : c.args[0])).toEqual(['fetch', 'rev-parse', 'fetch', 'diff', 'merge-base', 'diff', 'add:check', 'list', 'fetch', 'rev-parse', 'add', '-C']);
+    expect(f.calls.map((c) => c.cmd === 'node' ? `${c.args[1]}${c.args.includes('--check') ? ':check' : ''}` : c.args[0])).toEqual(['fetch', 'merge-base', 'fetch', 'rev-parse', 'fetch', 'diff', 'merge-base', 'diff', 'add:check', 'list', 'fetch', 'rev-parse', 'add', '-C']);
     expect(f.records[0]).toMatchObject({ path: '/home/test/records', daemon: 'control', branch: BASE.branch, sha: SHA, effectiveRef: BASE.branch, effectiveSha: SHA, dryRun: false, ok: true, registered: true, adopted: true, why: 'load tested patch' });
     expect(r.settings.sources['daemons.control.clone']).toBe('tool'); expect(r.settings.log).toContain('wev-control');
   });
@@ -1490,7 +2138,7 @@ describe('prototype-load', () => {
     run = (await applyPendingEffects(run, { store: createMemoryRunStore(), sinks: { [PROTOTYPE_LOAD_EFFECT]: (input) => f.run(input) } })).run;
     run = advance(run, { registry }); run = advance(run, { registry });
     expect(run.verdict).toMatchObject({ ok: true, dryRun: true, registered: false, adopted: false });
-    expect(JSON.parse(JSON.stringify(run.verdict)).gate.testsRun).toBe('case-1');
+    expect(JSON.parse(JSON.stringify(run.verdict)).gate.source).toBe('canonical-check-run');
   });
   it('publishes incomplete cleanup through the declared operation without losing adoption evidence', async () => {
     const f = fixture({ list: ['lane/old'], contained: ['lane/old'], changeAfterContainment: 'tip advanced' });
@@ -1505,4 +2153,1042 @@ describe('prototype-load', () => {
     expect(mutations(f, 'remove')).toEqual([]);
     expect(f.registrations.has('lane/old')).toBe(true);
   });
+});
+
+// R503 part 2 — a canonical audit for a rebased/merged head carries to the live head when the net-diff fingerprint is unchanged.
+describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const old = (o = {}) => auditRecord({ head: OLD, fingerprint: FP, ...o });
+  it('carries an audit of an older head whose fingerprint equals the live one', () => {
+    const record = old();
+    expect(prototypeLoad.canonicalAuditEvidence([record], SHA, () => true, FP)).toEqual({ ok: true, record });
+  });
+  it('a real code change (different fingerprint) does not carry', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => true, OTHER_FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it.each([['unreadable live fingerprint', null], ['malformed live fingerprint', 'zz']])('%s never carries', (_, live) => {
+    expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => true, live)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('a record without a stored fingerprint never carries', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old({ fingerprint: undefined })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('a WEAKENED audit on the carried head blocks', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old({ verdict: 'WEAKENED' })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  // The carry veto must judge a carried head's WEAKENED verdicts exactly as findAudit does (round 3): a record findAudit
+  // rejects, or supersedes, or never consults must not block a carry; a record it accepts still must (fail closed).
+  describe('carry veto follows findAudit', () => {
+    const OTHER_BASE = 'f'.repeat(40);
+    const carried = (...extra) => prototypeLoad.canonicalAuditEvidence([old(), ...extra], SHA, () => true, FP);
+    it.each([
+      ['a contradictory-findings WEAKENED record', { verdict: 'WEAKENED', findings: ['NOT WEAKENED'] }],
+      ['a contradictory-findings WEAKENED record (zero-width and line-break shapes)', { verdict: 'WEAKENED', findings: ['note\n\u200BNOT WEAKENED'] }],
+      ['a WEAKENED record with an unparseable timestamp', { verdict: 'WEAKENED', at: 'not-a-date' }],
+      ['a WEAKENED record with a malformed base', { verdict: 'WEAKENED', base: 'zz' }],
+      ['a WEAKENED empty-diff record (base equals head)', { verdict: 'WEAKENED', base: OLD }],
+    ])('%s on the carried head does not block the carry', (_, overrides) => {
+      expect(carried(old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z', ...overrides })).ok).toBe(true);
+    });
+    it('a WEAKENED verdict superseded by a later NOT WEAKENED on the same base does not block (latest wins)', () => {
+      const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z' });
+      const fixed = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-22T12:00:00Z' });
+      expect(carried(weak, fixed).ok).toBe(true);
+    });
+    it('a valid WEAKENED verdict that is the latest for its base still blocks, even next to a contradictory pass', () => {
+      const weak = old({ fingerprint: undefined, base: OTHER_BASE, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+      const earlierPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-21T12:00:00Z' });
+      const contradictoryLaterPass = old({ fingerprint: undefined, base: OTHER_BASE, at: '2026-10-23T12:00:00Z', findings: ['WEAKENED'] });
+      expect(carried(earlierPass, weak)).toEqual({ ok: false, reason: 'weakened' });
+      // a later pass findAudit rejects does not supersede the valid WEAKENED verdict
+      expect(carried(earlierPass, weak, contradictoryLaterPass)).toEqual({ ok: false, reason: 'weakened' });
+    });
+  });
+  describe('non-string head/base never alias a string one (trust boundary)', () => {
+    const B = 'f'.repeat(40);
+    it('an array-wrapped base cannot displace the veto of the real string base it stringifies to', () => {
+      const weak = old({ fingerprint: undefined, base: B, verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+      const alias = old({ fingerprint: undefined, base: [B], at: '2026-10-23T12:00:00Z' });
+      expect(prototypeLoad.canonicalAuditEvidence([old(), weak, alias], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    });
+    it('a carried array-based record is never a pass', () => {
+      expect(prototypeLoad.canonicalAuditEvidence([old({ base: [TREE] })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'no-record' });
+    });
+  });
+  it('a carried record never lends its head other records without the fingerprint', () => {
+    const other = old({ fingerprint: undefined, base: 'f'.repeat(40), at: '2026-10-21T12:00:00Z' });
+    const weak = old({ fingerprint: undefined, base: '9'.repeat(40), verdict: 'WEAKENED', at: '2026-10-22T12:00:00Z' });
+    expect(prototypeLoad.canonicalAuditEvidence([old(), other], SHA, () => true, FP)).toEqual({ ok: true, record: old() });
+    // ...but a valid WEAKENED verdict on that head still blocks, fingerprint or not (fail closed)
+    expect(prototypeLoad.canonicalAuditEvidence([old(), other, weak], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    // a foreign-question record is not a valid verdict and neither blocks nor enables
+    expect(prototypeLoad.canonicalAuditEvidence([old(), { ...weak, questionHash: 'foreign' }], SHA, () => true, FP)).toEqual({ ok: true, record: old() });
+  });
+  // AU1 PR-B: a current-question record for the carried head+base blocks a PRIOR-question pass even when carry
+  // eligibility (a missing or differing fingerprint) dropped that current record from the eligible set.
+  describe('prior-question pass vs an ineligible current-question record', () => {
+    const PRIOR = 'c'.repeat(64);
+    const opts = { priorQuestionHashes: [{ hash: PRIOR, acceptUntil: '2026-10-30T00:00:00Z' }], now: Date.parse('2026-10-22T13:00:00Z') };
+    const prior = () => old({ questionHash: PRIOR });
+    const carry = (...records) => prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP, opts);
+    it('the carried prior pass alone is a pass (the setting is live in this path)', () => {
+      expect(carry(prior())).toEqual({ ok: true, record: prior() });
+    });
+    it.each([
+      ['no fingerprint', { fingerprint: undefined }],
+      ['a differing fingerprint', { fingerprint: '1'.repeat(64) }],
+      ['an unusable timestamp', { fingerprint: undefined, at: 'not-a-date' }],
+      ['an unknown verdict', { fingerprint: undefined, verdict: 'MAYBE' }],
+    ])('a current-question record with %s on the same head+base blocks the carried prior pass, in either order', (_, over) => {
+      const current = old({ at: '2026-10-19T12:00:00Z', ...over });
+      expect(carry(prior(), current)).toEqual({ ok: false, reason: 'no-record' });
+      expect(carry(current, prior())).toEqual({ ok: false, reason: 'no-record' });
+    });
+    it('a current-question record for another base does not block the carried prior pass', () => {
+      expect(carry(prior(), old({ fingerprint: undefined, base: 'f'.repeat(40) }))).toEqual({ ok: true, record: prior() });
+    });
+    // Round 6: a carried head's prior-question WEAKENED must not be hidden by an unusable current-question record for the
+    // same head+base (findAudit lets that record block a prior PASS, which is fail-open for a negative verdict).
+    describe('a carried prior-question WEAKENED hidden by an unusable current-question record', () => {
+      const C = 'c'.repeat(40);
+      const livePass = () => auditRecord({ head: SHA, at: '2026-10-19T12:00:00Z' });
+      const weak = (o = {}) => old({ base: C, questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-20T12:00:00Z', findings: ['x.mjs:1 guard removed'], ...o });
+      const hider = (o = {}) => old({ base: C, at: '2026-10-21T12:00:00Z', findings: ['WEAKENED'], ...o });
+      it('still blocks the live head pass, in any record order', () => {
+        for (const records of [[livePass(), weak(), hider()], [hider(), weak(), livePass()], [weak(), livePass(), hider()]])
+          expect(carry(...records)).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it.each([
+        ['unparsable time', { at: 'not-a-date' }],
+        ['unknown verdict', { verdict: 'MAYBE' }],
+      ])('also when the hiding current-question record has %s', (_, over) => {
+        expect(carry(livePass(), weak(), hider(over))).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('a later prior-question NOT WEAKENED re-audit of that base supersedes it; an older one does not', () => {
+        const fixed = (at) => old({ base: C, questionHash: PRIOR, at, findings: [] });
+        expect(carry(livePass(), weak(), fixed('2026-10-20T18:00:00Z'), hider()).ok).toBe(true);
+        expect(carry(livePass(), fixed('2026-10-20T06:00:00Z'), weak(), hider())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('a newer own covered audit still supersedes it (fresh re-audit)', () => {
+        const newer = auditRecord({ head: SHA, at: '2026-10-22T12:00:00Z' });
+        expect(carry(livePass(), weak(), hider(), newer)).toEqual({ ok: true, record: newer });
+      });
+      it('a USABLE current-question re-audit of that base decides instead (findAudit alone)', () => {
+        expect(carry(livePass(), weak(), old({ base: C, at: '2026-10-21T12:00:00Z' })).ok).toBe(true);
+      });
+      it('does not apply to an expired prior hash, a foreign hash, a rejected prior WEAKENED, or a prior NOT WEAKENED', () => {
+        expect(carry(livePass(), weak({ at: '2026-08-01T00:00:00Z' }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ questionHash: 'd'.repeat(64) }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ findings: ['NOT WEAKENED'] }), hider()).ok).toBe(true);
+        expect(carry(livePass(), weak({ verdict: 'NOT WEAKENED', findings: [] }), hider()).ok).toBe(true);
+      });
+    });
+    // Round 5: a live-head in-window prior-question WEAKENED must veto a carried current-question pass even when
+    // findAudit cannot use it (here: contradictory findings), and a usable one must keep blocking.
+    describe('a live-head prior-question WEAKENED record', () => {
+      const live = (o = {}) => auditRecord({ head: SHA, questionHash: PRIOR, verdict: 'WEAKENED', at: '2026-10-21T12:00:00Z', ...o });
+      const carried = () => old({ at: '2026-10-19T12:00:00Z' });
+      it('a usable in-window one blocks the carried current-question pass through canonicalAuditEvidence', () => {
+        expect(carry(carried(), live())).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live(), carried())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('an in-window one findAudit rejects (contradictory findings) still blocks the carried pass, in either order', () => {
+        const unusable = live({ findings: ['NOT WEAKENED'] });
+        expect(carry(carried(), unusable)).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(unusable, carried())).toEqual({ ok: false, reason: 'weakened' });
+      });
+      it('an out-of-window or unknown-hash one does not block (and the carried pass still holds)', () => {
+        expect(carry(carried(), live({ at: '2026-08-01T00:00:00Z', findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+        expect(carry(carried(), live({ questionHash: 'd'.repeat(64), findings: ['NOT WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+      });
+      it('variant: an unusable WEAKENED on another base of the live head blocks a usable pass on a different base', () => {
+        const Y = 'f'.repeat(40);
+        const pass = old({ head: SHA, fingerprint: undefined, at: '2026-10-20T00:00:00Z' });
+        const bad = { findings: ['NOT WEAKENED'], at: '2026-10-21T12:00:00Z' };
+        expect(carry(pass, live({ base: Y, ...bad }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(pass, live({ base: Y, questionHash: QUESTION_HASH, ...bad }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live({ base: Y, ...bad }), pass)).toEqual({ ok: false, reason: 'weakened' });
+        // a base with a usable decision is judged by findAudit alone: an unusable WEAKENED on the same base does not block
+        expect(carry(pass, live({ base: TREE, ...bad }))).toMatchObject({ ok: true });
+      });
+      it('variant: an unparsable time on an unexpired prior-hash WEAKENED still blocks (fail closed), unless the hash expired', () => {
+        expect(carry(carried(), live({ at: 'not-a-date', findings: ['NOT WEAKENED'] }))).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(live({ at: 'not-a-date', findings: ['NOT WEAKENED'] }), carried())).toEqual({ ok: false, reason: 'weakened' });
+        expect(carry(carried(), live({ at: 'not-a-date', questionHash: 'd'.repeat(64) }))).toEqual({ ok: true, record: carried() });
+      });
+      it('a prior-question NOT WEAKENED on the live head never blocks the carried pass', () => {
+        expect(carry(carried(), live({ verdict: 'NOT WEAKENED', findings: ['WEAKENED'] }))).toEqual({ ok: true, record: carried() });
+      });
+    });
+  });
+  it('the base must still be covered by main', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([old()], SHA, () => false, FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+  it('the loader carries on a matching fingerprint and refuses on a differing or unreadable one', async () => {
+    const audits = auditLines([old()]);
+    const ok = await auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(ok).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    for (const fingerprint of [() => OTHER_FP, () => null, () => { throw new Error('boom'); }]) {
+      const out = await auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    }
+  });
+  // R503 red team round 5: a successful exact-sha load names only its own sha, so no live fingerprint is computed;
+  // the readiness it appends must keep the stored fingerprint or the next rebase of the same code cannot carry.
+  it('an exact-sha load keeps the stored fingerprint so a later rebase still carries', async () => {
+    const stored = 'e'.repeat(64), rebased = '9'.repeat(40);
+    const ready = auditLines([{ ref: BASE.branch, sha: SHA, fingerprint: stored, tests: 'green', audit: 'NOT WEAKENED' }]);
+    const audits = auditLines([auditRecord({ fingerprint: stored })]);
+    const first = auditedFixture('refuse', { ready, audits, auditBaseInMain: TREE, fingerprint: () => stored });
+    expect(await first.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    expect(first.readyWrites.at(-1)).toMatchObject({ sha: SHA, fingerprint: stored });
+    const appended = first.readyWrites.map(({ path, ...record }) => record);
+    const second = auditedFixture('refuse', { sha: rebased, ready: ready + auditLines(appended), audits, auditBaseInMain: TREE, fingerprint: () => stored });
+    expect(await second.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    // Unreadable or different live code still refuses: the inherited fingerprint never loosens the carry.
+    for (const fingerprint of [() => '1'.repeat(64), () => null]) {
+      const other = auditedFixture('refuse', { sha: rebased, ready: ready + auditLines(appended), audits, auditBaseInMain: TREE, fingerprint });
+      expect(await other.run()).toMatchObject({ ok: false });
+    }
+  });
+});
+
+// R503 part 3 — ready records and ruledWeakened entries carry to the live tip when the net-diff fingerprint matches.
+describe('readyEvidence fingerprint carry (R503)', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const input = { branch: BASE.branch, sha: SHA };
+  const findings = ['disclosed weakening'];
+  const green = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'NOT WEAKENED', ...o });
+  const weak = (o = {}) => green({ audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings, ...o });
+  const entry = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, ruling: 'R396', findings, ...o });
+  it('a ready record for an older sha carries when the fingerprints match', () => {
+    const r = green();
+    expect(prototypeLoad.readyEvidence([r], input, [], FP)).toEqual({ source: 'ready-record', record: r });
+  });
+  it.each([['changed code', OTHER_FP], ['unreadable live fp', null], ['malformed live fp', 'zz']])('%s does not carry a ready record', (_, live) => {
+    expect(prototypeLoad.readyEvidence([green()], input, [], live)).toBeNull();
+  });
+  it('a non-string sha never passes validSha, so an array sha is never a carried or live record', () => {
+    expect(prototypeLoad.validSha([OLD])).toBe(false);
+    expect(prototypeLoad.validSha(OLD)).toBe(true);
+    expect(prototypeLoad.readyEvidence([green({ sha: [OLD] })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ sha: [SHA] })], input, [], FP)).toBeNull();
+  });
+  it('retired warn mode treats an array-sha ready record as carried, never as the live head\'s own', async () => {
+    // readyEvidence already refuses it; this pins the IO gate's own fail-closed compare if a record ever gets through.
+    const ready = auditLines([green({ sha: [SHA] })]);
+    const out = await auditedFixture('warn', { ready, audits: auditLines([auditRecord({ verdict: 'WEAKENED' })]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(out.ok).toBe(false);
+  });
+  it('a record without a stored fingerprint, or for another ref, never carries', () => {
+    expect(prototypeLoad.readyEvidence([green({ fingerprint: undefined })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ ref: 'lane/other' })], input, [], FP)).toBeNull();
+  });
+  it('a ruled-WEAKENED record plus entry carry when both fingerprints match the live one', () => {
+    const r = weak();
+    expect(prototypeLoad.readyEvidence([r], input, [entry()], FP)).toEqual({ source: 'ready-record', record: r, ruledWeakened: { ruling: 'R396', findings } });
+  });
+  it.each([
+    ['entry fingerprint differs', [entry({ fingerprint: OTHER_FP })]],
+    ['entry has no fingerprint and another sha', [entry({ fingerprint: undefined })]],
+    ['entry for another ruling', [entry({ ruling: 'R397' })]],
+    ['entry findings differ', [entry({ findings: ['other'] })]],
+  ])('%s refuses the carry', (_, entries) => {
+    expect(prototypeLoad.readyEvidence([weak()], input, entries, FP)).toBeNull();
+  });
+  it('carry keeps the sha for provenance: a record or entry without a valid originating sha never carries', () => {
+    expect(prototypeLoad.readyEvidence([green({ sha: undefined })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ sha: 'invalid' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak()], input, [entry({ sha: 'invalid' })], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak()], input, [entry({ sha: undefined })], FP)).toBeNull();
+  });
+  it('the exact-sha path is unchanged without any fingerprint', () => {
+    const r = weak({ sha: SHA, fingerprint: undefined });
+    expect(prototypeLoad.readyEvidence([r], input, [entry({ sha: SHA, fingerprint: undefined })])).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
+  });
+  it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
+    const ready = auditLines([weak()]);
+    const settings = { ruledWeakened: [entry()] };
+    const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
+    expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
+    // A readable DIFFERENT fingerprint proves other code: readiness does not speak, so the audit gate refuses.
+    const other = await auditedFixture('warn', { ready, settings, fingerprint: () => OTHER_FP }).run();
+    expect(other).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    // An unreadable live fingerprint proves nothing, so the record's readable fingerprint still refuses (fail closed).
+    for (const fingerprint of [() => null, () => { throw new Error('boom'); }]) {
+      const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+    }
+  });
+});
+
+// R503 red team rounds 1–2 — evidence precedence: the latest verdict per head (and base) wins, the live head's own
+// evidence outranks carried evidence, and newer carried negative evidence blocks until the live head re-records.
+describe('carried evidence precedence (R503 red team)', () => {
+  const FP = 'e'.repeat(64), A = 'd'.repeat(40), C = '7'.repeat(40);
+  const at = (h) => `2026-10-2${h}T12:00:00Z`;
+  const audit = (o = {}) => auditRecord({ head: A, fingerprint: FP, ...o });
+  it('round 1: a superseded WEAKENED audit of a carried head does not block its newer passing audit', () => {
+    const pass = audit({ at: at(2) });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), pass], SHA, () => true, FP)).toEqual({ ok: true, record: pass });
+  });
+  it('round 1: a fresh live-head audit newer than an unsuperseded carried WEAKENED unblocks', () => {
+    const fresh = auditRecord({ at: at(3) });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
+    // and the superseded scenario plus a fresh live-head audit also loads
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ verdict: 'WEAKENED', at: at(1) }), audit({ at: at(2) }), fresh], SHA, () => true, FP)).toEqual({ ok: true, record: fresh });
+  });
+  it('a carried WEAKENED newer than the live head\'s own verdict still blocks', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(3) })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('a live-head WEAKENED blocks an older or newer carried pass', () => {
+    for (const [own, carried] of [[at(1), at(3)], [at(3), at(1)]]) {
+      expect(prototypeLoad.canonicalAuditEvidence([audit({ at: carried }), auditRecord({ verdict: 'WEAKENED', at: own })], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    }
+  });
+  it('a newer own audit of an uncovered base does not supersede a carried WEAKENED (self-review)', () => {
+    const records = [auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(2) }), auditRecord({ base: C, at: at(3) })];
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, (base) => base !== C, FP)).toEqual({ ok: false, reason: 'weakened' });
+    // ...while a newer own audit of a covered base does
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, () => true, FP)).toMatchObject({ ok: true });
+  });
+  it('covers() is asked once per base, so a flaky second answer cannot pass an audit older than a carried WEAKENED', () => {
+    const records = [auditRecord({ at: at(1) }), audit({ verdict: 'WEAKENED', at: at(2) }), auditRecord({ base: C, at: at(3) })];
+    const asked = new Map();
+    const flaky = (base) => { const n = (asked.get(base) ?? 0) + 1; asked.set(base, n); return base !== C || n === 1; };
+    expect(prototypeLoad.canonicalAuditEvidence(records, SHA, flaky, FP)).toEqual({ ok: true, record: records[2] });
+    expect([...asked.values()].every((n) => n === 1)).toBe(true);
+  });
+  it('an upper-case live sha still finds its own WEAKENED audit before any carried pass', () => {
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ at: at(3) }), auditRecord({ verdict: 'WEAKENED', at: at(1) })], SHA.toUpperCase(), () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+  });
+  it('the live head\'s own verdict outranks a carried pass: an uncovered own base does not fall back to the carry', () => {
+    const own = auditRecord({ base: C, at: at(1) });
+    expect(prototypeLoad.canonicalAuditEvidence([audit({ at: at(2) }), own], SHA, (base) => base !== C, FP)).toEqual({ ok: false, reason: 'no-record' });
+  });
+
+  const input = { branch: BASE.branch, sha: SHA };
+  const ready = (o = {}) => ({ ref: BASE.branch, sha: A, fingerprint: FP, tests: 'green', audit: 'NOT WEAKENED', ...o });
+  const liveWeak = ready({ sha: SHA, fingerprint: undefined, audit: 'WEAKENED' });
+  it('round 2: a live-head WEAKENED record blocks an older carried green record in either order', () => {
+    expect(prototypeLoad.readyEvidence([ready(), liveWeak], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([liveWeak, ready()], input, [], FP)).toBeNull();
+  });
+  it('an upper-case live sha (or record sha) still finds the live head\'s own WEAKENED record', () => {
+    expect(prototypeLoad.readyEvidence([ready(), liveWeak], { ...input, sha: SHA.toUpperCase() }, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([ready(), { ...liveWeak, sha: SHA.toUpperCase() }], input, [], FP)).toBeNull();
+  });
+  it('a live-head non-green record also blocks the carried green record', () => {
+    expect(prototypeLoad.readyEvidence([ready(), ready({ sha: SHA, fingerprint: undefined, tests: 'red' })], input, [], FP)).toBeNull();
+  });
+  it('the latest live-head record wins over an earlier one for the same sha', () => {
+    const green = ready({ sha: SHA, fingerprint: undefined });
+    expect(prototypeLoad.readyEvidence([green, liveWeak], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([liveWeak, green], input, [], FP)).toEqual({ source: 'ready-record', record: green });
+  });
+  it('a carried WEAKENED newer than the live head\'s own record blocks; a newer own record unblocks', () => {
+    const own = ready({ sha: SHA, fingerprint: undefined });
+    const carriedWeak = ready({ sha: C, audit: 'WEAKENED' });
+    expect(prototypeLoad.readyEvidence([own, carriedWeak], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([carriedWeak, own], input, [], FP)).toEqual({ source: 'ready-record', record: own });
+  });
+  it('a superseded carried WEAKENED does not block that head\'s newer green record', () => {
+    const green = ready();
+    expect(prototypeLoad.readyEvidence([ready({ audit: 'WEAKENED' }), green], input, [], FP)).toEqual({ source: 'ready-record', record: green });
+  });
+  it('an unsuperseded carried WEAKENED on another head blocks a carried green record', () => {
+    expect(prototypeLoad.readyEvidence([ready(), ready({ sha: C, audit: 'WEAKENED' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([ready({ sha: C, audit: 'WEAKENED' }), ready()], input, [], FP)).toBeNull();
+  });
+  it('the loader refuses a carried green record when the live head is recorded WEAKENED', async () => {
+    const out = await auditedFixture('warn', { ready: auditLines([ready(), liveWeak]), fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+  });
+  it('round 3: retired warn mode refuses a carried green record never loads over a canonical WEAKENED audit', async () => {
+    const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
+    const out = await auditedFixture('warn', { ready: auditLines([ready()]), audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason: 'weakened' } });
+    // A carried WEAKENED audit of the older head blocks the carried green record the same way.
+    const carriedAudits = auditLines([auditRecord({ head: A, fingerprint: FP, verdict: 'WEAKENED', findings: ['weakened guard'] })]);
+    const carried = await auditedFixture('warn', { ready: auditLines([ready()]), audits: carriedAudits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(carried).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
+  });
+  it('round 3: retired warn mode refuses live-head WEAKENED and missing audit', async () => {
+    const own = ready({ sha: SHA, fingerprint: undefined });
+    const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
+    expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
+    expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
+  });
+  it('round 3 self-review: a live-head WEAKENED audit that findAudit drops as malformed still blocks the carried pass', () => {
+    const pass = audit({ at: at(1) });
+    for (const weak of [
+      auditRecord({ verdict: 'WEAKENED', at: at(2), findings: ['guard removed', 'NOT WEAKENED'] }),
+      auditRecord({ verdict: 'WEAKENED', at: 'nope' }),
+      auditRecord({ verdict: 'WEAKENED', at: at(2), head: SHA.toUpperCase() }),
+    ]) expect(prototypeLoad.canonicalAuditEvidence([pass, weak], SHA, () => true, FP)).toEqual({ ok: false, reason: 'weakened' });
+    // A foreign-question record is still not a verdict: it neither blocks nor enables.
+    expect(prototypeLoad.canonicalAuditEvidence([pass, auditRecord({ verdict: 'WEAKENED', at: at(2), questionHash: 'foreign' })], SHA, () => true, FP)).toEqual({ ok: true, record: pass });
+  });
+  it('round 3 self-review: a newer WEAKENED ready record of another head without a fingerprint blocks the carry (rebase twice)', () => {
+    const between = ready({ sha: C, fingerprint: undefined, audit: 'WEAKENED' });
+    expect(prototypeLoad.readyEvidence([ready(), between], input, [], FP)).toBeNull();
+    // Proven different code (another fingerprint), an older one, or a green one does not block.
+    expect(prototypeLoad.readyEvidence([ready(), { ...between, fingerprint: '1'.repeat(64) }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+    expect(prototypeLoad.readyEvidence([between, ready()], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+    expect(prototypeLoad.readyEvidence([ready(), { ...between, audit: 'NOT WEAKENED' }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+  });
+});
+
+// R503 — when the loader computes the live fingerprint, and the production helper wiring (from main, PR #6353).
+// Same carry fixture as 'canonicalAuditEvidence fingerprint carry (R503)' above.
+describe('canonicalAuditEvidence live fingerprint wiring (R503)', () => {
+  const FP = 'e'.repeat(64), OLD = 'd'.repeat(40);
+  const old = (o = {}) => auditRecord({ head: OLD, fingerprint: FP, ...o });
+  // The live fingerprint costs a fetch plus a git diff, so it is computed only when an older head's stored fingerprint could carry.
+  it.each([
+    ['no audit records at all', ''],
+    ['records without a stored fingerprint', auditLines([old({ fingerprint: undefined })])],
+    ['only records whose head is the live head', auditLines([auditRecord({ fingerprint: FP })]), true],
+    ['an older-head record with an empty fingerprint', auditLines([old({ fingerprint: '' })])],
+    ['an older-head record without a head', auditLines([old({ head: undefined })])],
+    ['only live-head records stored in upper case', auditLines([auditRecord({ fingerprint: FP, head: SHA.toUpperCase() })]), true],
+  ])('never computes the live fingerprint for %s', async (_, audits, proceeds = false) => {
+    const fingerprint = vi.fn(() => FP);
+    const f = auditedFixture('refuse', { audits, auditBaseInMain: TREE, fingerprint });
+    const out = await f.run();
+    expect(fingerprint).not.toHaveBeenCalled();
+    // a loader that went on past the audit stage legitimately fetches `origin main <branch>` later (admission), so only a stop proves the guard
+    if (proceeds) expect(out.canonicalAudit).toMatchObject({ ok: true });
+    else {
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+      expect(f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length > 3)).toEqual([]);
+    }
+  });
+  it('computes the live fingerprint exactly once, for origin/main and the live sha, when a candidate exists', async () => {
+    let f, fetchesBefore;
+    const fingerprint = vi.fn(() => { fetchesBefore = f.calls.filter((c) => c.args[0] === 'fetch' && c.args.length === 3).map((c) => c.args); return FP; });
+    f = auditedFixture('refuse', { audits: auditLines([old(), old({ base: 'f'.repeat(40) })]), auditBaseInMain: TREE, fingerprint });
+    await f.run();
+    expect(fingerprint).toHaveBeenCalledTimes(1);
+    expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
+    // the live branch was fetched BEFORE it was fingerprinted
+    expect(fetchesBefore).toEqual([['fetch', 'origin', 'main'],
+      ['fetch', 'origin', `+refs/heads/${BASE.branch}:refs/remotes/origin/${BASE.branch}`]]);
+  });
+  it('a failed read-only main fetch means no carry and the fingerprint is never computed', async () => {
+    const fingerprint = vi.fn(() => FP);
+    // the injected fingerprint matches and main covers the base, so only the failed live fetch can withhold the carry
+    const control = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    expect(control).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    const out = await auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE, fingerprint, mainFetchFails: true }).run();
+    expect(fingerprint).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+  });
+  it('a failed candidate-object fetch refuses carry before fingerprinting or registration', async () => {
+    const fingerprint = vi.fn(() => FP);
+    const f = auditedFixture('refuse', { audits: auditLines([old()]), auditBaseInMain: TREE,
+      fingerprint, staleFetchFails: BASE.branch });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit',
+      canonicalAudit: { ok: false, reason: 'no-record' } });
+    expect(fingerprint).not.toHaveBeenCalled();
+    expect(f.calls.filter(({ cmd }) => cmd === 'node')).toEqual([]);
+    expect(f.readyWrites).toEqual([]);
+    expect(f.records).toHaveLength(1);
+  });
+  // The production wiring: no injected `fingerprint`, so netDiffFingerprint runs over the loader's own exec.
+  describe('default (non-injected) fingerprint wiring', () => {
+    const FORK = '9'.repeat(40);
+    // Canned git for the helper's own calls (the ones carrying --end-of-options); everything else keeps the fixture's handlers.
+    const cannedGit = (text) => {
+      const seen = [];
+      const exec = (cmd, args) => {
+        seen.push(args.slice(2));
+        const verb = args[2];
+        if (verb === 'rev-parse') return Buffer.from(`${args.at(-1).startsWith('origin/main') ? TREE : SHA}\n`);
+        if (verb === 'merge-base') return Buffer.from(`${FORK}\n`);
+        if (verb === 'diff') return Buffer.from(text);
+        throw new Error(`unexpected git ${args.slice(2)}`);
+      };
+      return { seen, exec, combinedIO: { handles: (cmd, args) => cmd === 'git' && args[0] === '-C' && args.includes('--end-of-options'), exec, fs: {} } };
+    };
+    const DIFF = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n';
+    const liveOf = (text) => netDiffFingerprint('/repo', 'origin/main', SHA, { exec: cannedGit(text).exec });
+    it('carries when the real helper, run over the loader exec, matches the stored fingerprint', async () => {
+      const fp = liveOf(DIFF);
+      expect(fp).toMatch(/^[0-9a-f]{64}$/);
+      const { combinedIO, seen } = cannedGit(DIFF);
+      const f = auditedFixture('refuse', { audits: auditLines([old({ fingerprint: fp })]), auditBaseInMain: TREE, combinedIO });
+      const out = await f.run();
+      expect(out.canonicalAudit).toEqual({ mode: 'refuse', ok: true, record: old({ fingerprint: fp }) });
+      // the helper saw origin/main as the base, the live sha as the head, and diffed the merge-base against the live sha
+      expect(seen.map((a) => a[0])).toEqual(['rev-parse', 'rev-parse', 'merge-base', 'diff']);
+      expect(seen[0].at(-1)).toBe(`${SHA}^{commit}`);
+      expect(seen[1].at(-1)).toBe('origin/main^{commit}');
+      expect(seen[3].slice(-2)).toEqual([FORK, SHA]);
+      // The candidate's objects, as well as main, precede the fingerprint reader.
+      const firstFetch = f.calls.findIndex((c) => c.args[0] === 'fetch'
+        && c.args[2] === `+refs/heads/${BASE.branch}:refs/remotes/origin/${BASE.branch}`);
+      const firstHelper = f.calls.findIndex((c) => c.cmd === 'git' && c.args.includes('--end-of-options'));
+      expect(firstFetch).toBeGreaterThanOrEqual(0);
+      expect(firstHelper).toBeGreaterThan(firstFetch);
+    });
+    it('does not carry when the live diff differs from the stored fingerprint', async () => {
+      const stored = liveOf(DIFF);
+      const { combinedIO, seen } = cannedGit(`${DIFF}+more\n`);
+      const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(seen.map((a) => a[0])).toContain('diff'); // the real helper ran; it is the differing diff that withholds the carry
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { ok: false, reason: 'no-record' } });
+    });
+    it('does not carry when the helper cannot read git (empty diff)', async () => {
+      const stored = liveOf(DIFF);
+      const { combinedIO, seen } = cannedGit('');
+      const out = await auditedFixture('refuse', { audits: auditLines([old({ fingerprint: stored })]), auditBaseInMain: TREE, combinedIO }).run();
+      expect(seen.map((a) => a[0])).toContain('diff');
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    });
+  });
+});
+
+// R503 part 3 — ready records and ruledWeakened entries carry to the live tip when the net-diff fingerprint matches.
+describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const input = { branch: BASE.branch, sha: SHA };
+  const findings = ['disclosed weakening'];
+  const green = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'NOT WEAKENED', ...o });
+  const weak = (o = {}) => green({ audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings, ...o });
+  const entry = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, ruling: 'R396', findings, ...o });
+  it('a ready record for an older sha carries when the fingerprints match', () => {
+    const r = green();
+    expect(prototypeLoad.readyEvidence([r], input, [], FP)).toEqual({ source: 'ready-record', record: r });
+  });
+  it.each([['changed code', OTHER_FP], ['unreadable live fp', null], ['malformed live fp', 'zz']])('%s does not carry a ready record', (_, live) => {
+    expect(prototypeLoad.readyEvidence([green()], input, [], live)).toBeNull();
+  });
+  it('a record without a stored fingerprint, or for another ref, never carries', () => {
+    expect(prototypeLoad.readyEvidence([green({ fingerprint: undefined })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ ref: 'lane/other' })], input, [], FP)).toBeNull();
+  });
+  it('a ruled-WEAKENED record plus entry carry when both fingerprints match the live one', () => {
+    const r = weak();
+    expect(prototypeLoad.readyEvidence([r], input, [entry()], FP)).toEqual({ source: 'ready-record', record: r, ruledWeakened: { ruling: 'R396', findings } });
+  });
+  it.each([
+    ['entry fingerprint differs', [entry({ fingerprint: OTHER_FP })]],
+    ['entry has no fingerprint and another sha', [entry({ fingerprint: undefined })]],
+    ['entry for another ruling', [entry({ ruling: 'R397' })]],
+    ['entry findings differ', [entry({ findings: ['other'] })]],
+  ])('%s refuses the carry', (_, entries) => {
+    expect(prototypeLoad.readyEvidence([weak()], input, entries, FP)).toBeNull();
+  });
+  it('carry keeps the sha for provenance: a record or entry without a valid originating sha never carries', () => {
+    expect(prototypeLoad.readyEvidence([green({ sha: undefined })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([green({ sha: 'invalid' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak()], input, [entry({ sha: 'invalid' })], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak()], input, [entry({ sha: undefined })], FP)).toBeNull();
+  });
+  it('the exact-sha path is unchanged without any fingerprint', () => {
+    const r = weak({ sha: SHA, fingerprint: undefined });
+    expect(prototypeLoad.readyEvidence([r], input, [entry({ sha: SHA, fingerprint: undefined })])).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
+  });
+  // An explicit audit of the CURRENT head outranks older carried evidence: a WEAKENED live-head record needs its ruled exception.
+  it('a current-head WEAKENED record is not masked by an older carried green record', () => {
+    const older = green();
+    const current = weak({ sha: SHA });
+    expect(prototypeLoad.readyEvidence([older, current], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, tests: 'red' })], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([older, { ...current, audit: 'weakened' }], input, [], FP)).toBeNull();
+    // The ruled exception (record + allowlist entry for the live head) still loads.
+    expect(prototypeLoad.readyEvidence([older, current], input, [entry({ sha: SHA })], FP))
+      .toEqual({ source: 'ready-record', record: current, ruledWeakened: { ruling: 'R396', findings } });
+  });
+  it('a later current-head NOT WEAKENED re-audit supersedes an earlier current-head WEAKENED record', () => {
+    const fresh = green({ sha: SHA });
+    expect(prototypeLoad.readyEvidence([weak({ sha: SHA }), fresh], input, [], FP)).toEqual({ source: 'ready-record', record: fresh });
+  });
+  // Fail closed on the current head's own latest record, whatever its shape: it is authoritative unless green NOT WEAKENED.
+  it.each([
+    ['a later red-tests NOT WEAKENED record', [weak({ sha: SHA }), green({ sha: SHA, tests: 'red' })]],
+    ['an unrecognised verdict string', [green({ sha: SHA, audit: 'WEAKENED (R396 pending)' })]],
+    ['a trailing-space verdict', [green({ sha: SHA, audit: 'WEAKENED ' })]],
+    ['a FAIL verdict', [green({ sha: SHA, audit: 'FAIL' })]],
+    ['a missing verdict', [green({ sha: SHA, audit: undefined })]],
+  ])('the current head\'s latest record (%s) is not masked by an older carried green record', (_, exactRecords) => {
+    expect(prototypeLoad.readyEvidence([green(), ...exactRecords], input, [], FP)).toBeNull();
+    // ...nor by an older carried ruled exception with its allowlist entry
+    expect(prototypeLoad.readyEvidence([weak(), ...exactRecords], input, [entry()], FP)).toBeNull();
+  });
+  it('a current-head WEAKENED record for another ref or sha does not veto', () => {
+    const older = green();
+    expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, ref: 'lane/other' })], input, [], FP)).toEqual({ source: 'ready-record', record: older });
+  });
+  it('the loader refuses with no-ready when the current head is WEAKENED over an older carried green record', async () => {
+    const out = await auditedFixture('warn', { ready: auditLines([green(), weak({ sha: SHA })]), fingerprint: () => FP }).run();
+    expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+  });
+  // The current head's own latest WEAKENED verdict is authoritative: an older carried ruled exception for DIFFERENT
+  // findings (or an older exact-head record) must not stand in for it.
+  it('an older carried ruled exception does not override a current-head WEAKENED verdict with different findings', () => {
+    const carried = weak();
+    const current = weak({ sha: SHA, auditDisclosed: ['different finding'] });
+    expect(prototypeLoad.readyEvidence([carried, current], input, [entry()], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([current, carried], input, [entry()], FP)).toBeNull();
+  });
+  it('the current-head record loads on its own ruled exception even beside a carried ruled record', () => {
+    const carried = weak();
+    const current = weak({ sha: SHA, auditDisclosed: ['different finding'] });
+    expect(prototypeLoad.readyEvidence([carried, current], input, [entry(), entry({ sha: SHA, findings: ['different finding'] })], FP))
+      .toEqual({ source: 'ready-record', record: current, ruledWeakened: { ruling: 'R396', findings: ['different finding'] } });
+  });
+  it('only the LATEST current-head WEAKENED record can be ruled: an older exact-head ruled record cannot stand in', () => {
+    const olderExact = weak({ sha: SHA });
+    const latestExact = weak({ sha: SHA, auditDisclosed: ['newer finding'] });
+    expect(prototypeLoad.readyEvidence([olderExact, latestExact], input, [entry({ sha: SHA })], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([latestExact, olderExact], input, [entry({ sha: SHA })], FP))
+      .toMatchObject({ record: olderExact });
+  });
+  describe('lazy live fingerprint', () => {
+    it('accepts a function and reads it once even with label arguments', () => {
+      const lazy = vi.fn(() => FP);
+      const r = green();
+      expect(prototypeLoad.readyEvidence([r], input, [], lazy)).toEqual({ source: 'ready-record', record: r });
+      expect(lazy).toHaveBeenCalledTimes(1);
+      const skipped = vi.fn(() => FP);
+      expect(prototypeLoad.readyEvidence([r], { ...input, testsRun: 'fixture-green', audit: 'NOT WEAKENED' }, [], skipped).source).toBe('ready-record');
+      expect(skipped).toHaveBeenCalledTimes(1);
+    });
+  });
+  describe('loader: live fingerprint is read lazily and once (R503)', () => {
+    // Coverage/carry share one main fetch; carry also fetches the candidate's objects before reading its fingerprint.
+    const branchFetches = (f) => f.calls.filter((c) => c.args[0] === 'fetch' && c.args[2] === 'main' && c.args.length === 3).length;
+    const baselineFetches = async () => { const f = auditedFixture('warn', { ready: auditLines([green({ sha: SHA })]) }); await f.run(); return branchFetches(f); };
+    const oldAudit = () => auditRecord({ head: OLD, fingerprint: FP });
+    it('the --tests-run/--audit labels preserve the normal fingerprint read', async () => {
+      const fingerprint = vi.fn(() => FP);
+      const f = auditedFixture('warn', { ready: auditLines([green()]), fingerprint });
+      const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
+      expect(out.gate).toMatchObject({ source: 'ready-record' });
+      expect(fingerprint).toHaveBeenCalledTimes(1);
+      expect(branchFetches(f)).toBe(await baselineFetches());
+    });
+    it('a ready record for another sha that stores a fingerprint triggers exactly one read, for origin/main and the live sha', async () => {
+      const fingerprint = vi.fn(() => FP);
+      const f = auditedFixture('warn', { ready: auditLines([green()]), fingerprint });
+      const out = await f.run();
+      expect(out.gate).toMatchObject({ source: 'ready-record' });
+      expect(fingerprint).toHaveBeenCalledTimes(1);
+      expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
+      expect(branchFetches(f)).toBe(await baselineFetches());
+    });
+    it('a ruled-exception allowlist entry for another sha that stores a fingerprint also triggers the read', async () => {
+      const fingerprint = vi.fn(() => FP);
+      const out = await auditedFixture('warn', { ready: auditLines([weak()]), settings: { ruledWeakened: [entry()] }, fingerprint }).run();
+      expect(out.gate).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
+      expect(fingerprint).toHaveBeenCalledTimes(1);
+      // The entry alone is a trigger: the record stores no fingerprint, so only the entry's fingerprint can start the read.
+      const alone = vi.fn(() => FP);
+      const refused = await auditedFixture('warn', { ready: auditLines([weak({ fingerprint: undefined })]), settings: { ruledWeakened: [entry()] }, fingerprint: alone }).run();
+      // A record with no stored fingerprint cannot carry, so it does not speak for this head: the audit gate refuses.
+      expect(refused).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+      expect(alone).toHaveBeenCalledTimes(1);
+    });
+    it.each([
+      ['an exact-sha ready record', [green({ sha: SHA })], { source: 'ready-record' }],
+      // No stored fingerprint: it is other code, so readiness is produced fresh from the audit and check-run.
+      ['an other-sha ready record without a fingerprint', [green({ fingerprint: undefined })], { source: 'canonical-check-run' }],
+    ])('%s never triggers the read', async (_, records, gate) => {
+      const fingerprint = vi.fn(() => FP);
+      const f = auditedFixture('warn', { ready: auditLines(records), fingerprint });
+      const out = await f.run();
+      expect(out.gate).toMatchObject(gate);
+      expect(fingerprint).not.toHaveBeenCalled();
+      if (gate.source === 'ready-record') expect(branchFetches(f)).toBe(await baselineFetches());
+    });
+    it('a failed (null) read is memoized too: the audit stage does not repeat it', async () => {
+      const fingerprint = vi.fn(() => null);
+      const f = auditedFixture('warn', { ready: auditLines([green(), green({ sha: SHA })]), audits: auditLines([oldAudit()]), fingerprint });
+      await f.run();
+      expect(fingerprint).toHaveBeenCalledTimes(1);
+    });
+    it('the ready and audit stages share ONE read (memoized across stages)', async () => {
+      const fingerprint = vi.fn(() => FP);
+      const f = auditedFixture('refuse', { ready: auditLines([green()]), audits: auditLines([oldAudit()]), auditBaseInMain: TREE, fingerprint });
+      const out = await f.run();
+      expect(out).toMatchObject({ ok: true });
+      expect(fingerprint).toHaveBeenCalledTimes(1);
+      expect(branchFetches(f)).toBe(await baselineFetches());
+    });
+    it.each([['null', () => null], ['throw', () => { throw new Error('boom'); }]])('a failed read (%s) is no carry and not a crash', async (_, fingerprint) => {
+      const out = await auditedFixture('warn', { ready: auditLines([green()]), fingerprint }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+    });
+  });
+  it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
+    const ready = auditLines([weak()]);
+    const settings = { ruledWeakened: [entry()] };
+    const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
+    expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
+    // A readable DIFFERENT fingerprint proves other code: readiness does not speak, so the audit gate refuses.
+    const other = await auditedFixture('warn', { ready, settings, fingerprint: () => OTHER_FP }).run();
+    expect(other).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    // An unreadable live fingerprint proves nothing, so the record's readable fingerprint still refuses (fail closed).
+    for (const fingerprint of [() => null, () => { throw new Error('boom'); }]) {
+      const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+    }
+  });
+});
+
+describe('prototype-load daemon key resolution (R502 item 1)', () => {
+  const daemons = { review: { label: 'com.we.review-daemon' }, fix: { label: 'com.we.fix-dispatch-daemon' }, verify: { label: 'com.we.verify-daemon' }, control: { label: 'com.we.control', clone: 'wev-control' }, drain: { label: 'com.plateau.drain-daemon', clone: '.lanes/we-drain-daemon/code' } };
+  const aliases = { 'reconcile-fix-dispatch': 'fix', 'wev-review-daemon': 'review', 'wev-control': 'control' };
+  it.each([
+    ['review', 'review'], ['verify-daemon', 'verify'], ['com.we.verify-daemon', 'verify'], ['fix-dispatch-daemon', 'fix'],
+    ['reconcile-fix-dispatch', 'fix'], ['wev-review-daemon', 'review'], ['wev-control', 'control'],
+  ])('maps %s to %s', (name, key) => { expect(resolveDaemonKey(daemons, aliases, name)).toEqual({ key }); });
+  it('refuses unknown names and lists every valid key', () => {
+    const r = resolveDaemonKey(daemons, aliases, 'nope');
+    expect(r.key).toBeUndefined(); expect(r.reason).toBe('unknown'); expect(r.valid).toEqual(['review', 'fix', 'verify', 'control', 'drain']);
+  });
+  it('refuses an ambiguous alias instead of guessing', () => {
+    const r = resolveDaemonKey({ a: { label: 'com.we.x-daemon' }, b: { label: 'com.we.y' } }, { 'x-daemon': 'b' }, 'x-daemon');
+    expect(r).toMatchObject({ reason: 'ambiguous', candidates: ['a', 'b'] });
+  });
+  it('never lets a generic clone dir basename self-select a daemon', () => {
+    expect(resolveDaemonKey(daemons, aliases, 'code')).toMatchObject({ reason: 'unknown' });
+  });
+  it('an exact key always wins over an alias of another daemon', () => {
+    expect(resolveDaemonKey({ fix: { label: 'l1' }, review: { label: 'l2' } }, { fix: 'review' }, 'fix')).toEqual({ key: 'fix' });
+  });
+  it('run() loads onto the canonical daemon for an alias and lists keys on a real unknown', async () => {
+    const f = fixture({ settings: { daemonAliases: { 'wev-review-daemon': 'review' } } });
+    expect((await f.run({ daemon: 'wev-review-daemon' })).daemon).toBe('review');
+    const g = fixture(); const r = await g.run({ daemon: 'nope' });
+    expect(r.stopReason).toBe('unknown-daemon'); expect(r.validDaemons).toEqual(['control', 'review', 'drain']); expect(JSON.stringify(r)).toContain('control, review, drain');
+  });
+  it.each(['mergewatch', 'com.we.mw', 'mw-alias'])('refuses a daemon marked unsupported (%s) before reading a plist or touching git, and records it', async (name) => {
+    const f = fixture({ settings: {
+      daemons: { control: { label: 'com.we.control', clone: 'wev-control' }, mergewatch: { label: 'com.we.mw', clone: 'wev-mw', unsupported: 'its self-sync runs main-only, so overlays are never adopted' } },
+      daemonAliases: { 'mw-alias': 'mergewatch' },
+    } });
+    const r = await f.run({ daemon: name });
+    expect(r).toMatchObject({ ok: false, stopReason: 'unsupported-daemon', detail: 'unsupported-daemon:mergewatch' });
+    expect(r.fallback).toContain('main-only');
+    expect(f.calls).toHaveLength(0); expect(mutations(f, 'add')).toHaveLength(0); expect(f.records).toHaveLength(1);
+  });
+  it('refuses an unsupported daemon even in retire-only and dry-run modes', async () => {
+    const settings = { daemons: { mergewatch: { label: 'com.we.mw', clone: 'wev-mw', unsupported: 'main-only self-sync' } } };
+    for (const extra of [{ retire: true }, { dryRun: true }]) {
+      const f = fixture({ settings }); expect((await f.run({ daemon: 'mergewatch', ...extra })).stopReason).toBe('unsupported-daemon'); expect(f.calls).toHaveLength(0);
+    }
+  });
+});
+
+
+describe('refuse-only safety properties P1–P9', () => {
+  const weak = { ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R787', auditDisclosed: ['guard removed'] };
+  const ruled = { ref: BASE.branch, sha: SHA, ruling: 'R787', findings: weak.auditDisclosed };
+  const canonicalWeak = auditRecord({ verdict: 'WEAKENED', findings: weak.auditDisclosed });
+  it('P1 refuses canonical WEAKENED even with a green ready record', async () => {
+    const f = auditedFixture(undefined, { audits: auditLines([canonicalWeak]) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit' });
+    expect(f.calls).toEqual([]);
+  });
+  it.each(['warn', 'other', { nested: 'warn' }])('P2 no mode setting or environment can bypass refusal: %j', async mode => {
+    const f = auditedFixture(mode, { env: { WE_PROTOTYPE_LOAD_CANONICAL_AUDIT_MODE: 'warn' } });
+    expect(await f.run({ canonicalAuditMode: 'warn' })).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(f.calls).toEqual([]);
+  });
+  it('P3 refusal writes only the load record, without recovery, retirement or publishing', async () => {
+    const f = auditedFixture('warn', { pendingDrops: 'unsettled', list: ['lane/old'] });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-canonical-audit' });
+    expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]);
+    expect(f.retirePlanner).not.toHaveBeenCalled(); expect(f.records).toHaveLength(1);
+  });
+  it('P4 ruled readiness is checked first and still needs matching canonical findings', async () => {
+    for (const findings of [['guard removed'], ['different'], []]) {
+      const f = auditedFixture('refuse', { ready: auditLines([weak]), settings: { ruledWeakened: [ruled] },
+        audits: auditLines([{ ...canonicalWeak, findings }]), auditBaseInMain: TREE });
+      const out = await f.run();
+      expect(out.gate.ruledWeakened).toEqual({ ruling: 'R787', findings: weak.auditDisclosed, layer: 'tool' });
+      expect(out.ok).toBe(findings[0] === 'guard removed');
+      if (!out.ok) { expect(out.stopReason).toBe('no-canonical-audit'); expect(mutations(f, 'add')).toHaveLength(0); }
+    }
+    const missing = auditedFixture('refuse', { ready: auditLines([weak]), settings: { ruledWeakened: [ruled] }, audits: '' });
+    expect(await missing.run()).toMatchObject({ stopReason: 'no-canonical-audit' });
+  });
+  it('P5 arguments are labels and never readiness', async () => {
+    expect(prototypeLoad.readyEvidence([], { ...BASE, testsRun: 'claimed', audit: 'NOT WEAKENED' })).toBeNull();
+    const f = auditedFixture('warn', { ready: '' });
+    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, registered: false });
+    expect(f.readyWrites).toEqual([]); expect(f.calls).toEqual([]);
+  });
+  it.each([null, { ok: false, reason: 'could-not-run' }, { ok: true, ran: false, sha: SHA }, { ok: true, sha: TREE }, { ok: true, sha: SHA }])('P6 requires a real passing dispatch smoke bound to the SHA: %j', async result => {
+    const smoke = vi.fn(async () => result);
+    const f = fixture({ dispatchSmoke: smoke, ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    const out = await f.run();
+    expect(smoke).toHaveBeenCalledWith({ sha: SHA, files: ['scripts/operations/dispatch-lane.mjs'] });
+    expect(out.ok).toBe(result?.ok === true && result.sha === SHA && result.ran !== false);
+    if (!out.ok) { expect(out.stopReason).toBe('dispatch-smoke-failed'); expect(mutations(f, 'add')).toHaveLength(0); expect(f.readyWrites).toEqual([]); }
+  });
+  it('P7 removes exactly one registration via expected-entry/tip guarded retirement', async () => {
+    const remove = vi.fn(async () => ({ retired: true }));
+    const f = fixture({ list: ['lane/old', 'lane/other'], removeRegistration: remove });
+    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', reason: 'withdraw unaudited' })).toMatchObject({ ok: true, removed: ['lane/old'] });
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith({ root: '/home/test/workspace/wev-control', ref: 'lane/old', expectedTip: 'd'.repeat(39) + '0', expectedEntry: { ref: 'lane/old' }, by: 'tester' });
+    expect(f.retirePlanner).not.toHaveBeenCalled(); expect(mutations(f, 'add')).toHaveLength(0);
+    expect(prototypeLoadOperation().input).toMatchObject({ remove: { type: 'string' }, reason: { type: 'string' } });
+  });
+  it.each([
+    ['--branch', { branch: 'lane/new', sha: SHA }], ['--replace', { replace: 'lane/other' }], ['--retire', { retire: true }],
+    ['--force-adopt', { forceAdopt: true }], ['a blank --reason', { reason: '  ' }],
+  ])('P7 --remove is exclusive: %s is refused with bad-input and nothing is removed', async (_, extra) => {
+    const remove = vi.fn(async () => ({ retired: true }));
+    const f = fixture({ list: ['lane/old'], removeRegistration: remove });
+    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', reason: 'withdraw', ...extra })).toMatchObject({ ok: false, stopReason: 'bad-input' });
+    expect(remove).not.toHaveBeenCalled();
+    for (const action of ['add', 'remove', 'replace', 'retire']) expect(mutations(f, action)).toHaveLength(0);
+  });
+  it.each([
+    ['the daemon\'s own pending verdict', { ok: false, pending: true, reason: 'pending', sha: SHA }],
+    ['an ok-shaped observation still marked pending', { ok: true, pending: true, sha: SHA }],
+    ['a pending observation that also reports ran', { ok: true, ran: true, pending: true, sha: SHA }],
+  ])('P6 a pending dispatch-smoke observation refuses admission: %s', async (_, observation) => {
+    const smoke = vi.fn(async () => observation);
+    const f = fixture({ dispatchSmoke: smoke, ownDiff: 'M\0scripts/operations/dispatch-lane.mjs\0', diff: 'M\0scripts/operations/dispatch-lane.mjs\0' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'dispatch-smoke-failed', dispatchSmoke: observation });
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(mutations(f, 'add')).toHaveLength(0); expect(f.readyWrites).toEqual([]);
+  });
+  it('P7 refuses stacked dependents, missing reason and changed-entry/tip removal', async () => {
+    const remove = vi.fn(async () => ({ retired: false, refused: 'tip-moved' }));
+    const stacked = JSON.stringify({ list: [{ ref: 'lane/old' }, { ref: 'lane/top', stackBases: ['lane/old'] }] });
+    const f = fixture({ listRaw: stacked, removeRegistration: remove });
+    expect(await f.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'stacked-dependents' });
+    expect(remove).not.toHaveBeenCalled();
+    expect(await f.run({ branch: '', remove: 'lane/old' })).toMatchObject({ stopReason: 'bad-input' });
+    const moved = fixture({ list: ['lane/old'], removeRegistration: remove });
+    expect(await moved.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'tip-moved', removed: [] });
+  });
+  it('P8 produces fix-ready from canonical audit and a passing exact-sha test check, without argument evidence', async () => {
+    const f = fixture({ ready: '' });
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(f.readyWrites).toHaveLength(1);
+    expect(f.readyWrites[0]).toMatchObject({ ref: BASE.branch, sha: SHA, audit: 'NOT WEAKENED', tests: 'green', testCheck: { sha: SHA, name: 'test', conclusion: 'success' } });
+  });
+  it.each([null, { sha: TREE, name: 'test', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'other', status: 'completed', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'in_progress', conclusion: 'success' }, { sha: SHA, name: 'test', status: 'completed', conclusion: 'failure' }])('P8 fails closed on absent, wrong-sha or nonpassing check evidence: %j', async check => {
+    const f = fixture({ ready: '', testCheck: async () => check });
+    expect(await f.run({ testsRun: 'claimed', audit: 'NOT WEAKENED' })).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('P9 an already-live registration is never removed or rebuilt, and an unaudited re-load is still refused', async () => {
+    const f = auditedFixture('refuse', { ready: '', list: [BASE.branch, 'lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(mutations(f, 'add')).toHaveLength(0); expect(mutations(f, 'remove')).toHaveLength(0); expect(f.retirePlanner).not.toHaveBeenCalled();
+  });
+  it('P9 an audited re-load of a live ref passes the admission gates, then reports already without any mutation', async () => {
+    const f = fixture({ list: [BASE.branch, 'lane/old'] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: 'already', canonicalAudit: { ok: true } });
+    // The live registration itself is never added, removed, replaced or rebuilt. (Other proved-merged entries may still
+    // be retired by the normal retirement step, which is why the planner is not asserted absent.)
+    for (const action of ['add', 'remove', 'replace']) expect(mutations(f, action)).toHaveLength(0);
+    expect(f.calls.some((c) => c.args[0] === 'push')).toBe(false);
+  });
+  it('real settings R786 (#6588), R790 (a7200c728), R796 (166689d) pass the canonical ruled gate using fake IO', async () => {
+    const shipped = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
+    for (const ruling of ['R786', 'R790', 'R796']) {
+      const entry = shipped.ruledWeakened.find((e) => e.ruling === ruling);
+      expect(entry, ruling).toBeDefined();
+      const f = fixture({ sha: entry.sha, ready: auditLines([{ ref: entry.ref, sha: entry.sha, tests: 'green', audit: 'WEAKENED', auditRuling: entry.ruling, auditDisclosed: entry.findings }]),
+        audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
+        settings: { ...shipped, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
+      expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling } } });
+    }
+  });
+});
+
+
+describe('test check-run evidence bounds (P8)', () => {
+  const pass = { id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 } };
+  it('uses the latest test run on the exact SHA, even when an older success exists', () => {
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [pass, { ...pass, id: 2, conclusion: 'failure' }] }, SHA)).toMatchObject({ sha: SHA, conclusion: 'failure' });
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, head_sha: TREE }] }, SHA)).toBeNull();
+  });
+  it('binds the test check to the GitHub Actions app, not its name alone', async () => {
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, app: { id: 1 } }] }, SHA)).toBeNull();
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, app: undefined }] }, SHA)).toBeNull();
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [pass, { ...pass, id: 9, app: { id: 1 }, conclusion: 'success' }] }, SHA)).toMatchObject({ id: 1, appId: 15368 });
+    const f = fixture({ ready: '', testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 1 }) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('another workflow\'s newer success never hides a failing test suite; a rerun in the same suite does supersede', () => {
+    const other = { ...pass, id: 9, check_suite: { id: 8 } };
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [{ ...pass, conclusion: 'failure' }, other] }, SHA)).toMatchObject({ id: 1, conclusion: 'failure' });
+    expect(prototypeLoad.testCheckEvidence({ total_count: 2, check_runs: [{ ...pass, conclusion: 'failure' }, { ...pass, id: 2 }] }, SHA)).toMatchObject({ id: 2, conclusion: 'success' });
+    expect(prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [{ ...pass, check_suite: undefined }] }, SHA)).toBeNull();
+  });
+  it('binds the test suite to the expected workflow file and fails closed on any gap', () => {
+    const ev = prototypeLoad.testCheckEvidence({ total_count: 1, check_runs: [pass] }, SHA);
+    expect(ev.suiteIds).toEqual([7]);
+    const run = { check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml' };
+    const ok = (runs, path) => prototypeLoad.testWorkflowBound(ev, { total_count: runs.length, workflow_runs: runs }, SHA, path);
+    expect(ok([run])).toBe(true);
+    expect(ok([{ ...run, path: '.github/workflows/ci.yml@refs/heads/x' }])).toBe(true);
+    expect(ok([{ ...run, path: '.github/workflows/other.yml' }])).toBe(false);
+    expect(ok([{ ...run, check_suite_id: 8 }])).toBe(false);
+    expect(ok([{ ...run, head_sha: TREE }])).toBe(false);
+    expect(ok([])).toBe(false);
+    expect(ok([run], '')).toBe(false);
+    expect(prototypeLoad.testWorkflowBound(ev, { total_count: 2, workflow_runs: [run] }, SHA)).toBe(false);
+    expect(prototypeLoad.testWorkflowBound(null, { total_count: 1, workflow_runs: [run] }, SHA)).toBe(false);
+  });
+  it('refuses an oversized or incomplete page rather than treating a truncated success as evidence', () => {
+    for (const total_count of [101, -1, null, 2]) expect(prototypeLoad.testCheckEvidence({ total_count, check_runs: [pass] }, SHA)).toBeNull();
+    expect(prototypeLoad.testCheckEvidence({ total_count: 100, check_runs: Array.from({ length: 100 }, (_, i) => ({ ...pass, id: i })) }, SHA)).toMatchObject({ sha: SHA, conclusion: 'success' });
+  });
+});
+
+
+// PR #6610 review: stored readiness for other code must not strand an iterated branch, but negative evidence about
+// THIS head (its own sha, or the same net diff) must still refuse.
+// PR #6610 red team: the readiness a successful ruled carry appends names the NEW sha, so the next identical load must
+// still bind that record to the carried canonical audit of the OLD sha (same net diff), not demand a re-audit.
+describe('a ruled carry stays loadable after it appends its own readiness', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const findings = ['disclosed weakening'];
+  const weak = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings, ...o });
+  const entry = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, ruling: 'R396', findings, ...o });
+  const oldAudit = (o = {}) => auditRecord({ head: OLD, verdict: 'WEAKENED', findings, fingerprint: FP, base: 'e'.repeat(40), ...o });
+  const gateFor = (o = {}) => ({ source: 'ready-record', record: { sha: SHA, fingerprint: FP, ...o }, ruledWeakened: { ruling: 'R396', findings } });
+  const evidence = (audits, gate, liveFp = FP) => prototypeLoad.canonicalAuditEvidence(audits, SHA, () => true, liveFp, { ruledWeakened: gate });
+  it('the second identical load admits: the gate record on the new sha binds to the carried WEAKENED audit', async () => {
+    const audits = auditLines([oldAudit()]);
+    const settings = { ruledWeakened: [entry()] };
+    const first = auditedFixture('warn', { ready: auditLines([weak()]), settings, audits, fingerprint: () => FP });
+    expect(await first.run()).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
+    expect(first.readyWrites).toHaveLength(1);
+    const { path: _path, ...appended } = first.readyWrites[0];
+    expect(appended).toMatchObject({ sha: SHA, fingerprint: FP, audit: 'WEAKENED', auditRuling: 'R396' });
+    const second = auditedFixture('warn', { ready: auditLines([weak(), appended]), settings, audits, fingerprint: () => FP });
+    expect(await second.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R396' } } });
+  });
+  it('binds only on the same net diff, the disclosed findings and a covered base', () => {
+    expect(evidence([oldAudit()], gateFor())).toMatchObject({ ok: true, record: { head: OLD } });
+    expect(evidence([oldAudit()], gateFor({ fingerprint: OTHER_FP }))).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit()], gateFor({ fingerprint: undefined }))).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit({ findings: ['other'] })], gateFor())).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit()], { ...gateFor(), ruledWeakened: undefined })).toEqual({ ok: false, reason: 'weakened' });
+    expect(evidence([oldAudit({ fingerprint: OTHER_FP })], gateFor())).toEqual({ ok: false, reason: 'no-record' });
+    expect(evidence([oldAudit()], gateFor(), OTHER_FP)).toEqual({ ok: false, reason: 'no-record' });
+    expect(prototypeLoad.canonicalAuditEvidence([oldAudit()], SHA, () => false, FP, { ruledWeakened: gateFor() })).toEqual({ ok: false, reason: 'weakened' });
+  });
+});
+
+describe('stale readiness never blocks a code-changed head', () => {
+  const FP = 'e'.repeat(64), OTHER_FP = '1'.repeat(64), OLD = 'd'.repeat(40);
+  const rec = (o = {}) => ({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED', ...o });
+  it('a second load of the same ref at a code-different sha writes fresh readiness from the first load\'s record', async () => {
+    const first = fixture({ ready: '', sha: OLD });
+    expect(await first.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(first.readyWrites).toHaveLength(1);
+    const { path: _path, ...stored } = first.readyWrites[0];
+    const second = fixture({ ready: auditLines([stored]) });
+    expect(await second.run()).toMatchObject({ ok: true, stopReason: null, gate: { source: 'canonical-check-run' } });
+    expect(second.readyWrites).toHaveLength(1);
+    expect(second.readyWrites[0]).toMatchObject({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'NOT WEAKENED' });
+  });
+  it.each([
+    ['a green record for another sha', [rec({ sha: OLD })]],
+    ['an unruled WEAKENED record for another sha with no fingerprint', [rec({ sha: OLD, audit: 'WEAKENED' })]],
+    ['a red record for another sha', [rec({ sha: OLD, tests: 'red' })]],
+  ])('%s does not refuse the new head', async (_, records) => {
+    const f = fixture({ ready: auditLines(records) });
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(f.readyWrites).toHaveLength(1);
+  });
+  it('a record carrying a DIFFERENT net-diff fingerprint is other code and does not refuse', async () => {
+    const f = fixture({ ready: auditLines([rec({ sha: OLD, audit: 'WEAKENED', fingerprint: FP })]), fingerprint: () => OTHER_FP });
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+  });
+  it.each([
+    ['its own latest record is red after an older green one', [rec(), rec({ tests: 'red' })]],
+    ['its own record is unruled WEAKENED', [rec({ audit: 'WEAKENED' })]],
+    ['an upper-case --sha still finds its own negative record', [rec({ tests: 'red', sha: SHA.toUpperCase() })]],
+    ['a record with no usable sha cannot be classified, so it refuses', [{ ref: BASE.branch, tests: 'red', audit: 'NOT WEAKENED' }]],
+  ])('still refuses when %s', async (_, records) => {
+    const f = fixture({ ready: auditLines(records) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+    expect(f.calls).toEqual([]); expect(f.readyWrites).toEqual([]);
+  });
+  it.each([['null', () => null], ['throw', () => { throw new Error('boom'); }]])(
+    'an unreadable live fingerprint (%s) cannot clear another sha\'s negative evidence that stores a fingerprint', async (_, fingerprint) => {
+      const f = fixture({ ready: auditLines([rec({ sha: OLD, tests: 'red', fingerprint: FP })]), fingerprint });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+      expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+    });
+  it('still refuses when negative evidence for the same net diff sits on another sha (carried), and never writes readiness', async () => {
+    const f = fixture({ ready: auditLines([rec({ sha: OLD, audit: 'WEAKENED', fingerprint: FP })]), fingerprint: () => FP });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
+});
+
+// PR #6610 review: every loader-level test above injects `testCheck`; these leave the seam at its default so the
+// production reader (gh api, completeness checks, workflow binding, configured workflow path) is what admits or refuses.
+describe('default test check-run reader (production wiring)', () => {
+  const REPO_SLUG = 'web-everything/web-everything';
+  const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
+  const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, ...options } = {}) {
+    const gh = [];
+    const combinedIO = { fs: {},
+      handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
+      exec: (cmd, args) => {
+        if (cmd === 'git') return `https://github.com/${REPO_SLUG}.git\n`;
+        gh.push(args.join(' '));
+        const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
+        if (args[0] === 'repo' && args[1] === 'view') return JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[0] === 'api' && args[1].includes('/check-runs')) return fail === 'checks' ? bad() : JSON.stringify(checks);
+        if (args[0] === 'api' && args[1].includes('/actions/runs')) return fail === 'runs' ? bad() : JSON.stringify(runs);
+        throw new Error(`unexpected gh call ${args.join(' ')}`);
+      } };
+    return { gh, ...fixture({ ready: '', defaultTestCheck: true, combinedIO, ...options }) };
+  }
+  const refused = async (f) => {
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-passing-test-check' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  };
+  it('admits a passing test bound to the expected workflow file and writes fresh readiness', async () => {
+    const f = ghFixture();
+    expect(await f.run()).toMatchObject({ ok: true, gate: { source: 'canonical-check-run' } });
+    expect(f.readyWrites[0]).toMatchObject({ sha: SHA, testCheck: { sha: SHA, name: 'test', conclusion: 'success', appId: 15368 } });
+    expect(f.gh.some((c) => c.includes(`commits/${SHA}/check-runs`))).toBe(true);
+    expect(f.gh.some((c) => c.includes(`actions/runs?head_sha=${SHA}`))).toBe(true);
+  });
+  it('refuses a same-named success from a foreign workflow file', async () => {
+    await refused(ghFixture({ runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }));
+  });
+  it('binds to the CONFIGURED workflow path, not a hard-coded one', async () => {
+    await refused(ghFixture({ settings: { testWorkflowPath: '.github/workflows/other.yml' } }));
+    expect(await ghFixture({ settings: { testWorkflowPath: '.github/workflows/other.yml' },
+      runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }).run()).toMatchObject({ ok: true });
+  });
+  it.each([
+    ['a failed workflow-runs read', { fail: 'runs' }],
+    ['a failed check-runs read', { fail: 'checks' }],
+    ['a truncated workflow-runs page', { runs: { total_count: 2, workflow_runs: [wf()] } }],
+    ['a truncated check-runs page', { checks: { total_count: 101, check_runs: [run()] } }],
+    ['a check-run from another GitHub app', { checks: { total_count: 1, check_runs: [run({ app: { id: 1 } })] } }],
+    ['a failing test check-run', { checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } }],
+  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options)); });
+});
+
+const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));
+it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))('real settings #6603 R803 passes the canonical ruled gate (requires its settings entry)', async () => {
+  const entry = shippedRuledSettings.ruledWeakened.find((e) => e.ruling === 'R803');
+  expect(entry).toBeDefined();
+  const f = fixture({ sha: entry.sha, ready: auditLines([{ ref: entry.ref, sha: entry.sha, tests: 'green', audit: 'WEAKENED', auditRuling: entry.ruling, auditDisclosed: entry.findings }]),
+    audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
+    settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
+  expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
 });

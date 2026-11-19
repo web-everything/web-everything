@@ -462,6 +462,42 @@ describe('lane-whois — AFTER', () => {
     expect(elapsedMs).toBeLessThan(10_000);
   });
 
+  it('perf-lane-whois: commitPreservedOnRemote probes named refs only, and treats a missing object as unknown (false, logged once)', async () => {
+    const { commitPreservedOnRemote } = await import(WHOIS_SCRIPT);
+    const root = mkdtempSync(join(tmpdir(), 'whois-cpr-'));
+    try {
+      const origin = join(root, 'origin.git');
+      const dir = join(root, 'clone');
+      git(['init', '--quiet', '--bare', '-b', 'main', origin], root);
+      git(['clone', '--quiet', origin, dir], root);
+      const c = (m) => git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '--allow-empty', '-m', m], dir);
+      git(['checkout', '--quiet', '-b', 'main'], dir);
+      c('base');
+      git(['push', '--quiet', 'origin', 'main'], dir);
+      git(['checkout', '--quiet', '-b', 'lane/x'], dir);
+      c('pushed');
+      const pushed = git(['rev-parse', 'HEAD'], dir).trim();
+      git(['push', '--quiet', 'origin', 'lane/x'], dir);
+      c('unpushed');
+      const unpushed = git(['rev-parse', 'HEAD'], dir).trim();
+      const base = git(['rev-parse', 'main'], dir).trim();
+      expect(commitPreservedOnRemote(dir, base, 'origin/main')).toBe(true);
+      expect(commitPreservedOnRemote(dir, pushed, 'origin/main')).toBe(true); // own pushed branch
+      expect(commitPreservedOnRemote(dir, unpushed, 'origin/main')).toBe(false);
+      const writes = [];
+      const orig = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (m) => { writes.push(String(m)); return true; };
+      try {
+        const missing = 'bf857f498f548620e0dbb912f1a7d4ad86322aea';
+        expect(commitPreservedOnRemote(dir, missing, 'origin/main')).toBe(false);
+        expect(commitPreservedOnRemote(dir, missing, 'origin/main')).toBe(false);
+      } finally { process.stderr.write = orig; }
+      expect(writes.filter((w) => w.includes('lane-whois: preservation')).length).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // PR #2641 review — `lane-pool.mjs reclaim`'s re-check used to run the cross-ref fallback unbounded; both it
   // and `whoisForLane` now share `lanePreservedFileChecker`, whose lane-wide budget this pins.
   it('lanePreservedFileChecker spends ONE lane-wide fallback budget across every dirty file', async () => {

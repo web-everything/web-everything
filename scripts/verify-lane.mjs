@@ -36,7 +36,7 @@
  *     IMMEDIATELY too — waiting longer can never change any of those. A bounded "timeout" is returned only if it is
  *     still `running` when <ms> elapses (clamped to the total verify budget — see MAX_SAFE_WAIT_MS /
  *     waitForVerifySettle in lib/lane-verify.mjs; a dispatched agent keeps each call under its Bash `timeout` by
- *     using `--wait=540000` and re-running on `timeout`). Replaces the old "request, then `check` again
+ *     using `--wait=150000` (150000 ms is the agent max) and re-running on `timeout`). Replaces the old "request, then `check` again
  *     next turn, repeat" loop with ONE blocking call per wait: same sanctioned `check` subcommand
  *     (`we:scripts/guard-bash.mjs`'s allowlist matches on the subcommand word, not the flags after it, so this needed
  *     no guard change), just a flag that does the polling for you instead of handing it back to the caller's own turn
@@ -56,20 +56,25 @@
  * accepted; 2 = red (suites failed — marker recorded red) / `check` verdict not-ok; 3 = usage / git error (no
  * marker written) / `request` refused because no verify daemon is alive / `reset` refused because a FOREIGN lease is live (own live lease no longer refuses, #3378).
  */
+import './lib/tools-root-guard.mjs';
 import { resolveBuildPolicy } from './lib/build-policy.mjs';
 import { redFirstWarning } from './lib/tests-first-policy.mjs';
 import { RUNNER_LOCK_ROOT, runnerLeaseStatus, probeRunnerLeaseLiveness } from '../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mjs';
+import { signalVerifyRequest } from './lib/fix-handoff.mjs';
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
-import { isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
+import { createOutputTail } from './lib/output-tail.mjs';
+import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES } from './lib/gate-timeout-retry.mjs';
 import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
+import { recordLocalSlotFallback } from './lib/remote-fallback-log.mjs';
+import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
@@ -77,15 +82,18 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
-import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { CARD_ONLY_SKIP_GATE, alwaysRunPlan, alwaysRunInventory, gateCommandsEqual, matchRequestedDefaultGate, verifySetting, verifySettingSource, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
 import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
+import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
+const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
 const flags = {};
@@ -217,6 +225,9 @@ if (MODE === 'check') {
     if (!Number.isFinite(requestedMs) || requestedMs <= 0) {
       emit({ sha: headSha, status: 'error', reason: 'bad-wait', ok: false, detail: `--wait must be given as --wait=<ms> (a positive number of milliseconds), got ${JSON.stringify(flags.wait)}.` }, 3);
     }
+    if (requestedMs > 170000) {
+      process.stderr.write(`⚠ --wait=${requestedMs} exceeds 170000 ms: agent Bash calls over ~180s are auto-backgrounded. Use --wait=150000 repeated in separate foreground calls; this warning does not shorten the wait.\n`);
+    }
     const ceilingMs = resolveWaitCeilingMs(requestedMs);
     if (ceilingMs < requestedMs) {
       process.stderr.write(`⚠ --wait=${requestedMs}ms clamped to ${ceilingMs}ms — a single blocking wait must stay inside the queue-plus-execution budget.\n`);
@@ -290,7 +301,10 @@ function siblingLeasesExcept(thisLeaseFile) {
 // because either side lacks an identity signal) still refuses: someone else may be relying on the current
 // marker, matching the START-write guard's own protective posture rather than working around it.
 if (MODE === 'reset') {
-  if (!existsSync(MARKER)) emit({ sha: headSha, status: 'noop', reason: 'no-marker', detail: `no marker at ${MARKER} — nothing to reset.` }, 0);
+  if (!existsSync(MARKER)) {
+    clearDeferredMarker(GIT_DIR); // R893 — a deferred file orphaned by a manual `rm` of the marker goes too
+    emit({ sha: headSha, status: 'noop', reason: 'no-marker', detail: `no marker at ${MARKER} — nothing to reset.` }, 0);
+  }
   const record = readMarker();
   const leaseFile = join(GIT_DIR, LEASE_FILENAME);
   let lease = null;
@@ -309,6 +323,7 @@ if (MODE === 'reset') {
     );
   }
   unlinkSync(MARKER);
+  clearDeferredMarker(GIT_DIR);
   const desc = record && !record.corrupt ? `${record.status || 'stranded'} marker for ${String(record.sha || '?').slice(0, 8)}` : 'a corrupt marker';
   emit({ sha: headSha, status: 'reset', reason: 'cleared', detail: `cleared ${desc} — ${MARKER} removed.` }, 0);
 }
@@ -344,17 +359,20 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
 }
 // The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
 const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
+// The sharded form of the same selected-test gate (still retryable, still runs the always-run guards).
+const isSelectedTestCommand = c => SELECTED_TEST_COMMAND.test(c) || String(c).startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `);
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
 // check:standards fails on a card, so `run` must execute the real gate. Only the marker-producing modes skip.
 const ALLOW_CARD_ONLY_SKIP = MODE !== 'run';
 resolveBuildPolicy({ log: line => process.stderr.write(line + '\n') });
-// The DEFAULT gate under the build policy. `build.finalGate=full` runs the whole unit tier plus standards, but it is
-// still the default gate, not an explicit `--gate`: its green feeds the ledger, and the marker keeps the diff's
-// changed files for red-cause attribution. It runs no selected-test half (`testCommand`), so no phase, scan or
-// isolated retry built for a selection applies. Any other policy keeps the diff-driven selection.
+// R913: local defaults use related selection; the standard `full` value is not an opt-in.
+// Only tool/env full with a real test:unit script runs the whole unit tier. That policy gate still
+// feeds the ledger and retains changed files for red-cause attribution, without selected-test phases.
 function resolveBuildDefaultGate(env) {
   const policy = resolveBuildPolicy({ env });
-  if (policy.finalGate !== 'full') {
+  const scripts = readCheckoutScripts();
+  const explicitFull = isExplicitFullPolicy(policy);
+  if (!runsWholeUnitTier(policy, scripts)) {
     const always = policy.finalGateStandards === 'always';
     const gateEnv = always ? { ...env, WE_VERIFY_STANDARDS: 'always', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '0' } : env;
     const gate = resolveDefaultGate({ runGit: git, env: gateEnv, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
@@ -363,11 +381,14 @@ function resolveBuildDefaultGate(env) {
     const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
     gate.gateReasons.push(reason);
     gate.decision.reasons = [...gate.decision.reasons, reason];
+    if (policy.finalGate === 'full') {
+      const downgrade = `build.finalGate=full (${policy.sources.finalGate}) downgraded to related selection — ${explicitFull ? 'no test:unit script in this checkout' : 'whole-suite execution requires an explicit tool/env opt-in'}; CI owns exhaustive verification`;
+      gate.gateReasons.push(downgrade);
+      gate.decision.reasons.push(downgrade);
+    }
     return gate;
   }
-  const scripts = readCheckoutScripts();
-  const tests = !scripts || scripts.includes('test:unit') ? 'npm run test:unit' : 'npm test';
-  const command = tests + (!scripts || scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+  const command = 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
   let changedFiles = null;
   try {
     // Untracked lane litter is not the change's own (the same rule as the diff selection).
@@ -379,6 +400,11 @@ function resolveBuildDefaultGate(env) {
   return { command, gateReasons: [reason], decision: { mode: 'full', reasons: [reason], changedFiles,
     selectionMode: { mode: 'pr', reason: 'build.finalGate=full' } } };
 }
+// The ONE effective-gate predicate: every caller asks this, never `policy.finalGate === 'full'` (PR #6769 round 3).
+// Hoisted declarations kept between resolveBuildDefaultGate and the preview marker, so a test that evaluates that
+// source slice in isolation (R913 provenance) still sees them.
+function isExplicitFullPolicy(policy) { return policy.finalGate === 'full' && ['tool', 'env'].includes(policy.sources.finalGate); }
+function runsWholeUnitTier(policy, scripts) { return isExplicitFullPolicy(policy) && !!scripts?.includes('test:unit'); }
 // Preview resolves the same default as verify, before any gate, admission or marker writes.
 if (MODE === 'print-gate') {
   const gate = resolveBuildDefaultGate(process.env);
@@ -390,6 +416,10 @@ let GATE;
 let resolvedGate;
 if (typeof flags.gate === 'string') {
   GATE = flags.gate;
+  // PR #6769 send-back — recognize a stamped DEFAULT gate (including one resolved under the other build.finalGate)
+  // BEFORE the explicit-gate refusal below: a full gate opted into under the requester's `full`, consumed by a child
+  // under `related` whose own selection is blocked, is the requester's default gate, not an agent-supplied override.
+  resolvedGate = recognizeRequestedDefaultGate(GATE);
   // A `request` (the only path a dispatched agent has) whose DEFAULT selection is blocked is the high-risk case —
   // config/dependency/unknown/oversized diffs used to force the full suite. The agent-supplied gate must then be an
   // affected-test shape, never an arbitrary command that would record a green for the surfaces that most need one.
@@ -403,7 +433,13 @@ if (typeof flags.gate === 'string') {
       const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
       defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
-    const refusal = defaultBlocked ? explicitGateRefusal(GATE) : null;
+    // The policy's own explicit (tool/env) whole-unit-tier command is the default gate, not an agent-supplied one.
+    const policyFull = (() => { try {
+      const policy = resolveBuildPolicy({ env: process.env });
+      const scripts = readCheckoutScripts();
+      return runsWholeUnitTier(policy, scripts) && GATE === 'npm run test:unit' + (scripts.includes('check:standards') ? ' && npm run check:standards' : '');
+    } catch { return false; } })();
+    const refusal = defaultBlocked && !policyFull && !resolvedGate ? explicitGateRefusal(GATE) : null;
     if (refusal) {
       // A dispatched child must leave a TERMINAL record (red, exit 3) — leaving the `running` request as it was would
       // make the dispatcher re-spawn this same refusal on every sweep. A plain `request` records nothing.
@@ -426,12 +462,13 @@ if (typeof flags.gate === 'string') {
 
 // The dispatcher passes the requested default command back via --gate. Recognize that exact command,
 // without interpreting arbitrary shell overrides or accidentally skipping their remaining steps.
-let admissionFallback = null;
-if (!resolvedGate && typeof flags.gate === 'string') {
+// Runs before the explicit-gate refusal (see the `--gate` branch above), so it never sees `resolvedGate` set.
+function recognizeRequestedDefaultGate(GATE) {
+  let resolvedGate;
   try {
     const resolveUnder = resolveBuildDefaultGate;
     const resolved = resolveUnder(process.env);
-    if (resolved.command === GATE) resolvedGate = resolved;
+    if (gateCommandsEqual(resolved.command, GATE)) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
     // which can differ from this dispatched child's (the daemon's env + checkout file): the standards policy,
     // and (#66) the related-test mode or timeout factor. If the stamped command is exactly what some declared
@@ -442,13 +479,16 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     else if (MODE === 'verify' && typeof flags['run-id'] === 'string') {
       const variants = verifySetting('matchRequestVariants', process.env);
       const policy = resolveBuildPolicy({ env: process.env });
-      const ours = policy.finalGate === 'full' ? 'full' : 'related';
+      // Key on the EFFECTIVE gate, not the setting's value: the standard `full` is not an opt-in and runs the related
+      // selection (resolveBuildDefaultGate), so a child on the standard default is `related` here and must still probe
+      // an explicit full for a whole-tier stamp (red team round 3 on PR #6769).
+      const ours = runsWholeUnitTier(policy, readCheckoutScripts()) ? 'full' : 'related';
       const { WE_VERIFY_STANDARDS: ownVerifyStandards, ...unpinned } = process.env;
       const cardOnlyStamp = GATE === CARD_ONLY_SKIP_GATE;
       for (const finalGate of [ours, ours === 'full' ? 'related' : 'full']) {
         const env = finalGate === ours ? process.env : { ...process.env, WE_BUILD_FINAL_GATE: finalGate };
         const base = finalGate === ours ? resolved : resolveUnder(env);
-        resolvedGate = (base.command === GATE ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
+        resolvedGate = (gateCommandsEqual(base.command, GATE) ? base : matchRequestedDefaultGate({ gate: GATE, env, resolved: base, resolveUnder, variants })) ?? undefined;
         if (resolvedGate) break;
         // #5831 — the requester may have stamped under build.finalGateStandards=selected (no standards half) or with the
         // card-only skip on. `always` pins WE_VERIFY_STANDARDS and the skip, so the matcher's probes cannot reproduce
@@ -465,10 +505,16 @@ if (!resolvedGate && typeof flags.gate === 'string') {
         if (resolvedGate) break;
       }
     }
-  } catch { /* Unknown selection cannot authorize a retry. */ }
+  } catch { return undefined; /* Unknown selection cannot authorize a retry. */ }
+  return resolvedGate;
+}
+
+let admissionFallback = null;
+if (!resolvedGate && typeof flags.gate === 'string') {
   // #66 — never fall back to whole-gate admission silently: say so on stderr (the dispatcher copies this line into
   // the daemon log) and record the reason in the marker's phases.
-  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && SELECTED_TEST_COMMAND.test(GATE)) {
+  // A sharded gate stamped in another checkout carries that checkout's wrapper root, so recognize it root-agnostically.
+  if (!resolvedGate && MODE === 'verify' && typeof flags['run-id'] === 'string' && (isSelectedTestCommand(GATE) || isShardWrapperCommand(GATE))) {
     admissionFallback = 'requested gate is not this checkout\'s default selection under any declared settings variant';
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }
@@ -592,6 +638,7 @@ if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, st
 // (below): a request never actually runs the gate itself, so it has no business queuing on the capacity
 // semaphore — that cost belongs to whichever `verify-dispatch.mjs` tick actually executes it.
 if (MODE === 'request') {
+  signalVerifyRequest();
   emit({ sha: headSha, status: 'requested', reason: 'requested', exitCode: null, detail: `verification requested for ${headSha.slice(0, 8)} (suites: ${GATE}) — poll \`node scripts/verify-lane.mjs check\` for the result.` }, 0);
 }
 
@@ -601,8 +648,9 @@ if (MODE === 'request') {
 //    with a stderr warning) — the residual-risk tradeoff `heavy-admission.mjs`'s own header names.
 //
 // #4360 — THIS `acquireSlotBlocking` CALL IS THE SOLE ADMISSION CHOKEPOINT FOR THE WHOLE DISPATCH PATH,
-// including `scripts/conveyor/verify-dispatch.mjs`'s daemon-side dispatch of several lanes' gates at once. The
-// daemon spawns this file as a plain child and lets EACH child queue on this SAME semaphore — it must NEVER
+// including `scripts/conveyor/verify-dispatch.mjs`'s daemon-side dispatch of several lanes' gates at once.
+// Remote-eligible phases skip this local slot; their nested wrapper owns remote dispatch and local fallback.
+// The daemon spawns this file as a plain child and lets EACH child queue on this SAME semaphore — it must NEVER
 // also acquire a slot itself before spawning, since that would either double-acquire (two slots consumed per
 // lane) or stall a child behind a slot its own parent is holding. If a future change ever needs the daemon to
 // reason about admission before spawning, that reasoning belongs here, not as a second chokepoint upstream.
@@ -611,14 +659,24 @@ const ADMISSION_CAP = resolveCap(process.env);
 const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
 // #verify-phase-admission — acquire the first phase before dispatch's execution marker.
-const retryableGate = SELECTED_TEST_COMMAND.test(resolvedGate?.testCommand ?? '');
+const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && retryableGate;
 const admissionPhases = {};
-async function acquireAdmission(phase) {
+async function acquireAdmission(phase, command) {
+  let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
+  if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
+    decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
+    process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
+  } else if (decision.reason !== 'raw-command') {
+    process.stderr.write(`verify-lane: local admission (${decision.reason})\n`);
+  }
+  const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
+  if (!plan.takeLocalSlot) return { ok: false, waitedMs: 0, remote: true, ...plan };
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
@@ -635,23 +693,26 @@ async function acquireAdmission(phase) {
   }
   return acquired;
 }
-const admission = await acquireAdmission('vitest');
-let firstPhaseAdmission = phaseAdmission ? admission : null;
+const admission = await acquireAdmission('vitest', retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
+let currentAdmission = admission;
+let vitestAdmittedLocally = admission.ok;
+const ranOnPhases = {};
+let remoteUnconfirmed = false;
+let firstPhaseAdmission = admission;
 // verify-admission (2026-10-20) — keep whichever slot this process holds alive while the gate runs. The slot lease
 // had no refresh, so a gate past ADMISSION_LEASE_MINUTES lost its slot to the next waiter and kept running
 // unslotted (12 concurrent verify-lanes, `heavy-queue` showing 0 held). The per-phase timeout below bounds how
 // long a refreshed slot can be kept. Unref'd: never keeps this process alive by itself.
 const SLOT_HEARTBEAT_MS = verifySetting('slotHeartbeatMs', process.env);
 process.stderr.write(`verify-lane: slot heartbeat every ${SLOT_HEARTBEAT_MS}ms (slotHeartbeatMs, ${verifySettingSource('slotHeartbeatMs', process.env)})\n`);
-const slotHeartbeat = setInterval(() => {
-  try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
-}, SLOT_HEARTBEAT_MS);
-slotHeartbeat.unref();
+let slotHeartbeat = null;
 // verify-admission — the hard per-phase ceiling (verify setting `phaseTimeoutMs`, logged with its source).
 const PHASE_TIMEOUT_MS = verifySetting('phaseTimeoutMs', process.env);
 const PHASE_TIMEOUT_SOURCE = verifySettingSource('phaseTimeoutMs', process.env);
 process.stderr.write(`verify-lane: phase timeout ${PHASE_TIMEOUT_MS}ms (phaseTimeoutMs, ${PHASE_TIMEOUT_SOURCE})\n`);
 let phaseTimeout = null;
+// Last 200 scrubbed output lines of the first phase that timed out or was killed (persisted on the infrastructure record).
+let killedOutputTail = null;
 // Named per verify-lane process, so a nested verify-lane (a test of this file) adds its own marker instead of replacing ours.
 const GATE_PHASE_MARKER_ENV = `WE_VERIFY_GATE_PHASE_${process.pid}`;
 const HEAVY_ADMISSION_MODULE = new URL('./readiness/heavy-admission.mjs', import.meta.url).href;
@@ -676,23 +737,37 @@ let isolatedRetry = null;
 let editedDuringRun = [];
 let baseCandidate = null;
 let baseFailures = null;
-const infrastructureNow = (exitCode, signal) => verificationInfrastructureFailure({ exitCode, signal });
-async function runGate(command, args) {
+// The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
+const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
+async function runGate(command, args, { forgeDispatch = false } = {}) {
+  const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
+  const reportFile = join(reportDir, 'report.jsonl');
+  const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
+  if (forgeDispatch) {
+    childEnv.WE_FORGE_GATE_DISPATCH = '1';
+    delete childEnv[ADMISSION_HELD_ENV];
+  } else {
+    delete childEnv.WE_FORGE_GATE_DISPATCH;
+    childEnv[ADMISSION_HELD_ENV] = '1';
+  }
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
+  const outputTail = createOutputTail();
   let bytes = 0;
   // xaipsbs — the gate's own `npm run test:unit` / `check:standards` are wrapped in `heavy-admission.mjs run`;
   // this flag makes those nested wrappers pass through instead of asking for a second slot for the same work.
   // PR #5768 — a per-phase env marker every descendant inherits: the watchdog finds one that left the tree AND the group by it.
   const phaseToken = randomBytes(8).toString('hex');
   const phaseMarker = `${GATE_PHASE_MARKER_ENV}=${phaseToken}`;
+  try {
   const result = await new Promise((resolveGate, reject) => {
     const child = spawn(command, args ?? [], { shell: !args, cwd: REPO, stdio: ['inherit', 'pipe', 'pipe'],
-      env: { ...process.env, [ADMISSION_HELD_ENV]: '1', [GATE_PHASE_MARKER_ENV]: phaseToken } });
+      env: { ...childEnv, [GATE_PHASE_MARKER_ENV]: phaseToken } });
     for (const [name, fd] of [['stdout', 1], ['stderr', 2]]) {
       child[name].setEncoding('utf8');
       child[name].on('data', chunk => {
         collector.push(chunk, name);
+        outputTail.push(chunk, name);
         bytes += Buffer.byteLength(chunk);
         if (bytes <= MAX_TIMEOUT_LOG_BYTES) output[name] += chunk;
         // Flush each chunk before the terminal JSON; no pending writable queue can overtake it.
@@ -717,20 +792,20 @@ async function runGate(command, args) {
     const finish = (code, closeSignal) => {
       if (settled) return;
       settled = true;
-      watchdog?.stop();
+      const stopped = watchdog?.stop();
       clearTimeout(grace);
       const timedOut = Boolean(watchdog?.fired());
       if (timedOut) announce();
       const result = { exitCode: Number.isFinite(code) ? code : 2, signal: timedOut ? 'SIGKILL' : closeSignal || null, ...(timedOut ? { timedOut: true } : {}) };
       // The tree can close before the escape sweeps finish (an escapee that holds no pipe): the phase, and with it the
       // slot, is not over until they ran.
-      if (timedOut && watchdog) watchdog.settled().then(() => resolveGate(result));
-      else resolveGate(result);
+      if (timedOut && watchdog) Promise.all([watchdog.settled(), stopped]).then(() => resolveGate(result));
+      else Promise.resolve(stopped).then(() => resolveGate(result));
     };
     const watchdog = Number.isInteger(child.pid) ? startTreeWatchdog({
       pid: child.pid, timeoutMs: PHASE_TIMEOUT_MS,
       kill: { orphansOfOwnGroup: true, marker: phaseMarker, outputFds: [child.stdout?._handle?.fd, child.stderr?._handle?.fd].filter((fd) => Number.isInteger(fd) && fd > 2) },
-      heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS },
+      ...(currentAdmission.ok ? { heartbeat: { module: HEAVY_ADMISSION_MODULE, exportName: 'heartbeatOwnedSlot', args: { lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }, everyMs: SLOT_HEARTBEAT_MS } } : {}),
       onFire: () => {
         if (settled) return;
         announce();
@@ -742,11 +817,18 @@ async function runGate(command, args) {
         grace.unref();
       },
     }) : null;
-    child.on('error', (e) => { watchdog?.stop(); clearTimeout(grace); if (!settled) { settled = true; reject(e); } });
+    child.on('error', (e) => {
+      const stopped = watchdog?.stop();
+      clearTimeout(grace);
+      if (!settled) { settled = true; Promise.resolve(stopped).then(() => reject(e)); }
+    });
     child.on('exit', (code, sig) => { exited = { code, signal: sig }; });
     child.on('close', (code, closeSignal) => finish(code, closeSignal));
   });
-  return { ...result, failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
+  const reports = readRemoteReport(reportFile);
+  if (reports.some(r => r.location === 'local-fallback')) process.stderr.write('verify-lane: remote attempt fell back to local admission (nested wrapper owns the slot)\n');
+  return { ...result, ...(result.timedOut || result.signal ? { outputTail: outputTail.finish() } : {}), remoteAttempt: forgeDispatch, ranOn: phaseRunLocation(reports, { remoteAttempt: forgeDispatch }), failureDetails: collector.finish(), output: bytes <= MAX_TIMEOUT_LOG_BYTES ? output : null };
+  } finally { rmSync(reportDir, { recursive: true, force: true }); }
 }
 // #5141 — retain null for phases never run; retries and multiple scans accumulate wall time.
 const phaseMs = { vitestMs: null, scanMs: null, standardsMs: null };
@@ -761,30 +843,95 @@ function recordOutcome(key, outcome) {
 async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   const kind = phase?.replace(/Ms$/, '');
   let acquired = null;
-  if (phaseAdmission && firstPhaseAdmission) acquired = firstPhaseAdmission;
-  else if (phaseAdmission) {
+  if (firstPhaseAdmission) acquired = firstPhaseAdmission;
+  else if (phaseAdmission || admission.remote) {
     // Dispatch already saw the one-shot started marker, so a later phase's wait would count as hung gate time.
     // Tell it we are queueing again, and that real gate work resumes once the slot is held. Keep both lines in
     // step with `GATE_QUEUED_MARKER` / `GATE_STARTED_MARKER` in `verify-dispatch.mjs`.
     // The leading newline keeps the marker at a line start even when the previous phase's output stopped mid-line.
     process.stderr.write(`\n⏳ gate queueing for admission (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
-    acquired = await acquireAdmission(kind);
+    acquired = await acquireAdmission(kind, args ? [command, ...args].join(' ') : command);
     process.stderr.write(`⏱ gate execution starting (phase: ${kind})${MARKER_NONCE_SUFFIX}\n`);
   }
+  currentAdmission = acquired ?? admission;
+  function startHeartbeat() {
+    if (currentAdmission.ok) {
+      slotHeartbeat = setInterval(() => {
+        try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+      }, SLOT_HEARTBEAT_MS);
+      slotHeartbeat.unref();
+    }
+  }
+  startHeartbeat();
   firstPhaseAdmission = null;
   const started = performance.now();
   try {
-    const result = await runGate(command, args);
+    // Admission may span the whole gate; a command rewrite belongs only to this phase.
+    const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
+    let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
+    if (shouldConfirmRemoteRed({ plan, ...result })) {
+      process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming on Forge\n`);
+      // One fresh Forge job; the nested wrapper owns any local fallback and its slot.
+      // Its verdict and failure inventory replace the first result before isolated retry.
+      const first = result;
+      result = await runGate(args ? command : plan.command, args, { forgeDispatch: true });
+      const where = result.ranOn?.location;
+      if (where === 'local') process.stderr.write('verify-lane: Forge unreachable for the confirm run - confirmed on the Mac\n');
+      // A GREEN confirm run with no report of where it ran proves nothing: the first red stands. Any other
+      // unlocated result (124, signal, another red) is the confirm's own verdict and is kept as returned.
+      const located = ['local', 'remote', 'mixed'].includes(where);
+      if (!located && result.exitCode === 0) {
+        process.stderr.write('verify-lane: confirm run reported no location - keeping the first red\n');
+        result = { ...first, ranOn: { ...first.ranOn, remoteRedConfirmed: 'unverified' } };
+      } else result = { ...result, ranOn: { ...result.ranOn, remoteRedConfirmed: !located ? 'unverified' : where === 'local' ? 'forge-unreachable' : 'forge' } };
+    }
+    // A nested local fallback owns its admission; its local verdict has the same retry safeguards.
+    if (kind === 'vitest') vitestAdmittedLocally = currentAdmission.ok
+      || (result.remoteAttempt === true && result.ranOn.location === 'local');
+    const locationKey = outcomeKey ?? kind ?? (/^npm run test:unit(?=\s|$)/.test(command) ? 'vitest' : /^npm run check:standards(?=\s|$)/.test(command) ? 'standards' : 'gate');
+    const previousLocation = ranOnPhases[locationKey];
+    ranOnPhases[locationKey] = previousLocation ? {
+      ...previousLocation, ...result.ranOn,
+      location: mergeRunLocation(previousLocation.location, result.ranOn.location),
+    } : result.ranOn;
+    const remoteFailure = remoteInfrastructureFailure(result);
+    if (remoteFailure) remoteUnconfirmed = true;
     if (result.timedOut && !phaseTimeout) phaseTimeout = { phase: kind || 'gate', ceilingMs: PHASE_TIMEOUT_MS };
-    if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }));
+    if ((result.timedOut || result.signal) && result.outputTail?.length) killedOutputTail ??= result.outputTail;
+    if (kind) recordOutcome(outcomeKey ?? kind, { ...buildPhaseOutcome({ ...result, kind, decision: resolvedGate?.decision }), ...(remoteFailure ? { reason: 'remote-termination-unconfirmed', infrastructure: remoteFailure } : {}) });
     return result;
   } catch (error) {
     if (kind) recordOutcome(outcomeKey ?? kind, buildPhaseOutcome({ kind, signal: error?.signal,
       exitCode: Number.isFinite(error?.status) ? error.status : 2, decision: resolvedGate?.decision }));
     throw error;
   } finally {
+    clearInterval(slotHeartbeat);
+    slotHeartbeat = null;
     if (phase) phaseMs[phase] = (phaseMs[phase] ?? 0) + performance.now() - started;
-    if (acquired?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
+    if (acquired?.ok && (phaseAdmission || admission.remote)) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
+  }
+}
+// runVitestOnBase runs inside the caller's slot. Only a whole-gate local slot is still held at that point; per-phase
+// and remote-planned gates released theirs (or never took one), so the base comparison takes its own local slot.
+const holdsWholeGateSlot = () => !phaseAdmission && admission.ok;
+async function withBaseRerunSlot(run) {
+  if (holdsWholeGateSlot()) return run();
+  // The same kind the Vitest phase (per-phase) or the whole gate is admitted under.
+  const baseKind = phaseAdmission ? phaseAdmissionKind({ phase: 'vitest', decision: resolvedGate.decision,
+    standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env }).kind : classifyCommandKind(GATE);
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: 'base-comparison-rerun', detail: 'base-sha vitest comparison runs locally', repo: REPO, kind: baseKind }); // logging only; never throws
+  const acquired = await acquireSlotBlocking({
+    lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
+    lane: laneMatch ? laneMatch[1] : null, kind: baseKind,
+  });
+  if (acquired.timedOut) process.stderr.write(`⚠ heavy-command admission: base comparison timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
+  const heartbeat = acquired.ok ? setInterval(() => {
+    try { heartbeatOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO }); } catch { /* best-effort */ }
+  }, SLOT_HEARTBEAT_MS) : null;
+  heartbeat?.unref();
+  try { return await run(); } finally {
+    clearInterval(heartbeat);
+    if (acquired.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
   }
 }
 const gateStarted = performance.now();
@@ -807,11 +954,11 @@ const alwaysRun = retryableGate
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
   let result = await timedRunGate(retryableGate ? 'vitestMs' : null,
-    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (`npm test`, a skipped-vitest echo)
+    // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
     retryableGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
-  if (retryableGate && admission.ok && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
+  if (retryableGate && vitestAdmittedLocally && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });
     editedDuringRun = changedNow?.changedFiles ?? [];
@@ -825,8 +972,8 @@ try {
       // The isolated run keeps the gate's OWN scaled timeouts: without them vitest falls back to its 5 s default and a
       // load-slow file that passed the main run's 15 s budget times out again alone (ci-heal-4017: still-red at load 25).
       const timeoutFlags = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? 1).split(' ').filter(Boolean);
-      result = await timedRunGate('vitestMs', 'npx', ['vitest', 'run', '--maxWorkers=1', '--minWorkers=1', '--no-file-parallelism',
-        ...timeoutFlags, ...retriedFailures.map(f => `./${f.file}`)]);
+      const retryArgv = isolatedRetryArgv(retriedFailures.map(f => f.file), timeoutFlags);
+      result = await timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1));
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
@@ -884,11 +1031,11 @@ try {
   // Measured once per main sha (cached); any error leaves `baseFailures` null, i.e. the red stays a real red.
   baseCandidate = baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
     changedFiles: Array.isArray(resolvedGate?.decision?.changedFiles) ? [...resolvedGate.decision.changedFiles, ...editedDuringRun] : null });
-  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal) ? tryGit(['rev-parse', 'origin/main']) : null;
+  const baseSha = baseCandidate && !infrastructureNow(exitCode, signal, failureDetails) ? tryGit(['rev-parse', 'origin/main']) : null;
   if (baseSha) {
     process.stderr.write(`Comparing ${baseCandidate.files.length} failing file(s) outside the diff with origin/main @ ${baseSha.slice(0, 8)}\n`);
     baseFailures = await measureBaseFailures({ baseSha, files: baseCandidate.files, cacheDir: join(tmpdir(), 'we-verify-base-failures'),
-      runBase: (files) => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs }) });
+      runBase: (files) => withBaseRerunSlot(() => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs })) });
   }
 } catch (e) {
   signal = e?.signal || null;
@@ -941,7 +1088,10 @@ const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit };
 const retryDetail = describeIsolatedRetry(retryAudit);
 // Item 99 — why the gate was red (also when a flaky failure outside the diff went green alone), with the files.
-const infrastructure = verificationInfrastructureFailure({ exitCode, signal, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) });
+const infrastructureBase = verificationInfrastructureFailure({ exitCode, signal, failureDetails, ...(phaseTimeout ? { timedOutPhase: phaseTimeout.phase, ceilingMs: phaseTimeout.ceilingMs, killer: 'verify-lane' } : {}) })
+  ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
+const infrastructure = infrastructureBase && killedOutputTail && ['verify-timeout', 'verify-signal'].includes(infrastructureBase.reason)
+  ? { ...infrastructureBase, outputTail: killedOutputTail } : infrastructureBase;
 // The gate's own diff plus whatever was edited while it queued or ran (the same set the isolated retry judges against).
 const diffFiles = Array.isArray(resolvedGate?.decision?.changedFiles) ? [...new Set([...resolvedGate.decision.changedFiles, ...editedDuringRun])] : resolvedGate?.decision?.changedFiles;
 // An UNEDITED failing test that imports the edited source is the change's own regression (`testReachesChanged`).
@@ -989,8 +1139,10 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
+// R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
+try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 

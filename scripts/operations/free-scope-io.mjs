@@ -12,12 +12,29 @@ import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { withPathLock } from '../readiness/with-lock.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { DEFAULT_REPOS, GH_LIST_FILE_CAP, choosePrFileSet, qualifyFile, repoKeyFor } from './free-scope.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 const matter = createRequire(import.meta.url)('gray-matter');
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export function defaultRegistryPath(env = process.env) {
   return env.WE_AGENT_SCOPES_PATH || path.join(os.homedir(), 'workspace/.operations/coordination/agent-scopes.json');
+}
+/** Standard heartbeat window for an entry registered with `--heartbeat`. */
+export const STANDARD_FREE_SCOPE_SETTINGS = Object.freeze({ staleAfterMinutes: 45 });
+export const STALE_AFTER_MINUTES_ENV = 'WE_FREE_SCOPE_STALE_AFTER_MINUTES';
+const positive = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
+/**
+ * Resolve `freeScope.staleAfterMinutes` standard -> platform -> env through the shared cascade, which logs the
+ * effective value and its source. Any invalid layer is refused, never silently replaced by a lower one.
+ */
+export function resolveFreeScopeSettings({ env = process.env, platform, log } = {}) {
+  const raw = env?.[STALE_AFTER_MINUTES_ENV];
+  const envValues = raw === undefined ? {} : { staleAfterMinutes: raw.trim() === '' ? NaN : Number(raw) };
+  const resolved = cascadePolicy('freeScope', undefined, { standard: STANDARD_FREE_SCOPE_SETTINGS, envValues,
+    valid: { staleAfterMinutes: positive }, env, ...(platform !== undefined ? { platform } : {}), ...(log ? { log } : {}) });
+  if (resolved.invalid.length) throw new TypeError(`free-scope: invalid staleAfterMinutes setting: ${resolved.invalid.join('; ')}`);
+  return { staleAfterMinutes: resolved.value.staleAfterMinutes, source: resolved.sources.staleAfterMinutes };
 }
 export function readRegistry(file) {
   let source;
