@@ -444,7 +444,7 @@ describe('preflight CLI IO hooks', () => {
       const alias = 'legacy-alpha';
       const env = configured === undefined ? {} : { WE_DAEMON_LEGACY_OWNER_VALUES: configured };
       const adapter = cliIO(env, { legacyHost: alias, execFileSync: (_file, args) => JSON.stringify(
-        args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
+        args.at(-1).includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
           : { type: 'file', encoding: 'base64', content: Buffer.from(alias + '\n').toString('base64') },
       ) });
       expect(await adapter.resolveRole({ thisHost: ME })).toMatchObject({
@@ -459,7 +459,7 @@ describe('preflight CLI IO hooks', () => {
     const decisions = await Promise.all([ME, OTHER].map(async (thisHost) => {
       const adapter = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: `legacy-alpha=${thisHost}` }, {
         legacyHost: 'legacy-alpha', execFileSync: (_file, args) => JSON.stringify(
-          args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
+          args.at(-1).includes('/git/ref/') ? { object: { type: 'commit', sha: VERSION } }
             : { type: 'file', encoding: 'base64', content: Buffer.from(`legacy-alpha\n${bindings}\n`).toString('base64') }),
       });
       return adapter.resolveRole({ thisHost });
@@ -490,7 +490,8 @@ describe('preflight CLI IO hooks', () => {
     const { io } = fixture({ resolveRole: adapter.resolveRole });
     expect((await run(io)).checks[0]).toEqual({ name: 'role', ok: true, detail: 'role=active reason=fresh-owner-is-this-host' });
     expect(calls).toHaveLength(2);
-    expect(calls[1][1][1]).toContain('/contents/host?ref=' + VERSION);
+    expect(calls[1][1].at(-1)).toContain('/contents/host?ref=' + VERSION);
+    expect(calls[1][1].slice(0, 3)).toEqual(['api', '--hostname', 'github.com']);
     for (const [command, args, options] of calls) {
       expect(command).toBe('gh');
       expect(args[0]).toBe('api');

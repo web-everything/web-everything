@@ -459,9 +459,22 @@ describe('GitHub ownership source', () => {
   it('transport bounds output and duration; execution and JSON errors fail closed', () => {
     const exec = vi.fn(() => '{"ok":true}');
     expect(guard.runGhApi('fixture', { execFile: exec }).ok).toBe(true);
-    expect(exec).toHaveBeenCalledWith('gh', ['api', 'fixture'], expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024 }));
+    expect(exec).toHaveBeenCalledWith('gh', ['api', '--hostname', 'github.com', 'fixture'], expect.objectContaining({ timeout: 15000, maxBuffer: 1024 * 1024 }));
     expect(guard.runGhApi('fixture', { execFile: () => '{' }).ok).toBe(false);
     expect(guard.runGhApi('fixture', { execFile: () => { throw new Error('HTTP 403'); } })).toMatchObject({ ok: false, status: 403 });
+  });
+
+  it('ignores an inherited GH_HOST override on every ownership read', () => {
+    const before = process.env.GH_HOST;
+    process.env.GH_HOST = 'evil.example.com';
+    try {
+      const exec = vi.fn(() => '{"ok":true}');
+      guard.runGhApi('fixture', { execFile: exec });
+      expect(exec.mock.calls[0][1]).toEqual(['api', '--hostname', 'github.com', 'fixture']);
+      expect(exec.mock.calls[0][2].env.GH_HOST).toBe('github.com');
+    } finally {
+      if (before === undefined) delete process.env.GH_HOST; else process.env.GH_HOST = before;
+    }
   });
 
   describe('synchronous production source honors the read deadline', () => {

@@ -121,7 +121,9 @@ export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost =
 export function runGhApi(path, { execFile = execFileSync, timeoutMs = READ_TIMEOUT_MS } = {}) {
   const timeout = Number.isFinite(timeoutMs) ? Math.min(READ_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs))) : 1;
   try {
-    const output = execFile('gh', ['api', path], {
+    // Pin the canonical host: an inherited GH_HOST must never let another server's same-named repo authorize this host.
+    const output = execFile('gh', ['api', '--hostname', 'github.com', path], {
+      env: { ...process.env, GH_HOST: 'github.com' },
       timeout, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     return { ok: true, status: 200, body: JSON.parse(output) };
