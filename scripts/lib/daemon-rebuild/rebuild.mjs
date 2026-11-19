@@ -112,6 +112,11 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
   if (waitInFlightTickMs !== undefined || waitSmokeSlotMs !== undefined) {
     Object.defineProperty(result, 'timing', { value: { waitInFlightTickMs, waitSmokeSlotMs } });
   }
+  // A refused between-tick launch must preserve evidence for operator repair, including
+  // pending adoptions, event/alert state and any force-watch rollback bookkeeping.
+  if (options.launchOnly && !result.moved && !result.adopted
+    && (result.unknownJobState
+      || !['needs-build', 'up-to-date', 'rebuild-job-started', 'rebuild-job-running'].includes(result.reason))) return result;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.

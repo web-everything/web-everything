@@ -203,7 +203,7 @@ export async function rebuildCloneAsJob({
   try {
     readState(root, env);
     initialReady = readReady(root, env);
-    if (!launchOnly) readPending(root, { env });
+    readPending(root, { env });
     readConsumed(store.dir, true);
     for (const r of store.list().records.filter(r => r.job.kind === REBUILD_JOB_KIND.kind
       && TERMINAL_JOB_STATUSES.includes(r.job.status))) readResult(store.dir, r.id, true);
@@ -275,6 +275,8 @@ export async function rebuildCloneAsJob({
   }
   // Between ticks, use the same admission checks without adopting or repairing the live tree.
   r ??= await adopt(launchOnly ? { readyOnly: true } : undefined);
+  // Preparation refused: do not evict snapshots or rewrite consumed-job evidence.
+  if (launchOnly && !r?.moved && !r?.adopted && r?.reason !== 'needs-build') return { ...r, finishedJobs };
   let recover = false;
   if (!launchOnly && !r?.moved && !r?.adopted
     // Sticky rejections must still wait for changed inputs or operator intervention.

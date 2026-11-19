@@ -4958,6 +4958,9 @@ The job fixture injects EACCES/EIO and corrupt JSON, asserting refusal without a
 the legacy fail-open reader remains unchanged for other consumers. Strict admission must precede
 preparation/adoption and reattachment: real preparation can overwrite corrupt state through that legacy
 reader. Assert the original state bytes survive refusal. Repair unreadable state before retrying.
+Launch-only admission also strictly reads pending adoptions before job bookkeeping. On refusal,
+skip housekeeping, pending-adoption notifications/rewrites, failure events and force-watch; the
+mixed overdue/malformed-record fixture asserts that the public rebuild wrapper preserves file bytes.
 Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
 regression cannot turn the protected behaviour into an expected failure.
 

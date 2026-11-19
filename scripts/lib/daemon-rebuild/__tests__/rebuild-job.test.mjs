@@ -12,6 +12,9 @@ import { rebuildClone } from '../rebuild.mjs';
 import * as planner from '../plan.mjs';
 import * as edgeFetch from '../edge-fetch.mjs';
 import * as laneRepair from '../../lane-repair.mjs';
+import * as rebuildJob from '../rebuild-job.mjs';
+import * as forceAdopt from '../../daemon-force-adopt.mjs';
+import * as overlayAdoption from '../../overlay-adoption.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-job-jitter-')); });
@@ -249,8 +252,10 @@ it.each(['corrupt', 'null', 'missing adopt', 'wrong finalSha', 'EACCES', 'ENOENT
     if (!absent) { expect(readFileSync(file, 'utf8')).toBe(text); expect(nodeFs.existsSync(store.dir)).toBe(false); }
   });
 
-it.each(['corrupt', 'object', 'invalid record', 'missing at', 'invalid at', 'invalid overdueSent', 'EACCES', 'ENOENT'])(
-  'recovery pending-adoptions %s refuses before preparation, preserves files and logs; absence is empty', async failure => {
+it.each([true, false].flatMap(launchOnly =>
+  ['corrupt', 'object', 'invalid record', 'missing at', 'invalid at', 'invalid overdueSent', 'EACCES', 'ENOENT']
+    .map(failure => [launchOnly, failure])))(
+  'launchOnly=%s pending-adoptions %s refuses before preparation, preserves files and logs; absence is empty', async (launchOnly, failure) => {
     const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
     const file = pendingAdoptionPath(root, env);
     mkdirSync(join(env.WE_DAEMON_OVERLAY_DIR, 'adoption-pending'), { recursive: true });
@@ -267,7 +272,7 @@ it.each(['corrupt', 'object', 'invalid record', 'missing at', 'invalid at', 'inv
       } } });
     const adopt = vi.fn(async () => ({ reason: 'needs-build' })); const reattach = vi.fn(); const error = vi.fn();
     const store = createJobStore(join(root, 'jobs'));
-    const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, readPending,
+    const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, readPending, launchOnly,
       codeSha: 'a'.repeat(40), evict() {}, log: { error } });
     const absent = failure === 'ENOENT';
     expect(result.reason).toBe(absent ? 'rebuild-job-started' : 'state-unreadable');
@@ -276,6 +281,57 @@ it.each(['corrupt', 'object', 'invalid record', 'missing at', 'invalid at', 'inv
       expect(readFileSync(file, 'utf8')).toBe(text); expect(nodeFs.existsSync(store.dir)).toBe(false);
       expect(error).toHaveBeenCalledWith(expect.stringContaining('pending-adoptions'));
     } else expect(readPendingAdoptionsStrict(root, { env })).toEqual([]);
+  });
+
+it.each(['early', 'recovery'])(
+  '%s launchOnly preserves mixed overdue and malformed pending-adoption bytes on strict refusal', async launchedBy => {
+    const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    const file = pendingAdoptionPath(root, env);
+    mkdirSync(join(env.WE_DAEMON_OVERLAY_DIR, 'adoption-pending'), { recursive: true });
+    const original = Buffer.from(JSON.stringify([
+      { ref: 'lane/overdue', sha: 'a'.repeat(40), at: new Date(Date.now() - 16 * 60_000).toISOString() }, {},
+    ], null, 2) + '\n');
+    writeFileSync(file, original);
+    const emitEvent = vi.fn();
+    const run = vi.fn(() => { throw new Error('unexpected git'); });
+    const result = await rebuildClone({ root, env, asJob: true, launchOnly: true, launchedBy,
+      emitEvent, run, log: { error() {} } });
+    expect(result.reason).toBe('state-unreadable');
+    expect(readFileSync(file)).toEqual(original);
+    expect(emitEvent).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+it.each(['state-unreadable', 'still-rejected', 'smoke-failed', 'future-refusal', 'rebuild-job-running'])(
+  'launchOnly %s skips pending rewrites, failure alerts and force-watch', async reason => {
+    const refused = { moved: false, reason, ...(reason === 'rebuild-job-running' ? { unknownJobState: true } : {}) };
+    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue(refused);
+    const pending = vi.spyOn(overlayAdoption, 'checkPendingAdoptions').mockResolvedValue([]);
+    const watch = vi.spyOn(forceAdopt, 'runForceWatchTick').mockResolvedValue({});
+    const emitEvent = vi.fn();
+    expect(await rebuildClone({ root, env: {}, asJob: true, launchOnly: true,
+      launchedBy: 'tick-start', emitEvent })).toEqual(refused);
+    expect(pending).not.toHaveBeenCalled();
+    expect(watch).not.toHaveBeenCalled();
+    expect(emitEvent).not.toHaveBeenCalled();
+  });
+
+it.each(['still-rejected', 'state-unreadable', 'future-refusal'])(
+  'launchOnly preparation %s skips housekeeping writes after refusal', async reason => {
+    const store = createJobStore(join(root, 'jobs'));
+    const original = ' [ ] \n';
+    const adopt = vi.fn(async () => {
+      writeFileSync(join(store.dir, 'consumed.json'), original);
+      return { moved: false, reason };
+    });
+    const evict = vi.fn();
+    const reattach = vi.fn();
+    const result = await rebuildCloneAsJob({ root, env: {}, store, adopt, evict, reattach,
+      launchOnly: true, log: { error() {} } });
+    expect(result.reason).toBe(reason);
+    expect(readFileSync(join(store.dir, 'consumed.json'), 'utf8')).toBe(original);
+    expect(evict).not.toHaveBeenCalled();
+    expect(reattach).not.toHaveBeenCalled();
   });
 
 it.each([
