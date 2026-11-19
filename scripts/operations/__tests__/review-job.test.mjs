@@ -291,6 +291,28 @@ describe('runReviewJob — the arc, no Claude wrapper session', () => {
 describe('dispatchReviewJob — what the daemon calls', () => {
   const base = { ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root: '/daemon', checkStaleness: FRESH, readCompletion: () => null };
 
+  it('resolves the same operator caps in the daemon, job and speculative runner despite settings overlays', async () => {
+    const { resolveProviderCap, reviewSeatLaunchEnv } = await import('../../lib/review-seat-caps.mjs');
+    const env = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_EXTRA_SEATS_DAILY_CAP: '5000',
+      WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+    let jobEnv, speculativeEnv;
+    dispatchReviewJob({ ...base, dir, env,
+      resolveSettingsEnv: () => ({ WE_REVIEW_SEAT_CAP_CODEX: '80', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300', PATH: 'shim' }),
+      spawnJob: input => { jobEnv = input.env; return 4242; } });
+    const io = createReviewJobIo({ dir, env: jobEnv,
+      spawnSpeculative: (_bin, argv, options) => {
+        expect(argv).toContain('red-team-speculate');
+        speculativeEnv = options.env;
+        return { pid: 4243, unref() {} };
+      } });
+    io.startSpeculativeRedTeam({ pr: 10, repo: REPO, lanePath: dir, slug: 'caps', waitMs: 1 });
+    for (const provider of ['codex', 'agy-claude', 'agy-gemini']) {
+      expect(resolveProviderCap(provider, speculativeEnv)).toBe(resolveProviderCap(provider, env));
+    }
+    expect(speculativeEnv).toMatchObject({ ...env, PATH: 'shim' });
+    expect(reviewSeatLaunchEnv({})).not.toHaveProperty('WE_REVIEW_SEAT_CAP_AGY_GEMINI');
+  });
+
   it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('advisory CI waiver: %s', state => {
     let spawns = 0;
     const out = dispatchReviewJob({ ...base, dir, resolveSettingsEnv: () => null, env: { WE_REVIEW_START_AFTER: 'ci-green' },

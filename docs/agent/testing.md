@@ -411,6 +411,14 @@ The sequential and speculative paths skip before budget reservation and record t
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
 
+Red-team cap deferrals retain the reservation provider's daily-cap reason when the operator's
+routing chain is exhausted; a roster provider outside that chain is never a fallback. Explicit
+operator cap env values survive launcher settings overlays and the speculative spawn. The
+reservation union includes today's scorecards and outstanding ledger IDs, so a scorecard-only
+availability snapshot can still lose the reservation race. Regressions live in
+`review-extra-seats.test.mjs`, `review-job.test.mjs`, and the behavior-probed
+`red-team-reservation-route-exhaustion` soak break.
+
 ## Drain red-team disposition and retry evidence
 
 Stale abandonment publishes a complete marker before replacing the writer, under the shared status

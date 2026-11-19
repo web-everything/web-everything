@@ -61,6 +61,52 @@ const LOOP_PAYLOAD = {
 const answer = (lenses) => `I reviewed it.\n\n\`\`\`json\n${JSON.stringify({ lenses })}\n\`\`\``;
 const VALID_SEAT_FINDING = { summary: 'Real finding', category: 'failing-input', impactIfUnfixed: 'broken', file: null, line: null, failure_scenario: 'A concrete failure.' };
 
+describe('red-team reservation routing under operator overrides', () => {
+  const run = (io, env) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane',
+    read: LOOP_PAYLOAD.findings.read, env, post: false, record: false }, io);
+  const policyFor = (fallback = []) => {
+    const policy = structuredClone(readRoutingPolicy());
+    policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', fallback };
+    return policy;
+  };
+  const caps = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+  it('uses the codex-only override with both agy providers capped at zero', async () => {
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(),
+      readAiRouting: () => ({}), readHeadMessage: () => '',
+      runSeat: async o => { calls.push(['seat', o]); return { report: { lastMessage: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } }; } });
+    expect((await run(io, caps)).status).toBe('speculated');
+    expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 1, 1]]);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+  });
+  it.each(['0', '300'])('retains codex daily-cap denial when out-of-chain agy capacity is %s', async agyCap => {
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(), readAiRouting: () => ({}),
+      reserveCalls: ({ provider, dailyCap }) => { calls.push(['denied', provider, dailyCap]); return { used: 5000, callIds: [] }; } });
+    const result = await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: agyCap });
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain('daily-cap: 5000/5000 non-Claude seat calls used today for codex');
+    expect(result.reason).not.toContain('no available route');
+    expect(calls.filter(c => c[0] === 'denied')).toEqual([['denied', 'codex', 5000]]);
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+  });
+  it('tries a remaining in-chain fallback after codex reservation denial', async () => {
+    const { io, calls } = fakeSeatIo({
+      readRoutingPolicy: () => policyFor([{ provider: 'agy-claude', model: 'sonnet' }]), readAiRouting: () => ({}), readHeadMessage: () => '',
+      runSeat: async o => { calls.push(['seat', o]); return { report: { events: { finalResponse: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } } }; },
+    });
+    const reserve = io.reserveCalls;
+    io.reserveCalls = o => o.provider === 'codex' ? { used: 5000, callIds: [] } : reserve(o);
+    expect((await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' })).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+  });
+  it('never reserves a routing-disabled provider even with a positive environment cap', async () => {
+    const policy = policyFor();
+    policy.operations['review-seat:red-team'].disabledProviders = ['codex'];
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policy, readAiRouting: () => ({}) });
+    expect((await run(io, caps)).status).toBe('skipped');
+    expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
+  });
+});
+
 /** A fake seat io recording every effect. Reservations are kept in ONE ledger PER PROVIDER inside `ledgerBox`
  *  (an object keyed by provider), matching the real io's per-provider ledger files — pass one `ledgerBox` to
  *  several fakes to model concurrent review jobs contending for the SAME provider's budget. */
