@@ -5022,11 +5022,11 @@ describe('#5649 — approval rows at the label home', () => {
     expect(rows()).toEqual([]);
   });
 
-  it('interactive clear-human retains its behavior after a throwing verdict append', () => {
+  it('clear-human on any channel refuses a throwing verdict append before any write', () => {
     const p = stubProvider(['review:human']);
     const { exitCode } = run(p, CLEAR, { appendLedgerVerdict: () => { throw new Error('ledger unavailable'); } });
-    expect(exitCode).toBe(0);
-    expect(p.calls).toContain('setLabels');
+    expect(exitCode).toBe(1);
+    expect(p.calls).toEqual([]);
   });
 
   it('a throwing approval append also blocks the swap', () => {

@@ -2099,7 +2099,7 @@ export function runReviewLabelCli({
       }
     }
   } catch (e) {
-    if (to === 'clear-human' && normalizeChannel(channelArg) === 'daemon') {
+    if (to === 'clear-human') {
       clearingLedgerMiss = true;
       clearingLedgerError = String((e && e.message) || e).split('\n')[0];
     }
