@@ -749,9 +749,12 @@ export function enrichPrsWithReferralHoldAutoResolve(prs, { repo, env = process.
   });
 }
 
-function defaultReadComments({ repo, number }) {
-  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(number), ...(repo ? ['--repo', repo] : []), '--json', 'comments'],
+// `gh pr view --json comments` pages through the whole thread (it is not the 100-comment list cap), so a successful
+// read is complete by construction; say so, or a 100+ comment thread would stay incomplete and its hold never resolve.
+export function defaultReadComments({ repo, number }, exec = execFileSyncThrottled) {
+  const comments = JSON.parse(exec('gh', ['pr', 'view', String(number), ...(repo ? ['--repo', repo] : []), '--json', 'comments'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 })).comments;
+  return { comments, complete: Array.isArray(comments) };
 }
 
 export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = process.env, readRuns = readReviewRunEvidence,

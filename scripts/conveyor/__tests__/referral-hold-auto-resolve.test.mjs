@@ -16,7 +16,7 @@ import { liveReferralState } from '../../lib/referral-live-context.mjs';
 import { openReferralFindings } from '../../operations/record-referral-ruling.mjs';
 import {
   decideReferralHoldAutoResolve, enrichPrsWithReferralHoldAutoResolve, enrichPrsWithReferralHolds, resolveReferralHoldAutoResolve,
-  GH_LIST_COMMENT_CAP, REFERRAL_HOLD_AUTO_RESOLVE_STANDARD,
+  GH_LIST_COMMENT_CAP, REFERRAL_HOLD_AUTO_RESOLVE_STANDARD, defaultReadComments,
   referralHoldSendBackBody,
 } from '../review-referral-hold.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
@@ -261,6 +261,19 @@ describe('complete long threads with ruled referral-kind holds', () => {
     }
   });
 
+  it('the default reader (gh stubbed) on a 100+ comment thread yields a complete read and the hold resumes', () => {
+    const full = thread('not-real');
+    const exec = vi.fn(() => JSON.stringify({ comments: full }));
+    const read = defaultReadComments({ repo, number: fx.number }, exec);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(read).toEqual({ comments: full, complete: true });
+    const [pr] = enrichPrsWithReferralHolds([asPr(fx, full.slice(0, GH_LIST_COMMENT_CAP))], {
+      repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments: a => defaultReadComments(a, exec),
+    });
+    expect(pr.commentsComplete).toBe(true);
+    expect(decide(pr, hold)).toMatchObject({ outcome: 'resume' });
+  });
+
   it('an explicit commentsComplete:false keeps the hold even for a short thread', () => {
     const comments = thread('not-real').slice(0, 1);
     expect(comments.length).toBeLessThan(GH_LIST_COMMENT_CAP);
@@ -345,6 +358,7 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold with a conflicting second Net basis line', [{ ...advisory, body: `${advisory.body}\nNet basis: \`${'1'.repeat(40)}..${'2'.repeat(40)}\`` }], {}, /no clean advisory accept/],
     ['same-head hold with a quoted advisory inside another comment', [{ ...advisory, body: `quoted example, not a review:\n\n${advisory.body}` }], {}, /no clean advisory accept/],
     ['same-head hold whose advisory note carries a fenced example', [{ ...advisory, body: `${advisory.body}\n\`\`\`\n**Advisory outcome:** \`accept\`\n\`\`\`` }], {}, /no clean advisory accept/],
+    ['same-head hold whose advisory note carries a tilde-fenced example', [{ ...advisory, body: `${advisory.body}\n~~~\n**Advisory outcome:** \`accept\`\n~~~` }], {}, /no clean advisory accept/],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
     ['same-head hold with a different full advisory head', [{ ...advisory, body: advisory.body.replace(fx.headRefOid, 'a'.repeat(40)) }], {}, /no clean advisory accept/],
     ['same-head hold with an untrusted advisory author', [{ ...advisory, author: { login: 'untrusted-contributor' }, authorAssociation: 'NONE' }], {}, /no clean advisory accept/],
