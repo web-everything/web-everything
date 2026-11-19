@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isScorableDiffText } from './lib/pinned-diff-basis.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -723,7 +724,7 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   // The merge is pinned to the pass-start head (`--match-head-commit`); a clearance carried onto any other head would
   // let the pinned commit merge on another commit's proof.
   if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven', true);
-  // `readHeadDiff(headSha)` (the drain's call site: `readNetDiffAtHead` in the PR's clone) reads the live head's own diff,
+  // `readHeadDiff(headSha)` reads the live head's own diff under the caller's evidence boundary,
   // only once a carry is otherwise possible; `netDiffText` is the already-read form. A throw is an unscored read.
   if (typeof readHeadDiff === 'function') {
     try { netDiffText = readHeadDiff(headSha); } catch { netDiffText = null; }
@@ -751,6 +752,20 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
     }
   }
   return unchanged(carry.reason, carry.retryable === true);
+}
+
+/** Drain carries require fresh, isolated evidence for BOTH heads, matching the scored pass's basis. */
+export function readPinnedCarryDiff({ exec, headSha, carriedHeadSha, expected } = {}) {
+  try {
+    const basis = resolvePinnedDiffBasis({ exec, headSha });
+    const live = requireScoredNetDiff(computeNetDiffSignals({ exec, basis }), headSha);
+    if (['baseSha', 'headSha', 'mergeBaseSha'].some(key => live[key] !== expected?.[key])) return null;
+    const carriedBasis = resolvePinnedDiffBasis({ exec, headSha: carriedHeadSha });
+    const old = requireScoredNetDiff(computeNetDiffSignals({ exec, basis: carriedBasis }), carriedHeadSha);
+    if (old.baseSha !== live.baseSha || old.mergeBaseSha !== live.mergeBaseSha ||
+        old.netDiffText.text !== live.netDiffText.text || live.netDiffText.text !== expected.text) return null;
+    return live.netDiffText;
+  } catch { return null; } // Retain the hold; retry or request full human review.
 }
 
 /** The production tamper-park callback, shared with the carry wiring regression tests. */
@@ -4433,7 +4448,34 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [] } = {}) {
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: pinnedBasis } = {}) {
+  if (pinnedBasis) {
+    const stamp = stampDiffBasis(pinnedBasis);
+    const miss = reason => ({ ...stamp, changedFiles: [], diffLines: 0, humanBasisFiles: [],
+      cumulativeDiffLines: 0, scored: false, basisNarrowed: false, diffHunks: null,
+      netDiffText: { ...stamp, text: '', scored: false, reason } });
+    if (!isPinnedDiffBasis(pinnedBasis)) return miss(pinnedBasis.reason || 'basis-mismatch');
+    const { headSha, mergeBaseSha } = pinnedBasis;
+    const diff = (left, flags = []) => readPinnedDiff(exec, { ...pinnedBasis, mergeBaseSha: left }, flags);
+    try {
+      const cumulative = parseNumstat(diff(mergeBaseSha, ['--numstat']));
+      let own = cumulative;
+      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseRev ?? '') && baseRev !== headSha) {
+        try {
+          pinnedGit(exec, ['merge-base', '--is-ancestor', '--end-of-options', baseRev, headSha]);
+          own = parseNumstat(diff(baseRev, ['--numstat']));
+        } catch { /* cumulative scoring is the conservative fallback */ }
+      }
+      const text = diff(mergeBaseSha);
+      // Opaque content cannot grant tamper clearance; request full human review.
+      if (/^Binary files .* differ$/m.test(text)) return miss('opaque-diff');
+      if (!isScorableDiffText(text)) return miss('unparseable-diff');
+      const netDiffText = { ...stamp, text, base: mergeBaseSha, rev: headSha, scored: true };
+      return { ...stamp, ...own, humanBasisFiles: cumulative.changedFiles,
+        cumulativeDiffLines: cumulative.diffLines, basisKind: 'merge-base', basisNarrowed: true,
+        scored: true, netDiffText, diffHunks: diffHunksFrom(netDiffText) };
+    } catch { return miss('diff-failed'); }
+  }
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis });
   const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis });
@@ -6477,7 +6519,15 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const basis = resolvePinnedDiffBasis({ exec, headSha: v.listedHeadSha });
+        const sig = computeNetDiffSignals({ exec, basis, baseRev: v.base });
+        v.diffBasis = stampDiffBasis(sig);
+        try { requireScoredNetDiff(sig, v.listedHeadSha); }
+        catch {
+          v.decision = 'skip';
+          v.reason = 'net diff unscored or head mismatch; retry or request human review of the full diff';
+          continue; // Preserve existing review/tamper holds; no files-list fallback can clear them.
+        }
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;
@@ -6488,17 +6538,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         basisNarrowed = sig.scored ? sig.basisNarrowed !== false : true; // #3343
       }
       if (!netScored) {
-        try {
-          const files = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'files'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').files || [];
-          changedFiles = files.map((f) => f.path).filter(Boolean);
-          diffLines = files.reduce((s, f) => s + (Number(f.additions) || 0) + (Number(f.deletions) || 0), 0);
-          // The gh files list is the PR's full diff vs its base branch (main) — already cumulative, so it IS the
-          // human-gate basis (a stacked base never de-inflates this fallback path).
-          humanBasisFiles = changedFiles;
-          // #3317 — and so is its line count: this IS the cumulative measurement on this path.
-          cumulativeDiffLines = diffLines;
-          basisNarrowed = true; // #3343 — the gh files list is already the PR's own (three-dot) file set
-        } catch { /* signal-fetch miss → score on the manifest signals alone */ }
+        v.decision = 'skip';
+        v.reason = 'net diff unavailable; retry with a clone or request human review of the full diff';
+        continue; // No-clone evidence cannot clear an existing tamper hold either.
       }
       // #2890-review-fix finding 1 — `diffHunks` comes from `computeNetDiffSignals` above, which applies
       // `diffHunksFrom` (never a hand-rolled `scored ? text : null`): the text when it was actually computed,
@@ -6622,6 +6664,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
+          if (netDiffText.headSha !== tamperHeadSha) {
+            v.decision = 'skip';
+            v.reason = 'net diff head moved; retry with fresh evidence (tamper hold retained)';
+            continue;
+          }
           humanClearedSha = parseLatestHumanClearedSha(cd.comments || []);
           // card xu7kxtt (#5472) — the clearance names an OLDER head (the merge queue / rebase-drop moved it), but the
           // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
@@ -6642,7 +6689,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             const carried = carryHumanClearanceOnIdenticalDiff({
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
-              readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
+              readHeadDiff: (sha) => readPinnedCarryDiff({ exec: diffExec, headSha: sha,
+                carriedHeadSha: humanClearedSha, expected: netDiffText }),
               applyNumberingCarry: createTamperParkCarryCallback({ pr: v.num, repo: slug, exec: diffExec, dryRun: candidateDryRun }),
             });
             humanClearedSha = carried.humanClearedSha;

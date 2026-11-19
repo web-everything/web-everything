@@ -341,10 +341,42 @@ describe('wiring (source pins)', () => {
     expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/deferred: readDeferredForSha\(gitDir, refSha\)/);
   });
   // PR #6674 round 2 — the forge steps above are only as good as their call sites in pr-land and verify-lane.
-  it('pr-land checks the deferred CI gate BEFORE applyLabel, exits 3 on refusal, and is the only applyLabel call', () => {
+  it('pr-land checks deferred CI and certifies the head before its only, hold-guarded applyLabel call', () => {
     const src = readFileSync('scripts/pr-land.mjs', 'utf8');
-    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\(\{ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI \}\);\s*if \(deferredRefusal\) emit\(\{ repo: REPO, merged: false, \.\.\.deferredRefusal \}, 3\);\s*applyLabel\(\);\s*\}/);
+    // Pinned-diff certification now runs between the deferred-CI refusal and the label write.
+    // Keep both refusals and the hold guard explicit; allowing arbitrary intervening code would miss a bypass.
+    expect(src).toMatch(/if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal = deferredLabelRefusal\(\{ forge, prNum, sha: refSha, deferred: DEFERRED_TO_CI \}\);\s*if \(deferredRefusal\) emit\(\{ repo: REPO, merged: false, \.\.\.deferredRefusal \}, 3\);\s*reviewVerdict = applyReviewEscalationLabel\(\);\s*if \(!held\) \{\s*applyLabel\(\);\s*\}\s*\}/);
     expect(src.match(/^\s*(?:if \([^)]*\) )?applyLabel\(\);/gm)).toHaveLength(1);
+  });
+  it.each([
+    ['open without labelling', false, false, false, false, []],
+    ['deferred CI refusal', true, true, false, false, ['deferred', 'exit:3']],
+    ['unscored head', true, false, true, false, ['deferred', 'certify']],
+    ['review hold', true, false, false, true, ['deferred', 'certify']],
+    ['certified head', true, false, false, false, ['deferred', 'certify', 'label']],
+  ])('production label block preserves ordering and refusals: %s', (_name, labelWhenGreen, refused, unscored, held, expected) => {
+    const src = readFileSync('scripts/pr-land.mjs', 'utf8');
+    const block = src.match(/  if \(PLAN\.labelWhenGreen\) \{\s*const deferredRefusal[\s\S]*?\n  \}/)?.[0];
+    expect(block).toBeTypeOf('string');
+    const calls = [];
+    const refusal = { reason: 'deferred-ci-not-green' };
+    const stop = new Error('refused');
+    const io = {
+      PLAN: { labelWhenGreen }, forge: {}, prNum: 7, refSha: SHA, DEFERRED_TO_CI: {}, REPO: '.', held,
+      deferredLabelRefusal: () => { calls.push('deferred'); return refused ? refusal : null; },
+      applyReviewEscalationLabel: () => { calls.push('certify'); if (unscored) throw stop; return {}; },
+      applyLabel: () => calls.push('label'),
+      emit: (payload, code) => {
+        calls.push(`exit:${code}`);
+        expect(payload).toEqual({ repo: '.', merged: false, ...refusal });
+        throw stop;
+      },
+    };
+    // Run the actual CLI block with isolated effects, so a reordered or swallowed refusal cannot pass.
+    const run = () => new Function('io', `const { ${Object.keys(io).join(', ')} } = io; let reviewVerdict;\n${block}`)(io);
+    if (refused || unscored) expect(run).toThrow(stop);
+    else run();
+    expect(calls).toEqual(expected);
   });
   it('pr-land adds the disclosure on create and on a rerun against an open PR', () => {
     const src = readFileSync('scripts/pr-land.mjs', 'utf8');

@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 import * as drain from '../merge-ai-prs.mjs';
 
 // Cover the 6x load cap (even if load rises later), an explicit override, and fixture cleanup.
@@ -45,13 +46,18 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
+const fs = require('node:fs');
 const a = process.argv.slice(2);
+const prs = JSON.parse(fs.readFileSync(process.env.ISOLATION_FIXTURE, 'utf8'));
+if (a.includes('diff') && process.env.ISOLATION_UNSCORED_FIRST === '1' && a.at(-1) === prs[0].headRefOid) process.exit(1);
+const pinned = (${pinnedLeafGitFixture})(a, prs);
+if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-isolation.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
 
-function runCli({ failAll = false, watch = false } = {}) {
+function runCli({ failAll = false, watch = false, unscoredFirst = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-isolation-'));
   try {
     const bin = join(dir, 'bin');
@@ -60,10 +66,10 @@ function runCli({ failAll = false, watch = false } = {}) {
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([2879, 2880].map(number => ({
       number, title: `independent leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     // Keep the real lock implementation, but isolate its os.homedir()-based state from the resident drain.
@@ -73,7 +79,7 @@ function runCli({ failAll = false, watch = false } = {}) {
       ...(watch ? ['--watch', '--interval=1', '--max-idle=1'] : [])], {
       cwd: dir, encoding: 'utf8', timeout: spawnTimeoutMs(),
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, ISOLATION_FIXTURE: fixture,
-        ISOLATION_HOME: dir, ISOLATION_FAIL_ALL: failAll ? '1' : '0' },
+        ISOLATION_HOME: dir, ISOLATION_FAIL_ALL: failAll ? '1' : '0', ISOLATION_UNSCORED_FIRST: unscoredFirst ? '1' : '0' },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
@@ -125,6 +131,17 @@ describe('#4389 merge failure isolation', () => {
     expect(result.merged).toEqual([]);
     expect(result.failed.map(p => p.num)).toEqual([2879, 2880]);
     expect(status).toBe(2);
+  }, CLI_TEST_TIMEOUT_MS);
+
+  it('holds an unscored PR without aborting the pass or preventing a scored peer from merging', () => {
+    const { status, result, attempts } = runCli({ unscoredFirst: true });
+    expect(attempts).toEqual([2880]);
+    expect(result.merged.map(p => p.num)).toEqual([2880]);
+    expect(result.failed).toEqual([]);
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 2879, reason: expect.stringContaining('net diff unscored') }),
+    ]));
+    expect(status).toBe(0);
   }, CLI_TEST_TIMEOUT_MS);
 
   it('watch uses all landed PRs even when the final pass only fails', () => {
