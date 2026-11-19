@@ -468,3 +468,102 @@ describe('urgent-verify blocker fixes', () => {
     expect(() => createUrgentDeps({ spawnSync }).verifyFui()).toThrow(/frontier-ui/);
   });
 });
+
+// Isolation: urgent-verify runs in its own detached worktree (real temp git repos, doubles only for the steps).
+import { mkdtempSync, writeFileSync, readdirSync, existsSync, realpathSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join as pjoin } from 'node:path';
+
+const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1' } }).trim();
+function tempRepo() {
+  const parent = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-iso-'))), repo = pjoin(parent, 'repo');
+  execFileSync('mkdir', [repo]);
+  git(repo, 'init', '-q'); git(repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git');
+  writeFileSync(pjoin(repo, '.gitignore'), 'node_modules/\ncoverage/\ncoverage-shards/\n'); writeFileSync(pjoin(repo, 'a.txt'), 'a');
+  git(repo, 'add', '-A'); git(repo, 'commit', '-qm', 'init');
+  return { parent, repo, head: git(repo, 'rev-parse', 'HEAD') };
+}
+// Real deps in a real repo; only the CI steps are doubles. `standards` runs `hook(dir, repo)` inside the run.
+function isoDeps({ parent, repo }, hook, dirs = []) {
+  const noop = () => {};
+  return createUrgentDeps({ isolated: true, cwd: repo, home: pjoin(parent, 'home'), decorate: (d, dir) => ({ ...d,
+    plan: () => [{ shard: '1/1' }], 'fetch-main-history': noop, verifyFui: () => ({ sha: 'f'.repeat(40), repo: urgentFuiRepo }),
+    'install-fui': noop, install: noop, shard: noop, coverage: noop, hostPaths: noop, integration: noop,
+    standards: () => { dirs.push(dir); hook(dir, repo); } }) });
+}
+const leftovers = parent => readdirSync(parent).filter(n => n.startsWith('.urgent-verify-'));
+
+describe('urgent-verify isolated worktree', () => {
+  it('a file written into the caller checkout mid-run does not change the verdict', async () => {
+    const t = tempRepo(), dirs = [];
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, (_dir, repo) => writeFileSync(pjoin(repo, 'intruder.md'), 'x'), dirs));
+    expect(r).toMatchObject({ ok: true, marker: { result: 'green', sha: t.head } });
+    expect(dirs).toHaveLength(1); expect(dirs[0]).not.toBe(t.repo); expect(dirs[0]).toMatch(/\.urgent-verify-/);
+    expect(existsSync(pjoin(t.repo, 'intruder.md'))).toBe(true);
+  });
+  it('removes its worktree afterwards, green or red', async () => {
+    const t = tempRepo();
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => { throw new Error('boom'); }));
+    expect(leftovers(t.parent)).toEqual([]);
+    expect(git(t.repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+  });
+  it('a dirty caller checkout before the run does not matter either', async () => {
+    const t = tempRepo(); writeFileSync(pjoin(t.repo, 'dirt.md'), 'x'); writeFileSync(pjoin(t.repo, 'a.txt'), 'changed');
+    expect(await urgentVerify({ sha: t.head }, isoDeps(t, () => {}))).toMatchObject({ ok: true });
+  });
+  it('an unknown sha is red-equivalent (not ok) and leaves nothing behind', async () => {
+    const t = tempRepo();
+    expect(await urgentVerify({ sha: 'c'.repeat(40) }, isoDeps(t, () => {}))).toMatchObject({ ok: false });
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('prunes a dead run leftover on start', async () => {
+    const t = tempRepo(), dead = pjoin(t.parent, `.urgent-verify-${t.head.slice(0, 12)}-2147483646`);
+    git(t.repo, 'worktree', 'add', '--detach', dead, t.head);
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
+    expect(existsSync(dead)).toBe(false);
+  });
+  it('child env carries no GIT_DIR / GIT_WORK_TREE', () => {
+    const seen = [], spawnSync = (cmd, args, o) => { seen.push(o.env); return { status: 0, stdout: '' }; };
+    createUrgentDeps({ cwd: '/r', env: { PATH: '/bin', GIT_DIR: '/x', GIT_WORK_TREE: '/y', GIT_INDEX_FILE: '/z' }, spawnSync }).head();
+    expect(seen[0]).not.toHaveProperty('GIT_DIR'); expect(seen[0]).not.toHaveProperty('GIT_WORK_TREE'); expect(seen[0]).not.toHaveProperty('GIT_INDEX_FILE');
+  });
+});
+
+describe('urgent-verify worktree tampered', () => {
+  it('a file written INTO the worktree gives red "checkout changed"', async () => {
+    const t = tempRepo();
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => writeFileSync(pjoin(dir, 'tamper.md'), 'x')));
+    expect(r).toMatchObject({ ok: false, marker: { result: 'red' }, failure: { message: expect.stringContaining('checkout changed') } });
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('a moved HEAD in the worktree gives red "checkout changed"', async () => {
+    const t = tempRepo();
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => git(dir, 'commit', '--allow-empty', '-qm', 'moved')));
+    expect(r).toMatchObject({ ok: false, failure: { message: expect.stringContaining('checkout changed') } });
+  });
+  it('is re-checked after EACH step, not only at the end', async () => {
+    const t = tempRepo(); let later = 0;
+    const deps = createUrgentDeps({ isolated: true, cwd: t.repo, home: pjoin(t.parent, 'home'), decorate: (d, dir) => ({ ...d,
+      plan: () => [{ shard: '1/1' }], 'fetch-main-history': () => writeFileSync(pjoin(dir, 'early.md'), 'x'),
+      verifyFui: () => ({ sha: 'f'.repeat(40), repo: urgentFuiRepo }), 'install-fui': () => later++, install: () => later++,
+      shard: () => later++, coverage: () => later++, hostPaths: () => later++, integration: () => later++, standards: () => later++ }) });
+    expect(await urgentVerify({ sha: t.head }, deps)).toMatchObject({ ok: false });
+    expect(later).toBe(0);
+  });
+});
+
+describe('urgent-verify red exits non-zero', () => {
+  const { finish } = resolveOperation('urgent-verify');
+  it('red result exits 1, green exits 0', async () => {
+    const t = tempRepo();
+    const red = await urgentVerify({ sha: t.head }, isoDeps(t, () => { throw new Error('boom'); }));
+    const green = await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
+    expect(finish({ run: { verdict: red }, code: 0, lines: [] }).code).toBe(1);
+    expect(finish({ run: { verdict: green }, code: 0, lines: [] }).code).toBe(0);
+  });
+  it('a missing verdict never exits 0', () => {
+    expect(finish({ run: {}, code: 0, lines: [] }).code).not.toBe(0);
+  });
+});

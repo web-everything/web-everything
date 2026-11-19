@@ -6,7 +6,12 @@ import { hostname, homedir } from 'node:os';
 import { join, dirname, resolve, delimiter } from 'node:path';
 import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo, canonicalFuiRepo } from './urgent-verify-marker.mjs';
 
-export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env } = {}) {
+const worktreePrefix = '.urgent-verify-';
+const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+
+// `decorate(deps, dir)` is a test seam: it may replace step functions of the scoped (worktree) deps.
+// `isolated: true` (the CLI default via urgentVerify) adds `isolate`; scoped deps are created with false so they never nest.
+export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false } = {}) {
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'SHELL', 'USER']
     .filter(k => typeof env[k] === 'string' && !env[k].includes(urgentKeyPath(home))).map(k => [k, env[k]]));
   // Local verification must acquire host admission even when launched from CI.
@@ -29,7 +34,25 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   };
   let gates;
   const heavy = (args, dir = cwd) => run(process.execPath, [dir === cwd ? 'scripts/readiness/heavy-admission.mjs' : join(cwd, 'scripts/readiness/heavy-admission.mjs'), 'run', '--wait-ms=60000', '--', ...args], dir);
-  return { repo: () => normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'])),
+  // Every step runs in a private detached worktree pinned to the sha, so other writers in the caller's
+  // checkout cannot change the verdict. Sibling of the caller so ../frontierui still resolves.
+  const isolate = isolated ? sha => {
+    const parent = dirname(cwd);
+    for (const name of fs.readdirSync(parent)) { // prune leftovers of dead runs
+      const m = name.startsWith(worktreePrefix) && name.match(/-(\d+)$/);
+      if (m && !pidAlive(Number(m[1]))) { try { run('git', ['worktree', 'remove', '--force', join(parent, name)]); } catch { /* pruned below */ } }
+    }
+    try { run('git', ['worktree', 'prune']); } catch { /* best effort */ }
+    const dir = join(parent, `${worktreePrefix}${sha.slice(0, 12)}-${process.pid}`);
+    run('git', ['worktree', 'add', '--detach', dir, sha]);
+    const cleanup = () => { try { run('git', ['worktree', 'remove', '--force', dir]); } catch (e) { console.error(`urgent-verify: worktree cleanup failed: ${e.message}`); } };
+    try {
+      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env, isolated: false });
+      if (scoped.head() !== sha) throw new Error('worktree not at requested sha');
+      return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
+    } catch (e) { cleanup(); throw e; }
+  } : undefined;
+  return { isolate, repo: () => normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'])),
     readKey: () => {
       const path = urgentKeyPath(home);
       fs.mkdirSync(dirname(path), { recursive: true });
@@ -106,8 +129,13 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   };
 }
 
-export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
+export async function urgentVerify({ sha }, deps = createUrgentDeps({ isolated: true })) {
   const fallback = 'Use a clean checkout at the full SHA, repair CI layout/command or suite failures, and retry urgent-verify when capacity is available; alternatively wait for passing CI.';
+  let iso;
+  try {
+    if (typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha) && deps.isolate) { iso = deps.isolate(sha); deps = iso.deps; }
+  } catch (e) { return { ok: false, detail: `isolated-worktree-failed: ${String(e.message)}`, fallback }; }
+  const intact = () => { if (iso && (!deps.clean() || deps.head() !== sha)) throw new Error('checkout changed'); };
   try {
     if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/i.test(sha) || !deps.clean() || deps.head() !== sha)
       return { ok: false, detail: 'clean-checkout-at-sha-required', fallback };
@@ -117,13 +145,13 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
     // Stop on failure, including queue exhaustion: no admission polling or retry loop.
     try {
       steps.push('fetch-main-history');
-      await deps['fetch-main-history']();
+      await deps['fetch-main-history'](); intact();
       const fui = await deps.verifyFui();
       fuiSha = fui.sha; fuiRepo = fui.repo;
       if (fuiRepo !== urgentFuiRepo) throw new Error('untrusted FUI origin');
-      for (const step of ['install-fui', 'install']) { steps.push(step); await deps[step](); }
-      for (const shard of plan) { steps.push(`unit:${shard.group ?? 'unit'}:${shard.shard}`); await deps.shard(shard); }
-      for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { steps.push(step); await deps[step](); }
+      for (const step of ['install-fui', 'install']) { steps.push(step); await deps[step](); intact(); }
+      for (const shard of plan) { steps.push(`unit:${shard.group ?? 'unit'}:${shard.shard}`); await deps.shard(shard); intact(); }
+      for (const step of ['coverage', 'hostPaths', 'integration', 'standards']) { steps.push(step); await deps[step](); intact(); }
       if (!deps.clean() || deps.head() !== sha) throw new Error('checkout changed');
       const finalFui = await deps.verifyFui({ sha: fuiSha, repo: fuiRepo });
       if (finalFui.sha !== fuiSha || finalFui.repo !== fuiRepo) throw new Error('FUI sibling changed');
@@ -138,4 +166,5 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
     deps.append(failure ? { ...marker, failure } : marker);
     return { ok: result === 'green', marker, ...(failure ? { failure } : {}), ...(result === 'red' ? { fallback } : {}) };
   } catch (e) { return { ok: false, detail: String(e.message), fallback }; }
+  finally { iso?.cleanup(); }
 }
