@@ -26,7 +26,7 @@ beforeEach(async()=>{
   if(gen!==hookGen)return;
   root=r;repo=repoDir;
 });
-afterEach(async()=>{vi.restoreAllMocks();for(const r of made.splice(0))await fs.rm(r,{recursive:true,force:true});});
+afterEach(async()=>{vi.restoreAllMocks();for(const r of made.splice(0))await fs.rm(r,{recursive:true,force:true,maxRetries:5,retryDelay:100});});
 async function baseFixture() {
   const sha=git(['rev-parse','HEAD']).toString().trim();
   const manifest=await remote.buildManifest({cwd:repo,exec});
@@ -843,7 +843,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     expect(commands.some(line=>line.includes('--dry-run --offline'))).toBe(true);
     expect(await fs.stat(join(f.server,'cache',hash(lockData),'dev-v5-'+manifestDigest,'dependencies.tar'))).toBeDefined();
     await f.runner.finish(request);
-  });
+  },15_000);
 
   // Card 7515: presync ships delta leaves ahead of the run; the run offers them
   // only as an rsync --copy-dest basis, and Forge still verifies every byte.

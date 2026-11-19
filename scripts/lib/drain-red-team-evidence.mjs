@@ -457,7 +457,19 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     return completeReads.get(settleAt);
   };
   const indexReadErrors = new Map();
-  const indexReads = new Map(); // at most the bounded index ids; reused only within the index attempt
+  const indexReads = new Map(); // bounded by the shared payload budget
+  const indexIdentities = new Map();
+  const currentIdentity = id => {
+    const metadata = stat(join(runsDir, `${id}.json`));
+    return JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
+  };
+  const discardChangedRead = (id, identity) => {
+    if (indexIdentities.get(id) !== identity) {
+      indexReads.delete(id);
+      indexReadErrors.delete(id);
+      indexIdentities.delete(id);
+    }
+  };
   const setting = resolveRunScanSettings(scanSettings);
   const maxParses = setting.value.scan.maxParses;
   let parsed = 0;
@@ -480,6 +492,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
         mtimes.set(id, metadata.mtimeMs);
         return metadata;
       }, read: id => {
+        const identity = indexedIds || indexReads.has(id) ? currentIdentity(id) : undefined;
+        discardChangedRead(id, identity);
         if (!indexReads.has(id) && parsed >= maxParses) {
           // This record remains unread: preserve its boundary for the existing capped-scan rules.
           boundary = mtimes.get(id);
@@ -493,7 +507,10 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           parsed++; // Failed reads also consume the shared budget.
           run = read(id, runsDir);
         }
-        if (indexedIds) indexReads.set(id, run);
+        if (indexedIds) {
+          indexReads.set(id, run);
+          indexIdentities.set(id, identity);
+        }
         if (indexedIds && (run?.id !== id || run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))) {
           throw Error('unverified review index entry');
         }
@@ -572,9 +589,12 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (!scan) {
       const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),
         read: id => {
+          const identity = currentIdentity(id);
+          discardChangedRead(id, identity);
           if (!indexReads.has(id)) {
             if (parsed >= maxParses) throw budgetExhausted;
             parsed++;
+            indexIdentities.set(id, identity);
             // Failed reads consume budget and retain the scan's unreadable-record refusal.
             try { indexReads.set(id, read(id, runsDir)); }
             catch (error) { indexReads.set(id, null); indexReadErrors.set(id, error); throw error; }
@@ -591,14 +611,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
         } catch { scan = null; }
       }
       if (!scan) {
-        // Verification may have observed a replacement after reading a payload. The
-        // fallback must read fresh evidence, charging the same budget (including failures).
-        indexReads.clear();
-        indexReadErrors.clear();
+        // Reuse verification reads only while their file identity still matches.
+        // Replacements require fresh IO charged to the same budget (including failures).
         runScan();
       }
       indexReads.clear();
       indexReadErrors.clear();
+      indexIdentities.clear();
     }
     const key = `${order}|${exactHead}|${writtenAfter}|${newestHead}`;
     if (!failures.has(key)) failures.set(key, failureFor(order, exactHead, writtenAfter, newestHead));

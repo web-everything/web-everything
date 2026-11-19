@@ -4,6 +4,7 @@ import { readAbandonedReviewSignal } from './abandoned-review-signal.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
+import { assertReviewRunEvidence, readCompleteReviewRunsForPr } from './review-run-index.mjs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { runBacklogOnlyPrep, readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
@@ -403,20 +404,7 @@ function* reviewRuns({ runsDir, list, read, stat }) {
     const at = stat(join(runsDir, `${id}.json`)).mtimeMs;
     if (!Number.isFinite(at)) throw Error('run metadata unreadable');
     const run = read(id, runsDir);
-    const object = value => value != null && typeof value === 'object' && !Array.isArray(value);
-    if (!object(run) || typeof run.op !== 'string' || !run.op.trim()) throw Error('run identity unreadable');
-    // The filename is only a candidate selector. Missing identity must not classify
-    // a corrupt review as unrelated and turn an incomplete scan into a proof.
-    if (run.op === 'review-pr' && (!object(run.input)
-      || typeof run.input.repo !== 'string' || !run.input.repo.trim()
-      || !['string', 'number'].includes(typeof run.input.pr)
-      || !Number.isSafeInteger(Number(run.input.pr)) || Number(run.input.pr) <= 0
-      || !Array.isArray(run.effects)
-      || !(run.pending == null || object(run.pending))
-      || !(run.verdict === null || (object(run.verdict)
-        && typeof run.verdict.verdict === 'string' && run.verdict.verdict.trim())))) {
-      throw Error('review run identity or evidence unreadable');
-    }
+    assertReviewRunEvidence(run);
     if (isRunAbandoned(id, runsDir) && !hasRejectingReviewVerdict(run)) continue;
     yield { id, run, at };
   }
@@ -427,6 +415,23 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
   try {
     if (!isRealHead(head)) return false;
+    try {
+      const ids = readCompleteReviewRunsForPr(runsDir, repo, pr, { list,
+        stat: id => stat(join(runsDir, `${id}.json`)) });
+      if (ids !== null) {
+        const verifiedRead = (id, dir) => {
+          const run = read(id, dir);
+          if (run?.id !== id || run.op !== 'review-pr' || run.input?.repo !== repo
+            || Number(run.input?.pr) !== Number(pr)) throw Error('indexed review subject unreadable');
+          return run;
+        };
+        for (const { run } of reviewRuns({ runsDir, list: () => ids, read: verifiedRead, stat })) {
+          const rev = run.findings?.read?.netBasis?.rev;
+          if (!isRealHead(rev) || rev === head) return false;
+        }
+        return true;
+      }
+    } catch { /* Unverifiable indexed evidence takes the original bounded scan. */ }
     for (const { run } of reviewRuns({ runsDir, list, read, stat })) {
       if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)) continue;
       const rev = run.findings?.read?.netBasis?.rev;
