@@ -718,7 +718,6 @@
   "scripts/conveyor/soak/__tests__/breaks-index-discovery.test.mjs": 0.77,
   "scripts/conveyor/soak/__tests__/daemon-soak-gate.test.mjs": 0.29,
   "scripts/conveyor/soak/__tests__/shard-files.test.mjs": 2.19,
-  "scripts/conveyor/soak/breaks/drain-decline-memo-head-scope.soak.test.mjs": 0.02,
   "scripts/design-refs/__tests__/archive-quarantine.test.mjs": 0.01,
   "scripts/design-refs/__tests__/benchmark.test.mjs": 0.04,
   "scripts/design-refs/__tests__/codification.test.mjs": 0.01,
@@ -1713,6 +1712,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/drain-decline-memo-head-scope.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/owed-ci-rerun-planned-but-never-executed.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
