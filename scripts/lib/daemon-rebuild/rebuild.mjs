@@ -6,7 +6,7 @@
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -18,7 +18,7 @@ import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
-  ACTIVE_BUILD_TOKENS,
+  ACTIVE_BUILD_TOKENS, processStartMs,
 } from './lease.mjs';
 import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -35,10 +35,10 @@ import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 // new reasons to be classified. `error` covers versionedRebuild's error: <detail>.
 export const FAILURE_REASONS = new Set([
   'candidate-worktree-failed', 'deps-job-queue-failed', 'dispatch-smoke-failed',
-  'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
+  'drop-pending-unsettled', 'established-overlay-conflict', 'existing-overlays-unresolved', 'fetch-failed', 'force-adopt-refused',
   'git-common-dir-failed', 'git-dir-unreadable', 'head-unresolved', 'launch-failed',
   'main-unresolved', 'merge-tree-failed', 'no-origin-url', 'not-built',
-  'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-hold-marker-failed', 'pinned-overlay-unavailable',
+  'overlay-removal-refused', 'overlay-state-corrupt', 'pinned-overlay-conflict', 'pinned-overlay-hold-marker-failed', 'pinned-overlay-unavailable',
   'pinned-unparsable', 'pinned-unreadable', 'pinned-write-failed', 'quarantined',
   'rebuild-error', 'rebuild-interrupted-unrecoverable', 'rebuild-job-queue-failed',
   'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
@@ -64,6 +64,17 @@ export function defaultSpawnerOwners({ pid = process.ppid, host = hostname(), ex
     } catch { break; }
   }
   return owners;
+}
+
+/** A durable job may outlive its launcher. Bind its exclusion to clone, host, pid AND process session. */
+export function targetDaemonReader(raw, root, startTimeOf = processStartMs, host = hostname()) {
+  try {
+    const r = JSON.parse(raw);
+    if (typeof r.root !== 'string' || resolve(r.root) !== resolve(root)
+      || !Number.isSafeInteger(r.pid) || r.pid <= 1 || r.owner !== `${host}:${r.pid}`
+      || !Number.isFinite(r.startedMs) || startTimeOf(r.pid) !== r.startedMs) return [];
+    return [r.owner];
+  } catch { return []; } // Unknown session: retain the reader and let the next tick/operator retry.
 }
 
 function trustedIgnoreOwners(raw, spawnerOwners, log) {
@@ -176,7 +187,7 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners,
+  asJob, admissionWaitMs, spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
@@ -194,6 +205,8 @@ async function rebuildCloneInternal({
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
   if (vctx) {
+    // An adopt-only pass never builds: a versioned clone has no ready candidate to adopt, so say a build is due.
+    if (adoptOnly) return { moved: false, adopted: false, reason: 'needs-build', alerts: [] };
     // Versioned builds take no clone lease to renew while queued, but their live smoke
     // shares the same host capacity and deadline as an unversioned candidate.
     const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
@@ -225,8 +238,11 @@ async function rebuildCloneInternal({
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
     // Only the ready-only job has prepare guards that make excluding its spawner safe.
-    // The env value is honoured only for this process's actual spawner or an ancestor; anything else is dropped.
-    ...(readyOnly ? { ignoreOwners: trustedIgnoreOwners(env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS, spawnerOwners, log) } : {}),
+    // Exclude ancestors or a persisted target whose clone, host and process session still match.
+    ...(readyOnly ? { ignoreOwners: [
+      ...trustedIgnoreOwners(env?.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS, spawnerOwners, log),
+      ...targetDaemonReader(env?.WE_DAEMON_REBUILD_READER, root, readerStartTimeOf),
+    ] } : {}),
     now,
     waitMs,
     onBlocked: ({ blockers, waitMs: w }) => log.error?.(

@@ -170,7 +170,7 @@ describe('infra-cancelled evidence + planning', () => {
   const withTestJob = (steps) => {
     const base = mkExec();
     return (c, args) => {
-      const path = args[1];
+      const path = args[0] === 'api' && args[1] === '--allow-escape-sequences' ? args[2] : args[1];
       if (/actions\/jobs\/1$/.test(path)) return JSON.stringify({ id: 1, run_id: 100, head_sha: head, run_attempt: 1, name: 'test', status: 'completed', conclusion: 'failure', runner_name: 'GitHub Actions 1', steps });
       if (/actions\/jobs\/1\/logs$/.test(path)) return 'FAIL scripts/x.test.mjs > a real failure\n';
       return base(c, args);

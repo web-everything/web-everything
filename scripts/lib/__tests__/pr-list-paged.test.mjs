@@ -163,6 +163,7 @@ describe('query and gh row shape', () => {
     expect(q).toContain('repository(owner:"owner",name:"name")');
     expect(q).toContain('states:OPEN,first:20,orderBy:');
     expect(q).not.toContain('after:');
+    expect(q).toContain('workflowRun{databaseId workflow{name}}');
     expect(q).toContain('commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{');
     expect([...q].filter(c => c === '{')).toHaveLength([...q].filter(c => c === '}').length);
     const after = 'cursor"\\\n';
@@ -184,7 +185,12 @@ describe('query and gh row shape', () => {
     ] });
     expect(Object.keys(row(1)).filter(k => !['rowsHead', 'rowsComplete'].includes(k))).toEqual(PAGED_LIGHT_FIELDS);
     expect(row(1)).toMatchObject({ labels: [], statusCheckRollup: [], reviewDecision: '' });
-    check.checkSuite = { workflowRun: { workflow: { name: 'build' } } };
+    check.checkSuite = { workflowRun: { databaseId: 42, workflow: { name: 'build' } } };
+    expect(mapGraphqlPr(n).statusCheckRollup[0].workflowRunId).toBe(42);
+    for (const invalid of [null, '42', 4.2]) {
+      check.checkSuite.workflowRun.databaseId = invalid;
+      expect(mapGraphqlPr(n).statusCheckRollup[0]).not.toHaveProperty('workflowRunId');
+    }
     expect(mapGraphqlPr(n).statusCheckRollup[0].workflowName).toBe('build');
     expect(Object.isFrozen(HEAVY_FIELDS)).toBe(true);
     expect(Object.isFrozen(PAGED_LIGHT_FIELDS)).toBe(true);
