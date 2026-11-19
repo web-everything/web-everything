@@ -4764,16 +4764,15 @@ different-tip, evidence-only, and unknown-kind markers.
 
 ### Tick red-team durable floor admission
 
-`tick-core.test.mjs` drives the tick comment-read seam through the shared complete
-reader, then plans with an empty post-restart attempt tally. Repair candidates
-defer with a retry note on read failure, page-cap exhaustion, count mismatch or an
-unset floor; complete reads at zero/below/at cap preserve admission accounting.
-Read every repair candidate completely, including `review:changes` and `red-team:blocked`:
-a failed or truncated read cannot rule out red-team history beyond the visible prefix.
-Record an explicit unknown floor (`null`) on read failure so admission defers even after
-labels change. CI-only floors remain best effort. Persistent deferral asks the operator
-to inspect the full thread; the next tick reads fresh evidence. Keep the ten-page bound
-and the shared 128-call tick budget, including CI-only reads.
+The tick reads PR comments best-effort for `review:changes` and CI-heal targets.
+A failed read leaves the durable floor unset (effective 0, fail-open, pre-existing
+behaviour); the in-session attempt tally still guards the cap. The fix floor is
+`countRearmComments(comments) + countRedTeamFixComments(comments)`, so spent red-team
+receipts survive a restart alongside ordinary re-arms.
+
+`scripts/conveyor/__tests__/tick-core.test.mjs` covers the production read seam with
+`restart floor includes red-team receipts` and
+`failed comment read leaves the restart floor unset (0, best effort, fail-open)`.
 
 ## Red-team repair charge transaction
 
@@ -4802,8 +4801,11 @@ and `runFixCli`: its ordinary CI-heal must read CI evidence and reach the execut
 
 The reconcile-to-fix planning projection must preserve `roundCap` on both item-backed and
 PR-diff rows. Cap-1 tests exercise both receipt writers after a competing writer consumes
-the live budget. Spent-launch checks read trusted receipts before selecting repair mode,
-even after labels change to `review:changes`; CI-heal therefore also reads the thread.
+the live budget. Planned red-team repairs check spent-launch receipts even after labels
+change to `review:changes`. Ordinary, conflict and CI-heal repairs follow the planner's
+mode without red-team charges or spent-launch checks; accepted/blocked labels alone
+do not select red-team context. `planner -> launcher admits an accepted blocked PR for
+%s without red-team accounting` in `fix-run.test.mjs` replays those planner paths.
 Receipt and hand-back producers are tested as bookkeeping-only threads through the
 planner's existing `no-findings` refusal.
 

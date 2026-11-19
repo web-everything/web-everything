@@ -1,11 +1,12 @@
 /** PR #7080 / #7031: an admitted repair must survive refund accounting and CI-heal admission. */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acceptedRedTeamRepair, failingRedTeamRepair, roundCommitGitOutput } from '../../__tests__/fixtures/accepted-red-team-repair.mjs';
+import { acceptedRedTeamRepair, failingRedTeamRepair, ordinaryAcceptedRedTeamRepair, roundCommitGitOutput } from '../../__tests__/fixtures/accepted-red-team-repair.mjs';
 import { planReconcile } from '../../reconcile-core.mjs';
 import { planFixesFromReconcile, publishRedTeamFixDispatch } from '../../reconcile-fix-dispatch.mjs';
-import { countRedTeamFixComments } from '../../red-team-fix-round-count.mjs';
+import { countRedTeamFixComments, RED_TEAM_FIX_COMMENT_MARKER } from '../../red-team-fix-round-count.mjs';
 import { runFixCli } from '../../../operations/fix-run.mjs';
 
 const plan = pr => planReconcile({ prs: [pr], agents: [], now: Date.parse('2026-11-18T12:00:00Z'),
@@ -26,13 +27,16 @@ function claudeReplay() {
   return { ...output, receipts: countRedTeamFixComments(pr.comments) };
 }
 
-async function borrowedReplay(ci, readable = true) {
-  const pr = ci ? failingRedTeamRepair(7) : acceptedRedTeamRepair(7);
+async function borrowedReplay(ci, readable = true, ordinaryKind = null, launcher = runFixCli) {
+  const pr = ordinaryKind ? ordinaryAcceptedRedTeamRepair(ordinaryKind) : ci ? failingRedTeamRepair(7) : acceptedRedTeamRepair(7);
+  if (ordinaryKind) pr.comments.push({ author: { login: 'web-everything' },
+    body: `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=old result=old attempt=old-launch` });
   const row = plan(pr).dispatch[0];
+  const redTeamRepair = row.mode === 'red-team-sent-back';
   let launched = 0, ciReads = 0, commitReads = 0;
   const errors = [];
   const run = (cmd, args, opts) => {
-    if (cmd === 'git' && ['fetch', 'log', 'merge-tree'].includes(args[0])) {
+    if (!ordinaryKind && cmd === 'git' && ['fetch', 'log', 'merge-tree'].includes(args[0])) {
       if (opts.cwd !== '/fixture') throw Error('wrong commit read target');
       if (args[0] === 'log') commitReads++;
       return roundCommitGitOutput(pr, args);
@@ -53,9 +57,11 @@ async function borrowedReplay(ci, readable = true) {
     if (args[0] === 'rev-parse') return pr.headRefOid;
     return '';
   };
-  const result = await runFixCli(['--pr=7', '--session=fix-7', '--ref=lane/7-repair', '--prompt-file=/fixture/brief',
+  const result = await launcher(['--pr=7', '--session=fix-7', '--ref=lane/7-repair', '--prompt-file=/fixture/brief',
     '--provider=codex', '--repo=o/r', '--lane-repo=/fixture',
-    ...(ci ? [`--repair-kind=${row.kind}`] : [`--planned-repair-mode=${row.mode}`, `--red-team-round-cap=${row.roundCap}`])], {
+    `--repair-kind=${row.kind}`,
+    ...(ordinaryKind ? ['--launch-id=old-launch'] : []),
+    ...(redTeamRepair ? [`--planned-repair-mode=${row.mode}`, `--red-team-round-cap=${row.roundCap}`] : [])], {
     run, readPrompt: () => 'Repair the fixture', removePrompt: () => {},
     timingPolicy: { pushAfterCi: false }, readRequired: () => ({ checks: ['test'] }), readChecks: async () => [],
     readComments: async () => pr.comments,
@@ -67,7 +73,9 @@ async function borrowedReplay(ci, readable = true) {
     readCiHeal: () => { ciReads++; return { title: 'CI red', checks: [{ name: 'test' }], jobs: [{ name: 'test', log: 'CI regression evidence' }] }; },
     resolveProvider: () => ({ spawn: async request => {
       if (ci && !request.prompt.includes('CI regression evidence')) throw Error('CI evidence missing');
-      if (!ci && countRedTeamFixComments(pr.comments) !== 1) throw Error('missing receipt before execution');
+      if (redTeamRepair && countRedTeamFixComments(pr.comments) !== 1) throw Error('missing receipt before execution');
+      if (ordinaryKind === 'conflict' && !request.prompt.includes(pr.body)) throw Error('conflict context missing');
+      if (ordinaryKind === 'ordinary' && !request.prompt.includes('Ordinary repair evidence')) throw Error('ordinary context missing');
       launched++;
     } }),
     readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, persistEvidence: () => {},
@@ -75,40 +83,52 @@ async function borrowedReplay(ci, readable = true) {
     releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {},
     weRoot: '/fixture', write: () => {}, writeErr: text => errors.push(text.trim()),
   });
-  return { fixture: ci ? 'accepted-blocked-required-ci-failure' : readable ? 'three-mechanical-rounds-borrowed' : 'unreadable-round-evidence',
-    plannerKind: row.kind, plannerAttempts: row.attempts, code: result.code,
+  return { fixture: ordinaryKind ?? (ci ? 'accepted-blocked-required-ci-failure' : readable ? 'three-mechanical-rounds-borrowed' : 'unreadable-round-evidence'),
+    plannerKind: row.kind, plannerMode: row.mode, plannerAttempts: row.attempts, code: result.code,
     receipts: countRedTeamFixComments(pr.comments), launched, ciReads, commitReads, errors };
 }
 
 export default {
   id: 'accepted-red-team-repair-accounting',
-  title: 'accepted red-team repair preserves mechanical refunds and admits ordinary CI-heal',
+  title: 'accepted red-team repair preserves refunds and admits planner-selected ordinary repairs',
   card: 'PR #7080, live #7031',
   fixedBy: { sha: 'HEAD', where: 'lane/redteam-sent-back-accepted-owed', paths: [
     'scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs', 'scripts/operations/fix-run.mjs',
   ] },
   fixPresent(root) {
-    return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('requireRoundCommits = false')
-      && readFileSync(join(root, 'scripts/operations/fix-run.mjs'), 'utf8').includes('hasRedTeamSentBackLabels(prHead, launch.repairKind)');
+    // The soak registry's probe is synchronous. Replay injected IO in a bounded child rather
+    // than identifying a spelling in the launcher that can exist while it still refuses dispatch.
+    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { pathToFileURL } from 'node:url';
+      import { resolve } from 'node:path';
+      const { default: b } = await import(pathToFileURL(resolve('scripts/conveyor/soak/breaks/accepted-red-team-repair-accounting.mjs')).href);
+      if (b.judge(await b.run()).length) process.exitCode = 1;
+      else process.stdout.write('fixed');
+    `], { cwd: root, encoding: 'utf8', timeout: 15_000, maxBuffer: 128 * 1024 });
+    return probe.status === 0 && probe.stdout === 'fixed';
   },
-  async run() {
+  async run({ ordinaryLauncher = runFixCli } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'repair-replay-'));
     const env = { WE_COORDINATION_ROOT: root, WE_RESOURCE_CUTOVER: 'shadow', WE_RESOURCE_SHADOW: 'off' };
     const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
     Object.assign(process.env, env);
-    try { return { results: [claudeReplay(), await borrowedReplay(false), await borrowedReplay(true), await borrowedReplay(false, false)] }; }
+    try { return { results: [claudeReplay(), await borrowedReplay(false), await borrowedReplay(true), await borrowedReplay(false, false)],
+      ordinary: await Promise.all(['conflict', 'ci-heal', 'ordinary'].map(kind => borrowedReplay(kind === 'ci-heal', true, kind, ordinaryLauncher))) }; }
     finally {
       Object.entries(saved).forEach(([key, value]) => { if (value === undefined) delete process.env[key]; else process.env[key] = value; });
       rmSync(root, { recursive: true, force: true });
     }
   },
-  judge({ results: [claude, borrowed, ci, unreadable] }) {
+  judge({ results: [claude, borrowed, ci, unreadable], ordinary }) {
     return [
       ...(claude.plannerAttempts === 0 && claude.receipt === 'published' && claude.receipts === 1 ? [] : [JSON.stringify(claude)]),
       ...(borrowed.code === 0 && borrowed.launched === 1 && borrowed.receipts === 1 && borrowed.commitReads === 1 ? [] : [JSON.stringify(borrowed)]),
       ...(ci.plannerKind === 'ci-heal' && ci.code === 0 && ci.launched === 1 && ci.ciReads === 1 && ci.receipts === 0 ? [] : [JSON.stringify(ci)]),
       ...(unreadable.code === 1 && unreadable.launched === 0 && unreadable.receipts === 0
         && unreadable.errors.some(e => e.includes('round commit evidence unreadable')) ? [] : [JSON.stringify(unreadable)]),
+      ...ordinary.filter(row => row.code !== 0 || row.launched !== 1 || row.receipts !== 1
+        || row.plannerMode === 'red-team-sent-back' || row.plannerKind !== (row.fixture === 'ci-heal' ? 'ci-heal' : 'fix')
+        || row.ciReads !== (row.fixture === 'ci-heal' ? 1 : 0)).map(row => JSON.stringify(row)),
     ];
   },
 };

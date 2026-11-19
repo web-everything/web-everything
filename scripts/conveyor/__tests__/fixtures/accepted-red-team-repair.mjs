@@ -28,6 +28,26 @@ export function failingRedTeamRepair(number = 7031) {
   return pr;
 }
 
+/** Ordinary planner paths keep the accepted/blocked labels without selecting red-team accounting. */
+export function ordinaryAcceptedRedTeamRepair(kind, evidence = 'current') {
+  const pr = kind === 'ci-heal' ? failingRedTeamRepair(7) : acceptedRedTeamRepair(7);
+  pr.comments = pr.comments.slice(kind === 'ci-heal' ? 0 : 3);
+  delete pr.roundCommits;
+  pr.title = 'Accepted repair fixture';
+  pr.body = 'Preserve the branch work while repairing the PR';
+  if (evidence === 'missing') pr.comments = [];
+  if (evidence === 'stale') pr.headRefOid = 'b'.repeat(40);
+  if (kind === 'conflict') {
+    pr.baseRefName = 'lane/base'; // The planner owns stacked-base conflicts; the drain owns main-base conflicts.
+    pr.mergeStateStatus = 'DIRTY';
+    pr.mergeable = 'CONFLICTING';
+  } else if (kind === 'ordinary') {
+    pr.labels.push('review:changes');
+    pr.comments.push({ author: { login: 'web-everything' }, body: '🔁 review — changes requested\nOrdinary repair evidence' });
+  }
+  return pr;
+}
+
 /** Raw git IO for the real commit reader, including its clean-merge proof. */
 export function roundCommitGitOutput(pr, args) {
   if (args[0] === 'fetch') return '';

@@ -24,6 +24,7 @@ import {
   clearTerminalFixAttempts,
   planCiHealSpawns,
   ciHealFloorFromComments,
+  readRetryFloors,
   retireCiHealGuards,
   clearTerminalCiHealAttempts,
   armWatchers,
@@ -53,6 +54,22 @@ import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
+import { REARM_COMMENT_MARKER } from '../rearm-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER } from '../red-team-fix-round-count.mjs';
+
+describe('tick durable retry floors', () => {
+  it('restart floor includes red-team receipts', () => {
+    const comments = [REARM_COMMENT_MARKER, RED_TEAM_FIX_COMMENT_MARKER]
+      .map(body => ({ author: { login: 'web-everything' }, body }));
+    expect(readRetryFloors(() => comments, { wantsRearm: true })).toEqual({ rearm: 2 });
+  });
+
+  it('failed comment read leaves the restart floor unset (0, best effort, fail-open)', () => {
+    const floors = readRetryFloors(() => { throw Error('comment read failed'); }, { wantsRearm: true, wantsCiHeal: true });
+    expect(floors).toEqual({});
+    expect(floors.rearm ?? 0).toBe(0);
+  });
+});
 
 // ── The in-flight dispatch (build) guard — filter by num OR lane ──────────────────────────────────────────────
 

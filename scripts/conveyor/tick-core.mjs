@@ -161,6 +161,8 @@ import { readPreparePolicy } from './prepare-policy-settings.mjs';
 import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
 import { costAdmissionOn, jobCostClass } from '../lib/cost-admission.mjs'; // card x60i0ie — heavy/light cost classes (pure)
 import { ciHealBudgetEvidence, resolveCiHealBudget, resolveCiHealBudgetRestore } from './ci-heal-mark.mjs'; // #5968 — the shared CI-heal budget calculation
+import { countRearmComments } from './rearm-review.mjs';
+import { countRedTeamFixComments } from './red-team-fix-round-count.mjs';
 
 /** Held reasons (from {@link ../readiness/dispatch-plan.mjs HELD_REASONS}) that already have their OWN dedicated
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
@@ -956,6 +958,17 @@ export function planCiHealSpawns({ prs = [], launchedNums = [], liveCiHealGuards
 export function ciHealFloorFromComments(comments, { policy = resolveCiHealBudget({ env: process.env }), restore = resolveCiHealBudgetRestore(process.env) } = {}) {
   const { chargeable, refunded } = ciHealBudgetEvidence(comments, { resetOnFixHead: policy.resetOnFixHead, restore });
   return { count: chargeable, refunded };
+}
+
+/** Best-effort tick read: an unavailable thread leaves the durable floors unset (effective 0). */
+export function readRetryFloors(readComments, { wantsRearm = false, wantsCiHeal = false } = {}) {
+  const floors = {};
+  try {
+    const comments = readComments();
+    if (wantsRearm) floors.rearm = countRearmComments(comments) + countRedTeamFixComments(comments);
+    if (wantsCiHeal) floors.ciHeal = ciHealFloorFromComments(comments);
+  } catch { /* leave the floor unset — the in-session tally still guards the cap */ }
+  return floors;
 }
 
 /**
@@ -2195,8 +2208,6 @@ async function main(argv) {
   // was auto-fixed" — the in-session `fixAttempts` map is gone after a restart, so without this the cap could
   // never bind on a fresh conveyor. Only `review:changes` PRs are read (rare), so it adds no per-tick gh cost in
   // the common case; a comment read that fails is best-effort (floor 0 — the in-session tally still guards).
-  const { countRearmComments } = await import('./rearm-review.mjs');
-  const { countRedTeamFixComments } = await import('./red-team-fix-round-count.mjs'); // spent red-team rounds share this floor
   const prRearmCounts = {};
   const prCiHealCounts = {};
   const prCiHealRefunds = {};
@@ -2217,19 +2228,18 @@ async function main(argv) {
     // restart bug this fixes, re-exposed for that invocation).
     const prViewArgs = ['pr', 'view', String(p.prNumber), '--json', 'comments'];
     if (typeof flags.repo === 'string') { prViewArgs.push(`--repo=${flags.repo}`); }
-    try {
+    const floors = readRetryFloors(() => {
       // #x5n4zn3 — was bare (no timeout); best-effort per-PR read, so a bound here just means one PR's
       // floor stays unset instead of the whole tick stalling on it.
       const raw = time('prCommentReadsMs', () => execFileSync('gh', prViewArgs,
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' }));
-      const comments = JSON.parse(raw)?.comments;
-      if (wantsRearm) prRearmCounts[p.prNumber] = countRearmComments(comments) + countRedTeamFixComments(comments);
-      if (wantsCiHeal) {
-        const floor = ciHealFloorFromComments(comments);
-        prCiHealCounts[p.prNumber] = floor.count;
-        prCiHealRefunds[p.prNumber] = floor.refunded;
-      }
-    } catch { /* leave the floor unset — the in-session tally still guards the cap */ }
+      return JSON.parse(raw)?.comments;
+    }, { wantsRearm, wantsCiHeal });
+    if (floors.rearm !== undefined) prRearmCounts[p.prNumber] = floors.rearm;
+    if (floors.ciHeal) {
+      prCiHealCounts[p.prNumber] = floors.ciHeal.count;
+      prCiHealRefunds[p.prNumber] = floors.ciHeal.refunded;
+    }
   }
 
   // #3461 — the admission queue's live `status` read. Best-effort (`runJson` exits the whole tick on failure,

@@ -4,7 +4,7 @@ import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-pr
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
-import { redTeamSentBackFindings, hasRedTeamSentBackLabels } from '../conveyor/dispatch-eligibility-facts.mjs';
+import { redTeamSentBackFindings } from '../conveyor/dispatch-eligibility-facts.mjs';
 import { readRoundCommits, receiptCountsMechanicalRounds, resolveMechanicalRoundsSetting } from '../conveyor/mechanical-round-cap.mjs';
 import { publishRedTeamFixLaunch, lockRedTeamFixCharge, hasRedTeamFixLaunch } from '../conveyor/red-team-fix-round-count.mjs';
 import { randomUUID } from 'node:crypto';
@@ -403,7 +403,7 @@ const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[
  */
 export function renderPrContext(json, { plannedRepairMode } = {}) {
   const pr = typeof json === 'string' ? JSON.parse(json) : json;
-  if (plannedRepairMode === 'red-team-sent-back' || hasRedTeamSentBackLabels(pr)) {
+  if (plannedRepairMode === 'red-team-sent-back') {
     const findings = redTeamSentBackFindings(pr);
     if (!findings.length) throw new LauncherError('no-finding: no trusted current-head red-team send-back');
     return '## Red-team sent-back findings (authoritative ask)\nRepair and push the same branch; hand the new head back as review:pending for independent re-review.\n'
@@ -781,16 +781,12 @@ export async function runFixCli(argv = [], {
     const recoverRedTeamPush = redTeamRepair && Boolean(prHeadSha) && pending?.sha === prHeadSha
       && (pending.kind === undefined || pending.kind === 'push');
     if (!recoverRedTeamPush) {
-      if (hasRedTeamFixLaunch(comments, launch.launchId)) {
+      if (redTeamRepair && hasRedTeamFixLaunch(comments, launch.launchId)) {
         throw new LauncherError('launch already spent; a new dispatch is required');
       }
       // The plan owns accounting. Publish before context rendering or execution, including
       // when the accepted/blocked labels have already changed to review:changes.
       if (redTeamRepair) await chargeRedTeamLaunch();
-      else if (hasRedTeamSentBackLabels(prHead, launch.repairKind)
-        && redTeamSentBackFindings({ ...prHead, number: Number(pr), comments, commentsComplete: true }).length > 0) {
-        throw new LauncherError('red-team repair requires --planned-repair-mode=red-team-sent-back; reconcile again');
-      }
       if (launch.repairKind === 'ci-heal') {
         const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
         if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
@@ -805,7 +801,7 @@ export async function runFixCli(argv = [], {
           withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
           throw new LauncherError('repeated finding: operator scope-baseline required');
         }
-        prContext = target && !redTeamRepair && !hasRedTeamSentBackLabels(prHead) && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+        prContext = target && !redTeamRepair && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
           ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
           : renderPrContext({ ...prHead, number: Number(pr), comments, commentsComplete: true }, { plannedRepairMode: launch.plannedRepairMode });
       }
