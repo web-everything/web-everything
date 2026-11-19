@@ -9,6 +9,7 @@
   "restartInFlight": "adopt",
   "runAllPhases": true,
   "isolatedRetry": "untouched",
+  "retryFailed": 1,
   "relatedMaxTests": 40,
   "relatedDepth": 2,
   "skipLocalForCardOnly": true,
