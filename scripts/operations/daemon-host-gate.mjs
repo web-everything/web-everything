@@ -18,7 +18,7 @@ import { realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as timerSleep } from 'node:timers/promises';
 import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
 
@@ -310,7 +310,15 @@ async function main() {
 /** Symlinked paths (macOS /tmp -> /private/tmp) must still count as the entrypoint. */
 export function isEntrypoint(importUrl, argv1, realpath = realpathSync) {
   if (!argv1) return false;
-  try { return importUrl === pathToFileURL(realpath(argv1)).href; } catch { return importUrl === pathToFileURL(argv1).href; }
+  // Match the resolved AND the unresolved form: with --preserve-symlinks-main the module URL keeps the symlink
+  // path while argv[1] may resolve (or the reverse). Comparing real paths of both sides covers every mix, so a
+  // symlinked entrypoint always runs main instead of silently exiting 0.
+  if (importUrl === pathToFileURL(argv1).href) return true;
+  try {
+    const real = realpath(argv1);
+    if (importUrl === pathToFileURL(real).href) return true;
+    return realpath(fileURLToPath(importUrl)) === real;
+  } catch { return false; }
 }
 
 if (isEntrypoint(import.meta.url, process.argv[1])) main();

@@ -831,8 +831,19 @@ describe('isEntrypoint', () => {
   it('matches through a symlinked argv path', () => {
     expect(isEntrypoint('file:///private/tmp/a/g.mjs', '/tmp/a/g.mjs', () => '/private/tmp/a/g.mjs')).toBe(true);
   });
+  it('matches a symlinked module URL (--preserve-symlinks-main) against a resolved argv path, and the reverse', () => {
+    const real = { '/tmp/a/link.mjs': '/private/tmp/a/g.mjs', '/private/tmp/a/g.mjs': '/private/tmp/a/g.mjs' };
+    const realpath = (path) => real[path] ?? path;
+    // Module URL keeps the symlink path; argv[1] is already resolved.
+    expect(isEntrypoint('file:///tmp/a/link.mjs', '/private/tmp/a/g.mjs', realpath)).toBe(true);
+    // Module URL keeps the symlink path; argv[1] is the same symlink.
+    expect(isEntrypoint('file:///tmp/a/link.mjs', '/tmp/a/link.mjs', realpath)).toBe(true);
+    // Module URL is resolved; argv[1] is the symlink.
+    expect(isEntrypoint('file:///private/tmp/a/g.mjs', '/tmp/a/link.mjs', realpath)).toBe(true);
+  });
   it('is false for another module or no argv', () => {
-    expect(isEntrypoint('file:///x/g.mjs', '/y/h.mjs', () => '/y/h.mjs')).toBe(false);
+    const other = (path) => ({ '/y/h.mjs': '/y/h.mjs', '/x/g.mjs': '/x/g.mjs' })[path] ?? path;
+    expect(isEntrypoint('file:///x/g.mjs', '/y/h.mjs', other)).toBe(false);
     expect(isEntrypoint('file:///x/g.mjs', undefined)).toBe(false);
   });
 });
