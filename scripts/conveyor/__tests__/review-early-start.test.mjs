@@ -10,7 +10,8 @@ const headSha = 'a'.repeat(40);
 const row = (status, conclusion = null) => ({ name: 'test', head_sha: headSha, status, conclusion });
 const pr = checks => ({ number: 12, state: 'OPEN', headRefOid: headSha, headRefName: 'lane/early-review',
   baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', body: 'Review early CI policy.',
-  labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [], statusCheckRollup: checks });
+  labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [], statusCheckRollup: checks,
+  rowsComplete: true, rowsHead: headSha });
 
 describe('early review never grants landing permission', () => {
   it.each([2, 3, 4])('enforces maxLiveReviewRounds=3 for pending-CI early review with %i live rounds', live => {
@@ -49,13 +50,13 @@ describe('early review never grants landing permission', () => {
   it.each(['off', 'shadow', 'on'])('holds ready and merge with an accepted early verdict and pending or red CI (%s)', startEarly => {
     const policy = { ...REVIEW_TIMING_DEFAULTS, startAfter: 'ci-green', startEarly };
     for (const checks of [[row('in_progress')], [row('completed', 'failure')]]) {
-      const start = reviewStartGate({ headSha, checks, requiredChecks: ['test'], policy });
+      const start = reviewStartGate({ rowsComplete: true, headSha, checks, requiredChecks: ['test'], policy });
       if (checks[0].conclusion === 'failure') expect(start).toMatchObject({ allowed: false,
         reason: startEarly === 'off' ? 'required-checks-not-successful' : 'ci-red' });
       else if (startEarly === 'on') expect(start).toMatchObject({ allowed: true, earlyStart: true });
       // Model a stored accepted verdict on precisely this head, including an accidentally present ready label.
       const accepted = { ...pr(checks), reviewedSha: headSha, earlyStart: true };
-      expect(reviewCiGate({ headSha, checks, requiredChecks: ['test'] }).allowed).toBe(false);
+      expect(reviewCiGate({ rowsComplete: true, headSha, checks, requiredChecks: ['test'] }).allowed).toBe(false);
       expect(pollVerdict({ state: 'CLEAN', checkStatus: checks[0].conclusion ? 'failed' : 'pending',
         requiredCount: 1, labelWhenGreen: true })).not.toBe('label');
       expect(classifyPr(accepted, { requiredCheck: 'test', queueRequiredChecks: ['test'] }).decision).toBe('skip');
@@ -64,7 +65,7 @@ describe('early review never grants landing permission', () => {
     expect(classifyPr(pr([row('completed', 'success')]), { requiredCheck: 'test' }).decision).toBe('merge');
     expect(shouldLabelOnGreen({ ...pr([row('completed', 'success')]), labels: [{ name: 'review:accepted' }] },
       { requiredCheck: 'test' })).toBe(true);
-    expect(reviewCiGate({ headSha, checks: [{ ...row('completed', 'success'), head_sha: 'b'.repeat(40) }],
+    expect(reviewCiGate({ rowsComplete: true, headSha, checks: [{ ...row('completed', 'success'), head_sha: 'b'.repeat(40) }],
       requiredChecks: ['test'] }).allowed).toBe(false);
   });
 });

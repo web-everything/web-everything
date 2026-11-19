@@ -158,6 +158,28 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   return { excused, kind, holds, others, why: candidate ? 'current candidate must pass merge-gate' : excused ? 'only candidacy or cleared shared-freeze holds' : 'real or absent blocking evidence' };
 }
 
+/**
+ * Review admission may consume the successful projection produced by excuseMergeGateRows.
+ * Bind its in-memory classification to the same job/head and retain its exact hold shape.
+ * A stale-freeze kind attests the classifier's fresh freeze/main-CI checks; it is not
+ * inferred from a red-main-freeze row here. Review-only annotations are never excusals.
+ */
+export function isBoundMergeGateExcusal(row, headSha) {
+  const proof = row?.mergeGateHoldExcused;
+  const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row?.detailsUrl ?? row?.details_url ?? '')?.[1]);
+  if (row?.name !== 'merge-gate' || String(row.status).toLowerCase() !== 'completed'
+    || String(row.conclusion).toLowerCase() !== 'success' || !proof
+    || !Number.isSafeInteger(jobId) || jobId <= 0 || proof.jobId !== jobId
+    || typeof headSha !== 'string' || typeof proof.headSha !== 'string'
+    || proof.headSha.toLowerCase() !== headSha.toLowerCase()
+    || !Array.isArray(proof.holds) || !proof.holds.length || !Array.isArray(proof.holdIds)
+    || proof.holdIds.length !== proof.holds.length
+    || ![...proof.holds].every(hold => hold?.status === 'hold' && proof.holdIds.includes(hold.id)
+      && (isCandidacyHold(hold) || manualFreeze(hold)))) return false;
+  const candidacy = proof.holds.some(isCandidacyHold), freeze = proof.holds.some(manualFreeze);
+  return proof.kind === (freeze ? candidacy ? 'candidacy+stale-freeze' : 'stale-freeze' : 'candidacy');
+}
+
 /** Latest failing completed run only; success/pending supersedes all older failures. */
 export function latestFailingMergeGate(rows) {
   const row = collapseRollupToLatestPerName(rows).find(r => r.name === 'merge-gate');
@@ -187,8 +209,10 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
         || !holds?.length || holds.length > 2
         || holds.filter(isWorkflowTouchHold).length !== 1
         || !holds.every(h => isWorkflowTouchHold(h) || isRedTeamMissing(h))) return unchanged;
+      // holdIds/headSha bind the hold for the strict resolver, like every other review-hold annotation.
       const replacement = { ...row, mergeGateReviewHold: {
         holds: [...holds.map(r => r.id), 'workflow-edit-protection'], jobId,
+        holdIds: holds.map(r => r.id), headSha: verdict.head_sha, workflowEditProtection: true,
       } };
       return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
     }
@@ -198,14 +222,14 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
       const holds = verdict.results?.filter(blocking) ?? [];
       // Card 273, #5157: annotation rides on candidacyHoldIsNotCiFailure; off never annotates.
       if (holds.length && holds.every(r => r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))) {
-        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), jobId } };
+        const replacement = { ...row, mergeGateReviewHold: { holds: holds.map(r => r.id), holdIds: holds.map(r => r.id), headSha, jobId } };
         return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
       }
       return unchanged;
     }
     const replacement = { ...row, conclusion: row.conclusion === row.conclusion.toLowerCase() ? 'success' : 'SUCCESS',
-      mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, jobId } };
-    return { rows: rows.filter(r => r.name !== 'merge-gate' || r === row).map(r => r === row ? replacement : r), excused: true };
+      mergeGateHoldExcused: { kind: classification.kind, holds: classification.holds, holdIds: classification.holds.map(r => r.id), headSha, jobId } };
+    return { rows: rows.map(r => r === row ? replacement : r), excused: true };
   } catch { return unchanged; }
 }
 

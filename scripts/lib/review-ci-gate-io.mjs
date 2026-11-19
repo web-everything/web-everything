@@ -8,6 +8,7 @@ import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
+import { ACTIONS_JOB_SLOT } from './check-state-predicate.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
@@ -15,25 +16,82 @@ const gh = argv => readGh(argv, { encoding: 'utf8', timeout: 15_000, stdio: ['ig
 export const readReviewHead = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'])).headRefOid;
 /** Fetch labels with the head so the default gate needs no separate label request. */
 export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']));
+
+/** REST check runs omit workflow attempts. Duplicate Actions names need job-bound lineage. */
+function bindReviewReruns(checks, { repo, headSha, run }) {
+  const counts = new Map(), jobs = new Map();
+  for (const check of checks) counts.set(check?.name, (counts.get(check?.name) ?? 0) + 1);
+  const bound = checks.map(check => {
+    // Only the job endpoint can establish workflow identity, never fields in a check feed.
+    const { run_id: ignoredRun, run_attempt: ignoredAttempt, ...row } = check;
+    if (counts.get(row.name) < 2 || row.app?.slug !== 'github-actions') return row;
+    const unavailable = () => { throw new Error('rerun lineage unavailable; inspect Actions jobs before retrying review'); };
+    const match = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(row.details_url);
+    const positive = n => Number.isSafeInteger(n) && n > 0;
+    if (!match || match[1] !== repo || !positive(Number(match[2])) || !positive(Number(match[3]))
+      || !positive(row.id) || row.head_sha !== headSha) return unavailable();
+    if (!jobs.has(match[3])) {
+      if (jobs.size >= 20) throw new Error('rerun lineage exceeds 20 job reads; inspect Actions reruns before retrying review');
+      jobs.set(match[3], JSON.parse(run(['api', `repos/${repo}/actions/jobs/${match[3]}`])));
+    }
+    const job = jobs.get(match[3]);
+    if (job?.id !== Number(match[3]) || job.run_id !== Number(match[2]) || job.head_sha !== headSha
+      || job.name !== row.name || job.check_run_url !== `https://api.github.com/repos/${repo}/check-runs/${row.id}`
+      || !positive(job.run_attempt)) return unavailable();
+    return { ...row, run_id: job.run_id, run_attempt: job.run_attempt };
+  });
+  const attempts = new Map();
+  for (const row of bound) {
+    if (!row.run_id) continue;
+    const key = `${row.run_id}/${row.run_attempt}`;
+    if (!attempts.has(key)) {
+      if (jobs.size + attempts.size >= 20) throw new Error('rerun lineage exceeds 20 job reads; inspect Actions reruns before retrying review');
+      const page = JSON.parse(run(['api',
+        `repos/${repo}/actions/runs/${row.run_id}/attempts/${row.run_attempt}/jobs?per_page=100`]));
+      const list = page?.jobs;
+      // One bounded page proves the whole inventory only when its count agrees.
+      // Larger workflows need operator inspection, never an unbudgeted pagination loop.
+      if (!Array.isArray(list) || !Number.isSafeInteger(page.total_count) || list.length > 100
+        || page.total_count !== list.length || list.some(job => !job || job.run_id !== row.run_id
+          || job.run_attempt !== row.run_attempt || job.head_sha !== headSha)) {
+        throw new Error('rerun job inventory unavailable; inspect Actions jobs before retrying review');
+      }
+      attempts.set(key, list);
+    }
+    const list = attempts.get(key), same = list.filter(job => job.name === row.name);
+    const job = jobs.get(String(/\/job\/(\d+)$/.exec(row.details_url)?.[1]));
+    if (!list.some(entry => entry.id === job.id && entry.name === job.name && entry.check_run_url === job.check_run_url)) {
+      throw new Error('rerun job inventory mismatch; inspect Actions jobs before retrying review');
+    }
+    if (same.length === 1) row[ACTIONS_JOB_SLOT] = row.name;
+  }
+  // A singleton rerun cannot erase an ambiguous matrix name in an earlier attempt.
+  for (const row of bound) {
+    if (row[ACTIONS_JOB_SLOT] && bound.some(other => other.run_id === row.run_id && other.name === row.name
+      && other[ACTIONS_JOB_SLOT] !== row.name)) delete row[ACTIONS_JOB_SLOT];
+  }
+  return bound;
+}
 /**
  * Every check run PLUS every legacy commit status (`{context, state, target_url}`) for the SHA: a required context may be
  * published through either, and a reader of check runs alone would call a green commit-status context missing.
  * The combined-status endpoint already reports only the latest state per context.
+ * Non-enumerable rowsComplete preserves the array API while carrying pagination proof.
  */
-export const readReviewChecks = ({ repo, headSha, run = gh }) => [
-  ...JSON.parse(run([
+export const readReviewChecks = ({ repo, headSha, run = gh }) => Object.defineProperty([
+  ...bindReviewReruns(JSON.parse(run([
     'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`,
   ])).flatMap(page => {
     if (!Array.isArray(page.check_runs)) throw new Error('unreadable check runs');
     return page.check_runs;
-  }),
+  }), { repo, headSha, run }),
   ...JSON.parse(run([
     'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
   ])).flatMap(page => {
     if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
     return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
   }),
-];
+], 'rowsComplete', { value: true });
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,
@@ -86,6 +144,8 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
     checks ??= readChecks({ repo, headSha });
+    // Capture proof before hold excusal replaces the array; bare/cached rollups lack it.
+    const rowsComplete = checks?.rowsComplete === true;
     const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
     try {
@@ -108,13 +168,13 @@ export function readReviewCiGate({ repo, pr, readHead, readLabels,
       try { verifyGreen = readVerifyGreen({ dir: greenLedgerDir({ coordinationRoot: coordinationRoot ?? resolveCoordinationRoot() }), sha: headSha }) === true; }
       catch { /* Unreadable verification waits on CI. */ }
     }
-    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, policy, verifyGreen });
+    const gate = reviewStartGate({ headSha, repo, requiredChecks, checks, rowsComplete, policy, verifyGreen });
     if (gate.earlyStartNote) {
       // console is wrapped by the project's daemon logger; injected loggers keep fixtures hermetic.
       try { log(gate.earlyStartNote.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 2000)); }
       catch { /* Diagnostics cannot change permission. */ }
     }
-    return withSource({ ...gate, checks, requiredChecks });
+    return withSource({ ...gate, checks, rowsComplete, requiredChecks });
   } catch (error) {
     return { allowed: false, headSha, startAfter: policy.startAfter, reason: 'unreadable-ci', error: String(error?.message ?? error) };
   }

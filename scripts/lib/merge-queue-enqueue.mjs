@@ -634,7 +634,9 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   // The real classifier must also pass its gates AFTER the merge-state arm (body and review holds).
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
-  const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
+  const gate = reviewCiGate({ headSha, rowsHead: pr.rowsHead ?? null,
+    rowsComplete: pr.rowsComplete === true, requiredChecks, checks: pr.statusCheckRollup });
+  if (gate.unknown) return unchanged;
   // A startup_failure Merge gate run creates no check-run, so the row can be absent; any other refusal stays refused.
   // reviewCiGate drops checks implied by others (integration under test), so here EVERY other required row must be present and successful.
   const onlyGateMissing = gate.affected.length === 1 && gate.affected[0].name === 'merge-gate' && gate.affected[0].reason === 'missing'

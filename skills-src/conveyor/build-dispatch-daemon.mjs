@@ -2687,7 +2687,9 @@ export async function cliRecoverBuilderDrafts({ rawOpenPrs, allowResume, dryRun 
         freeze: () => (io.readFreeze ?? readSharedFreeze)(),
       }).rows;
     } catch { /* Unreadable excusal evidence keeps the original check failures. */ }
-    const failed = effectiveChecks.find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
+    // The excusal keeps superseded runs of a check (evidence for other readers); only the latest run of each counts.
+    const { collapseRollupToLatestPerName } = await import('../../scripts/lib/rollup-collapse.mjs');
+    const failed = collapseRollupToLatestPerName(effectiveChecks).find(c => c.name !== 'review-gate' && ['failure', 'timed_out', 'cancelled', 'action_required'].includes(c.conclusion));
     if (!failed) continue;
     const annotations = paged(`repos/${repo}/check-runs/${failed.id}/annotations`);
     let firstError = annotations.find(a => a?.annotation_level === 'failure'

@@ -9,7 +9,7 @@ import { aiPr } from '../../__tests__/fixtures/merge-ai-prs-fixtures.mjs';
 const roots = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const repo = 'owner/repo', head = 'a'.repeat(40);
-const pending = () => aiPr({ number: 42, headRefOid: head, baseRefName: 'main', state: 'OPEN', isDraft: false,
+const pending = () => aiPr({ number: 42, headRefOid: head, rowsHead: head, rowsComplete: true, baseRefName: 'main', state: 'OPEN', isDraft: false,
   labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], mergeStateStatus: 'BLOCKED', mergeable: 'MERGEABLE',
   statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null, head_sha: head }] });
 function fixture(options = {}) {
@@ -31,6 +31,11 @@ function fixture(options = {}) {
 const green = f => { f.pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }; };
 
 describe('CI pre-stage', () => {
+  it.each([{ rowsComplete: undefined }, { rowsComplete: false }, { rowsHead: null }, { rowsHead: 'b'.repeat(40) }])('keeps green CI unknown without complete current-head proof: %j', evidence => {
+    const pr = pending();
+    pr.statusCheckRollup = [{ name: 'test', status: 'completed', conclusion: 'success' }];
+    expect(prestageCi({ ...pr, ...evidence }, ['test'])).toBe('unknown');
+  });
   it.each([{hasManifest:true}, {coupleCarrier:{num:43}}])('invalidates older unsafe cache entries (%j)', async candidate => {
     const f = fixture();
     const entry = f.cache.get(repo, 42, 30);
@@ -307,7 +312,8 @@ describe('CI pre-stage', () => {
     const p = pending();
     expect(prestageCi(p, ['test', 'integration'])).toBe('unknown');
     p.statusCheckRollup[0].head_sha = 'other';
-    expect(prestageCi(p, ['test'])).toBe('red');
+    // Another head's row is unreadable evidence for this head (the review CI contract): never a shortcut.
+    expect(prestageCi(p, ['test'])).toBe('unknown');
     p.statusCheckRollup[0].head_sha = head; p.mergeable = 'CONFLICTING';
     expect(classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
   });

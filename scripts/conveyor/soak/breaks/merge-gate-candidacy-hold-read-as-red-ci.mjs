@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 const done = (name) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
 const identity = x => x;
-const sha = 'a'.repeat(40);
+const headFor = number => number.toString(16).padStart(40, 'a');
 // Real job-log row wording from the #4965/#5008 incident, projected onto the replay PRs.
 const candidacyLog = number => `2026-10-12T09:49:30.3934630Z #${number}: HOLD
 2026-10-12T09:49:30.3936795Z   hold              candidate-label        no "ready-to-merge" label — the drain never considers it
@@ -53,22 +53,29 @@ export default {
       5024: log5008.replaceAll('5008', '5024').replace('main CI (ci.yml@main): green', 'main CI (ci.yml@main): RED since bbbbbbbbb'),
     };
     const prs = [5008, 5012, 5020, 5022, 5023, 5024].map(number => ({
-      number, state: 'OPEN', headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main',
+      number, state: 'OPEN', headRefOid: headFor(number), rowsHead: headFor(number), rowsComplete: true,
+      headRefName: `lane/${number}-example`, baseRefName: 'main',
       labels: [{ name: 'review:pending' }], comments: [], isDraft: number !== 5008,
       statusCheckRollup: [
         ...['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({
           ...done(name), conclusion: number === 5020 && name === 'test' ? 'FAILURE' : 'SUCCESS',
         })),
-        { ...done('merge-gate'), conclusion: 'FAILURE', detailsUrl: `https://github.com/example-owner/example-repo/actions/runs/38245735516/job/${114798995647 + number - 5008}` },
+        { ...done('merge-gate'), id: number, conclusion: 'FAILURE', detailsUrl: `https://github.com/example-owner/example-repo/actions/runs/38245735516/job/${114798995647 + number - 5008}` },
       ],
     }));
     const plan = runReconcilePass({
       readPrs: () => prs, readAgents: () => [], enrich: identity,
-      readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
-      readChecks: () => { throw new Error('complete fixture rollups must not hydrate checks'); },
+      readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'], source: 'live' }),
+      // Candidacy excusal re-reads the complete exact-head feed and matches the
+      // immutable check ID before carrying its bound hold into review admission.
+      readChecks: ({ sha: requestedHead }) => {
+        const pr = prs.find(row => row.headRefOid === requestedHead);
+        if (!pr) throw new Error('unexpected check head');
+        return Object.assign(pr.statusCheckRollup.map(row => ({ ...row, head_sha: requestedHead })), { rowsComplete: true });
+      },
       readMergeGateVerdict: ({ prNumber }) => ({
         ...parsePrResultTable(complete(failureLogs[prNumber] ?? (prNumber === 5008 ? log5008 : candidacyLog(prNumber)), GATE_IDS), prNumber),
-        head_sha: sha, completed_at: '2026-10-12T11:56:08Z',
+        head_sha: headFor(prNumber), completed_at: '2026-10-12T11:56:08Z',
       }),
       readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }),
       mergeGateSetting: { value: 'on', source: 'soak' },

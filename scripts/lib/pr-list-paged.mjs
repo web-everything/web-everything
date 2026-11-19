@@ -231,6 +231,34 @@ export function rollupEvidence(commit) {
       && c.nodes.every(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename)) };
 }
 
+/** Legacy lists omit metadata. Bound reads to ten batches of twenty heads.
+ * Unknown evidence holds review until the next tick or an operator repairs the read.
+ */
+export function enrichPrRollupEvidence({ repo, rows, exec, execOpts = {} }) {
+  for (const pr of rows) Object.assign(pr, { rowsComplete: false, rowsHead: null });
+  const heads = [...new Set(rows.map(pr => pr.headRefOid).filter(sha => typeof sha === 'string' && SHA_RE.test(sha)))].slice(0, 200);
+  for (let offset = 0; offset < heads.length; offset += 20) {
+    const batch = heads.slice(offset, offset + 20);
+    const objects = batch.map((sha, i) => `h${i}:object(oid:"${sha}"){...on Commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}`).join(' ');
+    try {
+      const out = JSON.parse(String(exec('gh', ['api', 'graphql', '-F', `owner=${repo?.split('/')[0] || '{owner}'}`,
+        '-F', `name=${repo?.split('/')[1] || '{repo}'}`, '-f',
+        `query=query($owner:String!,$name:String!){repository(owner:$owner,name:$name){${objects}}}`], execOptions(execOpts))));
+      if (out?.errors?.length) continue;
+      batch.forEach((sha, i) => {
+        const commit = out?.data?.repository?.[`h${i}`];
+        if (commit?.oid !== sha) return;
+        for (const pr of rows.filter(pr => pr.headRefOid === sha)) {
+          Object.assign(pr, rollupEvidence(commit));
+          const nodes = commit?.statusCheckRollup?.contexts?.nodes;
+          if (Array.isArray(nodes) && nodes.every(n => n && ['CheckRun', 'StatusContext'].includes(n.__typename))) pr.statusCheckRollup = nodes.map(mapCtx);
+        }
+      });
+    } catch { /* unknown: retain fail-closed evidence */ }
+  }
+  return rows;
+}
+
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape, plus evidence metadata. */
 export function mapGraphqlPr(n) {
   return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,

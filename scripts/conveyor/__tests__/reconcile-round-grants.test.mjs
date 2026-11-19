@@ -24,7 +24,7 @@ const sendBack = { id: 'operator', author: { login: 'chalbert' }, createdAt: '20
 const end = { author: bot, body: '🔓 conveyor fix-end' };
 const plan = (comments, options = {}, over = {}) => core.planReconcile({ reviewTiming: { startAfter: 'ci-green' }, repo: 'we', requiredChecks: ['gate'],
   now: Date.parse('2026-10-15T12:00Z'), roundCap: 6, prs: [{ number: 5169, state: 'OPEN',
-    headRefName: 'lane/5169-repair', headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN',
+    headRefName: 'lane/5169-repair', rowsComplete: true, rowsHead: 'a'.repeat(40), headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN',
     labels: [{ name: 'review:changes' }], statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
     comments: [{ body: '🔁 human review — changes requested\n\nRepair the bug.' }, ...comments], ...over }], ...options });
 
@@ -50,7 +50,7 @@ describe('an automatic (standing-ruling) grant frees a round NOW (live #5690)', 
   // PR #5758 review: every test above injected `standingRuling` straight into planReconcile, so dropping the pass's
   // enrich call left them green. This runs the PASS, with the real enrich + scope and only the GitHub reads injected.
   describe('through runReconcilePass', () => {
-    const snapshot = () => ({ number: 5169, state: 'OPEN', headRefName: 'lane/5169-repair', headRefOid: H, baseRefName: 'main',
+    const snapshot = () => ({ number: 5169, state: 'OPEN', headRefName: 'lane/5169-repair', rowsComplete: true, rowsHead: H, headRefOid: H, baseRefName: 'main',
       mergeStateStatus: 'CLEAN', labels: [{ name: 'review:changes' }], files: [{ path: 'backlog/5169-x.md' }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: H }],
       comments: [{ body: '🔁 human review — changes requested\n\nRepair the bug.' }, ...over] });

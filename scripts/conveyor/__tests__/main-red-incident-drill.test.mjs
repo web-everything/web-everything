@@ -52,7 +52,7 @@ const SIM = { agentToPrMs: 10 * MIN, ciMs: 10 * MIN, reviewMs: TICK, drainMs: TI
 const planReconcile = (o) => planReconcileCore({ requiredChecks: ['gate'], ...o });
 const lbl = (...n) => n.map((name) => ({ name }));
 const rollup = (conclusion) => [{ name: 'gate', status: 'completed', conclusion }];
-const prRow = (over) => ({ state: 'OPEN', headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN', labels: lbl('review:pending'),
+const prRow = (over) => ({ state: 'OPEN', rowsComplete: true, rowsHead: 'f'.repeat(40), headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN', labels: lbl('review:pending'),
   statusCheckRollup: rollup('success'), comments: [], ...over });
 
 let dir;

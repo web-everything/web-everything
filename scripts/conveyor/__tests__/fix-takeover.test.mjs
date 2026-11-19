@@ -41,7 +41,7 @@ const marker = (head) => ({ author: BOT, createdAt: '2026-10-10T00:00:00Z', body
 const rearm = (i) => ({ author: BOT, createdAt: `2026-10-0${i}T00:00:00Z`, body: REARM_COMMENT_MARKER });
 function cappedPr(extraComments = []) {
   return {
-    number: 7, headRefName: 'lane/x-thing', headRefOid: HEAD, isDraft: false, createdAt: '2026-10-01T00:00:00Z',
+    number: 7, headRefName: 'lane/x-thing', rowsComplete: true, rowsHead: HEAD, headRefOid: HEAD, isDraft: false, createdAt: '2026-10-01T00:00:00Z',
     labels: [{ name: 'review:changes' }], statusCheckRollup: [], files: [{ path: 'src/a.mjs' }],
     comments: [{ author: BOT, createdAt: '2026-10-01T00:00:00Z', body: '🔁 review — changes requested\n\n### Findings\n\n**correctness/logic** (1)\n- `src/a.mjs:1` — bad' }, ...extraComments],
   };

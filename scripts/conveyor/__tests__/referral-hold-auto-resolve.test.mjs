@@ -45,6 +45,7 @@ const repo = 'web-everything/web-everything';
 const noCards = () => false;
 const asPr = (fx, comments = fx.comments) => ({
   number: fx.number, headRefOid: fx.headRefOid, body: fx.body, createdAt: fx.createdAt, isDraft: false, baseRefName: 'main',
+  rowsHead: fx.headRefOid, rowsComplete: true,
   labels: fx.labels.map(name => ({ name })), comments,
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'ci' }],
 });

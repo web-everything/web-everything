@@ -1,3 +1,4 @@
+import { readPlannerRows } from './red-team-planner-row.mjs';
 import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
@@ -397,12 +398,14 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
   const transaction = transactions.get(queue)?.();
   try {
     const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
-    const incoming = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
+    // Every queue reader consumes refusals through the shared planner-row reader.
+    const plannerRefusals = readPlannerRows({ repo, plan, rawPrs }).map(({ refusal }) => refusal);
+    const incoming = plannerRefusals.filter(row => row.kind === 'already-reviewed-head'
       && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       .map(row => ({ repo, pr: Number(row.prNumber) }));
     const liveEvidence = queue.reconcile({ ...rest, readLivePr, candidates: incoming });
     const candidates = [], cardOnlyCandidates = [];
-    for (const row of plan?.refusals ?? []) {
+    for (const row of plannerRefusals) {
       if (row.kind !== 'already-reviewed-head') continue;
       const head = row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid;
       if (!isRealHead(head)) continue;
@@ -452,13 +455,13 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
       && (capacity.budget == null || finite(capacity.budget.left));
     const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
     const allowed = new Set(admitted.map(entry => entry.pr));
-    const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
+    const held = new Set(plannerRefusals.filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       && !allowed.has(Number(row.prNumber)) && !bypassed.has(Number(row.prNumber))).map(row => Number(row.prNumber)));
     const blocked = new Set(queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)).map(entry => entry.pr));
     for (const pr of held) note(log, `hold ${repo}#${pr}: ${blocked.has(pr) ? readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled' : 'capacity'}; waiting for a later tick`);
     // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
-    const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
+    const kept = plannerRefusals.filter(row => !held.has(Number(row.prNumber)));
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
     // Replace admitted candidate slots in FIFO order while preserving unrelated rows and metadata.
     const queuedRows = admitted.flatMap(entry => refusals.filter(row =>

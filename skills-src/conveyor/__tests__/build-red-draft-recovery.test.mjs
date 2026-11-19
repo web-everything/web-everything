@@ -121,6 +121,8 @@ describe('abandoned builder draft recovery', () => {
   ])('classifies REST merge-gate HOLD evidence: %s', async (kind, failure) => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-hold-'));
     const repo = 'web-everything/web-everything';
+    // A real 40-hex head: the strict resolver binds the excusal to the commit it was read for.
+    const holdHead = 'a'.repeat(40);
     const labels = [{ name: 'review:pending' }];
     const gate = { id: 5022, name: 'merge-gate', status: 'completed', conclusion: 'failure',
       started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:06:00Z',
@@ -140,12 +142,12 @@ describe('abandoned builder draft recovery', () => {
       }] }) },
       isPidAlive: () => false, listAgents: () => [],
       api: vi.fn(path => path.startsWith('pulls/')
-        ? { draft: true, state: 'open', labels, head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: repo } } }
-        : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+        ? { draft: true, state: 'open', labels, head: { ref: candidate.laneRef, sha: holdHead, repo: { full_name: repo } } }
+        : path === `commits/${holdHead}` ? { commit: { committer: { date: candidate.headCommittedAt } } }
         : { check_runs: checks }),
       mergeGateSetting: kind === 'off' ? 'off' : 'on',
       readMergeGateVerdict: vi.fn(() => kind === 'unreadable' ? { error: 'log unavailable' }
-        : { num: 5012, head_sha: 'abc', ok: false, results: [result],
+        : { num: 5012, head_sha: holdHead, ok: false, results: [result],
           completed_at: gate.completed_at, mainCiGreen: true }),
       readFreeze: vi.fn(() => ({ frozen: false, publishedAt: '2026-09-30T02:00:00Z' })),
       ...(kind === 'throws' ? { excuseMergeGateRows: () => { throw new Error('excusal unavailable'); } } : {}),

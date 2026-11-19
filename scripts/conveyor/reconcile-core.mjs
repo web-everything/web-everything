@@ -564,7 +564,7 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
   if (!rows.length || rows.some(row =>
     ['queued', 'in_progress', 'pending', 'waiting', 'requested'].includes(String(row?.status ?? row?.state).toLowerCase())
     || String(row?.state).toLowerCase() === 'expected')) return null;
-  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
+  const gate = reviewStartGate({ headSha: pr.headRefOid, requiredChecks, checks: pr.statusCheckRollup, rowsComplete: pr.rowsComplete === true && pr.rowsHead === pr.headRefOid, verifyGreen: pr.verifyGreen, policy: pr.reviewTiming });
   // 'ci-not-registered' is the early-start gate's name for the same all-missing shape (startEarly shadow/on).
   if (gate.allowed || !['required-checks-not-successful', 'ci-not-registered'].includes(gate.reason) || !gate.affected.length
       || gate.affected.some(row => row.reason !== 'missing')) return null;
@@ -1580,8 +1580,12 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
  * reviewHoldCiWaivable({ pr, requiredChecks: ['review-gate', 'merge-gate'] });
  */
 export function reviewHoldCiWaivable({ pr, requiredChecks }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr?.reviewTiming });
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup,
+    rowsComplete: pr?.rowsComplete === true && pr?.rowsHead === pr?.headRefOid,
+    verifyGreen: pr?.verifyGreen, policy: pr?.reviewTiming });
   if (ci.allowed) return true;
+  // Unknown or incomplete evidence (stale or unpaged snapshot) never waives the CI wait.
+  if (ci.unknown || ci.reason === 'rows-incomplete') return false;
   const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   const annotated = rollup.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
   return Array.isArray(ci.affected) && ci.affected.length > 0
@@ -1592,11 +1596,14 @@ export function reviewHoldCiWaivable({ pr, requiredChecks }) {
 
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup,
+    rowsComplete: pr?.rowsComplete === true && pr?.rowsHead === pr?.headRefOid,
+    verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, pr?.headRefOid));
+  const allowed = ci.allowed || (!ci.unknown && ci.reason !== 'rows-incomplete'
+    && onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, pr?.headRefOid));
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -1747,8 +1754,9 @@ function dispatchReviewRow({
       // A targeted-check agent is a review emission too, so a required `review-gate` conflict still refuses it
       // (the early planner refusal no longer reaches a `needs-human` PR). Other required-check states are
       // deliberately NOT applied here: converting a superseded verdict never waited on CI (#xconv1).
-      const convertCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
-      if (convertCi.reason === 'required-review-gate-conflict') {
+      // Unknown or incomplete evidence still refuses: it cannot prove conversion safe.
+      const convertCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true });
+      if (convertCi.unknown || convertCi.reason === 'required-review-gate-conflict') {
         refuse('review-ci', {
           ...withPhase, ...extra, ci: convertCi,
           why: `${convertCi.reason}: ${convertCi.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2244,7 +2252,7 @@ export function planReconcile({
   // Optional and pure DATA IN: this file stays IO-free, so the caller (`we:scripts/conveyor/reconcile-pass.mjs`)
   // is the one that fetches (and caches) the live set; omitted, `classifyPr` falls back to its own exclusion-
   // list default unchanged — byte-identical behaviour to before this param existed.
-  requiredChecks = null, reviewTiming = REVIEW_TIMING_DEFAULTS, fixTiming = FIX_TIMING_DEFAULTS,
+  requiredChecks = null, rosterSource, reviewTiming = REVIEW_TIMING_DEFAULTS, fixTiming = FIX_TIMING_DEFAULTS,
   advisoryReviewOnHumanHandoff = 'off', unlabeledRedAgentPr = 'off',
   // xilx617 (epic #4075/#3383) — the bound a `live-process` refusal must overrun before it also gets a
   // surfaced `session-overrun` note (see {@link LIVE_SESSION_OVERRUN_MS}'s own docblock). A `planReconcile`
@@ -2331,7 +2339,7 @@ export function planReconcile({
         && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN'
         && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
         && !pr.codeqlFailure
-        && ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })
+        && ciGreenForEscalation({ headSha: pr.headRefOid, rowsHead: pr.rowsHead, rowsComplete: pr.rowsComplete === true, rollup: pr.statusCheckRollup, requiredChecks, rosterSource })
         && latestCiHealEscalationForHead(pr.comments, pr.headRefOid, {
           baseHead: pr.escalationBaseHead ?? null, recheck: verdictSettings.recheckNotCiBreak,
           voidNeedsHuman: verdictSettings.voidNeedsHumanWhenCiGreen,
@@ -3012,7 +3020,7 @@ export function planReconcile({
     // affected check. Any other failing required check, and every non-`ci-red` phase (a bounced PR owed a
     // fixer, an advisory-fix PR), falls through so its repair ownership is intact; review emission is
     // already gated separately by {@link reviewChecksAllow}.
-    const reviewCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
+    const reviewCi = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, rowsHead: pr?.rowsHead, rowsComplete: pr?.rowsComplete === true });
     // LIVE INCIDENT 2026-10-04, PR #3833: `classifyPr` ranks `review:human` ('needs-human') ABOVE `ci-red`, so a
     // `review:human` PR with a genuinely red required check never entered the `ci-red` branch below — the
     // main-red watch logged "owed a ci-heal" and the review row logged `review-ci`, and NOBODY planned the heal

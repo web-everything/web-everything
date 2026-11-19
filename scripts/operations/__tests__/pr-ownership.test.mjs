@@ -14,8 +14,10 @@ const NOW = Date.parse('2026-09-24T20:00:00.000Z');
 const ago = (min) => new Date(NOW - min * 60_000).toISOString();
 const GREEN = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
 const pr = (number, labels, extra = {}) => ({
-  number, headRefName: `lane/${number}-thing`, headRefOid: `sha${number}`, baseRefName: 'main',
+  // A real 40-hex head: the review CI contract refuses evidence it cannot bind to a commit.
+  number, headRefName: `lane/${number}-thing`, headRefOid: String(number).padStart(40, '0'), baseRefName: 'main',
   labels: labels.map((name) => ({ name })), mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN, comments: [],
+  rowsComplete: true, rowsHead: extra.headRefOid ?? String(number).padStart(40, '0'),
   isDraft: false, ...extra,
 });
 

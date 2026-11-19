@@ -60,13 +60,14 @@ describe('classifyStartupFailureGate', () => {
 describe('startup-failure stale merge-gate refresh', () => {
   const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
   function options(extra = {}) {
+    const snapshot = extra.pr ?? { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] };
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
-      pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
       requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
       cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
+      pr: { rowsHead: snapshot.headRefOid, rowsComplete: true, ...snapshot },
     };
   }
   it('refreshes once with runId and shares the ledger bound when newHead equals head', async () => {
@@ -84,6 +85,12 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect(o.readVerdict).not.toHaveBeenCalled();
     expect(o.readFreeze).not.toHaveBeenCalled();
     expect(o.readAcceptance).not.toHaveBeenCalled();
+  });
+  it.each([{ rowsComplete: false }, { rowsHead: null }, { rowsHead: 'b'.repeat(40) }])('never refreshes from unproven snapshots: %j', async evidence => {
+    const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')], ...evidence } });
+    await expect(handleStaleMergeGate(o)).resolves.toEqual({ handled: false });
+    expect(o.readGateRuns).not.toHaveBeenCalled();
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
   });
   it('refreshes when the merge-gate row is missing (startup_failure leaves no check-run)', async () => {
     const o = options({ pr: { headRefOid: HEAD, statusCheckRollup: [green('test')] } });

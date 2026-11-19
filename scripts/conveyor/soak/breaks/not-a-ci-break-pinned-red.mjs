@@ -20,15 +20,20 @@ export default {
     const { buildCiHealEscalationComment, buildCiHealVerdictVoidComment, latestCiHealEscalationForHead, notCiBreakRecordRefusal } = await import(pathToFileURL(join(root, 'scripts/conveyor/ci-heal-escalation-mark.mjs')).href);
     const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../__tests__/fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
     const headSha = fixture.headRefOid;
+    // This replay supplies a complete feed on the captured head, with the live roster
+    // recorded in the fixture. Historical gh JSON alone carries no pagination proof.
+    fixture.rowsHead = headSha;
+    fixture.rowsComplete = true;
     const red = contradictingChecks({ escalation: latestCiHealEscalationForHead(fixture.comments, headSha, { recheck: true }),
-      headSha, rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks });
+      headSha, rowsHead: fixture.rowsHead, rowsComplete: fixture.rowsComplete, rosterSource: 'live',
+      rollup: fixture.statusCheckRollup, requiredChecks: fixture.requiredChecks });
     if (!red.length) violations.push('required red test does not contradict the not-a-ci-break verdict');
     const comments = [...fixture.comments, { author: { login: 'web-everything' }, createdAt: '2026-10-09T05:00:00Z',
       body: buildCiHealVerdictVoidComment({ headSha, red }) }];
     if (latestCiHealEscalationForHead(comments, headSha, { recheck: true }) !== null) violations.push('trusted void leaves the head pinned');
     const statusCheckRollup = fixture.statusCheckRollup.filter((r) => r.startedAt <= fixture.escalationAt)
       .map((r) => r.completedAt > fixture.escalationAt ? { ...r, status: 'IN_PROGRESS', conclusion: null } : r);
-    if (notCiBreakRecordRefusal({ headSha, pr: { ...fixture, statusCheckRollup }, requiredChecks: fixture.requiredChecks }) === null) {
+    if (notCiBreakRecordRefusal({ headSha, pr: { ...fixture, statusCheckRollup }, requiredChecks: fixture.requiredChecks, rosterSource: 'live' }) === null) {
       violations.push('unfinished required checks allow recording not-a-ci-break');
     }
     // PR #4560 review: a void is owed per VERDICT. A second contradicted verdict on a head that already has a void
@@ -38,7 +43,7 @@ export default {
       body: buildCiHealEscalationComment({ headSha, outcome: 'not-a-ci-break', reason: 'second verdict' }) };
     const second = planVerdictVoid({ note: { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha, prNumber: 4535 },
       pr: { ...fixture, comments: [...comments, verdict] }, repo: fixture.repo, verdictSettings: { recheckNotCiBreak: true },
-      readRequiredChecks: () => fixture.requiredChecks });
+      readRequiredChecks: () => ({ checks: fixture.requiredChecks, source: 'live' }) });
     if (!second || second.alreadyPosted) violations.push('a later contradicted verdict on an already-voided head is never voided');
     return { violations };
   },

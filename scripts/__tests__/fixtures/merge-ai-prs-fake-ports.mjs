@@ -32,6 +32,18 @@ if (a[0] === 'api') {
       out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:(!!pr.inQueue && (!pr.loseQueueAfterAdmission || reads === 1)) || fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
     }
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
+    // Per-head rollup evidence (enrichPrRollupEvidence): like GitHub, a commit's rollup holds only its own checks.
+    if (q.includes(':object(oid:')) {
+      const repository = {};
+      for (const [, alias, oid] of q.matchAll(/(h\d+):object\(oid:"([0-9a-f]{40})"\)/g)) {
+        const nodes = (oid === pr.headRefOid ? pr.statusCheckRollup || [] : []).filter(r => !r.head_sha || r.head_sha === oid)
+          .map(r => r.context ? { __typename:'StatusContext', context:r.context, state:r.state }
+            : { __typename:'CheckRun', name:r.name, status:r.status, conclusion:r.conclusion, detailsUrl:r.detailsUrl });
+        repository[alias] = oid === pr.headRefOid
+          ? { oid, statusCheckRollup: { contexts: { pageInfo:{hasNextPage:false}, totalCount:nodes.length, nodes } } } : null;
+      }
+      out({ data: { repository } });
+    }
     const [owner, name] = process.env.PRESTAGE_REPO.split('/');
     if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
     out(page([pr], q));

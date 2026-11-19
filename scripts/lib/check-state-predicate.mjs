@@ -143,6 +143,17 @@ const evidenceJob = row => {
   } catch { return undefined; }
 };
 
+// The merge-gate producer's workflow-protection review hold (merge-gate-hold-class): exactly one
+// review-acceptance hold, optionally with the red-team check the review itself produces. Nothing else.
+const workflowProtectionHold = hold => hold?.workflowEditProtection === true
+  && hold.holdIds.length <= 2 && hold.holdIds.filter(id => id === 'review-acceptance').length === 1
+  && hold.holdIds.every(id => id === 'review-acceptance' || id === 'red-team');
+
+// In-process producer proof only: JSON check feeds and persisted snapshots cannot forge it.
+// The REST reader binds this after exhausting each attempt's job inventory and proving
+// exactly one job has this name. Job IDs themselves change across Actions reruns.
+export const ACTIONS_JOB_SLOT = Symbol('validated-actions-job-slot');
+
 // Completed is a lifecycle marker, not an outcome. Compare only explicit
 // outcome categories, before legacy mapping or hold excusal rewrites evidence.
 // A present state has its own closed vocabulary, independent of conclusions.
@@ -164,9 +175,10 @@ const contradictoryEvidence = row => {
   return new Set(outcomes).size > 1;
 };
 
-// A name/run pair alone cannot identify a matrix job. Prefer the Actions job
-// identity; otherwise require the same check-run identity, never infer lineage.
+// A name/run pair alone cannot identify a matrix job. Accept a name only with
+// producer-bound inventory proof; otherwise require the same job/check identity.
 const evidenceIdentity = row => {
+  if (row?.[ACTIONS_JOB_SLOT] && row[ACTIONS_JOB_SLOT] === evidenceName(row)) return `slot:${row[ACTIONS_JOB_SLOT]}`;
   const job = evidenceInteger(evidenceJob(row));
   if (job !== null) return `job:${job}`;
   const check = evidenceInteger(row?.check_run_id ?? row?.databaseId ?? row?.id);
@@ -174,10 +186,10 @@ const evidenceIdentity = row => {
 };
 
 /** Resolve required evidence without guessing a roster, head, attempt order, or read completeness.
- * Every required name needs its own evidence; historical implication options are ignored.
+ * Implication is opt-in via allowImplication (default false); only the review-ci-gate adapter opts in.
  * rowsComplete is true only after exhausting pages or explicitly fetching every required name.
  */
-export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [] } = {}) {
+export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNames, rosterSource, head, holds = [], optionalNames = [], allowImplication = false } = {}) {
   const perName = Object.create(null), reasons = [];
   const validNames = names => Array.isArray(names) && [...names].every(n => typeof n === 'string' && n.trim());
   if (!['live', 'cache'].includes(rosterSource) || !validNames(requiredNames) || !requiredNames.length) reasons.push('roster-unavailable');
@@ -220,7 +232,8 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       const job = evidenceInteger(evidenceJob(row));
       if (job !== null && candidates.some(hold => evidenceInteger(hold?.jobId) === job
         && rowHead !== null && sha(hold?.headSha) === rowHead && Array.isArray(hold?.holdIds) && hold.holdIds.length
-        && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only)) state = 'held';
+        && (humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only
+          || workflowProtectionHold(hold)))) state = 'held';
     }
     return { row, name, state, reasons: why, rowHead, identity: evidenceIdentity(row), run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
   });
@@ -242,6 +255,9 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       reasons: active.length ? [...new Set(active.flatMap(r => r.reasons))].sort() : ['missing'] };
   };
   for (const name of [...new Set(requiredNames)].sort()) perName[name] = resolveName(name);
+  if (allowImplication === true && Object.hasOwn(perName, 'integration') && !classified.some(r => r.name === 'integration') && resolveName('test').state === 'pass') {
+    perName.integration = { state: 'pass', rows: [], via: 'test', rerunInFlight: false, reasons: [] };
+  }
   return { state: reasons.length ? 'unknown' : worstEvidence(Object.values(perName).map(r => r.state)), perName,
     reasons: [...new Set([...reasons, ...Object.values(perName).flatMap(r => r.reasons)])].sort() };
 }

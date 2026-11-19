@@ -292,6 +292,8 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const { MAX_VERDICT_VOIDS_PER_HEAD, planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
   const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
   const head = fixture.headRefOid;
+  fixture.rowsHead = head;
+  fixture.rowsComplete = true;
   const settings = { recheckNotCiBreak: true };
   const voidComment = (headSha = head) => ({ author: AUTOMATION, createdAt: '2026-10-09T05:00:00Z',
     body: buildCiHealVerdictVoidComment({ headSha, red: ['test'] }) });
@@ -299,7 +301,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const escalation = latest(fixture.comments);
   const asOf = fixture.statusCheckRollup.filter((r) => r.startedAt <= fixture.escalationAt)
     .map((r) => r.completedAt > fixture.escalationAt ? { ...r, status: 'IN_PROGRESS', conclusion: null } : r);
-  const refusal = (overrides = {}) => notCiBreakRecordRefusal({ headSha: head, pr: fixture, requiredChecks: fixture.requiredChecks, ...overrides });
+  const refusal = (overrides = {}) => notCiBreakRecordRefusal({ rosterSource: 'live', headSha: head, pr: fixture, requiredChecks: fixture.requiredChecks, ...overrides });
 
   it('finds the real escalation and voids it only with rechecking enabled', () => {
     expect(escalation).toMatchObject({ outcome: 'not-a-ci-break', headSha: head, createdAt: fixture.escalationAt });
@@ -330,17 +332,32 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     expect(refusal()).toContain('red: test');
     expect(refusal()).toContain('IS a CI break');
   });
+  it('refuses an all-green rollup without completeness proof and preserves human escalation', () => {
+    const pr = { ...fixture, rowsComplete: false,
+      statusCheckRollup: fixture.requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })) };
+    expect(refusal({ pr })).toContain('check-evidence');
+    expect(needsHumanGateOnlyRefusal({ rosterSource: 'live', headSha: head, pr, requiredChecks: fixture.requiredChecks })).toBeNull();
+  });
   it('accepts all required checks green', () => {
     const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
     expect(refusal({ pr: { ...fixture, statusCheckRollup } })).toBeNull();
   });
-  it('does not judge a different head or unknown required set', () => {
+  it('does not judge a different head', () => {
     expect(refusal({ headSha: 'abcdef0123456789' })).toBeNull();
-    expect(refusal({ requiredChecks: [] })).toBeNull();
   });
 
   const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
-    readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
+    readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ source: 'live', checks: fixture.requiredChecks })) });
+
+  it.each([[[]], [undefined], [null]])('refuses an unavailable roster (%j) without using observed names', async requiredChecks => {
+    for (const conclusion of ['FAILURE', 'SUCCESS']) {
+      const pr = { ...fixture, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion }] };
+      expect(refusal({ pr, requiredChecks })).toContain('check-evidence');
+      const result = await checkNotCiBreakRecordable({ ...recordOptions(), readPr: () => pr,
+        readRequired: () => ({ checks: requiredChecks, source: 'fallback' }) });
+      expect(result.refusal).toContain('check-evidence');
+    }
+  });
 
   it.each([
     ['not-a-ci-break', checkNotCiBreakRecordable],
@@ -351,7 +368,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
         const rows = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }, malformed];
         await expect(preflight({ ...recordOptions(), outcome,
           readPr: () => ({ ...fixture, statusCheckRollup: reverse ? rows.toReversed() : rows }),
-          readRequired: async () => ({ checks: ['test'] }),
+          readRequired: async () => ({ source: 'live', checks: ['test'] }),
         })).rejects.toThrow(TypeError);
       }
     }
@@ -362,7 +379,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     const gatePr = (statusCheckRollup = [check('test', 'SUCCESS'), check('review-gate', 'FAILURE')]) => ({
       ...fixture, statusCheckRollup,
     });
-    const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({
+    const humanRefusal = (overrides = {}) => needsHumanGateOnlyRefusal({ rosterSource: 'live',
       headSha: head, pr: gatePr(), requiredChecks: ['test'], ...overrides,
     });
     it.each([1, 2, 3])('does not match a --head prefix of %i characters', length => {
@@ -370,7 +387,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     });
 
     const humanOptions = () => ({ ...recordOptions(), outcome: 'needs-human',
-      readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ checks: ['test'] })) });
+      readPr: vi.fn(() => gatePr()), readRequired: vi.fn(async () => ({ source: 'live', checks: ['test'] })) });
 
     const requiredStates = ['SUCCESS', 'FAILURE', 'CANCELLED', 'STALE', 'IN_PROGRESS', 'MISSING'];
     const gateStates = ['SUCCESS', 'FAILURE', 'IN_PROGRESS', 'MISSING'];
@@ -381,14 +398,15 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
           : [check(name, value === 'IN_PROGRESS' ? null : value,
             { status: value === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'COMPLETED',
               ...(name === 'merge-gate' && value === 'FAILURE'
-                ? { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } } : {}) })];
+                ? { detailsUrl: 'https://github.com/example/repo/actions/runs/100/job/123',
+                  mergeGateReviewHold: { holds: ['review-acceptance'], holdIds: ['review-acceptance'], headSha: head, jobId: 123 } } : {}) })];
         const readers = { readPr: () => gatePr([...row('test', required), ...row(gate, state)]),
-          readRequired: async () => ({ checks: ['test', gate] }) };
+          readRequired: async () => ({ source: 'live', checks: ['test', gate] }) };
         const human = await checkNeedsHumanEscalable({ ...humanOptions(), ...readers });
         const notCi = await checkNotCiBreakRecordable({ ...recordOptions(), ...readers });
         expect(human.refusal !== null).toBe(required === 'SUCCESS' && state === 'FAILURE');
         expect(notCi.refusal !== null).toBe(required !== 'SUCCESS'
-          || (gate === 'merge-gate' && ['IN_PROGRESS', 'MISSING'].includes(state)));
+          || ['IN_PROGRESS', 'MISSING'].includes(state));
       },
     );
 
@@ -431,7 +449,8 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
 
     it('a proven merge-gate review hold refuses needs-human and names the gate', () => {
       expect(humanRefusal({ pr: gatePr([check('test', 'SUCCESS'), check('merge-gate', 'FAILURE',
-        { mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 123 } })]) }))
+        { detailsUrl: 'https://github.com/example/repo/actions/runs/100/job/123',
+                  mergeGateReviewHold: { holds: ['review-acceptance'], holdIds: ['review-acceptance'], headSha: head, jobId: 123 } })]) }))
         .toEqual(expect.stringContaining('merge-gate'));
     });
 
@@ -453,7 +472,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
         check('test', 'FAILURE', { __typename: 'CheckRun', completedAt: '2026-10-28T02:00:00Z' }),
       ];
       const pr = gatePr([...(reverse ? rows.toReversed() : rows), check('review-gate', 'FAILURE')]);
-      const readers = { readPr: vi.fn(() => pr), readRequired: vi.fn(async () => ({ checks: ['test'] })) };
+      const readers = { readPr: vi.fn(() => pr), readRequired: vi.fn(async () => ({ source: 'live', checks: ['test'] })) };
       await expect(checkNeedsHumanEscalable({ ...humanOptions(), ...readers })).resolves.toEqual({ refusal: null });
       await expect(checkNotCiBreakRecordable({ ...recordOptions(), ...readers })).resolves.toEqual({ refusal: expect.stringContaining('red: test') });
       expect(readers.readPr).toHaveBeenCalledTimes(2);
@@ -532,10 +551,10 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     expect(opts.readPr).not.toHaveBeenCalled();
     expect(opts.readRequired).not.toHaveBeenCalled();
   });
-  it('reports a read warning without refusing on missing evidence', async () => {
+  it('refuses not-a-ci-break with an operator fallback on unreadable evidence', async () => {
     const opts = recordOptions();
     opts.readPr.mockImplementation(() => { throw new Error('offline'); });
-    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: null, warning: expect.stringContaining('offline') });
+    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: expect.stringContaining('inspect complete checks'), warning: expect.stringContaining('offline') });
     expect(opts.readRequired).not.toHaveBeenCalled();
   });
   it('refuses with injected PR and asynchronous required-check readers', async () => {
@@ -547,7 +566,11 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
 
   const note = { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha: head, prNumber: 4535 };
   const planOptions = () => ({ note, pr: fixture, repo: fixture.repo, verdictSettings: settings,
-    readRequiredChecks: vi.fn(() => fixture.requiredChecks) });
+    readRequiredChecks: vi.fn(() => ({ checks: fixture.requiredChecks, source: 'live' })) });
+  it.each([undefined, 'fallback', 'declared'])('daemon verdict void preserves unavailable roster source %s', source => {
+    expect(planVerdictVoid({ ...planOptions(),
+      readRequiredChecks: () => ({ checks: fixture.requiredChecks, source }) })).toBeNull();
+  });
   it('plans a verdict void from the daemon note and deduplicates a trusted void', () => {
     expect(planVerdictVoid(planOptions())).toMatchObject({ kind: 'ci-heal-verdict-void', alreadyPosted: false, body: voidComment().body });
     expect(planVerdictVoid({ ...planOptions(), pr: { ...fixture, comments: [...fixture.comments, voidComment()] } })).toMatchObject({ alreadyPosted: true });
@@ -593,7 +616,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     it('the notes daemon posts the second void', () => {
       const postComment = vi.fn(() => ({ ok: true }));
       const result = runReconcileNotesAllRepos({ repos: [fixture.repo], verdictSettings: settings,
-        readRequiredChecks: () => fixture.requiredChecks, dryRun: false, postComment,
+        readRequiredChecks: () => ({ checks: fixture.requiredChecks, source: 'live' }), dryRun: false, postComment,
         tick: () => ({ notes: [note], prsByNumber: new Map([[4535, prWith([verdict(1), voidComment(), verdict(2)])]]) }) });
       expect(postComment).toHaveBeenCalledTimes(1);
       expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', posted: true })]);
@@ -607,7 +630,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   it.each([true, false])('notes daemon plans/posts the void with dryRun=%s', (dryRun) => {
     const postComment = vi.fn(() => ({ ok: true }));
     const result = runReconcileNotesAllRepos({ repos: [fixture.repo], verdictSettings: settings,
-      readRequiredChecks: () => fixture.requiredChecks, dryRun, postComment,
+      readRequiredChecks: () => ({ checks: fixture.requiredChecks, source: 'live' }), dryRun, postComment,
       tick: () => ({ notes: [note], prsByNumber: new Map([[4535, fixture]]) }) });
     expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', body: voidComment().body, posted: !dryRun, dryRun })]);
     expect(postComment).toHaveBeenCalledTimes(dryRun ? 0 : 1);
@@ -744,6 +767,10 @@ for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile
     if (method === 'execFileSync' && args[0] === 'gh') {
       if (args[1][0] === 'pr' && args[1][1] === 'view') return JSON.stringify(facts);
       if (args[1][0] === 'api' && args[1].at(-1) === 'repos/web-everything/web-everything/actions/jobs/123') {
+      if (args[1][0] === 'api' && args[1].at(-1).includes('/check-runs?'))
+        return JSON.stringify([{ check_runs: facts.statusCheckRollup }]);
+      if (args[1][0] === 'api' && args[1].at(-1).includes('/status?'))
+        return JSON.stringify([{ statuses: [] }]);
         if (${JSON.stringify(evidence)} === 'unreadable') return 'invalid JSON';
         return JSON.stringify({ head_sha: ${JSON.stringify(evidence === 'other-head' ? 'a'.repeat(40) : HEAD)}, completed_at: '2026-10-29T03:00:00Z' });
       }
@@ -792,7 +819,7 @@ syncBuiltinESMExports();
       expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
         'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
       expect(reads.map(call => call.args[1][0] === 'api' ? call.args[1] : call.args[1].slice(0, 2))).toEqual([
-        ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
+        ['pr', 'view'], ['api', '--paginate'], ['api', '--paginate'], ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
           ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
           ...(evidence === 'unreadable' ? [] : [['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
         ] : []),
@@ -851,7 +878,7 @@ describe('needs-human verdict void', async () => {
     note: { kind: 'ci-heal-escalation-moot', prNumber: 5012, headSha: HEAD, outcome: 'needs-human' },
     repo: 'we', verdictSettings: { voidNeedsHumanWhenCiGreen: true },
     pr: { headRefOid: HEAD, state: 'OPEN', comments, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
-    readRequiredChecks: () => ['test'],
+    readRequiredChecks: () => ({ checks: ['test'], source: 'live' }),
   });
   it('preserves the original not-a-ci-break comment byte for byte', () => {
     expect(buildVoid({ headSha: HEAD, red: ['test'] })).toBe([
@@ -877,12 +904,20 @@ describe('needs-human verdict void', async () => {
     expect(notCiBreakVerdictVoidState([escalation('not-a-ci-break'), voidComment()], HEAD).voidCount).toBe(0);
     expect(needsHumanVoidState(comments, HEAD)).toEqual({ escalationIndex: 0, voided: true, voidCount: 1 });
   });
-  it('plans once per escalation, dedupes and caps', () => {
-    expect(planNeedsHumanVoid(options())).toMatchObject({ key: 'ci-heal-needs-human-void:5012:' + HEAD + ':0', alreadyPosted: false });
+  it.each([undefined, 'live', 'cache', 'fallback'])('daemon green retirement preserves roster source %s', source => {
+    const o = options();
+    const result = planNeedsHumanVoid({ ...o, pr: { ...o.pr, rowsHead: HEAD, rowsComplete: true },
+      readRequiredChecks: () => ({ checks: ['test'], source }) });
+    if (['live', 'cache'].includes(source)) expect(result).toMatchObject({ alreadyPosted: false });
+    else expect(result).toBeNull();
+  });
+  it('retains needs-human when the daemon snapshot cannot prove complete CI', () => {
+    // Cached rollups carry no pagination proof; no green claim may void a human escalation.
+    expect(planNeedsHumanVoid(options())).toBeNull();
     expect(planNeedsHumanVoid(options([escalation(), voidComment()]))).toMatchObject({ alreadyPosted: true });
     const cycles = Array.from({ length: MAX_VERDICT_VOIDS_PER_HEAD }, () => [escalation(), voidComment()]).flat();
     expect(planNeedsHumanVoid(options([...cycles, escalation()]))).toBeNull();
-    expect(planNeedsHumanVoid(options([escalation(), voidComment(), escalation()]))).toMatchObject({ alreadyPosted: false });
+    expect(planNeedsHumanVoid(options([escalation(), voidComment(), escalation()]))).toBeNull();
   });
   it('re-verifies facts and never falls through to an operator note', () => {
     const o = options();
@@ -903,13 +938,24 @@ describe('needs-human verdict void', async () => {
     const postComment = vi.fn(() => ({ ok: true }));
     runReconcileNotesAllRepos({ ...o, repos: ['we'], dryRun: false, postComment,
       tick: () => ({ notes: [o.note], prsByNumber: new Map([[5012, o.pr]]) }) });
-    expect(postComment).toHaveBeenCalledTimes(1);
-    expect(postComment).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('voids: needs-human') }));
+    // Unproven completeness retains the escalation; the operator/live path owns resolution.
+    expect(postComment).not.toHaveBeenCalled();
   });
 });
 
 
 describe('R4: default CLI check reader classifies merge-gate review holds', () => {
+  const prReader = facts => argv => {
+    if (!argv || argv[0] === 'pr') return JSON.stringify(facts);
+    const path = argv.at(-1);
+    if (path.includes('/check-runs?')) return JSON.stringify([{ check_runs: facts.statusCheckRollup.map(row => ({
+      ...row, head_sha: facts.headRefOid,
+      ...(row.name === 'merge-gate' ? { details_url: `https://github.com/example/repo/actions/runs/100/job/${row.id}` } : {}),
+    })) }]);
+    if (path.includes('/status?')) return JSON.stringify([{ statuses: [] }]);
+    throw Error('unexpected check read');
+  };
+
   const jobId = 123;
   const options = (overrides = {}) => {
     const facts = { number: 6042, url: 'https://github.com/example/repo/pull/6042',
@@ -918,9 +964,9 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
         { name: 'merge-gate', id: jobId, status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T13:00:00-04:00' },
       ] };
     return { pr: 6042, repo: 'example/repo', headSha: HEAD, outcome: 'needs-human',
-      settings: { recheckNotCiBreak: true }, readRequired: () => ({ checks: ['test', 'merge-gate'] }),
+      settings: { recheckNotCiBreak: true }, readRequired: () => ({ source: 'live', checks: ['test', 'merge-gate'] }),
       prChecksOptions: {
-        runGh: vi.fn(() => JSON.stringify(facts)),
+        runGh: vi.fn(prReader(facts)),
         readMergeGateVerdict: vi.fn(() => ({ num: 6042, head_sha: HEAD, ok: false,
           results: [{ id: 'review-acceptance', status: 'hold', reason: 'review pending' }] })),
         readFreeze: vi.fn(() => { throw new Error('freeze should be lazy'); }),
@@ -928,6 +974,31 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
       },
     };
   };
+
+
+  it('refuses a green claim when paged check IO fails, with an operator fallback', async () => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    opts.prChecksOptions.runGh.mockImplementation(argv => {
+      if (argv[0] === 'api') throw Error('checks offline');
+      return JSON.stringify(facts);
+    });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('inspect complete checks'), warning: expect.stringContaining('checks offline') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).not.toHaveBeenCalled();
+  });
+  it('refuses a green claim when the head moves during paged checks', async () => {
+    const opts = options();
+    const facts = JSON.parse(opts.prChecksOptions.runGh());
+    let headReads = 0;
+    opts.prChecksOptions.runGh.mockImplementation(argv => {
+      if (argv[0] === 'pr' && ++headReads === 2) return JSON.stringify({ ...facts, headRefOid: 'b'.repeat(40) });
+      return prReader(facts)(argv);
+    });
+    expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
+      .toEqual({ refusal: expect.stringContaining('inspect complete checks'), warning: expect.stringContaining('head changed') });
+    expect(opts.prChecksOptions.readMergeGateVerdict).not.toHaveBeenCalled();
+  });
 
   it('refuses needs-human through the real default reader with injected classifier I/O', async () => {
     const opts = options();
@@ -943,7 +1014,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     const opts = options();
     const facts = JSON.parse(opts.prChecksOptions.runGh());
     facts.labels = [{ name: 'review:pending' }];
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: expect.stringContaining('merge-gate') });
   });
 
@@ -987,7 +1058,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     });
     const facts = JSON.parse(opts.prChecksOptions.runGh());
     facts.labels = [];
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
     expect(await checkNeedsHumanEscalable(opts))
       .toEqual({ refusal: null, warning: expect.stringContaining('freeze unavailable') });
     expect(opts.prChecksOptions.readFreeze).toHaveBeenCalledTimes(1);
@@ -1008,7 +1079,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     const facts = JSON.parse(opts.prChecksOptions.runGh());
     facts.statusCheckRollup.push({ name: 'merge-gate', id: 99, run_id: 1, run_attempt: 2,
       status: 'COMPLETED', conclusion: 'FAILURE', completed_at: '2026-10-28T14:00:00-04:00' });
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: expect.stringContaining('merge-gate') });
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledTimes(2);
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
@@ -1025,7 +1096,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     facts.statusCheckRollup.push({ name: 'merge-gate', id: 99,
       status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T12:00:00-04:00' });
     if (reverse) facts.statusCheckRollup.reverse();
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: expect.stringContaining('red: merge-gate') });
@@ -1039,7 +1110,7 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
       { name: 'CodeQL', status: 'COMPLETED', conclusion: 'SUCCESS', run_attempt: 2 },
     );
     if (reverse) facts.statusCheckRollup.reverse();
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: expect.stringContaining('red: CodeQL') });
@@ -1050,8 +1121,8 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
     const facts = JSON.parse(opts.prChecksOptions.runGh());
     facts.statusCheckRollup.push({ name: 'MERGE-GATE', id: 999,
       status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-28T14:00:00-04:00' });
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
-    opts.readRequired = () => ({ checks: ['test', 'merge-gate', 'MERGE-GATE'] });
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
+    opts.readRequired = () => ({ source: 'live', checks: ['test', 'merge-gate', 'MERGE-GATE'] });
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: null });
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: expect.stringContaining('red: MERGE-GATE') });
@@ -1065,10 +1136,30 @@ describe('R4: default CLI check reader classifies merge-gate review holds', () =
       status: conclusion ? 'COMPLETED' : 'IN_PROGRESS', conclusion,
       started_at: '2026-10-28T14:00:00-04:00',
       ...(conclusion ? { completed_at: '2026-10-28T14:01:00-04:00' } : {}) });
-    opts.prChecksOptions.runGh.mockReturnValue(JSON.stringify(facts));
+    opts.prChecksOptions.runGh.mockImplementation(prReader(facts));
     expect(await checkNeedsHumanEscalable(opts)).toEqual({ refusal: conclusion ? expect.stringContaining('merge-gate') : null });
     expect(await checkNotCiBreakRecordable({ ...opts, outcome: 'not-a-ci-break' }))
       .toEqual({ refusal: conclusion ? null : expect.stringContaining('merge-gate') });
     expect(opts.prChecksOptions.readMergeGateVerdict).toHaveBeenCalledWith({ repo: 'example/repo', prNumber: 6042, jobId });
+  });
+});
+
+describe('PR1 recording roster provenance', async () => {
+  const { checkNotCiBreakRecordable, checkNeedsHumanEscalable } = await import('../ci-heal-escalation-mark.mjs');
+  const head = 'a'.repeat(40);
+  const options = { pr: 123, repo: 'o/r', headSha: head, settings: { recheckNotCiBreak: true },
+    readPr: () => ({ headRefOid: head, rowsHead: head, rowsComplete: true, statusCheckRollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
+      { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
+    ] }) };
+  it.each([undefined, 'fallback', 'declared', 'unavailable'])('preserves unavailable roster source %s through both preflights', async source => {
+    const readRequired = () => ({ checks: ['test'], ...(source === undefined ? {} : { source }) });
+    expect((await checkNotCiBreakRecordable({ ...options, outcome: 'not-a-ci-break', readRequired })).refusal).toContain('check-evidence');
+    expect((await checkNeedsHumanEscalable({ ...options, outcome: 'needs-human', readRequired })).refusal).toBeNull();
+  });
+  it.each(['live', 'cache'])('preserves trusted roster source %s through both preflights', async source => {
+    const readRequired = () => ({ checks: ['test'], source });
+    expect((await checkNotCiBreakRecordable({ ...options, outcome: 'not-a-ci-break', readRequired })).refusal).toBeNull();
+    expect((await checkNeedsHumanEscalable({ ...options, outcome: 'needs-human', readRequired })).refusal).toContain('only review-gate');
   });
 });

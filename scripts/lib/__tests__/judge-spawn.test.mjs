@@ -560,6 +560,29 @@ describe('judgeSpawn — the one function a `judge` step calls, exercised over a
     expect(seen.opts.env).toEqual({ A: '1', WE_CONVEYOR_WORKER: '1' });
   });
 
+  it.each([
+    ['empty error evidence', { error: [] }, '', 0, false],
+    ['execution error in quota message', { result: "You've hit your weekly limit · resets tomorrow\nexecution error" }, '', 0, false],
+    ['stderr diagnostic', {}, 'execution error', 0, false],
+    ['nonzero exit', {}, '', 1, false],
+    ['pure whitelisted quota', {}, '', 0, true],
+  ])('records quota-only evidence: %s', async (_, extra, stderr, code, quotaOnly) => {
+    const result = "You've hit your weekly limit · resets tomorrow";
+    const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result, ...extra }), { code, stderr });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn }).catch(e => e);
+    expect(error).toMatchObject({ quota: true, quotaOnly, otherFailures: expect.any(Array),
+      telemetry: { failureKind: 'provider-quota', quotaOnly, exitCode: code } });
+    expect(error.otherFailures.length === 0).toBe(quotaOnly);
+  });
+
+  it('throws a quota error with process metadata for a lone stderr JSON event', async () => {
+    const message = "You've hit your weekly limit · resets tomorrow";
+    const { fn } = fakeSpawn('', { stderr: JSON.stringify({ type: 'error', message }) });
+    const error = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn }).catch(e => e);
+    expect(error).toMatchObject({ quota: true, quotaOnly: true, otherFailures: [],
+      telemetry: { exitCode: 0, signal: null, quotaOnly: true } });
+  });
+
   it('throws the juror\'s OWN failure text rather than a paraphrase', async () => {
     const { fn } = fakeSpawn(JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), { code: 1 });
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, spawnFn: fn }))

@@ -19,6 +19,8 @@ const snapshot = (extra = {}) => ({
   number: NUMBER, state: 'OPEN', isDraft: false, headRefName: 'lane/5454', headRefOid: HEAD,
   labels: [{ name: 'review:pending' }, { name: 'checking' }], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+  // Complete check evidence read at the snapshot's own head (the review CI contract).
+  rowsComplete: true, rowsHead: Object.hasOwn(extra, 'headRefOid') ? extra.headRefOid : HEAD,
   comments: [], ...extra,
 });
 const input = (extra = {}) => ({

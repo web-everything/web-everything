@@ -51,7 +51,8 @@ const module_default = {
         const raw = JSON.parse(readFileSync(existsSync(path) ? path : join(ROOT, 'scripts/conveyor/__tests__/fixtures', `pr-${n}-stale-referral-hold.json`), 'utf8'));
         return { ...raw, comments: raw.comments.map(c => (BOTS.has(c.author?.login) ? { ...c, author: { login: 'web-everything' } } : c)) };
       };
-      const asPr = (f, comments = f.comments) => ({ number: f.number, headRefOid: f.headRefOid, body: f.body, createdAt: f.createdAt, isDraft: false,
+      const asPr = (f, comments = f.comments) => ({ number: f.number, headRefOid: f.headRefOid,
+        rowsHead: f.headRefOid, rowsComplete: true, body: f.body, createdAt: f.createdAt, isDraft: false,
         baseRefName: 'main', labels: f.labels.map(name => ({ name: name === 'review:human' ? 'review:pending' : name })), comments,
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'ci' }] });
       // Hold clock inside the verdict write-back grace of the head's last finished run: a review:pending PR past it is the

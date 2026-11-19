@@ -52,7 +52,7 @@ const comments = [
   comment('11T01:17:40', '🔀 conveyor rebase-onto-main'),
   ...['10T14:45:15', '10T20:28:30', '10T21:50:09', '11T01:22:19', '11T02:18:51', '11T04:39:04'].map((t) => comment(t, `${BOUNCE_PREFIX}\n\n### Findings\n- repair needed\n\nNet basis: \`${'0'.repeat(40)}..${commits[1].sha}\``)),
 ];
-const pr = { number: 4757, headRefOid: head, headRefName: 'lane/fixer-resume-ladder', baseRefName: 'lane/fixer-history-takeover',
+const pr = { number: 4757, rowsComplete: true, rowsHead: head, headRefOid: head, headRefName: 'lane/fixer-resume-ladder', baseRefName: 'lane/fixer-history-takeover',
   labels: ['review:pending', 'review-round:5'].map((name) => ({ name })), isDraft: false, createdAt: at('10T12:00:00'),
   files: [{ path: 'scripts/conveyor/reconcile-core.mjs' }], comments,
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],

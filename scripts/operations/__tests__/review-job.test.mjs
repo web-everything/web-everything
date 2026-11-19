@@ -434,8 +434,8 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
       readChecks: args => {
         reads.push(['checks', args]);
         if (state === 'error') throw new Error('offline');
-        return [{ name: 'test', status: 'completed', conclusion: 'success' },
-          ...(state === 'missing' ? [] : [{ name: 'daemon-soak', status: state === 'pending' ? 'in_progress' : 'completed', conclusion: state === 'red' ? 'failure' : 'success' }])];
+        return Object.defineProperty([{ name: 'test', status: 'completed', conclusion: 'success' },
+          ...(state === 'missing' ? [] : [{ name: 'daemon-soak', status: state === 'pending' ? 'in_progress' : 'completed', conclusion: state === 'red' ? 'failure' : 'success' }])], 'rowsComplete', { value: true });
       },
     });
     const out = dispatchReviewJob({ pr: 3432, repo: REPO, root: '/daemon', dir, ciGate,
@@ -465,7 +465,7 @@ it('x6n7c2p required checks before review — default job four-tick soak spends 
         checkStaleness: FRESH, readCompletion: () => null, resolveSettingsEnv: () => ({}),
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green', startEarly: 'off' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
-          readChecks: () => [{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }],
+          readChecks: () => Object.defineProperty([{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }], 'rowsComplete', { value: true }),
         }), spawnJob: () => { spawns++; return 4242; },
       }),
     });

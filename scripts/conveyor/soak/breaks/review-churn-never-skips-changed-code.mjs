@@ -20,7 +20,7 @@ export default {
     const accept = (head, h) => ({ author: bot, createdAt: `2026-10-10T0${h}:00:00Z`, body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
     const comments = [accept(sha('a'), 1), accept(sha('b'), 2), accept(sha('c'), 3)];
     const head = sha('d');
-    const mk = (settings) => ({ number: 7, headRefName: 'lane/x-thing', headRefOid: head, baseRefName: 'main', isDraft: false,
+    const mk = (settings) => ({ number: 7, headRefName: 'lane/x-thing', rowsComplete: true, rowsHead: head, headRefOid: head, baseRefName: 'main', isDraft: false,
       createdAt: '2026-10-10T00:00:00Z', labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }], comments,
       reviewChurn: { settings, headTree: sha('9'), trees: { [sha('a')]: sha('8') } } });

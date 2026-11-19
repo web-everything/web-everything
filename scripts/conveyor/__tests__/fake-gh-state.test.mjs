@@ -17,7 +17,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFakeGithub, addLabelsPure, removeLabelsPure, applyBranchDeletionPure, requirePr } from './helpers/fake-gh.mjs';
 import { git, writeLocalIdentity, DEFAULT_BRANCH } from '../../operations/__tests__/helpers/real-repo.mjs';
-import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
+import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged, enrichPrRollupEvidence } from '../../lib/pr-list-paged.mjs';
+import { readReviewChecks } from '../../lib/review-ci-gate-io.mjs';
+import { reviewCiGate } from '../../lib/review-ci-gate.mjs';
 import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
 import { readCompletePrComments } from '../pr-comments-complete.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
@@ -80,6 +82,39 @@ function ghExecAsync(gh, args, cwd) {
 }
 
 describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
+  it('serves exact-head connection proof and marks more than 100 contexts incomplete', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-check-proof-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/check-proof');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/check-proof', title: 'check proof' });
+    gh.setChecks(SLUG, number, [{ name: 'test', conclusion: 'SUCCESS' }]);
+    const exec = (_command, args) => ghExec(gh, args, clonePath);
+    const [pr] = listOpenPrsLightPaged({ repo: SLUG, pageSize: 2, pageRetries: 0, exec }).rows;
+    expect(pr).toMatchObject({ rowsComplete: true, rowsHead: pr.headRefOid });
+    gh.setChecks(SLUG, number, Array.from({ length: 101 }, (_, i) => ({ name: `check-${i}` })));
+    enrichPrRollupEvidence({ repo: SLUG, rows: [pr], exec });
+    expect(pr).toMatchObject({ rowsComplete: false, rowsHead: pr.headRefOid });
+    expect(pr.statusCheckRollup).toHaveLength(100);
+    pr.headRefOid = 'f'.repeat(40);
+    enrichPrRollupEvidence({ repo: SLUG, rows: [pr], exec });
+    expect(pr).toMatchObject({ rowsComplete: false, rowsHead: null });
+  });
+
+  it('serves distinct Actions rerun jobs through the production reader and strict gate', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-rerun-proof-');
+    const gh = makeGithub(originPath);
+    seedBranchAt(originPath, 'lane/rerun-proof');
+    const number = gh.openPr({ repo: SLUG, head: 'lane/rerun-proof', title: 'rerun proof' });
+    const headSha = gh.pr(SLUG, number).headRefOid;
+    gh.setChecks(SLUG, number, [
+      { name: 'test', conclusion: 'FAILURE', actions: { runId: 700, attempt: 1, jobId: 110, checkRunId: 10 } },
+      { name: 'test', conclusion: 'SUCCESS', actions: { runId: 700, attempt: 2, jobId: 111, checkRunId: 11 } },
+    ]);
+    const checks = readReviewChecks({ repo: SLUG, headSha, run: args => ghExec(gh, args, clonePath) });
+    expect(checks).toHaveLength(2);
+    expect(reviewCiGate({ headSha, rowsComplete: checks.rowsComplete, requiredChecks: ['test'], checks }).allowed).toBe(true);
+  });
+
   it('api user reports the same actor that posts comments', () => {
     const { originPath, clonePath } = makeOrigin('fake-gh-identity-');
     const gh = makeGithub(originPath);

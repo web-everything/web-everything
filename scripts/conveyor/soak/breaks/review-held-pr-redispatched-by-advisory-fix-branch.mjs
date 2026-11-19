@@ -39,6 +39,7 @@ const evidence = { id: 'review-pr-1', repo, pr: 3771, head, startedAt: at, compl
 const basePr = (over = {}) => ({ number: 3771, state: 'OPEN', headRefName: 'lane/xjudge', headRefOid: head,
   labels: [{ name: 'review:human' }, { name: 'advisory:changes' }], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+  rowsComplete: true, rowsHead: over.headRefOid ?? head,
   comments: [{ body: ADVISORY_NOTE_MARKER + '\\n\\nround 1', author: { login: 'web-everything' } },
     { body: buildAdvisoryFixComment({}), viewerDidAuthor: true }], ...over });
 const plan = (pr) => core.planReconcile({ prs: [{ ...pr, referralHold: hold.decideReferralHold(pr, [evidence], { repo, now: at + 400_000 }) }],

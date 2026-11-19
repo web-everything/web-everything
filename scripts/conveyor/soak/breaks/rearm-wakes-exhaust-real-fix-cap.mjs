@@ -30,7 +30,8 @@ export default {
     const facts = { head, commits: [{ sha: head, parents: ['b'.repeat(40)], authoredAt: at(0), subject: 'original PR work' }] };
     const pr = { number: 6877, headRefOid: head, headRefName: 'lane/wake', baseRefName: 'main', isDraft: false,
       createdAt: at(0), labels: [{ name: 'review:pending' }], comments,
-      files: [{ path: 'src/a.mjs' }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }] };
+      files: [{ path: 'src/a.mjs' }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
+      rowsComplete: true, rowsHead: head }; // complete exact-head check evidence (the review CI contract)
     let reads = 0;
     const enriched = enrichPrsWithMechanicalRound([pr], { roundCap: 5, readRoundCommits: () => { reads += 1; return facts; } })[0];
     // Preloaded evidence must be safe too, independently of whether the threshold fetched it this tick.

@@ -633,6 +633,7 @@ describe('the held claim blocks every dispatch on a red intermediate head', () =
     labels: [{ name: 'review:changes' }, { name: 'review-status:fixing' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-10T14:20:00Z' }],
     fixClaim: { who: 'fix-4115', why: 'conveyor fix', claimedAt: '2026-10-10T14:00:00Z' },
+    rowsComplete: true, rowsHead: SHA,
     ...over,
   });
   it('reconcile planner: refuses fix-claimed, and the same PR unclaimed WOULD be dispatched (control)', () => {
