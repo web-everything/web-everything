@@ -21,7 +21,7 @@ vi.mock('node:fs', async importOriginal => {
 let runsDir, archiveDir;
 beforeEach(() => {
   runsDir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'closed-review-runs-'));
-  archiveDir = join(runsDir, 'archive', 'review-pr');
+  archiveDir = join(runsDir, 'archive', 'review-pr', 'org', 'repo', '12');
 });
 afterEach(() => { race.afterLink = undefined; rmSync(runsDir, { recursive: true, force: true }); });
 function record(id = 'review-pr-one', overrides = {}) {
@@ -29,7 +29,7 @@ function record(id = 'review-pr-one', overrides = {}) {
   writeRun(value, runsDir);
   return value;
 }
-const run = (options = {}) => archiveClosedReviewRuns({ runsDir, dryRun: false, prState: () => 'closed', ...options });
+const run = (options = {}) => archiveClosedReviewRuns({ runsDir, dryRun: false, prState: () => 'closed', minAgeDays: 0, ...options });
 
 function atomicReplace(source, value) {
   const temporary = `${source}.writer`;
@@ -227,7 +227,7 @@ it('caches PR states across numeric and string PR numbers, including resolver fa
 it('defaults to dry-run and creates no archive or moves', () => {
   const { id } = record();
   const move = vi.fn();
-  expect(archiveClosedReviewRuns({ runsDir, prState: () => 'closed', move }).archived).toEqual([id]);
+  expect(archiveClosedReviewRuns({ runsDir, prState: () => 'closed', move, minAgeDays: 0 }).archived).toEqual([id]);
   expect(move).not.toHaveBeenCalled();
   expect(listRunIds(runsDir)).toEqual([id]);
   expect(existsSync(archiveDir)).toBe(false);
@@ -426,8 +426,8 @@ it('supports a custom archive directory and injected list/read/move', () => {
   expect(list).toHaveBeenCalledWith(runsDir);
   expect(read).toHaveBeenCalledWith(value.id, runsDir);
   expect(move).toHaveBeenCalledTimes(1);
-  expect(move).toHaveBeenCalledWith(expect.stringMatching(/\.archiving-\d+-[\da-f-]+$/), join(archive, `${value.id}.json`));
-  expect(readFileSync(join(archive, `${value.id}.json`))).toEqual(original);
+  expect(move).toHaveBeenCalledWith(expect.stringMatching(/\.archiving-\d+-[\da-f-]+$/), join(archive, 'other', 'repo', '7', `${value.id}.json`));
+  expect(readFileSync(join(archive, 'other', 'repo', '7', `${value.id}.json`))).toEqual(original);
   expect(listRunIds(runsDir)).toEqual([]);
 });
 
@@ -450,7 +450,7 @@ it.each([{ args: [] }, { args: ['--apply'] }, { args: ['--json'] }])('CLI report
   });
   expect(output.status, output.stderr).toBe(0);
   if (args.includes('--json')) expect(JSON.parse(output.stdout)).toEqual({
-    scanned: 0, archived: [], kept: { open: [], unfinished: [], unknownState: [], corrupt: [], notReview: [], changed: [], claimed: [] }, errors: [],
+    scanned: 0, archived: [], kept: { open: [], unfinished: [], unknownState: [], corrupt: [], notReview: [], changed: [], claimed: [], recent: [] }, errors: [],
   });
   else {
     expect(output.stdout).toContain(`${args.includes('--apply') ? 'archived' : 'would-archive'}: 0`);

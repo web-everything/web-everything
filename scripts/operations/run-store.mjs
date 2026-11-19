@@ -22,14 +22,14 @@
  * nothing above the seam changes.
  */
 
-import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
-import { appendReviewRunIndex, appendReviewRunJournal } from '../lib/review-run-index.mjs';
+import { appendReviewRunIndex } from '../lib/review-run-index.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
 
@@ -157,6 +157,12 @@ export function newRunId(prefix = 'run') {
   return `${prefix}-${randomUUID()}`;
 }
 
+export const NAME_RE = /^review-pr-pr([1-9]\d{0,9})-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+
+export function newReviewRunId(pr) {
+  return newRunId(Number.isInteger(pr) && pr > 0 && pr <= 9999999999 ? `review-pr-pr${pr}` : 'review-pr');
+}
+
 /**
  * Read a run. Returns `null` ONLY when the file genuinely does not exist. THROWS on a corrupt record —
  * refusing is the point: a torn record must never be mistaken for a run that never began, which would
@@ -189,32 +195,13 @@ export function readRun(id, dir = resolveRunsDir()) {
  */
 export function writeRun(record, dir = resolveRunsDir()) {
   assertRunRecord(record, 'run record being written');
+  const named = NAME_RE.exec(record.id);
+  if (named && (record.op !== 'review-pr' || Number(record.input?.pr) !== Number(named[1]))) {
+    throw new TypeError('review run filename and payload disagree');
+  }
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
-  let publishedFd;
-  try {
-    writeJsonAtomic(path, record, { renameSyncFn: (tmp, destination) => {
-      // Keep the writer's inode alive across rename, including an intervening replacement.
-      if (record.op === 'review-pr') {
-        try { publishedFd = openSync(tmp, 'r'); } catch { /* no binding means no seal */ }
-      }
-      try { appendReviewRunJournal(record, dir); } catch { /* discovery is best-effort */ }
-      renameSync(tmp, destination);
-    } });
-    if (publishedFd !== undefined) {
-      try {
-        const metadata = statSync(path), published = fstatSync(publishedFd);
-        const fields = ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'birthtimeMs'];
-        if (fields.every(field => Number.isFinite(metadata[field]) && metadata[field] === published[field])) {
-          appendReviewRunJournal(record, dir, Date.now(), metadata);
-        }
-      } catch { /* discovery is best-effort; an unbound publication remains unknown */ }
-    }
-  } finally {
-    if (publishedFd !== undefined) {
-      try { closeSync(publishedFd); } catch { /* best-effort cleanup, including refused rename */ }
-    }
-  }
+  writeJsonAtomic(path, record);
   if (record.op === 'review-pr') {
     try { appendReviewRunIndex(record, dir); } catch { /* discovery is best-effort; never fail a persisted run */ }
   }

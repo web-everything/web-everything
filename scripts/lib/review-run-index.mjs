@@ -2,10 +2,11 @@
  * Overflow/corruption/missing records fall back to the ordinary scan and its HOLD.
  * Backfill stages a complete pass over review ids, at most 50 payloads per drain tick.
  */
-import { closeSync, openSync, writeSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { isValidRunId, parseRunRecord } from '../operations/run-record.mjs';
+import { NAME_RE, listRunIds } from '../operations/run-store.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 
 /** Shared scan/backfill guard: even unrelated malformed evidence prevents a negative proof. */
@@ -33,110 +34,30 @@ const reviewId = id => isValidRunId(id) && id.startsWith('review-pr-');
 const keyOf = (repo, pr) => typeof repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(repo)
   && Number.isSafeInteger(Number(pr)) && Number(pr) > 0 ? `${repo}#${Number(pr)}` : null;
 export const reviewRunIndexPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.json`);
-/** Append-only discovery journal; payloads remain the authority. */
-export const reviewRunJournalPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.jsonl`);
-const journalIdentity = metadata => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs, metadata.ctimeMs, metadata.birthtimeMs];
-const validJournalIdentity = identity => Array.isArray(identity) && identity.length === 6
-  && identity.every(Number.isFinite);
-const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
-
-/** One O_APPEND write: an intent before publication, or a seal of the final path afterward.
- * The writer owns best-effort error handling. Never seal temporary-file metadata. */
-export function appendReviewRunJournal(record, runsDir, at = Date.now(), metadata) {
-  const key = keyOf(record?.input?.repo, record?.input?.pr);
-  if (record?.op !== 'review-pr' || !reviewId(record.id) || !key) return false;
-  const row = metadata ? { id: record.id, key, seal: journalIdentity(metadata) } : { id: record.id, key, at };
-  const bytes = Buffer.from(`${JSON.stringify(row)}\n`);
-  const fd = openSync(reviewRunJournalPath(runsDir), 'a');
+/** Filename discovery is a complete candidate set only while the names stay stable.
+ * One top-level readdir, no metadata exclusion. Legacy names always require parsing.
+ * Claims and archived evidence require operator restoration before proving absence. */
+export function readNamedCandidates(runsDir, repo, pr, { list = listRunIds, readdir = readdirSync } = {}) {
   try {
-    if (writeSync(fd, bytes) !== bytes.length) throw Error('short review journal write');
-  } finally { closeSync(fd); }
-  return true;
-}
-
-function journalKeys(runsDir) {
-  const path = reviewRunJournalPath(runsDir);
-  if (statSync(path).size > JOURNAL_MAX_BYTES) throw Error('review journal oversized');
-  const bytes = readFileSync(path);
-  if (bytes.length > JOURNAL_MAX_BYTES) throw Error('review journal oversized');
-  const rows = bytes.toString('utf8').split('\n');
-  rows.pop(); // Never trust a final line without its publication newline.
-  const keys = new Map();
-  for (const text of rows) {
-    let row;
-    try { row = JSON.parse(text); } catch { continue; } // Invalid lines supply no evidence.
-    if (!reviewId(row?.id)) continue;
-    const match = typeof row.key === 'string' && /^([\w.-]+\/[\w.-]+)#([1-9][0-9]*)$/.exec(row.key);
-    const rowKey = match && keyOf(match[1], match[2]) === row.key ? row.key : null;
-    const prior = keys.get(row.id);
-    const key = prior && prior.key !== rowKey ? null : rowKey;
-    keys.set(row.id, { key, seal: row.seal }); // Conflicts remain unknown; only the last line can seal.
-  }
-  return keys;
-}
-
-/** Complete candidate set, or null to request the bounded fallback. The non-enumerable
- * journalSet identifies candidates requiring full key verification by the payload reader. */
-export function readJournalCandidates(runsDir, repo, pr, {
-  list = listReviewIds, stat = id => statSync(join(runsDir, `${id}.json`)),
-} = {}) {
-  try {
-    const key = keyOf(repo, pr);
-    if (!key) return null;
-    if (statSync(reviewRunJournalPath(runsDir)).size > JOURNAL_MAX_BYTES) return null;
-    const snapshot = () => {
-      const names = readdirSync(runsDir);
-      if (names.some(name => /^\.review-pr-.*\.archiving-/.test(name))) throw Error('review archive in progress');
-      return { names: names.sort(), ids: list(runsDir).filter(reviewId).sort() };
-    };
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const before = snapshot(), keys = journalKeys(runsDir), after = snapshot();
-      if (JSON.stringify(before) !== JSON.stringify(after)) continue;
-      const ids = [], journalSet = new Set();
-      let unjournaled = 0;
-      for (const id of after.ids) {
-        const entry = keys.get(id);
-        let target = entry?.key;
-        try {
-          if (target === key) { ids.push(id); journalSet.add(id); continue; }
-          const metadata = stat(id);
-          if (!validJournalIdentity(entry?.seal)
-            || JSON.stringify(entry.seal) !== JSON.stringify(journalIdentity(metadata))) target = null;
-        } catch { target = null; }
-        if (target == null) { ids.push(id); unjournaled++; }
-      }
-      return Object.defineProperty({ ids, source: 'journal', unjournaled }, 'journalSet', { value: journalSet });
+    if (!keyOf(repo, pr)) return null;
+    const names = readdir(runsDir).sort();
+    if (names.some(name => /^\.review-pr-.*\.archiving-/.test(name))) return null;
+    if (names.includes('archive')) {
+      try {
+        if (readdir(join(runsDir, 'archive', 'review-pr', ...repo.split('/'), String(Number(pr)))).length) return null;
+      } catch (error) { if (error.code !== 'ENOENT') return null; }
     }
-    return null;
+    const all = list === listRunIds
+      ? names.filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)).filter(reviewId)
+      : list(runsDir).filter(reviewId).sort();
+    let legacy = 0;
+    const ids = all.filter(id => {
+      const match = NAME_RE.exec(id);
+      if (!match) { legacy++; return true; }
+      return Number(match[1]) === Number(pr);
+    });
+    return Object.defineProperty({ ids, source: 'names', legacy, mismatch: 0 }, 'snapshot', { value: JSON.stringify([names, all]) });
   } catch { return null; }
-}
-
-/** Seed readable, previously unjournaled records without rewriting concurrent appends. */
-export function seedReviewRunJournal({ runsDir, list = listReviewIds, read = id => readRecord(runsDir, id),
-  stat = id => statSync(join(runsDir, `${id}.json`)),
-} = {}) {
-  let keys;
-  try { keys = journalKeys(runsDir); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; keys = new Map(); }
-  const counts = { seeded: 0, already: 0, skipped: 0 };
-  for (const id of list(runsDir).filter(reviewId)) {
-    try {
-      const before = stat(id);
-      const entry = keys.get(id);
-      if (entry?.key && validJournalIdentity(entry.seal)
-        && JSON.stringify(entry.seal) === JSON.stringify(journalIdentity(before))) { counts.already++; continue; }
-      const run = read(id, runsDir);
-      recordKey(run, id);
-      const after = stat(id);
-      if (JSON.stringify(journalIdentity(before)) !== JSON.stringify(journalIdentity(after))) throw Error('run changed during journal seed');
-      if (appendReviewRunJournal(run, runsDir, after.mtimeMs, after)) counts.seeded++;
-      else counts.skipped++;
-    } catch { counts.skipped++; }
-  }
-  // An empty seed still makes an empty journal available for subsequent writes.
-  const fd = openSync(reviewRunJournalPath(runsDir), 'a');
-  closeSync(fd);
-  return counts;
 }
 
 function readJson(path, maxBytes = MAX_BYTES) {

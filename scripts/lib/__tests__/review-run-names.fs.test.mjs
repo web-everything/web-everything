@@ -137,7 +137,7 @@ it('T3 holds Y after an in-place X rejection immediately following Y publication
   expect(statSync(pathOf(f, run.id)).ino).toBe(inode);
   hold(evidence(f));
   expect(probe(f)).toMatch(/^mismatch: 1$/m);
-  expect(readdirSync(f.root)).toEqual(['runs']);
+  expect(readdirSync(f.root)).toEqual(['runs', 'runs-review-index.json']);
   expect(readdirSync(f.runsDir)).toEqual([`${run.id}.json`]);
 });
 
@@ -151,7 +151,7 @@ it.each(['throw', 'lie'])('T4 names ignore stat that can %s; same-inode same-siz
   const compact = JSON.stringify(newer);
   expect(Buffer.byteLength(compact)).toBeLessThanOrEqual(before.size);
   writeFileSync(path, compact.padEnd(before.size, ' '));
-  utimesSync(path, before.atime, before.mtime);
+  utimesSync(path, before.atimeMs / 1000, before.mtimeMs / 1000);
   const after = statSync(path);
   expect(after.ino).toBe(before.ino);
   expect(after.size).toBe(before.size);
@@ -282,9 +282,9 @@ it('T9 rewrite between classification and claim stays live and is not archived u
   expect(result.kept.changed).toContain(old.id);
 });
 
-it('T10 writeRun creates only run JSON, no sibling JSONL or seals, and ignores leftover tmp files', () => {
+it('T10 writeRun keeps the existing JSON index, creates no JSONL or seals, and ignores leftover tmp files', () => {
   const f = fixture(), run = persist(f);
-  expect(readdirSync(f.root)).toEqual(['runs']);
+  expect(readdirSync(f.root)).toEqual(['runs', 'runs-review-index.json']);
   expect(readdirSync(f.runsDir)).toEqual([`${run.id}.json`]);
   writeFileSync(join(f.runsDir, `${run.id}.json.tmp-leftover`), '{');
   expect(candidates(f)).toEqual({ ids: [run.id], source: 'names', legacy: 0, mismatch: 0 });

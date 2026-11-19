@@ -3,9 +3,9 @@ import { afterEach, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
+import { newReviewRunId, newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
 import { readDrainRedTeamEvidence, readRecoveryWitness } from '../drain-red-team-evidence.mjs';
-import { backfillAllReviewRuns, readCompleteReviewRunsForPr, appendReviewRunIndex, backfillOpenReviewRuns, backfillReviewRunIndex, readReviewRunIndex, reviewRunIndexPath, reviewRunJournalPath, readJournalCandidates } from '../review-run-index.mjs';
+import { backfillAllReviewRuns, readCompleteReviewRunsForPr, appendReviewRunIndex, backfillOpenReviewRuns, backfillReviewRunIndex, readReviewRunIndex, reviewRunIndexPath, readNamedCandidates } from '../review-run-index.mjs';
 
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { headNeverReviewedFromRuns } from '../review-red-team-on-skip.mjs';
@@ -769,7 +769,9 @@ it('full backfill retains progress under churn and never publishes while an unre
 });
 
 // These integration cases intentionally use the default lookup, list, read and stat:
-// a complete journal scan is authoritative even when it finds no exact-head record.
+// a complete filename scan is authoritative even when it finds no exact-head record.
+// Retired journal files are inert, including conflicting and torn rows.
+const reviewRunJournalPath = dir => `${dir}-review-index.jsonl`;
 const journalReaders = [
   { name: 'drain', reader: readDrainRedTeamEvidence },
   { name: 'recovery', reader: readRecoveryWitness },
@@ -785,10 +787,10 @@ function journalPayload(f, run, at) {
 }
 const journalBudget = maxParses => ({ file: { runs: { scan: { maxParses } } }, platform: {}, env: {} });
 
-it.each(journalReaders)('$name default journal lookup keeps completed absence without an exact-head fallback', ({ reader }) => {
+it.each(journalReaders)('$name default name lookup keeps completed absence without an exact-head fallback', ({ reader }) => {
   const f = fixture();
   const differentHead = { ...f.run, findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } };
-  const unrelated = { ...f.run, id: 'review-pr-unrelated', input: { repo: f.repo, pr: 8 } };
+  const unrelated = { ...f.run, id: newReviewRunId(8), input: { repo: f.repo, pr: 8 } };
   journalPayload(f, differentHead, 2);
   journalPayload(f, unrelated, 100);
   writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f, f.run.id, 'o/r#7') + journalLine(f, unrelated.id, 'o/r#8'));
@@ -798,7 +800,7 @@ it.each(journalReaders)('$name default journal lookup keeps completed absence wi
 });
 
 for (const kind of ['omitted', 'conflicting', 'stale-key', 'torn', 'invalid JSON']) {
-  it.each(journalReaders)(`$name default journal lookup cannot hide a newer rejection with ${kind} lines`, ({ reader }) => {
+  it.each(journalReaders)(`$name default name lookup cannot hide a newer rejection with ${kind} lines`, ({ reader }) => {
     const f = fixture();
     const newer = { ...f.run, id: 'review-pr-rejection', verdict: { verdict: 'changes' },
       stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
@@ -816,13 +818,15 @@ for (const kind of ['omitted', 'conflicting', 'stale-key', 'torn', 'invalid JSON
 }
 
 for (const field of ['id', 'op', 'repo', 'pr', 'unjournaled id']) {
-  it.each(journalReaders)(`$name default journal lookup refuses a mismatched ${field} payload before proving absence`, ({ reader }) => {
-    const f = fixture(), impostor = structuredClone(f.run);
+  it.each(journalReaders)(`$name default name lookup refuses a mismatched ${field} payload before proving absence`, ({ reader }) => {
+    const f = fixture();
+    if (field !== 'unjournaled id') f.run.id = newReviewRunId(f.pr);
+    const impostor = structuredClone(f.run);
     if (field === 'id' || field === 'unjournaled id') impostor.id = 'review-pr-impostor';
     if (field === 'op') impostor.op = 'fix-pr';
     if (field === 'repo') impostor.input.repo = 'other/repo';
     if (field === 'pr') impostor.input.pr = 999;
-    const unrelated = { ...f.run, id: 'review-pr-unrelated', input: { repo: f.repo, pr: 8 } };
+    const unrelated = { ...f.run, id: newReviewRunId(8), input: { repo: f.repo, pr: 8 } };
     // Publish under the candidate filename even when the payload claims another id.
     writeFileSync(join(f.runsDir, `${f.run.id}.json`), JSON.stringify(impostor));
     utimesSync(join(f.runsDir, `${f.run.id}.json`), 2, 2);
@@ -830,32 +834,31 @@ for (const field of ['id', 'op', 'repo', 'pr', 'unjournaled id']) {
     writeFileSync(reviewRunJournalPath(f.runsDir),
       (field === 'unjournaled id' ? '' : journalLine(f, f.run.id, 'o/r#7')) + journalLine(f, unrelated.id, 'o/r#8'));
     const result = reader({ ...f, scanSettings: journalBudget(1), warn: () => {} });
-    expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+    if (field === 'repo') expect(result.ok).not.toBe(false); // Names encode PR, not repository.
+    else expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(result.loopPayload ?? result.newest ?? null).toBeNull();
   });
 }
 
 
 it.each(journalReaders.flatMap(reader => [0, 5000].map(gapMs => ({ ...reader, gapMs }))))(
-  '$name default journal lookup returns a rejection replacing an other-PR file within the 10-second allowance (gap=$gapMs ms)',
+  '$name default name lookup returns a rejection replacing an other-PR file within the 10-second allowance (gap=$gapMs ms)',
   ({ reader, gapMs }) => {
     const f = fixture();
     writeRun(f.run, f.runsDir);
     const other = { ...f.run, id: 'review-pr-replaced-other', input: { repo: f.repo, pr: 8 } };
     writeRun(other, f.runsDir);
-    const row = readFileSync(reviewRunJournalPath(f.runsDir), 'utf8').trimEnd().split('\n')
-      .map(text => JSON.parse(text)).find(row => row.id === other.id);
-    expect(row.key).toBe('o/r#8');
-    expect(readJournalCandidates(f.runsDir, f.repo, f.pr).ids).toEqual([f.run.id]);
+    const atBefore = statSync(join(f.runsDir, `${other.id}.json`)).mtimeMs;
+    expect(readNamedCandidates(f.runsDir, f.repo, f.pr).ids).toEqual([f.run.id, other.id].sort());
     const rejection = { ...f.run, id: other.id, verdict: { verdict: 'changes' },
       stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(Date.now()).toISOString() }] };
     const path = join(f.runsDir, `${other.id}.json`);
-    writeJsonAtomic(path, rejection); // Bypass journal maintenance, as a direct replacement does.
-    const at = (row.at + gapMs) / 1000;
+    writeJsonAtomic(path, rejection); // Directly replace a legacy payload; no name can exclude it.
+    const at = (atBefore + gapMs) / 1000;
     utimesSync(path, at, at);
-    expect(Math.abs(statSync(path).mtimeMs - row.at)).toBeLessThan(10_000);
-    expect(readJournalCandidates(f.runsDir, f.repo, f.pr)).toMatchObject({
-      ids: [f.run.id, other.id].sort(), unjournaled: 1,
+    expect(Math.abs(statSync(path).mtimeMs - atBefore)).toBeLessThan(10_000);
+    expect(readNamedCandidates(f.runsDir, f.repo, f.pr)).toMatchObject({
+      ids: [f.run.id, other.id].sort(), legacy: 2,
     });
     const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
     expect(result.ok).not.toBe(false);

@@ -5173,41 +5173,25 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
 
-## Review-run journal discovery
+## Review-run filename discovery (R1099)
 
-`scripts/lib/__tests__/review-run-journal.fs.test.mjs` exercises the append-before-rename
-journal on real files, including 6,000 runs, seed/probe CLI calls, torn/conflicting lines,
-archive claims, oversized journals and payload identity mismatches. Run it alongside
-`review-run-index.test.mjs`, `drain-red-team-evidence.test.mjs` and
-`red-team-skip-settle-r622.test.mjs` through heavy admission. Journal discovery must not
-consume the injected listing seam when the journal is missing: existing index fallback
-fixtures use that seam to replace a payload atomically between verification and scanning.
-Journal candidates and fallback reads share the same parse budget and file-identity cache.
+`review-run-names.fs.test.mjs` covers 6,000 real files, strict PR-name exclusion,
+legacy parsing, in-place corruption, shared parse budgets, filename churn, archive
+claims and age-gated archives. Run it with `review-run-index.test.mjs`,
+`drain-red-team-evidence.test.mjs`, `archive-closed-review-runs.test.mjs`, and
+`red-team-skip-settle-r622.test.mjs` through heavy admission.
 
-`writeRun` appends `{id,key,at}` before rename, then best-effort appends
-`{id,key,seal:[dev,ino,size,mtimeMs,ctimeMs,birthtimeMs]}` after statting the final path.
-Rename changes ctime: temporary-file identity cannot seal the published file.
-The writer holds its temporary file open across rename and compares its descriptor's
-post-rename identity with the final path before sealing. A deterministic replacement
-between rename and final-path stat must leave the other-PR intent unsealed and reveal
-the replacement rejection. Close the descriptor on success and failed publication.
-Only a last-line seal matching the current file identity permits other-PR exclusion.
-Missing/legacy seals, mismatches, later unsealed lines, conflicting keys and stat
-failures make the id unknown and require parsing (or the bounded scan's HOLD).
-Target-key ids remain candidates regardless of seal. Seed validates unchanged identity
-around parsing before sealing; it migrates legacy or stale rows. The same-inode,
-same-size rewrite regression restores mtime and must reveal the newer rejection via
-changed ctime. Unchanged sealed other-PR files stay excluded, including at 6,000 runs.
-A lone other-PR key cannot hide a later direct replacement. Filename/payload ID
-mismatches retain an unreadable-record error through journal/index fallback and
-must never allow an older acceptance to win. The real-filesystem journal suite
-covers both paths with ample parse budget and unchanged other-PR parse exclusion.
+`writeRun` validates keyed filename/payload identity before atomic publication.
+Discovery uses directory names without stat-based exclusion. Every candidate is
+parsed; keyed ID, operation or PR disagreement holds through fallback. Compare
+names around parsing, retry once on churn, then use the bounded scan and HOLD.
+Claims or a nonempty target archive require operator restoration before absence
+can be proven. Archives default to closed/merged terminal records at least 14 days
+old under `archive/review-pr/<owner>/<repo>/<pr>/`; race fixtures explicitly use
+`minAgeDays: 0` to exercise fresh-record claims. The probe CLI is
+`scripts/review-run-probe.mjs --probe <repo>#<pr> [--head=] [--runs-dir=]`.
 
-The `default journal lookup` regressions in `review-run-index.test.mjs` use real files
-and both public readers without injecting a lookup, listing, read or stat implementation.
-They defend newer rejections against omitted/conflicting/stale-key/torn/invalid lines,
-require a capped fallback for mismatched payload identities/keys, and prove that a
-completed journal scan keeps exact-head absence. For mutation verification, temporarily
-remove each candidate-inclusion, conflict, newline, payload-verification or completed-scan
-guard, run its named case through heavy admission, and require an assertion failure;
-restore the source after each mutation before running the unmodified scoped suite.
+Filesystem mtime fixtures must restore numeric seconds (`mtimeMs / 1000`), not a
+`Date`: Date truncates fractional milliseconds and cannot verify unchanged mtime
+at sub-millisecond precision. The retained JSON index sidecar is expected; the
+filename contract removes journal JSONL and seals, not the existing index writer.
