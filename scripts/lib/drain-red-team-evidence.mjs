@@ -441,7 +441,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   let parsed = 0;
   const budgetExhausted = Symbol('shared review parse budget exhausted');
   let hardHold = false;
-  const runScan = (indexedIds, named = false) => {
+  const runScan = (indexedIds, allCandidates = false) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     const mtimes = new Map();
@@ -451,12 +451,12 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     // different records in the drain's and recovery's windows, and the two could disagree.
     const find = createNewestRunFinder({ ids: indexedIds ?? list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
       stat: id => {
-        // Metadata orders liveness bounds; it never excludes a named candidate.
-        const metadata = (named ? statSync : stat)(join(runsDir, `${id}.json`));
+        // Metadata orders the same liveness bounds as the ordinary scan.
+        const metadata = stat(join(runsDir, `${id}.json`));
         mtimes.set(id, metadata.mtimeMs);
         return metadata;
       }, read: id => {
-        const identity = named ? currentIdentity(id, statSync) : indexedIds || indexReads.has(id) ? currentIdentity(id) : undefined;
+        const identity = indexedIds || indexReads.has(id) ? currentIdentity(id) : undefined;
         discardChangedRead(id, identity);
         if (!indexReads.has(id) && parsed >= maxParses) {
           // This record remains unread: preserve its boundary for the existing capped-scan rules.
@@ -475,14 +475,14 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           indexReads.set(id, run);
           indexIdentities.set(id, identity);
         }
-        if (named || NAME_RE.test(id)) {
+        if (allCandidates || NAME_RE.test(id)) {
           const match = NAME_RE.exec(id);
           try {
             assertReviewRunEvidence(run);
             if (run?.id !== id || (match && (run.op !== 'review-pr' || Number(run.input?.pr) !== Number(match[1])))) throw Error('review run filename and payload disagree');
           } catch (error) { hardHold = true; throw error; }
         }
-        if (!named && indexedIds && (run?.id !== id
+        if (!allCandidates && indexedIds && (run?.id !== id
           || run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))) {
           // A payload with a different identity must never reappear as a verdict
           // when the fallback reuses this verified file's cached read.
@@ -520,7 +520,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       const { exact, newest } = slots[tieBreak];
       boundary = nextAt;
       if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
-      return !indexedIds && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
+      return (!indexedIds || allCandidates) && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
     }); } catch (error) {
       if (error !== budgetExhausted) throw error;
       end = RUN_SCAN_CAPPED;
@@ -568,12 +568,11 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           }
           try { runScan(before.ids, true); }
           catch { hardHold = true; scan = null; break; }
-          if (scan.end?.ok === false) hardHold = true;
           const after = readNamedCandidates(runsDir, repo, pr, { list });
           let unchanged = true;
           try {
             for (const [id, identity] of indexIdentities) {
-              if (currentIdentity(id, statSync) !== identity) { unchanged = false; break; }
+              if (currentIdentity(id) !== identity) { unchanged = false; break; }
             }
           } catch { unchanged = false; }
           if (after !== null && before.snapshot === after.snapshot && unchanged) break;

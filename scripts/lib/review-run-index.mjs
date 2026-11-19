@@ -35,7 +35,7 @@ const keyOf = (repo, pr) => typeof repo === 'string' && /^[\w.-]+\/[\w.-]+$/.tes
   && Number.isSafeInteger(Number(pr)) && Number(pr) > 0 ? `${repo}#${Number(pr)}` : null;
 export const reviewRunIndexPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.json`);
 /** Filename discovery is a complete candidate set only while the names stay stable.
- * One top-level readdir, no metadata exclusion. Legacy names always require parsing.
+ * One top-level readdir, no name or metadata exclusion. All review ids require parsing.
  * Claims and archived evidence require operator restoration before proving absence. */
 export function readNamedCandidates(runsDir, repo, pr, { list = listRunIds, readdir = readdirSync } = {}) {
   try {
@@ -61,13 +61,8 @@ export function readNamedCandidates(runsDir, repo, pr, { list = listRunIds, read
     const all = list === listRunIds
       ? names.filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)).filter(reviewId)
       : list(runsDir).filter(reviewId).sort();
-    let legacy = 0;
-    const ids = all.filter(id => {
-      const match = NAME_RE.exec(id);
-      if (!match) { legacy++; return true; }
-      return Number(match[1]) === Number(pr);
-    });
-    return Object.defineProperty({ ids, source: 'names', legacy, mismatch: 0 }, 'snapshot', { value: JSON.stringify([names, all]) });
+    const legacy = all.filter(id => !NAME_RE.test(id)).length;
+    return Object.defineProperty({ ids: all, source: 'names', legacy, mismatch: 0 }, 'snapshot', { value: JSON.stringify([names, all]) });
   } catch { return null; }
 }
 

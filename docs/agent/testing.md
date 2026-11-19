@@ -5175,14 +5175,15 @@ The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarant
 
 ## Review-run filename discovery (R1099)
 
-`review-run-names.fs.test.mjs` covers 6,000 real files, strict PR-name exclusion,
+`review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
 legacy parsing, in-place corruption, shared parse budgets, filename churn, archive
 claims and age-gated archives. Run it with `review-run-index.test.mjs`,
 `drain-red-team-evidence.test.mjs`, `archive-closed-review-runs.test.mjs`, and
 `red-team-skip-settle-r622.test.mjs` through heavy admission.
 
 `writeRun` validates keyed filename/payload identity before atomic publication.
-Discovery uses directory names without stat-based exclusion. Every candidate is
+Discovery lists every review-pr ID without name-based exclusion, using the ordinary
+scan order, parse cap and liveness bounds. Every examined candidate is
 parsed; keyed ID, operation or PR disagreement holds through fallback. Compare
 names around parsing, retry once on churn, then use the bounded scan and HOLD.
 Claims or a nonempty target archive require operator restoration before absence

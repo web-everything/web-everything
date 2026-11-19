@@ -95,20 +95,34 @@ it('T1 exports the exact PR-name grammar and mints keyed ids, with legacy fallba
   }
 });
 
-it('T1 finds the sole exact-head review older than the newest 3000 of 6000 runs across 400 PRs', () => {
-  const f = fixture(), { target, exact } = bulk(f), io = counter(f);
-  expect(store.listRunIds(f.runsDir)).toHaveLength(6000);
-  expect(target).toHaveLength(15);
-  expect(candidates(f)).toEqual({ ids: target.slice().sort(), source: 'names', legacy: 0, mismatch: 0 });
-  found(f, exact, io);
-  expect(io.ids).toHaveLength(target.length);
-  expect(new Set(io.ids)).toEqual(new Set(target));
+it('T1 scans all 6000 runs like main: finds the target with sufficient budget and HOLDs below the count', () => {
+  const f = fixture(), { exact } = bulk(f), io = counter(f);
+  const ids = store.listRunIds(f.runsDir);
+  expect(ids).toHaveLength(6000);
+  expect(candidates(f)).toEqual({ ids: ids.slice().sort(), source: 'names', legacy: 0, mismatch: 0 });
+  found(f, exact, io, 6000);
+  expect(new Set(io.ids)).toEqual(new Set(ids));
+  const capped = counter(f);
+  expect(evidence(f, capped, 3000)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(capped.ids).toHaveLength(3000);
   const stdout = probe(f);
   expect(stdout).toContain('source: names');
-  expect(stdout).toMatch(/^parses: 15$/m);
+  expect(stdout).toMatch(/^parses: \d+$/m);
   expect(stdout).toMatch(/^legacy: 0$/m);
   expect(stdout).toMatch(/^mismatch: 0$/m);
 }, 120_000);
+
+it.each(['corrupt', 'rejection'])('parses a PR-8 name during PR-7 lookup: %s refuses older acceptance', kind => {
+  const f = fixture(); persist(f);
+  const misplaced = record(f, { id: store.newReviewRunId(8), startedAt: 2000, verdict: 'reject' });
+  writeFileSync(pathOf(f, misplaced.id), kind === 'corrupt' ? '{' : JSON.stringify(misplaced));
+  const io = counter(f);
+  const result = evidence(f, io);
+  hold(result);
+  expect(result.loopPayload?.verdict?.verdict).not.toBe('accept');
+  expect(io.ids).toContain(misplaced.id);
+  if (kind === 'rejection') expect(probe(f)).toMatch(/^mismatch: 1$/m);
+});
 
 it('T2 refuses a fresh mismatched keyed write without creating a file', () => {
   const f = fixture(), run = record(f);
@@ -141,7 +155,7 @@ it('T3 holds Y after an in-place X rejection immediately following Y publication
   expect(readdirSync(f.runsDir)).toEqual([`${run.id}.json`]);
 });
 
-it.each(['throw', 'lie'])('T4 names ignore stat that can %s; same-inode same-size restored-mtime rejection wins', mode => {
+it('T4 same-inode same-size restored-mtime rejection wins', () => {
   const f = fixture(), older = persist(f), newer = persist(f, { startedAt: 2000, verdict: 'reject' });
   // Equal-length valid verdict strings keep the serialized size fixed.
   const placeholder = { ...newer, verdict: { verdict: 'accept' } };
@@ -156,9 +170,7 @@ it.each(['throw', 'lie'])('T4 names ignore stat that can %s; same-inode same-siz
   expect(after.ino).toBe(before.ino);
   expect(after.size).toBe(before.size);
   expect(after.mtimeMs).toBeCloseTo(before.mtimeMs, 2);
-  const stat = () => { if (mode === 'throw') throw Error('no stat'); return { mtimeMs: 1, ino: 1, size: 1 }; };
-  expect(candidates(f, { stat })).toEqual(candidates(f));
-  found(f, newer, counter(f), 3000, { stat });
+  found(f, newer);
   expect(older.id).not.toBe(newer.id);
 });
 
@@ -168,8 +180,8 @@ it('T5 parses and finds a legacy X payload among 6000 keyed runs', () => {
   utimesSync(pathOf(f, legacy.id), 1, 1);
   expect(candidates(f).legacy).toBe(1);
   const io = counter(f);
-  found(f, legacy, io);
-  expect(io.ids).toHaveLength(16);
+  found(f, legacy, io, 6001);
+  expect(io.ids).toHaveLength(6001);
 }, 120_000);
 
 it('T5 legacy count above the parse cap gives scan-capped and HOLD even with an accept', () => {
@@ -180,19 +192,19 @@ it('T5 legacy count above the parse cap gives scan-capped and HOLD even with an 
   expect(io.ids).toHaveLength(3);
 });
 
-it('T6 only exact keyed names exclude another PR; malformed near-matches are parsed as legacy', () => {
+it('T6 parses every keyed name and counts malformed near-matches as legacy', () => {
   const f = fixture(7155);
   const legacyIds = [`review-pr-pr07155-${UUID}`, `review-pr-pr7155-${UUID.toUpperCase()}`,
     `review-pr-pr7155x-${UUID}`, `review-pr-pr7155-${UUID}-suffix`];
   for (const id of legacyIds) persist(f, { id });
   const own = persist(f, { startedAt: 2000 }), other = persist(f, { pr: 71, startedAt: 2000 });
-  expect(candidates(f)).toEqual({ ids: [...legacyIds, own.id].sort(), source: 'names', legacy: 4, mismatch: 0 });
+  expect(candidates(f)).toEqual({ ids: [...legacyIds, own.id, other.id].sort(), source: 'names', legacy: 4, mismatch: 0 });
   const io = counter(f); found(f, own, io);
-  expect(new Set(io.ids)).toEqual(new Set([...legacyIds, own.id]));
+  expect(new Set(io.ids)).toEqual(new Set([...legacyIds, own.id, other.id]));
   const small = { ...f, pr: 71 };
-  expect(candidates(small).ids).toEqual([...legacyIds, other.id].sort());
+  expect(candidates(small).ids).toEqual([...legacyIds, own.id, other.id].sort());
   const smallIo = counter(small); found(small, other, smallIo);
-  expect(smallIo.ids).not.toContain(own.id);
+  expect(smallIo.ids).toContain(own.id);
 });
 
 it('T7 parses the same PR number in another repo without matching its payload', () => {

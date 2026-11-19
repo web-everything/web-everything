@@ -776,7 +776,7 @@ const journalReaders = [
   { name: 'drain', reader: readDrainRedTeamEvidence },
   { name: 'recovery', reader: readRecoveryWitness },
 ];
-// Other-PR exclusions require final-path seals; legacy rows are covered by the filesystem suite.
+// Historical journal rows are inert; every live review ID remains a scan candidate.
 const journalLine = (f, id, key) => {
   const metadata = statSync(join(f.runsDir, `${id}.json`));
   return `${JSON.stringify({ id, key, seal: [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs, metadata.ctimeMs, metadata.birthtimeMs] })}\n`;
@@ -794,7 +794,7 @@ it.each(journalReaders)('$name default name lookup keeps completed absence witho
   journalPayload(f, differentHead, 2);
   journalPayload(f, unrelated, 100);
   writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f, f.run.id, 'o/r#7') + journalLine(f, unrelated.id, 'o/r#8'));
-  const result = reader({ ...f, scanSettings: journalBudget(1), warn: () => {} });
+  const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
   expect(result.ok).not.toBe(false);
   expect(result.loopPayload ?? result.newest ?? null).toBeNull();
 });
@@ -833,7 +833,7 @@ for (const field of ['id', 'op', 'repo', 'pr', 'unjournaled id']) {
     journalPayload(f, unrelated, 100);
     writeFileSync(reviewRunJournalPath(f.runsDir),
       (field === 'unjournaled id' ? '' : journalLine(f, f.run.id, 'o/r#7')) + journalLine(f, unrelated.id, 'o/r#8'));
-    const result = reader({ ...f, scanSettings: journalBudget(1), warn: () => {} });
+    const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
     if (field === 'repo') expect(result.ok).not.toBe(false); // Names encode PR, not repository.
     else expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(result.loopPayload ?? result.newest ?? null).toBeNull();
