@@ -4809,3 +4809,11 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Pinned drain fixtures across admission stages
+
+Card-group CLI fixtures also need `pinnedLeafGitFixture` responses before their legacy Git
+handlers so a mergeable source reaches the grouping decision. Declare additions and deletions
+alongside each file so numstat and patch evidence agree. For pushes after listing, keep the
+listed head available to pinned scoring and change the live GitHub head: the pre-merge
+revalidation must refuse it in `revalidationAborted`, with no merge or label/body edit.

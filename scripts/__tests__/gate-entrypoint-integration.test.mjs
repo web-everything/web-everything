@@ -491,9 +491,9 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     const { result, merges, edits } = runDrainLiveRecordingMerges({ _id: 'head-moved', prs: [liveLeaf(922, { _headRefOid: fixtureSha('sha-922-pushed-later') })] });
     expect(merges).toHaveLength(0);
     expect(nums(result.merged)).not.toContain(922);
-    // Pinned diff binding now detects this push before merge revalidation or any label/body edit.
-    expect(result.skipped.find((x) => Number(x.num) === 922)?.reason).toMatch(/net diff head moved/);
-    expect(result.revalidationAborted || []).toEqual([]);
+    // Scoring reads the immutable listing head; the fresh pre-merge read refuses the later push.
+    expect(result.revalidationAborted).toEqual([expect.objectContaining({ num: 922,
+      reason: expect.stringContaining(`head moved since the pass-start decision (${fixtureSha('sha-922').slice(0, 9)} → ${fixtureSha('sha-922-pushed-later').slice(0, 9)})`) })]);
     expect(edits).toEqual([]);
   });
 

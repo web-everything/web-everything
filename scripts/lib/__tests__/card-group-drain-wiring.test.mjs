@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
+import { pinnedLeafGitFixture } from '../../__tests__/fixtures/pinned-leaf-git-fixture.mjs';
 import { cardGroupHold } from '../card-group.mjs';
 
 const script = fileURLToPath(new URL('../../merge-ai-prs.mjs', import.meta.url));
@@ -48,6 +49,8 @@ out([]);
 const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs'), a = process.argv.slice(2);
 fs.appendFileSync(process.env.GROUP_LOG, JSON.stringify(['git', ...a]) + '\\n');
+const pinned = (${pinnedLeafGitFixture})(a, [JSON.parse(fs.readFileSync(process.env.GROUP_PR, 'utf8'))]);
+if (pinned !== null) { fs.writeSync(1, pinned); process.exit(0); }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:${slug}.git\\n');
 else if (['rev-parse','merge-base'].includes(a[0])) process.stdout.write('${sha}\\n');
 else if (a[0] === 'diff') {
@@ -67,7 +70,7 @@ function world(fn) {
     const statePath = join(dir, 'groups.json'), fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json');
     const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update readme.', state: 'OPEN', isDraft: false,
       headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
-      labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], files: [{ path: 'README.md', changeType: 'MODIFIED' }],
+      labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], files: [{ path: 'README.md', changeType: 'MODIFIED', additions: 1, deletions: 1 }],
       commits: [{ oid: sha, messageHeadline: 'Update readme', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: sha }],
       comments: [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${sha} -->`, createdAt: new Date().toISOString() }], reviews: [] };
