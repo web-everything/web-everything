@@ -144,6 +144,8 @@ describe('testing ledger union', () => {
     ['prose', 'unrestricted prose\n'], ['unterminated row', '- incomplete'], ['inline fence', '- ```\n'],
     ['inline comment', '- <!-- hidden\n'], ['list heading', '- # Disabled\n'],
     ['list HTML', '- <div>\n'], ['table delimiter', '| --- | --- |\n'],
+    ['thematic break (spaced stars)', '* * *\n'], ['thematic break (dashes)', '- - -\n'],
+    ['thematic break (stars)', '***\n'], ['thematic break (underscores)', '___\n'], ['list thematic break', '- ***\n'],
   ])('refuses a testing ledger insertion containing %s', async (_, insertion) => {
     const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
     const base = '# Tests\n- existing\n';

@@ -184,6 +184,19 @@ describe('strict containment supersession', () => {
       superseded: [{ entry: f.entries[0], oldTip: f.sha('lane/old'), newTip: f.candidate }] });
   }));
 
+  it('keeps a contained overlay in the fold on re-registration but supersedes it for a new candidate', async () => fixture(async f => {
+    const fresh = await previewOverlayConflict({ root: f.clone, ref: 'lane/new', existingOverlays: f.entries, env: f.env });
+    expect(fresh).toMatchObject({ ok: true, clean: true, cur: f.main, candSha: f.candidate,
+      setAside: [], superseded: [{ entry: f.entries[0], oldTip: f.sha('lane/old'), newTip: f.candidate }] });
+
+    addOverlay(f.clone, { ref: 'lane/new' }, { env: f.env });
+    const entries = readOverlays(f.clone, { env: f.env });
+    const registered = await previewOverlayConflict({ root: f.clone, ref: 'lane/new', existingOverlays: entries, env: f.env });
+    expect(registered).toMatchObject({ ok: true, clean: true, candSha: f.candidate, setAside: [], superseded: [] });
+    expect(registered.cur).not.toBe(f.main);
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(entries);
+  }));
+
   it('excludes conflicting ancestor registrations before folding the candidate', async () => fixture(async f => {
     f.seedOriginBranch('lane/conflicting', { 'fix.txt': 'conflicting work\n' });
     f.seedOriginBranch('lane/resolved', { 'fix.txt': 'resolved work\n' }, 'lane/new');

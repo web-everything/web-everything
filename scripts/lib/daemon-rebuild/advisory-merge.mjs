@@ -39,8 +39,10 @@ const textLines = text => text.match(/[^\n]*\n|[^\n]+$/g) || [];
 function markdownRow(line) {
   const text = line.replace(/\r?\n$/, '');
   if (/[\x00-\x1f\x7f]/.test(text) || /```|~~~|<!--|-->|<\s*[!/?a-z]/i.test(text)) return null;
+  // A thematic break (`* * *`, `- - -`, `***`, `___`) is structure, never a data row.
+  if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(text)) return null;
   const item = text.match(/^(?:- |\* |\d+\. )(.+)$/);
-  if (item) return /^(?:\s|#|---(?:\s|$)|>)/.test(item[1]) ? null : 'list';
+  if (item) return /^(?:\s|#|---(?:\s|$)|>|[-*_](?:\s*[-*_])*\s*$)/.test(item[1]) ? null : 'list';
   if (!/^\|.+/.test(text)) return null;
   const cells = text.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim());
   return cells.every(cell => /^:?-+:?$/.test(cell)) ? null : 'table';

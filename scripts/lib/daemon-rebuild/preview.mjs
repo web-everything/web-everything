@@ -211,6 +211,7 @@ export async function previewOverlayConflict({
   root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = gitRun,
 } = {}) {
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
+  const candidateRegistered = existingOverlays.some(o => o.ref === ref);
   // Re-registration must compare the candidate against the other overlays. Including it here can
   // let its established priority drop a peer before even reaching the candidate conflict check.
   existingOverlays = existingOverlays.filter((o) => o.ref !== ref);
@@ -252,7 +253,10 @@ export async function previewOverlayConflict({
 
     const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
     if (!candSha) return { ok: false, reason: 'ref-unresolved' };
-    const superseded = supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head });
+    // A candidate that is ALREADY registered (a re-registration or an unaudited advance) can be held at its earlier
+    // adopted head by planRebuild, which need not contain what it would supersede: never supersede for it.
+    const superseded = candidateRegistered ? []
+      : supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head });
     existingOverlays = existingOverlays.filter(o => !superseded.some(s => s.entry.ref === o.ref));
 
     // 1. Fold every ALREADY-registered overlay using the running HEAD — the SAME `planRebuild` a real rebuild runs —
