@@ -136,7 +136,7 @@ describe('world capsule (R649 S1)', () => {
   });
 
   it.each([
-    ['api', 'repos/example/repo'], ['api', '-X', 'GET', 'repos/example/repo'],
+    ['api', 'repos/example/repo'], ['api', '--allow-escape-sequences', 'repos/example/repo/actions/jobs/1/logs'], ['api', '-X', 'GET', 'repos/example/repo'],
     ...['pr', 'issue', 'run'].flatMap(command => ['list', 'view'].map(action => [command, action, '--repo', 'o/r'])),
   ])('records read-only gh arguments %j from string results', async (...argv) => {
     const recorder = createCapsuleRecorder();

@@ -22,6 +22,7 @@ import {
   resolveRebuildAsJob, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
 } from '../daemon-rebuild/rebuild-job.mjs';
 import { readRebuildStarvation, writeRebuildStarvation } from '../daemon-rebuild/lease.mjs';
+import { writeReadyCandidate } from '../daemon-rebuild/state.mjs';
 import * as rebuildLease from '../daemon-rebuild/lease.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
@@ -145,6 +146,53 @@ describe('the job records a passed build; the tick adopts it without re-smoking'
     expect(head(cloneDir)).toBe(target);
   });
 
+  it('adopts stale-ready after main moved before considering a queued job, and rebuilds on the following tick', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    const target = advanceMain(originDir, dir => writeFile(dir, 'ready.txt', 'ready'));
+    const smoke = vi.fn(async () => PASS);
+    await rebuildClone({ root: cloneDir, env, runSmoke: smoke, prState: async () => null,
+      lockOpts: LOCK_OPTS, readyOnly: true, asJob: false, log: quietLog });
+    const ready = readReadyCandidate(cloneDir, env);
+    expect(ready.adopt.finalSha).toBe(target);
+    const latest = advanceMain(originDir, dir => writeFile(dir, 'later.txt', 'later'));
+    const store = createJobStore(mktemp('ready-first-jobs-'));
+    const queued = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root: cloneDir } });
+    const reattach = vi.fn(async () => ({}));
+    const adopt = () => rebuildClone({ root: cloneDir, env, runSmoke: smoke, prState: async () => null,
+      lockOpts: LOCK_OPTS, adoptOnly: true, asJob: false, skipCheck: null, log: quietLog });
+    const options = { root: cloneDir, env, store, adopt, reattach, log: quietLog, evict: () => ({}), codeSha: 'a'.repeat(40) };
+    const tick = await rebuildCloneAsJob(options);
+    expect(tick).toMatchObject({ moved: true, reason: 'ready-adopted', readyMatch: 'superseded' });
+    expect(head(cloneDir)).toBe(target);
+    expect(reattach).not.toHaveBeenCalled();
+    expect(store.list().records).toHaveLength(1);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(readReadyCandidate(cloneDir, env)).toBeNull();
+    store.update(queued.id, r => markSucceeded(r, { at: new Date().toISOString() }));
+    writeFileSync(join(store.dir, `${queued.id}${RESULT_SUFFIX}`), JSON.stringify({ readyRecorded: true }));
+    const next = await rebuildCloneAsJob(options);
+    expect(next).toMatchObject({ reason: 'rebuild-job-started', plan: { finalSha: latest } });
+    expect(head(cloneDir)).toBe(target);
+  });
+
+  it('a versioned clone with a job in flight never starts an inline build from the adopt-only pass', async () => {
+    const { cloneDir, env } = makeFixture();
+    const store = createJobStore(mktemp('versioned-jobs-'));
+    enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root: cloneDir } });
+    writeReadyCandidate(cloneDir, { kind: 'candidate', prevHead: 'x', tree: 't', passedAt: new Date().toISOString(),
+      adopt: { finalSha: 'ready', applied: [] } }, env);
+    const smoke = vi.fn(async () => PASS);
+    const reattach = vi.fn(async () => ({}));
+    const adopt = () => rebuildClone({ root: cloneDir, env, runSmoke: smoke, prState: async () => null, versions: { sentinel: true },
+      lockOpts: LOCK_OPTS, adoptOnly: true, asJob: false, skipCheck: null, log: quietLog });
+    const direct = await adopt();
+    expect(direct.reason).toBe('needs-build'); // adopt-only on a versioned clone says a build is due, never builds
+    const tick = await rebuildCloneAsJob({ root: cloneDir, env, store, adopt, reattach, log: quietLog, evict: () => ({}), codeSha: 'a'.repeat(40) });
+    expect(tick.reason).toBe('rebuild-job-running');
+    expect(smoke).not.toHaveBeenCalled();
+    expect(store.list().records).toHaveLength(1);
+  });
+
   it('adoptOnly with nothing ready says a build is due, smokes nothing and leaves no lease', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     const before = head(cloneDir);
@@ -183,7 +231,7 @@ describe('rebuildCloneAsJob — the tick side', () => {
     return { store: createJobStore(dir), reattach: vi.fn(async () => ({ slept: false, actions: [] })) };
   };
 
-  it('queues one job when a build is due, then reports it running without calling adopt again', async () => {
+  it('queues one job when a build is due, then reports it running without calling adopt again (no ready record)', async () => {
     const { store, reattach } = setup();
     const adopt = vi.fn(async () => ({ moved: false, reason: 'needs-build', plan: { finalSha: 'abc123' } }));
     const first = await rebuildCloneAsJob({

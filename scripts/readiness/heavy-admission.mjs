@@ -175,7 +175,7 @@ import {
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 import { routeNeedsGit } from './needs-git-route.mjs';
 import { capabilityBundleVerdict, capabilityRecord } from './remote-git-bundle.mjs'; // R501: test files that spawn git cannot run on Forge's .git-less snapshot
-import { recordRemoteRun } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
+import { recordRemoteRun, recordRemoteUsage } from '../lib/forge-share.mjs'; // R501: the one durable remote-success row forgeShare reads
 import { createMarkerReaper, markerContent, recordMarkerRun, watchMarkerExit, blockedSlots, heldTombstone, runVerdict } from './forge-slot-markers.mjs';
 import { createRunFinisher } from './forge-run-finish.mjs';
 import { classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES } from './heavy-repair-priority.mjs'; // red-main repair class — kept out of the projection (which the read-only `heavy-queue` op imports) because it needs `node:vm`
@@ -1554,7 +1554,7 @@ export async function runWithRemoteDecision({
       const confirmedByTelemetry = !terminated && await confirmFinished();
       await record(confirmedByTelemetry ? {mode:'cancelled',terminated:true,reason:result?.reason} : result); // record() itself skips a busy Forge result when the busy wait is enabled
       if (killedExit()) return killedExit();
-      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result };
+      if (result?.mode === 'remote' && Number.isInteger(result.code) && result.code >= 0 && result.code <= 254) return { handled: true, exitCode: result.code, remoteResult: result.resources ? {...result,slotUnits:units} : result };
       // Explicit acknowledgement or a fresh settled per-run result must confirm termination. Throws and
       // malformed replies alone may come from an executor whose remote child is still alive.
       if (!terminated) return killedExit() ?? refuseLocal(result?.reason ?? 'unconfirmed remote result');
@@ -3301,6 +3301,8 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
       if (result.handled) {
         if (result.remoteResult?.mode === 'remote') recordRemoteRun({ lockRoot, ms: Date.now() - remoteStartedAt, kind: classifyAdmissionCommandKind(command, process.env),
           receiptId: result.remoteResult.receiptId ?? result.remoteResult.run });
+        if (result.remoteResult?.mode === 'remote') recordRemoteUsage({ lockRoot, argv: remoteArgv,
+          ...result.remoteResult, kind: classifyAdmissionCommandKind(command, process.env) });
         if (result.remoteResult?.mode === 'remote') appendVerifyRemoteReport(process.env, {
           location: 'remote', receiptId: result.remoteResult.receiptId ?? result.remoteResult.run, exitCode: result.exitCode,
         });
