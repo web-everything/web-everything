@@ -562,6 +562,7 @@
   "scripts/conveyor/__tests__/poc-branch-sync.test.mjs": 1.68,
   "scripts/conveyor/__tests__/pr-blocked-by.test.mjs": 0.02,
   "scripts/conveyor/__tests__/pr-comments-complete.test.mjs": 0.13,
+  "scripts/conveyor/__tests__/pr-expectations.test.mjs": 0.3,
   "scripts/conveyor/__tests__/pr-label-mirror.test.mjs": 0.35,
   "scripts/conveyor/__tests__/pr-lifecycle.test.mjs": 0.05,
   "scripts/conveyor/__tests__/pr-live-owner-lock.test.mjs": 0.08,

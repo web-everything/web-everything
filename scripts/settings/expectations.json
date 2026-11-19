@@ -1,0 +1,105 @@
+{
+  "mode": "observe",
+  "expectations": [
+    {
+      "id": "ready-no-gate",
+      "after": [
+        "clear-human",
+        "ready-to-merge"
+      ],
+      "expect": "merge-gate-started",
+      "deadlineMinutes": 5,
+      "wouldBeResponse": "Diagnose merge gate with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "gate-not-merged",
+      "after": [
+        "merge-gate-pass"
+      ],
+      "expect": "merged",
+      "deadlineMinutes": 10,
+      "wouldBeResponse": "Diagnose merge delivery with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "push-no-review",
+      "after": [
+        "worker-push"
+      ],
+      "expect": "review-started",
+      "deadlineMinutes": 15,
+      "wouldBeResponse": "Diagnose review job with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "update-no-restart",
+      "after": [
+        "update-branch"
+      ],
+      "expect": "ci-and-review-restarted",
+      "deadlineMinutes": 15,
+      "wouldBeResponse": "Diagnose CI and review/red-team on the new head with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "red-team-no-verdict",
+      "after": [
+        "red-team:pending"
+      ],
+      "expect": "red-team-verdict",
+      "deadlineMinutes": 60,
+      "wouldBeResponse": "Diagnose red-team verdict with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "send-back-no-fixer",
+      "after": [
+        "send-back"
+      ],
+      "expect": "fixer-started",
+      "deadlineMinutes": 30,
+      "wouldBeResponse": "Diagnose fixer launch with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "ci-red-no-heal",
+      "after": [
+        "ci-red"
+      ],
+      "expect": "ci-heal-or-fixer-started",
+      "deadlineMinutes": 20,
+      "wouldBeResponse": "Diagnose CI heal or fixer with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "hot-patch-not-adopted",
+      "after": [
+        "hot-patch-load"
+      ],
+      "expect": "build-adopted",
+      "deadlineMinutes": 5,
+      "wouldBeResponse": "Diagnose hot-patch adoption with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "lead-no-heartbeat",
+      "after": [
+        "change-lead-heartbeat"
+      ],
+      "expect": "next-heartbeat",
+      "deadlineMinutes": 15,
+      "wouldBeResponse": "Diagnose change-lead heartbeat with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "clean-not-enqueued",
+      "after": [
+        "enqueue-eligible"
+      ],
+      "expect": "merge-queue-enqueued",
+      "deadlineMinutes": 15,
+      "wouldBeResponse": "Diagnose merge-queue admission with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    },
+    {
+      "id": "stale-publication-hold",
+      "after": [
+        "publication-hold-set"
+      ],
+      "expect": "publication-hold-cleared",
+      "deadlineMinutes": 30,
+      "wouldBeResponse": "Diagnose publication hold and whether its cause is gone with run.mjs why / pr-trace and record the cause. After proving nothing is still running, re-trigger once through the sanctioned op keyed (pr, sha, expectation). Escalate to the change lead, then needs-you, with cause and attempt."
+    }
+  ]
+}

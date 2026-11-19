@@ -5172,3 +5172,13 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+## Expectation babysitter replay (S1)
+
+Run `scripts/conveyor/__tests__/pr-expectations.test.mjs` with `node --test` through
+heavy admission. Replays require all three scratch paths: `--events-file`,
+`--evidence-file`, and `--state-file`; `--as-of` requires those paths too. The events
+file is both input and the scratch miss-event sink. Evidence fixtures use the
+explicit head-bound contract documented in `pr-expectations.mjs`. Missing or capped
+evidence remains unknown. Miss receipts reserve before append to prevent duplicate
+emission after restart; a failed append or abandoned lock requires operator inspection.

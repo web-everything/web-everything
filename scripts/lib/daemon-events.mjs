@@ -2,6 +2,9 @@
  * PR watcher kinds: pr-merged, pr-ready-not-merging, ready-stuck (detail.needsYou=true; label age and blocker cause), pr-looping, pr-no-progress, ci-job-overdue,
  * review-paused-no-verdict (once per PR head: >=3 review runs on the head, none a recorded decisive verdict; detail = { head, runs, reason }).
  * Stuck PR evidence kind: stuck-trace; detail = { head, trigger, headline, owner, waitingFor, note } (event only).
+ * Observe-only expectation kind: expectation-missed; daemon = expectation-babysitter;
+ * detail = { pr, sha, expectationId, action, actionAt, deadline, observedAt,
+ * minutesLate, evidenceRefs, wouldBeResponse, mode: "observe" }. Never executes a response.
  * Clone maintenance kind: clone-maintenance; detail = { clone, bytesBefore, bytesAfter,
  * freed, durationMs, skipped?, reason? }. Unavailable byte measurements are null.
  * This shared writer deliberately accepts open event kinds. */
