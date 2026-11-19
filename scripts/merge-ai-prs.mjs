@@ -132,8 +132,7 @@ import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from 
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
-import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
-// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
+import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
 import {
@@ -186,6 +185,16 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { backfillOpenReviewRuns } from './lib/review-run-index.mjs';
+/** Optional discovery hints must never reject the drain's open-PR context. */
+export function backfillDrainReviewRuns(context, {
+  backfill = backfillOpenReviewRuns, resolveDir = resolveRunsDir, localSlug,
+} = {}) {
+  try { backfill(context, { runsDir: resolveDir(), localSlug }); }
+  catch { /* The unchanged bounded evidence scan remains authoritative. */ }
+  return context;
+}
+import { resolveRunsDir } from './operations/run-store.mjs';
 import { resolveCardNumbering } from './lib/policy-cascade.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
@@ -4734,23 +4743,26 @@ export function describeGhListError(e) {
 
 // ── CLI boundary ───────────────────────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (IS_CLI) runCli().catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
+if (IS_CLI) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
-async function runCli() {
+export async function main(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
+  const flags = parseArgvFlags(argv);
+  // Keep the real CLI's synchronous flush before exit; fixtures supply a memory sink.
+  const writeStdout = text => stdout === process.stdout ? writeAllSync(1, text) : stdout.write(text);
   // #3866 (ratified) — opt-in only: a no-op unless WE_GITHUB_APP_* is configured, in which case every `gh`
   // call this drain run makes draws from the App installation's own rate-limit bucket instead of the
   // operator's personal one. Awaited HERE, before any gh work, so a fresh env var is in place for even the
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
   // PR #5729 — the drain is a daemon: install the gh refusal shim (or refuse) before any gh call.
-  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(env, argv) });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
-  // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
+  // value) throws here and is caught by this file's own top-level `main(...).catch(...)` — an ordinary CLI
   // usage-error exit, not a drain failure.
-  const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
-  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
-  process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }))}\n`);
+  const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env });
+  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env }))}\n`);
+  process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -4798,7 +4810,7 @@ async function runCli() {
   // `--under-lease=<owner>` (or the DRAIN_UNDER_LEASE env) declares this run a CHILD of the resident drain
   // daemon that already holds the lease (#2449) — run without acquiring, the parent owns the heartbeat.
   const NO_DRAIN_LEASE = !!flags['no-drain-lease'];
-  const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (process.env.DRAIN_UNDER_LEASE || null);
+  const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (env.DRAIN_UNDER_LEASE || null);
   // #2395 — `--max-runtime-min=N`: a wall-clock lifetime cap on a `--watch` monitor. The bounded-max-lifetime
   // backstop push-at-close needs: when its detached drain has no batch feed, `--until-batches-idle` is INERT
   // and would poll forever, so this hard-stops the watch after N minutes regardless of idle/feed state. 0/unset
@@ -4870,7 +4882,7 @@ async function runCli() {
   // use the URL so a remote on another GitHub host keeps its identity too. Never guess on a failed read.
   let implicitLabelRepo;
   const memoRepo = (repo) => {
-    if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
+    if (repo || env.GH_REPO) return repo || env.GH_REPO;
     if (!implicitLabelRepo) {
       implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
@@ -4908,7 +4920,7 @@ async function runCli() {
   // so a restarted or one-shot drain does not re-mint labels every pass. A not-found on a label write forgets the
   // entry and re-mints it (`healLabelNotFoundIn`), so a label deleted on GitHub is created again exactly when needed.
   const labelEnsurer = createLabelEnsurer({
-    path: process.env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
+    path: env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
     run: (args, repo) => execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }),
   });
 
@@ -4990,7 +5002,7 @@ async function runCli() {
   const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
-    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
+    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
@@ -5122,7 +5134,7 @@ async function runCli() {
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
-  const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(env);
   const stuckUnknownPath = join(dirname(refreshedStatePath()), 'stuck-unknown-mergeability.json');
   let stuckUnknownMarks = loadStuckUnknown(stuckUnknownPath);
   const updateStuckUnknown = next => {
@@ -5142,7 +5154,7 @@ async function runCli() {
   let stuckUnknownTool;
   try { stuckUnknownTool = readDeclaredDrainSettings()?.drain?.stuckUnknownMergeability; } catch { /* standard */ }
   const stuckUnknownSetting = cascadePolicy('drain.stuckUnknownMergeability', stuckUnknownTool, {
-    standard: { afterMinutes: 30 }, env: process.env,
+    standard: { afterMinutes: 30 }, env,
     valid: { afterMinutes: v => Number.isFinite(v) && v > 0 },
   });
   process.stderr.write(`merge-ai-prs: stuckUnknownMergeability.afterMinutes=${stuckUnknownSetting.value.afterMinutes} (${stuckUnknownSetting.sources.afterMinutes})\n`);
@@ -5164,9 +5176,9 @@ async function runCli() {
       read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) }),
   };
   const fail = (reason, detail, code) => {
-    if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
-    process.exit(code);
+    exit(code);
   };
 
   // Read a PR's lane manifest (#2188). xnsk54v — the manifest now rides the PR BODY (drain-only orchestration
@@ -5353,7 +5365,7 @@ async function runCli() {
     },
     onListingFailed: (repo) => { process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
-  });
+  }).then(context => backfillDrainReviewRuns(context, { localSlug }));
 
   // #2421 — POST-CI TOTAL CI-LIFECYCLE LABEL RECONCILE, generalizing #2216's green-only `reconcileGreenLabels`
   // per the #2281 ruling. Every open, PRODUCER-OWNED (AI-generated) PR is brought to the state
@@ -5717,7 +5729,10 @@ async function runCli() {
           // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
           let seed = snapshotSeed || [];
           if (!snapshotSeed) {
-            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+            // Cache-only within the snapshot's normal TTL and dirty rules (same bounds as before, so heavy-field
+            // staleness is unchanged); a stale or dirty snapshot just gives no seed. The old fresh-or-refresh read ran a second full paged
+            // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
+            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
           listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
@@ -6861,7 +6876,7 @@ async function runCli() {
   const drainOrder = (() => {
     let tool; try { tool = readDeclaredDrainSettings()?.drain; } catch { tool = undefined; }
     let platform = null; try { platform = platformPreference('drain') ?? null; } catch { platform = null; }
-    return resolveDrainOrderSettings({ tool, platform, env: process.env });
+    return resolveDrainOrderSettings({ tool, platform, env });
   })();
   const drainPriority = { ...readDeliveryPrioritySettings(), mode: drainOrder.priorityMode };
   delete drainPriority.invalid;
@@ -7339,7 +7354,7 @@ async function runCli() {
         // dedupe) — not a no-op stub, which silently dropped the trace for a PR found already merged before
         // the land path below rebinds it (the out-of-band branch right after revalidation).
         const makeMergeTrace = (headSha, prereadComments) => () => {
-          const reason = buildMergeTraceReason({ headSha, caller: 'drain', sessionId: process.env.CLAUDE_CODE_SESSION_ID || null });
+          const reason = buildMergeTraceReason({ headSha, caller: 'drain', sessionId: env.CLAUDE_CODE_SESSION_ID || null });
           const posted = postDrainReasonComment(c.repo, c.num, MERGE_TRACE_KIND, reason, null, prereadComments);
           if (!AS_JSON) process.stderr.write(`  💬 ${repoTag(c.repo)}${c.num} merge trace stamped (head ${headSha || 'unknown'})${posted ? '' : ' (already stamped / post failed)'}\n`);
         };
@@ -7655,7 +7670,7 @@ async function runCli() {
   // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
   const followup = await handOffDrainFollowup({
     landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
-    buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
+    buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof env.WE_PRIMARY === 'string' && env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
   });
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
@@ -7700,8 +7715,8 @@ async function runCli() {
   // left UNTOUCHED and loudly logged; a hint-less unlocatable (cwd IS the primary, already synced) stays quiet.
   let primarySynced = null;
   if (landedLocal) {
-    const primary = resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY });
-    const hinted = (typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim());
+    const primary = resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY });
+    const hinted = (typeof flags.primary === 'string' && flags.primary.trim()) || (typeof env.WE_PRIMARY === 'string' && env.WE_PRIMARY.trim());
     const gitAt = (a) => readGit(a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const isCwd = (p) => { try { return realpathSync(p) === realpathSync(process.cwd()); } catch { return false; } };
     const r = syncPrimaryOnLand({ exec: gitAt, primary, hinted: !!hinted, isCwd });
@@ -7946,15 +7961,15 @@ async function runCli() {
       : leaseGate.reason === 'lease-held-uncovered'
       ? `another drain holds the whole-process lease (${heldBy || '?'}) but its scope does NOT cover ${uncovered.join(', ')} — those repos are NOT swept by the holder; wait for it to exit, or force an immediate scoped run with --no-drain-lease (#2458)`
       : `another drain already holds the whole-process lease (${heldBy || '?'}) — no-op; its next pass covers this work (#2449/#2391)`;
-    if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: true, ...(WATCH ? { watch: true } : {}), skipped: 'drain-in-progress', heldBy, detail, ...(uncovered.length ? { uncovered } : {}) }) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify({ ok: true, ...(WATCH ? { watch: true } : {}), skipped: 'drain-in-progress', heldBy, detail, ...(uncovered.length ? { uncovered } : {}) }) + '\n');
     else process.stderr.write(`merge-ai-prs · ${detail}\n`);
-    process.exit(0);
+    exit(0);
   }
   if (leaseHeld) {
     // Release on ANY exit path (the watch loop has several `break`s + signal kills). Idempotent + owner-fenced:
     // releaseDrainLease only frees a lease THIS owner still holds, so a reclaimer who seized it is never stomped.
     process.on('exit', () => { releaseDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { repoKey: localSlug }); });
-    for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0)); // → triggers the exit handler → frees the lease
+    for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => exit(0)); // → triggers the exit handler → frees the lease
   }
 
   // ── RED-MAIN dispatch-freeze (#2681) — while main is red, nothing but the main-fix PR writes to main ─────────
@@ -7971,7 +7986,7 @@ async function runCli() {
   //     and the stranded-card sweep does not push (`redMainHeld`). The real CLI is defended in
   //     merge-ai-prs-red-main-hold-wiring.test.mjs, which runs WITHOUT the bypass and asserts both the
   //     `gh pr merge` calls and every `git push` to main.
-  const redMainBypass = !!flags['no-red-main-freeze'] || process.env.WE_MERGE_BREAK_GLASS === '1';
+  const redMainBypass = !!flags['no-red-main-freeze'] || env.WE_MERGE_BREAK_GLASS === '1';
   let freezeBeforePass = null;
   const readDrainFreezePass = async () => {
     const cached = freezeBeforePass;
@@ -8007,12 +8022,12 @@ async function runCli() {
     };
   };
   const emitRedMainStop = (stop) => {
-    if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, ...(WATCH ? { watch: true } : {}), stopped: 'red-main-freeze', detail: stop.detail, marker: stop.marker }) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify({ ok: false, ...(WATCH ? { watch: true } : {}), stopped: 'red-main-freeze', detail: stop.detail, marker: stop.marker }) + '\n');
     else process.stderr.write(`merge-ai-prs · STOP-THE-LINE — ${stop.detail}\n`);
   };
   {
     const stop = await redMainFreezeStop();
-    if (stop) { emitRedMainStop(stop); process.exit(5); } // distinct from empty (0), merge-fail (2), dup-id (3): a red-main stop-the-line
+    if (stop) { emitRedMainStop(stop); exit(5); } // distinct from empty (0), merge-fail (2), dup-id (3): a red-main stop-the-line
   }
 
   // ── Driver — one sweep (the /drain one-shot + /merge bare), or the `--watch` monitor (`/drain watch`) ──────
@@ -8026,11 +8041,11 @@ async function runCli() {
       sleepSync(REPOLL_SEC * 1000);
       ({ result, failedMerges, duplicateIdsOnMain } = await sweepOnce());
     }
-    if (AS_JSON) writeAllSync(1, JSON.stringify(result) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify(result) + '\n');
     // #2318 — a duplicate id surviving on main is a LOUD failure (exit 3), distinct from a merge failure (exit 2):
     // main is in a globally-red state until it is resolved by hand, so the drain must never exit 0 over it.
     const exitCode = passExitCode({ dup: duplicateIdsOnMain, failed: failedMerges, mergedCount: result.merged.length });
-    process.exit(exitCode);
+    exit(exitCode);
   }
 
   // WATCH: re-sweep on a fixed interval, landing PRs as they become eligible, until `--max-idle` consecutive
@@ -8051,7 +8066,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(env, argv) });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a
@@ -8135,8 +8150,8 @@ async function runCli() {
   }
   if (!AS_JSON) process.stderr.write(`watch: stopped after ${passes.length} pass(es); merged ${allMerged.length} PR(s) total.\n`);
   // A red-main freeze already emitted its own stop payload (above) — don't double-emit; just exit 5.
-  if (redMainStopped) process.exit(5);
-  if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: lastDup.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
+  if (redMainStopped) exit(5);
+  if (AS_JSON) writeStdout(JSON.stringify({ ok: lastDup.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
   const exitCode = passExitCode({ dup: lastDup, failed: lastFailed, mergedCount: allMerged.length });
-  process.exit(exitCode);
+  exit(exitCode);
 }
