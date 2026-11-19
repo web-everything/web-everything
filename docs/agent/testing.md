@@ -1107,6 +1107,8 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
+`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
+
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
 `scope` / `WE_REVIEW_SHADOW_AGY_SCOPE` defaults to `high-care`: use the read's
@@ -2930,6 +2932,8 @@ also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites 
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.
 
 ## Referral re-checks on the live head
+
+Unpromoted Carbon must retain prior unresolved referrals through both the mandatory-referral sink and the acceptance gate, like an unset Gemini cap. Keep default-path fixtures alongside promoted variants and assert that no settlement or audited retirement was written.
 
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
 `scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
@@ -4893,6 +4897,34 @@ an existing report that cannot be read, parsed or structurally validated, or exc
 the first attempt with the report failure in the diagnostic and an operator-review escalation.
 Keep ordinary flake rerun identity/count coverage checks unchanged. Run `overlay-main-sync-rerun.test.mjs`,
 `daemon-rebuild-overlay-main-sync.test.mjs`, and the killed-run soak through heavy admission.
+## Carbon review admission and complete escape evidence (Slice A)
+
+Carbon shadows require both `WE_REVIEW_SEAT_CAP_AGY_GEMINI > 0` and
+`WE_REVIEW_SEAT_CAP_CARBON_SHADOW > 0` (default 1; malformed values refuse).
+The daemon plist currently sets the Gemini cap to 0: operators must explicitly raise
+it to enable Carbon shadows. A refusal records `agy-gemini seat cap 0` or
+`carbon shadow seat off`; it never retries or reserves budget. Other Gemini models
+retain their provider cap.
+
+Non-shadow Carbon seats require `shadowSeats.antigravity.promoted === true`
+(default false; environment `WE_REVIEW_SHADOW_AGY_PROMOTED=true`). Only the
+orchestrator flips promotion after the manual ruling on ten agreeing PRs. The setting
+resolves standard → platform review → tool review.json → environment and logs provenance.
+The Carbon probation entry tracks shadow trials only; pinning Carbon never auto-seats
+an advisory reviewer. Unpromoted non-shadow Carbon is refused, leaving Gemini unseated
+by default. Historical counted-seat fixtures must explicitly supply promotion.
+
+`review-shadow-model.test.mjs` covers both launch switches, malformed overrides,
+manual promotion and the unchanged shadow path. `agy-review-juror.test.mjs` requires
+`read_file` to name a nonempty direct string path under a path-like key, contained
+by realpath in the juror lane (including symlink checks). Missing, scalar, array,
+nested-only and escaped parameters void the run. Other read tools retain their rules.
+Every nonempty transcript line must be an event object; an answered juror must end
+with a `result` object whose status is `SUCCESS`. Empty, whitespace-only, unrelated,
+non-object and incomplete transcripts void the run for incomplete escape evidence.
+Successful fixtures supply realistic tool events and a successful terminal result;
+never relax the evidence rule to accommodate an empty fixture. Refused evidence
+requires a fresh run with a complete transcript before its answer can count.
 ## Owed CI rerun execution
 
 The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
