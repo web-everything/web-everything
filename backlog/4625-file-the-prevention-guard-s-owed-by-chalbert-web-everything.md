@@ -3,10 +3,8 @@ bornAs: x3mwlhk
 kind: story
 size: 3
 status: open
-scope: ["we:contracts/plateau-progress-view.schema.json", "we:contracts/plateau-progress-view.examples.json", "we:contracts/plateau-progress-view.test.ts", "we:docs/agent/plateau-progress-view.md"]
+
 dateOpened: "2026-09-30"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "15f400ecdda55f99a759cf919567f6a482cfa9a7"
 tags: []
 ---
 
@@ -64,3 +62,12 @@ Each is a future backlog item, filed by the eventual builder:
 - Finding 4: review/lint check cross-referencing operator additions in a design doc against the contract schemas (needs its own design; the goal is an LLM-review check, not a deterministic rule).
 - Relay-side enforcement of per-item validation in `plateau-app:wip-relay.js`.
 - Extend the error-row rule to runs, holds, actions and items (needs a discriminator because `run`/`hold` allow additional properties).
+
+## Findings (standalone worker, 2026-11-19)
+
+The build-dispatch daemon held #4625 with:
+
+> worker-declined: Not prepared: #4625 — could-not-prepare. A contract decision remains: should malformed PRs become counted error rows, including when repo/number identity is unavailable, or preserve the last good collection? The proposed identity-free error row conflicts with PR identity and cached-membership requirements in 'we:contracts/plateau-progress-view.schema.json:4793' and ':4837'. Existing failure behavior retains the last good section ('we:docs/agent/plateau-progress-view.md:148'). Choosing between these changes consumer semantics. No files changed or stamps applied; no tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
