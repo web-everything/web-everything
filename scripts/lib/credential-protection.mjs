@@ -44,7 +44,7 @@ export function readCredentialProtection(text) {
 }
 
 const examples = new Set(['.env.example', '.env.sample', '.env.template']);
-const expandHome = (s, home) => s.replace(/\$\{HOME\}|\$HOME\b|~(?=\/)/g, () => home);
+const expandHome = (s, home) => s.replace(/\$\{HOME\}|\$HOME\b|~(?=\/|$)/g, () => home);
 export function classifyProtectedPath(path, { home, repoRoot, protectedPaths = DEFAULT_PROTECTED_PATHS } = {}) {
   if (typeof path !== 'string' || !home || !repoRoot) return { decision: 'pass', path: null, reason: null };
   const full = resolve(repoRoot, expandHome(path, home));
@@ -125,6 +125,7 @@ function envPrefixPossible(name) {
   return !examples.has(name);
 }
 function patternHit(word, options) {
+  if (word === '{}') return pass(); // find's placeholder, not a glob
   const full = resolve(options.repoRoot, expandHome(word, options.home));
   if (!/[*?\[{]/.test(full)) return classifyProtectedPath(word, options);
   const parts = full.split('/');
@@ -151,8 +152,80 @@ function patternHit(word, options) {
   }
   return pass();
 }
+// Only concrete protected paths participate: .env* remains a basename rule,
+// rather than making every directory a forbidden recursive source.
+function ancestorHit(word, options) {
+  const full = resolve(options.repoRoot, expandHome(word, options.home));
+  for (const entry of withProtectedPathFloor(options.protectedPaths)) {
+    if (entry.path === '.env*') continue;
+    const root = resolve(expandHome(entry.path, options.home));
+    if (root === full || root.startsWith(full.endsWith('/') ? full : `${full}/`)) {
+      return { decision: 'deny', path: full,
+        reason: `Recursive access can reach ${root}: ${entry.reason}; use explicit non-protected subpaths` };
+    }
+  }
+  return pass();
+}
+
+function recursiveAncestorHit(words, options) {
+  const name = basename(words[0] ?? '');
+  let args = words.slice(1);
+  const search = ['grep', 'egrep', 'fgrep', 'rg', 'ag'].includes(name);
+  const recursive = new Set(['tar', 'zip', '7z', '7za', '7zr', 'cp', 'rsync', 'scp', 'rg', 'ag', 'cpio', 'ditto', 'pax', 'mv']);
+  if (['grep', 'egrep', 'fgrep'].includes(name)) {
+    if (!args.some(w => w === '--recursive' || /^-[^-]*[rR]/.test(w))) return pass();
+  } else if (name === 'find') {
+    if (!args.some(w => /^-(?:exec|execdir|ok|okdir|fprint.*|fls)$/.test(w))) return pass();
+    while (['-H', '-L', '-P'].includes(args[0])) args.shift();
+    // Expressions are not search roots (in particular, the -fprint destination).
+    args = args.slice(0, args.findIndex(w => w.startsWith('-') || w === '!') >>> 0);
+  } else if (name === 'git') {
+    const subcommand = args.findIndex(w => ['add', 'commit'].includes(w));
+    if (subcommand < 0) return pass();
+    args = args.slice(subcommand + 1);
+  } else if (!recursive.has(name)) return pass();
+
+  let repoRoot = options.repoRoot;
+  let literal = false;
+  let grepPattern = search;
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i];
+    if (!literal && word === '--') { literal = true; continue; }
+    if (!literal && ['tar', 'zip'].includes(name)
+      && (word === '-C' || word === '--directory' || word.startsWith('--directory=') || word.startsWith('-C'))) {
+      const dir = word === '-C' || word === '--directory' ? args[++i]
+        : word.startsWith('--directory=') ? word.slice(12) : word.slice(2);
+      if (!dir) return { decision: 'deny', path: word, reason: 'Missing archive directory; use an explicit directory and retry' };
+      repoRoot = resolve(repoRoot, expandHome(dir, options.home));
+      continue;
+    }
+    if (!literal && search && ['-e', '--regexp', '-f', '--file'].includes(word)) {
+      i++; grepPattern = false; continue;
+    }
+    if (!literal && search && /^(?:--(?:regexp|file)=|-[ef].+)/.test(word)) {
+      grepPattern = false; continue;
+    }
+    if (!literal && name === 'git' && ['-m', '--message', '-F', '--file'].includes(word)) { i++; continue; }
+    if (!literal && word.startsWith('-')) continue;
+    if (grepPattern) { grepPattern = false; continue; }
+    // Remote scp/rsync operands are conservatively checked as path operands too.
+    const operand = ['scp', 'rsync'].includes(name) && word.includes(':') ? word.slice(word.indexOf(':') + 1) : word;
+    if (!operand) continue;
+    const hit = ancestorHit(operand, { ...options, repoRoot });
+    if (hit.decision === 'deny') return hit;
+  }
+  return pass();
+}
+
 export function classifyBashCommand(command, options = {}) {
   if (typeof command !== 'string') return pass();
+  // Preserve quoted/escaped whitespace in operands before shell quote removal.
+  for (const segment of command.replace(/\\\n/g, '').split(/&&|\|\||[;|\n()`]/)) {
+    const words = (segment.match(/(?:\$?'(?:\\.|[^'\\])*'|\$?"(?:\\.|[^"\\])*"|\\[\s\S]|[^\s"'\\])+/g) ?? []).map(normalizeWord);
+    while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
+    const hit = recursiveAncestorHit(words, options);
+    if (hit.decision === 'deny') return hit;
+  }
   // Retain substitutions for the SSH check; normalize adjacent shell fragments
   // before tokenization so escaping cannot conceal a protected directory.
   const text = normalizeWord(command.replace(/\\\n/g, ''));

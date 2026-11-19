@@ -57,7 +57,13 @@ of the outer command, including nested backticks and substitutions inside listin
 Shell word escapes, locale `$"..."` quotes, adjacent quote fragments, and ANSI-C
 `$'...'` escapes (hex, octal, Unicode, and control characters) normalize before matching; HOME,
 repeated separators, dot segments and lexical parent segments resolve. Glob patterns
-that can reach protected paths also deny. Git, gh, scp, rsync, and curl deny protected path arguments;
+that can reach protected paths also deny. Recursive reads of an ancestor of a protected
+path (including home, `/`, and `~/.config/gh`) deny for archives, copies, recursive
+searches, find content/output actions, and Git add/commit paths. Tar/zip `-C`
+operands resolve against that directory. Use explicit non-protected subpaths such as
+`~/projects` instead. Metadata listings and non-recursive reads of unrelated files
+remain allowed; `.env*` retains its basename rule rather than forbidding all directories.
+Git, gh, scp, rsync, and curl deny protected path arguments;
 Git/gh commands without those arguments follow normal permission flow. Content
 reads, copies, archives, transforms, interpreters referencing protected paths and input
 redirections deny. The Bash matcher exempts exact `.env.example`, `.env.sample`,
