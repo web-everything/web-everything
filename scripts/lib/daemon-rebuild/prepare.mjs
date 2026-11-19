@@ -2,6 +2,8 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
+import { timeoutRetryAt, resolveRecovery } from './recovery.mjs';
+
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
   alertsFilePath, readRebuildState, writeRebuildState, readReadyCandidate,
@@ -669,6 +671,7 @@ export async function prepareRebuild({
         });
         writeState();
         const fin = await finalizeRebuild({
+          readyPassedAt: ready.passedAt,
           root,
           env,
           log,
@@ -711,6 +714,10 @@ export async function prepareRebuild({
   const forceBypass = !forceBlockedReason(root, stEnv) && !!forceRequestFor(root, stEnv, plan.finalSha);
   if (forceBypass && (state.rejected?.inputsKey === plan.inputsKey || state.held?.reason === 'smoke-harness-broken')) {
     alert('force-adopt-bypasses-rejection', { target: plan.finalSha, rejected: state.rejected?.reason ?? null });
+  }
+  if (!forceBypass && state.held?.reason === 'smoke-env-timeout') {
+    const retryAt = timeoutRetryAt(state.held, resolveRecovery({ env, log: m => log.error?.(m) }));
+    if (!Number.isFinite(retryAt) || nowMs() < retryAt) return terminal({ moved: false, reason: 'smoke-env-timeout-backoff', plan });
   }
   if (!forceBypass && state.held?.reason === 'smoke-harness-broken' && state.rejected?.harnessBroken) {
     const retryAtMs = Date.parse(state.rejected.retryAt || '');

@@ -4810,3 +4810,22 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+
+## Between-tick rebuild launch probes
+
+`daemon-rebuild-early-launch.test.mjs` runs with Node's test runner and also registers with Vitest.
+Its hermetic `withSelfSync` probe drives the injected watcher timer between ticks, with real job-store
+queue tests and no Git/network children. `daemon-rebuild-early-timing.test.mjs` advances separate
+reader-lock, planning, smoke-slot and smoke clocks so planning/smoke time cannot masquerade as queue wait.
+The early-launch setting is off by default; `daemon-rebuild-settings.json` `earlyLaunch.entries`
+opts in an entry such as `health-watch.mjs`. `WE_DAEMON_REBUILD_EARLY_LAUNCH=0|1` overrides enablement;
+`WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS` overrides the trailing debounce. Missing or oversized event
+history defers to tick-start. The watcher only queues a job; ready candidates still adopt at tick boundaries.
+
+Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (node:test, also
+selectable by Vitest) and the `rebuild-held-recovery` soak break. Environment timeout
+backoff lives on `state.held`, leaving candidate rejection semantics intact. Legacy holds
+without a deadline derive one from `updatedAt`/`since`; invalid timestamps stay held for
+operator repair. Recovery settings use the shared policy cascade and the detached job
+queue retains its in-flight guard before considering any recovery trigger.

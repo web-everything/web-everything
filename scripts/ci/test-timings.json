@@ -2031,5 +2031,10 @@
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
- }
+ },
+  "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
+  "scripts/lib/__tests__/daemon-rebuild-early-launch.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-early-timing.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1
 }

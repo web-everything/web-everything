@@ -128,6 +128,7 @@ import { gateMergedCommit } from './daemon-live-smoke.mjs';
 import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
 import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
+import { createEarlyLaunchWatcher, createMainMoveReader, resolveEarlyLaunch } from './daemon-rebuild-early-watch.mjs';
 import { createAdoptYieldProbe } from './daemon-rebuild/adopt-yield.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
@@ -827,7 +828,7 @@ export function withSelfSync(effects, {
   background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, rebuildJobIds,
   readLatestRebuildJobResult: readLatestJobOpt,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
-  rebuildAsJob: rebuildAsJobOpt,
+  rebuildAsJob: rebuildAsJobOpt, earlyLaunch, earlyLaunchIo = {},
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
@@ -1120,13 +1121,31 @@ export function withSelfSync(effects, {
     return skippedTick('clone-recloned');
   };
 
+  const earlySettings = earlyLaunch ?? resolveEarlyLaunch({ entries, env, log: (m) => log.error?.(m) });
+  const earlyWatcher = createEarlyLaunchWatcher({
+    settings: { ...earlySettings, enabled: earlySettings.enabled && !resolvedPocBranch && !vctx },
+    now, log: (m) => log.error?.(m),
+    readSignal: earlyLaunchIo.readSignal ?? (realIo && earlySettings.enabled ? createMainMoveReader({ env, now }) : () => null),
+    inFlight: earlyLaunchIo.inFlight ?? (() => {
+      const store = createJobStore(rebuildJobsDir(root, env));
+      const { records, corrupt } = store.list();
+      if (corrupt?.length) return null;
+      return records.some((r) => r.job?.kind === REBUILD_JOB_KIND.kind && !TERMINAL_JOB_STATUSES.includes(r.job.status));
+    }),
+    launch: (options) => {
+      tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: now(), ...cloneLockOpts() });
+      return rebuild(options);
+    },
+    ...(earlyLaunchIo.schedule ? { schedule: earlyLaunchIo.schedule } : {}),
+    ...(earlyLaunchIo.cancel ? { cancel: earlyLaunchIo.cancel } : {}),
+  });
   const synced = {
     ...effects,
     // Forwards whatever arguments the caller's own tickOnce takes (e.g. runner.mjs's per-tick bookkeeping
     // payload) straight through to the wrapped `tick` — this wrapper never needs to see them itself, and
     // dropping them would silently reset a payload-threading caller's state every tick. The daemons that
     // built this helper pass a zero-arg tickOnce, so `...args` is empty for them and nothing changes.
-    tickOnce: async (...args) => {
+    tickOnce: async (...args) => earlyWatcher.tick(async () => {
       const ownershipNowMs = now();
       tickOwnership = resolveCloneOwnership({ root, entries, env, nowMs: ownershipNowMs, ...cloneLockOpts() });
       if (tickOwnership.reason !== lastOwnershipReason) {
@@ -1358,7 +1377,7 @@ export function withSelfSync(effects, {
         }
         return tickResult;
       }
-    },
+    }),
   };
   return synced;
 }

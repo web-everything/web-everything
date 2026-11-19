@@ -342,9 +342,9 @@ export function staleAlertDetail(result, state) {
     reason: result.reason,
     mainSha: result.plan.mainSha,
     target: result.plan.finalSha,
-    retryAt: result.reason === 'smoke-harness-broken-backoff' || result.reason === 'smoke-harness-broken'
+    retryAt: state.held?.reason === 'smoke-env-timeout' ? state.held.retryAt ?? null : result.reason === 'smoke-harness-broken-backoff' || result.reason === 'smoke-harness-broken'
       || state.rejected?.inputsKey === result.plan.inputsKey ? (state.rejected?.retryAt ?? null) : null,
-    attempts: state.rejected?.attempts ?? null,
+    attempts: state.held?.reason === 'smoke-env-timeout' ? state.held.attempts ?? null : state.rejected?.attempts ?? null,
     ...(state.held ? { broken: {
       failed: state.held.failed,
       detail: state.held.details?.[0]?.name === 'daemon-entries-boot'
@@ -372,7 +372,7 @@ export async function finalizeRebuild(options) {
 }
 
 async function finalizeRebuildLocked({
-  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
+  root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, readyPassedAt,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -430,6 +430,7 @@ async function finalizeRebuildLocked({
     if (!state.adopted || state.adopted.inputsKey !== plan.inputsKey || state.held) {
       state.adopted = {
         head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+        ...(Number.isFinite(Date.parse(readyPassedAt)) ? { readyToAdoptedMs: Math.max(0, nowMs() - Date.parse(readyPassedAt)) } : {}),
       };
       state.rejected = null;
       state.held = null;
@@ -501,6 +502,7 @@ async function finalizeRebuildLocked({
     }
     state.adopted = {
       head: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied, at: nowIso(),
+      ...(Number.isFinite(Date.parse(readyPassedAt)) ? { readyToAdoptedMs: Math.max(0, nowMs() - Date.parse(readyPassedAt)) } : {}),
     };
     state.rejected = null;
     state.held = null;

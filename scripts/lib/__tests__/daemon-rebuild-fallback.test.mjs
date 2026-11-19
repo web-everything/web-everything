@@ -384,6 +384,9 @@ describe('smoke-env-timeout: a slow lane scan under load never makes an overlay 
     const state = readRebuildState(cloneDir, env);
     expect(state.rejected).toBeNull();
     expect(state.held?.reason).toBe('smoke-env-timeout');
+    expect(state.held.attempts).toBe(1);
+    expect(Date.parse(state.held.retryAt) - Date.parse(state.held.updatedAt)).toBeGreaterThanOrEqual(599_000);
+    expect(result.alerts.find(a => a.kind === 'clone-held-stale').detail.retryAt).toBe(state.held.retryAt);
     expect(runSmoke).toHaveBeenCalledTimes(1); // no plain-main, no last-good control
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
   });

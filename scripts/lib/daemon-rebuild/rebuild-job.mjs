@@ -41,7 +41,9 @@ import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
-import { alertsFilePath } from './state.mjs';
+import { readPendingAdoptions } from '../overlay-adoption.mjs';
+import { recoveryDue, resolveRecovery } from './recovery.mjs';
+import { readRebuildState, readReadyCandidate, alertsFilePath } from './state.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -176,10 +178,14 @@ function clockFor(dir) {
 export async function rebuildCloneAsJob({
   root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
+  launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
+  recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
+  readState = readRebuildState, readPending = readPendingAdoptions,
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
   mkdirSync(store.dir, { recursive: true });
+  if (store.list().corrupt?.length) return { moved: false, reason: 'rebuild-job-running', unknownJobState: true };
   const kind = REBUILD_JOB_KIND.kind;
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
   const snap = snapshot ?? { repoDir: root, install: cloneNodeModulesInstaller(root) };
@@ -234,9 +240,14 @@ export async function rebuildCloneAsJob({
     inFlight = null; // finished during the pass — fall through, the next tick consumes it
   }
 
+  if (launchOnly && readReadyCandidate(root, env)) return { moved: false, reason: 'ready-pending', finishedJobs };
+
   // 3. Adopt-only: a ready candidate (or a skip-unrelated move) is adopted here, fast, under the existing rules.
-  const r = await adopt();
-  if (r?.reason !== 'needs-build') {
+  const r = launchOnly ? { reason: 'needs-build' } : await adopt();
+  const recover = !launchOnly && !r?.moved && !r?.adopted
+    && ['needs-build', 'still-rejected', 'up-to-date'].includes(r?.reason)
+    && recoveryDue({ state: readState(root, env), pending: readPending(root, { env }), nowMs: now(), settings: recoverySettings });
+  if (r?.reason !== 'needs-build' && !recover) {
     housekeeping();
     return { ...r, finishedJobs };
   }
@@ -248,7 +259,7 @@ export async function rebuildCloneAsJob({
   const lastRes = last ? readResult(store.dir, last.id) : null;
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
+  if (!recover && last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
@@ -258,7 +269,7 @@ export async function rebuildCloneAsJob({
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null },
+      input: { root: resolve(root), entries, launchedBy, waitInFlightTickMs, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null },
     });
   } catch (e) {
     say(`could not queue a rebuild job (${String(e?.message || e).split('\n')[0]}) — the next tick retries`);
@@ -372,6 +383,18 @@ export function reportReaderWaitTimeout({
   return outcome;
 }
 
+/** Job result producer: local reader drain and host smoke capacity remain separate clocks. */
+export function buildRebuildJobResult(input, r, timeout, nowMs = Date.now()) {
+  return {
+    launchedBy: input.launchedBy ?? 'tick-start',
+    waitInFlightTickMs: (input.waitInFlightTickMs ?? 0) + (r.waitInFlightTickMs ?? 0),
+    waitSmokeSlotMs: r.waitSmokeSlotMs ?? null,
+    finishedAt: nowMs, reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}),
+    readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
+    alerts: (r.alerts || []).map((a) => a.kind), ...(timeout ?? {}),
+  };
+}
+
 export async function jobMain({
   runChild = runRebuildChild, reportTimeout = reportReaderWaitTimeout, env = process.env,
   ppid = process.ppid, host = hostname(),
@@ -389,11 +412,7 @@ export async function jobMain({
         const childEnv = rebuildChildEnv(env, { ppid, host });
         const r = await runChild({ input, env: childEnv, onChild: (c) => { child = c; } });
         const timeout = reportTimeout({ root: input.root, env, r });
-        const result = {
-          finishedAt: Date.now(), reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}), readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
-          alerts: (r.alerts || []).map((a) => a.kind),
-          ...(timeout ?? {}),
-        };
+        const result = buildRebuildJobResult(input, r, timeout);
         writeFileSync(join(dir, `${jobId}${RESULT_SUFFIX}`), `${JSON.stringify(result)}\n`);
         process.stderr.write(`[rebuild-job ${jobId}] ${new Date().toISOString()} done: ${result.reason}${result.mutation ? ` (${result.mutation})` : ''}${result.readyRecorded ? ' (ready candidate recorded)' : ''}\n`);
         return { reason: result.reason, readyRecorded: result.readyRecorded };
