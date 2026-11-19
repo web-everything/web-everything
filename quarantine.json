@@ -1,5 +1,24 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/__tests__/rust-scan-citation-check-parity.test.mjs",
+      "brokenSha": "46abe5d8",
+      "owner": "#7107",
+      "reason": "orchestrator acting on operator instruction 2026-11-19 11:54 ET ('You have authority to quarantine', R1087): integration hits 20-min cap; split lands in #7107",
+      "addedAt": 1795107266143,
+      "expiresAt": 1795193666143,
+      "job": "integration"
+    },
+    {
+      "test": "scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs",
+      "brokenSha": "46abe5d8",
+      "owner": "#7107",
+      "reason": "orchestrator acting on operator instruction 2026-11-19 11:54 ET ('You have authority to quarantine', R1087): integration hits 20-min cap; split lands in #7107",
+      "addedAt": 1795107266143,
+      "expiresAt": 1795193666143,
+      "job": "integration"
+    }
+  ],
   "mode": "quarantine"
 }
