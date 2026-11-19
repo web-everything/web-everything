@@ -2,7 +2,7 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -29,6 +29,7 @@ const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { net
 // Migrate legacy normalized fixtures to raw witnesses; the production reader is exercised below
 // and in review-recovery-witness.test.mjs. Each queued fixture persists its panel read first.
 function createReviewJobIo(options = {}) {
+  options = { readHeadClearance: () => null, ...options };
   if (!options.env?.WE_SHARED_RUNS_DIR) return productionJobIo(options);
   let current;
   const probe = { ...recoveryProbe(), isAlive: pid => {
@@ -248,6 +249,150 @@ function runStoredRecovery(input, { status, prior, saved, failComment = false, f
     timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '', WE_UNDER_TEST: '1' },
   }));
 }
+
+describe('red-team-only head clearance', () => {
+  it.each(['cleared', 'absent', 'other-head', 'late-write', 'label', 'no-verdict', 'refused', 'refused-advisory', 'refused-without-clearance', 'read-error'])(
+    'plumbs %s clearance through the witness and job', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-clearance-'));
+      try {
+        const parked = { op: 'review-pr', input: { repo, pr }, ...payload(),
+          verdict: { verdict: 'needs-human', humanRequired: true,
+            lensVerdicts: { correctness: 'accept', security: 'accept' } },
+          stepTimings: [{ step: 'read', startedAt: new Date(10_000).toISOString() }],
+          pending: { kind: 'effect', step: 'advise' },
+          effects: [{ type: 'review.scoped-rereview-shadow', status: 'pending' }] };
+        if (kind.startsWith('refused')) Object.assign(parked, { pending: null, outcome: 'refused',
+          effects: [{ type: 'review.label-swap', status: 'refused' }] });
+        if (kind === 'refused-advisory') parked.effects[0].type = 'review.advisory-note';
+        if (kind === 'label') parked.effects = [{ type: 'review.label-swap', status: 'pending' }];
+        if (kind === 'no-verdict') parked.verdict = null;
+        const readHeadClearance = vi.fn(() => {
+          if (kind === 'read-error') throw Error('clearance read failed');
+          if (['absent', 'refused-without-clearance'].includes(kind)) return null;
+          return { sha: kind === 'other-head' ? 'b'.repeat(40) : head, at: 20_000 };
+        });
+        const production = productionJobIo({ env: { WE_SHARED_RUNS_DIR: dir }, readEvidence: () => ({}),
+          readHeadClearance, readWitness: key => readRecoveryWitness({ ...key,
+          env: { WE_SHARED_RUNS_DIR: dir }, readScorecards: () => [], now: 30_000,
+          list: () => ['review-pr-parked'], read: () => parked,
+          stat: () => ({ mtimeMs: kind === 'late-write' ? 20_001 : 20_000 }) }) });
+        const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
+        const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
+        expect(readHeadClearance).toHaveBeenCalledWith({ repo, pr, head });
+        if (['cleared', 'refused-advisory'].includes(kind)) {
+          expect(redTeamOwedFor(parked)).toBe(true);
+          expect(result.outcome).toBe('red-team-only');
+          expect(io.runRedTeam).toHaveBeenCalled();
+        } else {
+          expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
+          expect(io.runRedTeam).not.toHaveBeenCalled();
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+  it.each(['clear', 'untrusted', 'other-head', 'later-comment', 'later-hold', 'later-review', 'reviews-error', 'oversized-reviews'])(
+    'default reader requires trusted complete clearance evidence: %s', kind => {
+      const at = new Date(20_000).toISOString();
+      const sha = kind === 'other-head' ? 'b'.repeat(40) : head;
+      const body = `<!-- reviewed-sha: ${sha} --><!-- cleared-human: operator -->`;
+      const comments = [`${body}\t${at}\t${kind === 'untrusted' ? 'stranger' : 'web-everything'}\tIC_clear`];
+      if (kind === 'later-comment') comments.push(`Please hold\t${at}\tstranger\tIC_later`);
+      if (kind === 'later-hold') comments.push(`manifest baseline mismatch\t${at}\tweb-everything\tIC_later`);
+      const exec = vi.fn((_file, args) => {
+        if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } });
+        if (args.some(a => a.includes('/reviews?'))) {
+          if (kind === 'reviews-error') throw Error('reviews unreadable');
+          if (kind === 'oversized-reviews') return ' '.repeat(1024 * 1024 + 1);
+          return JSON.stringify(kind === 'later-review' ? [{ state: 'CHANGES_REQUESTED', submitted_at: new Date(30_000).toISOString() }] : []);
+        }
+        return comments.join('\n');
+      });
+      const readWitness = vi.fn(() => ({ newest: payload() }));
+      productionJobIo({ exec, readWitness }).readRedTeamOnlyPayload({ repo, pr, head });
+      const clearance = readWitness.mock.calls[0][0].clearance;
+      if (kind === 'clear') expect(clearance).toEqual({ sha: head, at });
+      else expect(clearance).toBeFalsy();
+    });
+});
+
+describe('red-team-only completed accept with later advisory run', () => {
+  it.each(['accept', 'alone', 'other-head', 'label', 'empty-effects', 'no-applied-label'])(
+    'admits only advisory bookkeeping backed by a completed same-head accept: %s', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-completed-accept-'));
+      const env = { WE_SHARED_RUNS_DIR: dir };
+      try {
+        const completed = { id: 'review-pr-completed', op: 'review-pr', input: { repo, pr }, ...payload(),
+          pending: null, effects: [{ type: 'review.label-swap', status: 'applied' }],
+          stepTimings: [{ step: 'read', startedAt: new Date(1000).toISOString() }] };
+        const parked = { ...completed, id: 'review-pr-parked',
+          pending: { kind: 'effect', step: 'advise' },
+          effects: [{ type: kind === 'label' ? 'review.label-swap' : 'review.scoped-rereview-shadow', status: 'pending' }],
+          stepTimings: [{ step: 'read', startedAt: new Date(15_000).toISOString() }] };
+        if (kind === 'other-head') completed.findings = { read: { netBasis: { rev: 'b'.repeat(40) } } };
+        if (kind === 'empty-effects') completed.effects = [];
+        if (kind === 'no-applied-label') completed.effects = [{ type: 'review.notice', status: 'applied' }];
+        const production = productionJobIo({ env, readEvidence: () => ({}), readHeadClearance: () => null,
+          readWitness: key => readRecoveryWitness({ ...key, env, readScorecards: () => [], now: 30_000,
+            list: () => kind === 'alone' ? [parked.id] : [completed.id, parked.id],
+            read: id => id === parked.id ? parked : completed,
+            stat: path => ({ mtimeMs: path.includes('completed') ? 12_000 : 20_000 }) }) });
+        const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
+        const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
+        if (kind === 'accept') {
+          expect(result.outcome).toBe('red-team-only');
+          expect(io.runRedTeam.mock.calls[0][0].loopPayload).toEqual(parked);
+        } else {
+          expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
+          expect(io.runRedTeam).not.toHaveBeenCalled();
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+});
+
+describe('red-team-only quarantined head review', () => {
+  it.each(['accept', 'no-clearance', 'other-head', 'late', 'changes', 'other-pr', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'])(
+    'uses only cleared exact-head quarantine evidence through production admission: %s', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-quarantine-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      try {
+        const loopPayload = { ...newRunRecord({ id: 'review-pr-quarantined', op: 'review-pr',
+          input: { repo, pr: kind === 'other-pr' ? pr + 1 : pr } }),
+          ...payload(), verdict: { verdict: kind === 'changes' ? 'changes' : 'accept' },
+          pending: { kind: 'effect', step: 'record', stepIndex: 3 }, effects: [
+            { key: 'label', type: 'review.label-swap', stepIndex: 3, index: 0, status: 'failed' },
+            { key: 'ledger', type: 'verdict-ledger.append', stepIndex: 3, index: 1, status: 'declared' },
+            { key: 'notice', type: 'review.notice', stepIndex: 3, index: 2, status: 'declared' },
+          ] };
+        if (kind === 'refused-outcome') loopPayload.outcome = 'refused';
+        if (kind === 'refused-label') Object.assign(loopPayload.effects[0], {
+          status: 'refused', attempts: 1, error: 'SELF-CLEAR REFUSED — nothing was changed (#2844)',
+        });
+        if (kind === 'other-step') loopPayload.pending.step = 'advise';
+        if (kind === 'other-effect') loopPayload.effects[0].type = 'review.other';
+        if (kind === 'other-head') loopPayload.findings.read.netBasis.rev = 'b'.repeat(40);
+        const path = writeRun(loopPayload, join(dir, 'runs-quarantine'));
+        utimesSync(path, 20, kind === 'late' ? 21 : 20);
+        // The remaining active review belongs to an older head.
+        writeRun({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
+          ...payload(), findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } }, env.WE_SHARED_RUNS_DIR);
+        const production = productionJobIo({ env, readEvidence: () => ({}),
+          readHeadClearance: () => kind === 'no-clearance' ? null : { sha: head, at: 20_000 },
+          readWitness: key => readRecoveryWitness({ ...key, env, readScorecards: () => [],
+            ...(kind === 'read-error' ? { quarantine: { read: () => { throw Error('quarantine unreadable'); } } } : {}) }) });
+        const io = fakeIo({ readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus });
+        const result = runReviewJob({ repo, pr, redTeamOnly: true }, io);
+        if (kind === 'accept') {
+          expect(result.outcome).toBe('red-team-only');
+          expect(io.runRedTeam.mock.calls[0][0].loopPayload).toEqual(loopPayload);
+        } else {
+          expect(io.runRedTeam).not.toHaveBeenCalled();
+          if (['late', 'changes', 'read-error', 'refused-outcome', 'refused-label', 'other-step', 'other-effect'].includes(kind))
+            expect(result).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('quarantin') });
+          else expect(result).toMatchObject({ outcome: 'red-team-not-owed', reason: 'stored review does not match live head' });
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+});
 
 describe('red-team-only review job', () => {
   it('recovery fetch: lane without H fetches before queued and runRedTeam sees H', () => {

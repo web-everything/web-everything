@@ -1989,6 +1989,7 @@
   "scripts/conveyor/soak/breaks/fix-daemon-pass-slow-phases-delay-fix.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/fix-pass-phase-budget.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-dead-owner-behind-pending-confirm.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/red-team-advisory-parked-after-accept.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
