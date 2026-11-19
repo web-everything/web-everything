@@ -23,8 +23,16 @@ describe('default conflict-watch GitHub readers', () => {
     expect(() => defaultReadPrLive({ pr, repo, exec })).toThrow('maxBuffer');
     expect(() => defaultDrainRebaseEvidence({ pr, repo, exec, identity: {} })).toThrow('maxBuffer');
   });
+  it.each(['not-json', '{"message":"API error"}', 'null', '[]'])('rejects unreadable commit evidence %s', output => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ headRefOid: head }))
+      .mockReturnValueOnce(output);
+    expect(() => defaultDrainRebaseEvidence({ pr, repo, exec, identity: {} })).toThrow();
+  });
+  it.each(['{}', 'null', '{"headRefOid":"short"}'])('rejects unreadable live evidence %s', output => {
+    expect(() => defaultDrainRebaseEvidence({ pr, repo, exec: () => output, identity: {} })).toThrow();
+  });
   const identity = { roles: { merger: { botLogin: 'drain-app[bot]' }, worker: { botLogin: 'worker-app[bot]' } } };
-  function evidence({ author = 'drain-app[bot]', committer = 'someone', date = '2026-09-27T22:22:19Z', message = 'ordinary update' } = {}) {
+  function evidence({ author = 'drain-app[bot]', committer = 'drain-app[bot]', date = '2026-09-27T22:22:19Z', message = 'ordinary update' } = {}) {
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ headRefOid: moved, mergeable: 'CONFLICTING' }))
       .mockReturnValueOnce(JSON.stringify({ sha: moved, author: { login: author }, committer: { login: committer },
         commit: { message, committer: { date } } }));
@@ -35,26 +43,55 @@ describe('default conflict-watch GitHub readers', () => {
     expect(result.value).toEqual({ by: 'drain', atMs: Date.parse('2026-09-27T22:22:19Z') });
     expect(result.exec.mock.calls[1][1]).toEqual(['api', `repos/o/n/commits/${moved}`]);
   });
-  it('accepts the drain committer identity', () => {
-    expect(evidence({ author: 'someone', committer: 'drain-app[bot]' }).value?.by).toBe('drain');
+  it('rejects a drain committer with a non-drain author', () => {
+    expect(evidence({ author: 'someone', committer: 'drain-app[bot]' }).value).toBeNull();
+  });
+  it('rejects an old drain-authored commit cherry-picked by someone else with a fresh committer date', () => {
+    expect(evidence({ committer: 'someone' }).value).toBeNull();
   });
   it.each(['someone', 'worker-app[bot]', 'web-everything[bot]'])('ignores message claims from %s', author => {
     expect(evidence({ author, message: 'merge drain rebased this PR' }).value).toBeNull();
   });
-  it.each([null, '', 'not a date'])('does not manufacture a missing/invalid API timestamp (%s)', date => {
-    expect(evidence({ date }).value).toBeNull();
+  it.each([null, '', 'not a date'])('holds for a missing/invalid API timestamp (%s)', date => {
+    expect(() => evidence({ date })).toThrow('unreadable committer date');
   });
-  it('restores only removed labels and removes only our bounce label', () => {
-    const provider = { setLabels: vi.fn() };
-    defaultRevertBounce({ repo, pr: { ...pr, labels: ['review:accepted', 'ready-to-merge', 'review:human', 'other'] }, provider });
-    expect(provider.setLabels).toHaveBeenCalledWith(repo, 7183, {
-      remove: ['review:changes'], add: ['review:accepted', 'ready-to-merge'],
-    });
+  it.each([
+    ['concurrent rejection', ['review:changes', 'advisory:changes'], head],
+    ['concurrent rearm', ['review:pending'], head],
+    ['concurrent acceptance', ['review:accepted'], head],
+    ['another head move', ['review:changes'], moved],
+    ['missing receipt', ['review:changes'], head],
+  ])('skips rollback after %s without editing live labels', (_, labels, liveHead) => {
+    const provider = { setLabels: vi.fn(), readPrState: vi.fn(() => ({ headRefOid: liveHead, labels, comments: [] })) };
+    expect(defaultRevertBounce({ repo, pr: { ...pr, labels: ['review:accepted'] },
+      headRefOid: head, provider })).toBe('bounce-revert-skipped-state-changed');
+    expect(provider.readPrState).toHaveBeenCalledWith(repo, pr.number);
+    expect(provider.setLabels).not.toHaveBeenCalled();
   });
-  it('retains a pre-existing changes label on revert', () => {
-    const provider = { setLabels: vi.fn() };
-    defaultRevertBounce({ repo, pr: { ...pr, labels: ['review:changes'] }, provider });
-    expect(provider.setLabels.mock.calls[0][2]).toEqual({ add: [], remove: [] });
+  it('skips a concurrent same-label rejection after our finding token', () => {
+    const findingToken = '12345678-1234-1234-1234-123456789abc';
+    const provider = { setLabels: vi.fn(), readPrState: vi.fn(() => ({ headRefOid: head,
+      labels: ['review:changes'], comments: [
+        { author: { login: 'web-everything' }, body: `<!-- conflict-watch-bounce:${findingToken} -->` },
+        { author: { login: 'web-everything' }, body: 'Independent rejection' },
+      ] })) };
+    expect(defaultRevertBounce({ pr, repo, headRefOid: head, findingToken, provider }))
+      .toBe('bounce-revert-skipped-state-changed');
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('holds when rollback state is unreadable or oversized', () => {
+    const provider = { setLabels: vi.fn(), readPrState: () => { throw new Error('maxBuffer exceeded'); } };
+    expect(() => defaultRevertBounce({ pr, repo, headRefOid: head, provider })).toThrow('maxBuffer');
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('retains our bounce when snapshot acceptance has no guarded clearing proof', () => {
+    const findingToken = '12345678-1234-1234-1234-123456789abc';
+    const provider = { setLabels: vi.fn(), readPrState: vi.fn(() => ({ headRefOid: head,
+      labels: ['review:changes'], comments: [{ author: { login: 'web-everything' },
+        body: `<!-- conflict-watch-bounce:${findingToken} -->` }] })) };
+    expect(() => defaultRevertBounce({ repo, pr: { ...pr, labels: ['review:accepted', 'ready-to-merge'] },
+      headRefOid: head, findingToken, provider })).toThrow('human review/rearm');
+    expect(provider.setLabels).not.toHaveBeenCalled();
   });
   it('passes the judged head through the real finding transport', () => {
     const exec = vi.fn();

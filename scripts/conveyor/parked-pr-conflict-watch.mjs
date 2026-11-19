@@ -1315,23 +1315,36 @@ export function defaultReadPrLive({ pr, repo, exec = execFileSyncThrottled }) {
 /** One commit at the live head, not commit-message claims or a locally observed clock. */
 export function defaultDrainRebaseEvidence({ pr, repo, exec = execFileSyncThrottled, identity = readDeliveryIdentity() }) {
   const live = defaultReadPrLive({ pr, repo, exec });
-  if (!/^[a-f0-9]{40}$/i.test(live?.headRefOid ?? '')) return null;
+  if (!/^[a-f0-9]{40}$/i.test(live?.headRefOid ?? '')) throw new Error('drain evidence: unreadable live head');
   const commit = JSON.parse(String(exec('gh', ['api', `repos/${repo}/commits/${live.headRefOid}`], liveReadOptions(repo))));
+  if (commit?.sha !== live.headRefOid || !commit?.commit?.committer) throw new Error('drain evidence: unreadable commit');
   const isDrain = person => {
     const role = roleOfBotLogin(person?.login, identity);
     return role === 'merger' || (role === 'legacy' && !identity?.roles?.merger);
   };
-  if (!isDrain(commit.author) && !isDrain(commit.committer)) return null;
+  if (!isDrain(commit.author) || !isDrain(commit.committer)) return null;
   const atMs = Date.parse(commit.commit?.committer?.date ?? '');
-  return Number.isFinite(atMs) ? { by: 'drain', atMs } : null;
+  if (!Number.isFinite(atMs)) throw new Error('drain evidence: unreadable committer date');
+  return { by: 'drain', atMs };
 }
 
-export function defaultRevertBounce({ pr, repo, provider = createGhProvider() }) {
-  // Mirror the changes verdict's removals; preserve every unrelated live label.
-  const removed = new Set(['review:pending', 'review:accepted', 'redteam:accepted', 'ready-to-merge', 'advisory:accepted', 'advisory:changes']);
-  const original = (pr.labels ?? []).map(label => typeof label === 'string' ? label : label.name);
-  provider.setLabels(repo, pr.number, { remove: original.includes('review:changes') ? [] : ['review:changes'],
-    add: original.filter(name => removed.has(name)) });
+export function defaultRevertBounce({ pr, repo, headRefOid, findingToken, provider = createGhProvider() }) {
+  const live = provider.readPrState(repo, pr.number);
+  const labels = live?.labels?.map(label => typeof label === 'string' ? label : label?.name);
+  const comments = live?.comments;
+  const ours = typeof findingToken === 'string' && /^[a-f0-9-]{36}$/.test(findingToken)
+    && Array.isArray(comments) && comments.length > 0
+    && isTrustedMarkerAuthor(comments.at(-1))
+    && comments.at(-1).body?.includes(`<!-- conflict-watch-bounce:${findingToken} -->`);
+  if (!/^[a-f0-9]{40}$/i.test(headRefOid ?? '') || live?.headRefOid !== headRefOid
+    || !Array.isArray(labels) || !labels.includes('review:changes') || !ours
+    || labels.some(name => /^(review:|redteam:|advisory:|ready-to-merge$)/.test(name) && name !== 'review:changes')) {
+    return 'bounce-revert-skipped-state-changed';
+  }
+  // review-set-label.mjs can accept only with fresh review/head-fingerprint proof and a
+  // successful clearing-ledger write. A snapshot label is neither proof nor permission
+  // to accept a new head. There is no guarded snapshot-restore target: retain the hold.
+  throw new Error('conflict finding rollback: bounce retained; guarded acceptance restore unavailable; human review/rearm required');
 }
 
 /**
@@ -1815,9 +1828,10 @@ export function watchParkedPrConflicts({
         // Keep this check next to the write, after all slower classification reads.
         const bounce = (extra, beforeWrite = () => {}) => {
           let evidence = null;
-          try { evidence = drainRebaseEvidence({ pr, repo: resolvedRepo }); } catch { /* no recent proof */ }
+          let evidenceUnreadable = false;
+          try { evidence = drainRebaseEvidence({ pr, repo: resolvedRepo }); } catch { evidenceUnreadable = true; }
           const grace = conflictWatchSettings?.drainGraceMinutes ?? 15;
-          let reason;
+          let reason = evidenceUnreadable ? 'drain-evidence-unreadable' : null;
           if (evidence?.by === 'drain' && Number.isFinite(evidence.atMs)
             && now >= evidence.atMs && now - evidence.atMs <= grace * 60_000) {
             reason = 'deferred-to-drain (recent drain rebase)';
@@ -1839,12 +1853,15 @@ export function watchParkedPrConflicts({
           let after = null;
           try { after = readPrLive({ pr, repo: resolvedRepo }); } catch { /* cannot confirm write */ }
           if (after?.headRefOid !== headRefOid || after?.mergeable !== 'CONFLICTING') {
-            if (finding?.findingToken) invalidateConflictFinding({
-              findingToken: finding.findingToken, pr, repo: resolvedRepo, headRefOid, provider, listPrComments,
+            const skipped = revertBounce({ pr, repo: resolvedRepo, headRefOid, findingToken: finding?.findingToken,
+              beforeRestore: () => {
+                if (finding?.findingToken) invalidateConflictFinding({
+                  findingToken: finding.findingToken, pr, repo: resolvedRepo, headRefOid, provider, listPrComments,
+                });
+              },
             });
-            revertBounce({ pr, repo: resolvedRepo, headRefOid });
-            entry.routedTo = after?.headRefOid !== headRefOid
-              ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed';
+            entry.routedTo = skipped || (after?.headRefOid !== headRefOid
+              ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed');
             log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${entry.routedTo}`);
             return false;
           }
