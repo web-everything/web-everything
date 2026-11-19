@@ -15,7 +15,7 @@ const TREE_LIMIT = 4 * 1024 * 1024;
 const oidPattern = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 const utf8 = bytes => new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
 
-export async function trackedTree({ cwd, exec, head, refuse, onHead }) {
+export async function trackedTree({ cwd, exec, head, refuse, onHead, trackedOnly = false }) {
   if (head === undefined) {
     const result = await exec({ file: 'git', args: ['rev-parse', 'HEAD'], cwd });
     if (result.code !== 0 || !Buffer.isBuffer(result.stdout)) throw refuse('mode', '.');
@@ -42,6 +42,9 @@ export async function trackedTree({ cwd, exec, head, refuse, onHead }) {
     if (!['100644', '100755', '120000'].includes(mode) || type !== 'blob') throw refuse('mode', path);
     entries.set(key, { path, mode, oid });
   }
+  // Sibling inventories select only their existing scoped index paths. Bind those
+  // shipped files to HEAD without imposing the main checkout's untracked-file rule.
+  if (trackedOnly) return { entries, head, algorithm };
   const untracked = await exec({ file: 'git', args: ['ls-files', '-o', '--exclude-standard', '-z'], cwd });
   if (untracked.code !== 0 || !Buffer.isBuffer(untracked.stdout) || untracked.stdout.length > TREE_LIMIT
     || (untracked.stdout.length && untracked.stdout.at(-1) !== 0)) throw refuse('untracked', '.');

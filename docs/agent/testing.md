@@ -4828,15 +4828,21 @@ omit the report without reading it. Generating coverage with `--coverage` does n
 consume a local coverage report. Legacy coverage inclusion, portability rewriting and
 full-ship selection remain unchanged.
 Sibling snapshots keep their existing index-based selection and identity checks; tracked
-runs also apply the path+oid size exceptions and binary allowlist, and count sibling bytes
+runs bind every shipped sibling file's bytes and executable bit to the sibling's pinned HEAD
+tree, independently of the index and `core.fileMode`. Mode or content mismatches refuse as
+`dirty` before the final sibling status check. They also apply the path+oid size exceptions
+and binary allowlist, and count sibling bytes
 against the main manifest's total cap. Size/type refusals keep their manifest reason and
 are logged; operators can run locally or review a path+oid size exception.
 
 `remote.manifest` comes only from the canonical host preferences path, including when
 `WE_PLATFORM_PREFERENCES` redirects other settings for a private pool or test. Inject `home`
-into `loadAdmissionPolicy` to test that path without reading the real home file. Unreadable
-or malformed canonical evidence uses the standard manifest default for redirected callers;
-it never uses the redirected manifest or a cached last-good host manifest. An invalid
+into `loadAdmissionPolicy` to test that path without reading the real home file. Missing,
+unreadable, oversized, malformed or structurally invalid canonical evidence disables remote
+execution for redirected callers, with a policy source explaining the local fallback. A valid
+canonical object without `remote.manifest` uses the standard manifest default. Failed reads
+are retried on the next call; they never use the redirected manifest or a cached last-good
+host manifest. An invalid
 platform manifest value disables remote execution with a policy source explaining the local
 execution requirement, even if private tool/environment settings enable remote execution.
 

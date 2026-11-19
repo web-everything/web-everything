@@ -1938,20 +1938,23 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       const prefs = join(lockRoot, 'torn.json'); const env = { WE_PLATFORM_PREFERENCES: prefs };
+      const home = join(lockRoot, 'host');
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'platform-preferences.json'), '{}');
       writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3, priority: { mode: 'off', repairPatterns: [] } } }));
-      const initial = loadAdmissionPolicy({ env });
+      const initial = loadAdmissionPolicy({ env, home });
       expect(initial.settings.cap).toBe(3);
       expect(initial.settings.priority).toEqual({ mode: 'off', repairPatterns: [] });
-      expect(loadAdmissionPolicy({ env })).toBe(initial);
+      expect(loadAdmissionPolicy({ env, home })).toBe(initial);
       vi.setSystemTime(Date.now() + 11_000);
       writeFileSync(prefs, '{"heavyAdmission": {"cap"');
-      const torn = loadAdmissionPolicy({ env });
+      const torn = loadAdmissionPolicy({ env, home });
       expect(torn.settings.cap).toBe(3);
       expect(torn.settings.priority).toEqual(initial.settings.priority);
       expect(torn.sources['priority.mode']).toBe('platform');
       expect(torn.invalid.join('\n')).toMatch(/platform:/);
       writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 5, priority: { mode: 'enforce', repairPatterns: ['^revert-red-42$'] } } }));
-      const replacement = loadAdmissionPolicy({ env });
+      const replacement = loadAdmissionPolicy({ env, home });
       expect(replacement.settings.cap).toBe(5);
       expect(replacement.settings.priority).toEqual({ mode: 'enforce', repairPatterns: ['^revert-red-42$'] });
       expect(replacement.sources['priority.repairPatterns']).toBe('platform');
@@ -3005,7 +3008,7 @@ describe('canonical host manifest policy', () => {
     expect(loadAdmissionPolicy({ ...options, home: legacyHome }).settings.remote.manifest).toBe('legacy');
   });
 
-  it.each(['missing', 'malformed', 'oversized', 'unreadable'])('uses the standard manifest when redirected canonical evidence is %s', fault => {
+  it.each(['missing', 'malformed', 'oversized', 'unreadable', 'invalid root', 'invalid admission', 'invalid remote'])('requires local execution when redirected canonical evidence is %s', async fault => {
     const home = join(lockRoot, 'host');
     const host = preferences(home, { manifest: 'tracked' });
     // Prime last-good host evidence: redirected callers must not use it after a failed read.
@@ -3014,22 +3017,47 @@ describe('canonical host manifest policy', () => {
     if (fault === 'malformed') writeFileSync(host, '{');
     if (fault === 'oversized') writeFileSync(host, ' '.repeat(256 * 1024 + 1));
     if (fault === 'unreadable') mkdirSync(host);
+    if (fault === 'invalid root') writeFileSync(host, 'null');
+    if (fault === 'invalid admission') writeFileSync(host, JSON.stringify({ heavyAdmission: [] }));
+    if (fault === 'invalid remote') writeFileSync(host, JSON.stringify({ heavyAdmission: { remote: false } }));
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'tracked', enabled: true, mode: 'always' });
+    const env = { WE_PLATFORM_PREFERENCES: redirect, LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true' };
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env });
+    expect(policy.settings.remote).toMatchObject({ manifest: 'legacy', enabled: false });
+    expect(policy.sources['remote.manifest']).toBe('standard');
+    expect(policy.invalid).toContainEqual(expect.stringContaining('canonical platform manifest:'));
+    expect(policy.sources['remote.enabled']).toBe('platform (canonical remote.manifest unavailable; local execution required)');
+    const remoteExec = vi.fn(), log = vi.fn();
+    expect(await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'fixture.test.mjs'],
+      cwd: lockRoot, lockRoot, env, policy, remoteExec, log, loadPerCore: () => 0 })).toEqual({ handled: false });
+    expect(remoteExec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('local (remote.enabled=false (platform (canonical remote.manifest unavailable; local execution required)))'));
+    // Failed canonical reads must not pin local execution after the host file is repaired.
+    rmSync(host, { recursive: true, force: true });
+    preferences(home, { manifest: 'tracked' });
+    expect(loadAdmissionPolicy({ home, repoRoot: lockRoot, env }).settings.remote).toMatchObject({ enabled: true, manifest: 'tracked' });
+  });
+
+  it.each([{}, { heavyAdmission: {} }, { heavyAdmission: { remote: {} } }])('valid canonical preferences without a manifest use the standard default (%j)', hostSettings => {
+    const home = join(lockRoot, 'host');
+    const host = preferences(home, {});
+    writeFileSync(host, JSON.stringify(hostSettings));
     const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'tracked', enabled: true });
     const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env: { WE_PLATFORM_PREFERENCES: redirect } });
     expect(policy.settings.remote).toMatchObject({ manifest: 'legacy', enabled: true });
     expect(policy.sources['remote.manifest']).toBe('standard');
-    if (fault !== 'missing') expect(policy.invalid).toContainEqual(expect.stringContaining('canonical platform manifest:'));
+    expect(policy.invalid).toEqual([]);
   });
 
-  it.each(['direct', 'redirected'])('invalid canonical remote.manifest disables remote execution for %s preferences', async mode => {
+  it.each(['direct', 'redirected'].flatMap(mode => ['trackd', null, false, 1, [], {}].map(value => [mode, value])))('invalid canonical remote.manifest disables remote execution for %s preferences (%j)', async (mode, value) => {
     const home = join(lockRoot, 'host');
-    preferences(home, { manifest: 'trackd', enabled: true, mode: 'always' });
+    preferences(home, { manifest: value, enabled: true, mode: 'always' });
     const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy', enabled: true, mode: 'always' });
     const env = { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true',
       ...(mode === 'redirected' ? { WE_PLATFORM_PREFERENCES: redirect } : {}) };
     const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env });
     expect(policy.settings.remote.enabled).toBe(false);
-    expect(policy.invalid).toContain('platform.remote.manifest="trackd"');
+    expect(policy.invalid).toContain(`platform.remote.manifest=${JSON.stringify(value)}`);
     expect(policy.sources['remote.enabled']).toBe('platform (invalid remote.manifest; local execution required)');
     const remoteExec = vi.fn(), log = vi.fn();
     expect(await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'fixture.test.mjs'],

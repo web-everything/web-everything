@@ -439,12 +439,13 @@ const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
  * remote client code or manifest validation. `home` injects the canonical host file's directory for tests.
- * Redirected preferences always take remote.manifest from that canonical file, defaulting on read failure.
+ * Redirected preferences always take remote.manifest from that canonical file; read failures require local execution.
  * A read that fails keeps the last
  * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
   let platform; let tool; let path; let hostPath; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
+  let canonicalManifestReadFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   checkoutRoot ??= repoRoot;
@@ -484,13 +485,16 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     try {
       if (!hostPath) throw new Error('canonical host preferences path unavailable');
       if (statSync(hostPath).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
-      hostManifest = JSON.parse(readFileSync(hostPath, 'utf8'))?.heavyAdmission?.remote?.manifest;
+      const host = JSON.parse(readFileSync(hostPath, 'utf8'));
+      if (!admissionObject(host) || (Object.hasOwn(host, 'heavyAdmission') && !admissionObject(host.heavyAdmission))
+        || (host.heavyAdmission && Object.hasOwn(host.heavyAdmission, 'remote') && !admissionObject(host.heavyAdmission.remote)))
+        throw new Error('invalid canonical preferences object');
+      hostManifest = host.heavyAdmission?.remote?.manifest;
     } catch (e) {
       // Never inherit redirected or last-good manifest values when canonical evidence is unavailable.
-      if (e?.code !== 'ENOENT') {
-        readFailed = true;
-        errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
-      }
+      readFailed = true;
+      canonicalManifestReadFailed = true;
+      errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
     }
     platform = { ...platform, remote: { ...remote, ...(hostManifest !== undefined ? { manifest: hostManifest } : {}) } };
   }
@@ -500,6 +504,10 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
+  if (canonicalManifestReadFailed) {
+    policy.settings.remote.enabled = false;
+    policy.sources['remote.enabled'] = 'platform (canonical remote.manifest unavailable; local execution required)';
+  }
   policy.ignored.push(...ignored);
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);

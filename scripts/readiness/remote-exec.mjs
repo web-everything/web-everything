@@ -9,7 +9,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
-import {trackedTree, validateTrackedFile, validateManifestFileBounds, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
+import {trackedTree, validateTrackedFile, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
 export {FORGE_MANIFEST_SIZE_EXCEPTIONS, FORGE_MANIFEST_BINARY_EXTENSIONS} from './forge-manifest-tracked.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
@@ -624,6 +624,8 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   const trackedMode = manifestMode === 'tracked' && !trackedOnly;
   const tree = trackedMode ? await trackedTree({cwd,exec,head,refuse:manifestRefusal,onHead:onTrackedHead}) : undefined;
+  const validationTree = tree ?? (manifestMode === 'tracked' && trackedOnly
+    ? await trackedTree({cwd,exec,head,refuse:manifestRefusal,trackedOnly:true}) : undefined);
   if (tree) head=tree.head;
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
   // selected tests can import excluded tests, directly or through helpers.
@@ -823,15 +825,13 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
       return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
     if (manifestMode === 'tracked') {
-      const oid=tree ? tree.entries.get(path.toString('base64'))?.oid : indexBlobs.get(path.toString('base64'));
+      const oid=validationTree ? validationTree.entries.get(path.toString('base64'))?.oid : indexBlobs.get(path.toString('base64'));
       if (st.size>FORGE_MANIFEST_FILE_CAP && !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===oid))
         throw manifestRefusal('oversize',path);
     }
     const content = await readManifestFile(absolute,st,fs);
-    if (tree) {
-      validateTrackedFile({path,content,st,tree,refuse:manifestRefusal,sizeExceptions});
-    } else if (manifestMode === 'tracked') {
-      validateManifestFileBounds({path,content,oid:indexBlobs.get(path.toString('base64')),refuse:manifestRefusal,sizeExceptions});
+    if (validationTree) {
+      validateTrackedFile({path,content,st,tree:validationTree,refuse:manifestRefusal,sizeExceptions});
     }
     if (manifestMode === 'tracked') {
       admittedBytes+=content.length;
@@ -922,7 +922,9 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
         throw error;
       });
       if (present) {
-        const checked = await checkSibling(siblingRoot,exec,fs);
+        // Tracked validation reports HEAD byte/mode mismatches as dirty before
+        // the final status check; legacy retains its original early status check.
+        const checked = await checkSibling(siblingRoot,exec,fs,{checkClean:manifestMode !== 'tracked'});
         const result = await exec({file:'git',args:['ls-files','-z','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))],cwd:siblingRoot});
         if (result.code !== 0) throw new Error('Sibling inventory unavailable');
         const files = splitPaths(result.stdout);
@@ -930,7 +932,7 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
         if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
         const siblingDone=beginSub('sibling-inventory');
         const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning,
-          ...(manifestMode === 'tracked' ? {manifestMode,env,sizeExceptions,totalCap,byteBudget} : {})});
+          ...(manifestMode === 'tracked' ? {manifestMode,env,sizeExceptions,totalCap,byteBudget,head:checked.sha} : {})});
         siblingDone();
         if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
         siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
@@ -938,7 +940,7 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     } catch (error) {
       if(typeof error.path==='string'){const rel=relative(resolve(cwd,'../frontierui'),Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path);if(rel&&!rel.startsWith('..'))error.siblingPath=rel;}
       error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file',
-        ...(manifestMode === 'tracked' ? ['oversize','total-oversize','binary-type'] : [])].includes(error.code) ? error.code : 'sibling-inventory-failed';
+        ...(manifestMode === 'tracked' ? ['dirty','oversize','total-oversize','binary-type'] : [])].includes(error.code) ? error.code : 'sibling-inventory-failed';
       throw error;
     }
   }
@@ -1120,7 +1122,7 @@ async function digestDeltaInput(delta,stage,cwd,exec) {
 }
 
 // All sibling evidence is local Git evidence; never ask Forge to resolve a revision.
-async function checkSibling(root, exec, fs) {
+async function checkSibling(root, exec, fs, {checkClean = true} = {}) {
   exec=await bindGit({cwd:root,exec});
   const roots = [];
   for (const path of [root,...Object.values(SIBLING_PATHS).map(path => resolve(root,'..',path.slice(3)))]) {
@@ -1136,7 +1138,7 @@ async function checkSibling(root, exec, fs) {
   if (await fs.realpath(root) !== (await git(['rev-parse','--show-toplevel'])).trim()) throw new Error('Unresolvable sibling worktree');
   const sha = (await git(['rev-parse','HEAD'])).trim();
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) throw new Error('Invalid sibling HEAD');
-  if ((await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
+  if (checkClean && (await git(['status','--porcelain=v1','-z','--untracked-files=normal','--',...Object.values(SIBLING_PATHS).map(path => path.slice('../frontierui/'.length))])).length) throw new Error('Dirty sibling worktree');
   return {sha,roots};
 }
 const sameSiblingEvidence = (actual, expected) => actual.sha === expected.sha && JSON.stringify(actual.roots) === JSON.stringify(expected.roots);

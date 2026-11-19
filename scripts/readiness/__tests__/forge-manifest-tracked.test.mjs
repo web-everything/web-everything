@@ -316,6 +316,57 @@ it('tracked sibling admits allowlisted binary assets', async () => {
   await sibling(Buffer.from([255, 254]), 'plugs/image.webp');
   expect((await build()).siblings.frontierui.entries[0].path.toString()).toBe('plugs/image.webp');
 });
+it.each(['add', 'remove'])('tracked sibling refuses an exec-bit %s with core.fileMode=false as dirty without dispatch', async change => {
+  await sibling('clean\n');
+  const main = cwd;
+  cwd = join(root, 'frontierui');
+  try {
+    if (change === 'remove') {
+      await fs.chmod(join(cwd, 'plugs/input.dat'), 0o755);
+      git(['update-index', '--chmod=+x', 'plugs/input.dat']);
+      git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'executable']);
+    }
+    git(['config', 'core.fileMode', 'false']);
+    await fs.chmod(join(cwd, 'plugs/input.dat'), change === 'add' ? 0o755 : 0o644);
+    expect(git(['status', '--porcelain'])).toBe('');
+  } finally { cwd = main; }
+  await fallback('dirty');
+  expect(await lines()).toContainEqual(expect.objectContaining({ mode: 'tracked', reason: 'dirty', path: 'plugs/input.dat' }));
+});
+it('tracked sibling checks staged content against HEAD rather than the index and refuses dirty without dispatch', async () => {
+  const headOid = await sibling('clean\n');
+  const main = cwd;
+  cwd = join(root, 'frontierui');
+  try {
+    await write('plugs/input.dat', 'staged\n');
+    git(['add', 'plugs/input.dat']);
+    expect(git(['rev-parse', ':plugs/input.dat'])).not.toBe(headOid);
+    expect(git(['diff', '--name-only'])).toBe('');
+  } finally { cwd = main; }
+  await fallback('dirty');
+  expect(await lines()).toContainEqual(expect.objectContaining({ mode: 'tracked', reason: 'dirty', path: 'plugs/input.dat' }));
+});
+it('legacy sibling retains index-based exec-bit behavior with core.fileMode=false', async () => {
+  await sibling('clean\n');
+  const main = cwd;
+  cwd = join(root, 'frontierui');
+  try {
+    git(['config', 'core.fileMode', 'false']);
+    await fs.chmod(join(cwd, 'plugs/input.dat'), 0o755);
+  } finally { cwd = main; }
+  const manifest = await build({ manifestMode: 'legacy', env: { ...env, FORGE_MANIFEST_SHADOW: '0' } });
+  expect(manifest.siblings.frontierui.entries[0]).toMatchObject({ path: Buffer.from('plugs/input.dat'), executable: true });
+  await expect(fs.stat(log)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+it('legacy sibling still refuses staged content with its existing inventory reason', async () => {
+  await sibling('clean\n');
+  const main = cwd;
+  cwd = join(root, 'frontierui');
+  try { await write('plugs/input.dat', 'staged\n'); git(['add', 'plugs/input.dat']); }
+  finally { cwd = main; }
+  await expect(build({ manifestMode: 'legacy', env: { ...env, FORGE_MANIFEST_SHADOW: '0' } })).rejects.toMatchObject({ code: 'sibling-inventory-failed' });
+  await expect(fs.stat(log)).rejects.toMatchObject({ code: 'ENOENT' });
+});
 it.each(['oversize', 'binary'])('legacy sibling still ships %s bytes with the same inventory', async kind => {
   const content = kind === 'oversize' ? 'x'.repeat(1048577) : Buffer.from([255, 254]);
   await sibling(content);
