@@ -872,6 +872,7 @@
   "scripts/lib/__tests__/delivery-policy.test.mjs": 41.81,
   "scripts/lib/__tests__/delivery-priority.replay.test.mjs": 0.01,
   "scripts/lib/__tests__/delivery-priority.test.mjs": 0.01,
+  "scripts/lib/__tests__/delivery-routes.test.mjs": 0.1,
   "scripts/lib/__tests__/describe-spawn-failure.test.mjs": 0.15,
   "scripts/lib/__tests__/design-pixels-adapter.test.mjs": 0.03,
   "scripts/lib/__tests__/diff-branch-coverage.test.mjs": 0.68,
@@ -1713,6 +1714,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/owed-ci-rerun-planned-but-never-executed.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
@@ -1721,6 +1723,7 @@
   "scripts/conveyor/soak/breaks/live-changes-stale-accepted-phase.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/unchecked-draft-and-stale-accepted-status.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/ready-candidate-adopted-across-overlay-churn.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-acquire-default-wait.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/ci-rerun-ignores-external-red-team.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-skip-reason-drops-comment-error.soak.test.mjs": 2,
@@ -2031,6 +2034,7 @@
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
+  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2
  }
 }
