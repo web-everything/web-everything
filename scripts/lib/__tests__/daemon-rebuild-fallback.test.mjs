@@ -22,8 +22,9 @@ import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
-import { budgetedRunChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
-import { runLiveSmoke, SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { budgetedRunChild, smokeCheckOfChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
+import { runLiveSmoke, SMOKE_CHECKS, DISPATCH_DRY_RUN_SCRIPT } from '../daemon-live-smoke.mjs';
+import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
@@ -817,18 +818,35 @@ describe('rebuild smoke budget and fail-fast', () => {
     expect(result.alerts.find((a) => a.kind === 'smoke-budget-exhausted').detail).toMatchObject({ totalMs: 30 * 60_000, source: { totalMs: 'env' } });
   });
 
-  it('re-runs boot, cleanliness and every code check on fallback, retaining only GitHub probes and widened budgets', async () => {
+  it.each([
+    { brokenImport: false, age: 599_999, limit: undefined, reused: true },
+    { brokenImport: true, age: 0, limit: undefined, reused: true },
+    { brokenImport: false, age: 600_000, limit: undefined, reused: false },
+    { brokenImport: false, age: 0, limit: '0', reused: false },
+    { brokenImport: false, age: 100, limit: '100', reused: false },
+    { brokenImport: false, age: null, limit: undefined, reused: false },
+  ])('fallback code/import and GitHub evidence age: $brokenImport / $age / $limit', async ({ brokenImport, age, limit, reused }) => {
     const { originDir, cloneDir, env } = makeFixture();
     advanceMain(originDir, (dir) => {
       writeFile(dir, 'main-moved.txt', 'y\n');
       // An unchanged importer with a missing dependency cannot prove the fallback safe.
-      writeFile(dir, 'scripts/conveyor/reconcile-pass.mjs', "import './missing.mjs';\n");
+      writeFile(dir, 'scripts/conveyor/reconcile-pass.mjs', brokenImport ? "import './missing.mjs';\n" : "process.stdout.write('[]');\n");
     });
     pushBranch(originDir, 'lane/bad2', (dir) => writeFile(dir, 'bad2.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/bad2' }, { env });
     const seen = [];
     let fallbackSmoke;
-    const children = vi.fn(async (cmd, args) => {
+    const fallbackSmokes = [];
+    const failures = [];
+    const t = 1_000_000;
+    if (limit !== undefined) env.WE_SMOKE_GH_ROW_REUSE_MAX_AGE_MS = limit;
+    const children = vi.fn(async (cmd, args, opts) => {
+      if (cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+        const child = spawnSync(process.execPath, args, { cwd: opts.cwd, encoding: 'utf8', timeout: 5_000, maxBuffer: 64 * 1024 });
+        if (child.error) throw child.error;
+        if (child.status !== 0) { failures.push(child.stderr); throw new Error(child.stderr); }
+        return child.stdout;
+      }
       if (cmd === 'node' && args[0] === '--input-type=module') {
         return String(args[2]).includes('daemon-boot-smoke:entry-boot')
           ? '{"ok":true}' : '[{"kind":"stub","pr":null,"ok":true}]';
@@ -844,20 +862,30 @@ describe('rebuild smoke budget and fail-fast', () => {
           budgets: { reconcileMs: 3_000_000, dispatchPassMs: 4_000_000, dispatchDryRunMs: 2_000_000 },
           results: [...codeFail('dispatch-dry-run').smoke.results,
             ...SMOKE_CHECKS.filter(check => check.name !== 'dispatch-dry-run')
-              .map(check => ({ name: check.name, ok: true, ms: 10 }))],
+              .map(check => ({ name: check.name, ok: true, ms: 10, completedAt: age === null ? undefined : t - age }))],
         },
       };
       fallbackSmoke = await runLiveSmoke({ root, changedFiles, reuseCode, reuseRows, runChild: children,
         env: { ...smokeEnv, WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9', WE_SMOKE_DISPATCH_PASSES: '0' } });
+      fallbackSmokes.push(fallbackSmoke);
       return { verdict: fallbackSmoke.pass ? 'pass' : 'code', attempts: 1, smoke: fallbackSmoke };
     });
-    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t });
+    if (brokenImport) {
+      expect(result.moved).toBe(false);
+      expect(fallbackSmokes[0].results.find(row => row.name === 'reconcile-dry-run'))
+        .toMatchObject({ ok: false });
+      expect(failures.some(error => error.includes('missing.mjs'))).toBe(true);
+      expect(children.mock.calls.some(([cmd, args]) => cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs')).toBe(true);
+      return;
+    }
     expect(result.reason).toBe('fallback-plain-main');
     expect(seen.map((s) => s.failFast)).toEqual([[], ['dispatch-dry-run']]);
     expect(seen[1].smokeEnv).toMatchObject({ WE_SMOKE_RECONCILE_MS: '3000000',
       WE_SMOKE_DISPATCH_PASS_MS: '4000000', WE_SMOKE_DISPATCH_DRY_RUN_MS: '2000000' });
-    expect(seen[1].reuseRows.map(row => row.name)).toEqual(['gh-api-repo', 'gh-pr-list']);
-    expect(fallbackSmoke.results.filter(row => row.reused).map(row => row.name)).toEqual(['gh-api-repo', 'gh-pr-list']);
+    expect(seen[1].reuseRows.map(row => row.name)).toEqual(reused ? ['gh-api-repo', 'gh-pr-list'] : []);
+    expect(children.mock.calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(reused ? 0 : 2);
+    expect(fallbackSmoke.results.filter(row => row.reused).map(row => row.name)).toEqual(reused ? ['gh-api-repo', 'gh-pr-list'] : []);
     for (const check of SMOKE_CHECKS.filter(check => !check.name.startsWith('gh-'))) {
       expect(fallbackSmoke.results.find(row => row.name === check.name)).toMatchObject({ ok: true });
       expect(fallbackSmoke.results.find(row => row.name === check.name).skipped).toBeUndefined();
@@ -869,6 +897,22 @@ describe('rebuild smoke budget and fail-fast', () => {
 });
 
 describe('budgetedRunChild', () => {
+  it('classifies real dispatch children and leaves real boot children runnable after dispatch failure', async () => {
+    const dispatch = ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT];
+    const boot = ['--input-type=module', '-e', buildEntryBootScript('scripts/conveyor/reconcile-pass.mjs')];
+    expect(smokeCheckOfChild('node', dispatch)).toBe('dispatch-dry-run');
+    expect(smokeCheckOfChild('node', boot)).toBeNull();
+    const base = vi.fn(async (_cmd, args) => {
+      if (args[2] === DISPATCH_DRY_RUN_SCRIPT) throw new Error('dispatch failed');
+      return '{"ok":true}';
+    });
+    const run = budgetedRunChild({ runChild: base, deadline: Infinity, failFast: ['dispatch-dry-run'] });
+    await expect(run('node', dispatch)).rejects.toThrow('dispatch failed');
+    await expect(run('node', boot)).resolves.toBe('{"ok":true}');
+    await expect(run('node', dispatch)).rejects.toThrow('fail-fast');
+    expect(base).toHaveBeenCalledTimes(2);
+  });
+
   it('honors a per-call floor, strips it, and keeps the default floor for other children', async () => {
     const base = vi.fn(async (_cmd, _args, opts) => opts);
     const run = budgetedRunChild({ runChild: base, deadline: 1275, now: () => 0 });
@@ -901,7 +945,7 @@ describe('budgetedRunChild', () => {
     expect(await run('git', ['status', '--porcelain'], {})).toBe('ok');
     await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs', '--repo=a/b', '--json'], {})).rejects.toThrow(/timed out/);
     await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs', '--repo=c/d', '--json'], {})).rejects.toThrow(/fail-fast/);
-    await expect(run('node', ['--input-type=module', '-e', 'x'], {})).rejects.toThrow(/fail-fast/);
+    await expect(run('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {})).rejects.toThrow(/fail-fast/);
     expect(await run('node', ['scripts/readiness/daemon-entry-boot.mjs'], {})).toBe('ok');
     expect(await run('git', ['status', '--porcelain'], {})).toBe('ok');
     expect(base).toHaveBeenCalledTimes(4);
@@ -914,7 +958,7 @@ describe('budgetedRunChild', () => {
     });
     const run = budgetedRunChild({ runChild: base, deadline: Infinity, failFast: ['reconcile-dry-run'] });
     await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs'])).rejects.toThrow('boom');
-    expect(await run('node', ['--input-type=module', '-e', 'x'])).toBe('ok');
+    expect(await run('node', ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT])).toBe('ok');
     expect(base).toHaveBeenCalledTimes(2);
   });
 

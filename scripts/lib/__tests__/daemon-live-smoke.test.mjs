@@ -1036,6 +1036,20 @@ describe('runLiveSmoke — injected runChild', () => {
     expect(typeof result.sessionSlug).toBe('string');
   });
 
+  it('records each row completion with the injected clock before later expensive checks', async () => {
+    let time = 1_000;
+    const runChild = async (cmd, args, opts) => {
+      const result = await passingRunChild(cmd, args, opts);
+      if (cmd === 'gh') time += 100;
+      if (cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs') time += 600_000;
+      return result;
+    };
+    const result = await runLiveSmoke({ root: '/x', env: {}, runChild, clock: () => time });
+    expect(result.results.find(row => row.name === 'gh-api-repo').completedAt).toBe(1_100);
+    expect(result.results.find(row => row.name === 'gh-pr-list').completedAt).toBe(1_200);
+    expect(result.results.find(row => row.name === 'reconcile-dry-run').completedAt).toBeGreaterThan(601_000);
+  });
+
   it('the lane acquire uses a unique --session slug and is released with the SAME lane number + slug', async () => {
     const calls = [];
     const runChild = vi.fn(async (cmd, args) => {

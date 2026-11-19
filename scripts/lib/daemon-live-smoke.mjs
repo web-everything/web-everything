@@ -751,6 +751,11 @@ const DISPATCH_DRY_RUN_LINES = [
 ];
 export const DISPATCH_DRY_RUN_SCRIPT = DISPATCH_DRY_RUN_LINES.join('\n');
 
+/** Identify this exact child harness without confusing other inline module probes. */
+export function isDispatchDryRunScript(script) {
+  return script === DISPATCH_DRY_RUN_SCRIPT;
+}
+
 /** The dispatch modules {@link DISPATCH_DRY_RUN_SCRIPT} runs — {@link checkCodeUnchanged}'s `codeEntries` for
  *  `dispatch-dry-run`, so skip-unchanged skips it when none of their import closure (which transitively pulls
  *  in `dispatch-lane.mjs`/`dispatch-lane-io.mjs`/`repo-profile.mjs`/`reconcile-pass.mjs`/`pr-work-unit.mjs`/
@@ -1041,7 +1046,8 @@ export async function runLiveSmoke({
           || (check.name === 'daemon-entries-boot' && bootOutputsOk))
         && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
           || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
-      results.push({ name: check.name, ms: clock() - startedAt, ...result,
+      const completedAt = clock();
+      results.push({ name: check.name, ms: completedAt - startedAt, ...result, completedAt,
         ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
       // Both external probes have completed before the expensive tree checks begin. Budgets are a fresh
       // per-run object from resolveSmokeBudgets; explicit operator timeouts remain absolute.
