@@ -10,12 +10,50 @@ function fixture(entries = [{ pr: 1, blocked: 'planner-skip' }]) {
     writeFile: (_path, value) => { stored = value; }, rename: () => {}, unlink: () => {} });
   const queue = open();
   const runRecovery = vi.fn(({ plan }) => ({ dispatched: [{ prNumber: plan.refusals[0].prNumber }] }));
-  const options = { queue, now: () => at, readLivePr: () => ({ state: 'OPEN', headRefOid: head }),
+  const options = { queue, now: () => at, readLivePr: () => ({ state: 'OPEN', isDraft: false, headRefOid: head }),
     runRecovery, capacity: { minConcurrent: 3, inFlight: 0, lanes: 10, remainingStarts: 10 }, alert: vi.fn() };
   return { queue, open, runRecovery, options };
 }
 
 describe('independent red-team queue drain', () => {
+  it('keeps a draft queued without admission and dispatches it once ready after restart', async () => {
+    const f = fixture([{ pr: 1, blocked: 'planner-skip', enqueuedAt: at }]);
+    let isDraft = true;
+    f.options.readLivePr = () => ({ state: 'OPEN', headRefOid: head, isDraft });
+    const before = f.open().entries();
+    expect(await drainRedTeamQueue(f.options)).toMatchObject({ admitted: 0, dispatched: 0 });
+    expect(f.runRecovery).not.toHaveBeenCalled();
+    expect(f.open().entries()).toEqual(before);
+
+    isDraft = false;
+    expect(await drainRedTeamQueue({ ...f.options, queue: f.open() }))
+      .toMatchObject({ admitted: 1, dispatched: 1 });
+    expect(f.runRecovery).toHaveBeenCalledTimes(1);
+    expect(f.open().entries()).toEqual([]);
+  });
+  it.each(['draft', 'missing', 'null', 'throw'])('retains an entry when dispatch-time draft evidence is %s', async evidence => {
+    const f = fixture([{ pr: 1, blocked: 'planner-skip', enqueuedAt: at }]);
+    const before = f.open().entries();
+    f.options.readLivePr = vi.fn()
+      .mockReturnValueOnce({ state: 'OPEN', headRefOid: head, isDraft: false })
+      .mockImplementationOnce(() => {
+        if (evidence === 'throw') throw new Error('unreadable');
+        if (evidence === 'null') return null;
+        return { state: 'OPEN', headRefOid: head, ...(evidence === 'draft' ? { isDraft: true } : {}) };
+      });
+    expect(await drainRedTeamQueue(f.options)).toMatchObject({ admitted: 0, dispatched: 0 });
+    expect(f.options.readLivePr).toHaveBeenCalledTimes(2);
+    expect(f.runRecovery).not.toHaveBeenCalled();
+    expect(f.open().entries()).toEqual(before);
+  });
+  it('holds missing draft evidence at reconciliation without spending capacity ahead of a ready entry', async () => {
+    const f = fixture([{ pr: 1, enqueuedAt: at - 200 }, { pr: 2, enqueuedAt: at - 100 }]);
+    f.options.capacity.minConcurrent = 1;
+    f.options.readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: head, ...(pr === 2 ? { isDraft: false } : {}) });
+    expect(await drainRedTeamQueue(f.options)).toMatchObject({ admitted: 1, dispatched: 1 });
+    expect(f.runRecovery.mock.calls.map(([o]) => o.plan.refusals[0].prNumber)).toEqual([2]);
+    expect(f.open().entries()).toEqual([expect.objectContaining({ pr: 1, attempts: 2 })]);
+  });
   it('retries a planner-skipped entry through an already-reviewed-head recovery row and settles dispatch', async () => {
     const f = fixture();
     expect((await drainRedTeamQueue(f.options)).dispatched).toBe(1);
@@ -32,7 +70,7 @@ describe('independent red-team queue drain', () => {
   });
   it('requeues a stale head with fresh attempts, age preserved and blocked cleared, including across restart', async () => {
     const f = fixture();
-    f.options.readLivePr = () => ({ state: 'OPEN', headRefOid: 'b'.repeat(40) });
+    f.options.readLivePr = () => ({ state: 'OPEN', isDraft: false, headRefOid: 'b'.repeat(40) });
     f.options.runRecovery = () => ({ notStarted: [{ prNumber: 1, reason: 'no review capacity left' }] });
     await drainRedTeamQueue(f.options);
     expect(f.open().entries()[0]).toMatchObject({ head: 'b'.repeat(40), attempts: 0,
@@ -64,7 +102,7 @@ describe('independent red-team queue drain', () => {
     const f = fixture([{ pr: 1, enqueuedAt: at - 200 }, { pr: 2, enqueuedAt: at - 100 }]);
     f.options.capacity.minConcurrent = 1;
     f.options.readLivePr = ({ pr }) => {
-      if (pr === 2) return { state: 'OPEN', headRefOid: head };
+      if (pr === 2) return { state: 'OPEN', isDraft: false, headRefOid: head };
       if (evidence === 'throw') throw new Error('live PR unreadable');
       return evidence === 'null' ? null : { state: 'OPEN' };
     };
@@ -121,7 +159,7 @@ describe('independent red-team queue drain', () => {
     expect(f.options.alert).toHaveBeenCalledTimes(1);
     expect(result.oldestAgeMin).toBeGreaterThan(60);
     expect(log.mock.calls.flat().join(' ')).toContain('oldestAgeMin=60.0');
-    await drainRedTeamQueue({ ...f.options, readLivePr: () => ({ state: 'OPEN', headRefOid: 'b'.repeat(40) }), now: () => at + 3 });
+    await drainRedTeamQueue({ ...f.options, readLivePr: () => ({ state: 'OPEN', isDraft: false, headRefOid: 'b'.repeat(40) }), now: () => at + 3 });
     expect(f.options.alert).toHaveBeenCalledTimes(2);
   });
 });

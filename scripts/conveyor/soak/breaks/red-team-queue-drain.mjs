@@ -30,7 +30,7 @@ export default {
       const queue = createRedTeamDispatchQueue({ file: 'memory', readFile: () => stored,
         writeFile: (_path, value) => { stored = value; }, rename: () => {}, unlink: () => {} });
       const starts = [], alerts = [];
-      const options = { queue, now: () => now, readLivePr: () => ({ state: 'OPEN', headRefOid: head }),
+      const options = { queue, now: () => now, readLivePr: () => ({ state: 'OPEN', isDraft: false, headRefOid: head }),
         capacity: { minConcurrent: 3, inFlight: 2, lanes: 10, remainingStarts: 10 },
         alert: event => alerts.push(event), runRecovery: ({ plan }) => {
           starts.push(plan.refusals[0].prNumber);

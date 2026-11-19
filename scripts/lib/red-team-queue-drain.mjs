@@ -1,4 +1,5 @@
 /** Independent recovery of queued heads; planner refusal/probe turns cannot starve this pass. */
+import { readLiveRedTeamPr } from './red-team-dispatch-queue.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readFileSync } from 'node:fs';
@@ -17,7 +18,7 @@ export function loadRedTeamQueueDrainSettings(options = {}) {
  * Unknown capacity holds entries for the next pass (and still reports/alerts their age).
  * Recovery is synchronous, matching runRedTeamOnSkip and the shared queue's settlement ledger.
  */
-export async function drainRedTeamQueue({ queue, readLivePr, runRecovery, capacity, now = Date.now,
+export async function drainRedTeamQueue({ queue, readLivePr = readLiveRedTeamPr, runRecovery, capacity, now = Date.now,
   log = () => {}, alert = appendDaemonEvent }) {
   const at = now();
   const note = message => {
@@ -47,7 +48,19 @@ export async function drainRedTeamQueue({ queue, readLivePr, runRecovery, capaci
     const livePr = liveEvidence.get(entry.key);
     // Retention is not admission evidence: unknown heads must not spend a recovery slot.
     if (livePr?.state !== 'OPEN' || livePr.headRefOid !== entry.head) continue;
-    if (!slots || !queue.admitDrain(entry, at).length) continue;
+    if (livePr.isDraft !== false) {
+      note(`hold ${entry.key}: draft or unreadable draft state; retry next interval`);
+      continue;
+    }
+    if (!slots) continue;
+    // Recheck at dispatch: the PR may have become a draft since reconciliation.
+    let dispatchPr;
+    try { dispatchPr = readLivePr({ repo: entry.repo, pr: entry.pr }); } catch { /* Retain unknown evidence. */ }
+    if (dispatchPr?.state !== 'OPEN' || dispatchPr.headRefOid !== entry.head || dispatchPr.isDraft !== false) {
+      note(`hold ${entry.key}: live PR/head/draft state changed or unreadable; retry next interval`);
+      continue;
+    }
+    if (!queue.admitDrain(entry, at).length) continue;
     slots--; summary.admitted++;
     let result;
     try {
