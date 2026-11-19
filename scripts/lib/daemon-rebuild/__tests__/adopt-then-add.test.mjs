@@ -65,10 +65,12 @@ describe('addOverlay dependsOn', () => {
     const root = mkdtempSync(join(tmpdir(), 'overlay-deps-'));
     const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
     try {
-      addOverlay(root, { ref: 'lane/x', dependsOn: ['lane/y', 'bad ref!', 'lane/y'] }, { env });
+      addOverlay(root, { ref: 'lane/x', dependsOn: ['lane/y', 'lane/y'] }, { env });
+      addOverlay(root, { ref: 'lane/m', dependsOn: ['lane/y', 'bad ref!'] }, { env });
       addOverlay(root, { ref: 'lane/z' }, { env });
       const list = readOverlays(root, { env });
       expect(list.find((o) => o.ref === 'lane/x').dependsOn).toEqual(['lane/y']);
+      expect(list.find((o) => o.ref === 'lane/m')).not.toHaveProperty('dependsOn'); // malformed: undeclared, not narrowed
       expect(list.find((o) => o.ref === 'lane/z')).not.toHaveProperty('dependsOn');
       addOverlay(root, { ref: 'lane/w', dependsOn: [] }, { env });
       expect(readOverlays(root, { env }).find((o) => o.ref === 'lane/w').dependsOn).toEqual([]);

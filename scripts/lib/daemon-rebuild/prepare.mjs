@@ -633,7 +633,8 @@ export async function prepareRebuild({
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
         // Adopt the build that passed, then add: benign removals (merged/no longer wanted) and still-registered overlays the
         // build omits queue an incremental rebuild instead of discarding the build; safety/unknown removals still discard.
-        removalSafety: (ref, sha) => classifyOverlayRemoval({
+        // A mainOnly rebuild wants no overlay at all, so a candidate carrying any is never adopted for a removed one.
+        removalSafety: mainOnly ? () => 'unknown' : (ref, sha) => classifyOverlayRemoval({
           ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
         }),
         // Registered NOW (the on-disk registry, not the tick-start snapshot): a removal made during planning is not re-added.

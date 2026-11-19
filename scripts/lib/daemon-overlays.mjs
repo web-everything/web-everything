@@ -263,7 +263,8 @@ export function addOverlay(root, {
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   // Declared dependencies (refs this overlay needs applied), recorded only when the caller declares them (an explicit
   // empty list asserts independence). An entry without it is "unknown" to the adopt-then-add omission check, never "none".
-  const deps = Array.isArray(dependsOn) ? [...new Set(dependsOn.filter((b) => isSafeBranchName(b)))] : null;
+  // Any malformed entry voids the whole declaration (left undeclared), never narrowed to a smaller list.
+  const deps = Array.isArray(dependsOn) && dependsOn.every((b) => isSafeBranchName(b)) ? [...new Set(dependsOn)] : null;
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
     pause();
