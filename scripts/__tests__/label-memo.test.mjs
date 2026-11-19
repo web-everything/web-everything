@@ -40,8 +40,10 @@ describe('implicit repository label wiring', () => {
         throw Object.assign(new Error('missing label'), { stderr: "'review:human' not found" });
       }
     };
+    // main now supplies env to these closures; preserve that scope in the extracted wiring.
+    const cliEnv = { ...env, WE_DRAIN_LABEL_MEMO_PATH: path };
     const api = runInNewContext(`${setup}\n${provision}\n({ memoRepo, labelEnsurer, healLabelNotFoundIn, addPrLabel })`, {
-      localSlug, process: { env: { ...env, WE_DRAIN_LABEL_MEMO_PATH: path }, cwd: () => '/checkout' },
+      localSlug, env: cliEnv, process: { env: cliEnv, cwd: () => '/checkout' },
       REVIEW_LABEL_META: { 'review:human': META }, CI_LIFECYCLE_LABEL_META: { 'ci:failed': META },
       execFileSync: exec, createLabelEnsurer, isLabelNotFoundError,
     });

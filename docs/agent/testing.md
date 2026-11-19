@@ -8,6 +8,17 @@ one negotiation ref; a bounded binary pack/index-pack handoff imports the pinned
 `review-job-fetch-security.test.mjs` replants hostile local/worktree/includeIf config after
 the scrub to prove isolation, and checks failed handoffs and moved heads leave the commit absent.
 
+## Merge drain CLI fixtures (R1063a)
+
+`merge-ai-prs-prestage.test.mjs` and `merge-ai-prs-listing-dedupe.test.mjs` call the exported
+`main(argv, { env, stdout, exit })` through `scripts/__tests__/fixtures/merge-ai-prs-cli-harness.mjs`.
+Mock `node:child_process` before importing the CLI. The harness reloads module-scoped paths/settings
+per invocation, captures exit with a sentinel, restores ambient IO in `finally`, and refuses unported
+commands even if a best-effort CLI reader catches the error. It spies on `process.cwd()` because
+Vitest's thread pool cannot chdir. Run it sequentially within each test file.
+The gh/git function ports also generate the executable shims for the two `*.real.test.mjs` smokes.
+Those files are explicitly excluded from the PR unit config. There is currently no filename-based
+scheduled real-process config discovery; scheduled-runner enrollment remains separate.
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
 
 ## Review PR transport isolation (R37)
@@ -4832,6 +4843,14 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Drain read-migration fixture imports
+
+Load the drain/adoption graph with static imports during collection in
+`proc-read-migration-74b.test.mjs`, as the reaper fixture does in `proc-read-migration-74c.test.mjs`.
+Dynamic imports of that cyclic graph can remain unresolved in the Vite runner, even when awaited
+sequentially. Keep fake executable PATH setup in `beforeAll` and all large-output/failed-read
+assertions inside the original per-test deadlines; increasing the setup timeout does not resolve the import stall.
 ## Ready-candidate adoption during overlay churn
 
 `daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
@@ -4877,6 +4896,13 @@ Each process emits `trace-<pid>.json`; merge with `mergeTraces`, then replay via
 Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
 rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
 Keep tracer tests mock-only: inject filesystem/child-process objects and exercise loader hooks directly.
+## Workflow-protection review admission
+
+The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged
+planner together using a rollup with `detailsUrl` and no check id. Workflow protection needs
+head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
+step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
+negative cases, rather than matching planner source text.
 ## Overlay main-sync interrupted test evidence
 
 A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
