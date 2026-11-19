@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Tracked-text host path ratchet, with injectable IO and an explicit baseline writer. */
 import { lstatSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findHostPaths, scanHostPaths } from './lib/host-path-scan.mjs';
 import { readGit } from './lib/proc-read.mjs';
@@ -11,9 +11,20 @@ const baselinePath = 'scripts/lib/host-path-baseline.json';
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const listTrackedFiles = root => readGit(['ls-files', '-z'], { cwd: root }).split('\0').filter(Boolean);
 
-/** Symlinks are references, not committed file contents. */
-function readTrackedFile(path) {
-  return lstatSync(path).isSymbolicLink() ? null : readFileSync(path);
+/** True when the git index records exactly this repo-relative path as a symlink (mode 120000). */
+function indexedAsSymlink(path) {
+  const rel = relative(repoRoot, path);
+  return readGit(['ls-files', '-s', '-z', '--', rel], { cwd: repoRoot }).split('\0')
+    .some(record => /^120000 [0-9a-f]+ \d\t/.test(record) && record.slice(record.indexOf('\t') + 1) === rel);
+}
+
+/** Symlinks are references, not committed file contents. Forge projects a tracked directory link
+ *  (.claude/agent-memory) into a real directory, so a directory indexed as a symlink is skipped too. */
+export function readTrackedFile(path, lstat = lstatSync, isIndexedSymlink = indexedAsSymlink) {
+  const stat = lstat(path);
+  if (stat.isSymbolicLink()) return null;
+  if (stat.isDirectory() && isIndexedSymlink(path)) return null;
+  return readFileSync(path);
 }
 
 /** IO callbacks receive the root (listing) and absolute filename (reading). */
