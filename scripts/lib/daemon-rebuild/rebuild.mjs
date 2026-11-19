@@ -89,6 +89,10 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
   return kept;
 }
 
+function isBetweenTickLaunch(options) {
+  return options.launchOnly === true && options.asJob === true
+    && (options.launchedBy === 'early' || options.launchedBy === 'recovery');
+}
 
 /**
  * Rebuild `root` fresh from `origin/main` + its registered overlay list. See the file header (xa4qo7n) for the
@@ -114,7 +118,10 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
   }
   // A refused between-tick launch must preserve evidence for operator repair, including
   // pending adoptions, event/alert state and any force-watch rollback bookkeeping.
-  if (options.launchOnly && !result.moved && !result.adopted
+  if (result.reason === 'state-unreadable') {
+    (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
+  }
+  if (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted
     && (result.unknownJobState
       || !['needs-build', 'up-to-date', 'rebuild-job-started', 'rebuild-job-running'].includes(result.reason))) return result;
   try {
@@ -133,7 +140,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
       }, eventOptions);
     }
     // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
-    await checkPendingAdoptions({
+    if (result.reason !== 'state-unreadable') await checkPendingAdoptions({
       overdueMs: resolveRecovery({ env: options.env, log: m => options.log?.error?.(m) }).overlayOverdueMs,
       root: options.root, env: { ...process.env, ...options.env }, daemon: basename(options.root),
       emit: (event) => emitEvent(event, eventOptions),
@@ -146,8 +153,8 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
  *  clone to the last-good build on a failed check or a crash loop. Never throws; readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
-  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, adoptOnly = false, launchOnly, asJob, launchedBy = 'tick-start' } = options;
-  const betweenTicks = !adoptOnly && launchOnly === true && asJob === true && (launchedBy === 'early' || launchedBy === 'recovery');
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, adoptOnly = false } = options;
+  const betweenTicks = !adoptOnly && isBetweenTickLaunch(options);
   if (!root || readyOnly || betweenTicks) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {

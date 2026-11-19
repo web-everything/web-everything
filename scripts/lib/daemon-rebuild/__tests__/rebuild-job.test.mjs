@@ -283,8 +283,8 @@ it.each([true, false].flatMap(launchOnly =>
     } else expect(readPendingAdoptionsStrict(root, { env })).toEqual([]);
   });
 
-it.each(['early', 'recovery'])(
-  '%s launchOnly preserves mixed overdue and malformed pending-adoption bytes on strict refusal', async launchedBy => {
+it.each([['early', true], ['recovery', true], ['tick-start', true], ['tick-start', false]])(
+  '%s launchOnly=%s preserves mixed overdue and malformed pending-adoption bytes on strict refusal', async (launchedBy, launchOnly) => {
     const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
     const file = pendingAdoptionPath(root, env);
     mkdirSync(join(env.WE_DAEMON_OVERLAY_DIR, 'adoption-pending'), { recursive: true });
@@ -293,24 +293,31 @@ it.each(['early', 'recovery'])(
     ], null, 2) + '\n');
     writeFileSync(file, original);
     const emitEvent = vi.fn();
+    const error = vi.fn();
+    const pending = vi.spyOn(overlayAdoption, 'checkPendingAdoptions');
+    const watch = vi.spyOn(forceAdopt, 'runForceWatchTick').mockResolvedValue({});
     const run = vi.fn(() => { throw new Error('unexpected git'); });
-    const result = await rebuildClone({ root, env, asJob: true, launchOnly: true, launchedBy,
-      emitEvent, run, log: { error() {} } });
+    const result = await rebuildClone({ root, env, asJob: true, launchOnly, launchedBy,
+      emitEvent, run, log: { error } });
     expect(result.reason).toBe('state-unreadable');
     expect(readFileSync(file)).toEqual(original);
     expect(emitEvent).not.toHaveBeenCalled();
     expect(run).not.toHaveBeenCalled();
+    expect(pending).not.toHaveBeenCalled();
+    expect(watch).toHaveBeenCalledTimes(launchedBy === 'tick-start' ? 1 : 0);
+    expect(error).toHaveBeenCalledWith(expect.stringMatching(/state-unreadable.*repair/));
   });
 
-it.each(['state-unreadable', 'still-rejected', 'smoke-failed', 'future-refusal', 'rebuild-job-running'])(
-  'launchOnly %s skips pending rewrites, failure alerts and force-watch', async reason => {
+it.each(['early', 'recovery'].flatMap(launchedBy =>
+  ['state-unreadable', 'still-rejected', 'smoke-failed', 'future-refusal', 'rebuild-job-running'].map(reason => [launchedBy, reason])))(
+  '%s launchOnly %s skips pending rewrites, failure alerts and force-watch', async (launchedBy, reason) => {
     const refused = { moved: false, reason, ...(reason === 'rebuild-job-running' ? { unknownJobState: true } : {}) };
     vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue(refused);
     const pending = vi.spyOn(overlayAdoption, 'checkPendingAdoptions').mockResolvedValue([]);
     const watch = vi.spyOn(forceAdopt, 'runForceWatchTick').mockResolvedValue({});
     const emitEvent = vi.fn();
     expect(await rebuildClone({ root, env: {}, asJob: true, launchOnly: true,
-      launchedBy: 'tick-start', emitEvent })).toEqual(refused);
+      launchedBy, emitEvent, log: { error() {} } })).toEqual(refused);
     expect(pending).not.toHaveBeenCalled();
     expect(watch).not.toHaveBeenCalled();
     expect(emitEvent).not.toHaveBeenCalled();

@@ -22,6 +22,7 @@ import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs'
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
+import * as rebuildPrepare from '../daemon-rebuild/prepare.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -800,12 +801,14 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     ['unknown launchedBy', { launchedBy: 'unknown', launchOnly: true, asJob: true }],
     ['tick-start', { launchedBy: 'tick-start', launchOnly: true, asJob: true }],
     ['adopt path', { launchedBy: 'early', launchOnly: true, asJob: true, adoptOnly: true }],
-  ])('%s still advances the force watch', async (_name, options) => {
+  ])('%s still advances the force watch after rebuild refuses', async (_name, options) => {
     const { cloneDir, env } = await forceAdoptF();
     const watchBefore = readForceWatch(cloneDir, env);
     const probe = vi.fn(healthy);
-    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue({ moved: false, reason: 'rebuild-job-running' });
-    await tick(cloneDir, env, { ...options, runSmoke: passing(), forceWatchProbe: probe });
+    const refusal = { moved: false, reason: 'still-rejected' };
+    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue(refusal);
+    vi.spyOn(rebuildPrepare, 'prepareRebuild').mockResolvedValue({ terminal: true, result: refusal, alerts: [] });
+    expect(await tick(cloneDir, env, { ...options, runSmoke: passing(), forceWatchProbe: probe })).toMatchObject(refusal);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(readForceWatch(cloneDir, env)).toMatchObject({ ticksLeft: watchBefore.ticksLeft - 1 });
   });
