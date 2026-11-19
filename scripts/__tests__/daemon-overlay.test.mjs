@@ -644,7 +644,7 @@ describe('stackAwareOverlayCheck', () => {
     const stackBases = vi.fn().mockReturnValue({ bases: [], via });
     expect(await stackAwareOverlayCheck({ ...options, preview, stackBases })).toEqual({ ...full, stackBases: [], stackVia: via });
     expect(preview).toHaveBeenCalledTimes(1);
-    expect(preview).toHaveBeenCalledWith(options);
+    expect(preview).toHaveBeenCalledWith({ ...options, stackBases: via.chain });
     expect(stackBases).toHaveBeenCalledTimes(1);
     expect(stackBases).toHaveBeenCalledWith(options);
   });
@@ -659,7 +659,7 @@ describe('stackAwareOverlayCheck', () => {
       ...options, preview, stackBases: () => ({ bases: ['lane/b'], via }),
     });
     expect(preview).toHaveBeenCalledTimes(2);
-    expect(preview).toHaveBeenNthCalledWith(2, { ...options, existingOverlays: [existingOverlays[1]] });
+    expect(preview).toHaveBeenNthCalledWith(2, { ...options, stackBases: via.chain, existingOverlays: [existingOverlays[1]] });
     expect(result).toEqual({
       ...(outcome === 'failed' ? full : second), stackBases: ['lane/b'], stackVia: via,
       ...(outcome === 'accepted' ? { stackConflictIgnored: { files: full.files, conflicting: full.conflicting } } : {}),

@@ -60,8 +60,10 @@ export function pinnedStatus(git, raw, mainSha, ovSha) {
  * Read adopted builds from the clone, not the preview's scratch repo (which has no HEAD reflog).
  * Unlike stack discovery, supersession cannot truncate history or exclude heads already in main:
  * every recorded adopted/applied head, including third-parent carried work, must be contained.
+ * PR registrations are ancestry stack bases, not replacement identities. Explicit PR-chain
+ * bases are retained even without a recorded PR; only plain registrations may be superseded.
  */
-export function supersededOverlays(git, overlays, mainSha, candidateSha, { historyGit = git, headSha } = {}) {
+export function supersededOverlays(git, overlays, mainSha, candidateSha, { historyGit = git, headSha, stackBases = [] } = {}) {
   let historyLines;
   try {
     if (![mainSha, candidateSha].every(sha => FULL_SHA_RE.test(sha ?? '')
@@ -79,7 +81,8 @@ export function supersededOverlays(git, overlays, mainSha, candidateSha, { histo
   } catch { return []; }
   return overlays.flatMap(entry => {
     try {
-      if (!isSafeBranchName(entry?.ref) || entry.pinned === true || entry.edgeResolution) return [];
+      if (!isSafeBranchName(entry?.ref) || entry.pr != null || stackBases.includes(entry.ref)
+        || entry.pinned === true || entry.edgeResolution) return [];
       const oldTip = verifyRev(git, `refs/remotes/origin/${entry.ref}^{commit}`);
       if (!FULL_SHA_RE.test(oldTip ?? '') || oldTip === candidateSha
         || verifyRev(git, `${oldTip}^{commit}`) !== oldTip

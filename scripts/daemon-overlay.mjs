@@ -213,10 +213,13 @@ export async function stackAwareOverlayCheck({
 }) {
   const options = { root, ref, pr, existingOverlays, env, originUrl };
   const { bases, via } = await stackBases(options);
-  const full = await preview(options);
+  // PR-backed ancestors remain stack bases in the planner. An explicit chain also
+  // protects bases registered without a PR; plain containment may still replace those.
+  const previewOptions = { ...options, stackBases: via.chain };
+  const full = await preview(previewOptions);
   const evidence = { stackBases: bases, stackVia: via };
   if (!full.ok || full.clean || bases.length === 0) return { ...full, ...evidence };
-  const sa = await preview({ ...options, existingOverlays: existingOverlays.filter(o => !bases.includes(o.ref)) });
+  const sa = await preview({ ...previewOptions, existingOverlays: existingOverlays.filter(o => !bases.includes(o.ref)) });
   if (!sa.ok) return { ...full, ...evidence };
   return {
     ...sa, ...evidence,

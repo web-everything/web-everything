@@ -199,7 +199,8 @@ function parseMergeTreeConflictFiles(output) {
  * result precisely because the caller (`add`) has a THIRD option `dryRunRebuild`'s own caller does not:
  * refuse to register at all.
  * @param {{root:string, ref:string, pr?:number|null, existingOverlays:Array<{ref:string,pr?:number|null}>,
- *   env?:NodeJS.ProcessEnv, originUrl?:string, run?:typeof gitRun}} o
+ *   env?:NodeJS.ProcessEnv, originUrl?:string, run?:typeof gitRun, stackBases?:string[]}} o
+ * `stackBases` carries explicit PR-chain evidence from admission; those registrations must stay.
  * `setAside` (every result) lists already-registered PINNED overlays that no longer fold onto main and were
  * left out of the check — the caller must surface them, since a real rebuild refuses until they are fixed.
  * @returns {Promise<{ok:true, clean:true, mainSha:string, cur:string, candSha:string, setAside:Array<object>}
@@ -208,7 +209,7 @@ function parseMergeTreeConflictFiles(output) {
  *   |{ok:false, reason:string, detail?:object, setAside?:Array<object>}>}
  */
 export async function previewOverlayConflict({
-  root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = gitRun,
+  root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = gitRun, stackBases = [],
 } = {}) {
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
   const candidateRegistered = existingOverlays.some(o => o.ref === ref);
@@ -256,7 +257,7 @@ export async function previewOverlayConflict({
     // A candidate that is ALREADY registered (a re-registration or an unaudited advance) can be held at its earlier
     // adopted head by planRebuild, which need not contain what it would supersede: never supersede for it.
     const superseded = candidateRegistered ? []
-      : supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head });
+      : supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head, stackBases });
     // Removing the old identity also removes planRebuild's adopted/graduated-tip
     // hold. A fresh ref must never launder that unaudited tip via the no-history exemption.
     // Following tips does not authorize erasing their registration identity.

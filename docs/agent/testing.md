@@ -4807,7 +4807,13 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 Admission replaces a registration only when its verified current tip is a strict ancestor of the
 candidate tip and the candidate contains every recorded adopted/applied/carried head for that same
-ref and PR. Read the running build and remembered builds from the clone's HEAD/reflog, without
+ref and PR. Containment alone does not replace a PR stack base: retain registrations with a PR,
+and retain explicit PR-chain bases even when their registration has no PR. Stack discovery still
+reports ancestry and chain evidence, and clean stack checks need no supersession audit. Automatic
+supersession is for a plain registration with neither a PR nor explicit chain evidence; all its
+existing containment, audit and race guards still apply. The real add/check cases in
+`daemon-overlay-supersede.test.mjs` cover both retained stack bases and plain superset replacement.
+Read the running build and remembered builds from the clone's HEAD/reflog, without
 truncating history or excluding graduated heads already in main; a scratch preview has no adoption
 reflog of its own. Force-pushed tips cannot erase these pins. Equal tips, explicit or mechanism pins, edge resolutions, unreadable Git evidence,
 and changed registration identities keep the existing path. The preview refuses supersession unless

@@ -158,11 +158,12 @@ describe('strict containment supersession', () => {
     expect(events).toContainEqual(expect.objectContaining({ kind: 'overlay-superseded', ref: 'lane/old', replacedBy: 'lane/new', oldTip: f.sha('lane/old'), newTip: f.candidate }));
   }));
 
-  it.each(['equal tip', 'non-ancestor', 'explicit pin', 'mechanism pin', 'missing object', 'short sha', 'git error', 'thrown git error', 'pin probe error', 'ancestry probe error', 'unresolved registered tip', 'edge resolution'])(
+  it.each(['equal tip', 'non-ancestor', 'PR stack base', 'explicit pin', 'mechanism pin', 'missing object', 'short sha', 'git error', 'thrown git error', 'pin probe error', 'ancestry probe error', 'unresolved registered tip', 'edge resolution'])(
     'does not supersede on %s', async kind => fixture(async f => {
       let candidate = f.candidate, entries = f.entries, git = f.git;
       if (kind === 'equal tip') candidate = f.sha('lane/old');
       if (kind === 'non-ancestor') candidate = f.sha('lane/peer');
+      if (kind === 'PR stack base') entries = entries.map(o => ({ ...o, pr: 7117 }));
       if (kind === 'explicit pin') entries = entries.map(o => ({ ...o, pinned: true }));
       if (kind === 'edge resolution') entries = entries.map(o => ({ ...o, edgeResolution: { sha: f.sha('lane/peer') } }));
       if (kind === 'mechanism pin') { entries = [{ ref: 'lane/mechanism' }]; candidate = f.sha('lane/mechanism-new'); }
@@ -205,7 +206,37 @@ describe('strict containment supersession', () => {
     expect(readOverlays(f.clone, { env: f.env })).toEqual(f.entries);
   }));
 
-  it('the real add CLI supersedes and reports the old registration without a retirement ruling', async () => fixture(async f => {
+  it.each(['PR ancestry', 'PR chain', 'chain without a registered PR'])(
+    'keeps a contained stack base reported and registered via %s, without a supersession audit', async via => fixture(async f => {
+      if (via !== 'chain without a registered PR') addOverlay(f.clone, { ref: 'lane/old', pr: 7117 }, { env: f.env });
+      if (via !== 'PR ancestry') f.env.WE_DAEMON_OVERLAY_STACK_BASES = JSON.stringify({ 'lane/new': 'lane/old' });
+      f.env.WE_FIX_READY_PATH = join(f.tmp, 'missing-audits');
+      const entries = readOverlays(f.clone, { env: f.env });
+      const args = ['scripts/daemon-overlay.mjs', 'add', `--clone=${f.clone}`, '--ref=lane/new', '--pr=7118',
+        `--expected-sha=${f.candidate}`, '--refuse-supersede', '--json'];
+      const check = spawnSync(process.execPath, [...args, '--check'],
+        { env: f.env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+      expect(check.status, check.stdout + check.stderr).toBe(0);
+      expect(JSON.parse(check.stdout)).toMatchObject({ wouldRegister: true, check: {
+        ok: true, clean: true, stackBases: ['lane/old'], superseded: [],
+        stackVia: { [via === 'PR ancestry' ? 'ancestry' : 'chain']: expect.arrayContaining(['lane/old']) },
+      } });
+      expect(readOverlays(f.clone, { env: f.env })).toEqual(entries);
+      const added = spawnSync(process.execPath, args,
+        { env: f.env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+      expect(added.status, added.stdout + added.stderr).toBe(0);
+      expect(readOverlays(f.clone, { env: f.env }).map(o => o.ref)).toEqual(['lane/old', 'lane/new']);
+    }),
+  );
+
+  it('the real add CLI supersedes a pure superset re-registration without a PR base or explicit chain', async () => fixture(async f => {
+    const check = spawnSync(process.execPath, ['scripts/daemon-overlay.mjs', 'add', `--clone=${f.clone}`, '--ref=lane/new',
+      '--pr=7118', '--check', '--json'], { env: f.env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+    expect(check.status, check.stdout + check.stderr).toBe(0);
+    expect(JSON.parse(check.stdout)).toMatchObject({ wouldRegister: true, check: {
+      superseded: [{ entry: f.entries[0], oldTip: f.sha('lane/old'), newTip: f.candidate }],
+    } });
+    expect(readOverlays(f.clone, { env: f.env })).toEqual(f.entries);
     const result = spawnSync(process.execPath, ['scripts/daemon-overlay.mjs', 'add', `--clone=${f.clone}`, '--ref=lane/new',
       '--pr=7118', `--expected-sha=${f.candidate}`, '--json'], { env: f.env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
     expect(result.status, result.stderr).toBe(0);
