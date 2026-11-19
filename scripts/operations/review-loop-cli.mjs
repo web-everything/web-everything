@@ -57,7 +57,7 @@
  */
 
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -89,6 +89,7 @@ import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_LENS, REVIEW_EFFECTS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
 import { parallelSeatsEnabled, seatsByTouchSetEnabled, resolveCardOnlyReviewSettings } from '../lib/review-seat-settings.mjs';
+import { classifyFromGit, resolveUiFastLaneSettings } from '../lib/review-ui-fast-lane.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
 import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
@@ -435,7 +436,31 @@ export const TOUCH_SET_FILE_CAP = 100;
  * @param {{enabled?: boolean, store?: {read: Function}, readChangedFiles?: (o: {pr: number, repo: string}) => string[]}} [o]
  * @returns {{securitySeat: boolean, reason: string}}
  */
-export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value } = {}) {
+export function chooseSecuritySeat(argv, { uiFastLane = defaultUiFastLane, ...options } = {}) {
+  const result = chooseSecuritySeatResult(argv, options);
+  const pr = Number(argvFlag(argv, 'pr'));
+  if (!argvFlag(argv, 'resume') && Number.isInteger(pr) && pr > 0) {
+    let shadow;
+    try { shadow = uiFastLane({ pr, repo: argvFlag(argv, 'repo') }); }
+    catch { shadow = { verdict: 'full-panel', reason: 'reader-failed' }; }
+    const reason = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(shadow?.reason ?? '') ? shadow.reason : 'invalid-evidence';
+    console.error(`ui-fast-lane ${shadow?.verdict === 'ui-fast-lane' && reason !== 'invalid-evidence' ? 'would-apply' : 'full-panel'}: ${reason}`);
+  }
+  return result;
+}
+
+function defaultUiFastLane({ repo, pr }) {
+  const settings = resolveUiFastLaneSettings().value;
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) return { verdict: 'full-panel', reason: 'repo-not-listed' };
+  const cwd = process.env.WE_UI_FAST_LANE_REPO_DIR || resolve(SCAFFOLD_ROOT, '..', repo.split('/')[1]);
+  if (!existsSync(join(cwd, '.git'))) return { verdict: 'full-panel', reason: 'no-local-checkout' };
+  const view = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '-R', repo, '--json', 'baseRefName,baseRefOid,headRefOid'],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+  if (!view.baseRefName || !view.baseRefOid || !view.headRefOid) return { verdict: 'full-panel', reason: 'pr-read-failed' };
+  return classifyFromGit({ cwd, repo, settings, base: view.baseRefName, head: `refs/pull/${pr}/head`, expectedBase: view.baseRefOid, expectedHead: view.headRefOid });
+}
+
+function chooseSecuritySeatResult(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles, cardOnly = resolveCardOnlyReviewSettings().value } = {}) {
   const resumeId = argvFlag(argv, 'resume');
   if (resumeId) {
     try { const saved = store?.read(resumeId); return { securitySeat: securitySeatFromRun(saved), cardOnlyLight: saved?.findings?.read?.cardOnlyLight === true, reason: `--resume ${resumeId}: roster read off the saved run` }; } catch {

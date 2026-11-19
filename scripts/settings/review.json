@@ -29,6 +29,16 @@
       ]
     }
   },
+  "uiFastLane": {
+    "enabled": false,
+    "seats": 1,
+    "redTeam": false,
+    "nitpicksBlock": false,
+    "maxFiles": 60,
+    "paths": {
+      "plateauapp/plateau-app": ["src/styles/**", "src/backlog-view/**", "src/platform-manager/**", "src/design-review/**", "src/feature-tracker/**", "src/main.ts"]
+    }
+  },
   "reviewChurn": {
     "sameTree": "shadow",
     "capMode": "shadow",
