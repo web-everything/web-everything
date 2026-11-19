@@ -5,8 +5,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { countOpenPrsForRepo, decideOpenPr, isBranchAllowedLive, isGlobalOffLive } from './pr-limit.mjs';
-import { repoKeyForSlug } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { checkCanonicalAuditForOpen } from '../operations/canonical-audit-gate.mjs';
 
 export const MAX_QUEUE_ENTRIES = 1000;
 const MAX_QUEUE_BYTES = 16 * 1024 * 1024;
@@ -84,7 +85,7 @@ function createQueuedPr(entry) {
 /** All IO ports are synchronous, like pr-land/reconcile. Lock covers create to serialize competing drains.
  * At most ten entries per invocation; unknown count/head/PR evidence retains the entry for a later tick. */
 export function drainPrLimitQueue({ repoKey, open = countOpenPrsForRepo, create = createQueuedPr,
-  head = remoteHead, hasPr = existingPr, path = resolveQueuePath(), dryRun = false,
+  head = remoteHead, hasPr = existingPr, audit = checkCanonicalAuditForOpen, path = resolveQueuePath(), dryRun = false,
   env = process.env, branchAllowed = isBranchAllowedLive, globalOff = isGlobalOffLive } = {}) {
   if (dryRun) return { pending: readQueue(path), opened: [], dropped: [] };
   if (!readQueue(path).length) return { opened: [], dropped: [], errors: [] };
@@ -101,7 +102,18 @@ export function drainPrLimitQueue({ repoKey, open = countOpenPrsForRepo, create 
           branch: entry.ref, branchAllowed: branchAllowed(entry.ref), globalOff: globalOff({ env }) });
         if (countsForRepo.count == null || !decision.allowed) continue;
         if (head(entry) !== entry.sha || hasPr(entry)) dropped.push(entry);
-        else { create(entry); opened.push(entry); countsForRepo.count++; }
+        else {
+          const repo = CONSTELLATION_REPOS[key].path.replace('$HOME', env.HOME || homedir())
+            || resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+          const verdict = audit({ repo, ref: entry.ref, sha: entry.sha });
+          if (verdict?.ok !== true) {
+            entry.blockedReason = verdict?.reason || 'canonical-audit-unconfirmed';
+            writeQueue(path, entries);
+            errors.push({ ref: entry.ref, detail: entry.blockedReason });
+            continue;
+          }
+          create(entry); opened.push(entry); countsForRepo.count++;
+        }
         entries = entries.filter(e => e !== entry);
         writeQueue(path, entries); // persist every completed effect, even if the next entry fails
       } catch (e) { blocked.add(key); errors.push({ ref: entry.ref, detail: String(e.message || e) }); }

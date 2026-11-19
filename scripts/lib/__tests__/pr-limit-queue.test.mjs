@@ -10,7 +10,7 @@ function fixture(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-limit-queue-'));
   const path = join(dir, 'queue.json');
   const create = vi.fn();
-  const ports = { path, create, head: e => e.sha, hasPr: () => false,
+  const ports = { path, create, head: e => e.sha, hasPr: () => false, audit: () => ({ ok: true }),
     open: () => ({ count: 0, limit: 1 }), branchAllowed: () => false, globalOff: () => false };
   try { fn({ path, ports, create }); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -45,10 +45,26 @@ describe('pr-limit queue', () => {
   }));
   it('retains unreadable remote evidence and create failures for the next drain', () => fixture(({ path, ports }) => {
     enqueue(entry('wait'), { path });
-    for (const port of ['head', 'hasPr', 'create']) {
+    for (const port of ['head', 'hasPr', 'audit', 'create']) {
       expect(drainPrLimitQueue({ ...ports, [port]: () => { throw new Error('unavailable'); } }).errors).toHaveLength(1);
       expect(readQueue(path)).toHaveLength(1);
     }
+  }));
+  it.each([
+    { ok: false, reason: 'canonical-audit-weakened' },
+    { ok: false, reason: 'waiver-revoked' },
+    { ok: false, reason: 'canonical-audit-missing' },
+    undefined,
+  ])('retains an unchanged queued SHA when its current audit is not ok: %j', verdict => fixture(({ path, ports, create }) => {
+    const queued = entry('audit-blocked');
+    enqueue(queued, { path });
+    const audit = vi.fn(() => verdict);
+    const result = drainPrLimitQueue({ ...ports, audit });
+    expect(audit).toHaveBeenCalledWith({ repo: expect.any(String), ref: queued.ref, sha: queued.sha });
+    expect(create).not.toHaveBeenCalled();
+    expect(result.opened).toEqual([]);
+    expect(readQueue(path)).toMatchObject([{ ...queued, blockedReason: verdict?.reason || 'canonical-audit-unconfirmed' }]);
+    expect(drainPrLimitQueue(ports).opened).toHaveLength(1);
   }));
   it('dry-run performs no remote reads or writes, including an absent store', () => fixture(({ path, ports }) => {
     const open = vi.fn();

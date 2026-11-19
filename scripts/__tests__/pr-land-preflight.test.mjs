@@ -7,7 +7,8 @@ import { pathToFileURL } from 'node:url';
 
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
-function run({ check = true, fail = false, override = '', count = 15, exempt = false } = {}) {
+function run({ check = true, fail = false, override = '', count = 15, exempt = false,
+  body = 'Description', earlyPr = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const queue = join(dir, 'queue.json');
@@ -24,7 +25,9 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       export const isBranchAllowedLive = () => ${override === 'branchAllowed'};
       export const isGlobalOffLive = () => ${override === 'globalOff'};`,
     './lib/forge-land-provider.mjs': `${record}
-      export const createGhLandProvider = () => ({ listOpenByHead: () => [],
+      let lookups = 0;
+      export const createGhLandProvider = () => ({ listOpenByHead: () => {
+        effect(['pr-lookup']); return ++lookups === 1 && ${earlyPr} ? [{ number: 7 }] : []; },
         create: p => { effect(['create', p]); return 'https://example.test/pull/7'; },
         viewPr: () => ({ labels: [], comments: [], body: 'Description' }),
         ensureLabel: () => {}, addLabel: () => {}, removeLabel: () => {} });`,
@@ -59,7 +62,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
-      '--ref=lane/preflight', '--title=fix: admission', '--body=Description', '--no-wait', '--json',
+      '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
     { cwd: dir, env: { ...process.env, WE_PR_LIMIT_QUEUE_FILE: queue, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
@@ -71,6 +74,14 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
 }
 
 describe('pr-land pre-push checkpoint', () => {
+  it.each([false, true])('refuses an empty create body when the early PR exists=%s and no PR exists at create', earlyPr => {
+    const { status, result, effects, queue } = run({ check: false, count: 0, body: '', earlyPr });
+    expect(status).toBe(3);
+    expect(result.reason).toBe('empty-body');
+    expect(effects.filter(([cmd]) => cmd === 'pr-lookup')).toHaveLength(earlyPr ? 2 : 1);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(false);
+    expect(queue).toEqual([]);
+  });
   it.each([true, false])('reports verify and soak blockers together with hints, check=%s', check => {
     const { status, result, effects, queue } = run({ check, fail: true });
     expect(status).toBe(3);

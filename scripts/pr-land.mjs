@@ -1153,6 +1153,8 @@ async function runCli() {
   }
 
   if (prNum == null) {
+    const bodyGuard = prCreateBodyGuard(BODY);
+    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: bodyGuard.code, detail: bodyGuard.reason }, 3);
     // we:xniq7xs — the open-PR backpressure limit. Too many open PRs is usually a REVIEW-SYSTEM problem
     // (the drain/review pipeline can't keep up), not a build problem, so a NEW PR over the per-repo cap is
     // refused HERE, AFTER the ref is already pushed (step 2 above) — the branch stays pushed; only the
