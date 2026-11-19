@@ -2200,6 +2200,7 @@
   "scripts/conveyor/soak/breaks/recovered-ci-auto-answer-boundaries.soak.test.mjs": 2.02,
   "scripts/conveyor/soak/breaks/recovery-apply-unbounded-hits-pass-deadline.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/recycled-pid-bg-spare-fix-claim.soak.test.mjs": 74.9,
+  "scripts/conveyor/soak/breaks/red-team-bare-flag-mode-mismatch.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-clear-reverted-by-unfinished-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-dead-owner-behind-pending-confirm.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-dead-owner-never-redispatched.soak.test.mjs": 4.35,
