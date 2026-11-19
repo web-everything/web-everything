@@ -49,7 +49,8 @@ export default {
       appendOverlayEvent(scratch, { kind: 'added', ref, at: '2026-11-14T10:00:00Z' }, { env });
       const expectedEntry = readOverlays(scratch, { env }).find((entry) => entry.ref === ref);
       const removal = await retireRegistration({ root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
-        deps: { prove: () => ({ action: 'retire', tip: sha, reason }), tip: () => sha } });
+        deps: { resolveOperatorIdentity: () => ({ login: actor, type: 'User' }),
+          prove: () => ({ action: 'retire', tip: sha, reason }), tip: () => sha } });
       const events = readOverlayEventLog(scratch, env);
       const removed = events.at(-1);
       if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true) {

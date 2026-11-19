@@ -1,0 +1,160 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { withdrawUnregisteredOverlay, main, replaceRegistration } from '../daemon-overlay.mjs';
+import { addOverlay, appendOverlayEvent, overlayFilePath } from '../lib/daemon-overlays.mjs';
+import { overlayRetiredByOperator } from '../lib/daemon-rebuild/adopt.mjs';
+import { REBUILD_IDENTITY_ENV } from '../lib/daemon-rebuild/shared.mjs';
+
+const roots = [];
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true }));
+});
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-withdraw-'));
+  roots.push(root);
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'store'), ...REBUILD_IDENTITY_ENV };
+  const git = (...args) => {
+    const r = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: root, env, encoding: 'utf8', timeout: 5000 });
+    if (r.status !== 0) throw new Error(r.stderr);
+    return r.stdout.trim();
+  };
+  git('init', '-q', '-b', 'main');
+  git('commit', '--allow-empty', '-qm', 'base');
+  git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+  git('checkout', '-qb', 'lane/withdraw');
+  writeFileSync(join(root, 'overlay'), 'overlay');
+  git('add', 'overlay');
+  git('commit', '-qm', 'overlay');
+  const tip = git('rev-parse', 'HEAD');
+  git('checkout', '-q', 'main');
+  git('merge', '--no-ff', '-m', 'daemon-rebuild: merge overlay lane/withdraw onto main', 'lane/withdraw');
+  const args = { root, ref: 'lane/withdraw', tip, actor: 'CHALBERT', reason: 'operator withdrawal', env,
+    deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'User' }) } };
+  const events = () => { try { return readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); } catch { return []; } };
+  return { root, env, git, args, tip, events };
+}
+
+describe('operator withdrawal of an unregistered live overlay', () => {
+  it('refuses a registered ref without writing events', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+    const before = f.events();
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/registered/);
+    expect(f.events()).toEqual(before);
+  });
+  it.each([
+    ['wrong tip', { tip: 'a'.repeat(40) }, /live.*tip/],
+    ['malformed tip', { tip: 'abc' }, /40-hex/],
+    ['tip with trailing newline', { tip: 'a'.repeat(40) + '\n' }, /40-hex/],
+    ['missing reason', { reason: ' ' }, /reason/],
+    ['missing actor', { actor: undefined }, /actor/],
+    ['non-operator', { actor: 'outsider', deps: { resolveOperatorIdentity: () => ({ login: 'outsider', type: 'User' }) } }, /registered operator/],
+    ['bot', { deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'Bot' }) } }, /human/],
+    ['actor mismatch', { actor: 'outsider' }, /does not match/],
+    ['unreadable identity', { deps: { resolveOperatorIdentity: () => { throw new Error('identity unreadable'); } } }, /unreadable/],
+  ])('refuses %s without writing anything', async (_name, override, message) => {
+    const f = fixture();
+    await expect(withdrawUnregisteredOverlay({ ...f.args, ...override })).rejects.toThrow(message);
+    expect(f.events()).toEqual([]);
+  });
+  it('refuses unreadable live history without writing anything', async () => {
+    const f = fixture();
+    f.git('update-ref', '-d', 'refs/remotes/origin/main');
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/live/);
+    expect(f.events()).toEqual([]);
+  });
+  it('refuses corrupt registration evidence without writing an event', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
+    writeFileSync(overlayFilePath(f.root, f.env), '{broken');
+    const before = f.events();
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/store is corrupt/);
+    expect(f.events()).toEqual(before);
+  });
+  it('refuses oversized history with an operator fallback and bounded subprocess IO', async () => {
+    const f = fixture();
+    const run = (_cmd, args, opts) => {
+      expect(opts).toMatchObject({ timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
+      return args[0] === 'merge-base' ? { status: 0, stdout: 'a'.repeat(40) }
+        : { status: null, error: new Error('ENOBUFS'), stdout: 'partial' };
+    };
+    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(/oversized; inspect.*retrying/);
+    expect(f.events()).toEqual([]);
+  });
+  it('refuses a merge for another ref and an unauthored merge message', async () => {
+    const f = fixture();
+    await expect(withdrawUnregisteredOverlay({ ...f.args, ref: 'lane/other' })).rejects.toThrow(/live applied tip/);
+    const run = (cmd, args, opts) => spawnSync(cmd, args, { ...opts, env: { ...opts.env, GIT_COMMITTER_EMAIL: 'outsider@example.test' } });
+    const amended = run('git', ['-c', 'commit.gpgsign=false', 'commit', '--amend', '--no-edit'], { cwd: f.root, env: f.env, encoding: 'utf8', timeout: 5000 });
+    expect(amended.status).toBe(0);
+    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/live applied tip/);
+    expect(f.events()).toEqual([]);
+  });
+  it('accepts the exact live tip and repairs actorless retirement history for adoption', async () => {
+    const f = fixture();
+    for (const event of [
+      { kind: 'added', at: '2020-01-01T00:00:00Z' },
+      { kind: 'auto-retired', tip: f.tip, reason: 'old withdrawal', at: '2020-01-02T00:00:00Z' },
+    ]) appendOverlayEvent(f.root, { ref: f.args.ref, ...event }, { env: f.env });
+    expect(overlayRetiredByOperator({ ref: f.args.ref, sha: f.tip, registered: () => false, events: f.events() })).toBe(false);
+    expect(await withdrawUnregisteredOverlay(f.args)).toMatchObject({ retired: true });
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, tip: f.tip, actor: 'chalbert', operatorReason: true, reason: f.args.reason });
+    expect(overlayRetiredByOperator({ ref: f.args.ref, sha: f.tip, registered: () => false, events: f.events() })).toBe(true);
+  });
+  describe.each(['remove', 'retire'])('ordinary %s CLI', cmd => {
+    async function run(f, actor, identity) {
+      vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.env.WE_DAEMON_OVERLAY_DIR);
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      return main([cmd, `--clone=${f.root}`, `--ref=${f.args.ref}`, '--json',
+        `--reason=${f.args.reason}`, ...(cmd === 'retire' ? [`--expected-tip=${f.tip}`] : []),
+        ...(actor === undefined ? [] : [`--actor=${actor}`])], {
+        pruneStaleOverlayRecords: () => {}, resolveOperatorIdentity: identity,
+        tip: () => f.tip, prove: () => ({ action: 'retire', reason: 'in-main', tip: f.tip }),
+      });
+    }
+    it('records the authenticated lowercase actor only with explicit --actor', async () => {
+      const f = fixture();
+      addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+      const identity = vi.fn(() => ({ login: 'CHALBERT', type: 'User' }));
+      await run(f, 'CHALBERT', identity);
+      expect(identity).toHaveBeenCalledTimes(1);
+      expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired', actor: 'chalbert' });
+      if (cmd === 'remove') expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
+      else expect(f.events().at(-1)).toHaveProperty('operatorReason', true);
+    });
+    it('without --actor removes without resolving identity or supplying operator proof', async () => {
+      const f = fixture();
+      addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+      const identity = vi.fn(() => { throw new Error('must not resolve absent actor'); });
+      await run(f, undefined, identity);
+      expect(identity).not.toHaveBeenCalled();
+      expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired' });
+      expect(f.events().at(-1)).not.toHaveProperty('actor');
+      expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
+    });
+    it('refuses a non-operator --actor before removing or writing an event', async () => {
+      const f = fixture();
+      addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+      const before = readFileSync(overlayFilePath(f.root, f.env), 'utf8');
+      const events = f.events();
+      await expect(run(f, 'outsider', () => ({ login: 'outsider', type: 'User' }))).rejects.toThrow(/registered operator/);
+      expect(readFileSync(overlayFilePath(f.root, f.env), 'utf8')).toBe(before);
+      expect(f.events()).toEqual(events);
+    });
+  });
+  it('records authenticated attribution for replace', async () => {
+    const f = fixture();
+    addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+    const result = await replaceRegistration({ ...f.args, actor: undefined, old: f.args.ref, ref: 'lane/new', expectedSha: f.tip,
+      deps: { ...f.args.deps, tip: () => f.tip,
+        contain: () => ({ ok: true, contained: true, oldTip: f.tip, newTip: f.tip }),
+        check: () => ({ ok: true, clean: true, candSha: f.tip }) } });
+    expect(result).toMatchObject({ ok: true, replaced: true });
+    expect(f.events().at(-1)).toMatchObject({ kind: 'replaced', actor: 'chalbert' });
+  });
+});

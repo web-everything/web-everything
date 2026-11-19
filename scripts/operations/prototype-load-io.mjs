@@ -436,7 +436,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           return stop('bad-input', { detail: '--remove requires --reason and no add/replace/retire' });
         stage = 'remove-refused';
         let actor;
-        if (input.actor) {
+        if (input.actor !== undefined) {
           try { actor = assertHumanOperator(await operatorIdentity({ env }), input.actor); }
           catch (error) {
             return stop('operator-identity-refused', { detail: String(error.message || error),
