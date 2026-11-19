@@ -81,7 +81,7 @@ export function existingTrackedPaths(paths, lstat = path => lstatSync(resolve(ro
 }
 
 export function readTracked(path, lstat = lstatSync, indexMode = path => {
-  const records = execFileSync('git', ['ls-files', '-s', '-z', '--', path], { cwd: root, encoding: 'utf8' })
+  const records = execFileSync('git', ['ls-files', '-s', '-z', '--', path], { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024 })
     .split('\0');
   for (const record of records) {
     const match = record.match(/^(\d{6}) [0-9a-f]+ [0-3]\t([\s\S]*)$/);
