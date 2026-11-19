@@ -1932,7 +1932,7 @@ describe('prototype-load', () => {
     expect(calls).toEqual([
       ['add', clone, '--ref=lane/new', '--check', `--expected-sha=${SHA}`, '--json'],
       ['list', clone, '--json'],
-      ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--reason=tested change', '--by=tester', '--json'],
+      ['add', clone, '--ref=lane/new', `--expected-sha=${SHA}`, '--refuse-supersede', '--reason=tested change', '--by=tester', '--json'],
     ]);
     const addIndex = f.calls.findIndex((c) => c.cmd === 'node' && c.args.includes('--by=tester'));
     expect(f.calls.slice(addIndex - 2, addIndex).map((c) => c.args)).toEqual([
@@ -1944,6 +1944,75 @@ describe('prototype-load', () => {
   });
   // R310 (incident 2026-11-01): a superseded registration and old tops froze two daemons for hours.
   describe('auto-retire and replace (R310)', () => {
+    it('round 3: superseded refs obey retirement refusals before registration', async () => {
+      const superseded = [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }];
+      const check = { ok: true, clean: true, candSha: SHA, superseded };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], conflicts: ['lane/old'], retireRefuses: 'lane/old',
+        checkRaw: JSON.stringify({ check, wouldRegister: true }), addRaw: JSON.stringify({ conflictCheck: check }),
+        retirePlan: ({ rows }) => rows.map(row => ({ ref: row.ref, action: 'retire', tip: TREE, reason: 'superseded' })) });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'retire-refused' });
+      expect(mutations(f, 'retire')).toHaveLength(1);
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(f.retirePlanner).toHaveBeenCalled();
+      expect(f.calls.some(c => c.args.includes('--ref=lane/old') && c.args.includes('--check'))).toBe(false);
+    });
+
+    it('round 3: superseded refs obey the shared mutable-registration refusal before add', async () => {
+      const check = { ok: true, clean: true, candSha: SHA,
+        superseded: [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }] };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'],
+        checkRaw: JSON.stringify({ check, wouldRegister: true }), addRaw: JSON.stringify({ conflictCheck: check }) });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', detail: 'mutable-registration',
+        staleChecks: { 'lane/old': { skipped: 'contained' } } });
+      expect(f.retirePlanner).toHaveBeenCalled();
+      expect(mutations(f, 'add')).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual(['lane/old']);
+    });
+
+    it('round 3: superseded refs with unreadable current evidence still block in stale checks', async () => {
+      const check = { ok: true, clean: true, candSha: SHA,
+        superseded: [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }] };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], staleFetchFails: 'lane/old', staleRemoteCode: 2,
+        checkRaw: JSON.stringify({ check, wouldRegister: true }) });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'check-unverifiable', detail: 'could not fetch registered ref lane/old' });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect([...f.registrations.keys()]).toEqual(['lane/old']);
+    });
+
+    it('round 3: live loader mutations refuse any supersession discovered after preview', async () => {
+      const add = fixture();
+      expect((await add.run()).ok).toBe(true);
+      expect(mutations(add, 'add')[0].args).toContain('--refuse-supersede');
+      const replace = fixture({ list: ['lane/old'], contained: ['lane/old'] });
+      expect((await replace.run({ replace: 'lane/old' })).ok).toBe(true);
+      expect(mutations(replace, 'replace')[0].args).toContain('--refuse-supersede');
+    });
+
+    it('R1048 retains a mutable ancestor before the fresh add guard can remove it', async () => {
+      const check = { ok: true, clean: true, candSha: SHA,
+        superseded: [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }] };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], checkRaw: JSON.stringify({ check, wouldRegister: true }) });
+      expect(await f.run()).toMatchObject({ ok: false, adopted: false, stopReason: 'swap-remove-failed' });
+      expect(mutations(f, 'add')).toEqual([]);
+      expect(mutations(f, 'remove')).toEqual([]);
+    });
+
+    it('R1048 does not count an explicit replacement target as an uncompleted automatic supersession', async () => {
+      const check = { ok: true, clean: true, candSha: SHA,
+        superseded: [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }] };
+      const f = fixture({ list: ['lane/old'], contained: ['lane/old'], checkRaw: JSON.stringify({ check, wouldRegister: true }) });
+      expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: true, adopted: true, replaced: 'lane/old', stopReason: null });
+    });
+
+    it('R1048 retains mutable ancestors when the candidate is already registered', async () => {
+      const superseded = [{ entry: { ref: 'lane/old' }, oldTip: 'd'.repeat(39) + '0', newTip: SHA }];
+      const check = { ok: true, clean: true, candSha: SHA, superseded };
+      const f = fixture({ list: ['lane/old', BASE.branch], contained: ['lane/old'],
+        checkRaw: JSON.stringify({ check, wouldRegister: true }), addRaw: JSON.stringify({ conflictCheck: check }) });
+      expect(await f.run()).toMatchObject({ ok: false, stopReason: 'swap-remove-failed', detail: 'mutable-registration' });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    });
+
     const retireOld = (extra = {}) => ({ retirePlan: ({ rows }) => rows.map((row) => (row.ref === 'lane/old'
       ? { ref: 'lane/old', action: 'retire', reason: 'superseded', tip: TREE, pr: 6056, evidence: { supersededBy: 6132 }, ...extra }
       : { ref: row.ref, action: 'keep', reason: 'unique-commits-not-on-main' })) });

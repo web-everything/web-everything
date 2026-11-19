@@ -45,7 +45,7 @@
  *
  * USAGE:
  *   node scripts/daemon-overlay.mjs add    --clone=<path> --ref=<branch> [--pr=N] [--pinned|--unpinned] [--reason=..] [--by=..] [--json]
- *                                          [--check] [--expected-sha=<40-hex>]
+ *                                          [--check] [--expected-sha=<40-hex>] [--refuse-supersede]
  *                                          [--allow-conflict --reason=.. --operator-instruction="<quote>"]  (operator's gh credential)
  *                                          [--allow-no-pr --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
@@ -79,6 +79,7 @@
  * THE NO-PR WARNING (xkhtg2a, incident 2026-10-08 — overlays without review or a merge link).
  * Adding without --pr warns loudly; overlaySafety.noPr=refuse (or WE_OVERLAY_NO_PR=refuse) refuses with exit 3
  * before the conflict guard or its lock. Override with --allow-no-pr --reason=<why>; --check warns too.
+ * `--refuse-supersede` retains mutable peers when a loader has not authorized their removal.
  * `--expected-sha` refuses (exit 3) a different fetched candidate under the add lock, before registration.
  *
  * THE OVERLAY-CONFLICT GUARD (epic #3383/#4075, live incident 2026-09-27: `lane/promote-stale-green`/#2826 was
@@ -232,6 +233,14 @@ export function remoteTip({ root, ref, env = process.env, run = spawnSync }) {
   if (ls?.status !== 0) return undefined;
   const match = new RegExp(`^([0-9a-f]{40})\\s+refs/heads/${ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm').exec(String(ls.stdout ?? ''));
   return match ? match[1] : null;
+}
+
+/** A stale preview cannot authorize replacing a moving registration. Unknown tips refuse the add. */
+export function supersessionTipsCurrent({ root, ref, check, env, tip = remoteTip }) {
+  if (!check.superseded?.length) return true;
+  return tip({ root, ref, env }) === check.candSha
+    && check.superseded.every(({ entry, oldTip, newTip }) => newTip === check.candSha
+      && tip({ root, ref: entry.ref, env }) === oldTip);
 }
 
 /** Run `fn(git, scratch)` in a scratch bare repo that borrows root's objects and fetches `refspecs` from root's origin. */
@@ -407,6 +416,22 @@ export async function settlePendingDrops({ root, env = process.env, by = null, d
   return settled;
 }
 
+/** Keep automatic supersession on the same durable recovery path as explicit replacement. */
+export async function registerSuperseding({ root, ref, check, env = process.env, by = null, register,
+  tip = ({ ref: branch }) => remoteTip({ root, ref: branch, env }),
+}) {
+  if (!supersessionTipsCurrent({ root, ref, check, env, tip })) return { ok: false, reason: 'supersession-tip-moved' };
+  const proofs = check.superseded || [];
+  for (const { entry, oldTip, newTip } of proofs) addPending(root, env, {
+    kind: 'replace', ref: entry.ref, entry, tip: oldTip, newRef: ref, newTip, at: new Date().toISOString(),
+  });
+  const list = register();
+  const settled = proofs.length ? await settlePendingDrops({ root, env, by, deps: { tip: branch => tip({ root, ref: branch, env }) } }) : [];
+  return settled.some(s => s.outcome !== 'drop-confirmed')
+    ? { ok: false, registered: true, reason: 'supersession-raced-restored', settled }
+    : { ok: true, registered: true, list };
+}
+
 /** Register-only removal requires a concrete pre-read snapshot. An absent ref never reaches the
  * mutation helper, so a registration arriving after that snapshot cannot be removed unguarded. */
 export function removeRegistration({ root, ref, by = null, reason = null, env = process.env, deps = {} }) {
@@ -485,7 +510,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
  * otherwise `old` is restored (`replace-raced-restored`). Same lock and drop intent as retire.
  * `deps` ({contain, check, tip, afterDrop}) is a test seam.
  */
-export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, deps = {} }) {
+export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, refuseSupersede = false, deps = {} }) {
   const contain = deps.contain ?? (() => proveReplaceContainment({ root, oldRef: old, newRef: ref, expectedSha, env }));
   const conflictCheck = deps.check ?? ((existingOverlays) => stackAwareOverlayCheck({ root, ref, pr, existingOverlays, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
@@ -504,6 +529,7 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!check.ok) return { ok: false, refused: check.reason, containment, check, code: 1 };
     if (check.candSha !== expectedSha) return { ok: false, refused: 'sha-moved', containment, check, code: 3 };
     if (!check.clean) return { ok: false, refused: 'conflict', containment, check, code: 3 };
+    if (refuseSupersede && check.superseded?.length) return { ok: false, refused: 'mutable-registration', containment, check, code: 3 };
     return { ok: true, oldEntry, containment, check };
   };
   if (checkOnly) return prove();
@@ -513,7 +539,11 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!proof.ok) return { ...proof, settled };
     // The replacement carries the old work, so it inherits an explicit pin unless the caller set one itself.
     const pin = pinned !== undefined ? pinned : (proof.oldEntry.pinned === true ? true : undefined);
-    addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin }, { env });
+    const registration = await registerSuperseding({ root, ref, check: proof.check, env, by,
+      tip: ({ ref: branch }) => tip(branch),
+      register: () => addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin }, { env, superseded: proof.check.superseded, supersessionTip: ({ ref: branch }) => tip(branch) }),
+    });
+    if (!registration.ok) return { ok: false, registered: !!registration.registered, refused: registration.reason, code: 3 };
     appendOverlayEvent(root, {
       kind: 'added', ref, pr, by, reason, replaces: old, ...(pin !== undefined ? { pinned: pin } : {}), ...(pr == null ? { noPr: true } : {}),
     }, { env });
@@ -803,6 +833,10 @@ async function main() {
       if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
         return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };
       }
+      if (!flags.check && flags['refuse-supersede'] && check.superseded?.length) {
+        return { ...check, ok: false, reason: 'mutable-registration',
+          fallback: 'Retain the registrations until their changes land on main and normal retirement can remove them.' };
+      }
       return check;
     };
 
@@ -855,7 +889,7 @@ async function main() {
         // is safe to override; it does not cover "the check itself could not run".
         process.stderr.write(`daemon-overlay: could not verify ${flags.ref} merges clean (${describeFailure(check)}) — refusing to register. Pass --allow-conflict --reason=... only for a CONFIRMED conflict this guard itself reported.\n`);
         if (asJson) process.stdout.write(`${JSON.stringify({ conflictCheck: check })}\n`);
-        process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
+        process.exitCode = ['sha-moved', 'mutable-registration'].includes(check.reason) ? 3 : 1;
         return null;
       }
       if (!check.clean) {
@@ -878,10 +912,19 @@ async function main() {
       // Register-only: `addOverlay` (Module B) does its own atomic read-modify-write under the list's own tiny
       // mutex and returns immediately — this never touches the clone's tree or its reader/writer lock. See the
       // file header for why that lock was dropped here.
-      const list = addOverlay(root, {
-        ref: flags.ref, pr, addedBy: by, reason, pinned,
-        ...(!check.clean && gate.override ? { conflictOverride: { ...gate.override, files: check.files } } : {}),
-      }, { env });
+      const registration = await registerSuperseding({ root, ref: flags.ref, check, env, by,
+        register: () => addOverlay(root, {
+          ref: flags.ref, pr, addedBy: by, reason, pinned,
+          ...(!check.clean && gate.override ? { conflictOverride: { ...gate.override, files: check.files } } : {}),
+        }, { env, superseded: check.superseded, supersessionTip: remoteTip }),
+      });
+      if (!registration.ok) {
+        if (asJson) process.stdout.write(`${JSON.stringify({ refused: registration.reason, conflictCheck: check })}\n`);
+        process.stderr.write('daemon-overlay: supersession tips changed or unreadable; retain registrations and retry admission.\n');
+        process.exitCode = 3;
+        return null;
+      }
+      const list = registration.list;
       appendOverlayEvent(root, {
         kind: 'added', ref: flags.ref, pr, by, reason, ...(pinned !== undefined ? { pinned } : {}),
         ...(pr == null ? { noPr: true } : {}),
@@ -923,7 +966,7 @@ async function main() {
       }
     }
     const r = await replaceRegistration({
-      root, ref: flags.ref, old, expectedSha: flags['expected-sha'], pr, by, reason, pinned, env, checkOnly: !!flags.check,
+      root, ref: flags.ref, old, expectedSha: flags['expected-sha'], pr, by, reason, pinned, env, checkOnly: !!flags.check, refuseSupersede: !!flags['refuse-supersede'],
     });
     if (r.code) process.exitCode = r.code;
     if (!asJson && !r.ok) {

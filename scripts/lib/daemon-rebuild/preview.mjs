@@ -12,7 +12,7 @@ import { join, isAbsolute, resolve as resolvePath, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fetchMainAndOverlays, defaultPrState } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, supersededOverlays } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { isSafeBranchName } from '../daemon-self-sync.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
@@ -211,6 +211,7 @@ export async function previewOverlayConflict({
   root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = gitRun,
 } = {}) {
   if (!isSafeBranchName(ref)) return { ok: false, reason: 'unsafe-ref' };
+  const candidateRegistered = existingOverlays.some(o => o.ref === ref);
   // Re-registration must compare the candidate against the other overlays. Including it here can
   // let its established priority drop a peer before even reaching the candidate conflict check.
   existingOverlays = existingOverlays.filter((o) => o.ref !== ref);
@@ -250,6 +251,26 @@ export async function previewOverlayConflict({
     const mainSha = verifyRev(scratchGit, 'origin/main^{commit}');
     if (!mainSha) return { ok: false, reason: 'main-unresolved' };
 
+    const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
+    if (!candSha) return { ok: false, reason: 'ref-unresolved' };
+    // A candidate that is ALREADY registered (a re-registration or an unaudited advance) can be held at its earlier
+    // adopted head by planRebuild, which need not contain what it would supersede: never supersede for it.
+    const superseded = candidateRegistered ? []
+      : supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head });
+    // Removing the old identity also removes planRebuild's adopted/graduated-tip
+    // hold. A fresh ref must never launder that unaudited tip via the no-history exemption.
+    // Following tips does not authorize erasing their registration identity.
+    const supersessionAudit = makeAuditedTipGate({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' });
+    for (const { entry, oldTip } of superseded) {
+      if (scratchGit(['merge-base', '--is-ancestor', oldTip, head]).status !== 0
+        && scratchGit(['merge-base', '--is-ancestor', oldTip, mainSha]).status !== 0
+        && supersessionAudit?.(entry.ref, oldTip) !== true) {
+        return { ok: false, reason: 'supersession-unaudited-tip', detail: { ref: entry.ref, tip: oldTip },
+          fallback: 'Retain the registration; audit its exact current tip and retry admission.' };
+      }
+    }
+    existingOverlays = existingOverlays.filter(o => !superseded.some(s => s.entry.ref === o.ref));
+
     // 1. Fold every ALREADY-registered overlay using the running HEAD — the SAME `planRebuild` a real rebuild runs —
     // to compute `cur`, the exact tree the candidate would land on top of (never re-derived by hand here).
     // Main is still the fold's base; HEAD supplies established priority and adopted heads for moving-tip pins.
@@ -279,17 +300,13 @@ export async function previewOverlayConflict({
     if (!planExisting.ok) return { ok: false, reason: 'existing-overlays-unresolved', detail: planExisting, setAside };
     const cur = planExisting.finalSha;
 
-    // 2. The candidate's own tip (already fetched above).
-    const candSha = fetched.goneRefs.includes(ref) ? null : verifyRev(scratchGit, `origin/${ref}^{commit}`);
-    if (!candSha) return { ok: false, reason: 'ref-unresolved' };
-
-    // 3. THE CHECK — deliberately WITH messages (unlike planRebuild's own internal folds), so a real conflict
+    // THE CHECK — deliberately WITH messages (unlike planRebuild's own internal folds), so a real conflict
     // names its file(s) for the refusal/`--allow-conflict` print.
     const mt = scratchGit(['merge-tree', '--write-tree', cur, candSha]);
-    if (mt.status === 0) return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+    if (mt.status === 0) return { ok: true, clean: true, mainSha, cur, candSha, setAside, superseded };
     if (mt.status === 1 && env[OVERLAY_EDGE_RESOLVE_ENV] !== '0'
       && resolveOverlayConflict({ git: scratchGit, cur, ovSha: candSha, ref }).ok) {
-      return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+      return { ok: true, clean: true, mainSha, cur, candSha, setAside, superseded };
     }
 
     // A repair can unlock a moving tip's retry even when it conflicts with the stack's pinned head.
@@ -312,7 +329,7 @@ export async function previewOverlayConflict({
           && FULL_SHA_RE.test(o.sha ?? '') && FULL_SHA_RE.test(a.sha ?? '')
           && (a.sha === o.sha || scratchGit(['merge-base', '--is-ancestor', o.sha, a.sha]).status === 0)))
         && planCandidate.establishedLost.length === 0) {
-        return { ok: true, clean: true, mainSha, cur, candSha, setAside };
+        return { ok: true, clean: true, mainSha, cur, candSha, setAside, superseded };
       }
     }
 

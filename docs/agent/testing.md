@@ -4803,3 +4803,33 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+## Prototype overlay containment and shared ledgers (R1048)
+
+Admission replaces a registration only when its verified current tip is a strict ancestor of the
+candidate tip and the candidate contains every recorded adopted/applied/carried head for that same
+ref and PR. Read the running build and remembered builds from the clone's HEAD/reflog, without
+truncating history or excluding graduated heads already in main; a scratch preview has no adoption
+reflog of its own. Force-pushed tips cannot erase these pins. Equal tips, explicit or mechanism pins, edge resolutions, unreadable Git evidence,
+and changed registration identities keep the existing path. The preview refuses supersession unless
+the old tip is already carried by HEAD/main or has exact fix-ready audit evidence, including in follow mode. A fresh ref cannot borrow the no-history exemption
+for an unaudited old tip. The guarded add rechecks remote tips and registration identity under the
+registry write mutex immediately before removal and records `overlay-superseded` with both SHAs.
+Prototype-load includes superseded peers in its ordinary retirement and stale checks, reuses its
+mutable-registration cleanup refusal before guarded add, and passes `--refuse-supersede` on live
+add/replace so peers discovered after preview remain registered too. Land their changes on main
+and use normal retirement before retrying when cleanup is refused.
+Reuse the durable drop intent and post-write tip check: moved or unreadable tips restore the old entry,
+including recovery after an interrupted registration.
+`daemon-overlay-supersede.test.mjs` and the `overlay-containment-ledger-union` soak replay cover this.
+
+The shared advisory resolver only unions ordinary list items and table rows in `docs/agent/testing.md`:
+every base line must survive in order, with common additions deduplicated at each insertion gap.
+Insertions must follow or sit inside an existing contiguous block of the same kind, or append after
+the last nonblank line. Ambiguous indentation, prose, headings, delimiters, HTML, code fences and
+comment tokens require operator resolution. Reject gaps inside or immediately around base fences,
+comments, raw HTML blocks (including their opening and closing lines), or indented code.
+Verify unchanged fence/comment/HTML balance after the union; unclosed blocks require human resolution. Edits,
+deletions, conflict markers, unreadable history and conflicts outside the three shared ledgers keep
+the existing refusal/operator path. The JSON timings and JS registry contracts are unchanged.
+Run the scoped unit files and the soak wrapper through heavy admission, using
+`--config vitest.soak.config.ts` for the soak.

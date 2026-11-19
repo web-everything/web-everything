@@ -158,13 +158,17 @@ function withListLock(root, env, fn) {
       sleepSync(10);
     }
   }
+  const acquired = statSync(lockDir);
   try {
     // Test-only seam: widen the read→write window so a race test can prove the mutex (never set in production).
     const delay = Number(env?.WE_DAEMON_OVERLAYS_TEST_RMW_DELAY_MS);
     const marker = env?.WE_DAEMON_OVERLAYS_TEST_RMW_MARKER;
     return fn(delay > 0 ? () => { if (marker) writeFileSync(marker, String(process.pid)); sleepSync(delay); } : () => {});
   } finally {
-    try { rmdirSync(lockDir); } catch { /* already broken as stale by another process — nothing to release */ }
+    try {
+      const current = statSync(lockDir);
+      if (current.ino === acquired.ino && current.dev === acquired.dev && current.birthtimeMs === acquired.birthtimeMs) rmdirSync(lockDir);
+    } catch { /* already broken as stale by another process — nothing to release */ }
   }
 }
 
@@ -208,9 +212,12 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
  * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
  *   stackBases?:string[]}} entry
- * @param {{env?:NodeJS.ProcessEnv, expectedOverlay?:object}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, expectedOverlay?:object, superseded?:Array<{entry:object,oldTip:string,newTip:string}>, supersessionTip?:Function}} [o]
  * `expectedOverlay`, when supplied, must still match the source registration under the list mutex.
  * Detached repairs use this snapshot to avoid undoing a concurrent unload or update.
+ * `superseded` comes from the admission guard's verified strict-containment proof; callers
+ * supply `supersessionTip` to recheck remote tips under the list mutex immediately before writing.
+ * Missing or changed evidence retains the entries and requires a new admission proof.
  * @returns {Array<object>} the new list
  */
 /**
@@ -256,13 +263,25 @@ export function registrationIdentity(entry) {
 
 export function addOverlay(root, {
   ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
-} = {}, { env = process.env, expectedOverlay } = {}) {
+} = {}, { env = process.env, expectedOverlay, superseded = [], supersessionTip } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   return withListLock(root, env, (pause) => {
-    const list = readOverlaysForWrite(root, env).slice();
+    let list = readOverlaysForWrite(root, env).slice();
+    const snapshot = list.slice();
+    const lockPath = `${overlayFilePath(root, env)}.lock`;
+    const lock = superseded.length ? statSync(lockPath) : null;
+    for (const proof of superseded) {
+      const entry = list.find(o => o?.ref === proof?.entry?.ref);
+      if (!entry || entry.ref === ref || entry.pinned === true || entry.edgeResolution
+        || !/^[a-f0-9]{40}$/.test(proof.oldTip ?? '') || !/^[a-f0-9]{40}$/.test(proof.newTip ?? '')
+        || proof.oldTip === proof.newTip
+        || !isDeepStrictEqual(registrationIdentity(entry), registrationIdentity(proof.entry))) {
+        throw new Error('supersession evidence changed; retain registrations and retry admission');
+      }
+    }
     pause();
     if (expectedOverlay !== undefined && (!expectedOverlay || !isSafeBranchName(expectedOverlay.ref)
       || !isDeepStrictEqual(registrationIdentity(list.find(o => o?.ref === expectedOverlay.ref)), registrationIdentity(expectedOverlay)))) {
@@ -284,7 +303,30 @@ export function addOverlay(root, {
       if (conflictOverride) next.conflictOverride = conflictOverride;
       list[idx] = next;
     }
-    return writeOverlays(root, list, { env });
+    if (superseded.length) {
+      // The preflight and post-write probes cannot guard this deletion. Recheck the
+      // proven remote tips under the same mutex as the registration compare-and-write.
+      if (typeof supersessionTip !== 'function') throw new Error('supersession tip probe unavailable; retain registrations and retry admission');
+      for (const { entry, oldTip, newTip } of superseded) {
+        if (supersessionTip({ root, ref, env }) !== newTip
+          || supersessionTip({ root, ref: entry.ref, env }) !== oldTip) {
+          throw new Error('supersession tips changed or unreadable; retain registrations and retry admission');
+        }
+      }
+      // Re-read after external IO as well. An entry refreshed since proof must survive.
+      const current = readOverlaysForWrite(root, env);
+      const currentLock = statSync(lockPath);
+      if (!isDeepStrictEqual(current, snapshot) || currentLock.ino !== lock.ino || currentLock.dev !== lock.dev
+        || currentLock.birthtimeMs !== lock.birthtimeMs) {
+        throw new Error('supersession evidence or registry lock changed; retain registrations and retry admission');
+      }
+    }
+    list = list.filter(o => !superseded.some(s => s.entry.ref === o.ref));
+    const written = writeOverlays(root, list, { env });
+    for (const { entry, oldTip, newTip } of superseded) appendOverlayEvent(root, {
+      kind: 'overlay-superseded', ref: entry.ref, pr: entry.pr ?? null, replacedBy: ref, oldTip, newTip, by: addedBy,
+    }, { env });
+    return written;
   });
 }
 

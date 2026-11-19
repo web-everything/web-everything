@@ -7,6 +7,7 @@ import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { tipInMain } from './audited-tip.mjs';
 import { createHash } from 'node:crypto';
+import { isSafeBranchName } from '../daemon-self-sync.mjs';
 
 // ── pinned overlays — the self-destruct guard ───────────────────────────────────────────────────────────────
 
@@ -51,6 +52,66 @@ export function pinnedStatus(git, raw, mainSha, ovSha) {
   const diff = git(['diff', '--name-only', base, ovSha, '--', ...REBUILD_MECHANISM_PATHS]);
   if (diff.status !== 0) return { pinned: true, why: 'unknown' };
   return String(diff.stdout ?? '').trim() ? { pinned: true, why: 'mechanism' } : { pinned: false, why: null };
+}
+
+/** R1048: only verified strict ancestors can be replaced without dropping work.
+ * Unknown Git evidence retains the registration for the existing refusal/operator path.
+ * Edge resolutions can carry additional work outside the branch tip, so retain those too.
+ * Read adopted builds from the clone, not the preview's scratch repo (which has no HEAD reflog).
+ * Unlike stack discovery, supersession cannot truncate history or exclude heads already in main:
+ * every recorded adopted/applied head, including third-parent carried work, must be contained.
+ */
+export function supersededOverlays(git, overlays, mainSha, candidateSha, { historyGit = git, headSha } = {}) {
+  let historyLines;
+  try {
+    if (![mainSha, candidateSha].every(sha => FULL_SHA_RE.test(sha ?? '')
+      && verifyRev(git, `${sha}^{commit}`) === sha)) return [];
+    headSha ??= verifyRev(historyGit, 'HEAD^{commit}');
+    if (!FULL_SHA_RE.test(headSha ?? '') || verifyRev(git, `${headSha}^{commit}`) !== headSha) return [];
+    const reflog = historyGit(['reflog', '--format=%H', 'HEAD']);
+    if (reflog.status !== 0) return [];
+    const builds = String(reflog.stdout ?? '').trim().split('\n').filter(Boolean);
+    if (!builds.every(sha => FULL_SHA_RE.test(sha))) return [];
+    const history = historyGit(['log', '--first-parent', '--format=%P%x09%ce%x09%s', ...new Set([headSha, ...builds])]);
+    if (history.status !== 0) return [];
+    historyLines = String(history.stdout ?? '').split('\n').filter(Boolean);
+    if (!historyLines.length || !historyLines.every(line => /^(?:[0-9a-f]{40}(?: [0-9a-f]{40})*)?\t[^\t]+\t.*$/.test(line))) return [];
+  } catch { return []; }
+  return overlays.flatMap(entry => {
+    try {
+      if (!isSafeBranchName(entry?.ref) || entry.pinned === true || entry.edgeResolution) return [];
+      const oldTip = verifyRev(git, `refs/remotes/origin/${entry.ref}^{commit}`);
+      if (!FULL_SHA_RE.test(oldTip ?? '') || oldTip === candidateSha
+        || verifyRev(git, `${oldTip}^{commit}`) !== oldTip
+        || pinnedStatus(git, entry, mainSha, oldTip).pinned
+        || git(['merge-base', '--is-ancestor', oldTip, candidateSha]).status !== 0) return [];
+      const heads = new Set([oldTip]);
+      const prKey = pr => pr == null || pr === '' ? null : Number(pr);
+      for (const line of historyLines) {
+        const [parents, committer, ...subject] = line.split('\t');
+        if (committer !== REBUILD_COMMITTER) continue;
+        const hit = subject.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
+        if (!hit) {
+          if (subject.join('\t').startsWith('daemon-rebuild: merge overlay ')) return [];
+          continue; // Other rebuild commits (e.g. a one-parent hold marker) record no applied head.
+        }
+        if (hit[1] !== entry.ref || prKey(hit[2]) !== prKey(entry.pr)) continue;
+        const ps = parents.split(' ');
+        if (![2, 3].includes(ps.length) || !ps.every(sha => FULL_SHA_RE.test(sha))) return [];
+        for (const sha of ps.slice(1)) heads.add(sha);
+      }
+      // A base applied through a stack top may have no merge record of its own. Keep the
+      // running build's shared carried ancestry as well, just as planRebuild does.
+      const bases = git(['merge-base', '--all', headSha, oldTip]);
+      if (bases.status !== 0) return [];
+      const carried = String(bases.stdout ?? '').trim().split('\n');
+      if (!carried.every(sha => FULL_SHA_RE.test(sha))) return [];
+      for (const sha of carried) heads.add(sha);
+      if (![...heads].every(sha => verifyRev(git, `${sha}^{commit}`) === sha
+        && git(['merge-base', '--is-ancestor', sha, candidateSha]).status === 0)) return [];
+      return [{ entry, oldTip, newTip: candidateSha }];
+    } catch { return []; }
+  });
 }
 
 /** The mechanism files main itself must carry for a build WITHOUT a skipped pinned overlay to still rebuild
