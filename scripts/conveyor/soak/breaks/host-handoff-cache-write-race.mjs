@@ -83,7 +83,7 @@ export default {
         for (const [index, thisHost] of [first, second].entries()) {
           const migration = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: alias + '=' + thisHost }, {
             legacyHost: alias, execFileSync: (_file, args) => JSON.stringify(
-              args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: 'a'.repeat(40) } }
+              args.at(-1).includes('/git/ref/') ? { object: { type: 'commit', sha: 'a'.repeat(40) } }
                 : { type: 'file', encoding: 'base64', content: Buffer.from(contents).toString('base64') }),
           });
           const decision = await migration.resolveRole({ thisHost });
