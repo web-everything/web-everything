@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recoverBuilderDrafts, runBuildDispatchTick, cliRecoverBuilderDrafts } from '../build-dispatch-daemon.mjs';
@@ -213,7 +213,8 @@ describe('abandoned builder draft recovery', () => {
         ? { draft: true, state: 'open', head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
         : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
         : { check_runs: [{ id: 2, name: 'test', conclusion: 'failure', output: { summary: 'red' } }] },
-      paged: () => [], freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(), dispatch,
+      paged: () => [{ annotation_level: 'failure', message: 'AssertionError: grouped build failed' }],
+      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(), dispatch,
       gh: vi.fn(), mergeGateSetting: 'off',
     };
     try {
@@ -227,7 +228,73 @@ describe('abandoned builder draft recovery', () => {
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('wires REST check evidence, same-branch dispatch, durable retries and the needs-human label', async () => {
+  const steps = [
+    { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:09Z' },
+    { conclusion: 'failure', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:19Z' },
+  ];
+  const noDetail = null; // No attributable evidence must report unattributed, never spend a repair attempt.
+  const evidenceCases = [
+    { evidence: 'attributable failed step', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2' },
+    { evidence: 'ANSI-coloured timestamps and FAIL row', metadata: { steps }, expectedError: 'FAIL actual.test.mjs > broken',
+      log: '\x1b[32m2026-09-30T01:00:01Z passing step\x1b[0m\nFAIL fixture.test.mjs > expected\n'
+        + '\x1b[31m2026-09-30T01:00:11Z failed step\x1b[0m\n\x1b[31mFAIL\x1b[0m actual.test.mjs > broken' },
+    { evidence: 'ANSI passing-step timestamp ends failed-step ownership',
+      metadata: { steps: [...steps, { conclusion: 'success', started_at: '2026-09-30T01:00:20Z', completed_at: '2026-09-30T01:00:29Z' }] },
+      expectedError: noDetail,
+      log: '2026-09-30T01:00:11Z failed step\n\x1b[32m2026-09-30T01:00:21Z passing step\x1b[0m\nError: Passing-step error context' },
+    // A whole-job log past Node's 1 MiB default buffer stays readable: the helper's maxBuffer reaches gh.
+    { evidence: 'a whole-job log over the 1 MiB default buffer', metadata: { steps }, expectedError: '##[error]AssertionError: Done-when 2',
+      log: `2026-09-30T01:00:01Z passing step ${'x'.repeat(2_200_000)}\n`
+        + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary' },
+    { evidence: 'missing step metadata', metadata: {}, expectedError: noDetail },
+    { evidence: 'published check detail', metadata: {}, summary: 'AssertionError: failed check summary', expectedError: noDetail },
+    { evidence: 'null metadata', metadata: null, expectedError: noDetail },
+    { evidence: 'empty steps', metadata: { steps: [] }, expectedError: noDetail },
+    { evidence: 'no failed steps', metadata: { steps: [steps[0]] }, expectedError: noDetail },
+    { evidence: 'no diagnostic in failed step', metadata: { steps }, log: '2026-09-30T01:00:11Z running', expectedError: noDetail },
+    { evidence: 'no job link or annotations', noJob: true, summary: 'No error detail published by the check.', expectedError: noDetail },
+    { evidence: 'empty failure annotation', metadata: {}, annotations: [{ annotation_level: 'failure', message: '  ' }], expectedError: noDetail },
+    { evidence: 'attributed failure annotation without a job link', noJob: true,
+      annotations: [{ annotation_level: 'failure', message: 'Error: annotated failure' }], expectedError: 'Error: annotated failure' },
+    { evidence: 'malformed step metadata', metadata: { steps: [null, steps[1]] }, expectedError: noDetail },
+    { evidence: 'missing failed-step time', metadata: { steps: [steps[0], { conclusion: 'failure' }] }, expectedError: noDetail },
+    { evidence: 'invalid failed-step time', metadata: { steps: [steps[0], { ...steps[1], started_at: 'invalid' }] }, expectedError: noDetail },
+    { evidence: 'reversed failed-step times', metadata: { steps: [steps[0], { ...steps[1], completed_at: steps[1].started_at, started_at: steps[1].completed_at }] }, expectedError: noDetail },
+    { evidence: 'overlapping passing step', metadata: { steps: [{ ...steps[0], completed_at: steps[1].completed_at }, steps[1]] }, expectedError: noDetail },
+    // Step times have SECOND resolution, log stamps are fractional: each step owns [start, completed_at + 1s).
+    // A line inside the shared boundary second is ambiguous (both steps own it), so it never wins attribution.
+    { evidence: 'a fractional passing-step line inside the shared boundary second',
+      metadata: { steps: [
+        { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:10Z' },
+        { conclusion: 'failure', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:20Z' },
+      ] },
+      expectedError: '2026-09-30T01:00:15.1234567Z Error: deployment denied',
+      log: '2026-09-30T01:00:10.2500000Z FAIL passing-step-fixture.test.mjs\n'
+        + '2026-09-30T01:00:15.1234567Z Error: deployment denied' },
+    // The failed step's own exit line lands fractionally after its whole-second completed_at.
+    { evidence: 'a failed-step error stamped after its whole-second completion',
+      metadata: { steps: [
+        { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:05Z' },
+        { conclusion: 'failure', started_at: '2026-09-30T01:00:06Z', completed_at: '2026-09-30T01:00:10Z' },
+      ] },
+      expectedError: '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.',
+      log: '2026-09-30T01:00:01.5000000Z passing step\n'
+        + '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.' },
+    // A passing `Post`/`if: always()` step starting in the failed step's last second shares that second: the exit
+    // line there is genuinely ambiguous at second resolution, so recovery must report it as unattributed.
+    { evidence: 'a failed-step error in a second shared with a following passing step',
+      metadata: { steps: [
+        { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:05Z' },
+        { conclusion: 'failure', started_at: '2026-09-30T01:00:06Z', completed_at: '2026-09-30T01:00:10Z' },
+        { conclusion: 'success', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:12Z' },
+      ] },
+      expectedError: noDetail,
+      log: '2026-09-30T01:00:01.5000000Z passing step\n'
+        + '2026-09-30T01:00:10.6000000Z ##[error]Process completed with exit code 1.' },
+  ];
+  // A literal-titled `it(` opener per row (not `it.each`) keeps the merge-gate's test-case counter honest: it
+  // only counts string-titled openers, so an `it.each` rewrite of one case reads as a net removal.
+  for (const { evidence, metadata, summary, expectedError, log, noJob, annotations = [] } of evidenceCases) it(`keeps earlier passing-step errors out of dispatch and comments with ${evidence}`, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
     const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
       payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
@@ -236,16 +303,29 @@ describe('abandoned builder draft recovery', () => {
     const io = {
       stateRoot: dir, store: { list: () => ['dispatch-lane-test'], read: () => ({ effects: [row] }) },
       isPidAlive: () => authorLive, listAgents: () => [],
-      api: vi.fn(path => path.startsWith('pulls/')
+      api: vi.fn(path => {
+        if (path === 'actions/jobs/456') {
+          return metadata;
+        }
+        return path.startsWith('pulls/')
         ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
           head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
         : path === 'commits/abc' ? { commit: { committer: { date: headCommittedAt } } }
         : { check_runs: [
           { id: 1, name: 'review-gate', conclusion: 'failure' },
-          { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
-        ] }),
-      paged: vi.fn(() => []), gh: vi.fn(() => 'setup\n##[error]AssertionError: Done-when 2\nsummary'),
-      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
+          { id: 2, name: 'test-shard (2)', conclusion: 'failure', output: { summary }, details_url: noJob ? undefined : 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
+        ] };
+      }),
+      paged: vi.fn(() => annotations), gh: vi.fn((ghArgs, opts) => {
+        const text = log ?? ('2026-09-30T01:00:01Z ##[error]Passing-step error context\n'
+          + '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: Done-when 2\nsummary');
+        // Emulate execFileSync: output past maxBuffer (Node default 1 MiB) fails with ENOBUFS.
+        if (ghArgs[0] === 'api' && Buffer.byteLength(text) > (opts?.maxBuffer ?? 1024 * 1024)) {
+          throw Object.assign(new Error('spawnSync gh ENOBUFS'), { code: 'ENOBUFS' });
+        }
+        return text;
+      }),
+      freeLanes: vi.fn(() => [8]), reserve: vi.fn(() => ({ ok: true })), release: vi.fn(),
       dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
     };
     const args = { rawOpenPrs: [{ repo: 'we', prs: [{ ...candidate, number: 3033, headRefName: candidate.laneRef, files: [{ path: 'scripts/a.mjs' }] }] }], allowResume: true };
@@ -262,12 +342,32 @@ describe('abandoned builder draft recovery', () => {
       expect(await cliRecoverBuilderDrafts(args, io)).toEqual([]);
       expect(io.dispatch).not.toHaveBeenCalled();
       row.lastSeenLiveAt = candidate.authorLastSeenLiveAt;
+      if (expectedError === noDetail) {
+        const unattributed = [{ pr: 3033, num: '4502', action: 'unattributed', reason: 'no-attributable-failure-evidence' }];
+        expect(await cliRecoverBuilderDrafts(args, io)).toEqual(unattributed);
+        expect(await cliRecoverBuilderDrafts({ ...args, dryRun: true }, io)).toEqual(unattributed);
+        expect(io.dispatch).not.toHaveBeenCalled();
+        expect(io.reserve).not.toHaveBeenCalled();
+        expect(io.freeLanes).not.toHaveBeenCalled();
+        expect(io.gh.mock.calls.some(([args]) => args[0] === 'pr')).toBe(false);
+        expect(readdirSync(dir)).toEqual([]);
+        return;
+      }
       for (let i = 0; i < MAX_RESUME_ATTEMPTS + 1; i++) await cliRecoverBuilderDrafts(args, io);
       expect(io.dispatch).toHaveBeenCalledTimes(MAX_RESUME_ATTEMPTS);
       expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 3033, itemNum: '4502', laneRef: candidate.laneRef, lane: 8, reason: 'red-ci' }));
       expect(io.gh).toHaveBeenCalledWith(['pr', 'edit', '3033', '--repo', 'web-everything/web-everything', '--add-label', 'blocked:needs-human']);
-      expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining('First error: ##[error]AssertionError: Done-when 2')]);
+      expect(io.gh).toHaveBeenCalledWith(['pr', 'comment', '3033', '--repo', 'web-everything/web-everything', '--body', expect.stringContaining(`First error: ${expectedError}`)]);
       expect(io.api).toHaveBeenCalledWith('commits/abc');
+      if (!noJob) {
+        expect(io.api).toHaveBeenCalledWith('actions/jobs/456');
+        expect(io.gh).toHaveBeenCalledWith(['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/456/logs'],
+          expect.objectContaining({ encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
+      }
+      expect(io.dispatch).toHaveBeenCalledWith(expect.objectContaining({ failure: { name: 'test-shard (2)', firstError: expectedError } }));
+      for (const [args] of io.gh.mock.calls.filter(([args]) => args[0] === 'pr' && args[1] === 'comment')) {
+        expect(args.at(-1)).not.toContain('Passing-step error context');
+      }
       // A producer receipt survives a wrapper that never settled its run.
       rmSync(join(dir, 'build-red-draft-resumes'), { recursive: true, force: true });
       const receipt = { runId: 'dispatch-lane-test', entry: structuredClone(row),
@@ -288,5 +388,63 @@ describe('abandoned builder draft recovery', () => {
       expect(io.dispatch).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true, force: true }); }
     // The first call cold-imports the whole dispatch IO stack, which alone exceeds vitest's 5s default.
+  }, 60_000);
+
+  // Fail closed: a job log past even the helper's 16 MiB bound is unreadable, and recovery aborts instead of
+  // keeping the stale published "No error detail" and still dispatching repair.
+  it('aborts recovery when the failed job log is unreadable instead of dispatching on stale detail', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
+    const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
+      payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
+    const io = {
+      stateRoot: dir, store: { list: () => ['dispatch-lane-test'], read: () => ({ effects: [row] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: vi.fn(path => path.startsWith('pulls/')
+        ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
+          head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
+        : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+        : { check_runs: [
+          { id: 1, name: 'review-gate', conclusion: 'failure' },
+          { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
+        ] }),
+      paged: vi.fn(() => []),
+      gh: vi.fn(() => { throw Object.assign(new Error('spawnSync gh ENOBUFS'), { code: 'ENOBUFS' }); }),
+      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
+      dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
+    };
+    const args = { rawOpenPrs: [{ repo: 'we', prs: [{ ...candidate, number: 3033, headRefName: candidate.laneRef, files: [{ path: 'scripts/a.mjs' }] }] }], allowResume: true };
+    try {
+      await expect(cliRecoverBuilderDrafts(args, io)).rejects.toThrow(/log unreadable/);
+      expect(io.dispatch).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it('aborts recovery when the failed job step metadata is unreadable instead of dispatching on stale detail', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-draft-'));
+    const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', lastSeenLiveAt: candidate.authorLastSeenLiveAt,
+      payload: { launchKind: 'build', num: '4502' }, result: { pr: 3033 }, status: 'applied' };
+    const io = {
+      stateRoot: dir, store: { list: () => ['dispatch-lane-test'], read: () => ({ effects: [row] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: vi.fn(path => {
+        if (path === 'actions/jobs/456') throw new Error('unreadable step metadata');
+        return path.startsWith('pulls/')
+          ? { draft: true, state: 'open', updated_at: new Date().toISOString(),
+            head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
+          : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+          : { check_runs: [
+            { id: 1, name: 'review-gate', conclusion: 'failure' },
+            { id: 2, name: 'test-shard (2)', conclusion: 'failure', details_url: 'https://github.com/web-everything/web-everything/actions/runs/123/job/456' },
+          ] };
+      }),
+      paged: vi.fn(() => []), gh: vi.fn(() => '2026-09-30T01:00:11Z failed step\n##[error]AssertionError: x\n'),
+      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(),
+      dispatch: vi.fn(async () => ({ agentId: 'pid:321' })),
+    };
+    const args = { rawOpenPrs: [{ repo: 'we', prs: [{ ...candidate, number: 3033, headRefName: candidate.laneRef, files: [{ path: 'scripts/a.mjs' }] }] }], allowResume: true };
+    try {
+      await expect(cliRecoverBuilderDrafts(args, io)).rejects.toThrow(/unreadable step metadata/);
+      expect(io.dispatch).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
 });
