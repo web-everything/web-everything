@@ -218,7 +218,9 @@ export function credentialBufferFinding(content,layers=0) {
   // swap16 requires whole code units; a trailing byte cannot encode a token character.
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   return textFinding(swapped.toString('utf16le'))
-    ??keyStructureFinding(content,bytes=>bytes===content?null:gzipLayerFinding(bytes,layers+1,credentialBufferFinding));
+    ??keyStructureFinding(content,bytes=>bytes===content?null:gzipLayerFinding(bytes,layers+1,credentialBufferFinding)
+      // Decoded candidates (base64, percent, hex, UTF-16 alignments) get the token patterns too.
+      ??textFinding(bytes.toString('latin1'))??textFinding(bytes.toString('utf8'))??textFinding(bytes.toString('utf16le')));
 }
 
 // Ordinary (non credential-named) files: high-confidence evidence only. The loose words `-----BEGIN` and

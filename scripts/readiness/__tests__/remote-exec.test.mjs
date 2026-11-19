@@ -2886,17 +2886,12 @@ describe('allowlisted sibling snapshots', { timeout: 30_000 }, () => {
   it.each([
     ['escaped relative path', "export const alias = {pkg: '\\x2e\\x2e/\\x66rontierui/plugs'};"],
     ['oversized static proof', '/*' + 'x'.repeat(64 * 1024) + '*/ export const shared = {};'],
-    ['deep static proof', 'export const shared = ' + '['.repeat(80) + '0' + ']'.repeat(80) + ';'],
+    // Brackets are not used here: 64+ nested JSON-shaped brackets exhaust the key scan every file now gets and
+    // refuse the file outright; unquoted object nesting stays deep for the sibling proof without that.
+    ['deep static proof', 'export const shared = ' + '{a:'.repeat(80) + '0' + '}'.repeat(80) + ';'],
   ])('%s cannot exempt siblings', async (_label, config) => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
-    // 80 nested brackets exhaust the content scan every file now gets, so that file refuses (local fallback)
-    // before sibling proof matters; the other rows still build and include the sibling.
-    if (_label === 'deep static proof') {
-      await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}))
-        .rejects.toMatchObject({code:'excluded-source-file'});
-      return;
-    }
     const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
     expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
   });

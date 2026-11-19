@@ -88,8 +88,12 @@ describe('Forge scans all manifest content',()=>{
     const gz=gzipSync(Buffer.from(JSON.stringify(jwk)));
     for(const bytes of [gz,Buffer.from(gz.toString('base64'))])
       expect(credentialBufferFinding(bytes)).toBeTruthy();
-    for(const tracked of [true,false])
+    const token='gh'+'p_'+'A1b2C3d4'.repeat(5);
+    for(const tracked of [true,false]) {
       refused('docs/token.md',Buffer.from(gz.toString('base64')),tracked,'credential');
+      refused('docs/token.md',Buffer.from(Buffer.from(token).toString('base64')),tracked,'credential');
+    }
+    expect(credentialBufferFinding(Buffer.from(Buffer.from(token).toString('base64')))).toBeTruthy();
   });
   it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
     const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);
