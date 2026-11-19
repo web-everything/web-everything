@@ -345,6 +345,7 @@ export async function planRebuild({
   const applied = [];
   let cur = mainSha;
   let holdFailure = null;
+  const markerRows = new WeakSet(); // applied rows minted by recordHold: same tree, bookkeeping second parent
   const holdRefusal = () => ({
     ok: false, reason: 'pinned-overlay-hold-marker-failed', detail: holdFailure,
     mainSha, finalSha: cur, applied, decisions, alerts,
@@ -559,7 +560,11 @@ export async function planRebuild({
   const recordHold = (ref, pr, heldSha, tip) => {
     // Keep the audit pin in memory even if its durable marker cannot be minted. Such a plan must never be adopted:
     // doing so would erase the adopted history the next rebuild needs. prepare logs the refusal once via plan.detail.
-    if (tip) applied.push({ ref, pr, sha: heldSha, pinnedFrom: tip });
+    if (tip) {
+      const row = { ref, pr, sha: heldSha, pinnedFrom: tip };
+      markerRows.add(row); // reported as applied, but merges nothing: never carrier proof (carriedByContent)
+      applied.push(row);
+    }
     if (holdFailure) return false;
     try {
       const tree = verifyRev(git, `${cur}^{tree}`);
@@ -926,13 +931,18 @@ export async function planRebuild({
   // mechanism-pinned overlay the running build CARRIED — conflicted with main; xpinskip SKIPPED it and the plan built
   // main + one overlay, dropping the whole live review stack (and the superseded rule would have adopted it). A pinned
   // overlay skipped by xpinskip counts as lost too when the running build carries it: hold, never build without it.
+  // Carrier proof is CONTENT: main, or a head this plan really merged. Never `cur`: by now it also holds identity and
+  // hold markers (set-aside bases kept at an adopted head, held records), whose second parent is bookkeeping — an
+  // adopted head built on a lost tip would otherwise "carry" a tip whose content this build dropped. Fail closed: a git
+  // error answering "is it carried?" counts as not carried.
+  const carriedByContent = (sha) => !!sha && [mainSha, ...applied.filter((a) => !markerRows.has(a)).map((a) => a.sha)]
+    .some((head) => !!head && git(['merge-base', '--is-ancestor', sha, head]).status === 0);
   const establishedLost = [];
   for (const d of decisions) {
     const pinSkipped = d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped';
     if (!pinSkipped && (d.action !== 'drop' || d.reason !== 'conflict')) continue;
     const files = conflictFiles.get(d.ref) ?? [];
-    const carriedSurvives = carriedHeads.has(d.ref)
-      && carriedHeads.get(d.ref).every((sha) => git(['merge-base', '--is-ancestor', sha, cur]).status === 0);
+    const carriedSurvives = carriedHeads.has(d.ref) && carriedHeads.get(d.ref).every(carriedByContent);
     // unaudited-tip — a dropped / skipped overlay whose adopted head a sibling still carries leaves NO merge record of its
     // own, so the next rebuild would find no adopted head and apply its next unaudited tip ungated. Keep its adopted identity.
     if (carriedSurvives && !establishedRefs.has(d.ref) && typeof auditedTip === 'function') {
@@ -977,14 +987,12 @@ export async function planRebuild({
 
   // Parking omits the conflicting tree, but must retain the adopted identity for the next exact-tip audit.
   // Add markers only after loss detection: their ancestry is bookkeeping, not proof that the content survived.
-  // Judge carrier proof against the build BEFORE any marker of this pass: a marker must neither fabricate it (for
-  // its own ref or a sibling whose head it happens to descend from) nor erase a real one (a registered clean repair
-  // that merged the lost tip). `identityOnly` = no content of this build carries the tip; only markers link it.
+  // Judge carrier proof by content only (`carriedByContent`): a marker must neither fabricate it (for its own ref or a
+  // sibling whose head it happens to descend from) nor erase a real one (a registered clean repair that merged the lost
+  // tip). `identityOnly` = no content of this build carries the tip; only markers link it to the build.
   if (typeof auditedTip === 'function' && establishedLost.length > 0) {
-    const content = cur;
     for (const lost of establishedLost) {
-      // Fail closed: a git error answering "is it carried?" counts as not carried.
-      if (!lost.sha || git(['merge-base', '--is-ancestor', lost.sha, content]).status !== 0) lost.identityOnly = true;
+      if (!carriedByContent(lost.sha)) lost.identityOnly = true;
     }
     for (const lost of establishedLost) {
       const keep = adoptedTips.get(lost.ref) ?? (establishedRefs.has(lost.ref) ? lost.sha : null);

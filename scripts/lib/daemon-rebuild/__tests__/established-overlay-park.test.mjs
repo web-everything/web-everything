@@ -346,7 +346,7 @@ describe('bounded established overlay hold', () => {
       if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
       return r.stdout.trim();
     };
-    const fixture = async ({ stacked = false } = {}) => {
+    const fixture = async ({ stacked = false, rebasedBase = false, movedTip = false } = {}) => {
       // Real clone, real fetch and real planner: only the rebuild's own Git and state, no injected plan.
       vi.restoreAllMocks();
       const origin = join(root, 'origin.git'), clone = join(root, 'clone'), author = join(root, 'author');
@@ -361,6 +361,16 @@ describe('bounded established overlay hold', () => {
       gitOk(clone, ['remote', 'add', 'origin', origin]);
       gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
       gitOk(root, ['clone', '-q', origin, author]);
+      const init = gitOk(clone, ['rev-parse', 'HEAD']);
+      const commitFiles = (branch, from, files, { force = false } = {}) => {
+        gitOk(author, ['fetch', '-q', 'origin']);
+        gitOk(author, ['checkout', '-q', '-B', branch, from]);
+        for (const [p, body] of Object.entries(files)) writeFileSync(join(author, p), body);
+        gitOk(author, ['add', '-A']);
+        gitOk(author, ['commit', '-q', '-m', branch]);
+        gitOk(author, ['push', '-q', ...(force ? ['--force'] : []), 'origin', `HEAD:refs/heads/${branch}`]);
+        return gitOk(author, ['rev-parse', 'HEAD']);
+      };
       const commit = (branch, from, body, extra = []) => {
         gitOk(author, ['fetch', '-q', 'origin']);
         gitOk(author, ['checkout', '-q', '-B', branch, from]);
@@ -386,17 +396,33 @@ describe('bounded established overlay hold', () => {
         gitOk(author, ['push', '-q', 'origin', `HEAD:refs/heads/${top}`]);
         listed.push({ ref: top, pr: 7002 });
       }
+      // Rebased-base variant: base P was adopted at P1, built on A's tip, so P1's history contains A1.
+      const base = 'lane/base', newTop = 'lane/base-top';
+      if (rebasedBase) {
+        commitFiles(base, `origin/${ref}`, { 'other.txt': 'p1\n' });
+        listed.push({ ref: base, pr: 7003 });
+      }
       for (const o of listed) addOverlay(clone, o, { env: e });
       gitOk(clone, ['fetch', '-q', 'origin']);
-      const first = await planRebuild({ git: (args) => gitRun(args, { cwd: clone, env: e }), headSha: gitOk(clone, ['rev-parse', 'HEAD']),
+      const first = await planRebuild({ git: (args, o = {}) => gitRun(args, { ...o, cwd: clone, env: { ...e, ...o.env } }), headSha: gitOk(clone, ['rev-parse', 'HEAD']),
         mainRef: 'origin/main', overlays: listed, prState: async () => 'OPEN', stackMode: 'independent' });
       expect(first.applied?.map(x => x.ref), JSON.stringify(first)).toEqual(listed.map(o => o.ref));
       gitOk(clone, ['checkout', '-q', '-B', 'main', first.finalSha]);
       writeRebuildState(clone, { adopted: { head: first.finalSha, applied: first.applied } }, e);
       // main rewrites the same line: A (and C) now conflict. B is the clean repair carrying both A and main.
       commit('main', 'origin/main', 'main rewrite');
-      const b = stacked ? null : commit('lane/live-rebased', `origin/${ref}`, 'live mechanism fix + main rewrite', ['origin/main']);
-      if (!stacked) addOverlay(clone, { ref: 'lane/live-rebased', pr: 7001, reason: `auto-rebase of ${ref}` }, { env: e });
+      const repaired = !stacked && !rebasedBase;
+      const b = repaired ? commit('lane/live-rebased', `origin/${ref}`, 'live mechanism fix + main rewrite', ['origin/main']) : null;
+      if (repaired) addOverlay(clone, { ref: 'lane/live-rebased', pr: 7001, reason: `auto-rebase of ${ref}` }, { env: e });
+      if (rebasedBase) {
+        // P is rebased off A (P2 drops A1) and a new top T2 carries P2: P is set aside as stack-contained, and with
+        // P2 unaudited its identity marker names the adopted P1 — whose history, not content, contains A1.
+        commitFiles(base, init, { 'other.txt': 'p2\n' }, { force: true });
+        commitFiles(newTop, `origin/${base}`, { 'top.txt': 't2\n' });
+        addOverlay(clone, { ref: newTop, pr: 7004 }, { env: e });
+        // Moved-tip variant: A itself advances (docs only), so it is carried but no longer established.
+        if (movedTip) commitFiles(ref, `origin/${ref}`, { 'README.md': 'docs\n' });
+      }
       gitOk(clone, ['fetch', '-q', 'origin']);
       const args = { root: clone, env: e, run: (argv, o = {}) => gitRun(argv, { ...o, env: { ...e, ...o.env } }), now: () => time, prBaseChain: () => [], prState: async () => 'OPEN' };
       return { clone, e, a, b, top, liveHead: first.finalSha,
@@ -436,6 +462,19 @@ describe('bounded established overlay hold', () => {
       // Each lost tip is an ancestor of the build only through this pass's markers (the top's marker descends from
       // the base's tip), so none counts as carried.
       expect(lost.every(l => l.identityOnly === true)).toBe(true);
+      expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: f.clone, encoding: 'utf8' }).stdout.trim()).toBe(f.liveHead);
+    }, 60_000);
+
+    // Self-review of round 4: markers minted EARLIER in the same plan (a set-aside base kept at its adopted head)
+    // gave a lost tip bookkeeping ancestry. Carrier proof must come from main or a real overlay merge only.
+    it.each([
+      ['established', { rebasedBase: true }],
+      ['carried with a moved tip', { rebasedBase: true, movedTip: true }],
+    ])('an earlier stack-base marker never excuses a lost %s mechanism overlay', async (_label, opts) => {
+      const f = await fixture(opts);
+      const r = await f.prepare();
+      expect(r.result?.reason, JSON.stringify(r.result ?? r.plan?.decisions)).toBe('established-overlay-conflict');
+      expect(r.result.detail.lost.map(l => l.ref)).toContain(ref);
       expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: f.clone, encoding: 'utf8' }).stdout.trim()).toBe(f.liveHead);
     }, 60_000);
   });
