@@ -4462,6 +4462,8 @@ missing main refs, origin mismatches, hostile Git overrides and read-only refres
 
 ## Recovering a red-team result whose check was never published
 
+Publication-hold clears need a fresh, memo-bypassing history read after the success POST: holds bypass the check lock. Test a hold inserted by the POST mock, including the pre-read second and a status ID above the posted success. Read past the success so a buried hold is visible; unreadable or capped verification restores a failure hold and keeps the local retry marker.
+
 The already-reviewed-head recovery in `review-red-team-on-skip.mjs` can publish a missing
 head-bound check without dispatching another seat. Read trusted check evidence before planning
 and again at publication; unreadable or existing runs never authorize replacement. The guarded

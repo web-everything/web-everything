@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext, readUnsettledPublicationHolds, ownsPublicationHold } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext, readUnsettledPublicationHolds, ownsPublicationHold, confirmPublicationHoldClear } from './red-team-check-run.mjs';
 import { isAutomationAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { createMqLiveReader, redTeamEnqueueHold } from './drain-queue-safety.mjs';
@@ -145,6 +145,7 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       const hold = redTeamEnqueueHold({ repo, pr, head, comments, labels: live.labels,
         recorded: true, scheduled: true, env });
       if (hold) return { ok: false, reason: hold };
+      const readAt = Date.now();
       const current = latestPublicationStatus(readStatus({ repo, headSha: head, gh: liveGh }), pr);
       if (current?.state === 'success') {
         if (!isTrustedMarkerAuthor({ user: { login: String(current.creator?.login ?? '') } }))
@@ -174,6 +175,8 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       }
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });
       if (cleared?.ok !== true) return { ok: false, reason: cleared?.reason ?? 'finished publication hold clear unconfirmed' };
+      const confirmed = confirmPublicationHoldClear({ repo, pr, headSha: head, readAt, posted: cleared, gh, readGh: liveGh, env, postHold });
+      if (!confirmed.ok) return confirmed;
       if (markerStat) rmSync(`${path}.unpublished`, { force: true });
       return { ok: true };
     }));

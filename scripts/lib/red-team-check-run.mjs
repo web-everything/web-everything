@@ -569,9 +569,10 @@ export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '
     if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context) throw Error('invalid red-team publication hold identity (repo, PR number and head required)');
     const description = String(held ? `held: ${reason || 'red-team round not confirmed published'}` : 'red-team publication confirmed')
       .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 140);
-    gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
+    const response = gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
       { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context, description }), env: redTeamWriterEnv(env) });
-    return { ok: true };
+    const status = JSON.parse(response || '{}');
+    return { ok: true, ...(Number.isSafeInteger(status?.id) ? { status } : {}) };
   } catch (error) {
     // A definite rejection (HTTP 4xx) created or changed no status. Read it from the FULL error text, before the
     // reason is truncated, so a long message never hides the code.
@@ -697,6 +698,33 @@ export function ownsPublicationHold(status, ownsHold, isTrusted = isTrustedMarke
     && isTrusted({ user: { login: String(status?.creator?.login ?? '') } });
 }
 
+/** Verify a clear against writers that bypass the check lock, including holds buried by our success.
+ * Read past that success to the pre-read second; a capped/unreadable history restores a hold for operator inspection. */
+export function confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, gh, readGh = gh, env = process.env,
+  postHold = postRedTeamPublicationHold }) {
+  const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
+  const freshGh = (args, options = {}) => readGh(args, { ...options, env: freshEnv,
+    throttle: { ...options.throttle, env: freshEnv } });
+  const since = Math.floor(readAt / 1000) * 1000;
+  const success = posted.status;
+  let reason;
+  try {
+    const { statuses, complete } = readStatusHistory({ repo, headSha, gh: freshGh,
+      context: redTeamPublicationContext(pr),
+      decisive: status => Date.parse(status.created_at) < since
+        && (!Number.isSafeInteger(success?.id) || status.id < success.id) });
+    if (!complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound; operator must inspect publication`);
+    const concurrent = statuses.find(status => status.context === redTeamPublicationContext(pr) && status.state !== 'success'
+      && (Date.parse(status.created_at) >= since || Date.parse(status.created_at) > Date.parse(success?.created_at)
+        || (Number.isSafeInteger(success?.id) && status.id > success.id)));
+    if (!concurrent) return { ok: true };
+    reason = `concurrent publication hold appeared during clear: ${concurrent.description}`;
+  } catch (error) { reason = `publication hold post-clear history unreadable: ${message(error)}; operator must inspect publication`; }
+  reason = reason.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 134);
+  const restored = postHold({ repo, pr, headSha, held: true, reason, gh, env });
+  return failure(restored?.ok === true ? reason : `${reason}; failure hold restore unconfirmed: ${restored?.reason ?? 'unknown error'}`);
+}
+
 /** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
  * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,
  * from a trusted author). Any other hold there (a round writer's) is its owner's to clear, so nothing is posted
@@ -710,6 +738,7 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
   // posted only when every hold above the newest trusted success is the live helper's own. Any other hold in that
   // range (a round writer's unconfirmed publication) is its owner's to clear: leave all of them.
   let holds = [];
+  const readAt = Date.now();
   try {
     // The combined summary (one latest status per context) settles absence first, the same way the gate reader does:
     // unrelated contexts can fill the 100-status history page, and absence must never read as an incomplete history
@@ -726,7 +755,9 @@ export function clearLivePublicationHold({ repo, pr, headSha, gh = runGhSync, en
   if (holds.some(status => !ownsPublicationHold(status, ownsHold, isTrusted)))
     return { ok: true, cleared: false, reason: 'a publication hold that is not the live helper\'s is set; left to its owner' };
   const posted = postRedTeamPublicationHold({ repo, pr, headSha, held: false, gh, env });
-  return posted.ok ? { ok: true, cleared: true } : posted;
+  if (!posted.ok) return posted;
+  const confirmed = confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, gh, env });
+  return confirmed.ok ? { ok: true, cleared: true } : confirmed;
 }
 
 export function readRedTeamPublicationHoldFact({ repo, pr, headSha, gh = runGhSync, isTrusted } = {}) {

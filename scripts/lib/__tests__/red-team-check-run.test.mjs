@@ -674,6 +674,44 @@ describe('red-team check run contract', () => {
         expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok, ...(ok ? { cleared } : {}) });
         expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(cleared ? 1 : 0);
       });
+      it.each(['clean', 'same-second failure', 'newer-id pending', 'unreadable', 'page bound'])('clearLivePublicationHold verifies its success with fresh history: %s', kind => {
+        const context = 'red-team/publication #7';
+        const since = Math.floor(Date.now() / 1000) * 1000;
+        const history = [{ id: 5, context, state: 'failure', description: 'held: live red-team check not clear: x',
+          created_at: new Date(since - 10_000).toISOString(), creator: { login: 'web-everything' } }];
+        const posts = [];
+        const gh = vi.fn((args, options) => {
+          if (args.includes('POST')) {
+            const body = JSON.parse(options.input);
+            posts.push(body);
+            if (body.state === 'success') {
+              if (!['clean', 'unreadable', 'page bound'].includes(kind)) history.unshift({ ...history[0],
+                id: kind === 'newer-id pending' ? 12 : 9, state: kind === 'newer-id pending' ? 'pending' : 'failure',
+                created_at: new Date(kind === 'newer-id pending' ? since - 1000 : since).toISOString(),
+                description: 'held: ' + 'x'.repeat(300) });
+              return JSON.stringify({ id: 11, created_at: new Date(since).toISOString() });
+            }
+            return '{}';
+          }
+          if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 1, statuses: [history[0]] });
+          if (posts.length) {
+            expect(options.env.WE_GH_READ_MEMO_DIR).toBeFalsy();
+            expect(options.throttle.env.WE_GH_READ_MEMO_DIR).toBeFalsy();
+            if (kind === 'unreadable') throw Error('offline');
+            if (kind === 'page bound') return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ id: 1000 - i, context, state: 'success', created_at: new Date(since).toISOString() })));
+          }
+          return JSON.stringify(history);
+        });
+        const out = api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh, env: { WE_GH_READ_MEMO_DIR: 'stale' } });
+        if (kind === 'clean') expect(out).toEqual({ ok: true, cleared: true });
+        else {
+          expect(out).toMatchObject({ ok: false, reason: expect.stringMatching(/concurrent publication hold|post-clear history unreadable/) });
+          expect(out.cleared).not.toBe(true);
+          expect(posts.at(-1).state).toBe('failure');
+          expect(posts.at(-1).description.length).toBeLessThanOrEqual(140);
+        }
+        expect(posts.map(post => post.state)).toEqual(kind === 'clean' ? ['success'] : ['success', 'failure']);
+      });
       // Red-team break on c639d9ba108e: 100 unrelated statuses on the head, no publication context. The combined
       // summary proves the context absent, so the clearer settles (ok, nothing posted) instead of failing on the full
       // history page and keeping the retry marker forever.
@@ -709,7 +747,7 @@ describe('red-team check run contract', () => {
         expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok: true, cleared: true });
         // It stops at the page holding the trusted success, never reading the older pages.
         const pages = gh.mock.calls.filter(([args]) => /\/statuses\?/.test(args[1])).length;
-        expect(pages).toBe(Math.floor((newer + 1) / 100) + 1);
+        expect(pages).toBe(Math.floor((newer + 1) / 100) + 1 + Math.ceil(history.length / 100));
       });
       it('clearLivePublicationHold: a context still undecided at the page cap fails closed (marker kept, nothing posted)', () => {
         const gh = vi.fn(args => {
@@ -1726,8 +1764,10 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       expect(fake.statuses.map(status => status.state)).toEqual(['success', 'failure']);
       expect(fake.runs).toEqual([expect.objectContaining({ app: { id: Number(WE_APP) }, external_id: 'o/r#7', conclusion: 'success',
         output: expect.objectContaining({ title: 'Live-check: Red team clear' }) })]);
-      // Reads keep the caller's env (the daemon's own identity); only writes switch to the writer env.
-      expect(fake.calls.filter(c => !c.args.includes('POST')).every(c => c.env === env)).toBe(true);
+      // Verification keeps the daemon identity while copying the env to bypass the read memo.
+      const reads = fake.calls.filter(c => !c.args.includes('POST'));
+      expect(reads.slice(0, -1).every(c => c.env === env)).toBe(true);
+      expect(reads.at(-1).env).toEqual({ ...env, WE_GH_READ_MEMO_DIR: '' });
       expect(env.WE_GITHUB_APP_ROLE).toBe('reviewer');
     });
 

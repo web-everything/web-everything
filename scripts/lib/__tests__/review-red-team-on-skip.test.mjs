@@ -2841,6 +2841,27 @@ describe('#6606 carried check recovered after a transient verification failure',
     });
   });
 
+  it('keeps the carried marker when a hold races the live publication clear', () => {
+    const w = world();
+    try {
+      const gh = (args, options) => {
+        if (args.includes('POST') && args[1].includes('/statuses/') && JSON.parse(options.input).state === 'success') {
+          w.statuses.unshift({ id: 1000, context: `red-team/publication #${pr}`, state: 'pending',
+            description: 'held: concurrent round', created_at: new Date().toISOString(), creator: { login: 'other-writer' } });
+        }
+        return w.gh(args, options);
+      };
+      w.statuses.unshift({ id: 1, context: `red-team/publication #${pr}`, state: 'failure',
+        description: 'held: live red-team check not clear: retry', creator: { login: 'web-everything' } });
+      const raced = publishCarriedCheckDurably({ repo, pr, head, env: w.env,
+        publish: () => ({ ok: true }),
+        clearHold: () => clearLivePublicationHold({ repo, pr, headSha: head, gh, env: w.env }) });
+      expect(raced).toMatchObject({ ok: false, reason: expect.stringContaining('concurrent publication hold appeared during clear') });
+      expect(w.owed()).toBe(true);
+      expect(w.statuses[0]).toMatchObject({ state: 'failure', description: 'held: concurrent publication hold appeared during clear: held: concurrent round' });
+    } finally { rmSync(w.dir, { recursive: true, force: true }); }
+  });
+
   it('settlement runs inside the publisher\'s writers\' lock, so no later attempt\'s hold lands before the clear', () => {
     // Red team on a67e77345: publish and settlement took the lock separately, so a later attempt could post its hold in
     // between (with no marker of its own) and the earlier attempt's late clear removed it.
