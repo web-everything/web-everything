@@ -24,7 +24,7 @@
 # - forge-cache-prune.service/timer: root oneshot cache retention, 2min after
 #   boot then every 15min, idle IO/low CPU priority;
 # - forge-exec-sweep.service/timer: root oneshot run/presync/receipt retention,
-#   5min after boot then every 30min, idle IO/low CPU priority;
+#   5min after boot then every 5min, idle IO/low CPU priority;
 #   also reclaims reservations older than 7 days under the writer lease, only
 #   with writerGuard evidence and proof the worker UID has no processes;
 # - R497 egress: slot users forge-exec-1..N get no outbound network except loopback and
@@ -510,10 +510,10 @@ SWEEP_SERVICE
 printf 'Environment=FORGE_EXEC_SLOTS=%s\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service
 cat > /etc/systemd/system/forge-exec-sweep.timer <<'SWEEP_TIMER'
 [Unit]
-Description=Check Forge execution retention every 30 minutes
+Description=Check Forge execution retention every 5 minutes
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=30min
+OnUnitActiveSec=5min
 AccuracySec=1min
 Persistent=false
 Unit=forge-exec-sweep.service

@@ -1327,6 +1327,22 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'not-started',terminated:true,reason:'forge-busy'});
     expect(callsOf(f.exec).some(c=>c.file==='rsync'||isRun(c)||isCleanup(c))).toBe(false);
   });
+  it.each(['bound','started','wrong nonce','wrong run','missing started','extra field'])(
+    'busy full unit rejection requires a bound not-started finish: %s', async kind => {
+      const f = fixture({runCode:254, receipt:(_nonce, value) => {
+        const reply = {v:1,nonce:value.nonce,run:value.run,phase:'rejected',reason:'forge-busy',siblings:false,started:false};
+        if (kind === 'started') reply.started = true;
+        if (kind === 'wrong nonce') reply.nonce = '0'.repeat(32);
+        if (kind === 'wrong run') reply.run = 'r-'+'0'.repeat(32);
+        if (kind === 'missing started') delete reply.started;
+        if (kind === 'extra field') reply.code = 254;
+        return JSON.stringify(reply);
+      }});
+      f.argv = ['npm','run','test:unit'];
+      expect(await runRemote(f)).toEqual(kind === 'bound'
+        ? {mode:'not-started',terminated:true,reason:'forge-busy'}
+        : {mode:'unconfirmed',reason:'ambiguous-result'});
+    });
   it.each(['forge-exec-2','root','forge-exec-3','forge-exec-01'])('rsync targets only a valid server-reserved pool member: %s',async slot=>{
     const f=fixture(),execute=f.exec;
     f.exec=vi.fn(async call=>{
@@ -2058,8 +2074,8 @@ describe('explicit remote CLI decision', () => {
     try {
       const pending = remoteManifestAPI.main({argv,cwd,lockRoot:join(cwd,'heavy'), timeoutMs:10, remoteExec:() => new Promise(() => {}), local, log:vi.fn()});
       await vi.dynamicImportSettled();
-      // An unconfirmed remote still exits 124 after the default 30s cancellation wait.
-      await vi.advanceTimersByTimeAsync(30010);
+      // An unconfirmed remote still exits 124 after the default 180s cancellation wait.
+      await vi.advanceTimersByTimeAsync(180010);
       expect(await pending).toBe(124);
       expect(local).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
