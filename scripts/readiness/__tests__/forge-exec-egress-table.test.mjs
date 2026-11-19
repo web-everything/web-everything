@@ -33,7 +33,10 @@ const probe = async () => { probeCalls++; return typeof probeResult === 'functio
 const makeRunner = () => createRunner({testRoot: root, testPath: bin + ':/usr/bin:/bin', testEgressProbe: probe});
 async function requestFor(runner) {
   const prepared = await runner.prepare({nonce, label: 'abcdef-1'});
-  const work = join(root, 'runs', prepared.run, 'work');
+  const runRoot = prepared.slot
+    ? join(root, 'runs', 'slot-' + prepared.slot.slice('forge-exec-'.length))
+    : join(root, 'runs');
+  const work = join(runRoot, prepared.run, 'work');
   await writeFile(join(work, 'package-lock.json'), 'lock');
   const entries = [{path: Buffer.from('package-lock.json'), sha256: hash('lock'), executable: false}];
   const manifest = manifestAPI.manifestWire({entries, excluded: []});
@@ -70,8 +73,33 @@ describe('egress table readiness', () => {
     await expect(runner.prepare({nonce, label: 'abcdef-1'})).rejects.toMatchObject({code: 'egress-table-absent'});
     expect(testExecute).toHaveBeenCalledTimes(1);
     expect(testExecute).toHaveBeenCalledWith('/usr/sbin/nft',
-      ['list', 'table', 'inet', 'forge_exec_egress'],
+      ['-n', 'list', 'table', 'inet', 'forge_exec_egress'],
       {env: {PATH: '/usr/sbin:/usr/bin:/bin', LANG: 'C'}, timeoutMs: 5000});
+  });
+  it.each([false, true])('checks this run UID against installed coverage (covered=%s)', async covered => {
+    const uid = process.getuid();
+    await mkdir(join(root, 'runs'), {recursive: true});
+    await mkdir(join(root, 'runs', 'slot-14'), {mode: 0o710});
+    const table = value => ({code: 0, stdout: `table inet forge_exec_egress {
+      chain output {
+        type filter hook output priority filter; policy accept;
+        meta skuid { ${value} } jump slot_egress
+      }
+    }`});
+    probeResult = table(uid);
+    const runner = makeRunner(), request = await requestFor(runner);
+    probeResult = table(covered ? uid : uid + 1);
+    if (covered) {
+      expect((await runner.run(request)).code).toBe(0);
+      expect(await ran()).toBe(true);
+    } else {
+      await expect(runner.run(request)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+      expect(await ran()).toBe(false);
+    }
+  });
+  it.each(['', 'garbage', 'meta skuid { 2014 } jump slot_egress'])('refuses incomplete UID evidence %j', async stdout => {
+    probeResult = {code: 0, stdout};
+    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
   });
   it('execute timeout resolves timedOut and kills a real sleeping child with SIGKILL', async () => {
     const pending = execute(process.execPath, ['-e', keepAliveScript()], {timeoutMs: 100});
@@ -112,7 +140,7 @@ describe('egress table readiness', () => {
     for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
     const nft = children.slice(before).filter(c => c.file === '/usr/sbin/nft');
     expect(nft).toHaveLength(1);
-    expect(nft[0].argv).toEqual(['list', 'table', 'inet', 'forge_exec_egress']);
+    expect(nft[0].argv).toEqual(['-n', 'list', 'table', 'inet', 'forge_exec_egress']);
     // A zero exit from the production probe is the only thing that lets it pass.
     nftStub.code = 0;
     await expect(createRunner(injected).egressReady()).resolves.toBeUndefined();

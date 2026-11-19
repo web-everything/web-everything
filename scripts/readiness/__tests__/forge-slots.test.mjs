@@ -84,7 +84,7 @@ describe('Forge slot settings', () => {
     const dir = fixture();
     const pool = join(dir, 'pool'); mkdirSync(pool);
     for (const k of [9, 14, 11]) mkdirSync(join(pool, 'slot-' + k));
-    const guard = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('if ! id forge-exec'))
+    const guard = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('# Preflight egress'))
       .replaceAll('/srv/forge-exec', pool);
     writeFileSync(join(dir, 'forge-setup.sh'), guard + `\nbash -c 'printf "%s" "$FORGE_EXEC_SLOTS"'\n`);
     const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
@@ -94,6 +94,37 @@ describe('Forge slot settings', () => {
     expect(result.stderr).toContain('forge-slots.json host/default setting');
     expect(result.stderr).toContain('keeping 14 installed slots');
   });
+  it.each(['success', 'egress-failure', 'after-egress-failure'])('grow 8 to 14 covers planned UIDs before publishing slots: %s', failure => {
+    const dir = fixture(), pool = join(dir, 'pool'), log = join(dir, 'log');
+    mkdirSync(pool);
+    for (let k = 1; k <= 8; k++) mkdirSync(join(pool, `slot-${k}`));
+    const fake = (name, body) => writeFileSync(join(dir, name), '#!/bin/bash\n' + body + '\n', {mode: 0o755});
+    fake('getent', `for k in {1..8}; do echo "forge-exec-$k:x:$((2000+k)):2000::/:/bin/bash"; done`);
+    fake('systemctl', 'echo not-found');
+    fake('nft', 'exit 0');
+    fake('id', '[[ "$1" == forge-exec ]] && exit 0; k=${1##*-}; ((k <= 8))');
+    fake('useradd', `echo "publish:$*" >> "$LOG"`);
+    writeFileSync(join(dir, 'login.defs'), 'SYS_UID_MIN 100\nSYS_UID_MAX 999\n');
+    writeFileSync(join(dir, 'forge-egress.sh'), `echo "egress:$FORGE_EGRESS_UIDS" >> "$LOG"
+[[ "$FAILURE" != egress-failure ]] || exit 1
+[[ "$FAILURE" != after-egress-failure ]] || touch "$FAIL_AFTER"
+`);
+    // Execute the actual setup prefix through account publication, with host IO stubbed.
+    const prefix = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('# Only ops may create run containers.'))
+      .replaceAll('/srv/forge-exec', pool).replace('/etc/login.defs', join(dir, 'login.defs'))
+      .replace('# Only after the complete target pool', '[[ ! -e "$FAIL_AFTER" ]] || exit 1\n# Only after the complete target pool');
+    writeFileSync(join(dir, 'forge-setup.sh'), prefix);
+    const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+      env: {PATH: dir + ':' + process.env.PATH, FORGE_EXEC_SLOTS: '14', LOG: log, FAILURE: failure, FAIL_AFTER: join(dir, 'fail-after')},
+    });
+    expect(result.status, result.stderr).toBe(failure === 'success' ? 0 : 1);
+    const events = readFileSync(log, 'utf8').trim().split('\n');
+    expect(events[0]).toBe('egress:2001 2002 2003 2004 2005 2006 2007 2008 999 998 997 996 995 994');
+    expect(events.slice(1)).toHaveLength(failure === 'success' ? 6 : 0);
+    if (failure === 'success') expect(events[1]).toContain('--uid 999');
+    expect(events.some(line => line.includes('sudoers'))).toBe(false);
+  });
   it('setup passes its effective count into both sweep and egress units', () => {
     expect(setup).toContain('Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS');
     expect(setup).toContain(`printf 'Environment=FORGE_EXEC_SLOTS=%s\\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service`);
@@ -101,7 +132,7 @@ describe('Forge slot settings', () => {
   it.each([128, 129])('setup revalidates retained slot-%i before any provisioning', count => {
     const dir = fixture();
     const pool = join(dir, 'pool'); mkdirSync(pool); mkdirSync(join(pool, `slot-${count}`));
-    const guard = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('if ! id forge-exec'))
+    const guard = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('# Preflight egress'))
       .replaceAll('/srv/forge-exec', pool);
     writeFileSync(join(dir, 'forge-setup.sh'), guard + '\nprintf "provisioning"\n');
     const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {

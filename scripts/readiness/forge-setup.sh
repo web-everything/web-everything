@@ -66,14 +66,62 @@ if [[ ! "$FORGE_EXEC_SLOTS" =~ ^[1-9][0-9]*$ ]] || (( FORGE_EXEC_SLOTS > 128 ));
   echo 'forge-setup: FORGE_EXEC_SLOTS must be 1..128' >&2
   exit 1
 fi
+# Preflight egress before publishing any new account or directory. Stop refreshes so
+# an old service count cannot replace coverage for the planned, not-yet-existing UIDs.
+if ! command -v python3 >/dev/null 2>&1; then apt-get install -y python3; fi
+installed_passwd=$(getent passwd)
+for user in $(printf '%s\n' "$installed_passwd" | cut -d: -f1); do
+  if [[ "$user" =~ ^forge-exec-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > FORGE_EXEC_SLOTS )); then
+    FORGE_EXEC_SLOTS=${BASH_REMATCH[1]}
+  fi
+done
+if (( FORGE_EXEC_SLOTS > 128 )); then
+  echo 'forge-setup: installed pool exceeds 128; inspect accounts before retrying' >&2; exit 1
+fi
+# Pick unused system UIDs without creating users. useradd -u below fails closed
+# if another account takes one meanwhile. Exhaustion requires operator cleanup.
+slot_uid_plan=$(printf '%s\n' "$installed_passwd" | python3 -c '
+import sys
+rows = [line.split(":") for line in sys.stdin.read().splitlines()]
+users = {r[0]: int(r[2]) for r in rows}
+used = set(users.values())
+limits = {"SYS_UID_MIN": 100, "SYS_UID_MAX": 999}
+with open("/etc/login.defs") as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in limits: limits[parts[0]] = int(parts[1])
+candidate = limits["SYS_UID_MAX"]
+for k in range(1, int(sys.argv[1]) + 1):
+    uid = users.get("forge-exec-" + str(k))
+    if uid is None:
+        while candidate in used and candidate >= limits["SYS_UID_MIN"]: candidate -= 1
+        if candidate < max(1, limits["SYS_UID_MIN"]):
+            sys.exit("forge-setup: no free system UIDs; inspect accounts before retrying")
+        uid = candidate
+        used.add(uid)
+    print(uid)
+' "$FORGE_EXEC_SLOTS")
+slot_uids=($slot_uid_plan)
+# Missing units are normal on first install. Stop the timer, then synchronously
+# finish any existing refresh. Never stop the service: sshd Requires= it.
+for unit in forge-exec-egress.timer forge-exec-egress.service; do
+  load_state=$(systemctl show -p LoadState --value "$unit") || { [[ "$load_state" == not-found ]] || exit 1; }
+  if [[ "$load_state" != not-found ]]; then
+    if [[ "$unit" == *.timer ]]; then systemctl stop "$unit";
+    else systemctl start "$unit"; fi
+  fi
+done
+if ! command -v nft >/dev/null 2>&1; then apt-get install -y nftables; fi
+FORGE_EGRESS_UIDS="${slot_uids[*]}" bash "$(dirname -- "$0")/forge-egress.sh" apply
+# Only after the complete target pool is covered may provisioning begin.
+for ((k=1; k<=FORGE_EXEC_SLOTS; k++)); do
+  if ! id "forge-exec-$k" >/dev/null 2>&1; then
+    useradd --system --user-group --uid "${slot_uids[k-1]}" --home-dir "/srv/forge-exec/slot-$k" --shell /bin/bash "forge-exec-$k"
+  fi
+done
 if ! id forge-exec >/dev/null 2>&1; then
   useradd --system --user-group --home-dir /srv/forge-exec --shell /bin/bash forge-exec
 fi
-for ((k=1; k<=FORGE_EXEC_SLOTS; k++)); do
-  if ! id "forge-exec-$k" >/dev/null 2>&1; then
-    useradd --system --user-group --home-dir "/srv/forge-exec/slot-$k" --shell /bin/bash "forge-exec-$k"
-  fi
-done
 if ! command -v python3 >/dev/null 2>&1; then
   apt-get install -y python3
 fi

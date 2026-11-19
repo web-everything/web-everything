@@ -902,13 +902,22 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
   let operator={uid:process.getuid(),gid:process.getgid()};
   const statePath = (run,phase) => join(receipts,run+'.'+phase);
   const busy=()=>Object.assign(new Error('Worker execution busy or interrupted; use local fallback. Operator must stop the reserved UID before removing its worker-active lock'),{code:'forge-busy'});
-  async function requireEgressTable() {
+  async function requireEgressTable(uid) {
     if(testRoot&&!testEgressProbe&&!testExecute)return;
     try {
       // Exec injection is only available to the explicit test-root harness.
-      const result=testRoot&&testEgressProbe?await testEgressProbe():await (testRoot&&testExecute?testExecute:execute)('/usr/sbin/nft',['list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
-      if(result?.code===0&&!result.timedOut)return;
-    } catch { /* all probe failures require local fallback */ }
+      const result=testRoot&&testEgressProbe?await testEgressProbe():await (testRoot&&testExecute?testExecute:execute)('/usr/sbin/nft',['-n','list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
+      if(result?.code===0&&!result.timedOut) {
+        if(uid===undefined)return;
+        // Numeric nft output only; match the output-hook UID jump, never a UID
+        // mentioned in a comment, another chain, or the registry address sets.
+        const output=/chain output\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/.exec(result.stdout??'')?.[1];
+        const match=output&&/type filter hook output priority (?:0|filter); policy accept;[\s\S]*?^\s*meta skuid (\{[\d,\s]+\}|\d+) jump slot_egress\s*$/m.exec(output);
+        const covered=match?.[1].replace(/[{}]/g,'').split(',').map(v=>Number(v.trim()));
+        if(covered?.includes(uid))return;
+        throw Object.assign(new Error(`Egress rules do not cover slot UID ${uid}; rerun forge-setup or use local fallback`),{code:'egress-uid-uncovered'});
+      }
+    } catch(error) { if(error.code==='egress-uid-uncovered')throw error; /* all probe failures require local fallback */ }
     throw Object.assign(new Error('Egress table inet forge_exec_egress absent; use local fallback'),{code:'egress-table-absent'});
   }
   async function identity(user) {
@@ -1415,7 +1424,8 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       await init();
       const run='warm-'+randomBytes(16).toString('hex'),nonce=randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce),record={run,nonce,...(worker.active?{slot:worker.user}:{})};
-      try{return await exclusiveWorker(async command=>{
+      try{if(worker.active)await requireEgressTable(worker.uid);
+      return await exclusiveWorker(async command=>{
         const container=join(worker.root,run),work=join(container,'work'),temp=join(container,'.forge-tmp');
         await mkdir(container,{mode:0o755});
         try {
@@ -1446,7 +1456,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       }finally{if(worker.active)await releaseWorker(record);}
     },
     // Read-only readiness probe; exposed so the test-seam guarantee (injection only under testRoot) is checkable.
-    async egressReady() {await requireEgressTable();},
+    async egressReady(uid) {await requireEgressTable(uid);},
     async prepare({nonce,label,siblings,baseSha,baseManifestDigest,slot,slotUnits = 1,capabilities,gitBundle}) {
       await init();
       await requireEgressTable();
@@ -1459,6 +1469,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const prepare=async()=>{
       const container=join(worker.root,run);
       try {
+      if(worker.active)await requireEgressTable(worker.uid);
       if(worker.active)await workerFor(record); // inside the try so a failure releases the reservation
       // Validate the grant against the worker actually reserved (its own slot limits); the catch
       // below releases the reservation, so a rejected grant never leaks a worker or a receipt.
@@ -1541,6 +1552,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         return value;
       };
       const worker=selected??{user:'forge-exec',root:runs};
+      if(worker.active)await requireEgressTable(worker.uid);
       const container=join(worker.root,request.run),work=join(container,'work');
       await directory(container,true,operator); await directory(work);
       let prewarmed=false;
