@@ -127,6 +127,22 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       if(open&&open.token===(token==='}'?'{':'['))emit(Buffer.from(text.slice(open.start,match.index+1)),{expand:false});
     }
   }
+  // Independent object candidates: global quote pairing above can be thrown off by stray double quotes in prose
+  // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
+  // from that brace only, bounded in length, so nothing before it can hide the object.
+  if(/kty/.test(text)) {
+    const pieces=/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
+    for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
+      tick();
+      const limit=Math.min(text.length,at+65536);
+      let depth=0;
+      pieces.lastIndex=at;
+      for(let piece=pieces.exec(text);piece&&pieces.lastIndex<=limit;piece=pieces.exec(text)) {
+        if(piece[0]==='{')depth++;
+        else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});break;}
+      }
+    }
+  }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
   for(const match of text.matchAll(/\[([^\[\]]*)\]/g)) {
     tick();
