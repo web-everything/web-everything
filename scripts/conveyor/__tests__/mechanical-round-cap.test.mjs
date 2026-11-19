@@ -621,3 +621,15 @@ describe('readMechanicalRoundFacts (real git)', { timeout: 30_000 }, () => {
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 });
+
+describe('receiptCountsMechanicalRounds (red-team receipt writers share the planner policy)', () => {
+  it.each([[true, true], [false, false]])('returns the resolved value %s', async (value, expected) => {
+    const { receiptCountsMechanicalRounds } = await import('../mechanical-round-cap.mjs');
+    expect(receiptCountsMechanicalRounds(() => ({ value }))).toBe(expected);
+  });
+  it('counts mechanical rounds when the setting is unreadable or malformed (fail closed)', async () => {
+    const { receiptCountsMechanicalRounds } = await import('../mechanical-round-cap.mjs');
+    expect(receiptCountsMechanicalRounds(() => { throw new Error('x'); })).toBe(true);
+    expect(receiptCountsMechanicalRounds(() => ({ value: 'yes' }))).toBe(true);
+  });
+});

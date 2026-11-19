@@ -2601,6 +2601,22 @@ describe('conflict-fix deadline exemption', () => {
 });
 
 describe('Claude red-team repair round publication', () => {
+  it.each([[true, false], [false, true], ['unreadable', false]])(
+    'the receipt writer honours mechanicalRoundsCountTowardCap=%s (publishes=%s) when conflict rounds fill the cap', (setting, publishes) => {
+      const pr = acceptedRedTeamRepair();
+      const rows = planReconcile({ prs: [pr], agents: [], now: Date.now(), roundCap: 3 }).dispatch;
+      const { planned: [fix] } = planFixesFromReconcile(rows, findItemStub, () => []);
+      const comments = [...pr.comments,
+        ...Array.from({ length: 3 }, () => ({ author: { login: 'web-everything' }, body: '🔧 conveyor fix — conflict resolved and re-armed (mechanical round, #xkmu3gv)' }))];
+      const exec = vi.fn();
+      const loadMechanicalRoundsSetting = setting === 'unreadable'
+        ? () => { throw new Error('unreadable setting'); } : () => ({ value: setting });
+      const publish = () => publishRedTeamFixDispatch({ repo: 'we', planned: fix }, {
+        readComments: () => comments, readCommits: () => pr.roundCommits, loadMechanicalRoundsSetting, exec });
+      if (publishes) expect(publish()).toBe(true);
+      else expect(publish).toThrow('cap exhausted');
+      expect(exec).toHaveBeenCalledTimes(publishes ? 1 : 0);
+    });
   it.each([false, true])('uses the real commit reader for missing evidence and refuses a moved live head (moved=%s)', moved => {
     const pr = acceptedRedTeamRepair();
     const rows = planReconcile({ prs: [pr], agents: [], now: Date.now(), roundCap: 3 }).dispatch;

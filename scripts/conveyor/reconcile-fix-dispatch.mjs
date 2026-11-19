@@ -1,5 +1,5 @@
 import { sharedRoundAttempts } from './reconcile-core.mjs';
-import { readRoundCommits } from './mechanical-round-cap.mjs';
+import { readRoundCommits, receiptCountsMechanicalRounds, resolveMechanicalRoundsSetting } from './mechanical-round-cap.mjs';
 import { publishRedTeamFixLaunch, lockRedTeamFixCharge } from './red-team-fix-round-count.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
@@ -1427,6 +1427,7 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
 export function publishRedTeamFixDispatch({ repo, planned }, {
   readComments = () => readCompletePrComments(planned.pr, { repo: ghRepoSlug(repo) }),
   exec = execFileSyncThrottled,
+  loadMechanicalRoundsSetting = resolveMechanicalRoundsSetting,
   readCommits = pr => {
     const live = JSON.parse(exec('gh', ['pr', 'view', String(planned.pr), '--repo', ghRepoSlug(repo),
       '--json', 'headRefOid,headRefName,baseRefName'],
@@ -1446,7 +1447,8 @@ export function publishRedTeamFixDispatch({ repo, planned }, {
     }
     return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.attempts + 1,
       chargedRounds: sharedRoundAttempts({ comments, headRefOid: head, roundCommits: planned.roundCommits },
-        { requireRoundCommits: true, readCommits }), cap: planned.roundCap,
+        { requireRoundCommits: true, readCommits,
+          mechanicalRoundsCountTowardCap: receiptCountsMechanicalRounds(loadMechanicalRoundsSetting) }), cap: planned.roundCap,
       publish: body => exec('gh', ['pr', 'comment', String(planned.pr), '--repo', ghRepoSlug(repo), '--body', body],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 }),
     });

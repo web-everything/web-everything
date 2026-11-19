@@ -5,7 +5,7 @@ import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
 import { redTeamSentBackFindings, hasRedTeamSentBackLabels } from '../conveyor/dispatch-eligibility-facts.mjs';
-import { readRoundCommits } from '../conveyor/mechanical-round-cap.mjs';
+import { readRoundCommits, receiptCountsMechanicalRounds, resolveMechanicalRoundsSetting } from '../conveyor/mechanical-round-cap.mjs';
 import { publishRedTeamFixLaunch, lockRedTeamFixCharge, hasRedTeamFixLaunch } from '../conveyor/red-team-fix-round-count.mjs';
 import { randomUUID } from 'node:crypto';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
@@ -654,6 +654,7 @@ export async function runFixCli(argv = [], {
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
   readCommits = (pr, { cwd = weRoot } = {}) => readRoundCommits({ pr, exec: (cmd, args, opts) => run(cmd, args, { ...opts, cwd }) }),
+  loadMechanicalRoundsSetting = resolveMechanicalRoundsSetting,
   readCiHeal = readCiHealInputs,
   timingPolicy = resolveTimingPolicy().fix,
   readChecks = readReviewChecks,
@@ -763,6 +764,7 @@ export async function runFixCli(argv = [], {
         const charged = publishRedTeamFixLaunch({
           comments, pr: Number(pr), head: prHeadSha, attemptId: launch.launchId,
           chargedRounds: sharedRoundAttempts({ ...prHead, comments }, { requireRoundCommits: true,
+            mechanicalRoundsCountTowardCap: receiptCountsMechanicalRounds(loadMechanicalRoundsSetting),
             readCommits: p => readCommits(p, { cwd: launch.laneRepo ?? weRoot }) }), cap: launch.redTeamRoundCap,
           publish: body => withMessageFile(body, file => run('gh', ['pr', 'comment', pr,
             ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })),
