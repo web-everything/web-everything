@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../review-abandon.mjs';
 import { newRunRecord, runPath, writeRun } from '../run-store.mjs';
-import { abandonedPath, isRunAbandoned } from '../../lib/run-abandoned.mjs';
-import { readDrainRedTeamEvidence, readRecoveryWitness } from '../../lib/drain-red-team-evidence.mjs';
+import { abandonedPath, isRunAbandoned, markRunAbandoned } from '../../lib/run-abandoned.mjs';
+import { COMMENT_SETTLEABLE_REASONS, readDrainRedTeamEvidence, readRecoveryWitness, settleUnknownEvidenceByComment } from '../../lib/drain-red-team-evidence.mjs';
 import { readReviewRunEvidence, findResumableParkedRun } from '../../conveyor/review-referral-hold.mjs';
 import { defaultFindResumableRun } from '../review-loop-cli.mjs';
 import { findSuspendedReferralRuns } from '../../lib/suspended-referral-run.mjs';
@@ -46,6 +46,15 @@ function op(args = [], extra = {}) {
 function evidence(pr = 7109, reader = readDrainRedTeamEvidence) {
   return reader({ repo, pr, head, runsDir: dir, env, now, readScorecards: () => [] });
 }
+function completed(r, startedAt, id = 'review-pr-replacement', rev = head) {
+  const next = structuredClone(r);
+  next.id = id; next.pending = null; next.effects = []; next.outcome = null; next.verdict = { verdict: 'accept' };
+  next.findings.read.netBasis.rev = rev;
+  next.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: new Date(startedAt).toISOString() }];
+  writeRun(next, dir);
+  utimesSync(runPath(id, dir), (startedAt + 1000) / 1000, (startedAt + 1000) / 1000);
+  return next;
+}
 it.each([7109, 7120])('abandons #%s after 30 minutes without claiming effects applied or rewriting the run', pr => {
   const r = fixture(pr), path = runPath(r.id, dir), bytes = readFileSync(path), mtime = statSync(path).mtimeMs;
   if (pr === 7120) expect(r.effects.filter(e => e.status === 'applied')).toHaveLength(5);
@@ -85,6 +94,17 @@ it('keeps younger-than-threshold effects and preserves six-hour retention for ot
   writeRun(other, dir); utimesSync(runPath(other.id, dir), (now - 31 * MIN) / 1000, (now - 31 * MIN) / 1000);
   expect(op(['--apply']).result.kept.young).toEqual([young.id, other.id]);
 });
+it.each(['pending', 'in-flight', 'other'])('explicit thresholdMs wins for %s runs, including --run selection', status => {
+  const r = fixture();
+  r.effects = status === 'other' ? [] : [{ ...r.effects[1], status }];
+  r.pending = { kind: status === 'other' ? 'judge' : 'effect', step: 'record', stepIndex: 9 };
+  writeRun(r, dir);
+  utimesSync(runPath(r.id, dir), (now - 31 * MIN) / 1000, (now - 31 * MIN) / 1000);
+  expect(op([`--run=${r.id}`, '--apply'], { thresholdMs: 60 * MIN }).result.kept.young).toEqual([r.id]);
+  expect(isRunAbandoned(r.id, dir)).toBe(false);
+  expect(op([`--run=${r.id}`, '--apply'], { thresholdMs: 20 * MIN }).result.reaped).toEqual([r.id]);
+  expect(JSON.parse(readFileSync(abandonedPath(r.id, dir), 'utf8')).probes).toMatchObject({ thresholdMs: 20 * MIN, thresholdSource: 'argument' });
+});
 it.each(['confirm', 'mandatoryReferrals', 'resumed'])('keeps %s continuations on the shorter path', kind => {
   const r = fixture();
   if (kind === 'resumed') r.resumeOf = 'earlier';
@@ -103,11 +123,11 @@ it.each(['unreadable', 'oversized', 'changed'])('keeps %s evidence; unreadable p
   if (mode !== 'changed') expect(err.mock.calls.flat().join(' ')).toContain('restore probe access and retry');
   expect(isRunAbandoned(r.id, dir)).toBe(false);
 });
-it.each([readDrainRedTeamEvidence, readRecoveryWitness])('gate reader ignores tombstones but retains non-tombstoned and rewritten holds', reader => {
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('gate reader requires a fresh review after abandonment and retains rewritten holds', reader => {
   const r = fixture();
   expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-unfinished' });
   op(['--apply']);
-  expect(evidence(7109, reader)).not.toMatchObject({ reason: 'review-unfinished' });
+  expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
   expect(evidence(7109, reader).loopPayload).toBeFalsy();
   r.findings.progress = 'new writer'; writeRun(r, dir);
   // Even an old mtime cannot revive a version-bound tombstone after rewriting the record.
@@ -115,13 +135,89 @@ it.each([readDrainRedTeamEvidence, readRecoveryWitness])('gate reader ignores to
   expect(isRunAbandoned(r.id, dir)).toBe(false);
   expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-unfinished' });
 });
-it('complete same-head read skips an abandoned run outside its summary cache', () => {
+it('complete same-head read keeps abandonment owed outside its warm summary cache until a newer completed panel', () => {
   const r = fixture();
   const before = evidence();
   expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + MIN })).toEqual({ complete: true, blocked: true });
   op(['--apply']);
   // New time avoids the per-lookup answer memo; exercises the warm record-summary cache.
-  expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + 2 * MIN })).toEqual({ complete: true, blocked: false });
+  expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + 2 * MIN })).toEqual({ ok: false, reason: 'review-abandoned', complete: true, blocked: true });
+  completed(r, now - MIN);
+  expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + 3 * MIN })).toEqual({ complete: true, blocked: false });
+});
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('does not resurrect older same-head acceptance, even if its mtime is newer', reader => {
+  const r = fixture();
+  const old = completed(r, now - 60 * MIN, 'review-pr-old');
+  utimesSync(runPath(old.id, dir), now / 1000, now / 1000);
+  op(['--apply']);
+  expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
+  const next = completed(r, now - MIN);
+  const result = evidence(7109, reader);
+  expect(result.ok).not.toBe(false);
+  expect(result.loopPayload ?? result.newest).toMatchObject({ id: next.id });
+});
+it.each(['same start', 'older start', 'other head', 'pending', 'refused'])('requires a NEWER completed SAME-head panel: %s cannot discharge abandonment', kind => {
+  const r = fixture(), before = evidence();
+  op(['--apply']);
+  const startedAt = Date.parse(r.stepTimings[0].startedAt);
+  const next = completed(r, kind === 'same start' ? startedAt : kind === 'older start' ? startedAt - MIN : now - MIN,
+    'review-pr-replacement', kind === 'other head' ? 'b'.repeat(40) : head);
+  if (['pending', 'refused'].includes(kind)) {
+    next.effects = [{ ...r.effects[1], status: kind,
+      ...(kind === 'refused' ? { attempts: 1, error: 'SELF-CLEAR REFUSED before any write' } : {}) }]; writeRun(next, dir);
+  }
+  expect(evidence()).toMatchObject({ ok: false, reason: 'review-abandoned' });
+  expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + MIN })).toMatchObject({ ok: false, reason: 'review-abandoned', blocked: true });
+});
+it.each([null, { verdict: 'needs-human' }, { verdict: 'prevention-outstanding' }])('tombstoned verdict %j owes a fresh panel and is never comment-settleable', verdict => {
+  const r = fixture(); r.verdict = verdict;
+  writeRun(r, dir);
+  markRunAbandoned({ id: r.id, dir, now, reason: 'historical tombstone', by: 'fixture', probes: {} });
+  const result = evidence();
+  expect(result).toMatchObject({ ok: false, reason: 'review-abandoned' });
+  expect(COMMENT_SETTLEABLE_REASONS).not.toContain('review-abandoned');
+  expect(settleUnknownEvidenceByComment(result, [], 7109, head)).toBe(result);
+  completed(r, now - MIN);
+  expect(evidence().ok).not.toBe(false);
+});
+it.each(['missing head', 'missing start'])('unreadable abandoned %s never proves a replacement', kind => {
+  const r = fixture();
+  if (kind === 'missing head') delete r.findings.read.netBasis.rev;
+  else r.stepTimings = [];
+  writeRun(r, dir);
+  markRunAbandoned({ id: r.id, dir, now, reason: 'historical tombstone', by: 'fixture', probes: {} });
+  completed(r, now - MIN);
+  expect(evidence()).toMatchObject({ ok: false, reason: 'review-abandoned' });
+});
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('a capped scan cannot hide an unread startless tombstone behind newer acceptance', reader => {
+  const r = fixture(); r.stepTimings = [];
+  writeRun(r, dir); utimesSync(runPath(r.id, dir), (now - 31 * MIN) / 1000, (now - 31 * MIN) / 1000);
+  markRunAbandoned({ id: r.id, dir, now, reason: 'historical tombstone', by: 'fixture', probes: {} });
+  completed(r, now - MIN);
+  const warnings = [];
+  const result = reader({ repo, pr: 7109, head, runsDir: dir, env, now, readScorecards: () => [],
+    scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, env: {} }, warn: message => warnings.push(message) });
+  expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(warnings.join(' ')).toContain('HOLD and inspect omitted runs');
+});
+it.each(['changes', 'unknown', {}, false, 0, '', { outcome: 'needs-work' }].flatMap(verdict =>
+  ['pending', 'refused'].map(status => [verdict, status])))('rejecting verdict %j with %s effect is kept and a historical tombstone still holds', (verdict, status) => {
+  const r = fixture(); r.verdict = verdict; r.effects = [{ ...r.effects[1], status,
+    ...(status === 'refused' ? { attempts: 1, error: 'SELF-CLEAR REFUSED before any write' } : {}) }];
+  r.outcome = status === 'refused' ? 'refused' : null;
+  if (status === 'refused') r.pending = null;
+  writeRun(r, dir); utimesSync(runPath(r.id, dir), (now - 8 * 60 * MIN) / 1000, (now - 8 * 60 * MIN) / 1000);
+  const before = evidence();
+  expect(before).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  expect(op(['--apply']).result.kept['rejecting-verdict']).toEqual([r.id]);
+  expect(isRunAbandoned(r.id, dir)).toBe(false);
+  completed(r, now - 60 * MIN, 'review-pr-old');
+  markRunAbandoned({ id: r.id, dir, now, reason: 'historical tombstone', by: 'fixture', probes: {} });
+  expect(isRunAbandoned(r.id, dir)).toBe(true);
+  for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+    expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  }
+  expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + MIN })).toEqual({ complete: true, blocked: true });
 });
 it('planner ignores abandoned parked runs, including cached/injected evidence, and sees rewrites again', () => {
   const r = fixture(), pr = { number: 7109, headRefOid: head, comments: [] };

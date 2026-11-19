@@ -9,6 +9,13 @@ import * as nodeFs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { runPath, resolveRunsDir } from '../operations/run-store.mjs';
 
+/** A present, unknown verdict is a rejection: abandonment must never erase a send-back. */
+export function hasRejectingReviewVerdict(run) {
+  if (run.verdict === undefined || run.verdict === null) return false;
+  const verdict = typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict;
+  return !['accept', 'prevention-outstanding', 'needs-human'].includes(verdict);
+}
+
 export function abandonedPath(id, dir = resolveRunsDir()) {
   return runPath(id, dir).replace(/\.json$/, '.abandoned.json');
 }

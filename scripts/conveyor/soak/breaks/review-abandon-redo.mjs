@@ -32,8 +32,32 @@ async function replay(sourceRoot) {
       reaperOptions: { dir, env, now, tool: {}, probes: { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' } } });
     if (code !== 0 || !result?.reaped.includes(id)) throw Error('dead stuck effect was not abandoned');
     const after = gate();
-    if (after.reason === 'review-unfinished' || after.loopPayload) throw Error('abandoned run still supplies review evidence');
+    if (after.ok !== false || after.reason !== 'review-abandoned' || after.loopPayload) throw Error('abandoned run did not require a fresh review');
     if (before !== readFileSync(runPath(id, dir), 'utf8')) throw Error('abandonment rewrote the unknown effect');
+    // An older completed accept must never become authoritative again, even when touched later.
+    const older = structuredClone(run);
+    older.id = 'review-pr-soak-older'; older.pending = null; older.effects = [];
+    older.stepTimings[0].startedAt = new Date(now - 60 * 60000).toISOString();
+    writeRun(older, dir);
+    if (gate().ok !== false || gate().reason !== 'review-abandoned') throw Error('older acceptance discharged abandonment');
+    const fresh = structuredClone(older);
+    fresh.id = 'review-pr-soak-fresh'; fresh.stepTimings[0].startedAt = new Date(now - 60000).toISOString();
+    writeRun(fresh, dir);
+    const released = gate();
+    if (released.ok === false || released.loopPayload?.id !== fresh.id) throw Error('newer completed same-head review did not release abandonment');
+
+    const rejecting = structuredClone(run);
+    rejecting.id = 'review-pr-soak-rejecting'; rejecting.input.pr = pr + 1;
+    rejecting.verdict = { verdict: 'changes' }; rejecting.findings.read.pr = pr + 1;
+    writeRun(rejecting, dir);
+    utimesSync(runPath(rejecting.id, dir), (now - 31 * 60000) / 1000, (now - 31 * 60000) / 1000);
+    const rejectedCode = main([`--run=${rejecting.id}`, '--apply', '--json'], {
+      out: text => { result = JSON.parse(text); }, err: () => {},
+      reaperOptions: { dir, env, now, tool: {}, probes: { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' } },
+    });
+    if (rejectedCode !== 0 || result.reaped.length || !result.kept['rejecting-verdict']?.includes(rejecting.id)) throw Error('rejecting stuck run was abandoned');
+    const held = readDrainRedTeamEvidence({ repo, pr: pr + 1, head, runsDir: dir, env, now, readScorecards: () => [] });
+    if (held.ok !== false || held.reason !== 'review-unfinished') throw Error('rejecting stuck run stopped holding');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

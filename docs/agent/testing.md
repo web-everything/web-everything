@@ -4809,7 +4809,11 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 `run.mjs review-abandon [--run=<review-pr-id>] [--apply] [--json]` shares the session-reaper's
 liveness probes and version-bound sidecars. A pending effect uses `reviewRunReaper.abandonStuckAfterMinutes`
 (default 30; `WE_REAP_DEAD_REVIEW_RUNS_STUCK_AFTER_MINUTES` overrides it); other dead cursors retain
-the six-hour horizon. Confirm, mandatory-referral and resumed continuations stay kept. Abandonment
-never reconciles unknown effects: readers exclude the unchanged tombstoned record, so a new panel
-is owed. Test cached readers and rewritten records as well as the operation; a record rewrite invalidates
+the six-hour horizon. An explicit `thresholdMs` argument overrides both horizons for every run.
+Confirm, mandatory-referral, resumed and rejecting-verdict continuations stay kept. Abandonment
+never reconciles unknown effects: planners exclude the unchanged tombstoned record so a new panel
+starts. Gates return `review-abandoned` until a completed same-head panel has a strictly later read
+start; older acceptance and result comments cannot discharge it. Historical tombstones on rejecting
+or unrecognised verdicts retain their original holds. The queue treats `review-abandoned` as a
+non-runnable wait without paging a human. Test cached readers and rewritten records as well as the operation; a record rewrite invalidates
 the tombstone. The `review-abandon-redo` soak detects the fix by running the operation and gate.

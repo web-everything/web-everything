@@ -48,6 +48,21 @@ function fixture(over = {}) {
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
 
+it.each(['readEvidence', 'readWitness'])('%s review-abandoned waits without dispatch, settlement, or a human confirmation page', reader => {
+  const escalate = vi.fn(), settlePending = vi.fn(), readReviewRuns = vi.fn();
+  const o = runFixture({ [reader]: () => ({ ok: false, reason: 'review-abandoned' }),
+    escalate, settlePending, readReviewRuns });
+  const row = runRedTeamOnSkip(o).rows[0];
+  expect(row).toMatchObject({ action: 'skip', why: 'review-abandoned' });
+  expect(row.escalate).not.toBe(true);
+  expect(row).not.toHaveProperty('escalationContext');
+  expect(row).not.toHaveProperty('settle');
+  expect(o.dispatch).not.toHaveBeenCalled();
+  expect(escalate).not.toHaveBeenCalled();
+  expect(settlePending).not.toHaveBeenCalled();
+  expect(readReviewRuns).not.toHaveBeenCalled();
+});
+
 describe('unfinished CI-held record retry', () => {
   const saved = (attempts = 1, error = 'review held: CI still pending on reviewed head', counters = {}) => reviewRunEvidence({
     id: 'review-pr-ci-held', op: 'review-pr', pending: { kind: 'effect', step: 'record' },
@@ -1155,6 +1170,20 @@ describe('operator clearance for a stored not-owed head with no result', () => {
     expect(o.settlePending).toHaveBeenCalledOnce();
     expect(o.publishCheck.mock.invocationCallOrder[0]).toBeLessThan(o.settlePending.mock.invocationCallOrder[0]);
     expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('abandonment appearing at fresh settlement waits without publishing, settling, or paging a human', () => {
+    const o = operatorFixture(), escalate = vi.fn();
+    const initial = o.readEvidence();
+    o.readEvidence = vi.fn().mockReturnValueOnce(initial).mockReturnValue({ ok: false, reason: 'review-abandoned' });
+    o.escalate = escalate;
+    const row = runRedTeamOnSkip(o).rows[0];
+    expect(row).toMatchObject({ action: 'skip', why: 'review-abandoned', escalate: false });
+    expect(row).not.toHaveProperty('settle');
+    expect(row).not.toHaveProperty('escalationContext');
+    expect(o.publishCheck).not.toHaveBeenCalled();
+    expect(o.settlePending).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(escalate).not.toHaveBeenCalled();
   });
   it('refuses operator-cleared not-owed publication over an unreadable stored seal', () => {
     const o = operatorFixture();

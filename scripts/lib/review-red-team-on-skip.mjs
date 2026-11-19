@@ -959,11 +959,12 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         }
       } catch (error) { row.settleError = safeErrorText(error); }
     };
-    const holdUnfinishedReview = row => {
-      row.action = 'skip'; row.why = 'review-unfinished'; row.escalate = true;
-      row.escalationContext = UNFINISHED_REVIEW_CONTEXT;
+    const holdUnfinishedReview = (row, reason) => {
+      row.action = 'skip'; row.why = reason; row.escalate = reason === 'review-unfinished';
+      if (row.escalate) row.escalationContext = UNFINISHED_REVIEW_CONTEXT;
+      else delete row.escalationContext;
       delete row.settle;
-      escalateRow(row);
+      if (row.escalate) escalateRow(row);
     };
     const freshSettlement = row => {
       const live = provider.readPrState(repo, row.prNumber);
@@ -990,8 +991,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
-      if (fresh?.why === 'review-unfinished' && fresh.escalate) {
-        holdUnfinishedReview(row);
+      if (fresh?.why === 'review-abandoned' || fresh?.why === 'review-unfinished' && fresh.escalate) {
+        holdUnfinishedReview(row, fresh.why);
         return null;
       }
       if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head) {

@@ -36,7 +36,7 @@ function sweep(more = {}) { return reapDeadReviewRuns({ dir, now, env, probes, l
 function kept(reason, more = {}) { expect(sweep(more).kept[reason]).toEqual(['review-dead']); }
 
 it('apply creates exactly one sidecar and preserves run bytes, mtime, verdict and effects', () => {
-  const original = record(undefined, { verdict: { outcome: 'needs-work' }, effects: [effect('in-flight')] });
+  const original = record(undefined, { verdict: { verdict: 'accept' }, effects: [effect('in-flight')] });
   const path = runPath(original.id, dir), before = readFileSync(path), mtime = statSync(path).mtimeMs;
   expect(sweep().reaped).toEqual([original.id]);
   expect(readFileSync(path)).toEqual(before); expect(statSync(path).mtimeMs).toBe(mtime);
@@ -48,6 +48,14 @@ it('apply creates exactly one sidecar and preserves run bytes, mtime, verdict an
   expect(sweep().kept.abandoned).toEqual([original.id]);
   expect(readFileSync(abandonedPath(original.id, dir))).toEqual(bytes);
   expect(readdirSync(dir).filter(f => f.endsWith('.abandoned.json'))).toHaveLength(1);
+});
+it('retains a malformed needs-work verdict without creating a sidecar or changing its bytes', () => {
+  const original = record(undefined, { verdict: { outcome: 'needs-work' }, effects: [effect('in-flight')] });
+  const path = runPath(original.id, dir), before = readFileSync(path), mtime = statSync(path).mtimeMs;
+  expect(sweep().kept['rejecting-verdict']).toEqual([original.id]);
+  expect(readFileSync(path)).toEqual(before); expect(statSync(path).mtimeMs).toBe(mtime);
+  expect(isRunAbandoned(original.id, dir)).toBe(false);
+  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
 });
 it('never manufactures a verdict when the verdict is null', () => {
   record(); sweep(); expect(tryReadRun('review-dead', dir).verdict).toBeNull();

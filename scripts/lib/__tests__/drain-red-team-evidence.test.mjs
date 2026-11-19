@@ -1617,6 +1617,15 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
   const settle = (ev, comments, reviews = []) => settleUnknownEvidenceByComment(ev, comments, pr, head, reviews);
   const review = (state, at, login = 'chalbert') => ({ state, submittedAt: iso(at), author: { login } });
 
+  it('never settles review-abandoned with a trusted result and later operator acceptance', () => {
+    const evidence = { ok: false, reason: 'review-abandoned', settleBounds: bounds() };
+    expect(settle(evidence, [result(), accept()])).toBe(evidence);
+  });
+  it('propagates review-abandoned discovered by the complete same-head read instead of settling older evidence', () => {
+    const evidence = unknown({ completeHeadRead: () => ({ ok: false, reason: 'review-abandoned', complete: true, blocked: true }) });
+    expect(settle(evidence, [result(), accept()])).toEqual({ ok: false, reason: 'review-abandoned' });
+  });
+
   it('holds when a formal COMMENTED review was submitted after the accept (operator hold)', () => {
     expect(settle(unknown(), [result(), accept()], [review('COMMENTED', T + 20 * 60e3)])).toMatchObject({ ok: false });
   });

@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { listRunIds, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
-import { isRunAbandoned, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
+import { hasRejectingReviewVerdict, isRunAbandoned, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
 import { reviewJobsDir, readJobRecord } from '../operations/review-job-store.mjs';
 import { parseJobHandle } from '../operations/job-record.mjs';
 import { pidIdentity } from './pid-alive.mjs';
@@ -95,6 +95,7 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     catch { result.scanned++; keep('unreadable', id); continue; }
     if (record.op !== 'review-pr') continue;
     result.scanned++;
+    if (hasRejectingReviewVerdict(record)) { keep('rejecting-verdict', id); continue; }
     if (io.isRunRecordTerminal(record)) { keep('terminal', id); continue; }
     if (isRunAbandoned(id, dir)) { keep('abandoned', id); continue; }
     if (!Array.isArray(record.effects) || record.effects.some(e => !e || typeof e.type !== 'string' || typeof e.status !== 'string')) {
@@ -114,8 +115,9 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     const ageMs = now - stat.mtimeMs;
     const stuck = pending?.kind === 'effect' || record.effects.some(active);
     // A confirm/referral/resumed cursor above still belongs to its existing continuation, even when old.
-    const threshold = stuck ? result.stuckThresholdMs : result.thresholdMs;
-    const thresholdSource = stuck ? result.stuckThresholdSource : result.thresholdSource;
+    const useStuckThreshold = stuck && thresholdMs === undefined;
+    const threshold = useStuckThreshold ? result.stuckThresholdMs : result.thresholdMs;
+    const thresholdSource = useStuckThreshold ? result.stuckThresholdSource : result.thresholdSource;
     if (ageMs < threshold) { keep('young', id); continue; }
     const stuckEffect = stuck ? { pending: pending ?? null,
       effects: record.effects.map(({ step, type, status, unknownAttempts }) => ({ step, type, status, unknownAttempts })) } : null;
