@@ -2068,6 +2068,7 @@
   "scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/lane-git-inherited-location.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/lane-local-guard-loaded-as-hook.soak.test.mjs": 0.33,
+  "scripts/conveyor/soak/breaks/merge-gate-verdict-log-escape-sequences.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/large-queue-slow-already-done.soak.test.mjs": 5.97,
   "scripts/conveyor/soak/breaks/large-reap-backlog-starves-dispatch.soak.test.mjs": 59.84,
   "scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs": 0.32,
