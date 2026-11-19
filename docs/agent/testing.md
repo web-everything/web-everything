@@ -5183,3 +5183,25 @@ archive claims, oversized journals and payload identity mismatches. Run it along
 consume the injected listing seam when the journal is missing: existing index fallback
 fixtures use that seam to replace a payload atomically between verification and scanning.
 Journal candidates and fallback reads share the same parse budget and file-identity cache.
+
+Journal rows carry append-time `at` milliseconds (seed rows use file `mtimeMs`).
+Readers stat each listed run: missing/non-finite timestamps, stat failures, or a file
+mtime more than 10 seconds after its last journal row make it an unknown candidate.
+Exclusion also requires a matching `[dev, ino, size, mtimeMs]` identity; timestamps
+alone never prove a key. `writeRun` records the validated temporary file's identity
+before its atomic rename, and seed validates unchanged identity around its read.
+Legacy identity-less rows require parsing. Same-window replacements (including
+identical mtimes) must reveal newer rejections while unchanged other-PR files stay excluded.
+A lone other-PR key cannot hide a later direct replacement. Filename/payload ID
+mismatches retain an unreadable-record error through journal/index fallback and
+must never allow an older acceptance to win. The real-filesystem journal suite
+covers both paths with ample parse budget and unchanged other-PR parse exclusion.
+
+The `default journal lookup` regressions in `review-run-index.test.mjs` use real files
+and both public readers without injecting a lookup, listing, read or stat implementation.
+They defend newer rejections against omitted/conflicting/stale-key/torn/invalid lines,
+require a capped fallback for mismatched payload identities/keys, and prove that a
+completed journal scan keeps exact-head absence. For mutation verification, temporarily
+remove each candidate-inclusion, conflict, newline, payload-verification or completed-scan
+guard, run its named case through heavy admission, and require an assertion failure;
+restore the source after each mutation before running the unmodified scoped suite.

@@ -35,13 +35,16 @@ const keyOf = (repo, pr) => typeof repo === 'string' && /^[\w.-]+\/[\w.-]+$/.tes
 export const reviewRunIndexPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.json`);
 /** Append-only discovery journal; payloads remain the authority. */
 export const reviewRunJournalPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.jsonl`);
+const journalIdentity = metadata => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs];
+const validJournalIdentity = identity => Array.isArray(identity) && identity.length === 4
+  && identity.every(Number.isFinite);
 const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
 
 /** One O_APPEND write before payload publication; the writer owns best-effort error handling. */
-export function appendReviewRunJournal(record, runsDir) {
+export function appendReviewRunJournal(record, runsDir, at = Date.now(), metadata) {
   const key = keyOf(record?.input?.repo, record?.input?.pr);
   if (record?.op !== 'review-pr' || !reviewId(record.id) || !key) return false;
-  const bytes = Buffer.from(`${JSON.stringify({ id: record.id, key })}\n`);
+  const bytes = Buffer.from(`${JSON.stringify({ id: record.id, key, at, identity: metadata && journalIdentity(metadata) })}\n`);
   const fd = openSync(reviewRunJournalPath(runsDir), 'a');
   try {
     if (writeSync(fd, bytes) !== bytes.length) throw Error('short review journal write');
@@ -63,15 +66,18 @@ function journalKeys(runsDir) {
     if (!reviewId(row?.id) || typeof row.key !== 'string') continue;
     const match = /^([\w.-]+\/[\w.-]+)#([1-9][0-9]*)$/.exec(row.key);
     if (!match || keyOf(match[1], match[2]) !== row.key) continue;
-    if (!keys.has(row.id)) keys.set(row.id, row.key);
-    else if (keys.get(row.id) !== row.key) keys.set(row.id, null); // Conflicts remain unknown.
+    const prior = keys.get(row.id);
+    const key = prior && prior.key !== row.key ? null : row.key;
+    keys.set(row.id, { key, at: row.at, identity: row.identity }); // Conflicts remain unknown; timestamp is always the last line's.
   }
   return keys;
 }
 
 /** Complete candidate set, or null to request the bounded fallback. The non-enumerable
  * journalSet identifies candidates requiring full key verification by the payload reader. */
-export function readJournalCandidates(runsDir, repo, pr, { list = listReviewIds } = {}) {
+export function readJournalCandidates(runsDir, repo, pr, {
+  list = listReviewIds, stat = id => statSync(join(runsDir, `${id}.json`)),
+} = {}) {
   try {
     const key = keyOf(repo, pr);
     if (!key) return null;
@@ -87,7 +93,15 @@ export function readJournalCandidates(runsDir, repo, pr, { list = listReviewIds 
       const ids = [], journalSet = new Set();
       let unjournaled = 0;
       for (const id of after.ids) {
-        const target = keys.get(id);
+        const entry = keys.get(id);
+        let target = entry?.key;
+        try {
+          const metadata = stat(id);
+          if (!validJournalIdentity(entry?.identity)
+            || JSON.stringify(entry.identity) !== JSON.stringify(journalIdentity(metadata))
+            || !Number.isFinite(entry?.at) || !Number.isFinite(metadata.mtimeMs)
+            || metadata.mtimeMs > entry.at + 10_000) target = null;
+        } catch { target = null; }
         if (target == null) { ids.push(id); unjournaled++; }
         else if (target === key) { ids.push(id); journalSet.add(id); }
       }
@@ -98,17 +112,22 @@ export function readJournalCandidates(runsDir, repo, pr, { list = listReviewIds 
 }
 
 /** Seed readable, previously unjournaled records without rewriting concurrent appends. */
-export function seedReviewRunJournal({ runsDir, list = listReviewIds, read = id => readRecord(runsDir, id) } = {}) {
+export function seedReviewRunJournal({ runsDir, list = listReviewIds, read = id => readRecord(runsDir, id),
+  stat = id => statSync(join(runsDir, `${id}.json`)),
+} = {}) {
   let keys;
   try { keys = journalKeys(runsDir); }
   catch (error) { if (error.code !== 'ENOENT') throw error; keys = new Map(); }
   const counts = { seeded: 0, already: 0, skipped: 0 };
   for (const id of list(runsDir).filter(reviewId)) {
-    if (keys.get(id)) { counts.already++; continue; }
+    if (keys.get(id)?.key && validJournalIdentity(keys.get(id).identity)) { counts.already++; continue; }
     try {
+      const before = stat(id);
       const run = read(id, runsDir);
       recordKey(run, id);
-      if (appendReviewRunJournal(run, runsDir)) counts.seeded++;
+      const after = stat(id);
+      if (JSON.stringify(journalIdentity(before)) !== JSON.stringify(journalIdentity(after))) throw Error('run changed during journal seed');
+      if (appendReviewRunJournal(run, runsDir, after.mtimeMs, after)) counts.seeded++;
       else counts.skipped++;
     } catch { counts.skipped++; }
   }

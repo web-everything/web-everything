@@ -1,12 +1,13 @@
 // @vitest-environment node
 import { afterEach, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
 import { readDrainRedTeamEvidence, readRecoveryWitness } from '../drain-red-team-evidence.mjs';
-import { backfillAllReviewRuns, readCompleteReviewRunsForPr, appendReviewRunIndex, backfillOpenReviewRuns, backfillReviewRunIndex, readReviewRunIndex, reviewRunIndexPath, reviewRunJournalPath } from '../review-run-index.mjs';
+import { backfillAllReviewRuns, readCompleteReviewRunsForPr, appendReviewRunIndex, backfillOpenReviewRuns, backfillReviewRunIndex, readReviewRunIndex, reviewRunIndexPath, reviewRunJournalPath, readJournalCandidates } from '../review-run-index.mjs';
 
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { headNeverReviewedFromRuns } from '../review-red-team-on-skip.mjs';
 
 const roots = [];
@@ -773,7 +774,11 @@ const journalReaders = [
   { name: 'drain', reader: readDrainRedTeamEvidence },
   { name: 'recovery', reader: readRecoveryWitness },
 ];
-const journalLine = (id, key) => `${JSON.stringify({ id, key })}\n`;
+// Fresh hints use timestamped rows; legacy missing-at refusal is covered by the filesystem suite.
+const journalLine = (f, id, key) => {
+  const metadata = statSync(join(f.runsDir, `${id}.json`));
+  return `${JSON.stringify({ id, key, at: Date.now(), identity: [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs] })}\n`;
+};
 function journalPayload(f, run, at) {
   writeFileSync(join(f.runsDir, `${run.id}.json`), JSON.stringify(run));
   utimesSync(join(f.runsDir, `${run.id}.json`), at, at);
@@ -786,7 +791,7 @@ it.each(journalReaders)('$name default journal lookup keeps completed absence wi
   const unrelated = { ...f.run, id: 'review-pr-unrelated', input: { repo: f.repo, pr: 8 } };
   journalPayload(f, differentHead, 2);
   journalPayload(f, unrelated, 100);
-  writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f.run.id, 'o/r#7') + journalLine(unrelated.id, 'o/r#8'));
+  writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f, f.run.id, 'o/r#7') + journalLine(f, unrelated.id, 'o/r#8'));
   const result = reader({ ...f, scanSettings: journalBudget(1), warn: () => {} });
   expect(result.ok).not.toBe(false);
   expect(result.loopPayload ?? result.newest ?? null).toBeNull();
@@ -799,10 +804,10 @@ for (const kind of ['omitted', 'conflicting', 'stale-key', 'torn', 'invalid JSON
       stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
     journalPayload(f, f.run, 2);
     journalPayload(f, newer, 100);
-    const current = journalLine(newer.id, 'o/r#7'), stale = journalLine(newer.id, 'o/r#8');
+    const current = journalLine(f, newer.id, 'o/r#7'), stale = journalLine(f, newer.id, 'o/r#8');
     const suffix = { omitted: '', conflicting: current + stale, 'stale-key': stale + current,
       torn: stale.trimEnd(), 'invalid JSON': `{"id":"${newer.id}","key":\n` }[kind];
-    writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f.run.id, 'o/r#7') + suffix);
+    writeFileSync(reviewRunJournalPath(f.runsDir), journalLine(f, f.run.id, 'o/r#7') + suffix);
     const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
     expect(result.ok).not.toBe(false);
     expect(result.loopPayload ?? result.newest).toEqual(newer);
@@ -823,9 +828,37 @@ for (const field of ['id', 'op', 'repo', 'pr', 'unjournaled id']) {
     utimesSync(join(f.runsDir, `${f.run.id}.json`), 2, 2);
     journalPayload(f, unrelated, 100);
     writeFileSync(reviewRunJournalPath(f.runsDir),
-      (field === 'unjournaled id' ? '' : journalLine(f.run.id, 'o/r#7')) + journalLine(unrelated.id, 'o/r#8'));
+      (field === 'unjournaled id' ? '' : journalLine(f, f.run.id, 'o/r#7')) + journalLine(f, unrelated.id, 'o/r#8'));
     const result = reader({ ...f, scanSettings: journalBudget(1), warn: () => {} });
     expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
     expect(result.loopPayload ?? result.newest ?? null).toBeNull();
   });
 }
+
+
+it.each(journalReaders.flatMap(reader => [0, 5000].map(gapMs => ({ ...reader, gapMs }))))(
+  '$name default journal lookup returns a rejection replacing an other-PR file within the 10-second allowance (gap=$gapMs ms)',
+  ({ reader, gapMs }) => {
+    const f = fixture();
+    writeRun(f.run, f.runsDir);
+    const other = { ...f.run, id: 'review-pr-replaced-other', input: { repo: f.repo, pr: 8 } };
+    writeRun(other, f.runsDir);
+    const row = readFileSync(reviewRunJournalPath(f.runsDir), 'utf8').trimEnd().split('\n')
+      .map(text => JSON.parse(text)).find(row => row.id === other.id);
+    expect(row.key).toBe('o/r#8');
+    expect(readJournalCandidates(f.runsDir, f.repo, f.pr).ids).toEqual([f.run.id]);
+    const rejection = { ...f.run, id: other.id, verdict: { verdict: 'changes' },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(Date.now()).toISOString() }] };
+    const path = join(f.runsDir, `${other.id}.json`);
+    writeJsonAtomic(path, rejection); // Bypass journal maintenance, as a direct replacement does.
+    const at = (row.at + gapMs) / 1000;
+    utimesSync(path, at, at);
+    expect(Math.abs(statSync(path).mtimeMs - row.at)).toBeLessThan(10_000);
+    expect(readJournalCandidates(f.runsDir, f.repo, f.pr)).toMatchObject({
+      ids: [f.run.id, other.id].sort(), unjournaled: 1,
+    });
+    const result = reader({ ...f, scanSettings: journalBudget(2), warn: () => {} });
+    expect(result.ok).not.toBe(false);
+    expect(result.loopPayload ?? result.newest).toEqual(rejection);
+  },
+);

@@ -477,8 +477,9 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           && (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))))) {
           // A payload with a different identity must never reappear as a verdict
           // when the fallback reuses this verified file's cached read.
-          if (journalSet && run?.id !== id) indexReads.set(id, null);
-          throw Error('unverified review index entry');
+          const error = Error('unverified review index entry');
+          if (run?.id !== id) indexReadErrors.set(id, error);
+          throw error;
         }
         return run;
       }, scanSettings, warn });
@@ -546,7 +547,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
     if (!scan) {
-      const journal = readJournalCandidates(runsDir, repo, pr, { list });
+      const journal = readJournalCandidates(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)) });
       if (journal !== null) {
         try {
           runScan(journal.ids, journal.journalSet);
@@ -563,7 +564,11 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
               parsed++;
               indexIdentities.set(id, identity);
               // Failed reads consume budget and retain the scan's unreadable-record refusal.
-              try { indexReads.set(id, read(id, runsDir)); }
+              try {
+                const run = read(id, runsDir);
+                if (run != null && run.id !== id) throw Error('unverified review index entry');
+                indexReads.set(id, run);
+              }
               catch (error) { indexReads.set(id, null); indexReadErrors.set(id, error); throw error; }
             }
             return indexReads.get(id);

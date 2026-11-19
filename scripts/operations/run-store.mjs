@@ -191,8 +191,11 @@ export function writeRun(record, dir = resolveRunsDir()) {
   assertRunRecord(record, 'run record being written');
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
-  try { appendReviewRunJournal(record, dir); } catch { /* discovery is best-effort */ }
-  writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes
+  writeJsonAtomic(path, record, { renameSyncFn: (tmp, destination) => {
+    // Bind the hint to the validated file BEFORE publication, including concurrent writers.
+    try { appendReviewRunJournal(record, dir, Date.now(), statSync(tmp)); } catch { /* discovery is best-effort */ }
+    renameSync(tmp, destination);
+  } });
   if (record.op === 'review-pr') {
     try { appendReviewRunIndex(record, dir); } catch { /* discovery is best-effort; never fail a persisted run */ }
   }
