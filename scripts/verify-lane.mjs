@@ -36,6 +36,7 @@
  *   node scripts/verify-lane.mjs                      # run the default full gate (whole unit tier + check:standards) foreground, record green/red for HEAD
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
+ *   node scripts/verify-lane.mjs --local              # force every heavy phase to run on THIS host (like `heavy-admission run --local`); marker records local:true. As valid as a remote verify: same suites.
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
  *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
@@ -135,6 +136,7 @@ for (const a of process.argv.slice(2)) {
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
 const AS_JSON = !!flags.json;
+const FORCE_LOCAL = flags.local === true; // --local: run every heavy phase on this host (no Forge dispatch); marker records local:true
 // #2833 finding 5 — resolve the gate options through the SHARED resolver so `check` mode agrees with pr-land:
 // `--require-verified` OR `WE_REQUIRE_VERIFIED=1`, and the `WE_LAND_UNVERIFIED=1` break-glass. Previously `check`
 // read only `flags['require-verified']`, so the same env produced two different verdicts at the two call sites.
@@ -636,7 +638,7 @@ if (MODE === 'request') {
   }
 }
 
-if (MODE !== 'run') writeMarker(verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }));
+if (MODE !== 'run') writeMarker({ ...verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }), ...(FORCE_LOCAL ? { local: true } : {}) });
 
 // #3105 — `request` stops HERE: the marker is stamped, nothing has run yet, and this call already returns
 // (`emit` calls `process.exit`). The actual suite run is picked up by `scripts/conveyor/verify-dispatch.mjs`
@@ -687,7 +689,11 @@ const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGat
 const admissionPhases = {};
 async function acquireAdmission(phase, command) {
   let decision = { remote: false, reason: localPhaseReason(command, { cwd: REPO }) };
-  if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
+  if (FORCE_LOCAL) {
+    // --local: never dispatch to Forge; every phase runs on this host under a local admission slot.
+    process.stderr.write('verify-lane: local admission (local-flag)\n');
+    decision = { remote: false, reason: 'local-flag' };
+  } else if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
   } else {
@@ -1217,7 +1223,7 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+writeMarker({ ...finished, ...(FORCE_LOCAL ? { local: true } : {}), ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
 try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
