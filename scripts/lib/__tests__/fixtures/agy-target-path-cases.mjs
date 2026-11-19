@@ -6,6 +6,7 @@ export const admissibleTargets = [
 ];
 export const refusedTargets = [
   'docs/a.test.mjs', 'docs/__tests__/a.test.ts',
+  'tests/a11y/rendered-site-a11y.spec.ts', 'tests/e2e/flow.spec.ts',
   'docs/Makefile', 'docs/Dockerfile', 'docs/install', 'docs/CODEOWNERS',
   'tests/run.sh', '__tests__/setup.mjs', 'src/__tests__/setup.js', 'tests/helper.py', 'src/a.test.sh',
   'scripts/__tests__/pr-merge-gate.test.js', 'scripts/__tests__/gate-entrypoint-integration.test.ts',

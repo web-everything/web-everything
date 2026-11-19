@@ -10,7 +10,9 @@ const isDirectory = p => {
 const isDocScope = p => isDoc(p) || p === 'docs' || p.startsWith('docs/') && isDirectory(p);
 const isTest = p => /\.(mjs|js|ts|cjs)$/.test(p)
   && (/(^|\/)(__tests__|tests)\//.test(p) || /\.(test|spec)\.[^/]+$/.test(p))
-  && !/(^|\/)setup(?:[.-]|Tests)/i.test(p);
+  && !/(^|\/)setup(?:[.-]|Tests)/i.test(p)
+  // Rendered-site gates (Playwright specs, a11y/e2e/conformance suites) are enforcement, not ordinary tests.
+  && !/^tests\/.*\.spec\.[^/]+$/.test(p) && !/(^|\/)(a11y|e2e|conformance|gates?)(\/|[.-])/i.test(p);
 // A test scope is a prefix only; every applied file is still checked by isTest, so no filesystem probe is needed.
 const isTestScope = p => isTest(p) || /(^|\/)(__tests__|tests)(\/|$)/.test(p) && !/\.[^/]+$/.test(p);
 /** Applied files must be prose or code tests; directory prefixes are scope-only. */

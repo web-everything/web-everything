@@ -119,7 +119,8 @@ function auditTranscript(text, clone) {
     throw new Error('incomplete or unsuccessful terminal transcript');
   for (const event of events) {
     const s = event?.step_update;
-    if (s?.step_type !== 'tool') continue;
+    // Anything that names a tool is a tool step whatever its step_type says (matches the juror's check).
+    if (s?.step_type !== 'tool' && s?.tool_name == null && s?.tool_info?.name == null) continue;
     const name = s.tool_name ?? s.tool_info?.name;
     if (/git/i.test(name ?? '') || /\bgit\b/i.test(JSON.stringify(s.tool_info?.parameters ?? {}))
       && /command|shell|exec/i.test(name ?? '')) throw new Error('agy git call');

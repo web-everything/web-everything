@@ -438,6 +438,7 @@ describe('escape evidence', () => {
       step_type: 'tool', tool_name: 'write_to_file', tool_info: { error: 'failed', parameters: { TargetFile: '/dev/null' } },
     } }],
     ['errored outside read', tool('view_file', { AbsolutePath: '/dev/null' }, { state: 'ERROR' })],
+    ['tool-named update with a non-tool step_type', tool('unknown_tool', {}, { step_type: 'mystery' })],
     ['mislabeled outside write event', { ...tool('write_to_file', { TargetFile: '/dev/null' }), event: 'unknown' }],
   ])('voids %s regardless of status or malformed parameters', async (_label, event) => {
     const f = fixture();
