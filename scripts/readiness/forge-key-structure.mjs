@@ -97,7 +97,7 @@ function encodedText(text) {
 function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
-  const stack=[];
+  const stack=[],visited=new Set();
   const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g
     :/"(?:\\[\s\S]|[^"\\])*"|[{}\[\]\ufffd]/g;
   for(const match of text.matchAll(tokens)) {
@@ -120,27 +120,35 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
         stack.length=0;continue;
       }
       if(stack.length>=64)throw EXHAUSTED;
-      stack.push({token,start:match.index});
-    } else if(token==='}'||token===']') {
+      stack.push({token,start:match.index});    } else if(token==='}'||token===']') {
       const open=stack.pop();
       // This pass already visits everything inside the container; only detect its members.
+      if(open&&open.token==='{'&&token==='}')visited.add(open.start);
       if(open&&open.token===(token==='}'?'{':'['))emit(Buffer.from(text.slice(open.start,match.index+1)),{expand:false});
     }
   }
   // Independent object candidates: global quote pairing above can be thrown off by stray double quotes in prose
   // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
   // from that brace only, bounded in length, so nothing before it can hide the object.
-  if(/kty/.test(text)) {
+  // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
+  if(/kty|\\u/i.test(text)) {
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
+      // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
+      // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
+      if(visited.has(at))continue;
+      // A JWK object opens with a quoted member name (after optional whitespace or comments).
+      if(!/^(?:\s|\/\/[^\r\n]*[\r\n]|\/\*[\s\S]*?\*\/)*"/.test(text.slice(at+1,at+4097)))continue;
       tick();
       const limit=Math.min(text.length,at+65536);
-      let depth=0;
+      let depth=0,closed=false;
       pieces.lastIndex=at;
       for(let piece=pieces.exec(text);piece&&pieces.lastIndex<=limit;piece=pieces.exec(text)) {
         if(piece[0]==='{')depth++;
-        else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});break;}
+        else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
       }
+      // A candidate longer than the bound is never silently skipped: fail closed.
+      if(!closed&&at+65536<text.length)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
