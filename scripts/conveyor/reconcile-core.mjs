@@ -519,9 +519,20 @@ export function reviewHoldGatesOnlyRed(rollup, requiredChecks) {
     || (name === 'merge-gate' && Boolean(mergeGate?.mergeGateReviewHold)));
 }
 
-/** PURE: required reds are exclusively review-owned holds, with all other required evidence green. */
-export function reviewHoldOnlyRed(rollup, requiredChecks) {
+/**
+ * PURE: required reds are exclusively review-owned holds, with all other required evidence green.
+ * @param {object[]} rollup Check rows to assess.
+ * @param {string[]} requiredChecks Required check names.
+ * @param {string} [headSha] When supplied, reject rows whose head_sha identifies another head.
+ * @returns {boolean} Whether only review-owned holds prevent green required CI.
+ * @example
+ * reviewHoldOnlyRed(rollup, ['test', 'review-gate'], headSha);
+ */
+export function reviewHoldOnlyRed(rollup, requiredChecks, headSha) {
   if (!reviewHoldGatesOnlyRed(rollup, requiredChecks)) return false;
+  // A check run from another head is never evidence for this head (strict gate: `wrong-head`).
+  if (headSha && Array.isArray(rollup) && rollup.some(row => row?.head_sha != null
+    && String(row.head_sha).toLowerCase() !== String(headSha).toLowerCase())) return false;
   const latest = collapseRollupToLatestPerName(rollup);
   const failing = splitFailingChecks(latest, requiredChecks).required;
   // Removing the proven holds must leave complete, readable green CI, never pending or unknown evidence.
@@ -1565,7 +1576,7 @@ function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }
   // Excuse only failed conclusions, preserving missing-head, wrong-head and incomplete-evidence refusals.
   const onlyFailures = ci.reason === 'ci-red' || (ci.affected.length > 0
     && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(row.reason.toUpperCase())));
-  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks));
+  const allowed = ci.allowed || (onlyFailures && reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, pr?.headRefOid));
   if (!allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci, ...earlyStartShadowFields(pr, requiredChecks),
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
@@ -2997,7 +3008,9 @@ export function planReconcile({
       // Card 273, #5157: review-pr INVARIANT 2 never accepts a review:human PR.
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
-        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason, ciWaived: true,
+        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason,
+          // A review-hold advisory waives only the held gate: any other required check still pending/red keeps the CI wait.
+          ciWaived: reason !== 'review-hold' || reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, pr?.headRefOid),
           why: reason === 'human-handoff'
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
