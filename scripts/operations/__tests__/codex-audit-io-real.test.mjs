@@ -1,5 +1,5 @@
 /** @file Real Git resolution and filesystem persistence for audit IO. */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
 import * as realFs from 'node:fs';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -102,7 +102,7 @@ describe('R1053 base reproduction IO', () => {
       expect(rows.map(row => row.cardLineHash)).toEqual([cardHash(firstLine), cardHash(nextLine)]);
     });
   });
-  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s persists both lines once and dropped needs-you blocks classification', async cls => {
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s blocks classification with persisted or dropped needs-you without filing another card', async cls => {
     await withRealRepo(async ({ root, tmp }) => {
       const cardsPath = join(tmp, 'cards.md'), indexPath = join(tmp, 'index.jsonl');
       const deps = createAuditDeps({ cwd: root, cardsPath, indexPath });
@@ -115,16 +115,21 @@ describe('R1053 base reproduction IO', () => {
       deps.fileCard(card);
       expect(readFileSync(cardsPath, 'utf8')).toBe(first);
       expect(readFileSync(indexPath, 'utf8')).toBe(index);
-      writeFileSync(cardsPath, first.split('\n').filter(l => !l.includes('[needs-you]')).join('\n'));
       const source = 'function X() {\n  return unsafeValue;\n}';
-      const result = classifyPreExisting({ findings: [{ text, sourceText: source }],
-        answers: parseReproAnswer(`#1 REPRODUCES SAME CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`, 1),
-        baseSha: 'a'.repeat(40), headSha: 'b'.repeat(40), readBaseFile: () => source,
-        changedLines: parseDiffChangedLines('diff --git a/y.mjs b/y.mjs\n--- a/y.mjs\n+++ b/y.mjs\n@@ -1 +1 @@\n-old\n+new\n', '1\t1\ty.mjs\n'), recheckMax: 6, protectedPaths: [],
-        auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
-        cardWritten: () => ({ written: true, expedite: true, needsYou: readFileSync(cardsPath, 'utf8').includes('[needs-you]') }) });
-      expect(result[0].blocking).toBe(true);
-      expect(result[0].reason).toContain('needs-you');
+      for (const needsYou of [true, false]) {
+        if (!needsYou) writeFileSync(cardsPath, first.split('\n').filter(l => !l.includes('[needs-you]')).join('\n'));
+        const cardsBefore = readFileSync(cardsPath, 'utf8');
+        const cardWritten = vi.fn(() => ({ written: true, expedite: true, needsYou: readFileSync(cardsPath, 'utf8').includes('[needs-you]') }));
+        const result = classifyPreExisting({ findings: [{ text, sourceText: source }],
+          answers: parseReproAnswer(`#1 REPRODUCES SAME CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`, 1),
+          baseSha: 'a'.repeat(40), headSha: 'b'.repeat(40), readBaseFile: () => source,
+          changedLines: parseDiffChangedLines('diff --git a/y.mjs b/y.mjs\n--- a/y.mjs\n+++ b/y.mjs\n@@ -1 +1 @@\n-old\n+new\n', '1\t1\ty.mjs\n'), recheckMax: 6, protectedPaths: [],
+          auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }, cardWritten });
+        expect(result[0]).toEqual({ blocking: true, reason: 'security finding; human review required' });
+        expect(cardWritten).not.toHaveBeenCalled();
+        expect(readFileSync(cardsPath, 'utf8')).toBe(cardsBefore);
+        expect(readFileSync(indexPath, 'utf8')).toBe(index);
+      }
     });
   });
   it('shadow adapter appends one JSON line to its injected path without touching cards or index', async () => {

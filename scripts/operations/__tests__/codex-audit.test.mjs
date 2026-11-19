@@ -599,7 +599,7 @@ describe('findAudit ordering and clock trust (#7011)', () => {
 describe('R1053 prove mode', () => {
   const source = 'function X() {\n  return unsafeValue;\n}\nfunction Y() {\n  return changedValue;\n}';
   const finding = 'x.mjs:2 unsafe return';
-  const reply = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
+  const reply = (cls = 'E1', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
     Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }),
@@ -623,7 +623,7 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.fileCard).toHaveBeenCalledOnce();
     const { cardLine } = f.deps.fileCard.mock.calls[0][0];
-    const text = `pre-existing audit finding (B2) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: ${finding}`;
+    const text = `pre-existing audit finding (E1) in we:x.mjs#X, reproduces on main ${BASE.slice(0, 10)}: ${finding}`;
     expect(cardLine).toBe(`- [R1053] ${date} ET: ${text}`);
     const cards = parseCards(cardLine);
     expect(cards).toHaveLength(1);
@@ -644,7 +644,7 @@ describe('R1053 prove mode', () => {
       const row = f.deps.shadowProof.mock.calls[0][0];
       expect(row).toMatchObject({ at: AT, base: BASE, head: HEAD, modelFindings: [finding], mode: 'block' });
       if (kind === 'proof error') expect(row.wouldBlock).toEqual([{ line: finding, reason: expect.stringContaining('human review') }]);
-      else expect(row.wouldExempt).toEqual([{ line: finding, key: 'x.mjs|X|B2', class: 'B2' }]);
+      else expect(row.wouldExempt).toEqual([{ line: finding, key: 'x.mjs|X|E1', class: 'E1' }]);
     }
   });
   it.each(['disabled', 'missing sink'])('shadow does no proof work when %s', async kind => {
@@ -709,12 +709,14 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.fileCard).toHaveBeenCalledOnce();
   });
-  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s clears only with expedite and needs-you confirmed', async cls => {
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s stays WEAKENED regardless of confirmed security receipts', async cls => {
     for (const confirmed of [true, false]) {
       const f = proof(reply(cls));
       f.deps.fileCard = vi.fn(() => ({ written: true, expedite: true, needsYou: confirmed }));
-      expect(await main(ARGS, f.deps)).toBe(confirmed ? 0 : 1);
-      expect(f.deps.fileCard).toHaveBeenCalledWith(expect.objectContaining({ expedite: true, needsYou: true }));
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'WEAKENED', findings: [finding], preExisting: [] });
+      expect(f.errors.join('')).toContain('security finding; human review required');
+      expect(f.deps.fileCard).not.toHaveBeenCalled();
     }
   });
   it('the repro prompt names the head and the diff range', async () => {
@@ -726,7 +728,7 @@ describe('R1053 prove mode', () => {
     const f = proof();
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'NOT WEAKENED', findings: [],
-      preExisting: [{ line: finding, key: 'x.mjs|X|B2', relation: 'SAME' }] });
+      preExisting: [{ line: finding, key: 'x.mjs|X|E1', relation: 'SAME' }] });
     expect(f.deps.fileCard).toHaveBeenCalledTimes(1);
     expect(f.output.join('')).toBe('NOT WEAKENED\n');
   });
@@ -734,13 +736,13 @@ describe('R1053 prove mode', () => {
     const f = proof();
     f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-oldValue\n+unsafeValue\n';
     expect(await main(ARGS, f.deps)).toBe(1);
-    expect(f.records[0].findingKeys).toEqual(['x.mjs|X|B2']);
+    expect(f.records[0].findingKeys).toEqual(['x.mjs|X|E1']);
     expect(f.deps.fileCard).not.toHaveBeenCalled();
   });
   it.each(['UNDETERMINED', 'malformed', 'missing', 'quote absent', 'timeout', 'card throws', 'missing dep', 'numstat absent', 'read throws', 'card unconfirmed'])(
     'a3 fails closed: %s', async kind => {
       const f = proof();
-      if (kind === 'UNDETERMINED') f.deps.reproOnBase = () => reply('B2', kind);
+      if (kind === 'UNDETERMINED') f.deps.reproOnBase = () => reply('E1', kind);
       if (kind === 'malformed') f.deps.reproOnBase = () => 'bad';
       if (kind === 'missing') f.deps.reproOnBase = () => '';
       if (kind === 'quote absent') f.deps.readBaseFile = () => 'other source';
@@ -758,10 +760,16 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.deps.fileCard).not.toHaveBeenCalled();
   });
-  it('a4 SAME security expedites a card and needs-you', async () => {
+  it('B-class security findings never clear in prove mode', async () => {
     const f = proof(reply('B1'));
-    expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.fileCard).toHaveBeenCalledWith(expect.objectContaining({ expedite: true, needsYou: true }));
+    f.deps.runCodex = vi.fn(async () => `WEAKENED\n${finding} [B1]`);
+    f.deps.fileCard = vi.fn(() => ({ written: true, expedite: true, needsYou: true }));
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.reproOnBase).toHaveBeenCalledOnce();
+    expect(f.records[0]).toMatchObject({ modelVerdict: 'WEAKENED', verdict: 'WEAKENED', findings: [`${finding} [B1]`], preExisting: [] });
+    expect(f.output.join('')).toBe(`WEAKENED\n${finding} [B1]\n`);
+    expect(f.errors.join('')).toContain('security finding; human review required');
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
   });
   it('a5 findings beyond the bound block for human review', async () => {
     const f = proof(reply() + '\n' + reply().replace('#1', '#2'));

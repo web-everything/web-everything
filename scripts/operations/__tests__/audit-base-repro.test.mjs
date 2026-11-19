@@ -6,11 +6,11 @@ import { AUDITOR_FLOOR } from '../../lib/audit-settings.mjs';
 
 const source = 'function X() {\n  return unsafe();\n}\nfunction Y() {\n  return fixed();\n}\n';
 const finding = { text: 'lib/x.mjs:2 missing guard', sourceText: source };
-const answer = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') =>
+const answer = (cls = 'E1', status = 'REPRODUCES', relation = 'SAME') =>
   `#1 ${status} ${relation} CLASS=${cls} BASE=lib/x.mjs:2\nQUOTE: return unsafe();`;
 const diff = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -5 +5 @@\n-  return old();\n+  return fixed();\n';
 const stat = '1\t1\tlib/x.mjs\n';
-const receipt = () => ({ written: true, expedite: true, needsYou: true });
+const receipt = () => true;
 const options = over => ({ findings: [finding], answers: parseReproAnswer(answer(), 1), baseSha: 'base-sha', headSha: 'head-sha',
   readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
   cardWritten: receipt, ...over });
@@ -27,12 +27,12 @@ describe('strict reproduction protocol', () => {
   });
   it('parses exact responses, including CRLF and independently missing entries', () => {
     expect(parseReproAnswer(answer().replaceAll('\n', '\r\n'), 2)).toEqual([
-      { status: 'REPRODUCES', relation: 'SAME', class: 'B2', base: { path: 'lib/x.mjs', line: 2 }, quote: 'return unsafe();' },
+      { status: 'REPRODUCES', relation: 'SAME', class: 'E1', base: { path: 'lib/x.mjs', line: 2 }, quote: 'return unsafe();' },
       { status: 'UNDETERMINED' },
     ]);
   });
   it.each([
-    '', 'bad text', answer().replace('CLASS=B2', 'CLASS=Z9'), answer().replace('SAME', 'same'),
+    '', 'bad text', answer().replace('CLASS=E1', 'CLASS=Z9'), answer().replace('SAME', 'same'),
     answer().replace('#1', '#01'), answer().replace(':2', ':0'), answer().replace('QUOTE: return unsafe();', 'QUOTE: '),
     answer().split('\n')[0], `${answer()}\n${answer()}`, `${answer()}\n#1 malformed`,
     `${answer()}\nextra prose`, answer().replace('#1', '#3'), `${answer()}\n${answer()}\n${answer()}`,
@@ -59,10 +59,9 @@ describe('strict reproduction protocol', () => {
 });
 
 describe('pre-existing classification', () => {
-  it('exports exactly the eligible classes and permits each on unprotected unchanged source', () => {
+  it('exports exactly the eligible classes and permits each non-B class on unprotected unchanged source', () => {
     expect(PREEXISTING_ELIGIBLE).toEqual(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
-    for (const cls of PREEXISTING_ELIGIBLE) expect(classify({ answers: parseReproAnswer(answer(cls), 1),
-      cardWritten: () => cls.startsWith('B') ? receipt() : true })[0].blocking).toBe(false);
+    for (const cls of ['E1', 'E2', 'D2']) expect(classify({ answers: parseReproAnswer(answer(cls), 1) })[0].blocking).toBe(false);
   });
   it.each(['E1', 'E2'])('production stage blocks %s', cls => {
     expect(classify({ auditPolicy: { releaseStage: 'prod', requirePayBy: false, requireOnMain: true },
@@ -89,12 +88,13 @@ describe('pre-existing classification', () => {
     expect(classify({ auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
       answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true })[0].blocking).toBe(false);
   });
-  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s requires confirmed expedite and needs-you', cls => {
-    const opts = { answers: parseReproAnswer(answer(cls), 1) };
-    expect(classify({ ...opts, cardWritten: () => ({ written: true, expedite: true, needsYou: true }) })[0])
-      .toMatchObject({ blocking: false, expedite: true, needsYou: true });
-    for (const receipt of [true, { written: true, expedite: true, needsYou: false }, { written: true, expedite: false, needsYou: true }]) {
-      expect(classify({ ...opts, cardWritten: () => receipt })[0].blocking).toBe(true);
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s blocks even with confirmed expedite and needs-you', cls => {
+    for (const receipt of [true, { written: true, expedite: true, needsYou: true },
+      { written: true, expedite: true, needsYou: false }, { written: true, expedite: false, needsYou: true }]) {
+      const cardWritten = vi.fn(() => receipt);
+      expect(classify({ answers: parseReproAnswer(answer(cls), 1), cardWritten })[0])
+        .toEqual({ blocking: true, reason: 'security finding; human review required' });
+      expect(cardWritten).not.toHaveBeenCalled();
     }
   });
   it('uses one-based inclusive base symbol ranges and permits shifted base lines', () => {
@@ -137,12 +137,12 @@ describe('pre-existing classification', () => {
   it('a1 finding in X while PR edits Y is non-blocking with a stable card identity', () => {
     const readBaseFile = vi.fn(() => source), cardWritten = vi.fn(receipt);
     const [result] = classify({ readBaseFile, cardWritten });
-    expect(result).toEqual({ blocking: false, expedite: true, tag: 'security', needsYou: true, reason: 'verified pre-existing finding', preExisting: {
-      line: finding.text, key: 'lib/x.mjs|X|B2', base: { sha: 'base-sha', path: 'lib/x.mjs', line: 2, quote: 'return unsafe();' },
-      relation: 'SAME', cardHash: cardHash('lib/x.mjs|X|B2'),
+    expect(result).toEqual({ blocking: false, reason: 'verified pre-existing finding', preExisting: {
+      line: finding.text, key: 'lib/x.mjs|X|E1', base: { sha: 'base-sha', path: 'lib/x.mjs', line: 2, quote: 'return unsafe();' },
+      relation: 'SAME', cardHash: cardHash('lib/x.mjs|X|E1'),
     } });
     expect(readBaseFile).toHaveBeenCalledWith('lib/x.mjs');
-    expect(cardWritten).toHaveBeenCalledWith('lib/x.mjs|X|B2');
+    expect(cardWritten).toHaveBeenCalledWith('lib/x.mjs|X|E1');
     expect(classify({ changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
   });
   it('an empty, truncated or incomplete diff clears nothing', () => {
@@ -210,11 +210,14 @@ describe('pre-existing classification', () => {
     'a4 B1 %s %s blocks', (status, relation) => {
       expect(classify({ answers: parseReproAnswer(answer('B1', status, relation), 1) })[0].blocking).toBe(true);
     });
-  it('a4 B1 SAME is non-blocking with expedite security and needsYou', () => {
-    expect(classify({ answers: parseReproAnswer(answer('B1'), 1) })[0]).toMatchObject({ blocking: false, expedite: true, tag: 'security', needsYou: true });
+  it('a4 B1 SAME blocks before consulting confirmed security receipts', () => {
+    const cardWritten = vi.fn(() => ({ written: true, expedite: true, needsYou: true }));
+    expect(classify({ answers: parseReproAnswer(answer('B1'), 1), cardWritten })[0])
+      .toEqual({ blocking: true, reason: 'security finding; human review required' });
+    expect(cardWritten).not.toHaveBeenCalled();
   });
   it('D2 WORSENED always blocks for non-security classes too', () => {
-    expect(classify({ answers: parseReproAnswer(answer('B2', 'REPRODUCES', 'WORSENED'), 1) })[0].blocking).toBe(true);
+    expect(classify({ answers: parseReproAnswer(answer('D2', 'REPRODUCES', 'WORSENED'), 1) })[0].blocking).toBe(true);
   });
   it('a5 excess findings block with explicit human-review fallback and no card attempt', () => {
     const cardWritten = vi.fn(receipt);
@@ -238,8 +241,8 @@ describe('diff and card helpers', () => {
     expect([...parseDiffChangedLines(diff.replace('+  return fixed();', '+++ b/evil')).keys()]).toEqual(['lib/x.mjs']);
   });
   it('renders exactly the held-card format and deterministic SHA256 identity', () => {
-    expect(cardLine({ date: '2026-11-18 07:00', cls: 'B2', path: 'lib/x.mjs', symbol: 'X', sha10: '1234567890', text: 'guard missing' }))
-      .toBe('- [R1053] 2026-11-18 07:00 ET: pre-existing audit finding (B2) in we:lib/x.mjs#X, reproduces on main 1234567890: guard missing');
+    expect(cardLine({ date: '2026-11-18 07:00', cls: 'E1', path: 'lib/x.mjs', symbol: 'X', sha10: '1234567890', text: 'guard missing' }))
+      .toBe('- [R1053] 2026-11-18 07:00 ET: pre-existing audit finding (E1) in we:lib/x.mjs#X, reproduces on main 1234567890: guard missing');
     expect(cardHash('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
   });
 });

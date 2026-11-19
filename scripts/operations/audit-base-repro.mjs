@@ -69,6 +69,8 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       const a = answers?.[i];
       if (!baseSha || !headSha || a?.status !== 'REPRODUCES' || a.relation !== 'SAME') return block('base reproduction is not SAME');
       if (!PREEXISTING_ELIGIBLE.includes(a.class) || (finding?.class && finding.class !== a.class)) return block('ineligible or conflicting class');
+      // R1085: B-class security findings never clear in prove mode; only a human ruling clears them.
+      if (a.class.startsWith('B')) return block('security finding');
       if (productionFindingBlocks(a.class, auditPolicy.releaseStage)) return block('production finding');
       // Pay-by authority is the persisted card, just as in computeVerdict. The model may name a card but cannot set its date.
       // D5: the held card is checked below; requireOnMain does not add a second existence check here.
