@@ -61,6 +61,27 @@ afterEach(async () => {
   await rm(root, {recursive: true, force: true});
 });
 const ran = () => readFile(join(root, 'npm.log'), 'utf8').then(() => true, () => false);
+// Numeric `nft list table` form of the complete forge-egress.sh ruleset.
+const ruleset = uid => `table inet forge_exec_egress {
+  set registry4 {
+    type ipv4_addr
+    elements = { 104.16.24.34, 104.16.25.34 }
+  }
+  set registry6 {
+    type ipv6_addr
+    elements = { 2606:4700::6810:1822 }
+  }
+  chain slot_egress {
+    oifname "lo" accept
+    ip daddr @registry4 tcp dport 443 accept
+    ip6 daddr @registry6 tcp dport 443 accept
+    reject with icmpx type admin-prohibited
+  }
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid { ${uid} } jump slot_egress
+  }
+}`;
 
 describe('egress table readiness', () => {
   it.each([
@@ -80,12 +101,7 @@ describe('egress table readiness', () => {
     const uid = process.getuid();
     await mkdir(join(root, 'runs'), {recursive: true});
     await mkdir(join(root, 'runs', 'slot-14'), {mode: 0o710});
-    const table = value => ({code: 0, stdout: `table inet forge_exec_egress {
-      chain output {
-        type filter hook output priority filter; policy accept;
-        meta skuid { ${value} } jump slot_egress
-      }
-    }`});
+    const table = value => ({code: 0, stdout: ruleset(value)});
     probeResult = table(uid);
     const runner = makeRunner(), request = await requestFor(runner);
     probeResult = table(covered ? uid : uid + 1);
@@ -100,6 +116,32 @@ describe('egress table readiness', () => {
   it.each(['', 'garbage', 'meta skuid { 2014 } jump slot_egress'])('refuses incomplete UID evidence %j', async stdout => {
     probeResult = {code: 0, stdout};
     await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+  });
+  it.each([
+    ['preceding unconditional accept', text => text.replace('meta skuid', 'accept\n    meta skuid')],
+    ['preceding broader accept', text => text.replace('meta skuid', 'meta skuid { 2014, 2015 } accept\n    meta skuid')],
+    ['preceding return', text => text.replace('meta skuid', 'return\n    meta skuid')],
+    ['preceding jump-away', text => text.replace('meta skuid', 'jump other_chain\n    meta skuid')],
+    ['preceding unparseable rule', text => text.replace('meta skuid', 'unknown rule\n    meta skuid')],
+    ['empty slot_egress chain', text => text.replace(/chain slot_egress \{[^}]*\}/, 'chain slot_egress { }')],
+    ['missing slot_egress chain', text => text.replace(/chain slot_egress \{[^}]*\}/, '')],
+    ['missing terminal restriction', text => text.replace('reject with icmpx type admin-prohibited', '')],
+    ['permissive terminal verdict', text => text.replace('reject with icmpx type admin-prohibited', 'accept')],
+    ['wrong hook', text => text.replace('hook output', 'hook input')],
+    ['unrestricted destination accept', text => text.replace('ip daddr @registry4 tcp dport 443 accept', 'accept')],
+    ['malformed UID set', text => text.replace('{ 2014 } jump', '{ 2014, } jump')],
+    ['trailing unknown evidence', text => text + '\nunknown'],
+  ])('refuses UID coverage with %s', async (_name, change) => {
+    probeResult = {code: 0, stdout: change(ruleset(2014))};
+    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+  });
+  it.each([
+    ['numeric priority and singleton UID', text => text.replace('priority filter', 'priority 0').replace('{ 2014 } jump', '2014 jump')],
+    ['terminal drop', text => text.replace('reject with icmpx type admin-prohibited', 'drop')],
+    ['empty registry sets', text => text.replace(/\s*elements = \{[^}]*\}/g, '')],
+  ])('accepts complete restrictions with %s', async (_name, change) => {
+    probeResult = {code: 0, stdout: change(ruleset(2014))};
+    await expect(makeRunner().egressReady(2014)).resolves.toBeUndefined();
   });
   it('execute timeout resolves timedOut and kills a real sleeping child with SIGKILL', async () => {
     const pending = execute(process.execPath, ['-e', keepAliveScript()], {timeoutMs: 100});

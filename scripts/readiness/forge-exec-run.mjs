@@ -909,11 +909,30 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const result=testRoot&&testEgressProbe?await testEgressProbe():await (testRoot&&testExecute?testExecute:execute)('/usr/sbin/nft',['-n','list','table','inet','forge_exec_egress'],{env:{PATH:'/usr/sbin:/usr/bin:/bin',LANG:'C'},timeoutMs:5000});
       if(result?.code===0&&!result.timedOut) {
         if(uid===undefined)return;
-        // Numeric nft output only; match the output-hook UID jump, never a UID
-        // mentioned in a comment, another chain, or the registry address sets.
-        const output=/chain output\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/.exec(result.stdout??'')?.[1];
-        const match=output&&/type filter hook output priority (?:0|filter); policy accept;[\s\S]*?^\s*meta skuid (\{[\d,\s]+\}|\d+) jump slot_egress\s*$/m.exec(output);
-        const covered=match?.[1].replace(/[{}]/g,'').split(',').map(v=>Number(v.trim()));
+        // Accept only the numeric ruleset shape emitted by forge-egress.sh.
+        // Unknown rules (including any earlier accept/return/jump-away) fail
+        // closed rather than attempting to infer their packet-level effects.
+        const registry=(name,type,addresses)=>`set ${name} \\{\\s*type ${type};?\\s*(?:elements = \\{\\s*${addresses}(?:\\s*,\\s*${addresses})*\\s*\\};?\\s*)?\\}`;
+        const uidList=String.raw`(?:\d+|\{\s*\d+(?:\s*,\s*\d+)*\s*\})`;
+        const shape=new RegExp('^\\s*'+[
+          String.raw`table inet forge_exec_egress \{`,
+          registry('registry4','ipv4_addr',String.raw`[\d.]+`),
+          registry('registry6','ipv6_addr',String.raw`[\da-fA-F:]+`),
+          String.raw`chain slot_egress \{`,
+          String.raw`oifname "lo" accept`,
+          String.raw`ip daddr @registry4 tcp dport 443 accept`,
+          String.raw`ip6 daddr @registry6 tcp dport 443 accept`,
+          String.raw`(?:reject with icmpx type admin-prohibited|drop)`,
+          String.raw`\}`,
+          String.raw`chain output \{`,
+          String.raw`type filter hook output priority (?:0|filter); policy accept;`,
+          `((?:meta skuid ${uidList} jump slot_egress\\s*)+)`,
+          String.raw`\}`,
+          String.raw`\}`,
+        ].join('\\s*')+'\\s*$(?![\\s\\S])');
+        const output=shape.exec(result.stdout??'')?.[1];
+        const covered=output&&[...output.matchAll(new RegExp(`meta skuid (${uidList}) jump slot_egress`,'g'))]
+          .flatMap(match=>match[1].replace(/[{}]/g,'').split(',').map(v=>Number(v.trim())));
         if(covered?.includes(uid))return;
         throw Object.assign(new Error(`Egress rules do not cover slot UID ${uid}; rerun forge-setup or use local fallback`),{code:'egress-uid-uncovered'});
       }
