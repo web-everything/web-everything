@@ -84,14 +84,14 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
     "fingerprint": "module-sha256-v2:4a3b12dbcc68e5464321cb1b0304d76a88a4d3d46fb0c7f66911e1fe85799f35",
     "function": "launchAgent",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:5fa911a94cdb6b27951545ade75587d385764da6e604012e8293f45c036ed538",
+    "moduleFingerprint": "module-sha256-v2:2f934eb0bcceae13644efa6f99ded1b928d936d2b72446107176357808da189e",
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
     "fingerprint": "module-sha256-v2:4db8d1022792a74a662ef204b1775ac870ad6a31248f940bcbeb48415a21d1cc",
     "function": "launchAgentToCompletion",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:5fa911a94cdb6b27951545ade75587d385764da6e604012e8293f45c036ed538",
+    "moduleFingerprint": "module-sha256-v2:2f934eb0bcceae13644efa6f99ded1b928d936d2b72446107176357808da189e",
   },
   {
     "file": "scripts/lib/claude-sessions.mjs",

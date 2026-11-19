@@ -10,6 +10,23 @@ import { isAgentLaunchTestPrimitive } from './agent-launch.test-seam.mjs';
 // Identity, never name/source text: closures, bound functions and proxies can discard argv.
 const approvedPrimitives = new Set([spawn, spawnSync, exec, execFile, execSync, execFileSync]);
 
+// Share one policy across Node options, env wrappers and shell assignment words.
+const executionEnvironment = /^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|PATH|SHELLOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*)$/i;
+const environmentName = /^[A-Za-z_][A-Za-z0-9_]*$/;
+function rejectExecutionEnvironment(key) {
+  if (executionEnvironment.test(key)) {
+    throw new SyntaxError('execution redirection environment is unsupported; remove loader, lookup and shell startup overrides');
+  }
+}
+
+function validateAssignment(word) {
+  const equals = word.indexOf('=');
+  if (equals < 0) throw new SyntaxError('unsupported environment assignment; use literal argv');
+  const key = word.slice(0, equals);
+  rejectExecutionEnvironment(key);
+  if (!environmentName.test(key)) throw new SyntaxError('unsupported environment name; use literal argv');
+}
+
 // No caller needs Node's fork: its JavaScript module/execArgv grammar is not agent argv.
 // Keep execution-redirection options closed for every remaining primitive, too.
 function snapshotInvocation(args, primitive) {
@@ -29,12 +46,7 @@ function snapshotInvocation(args, primitive) {
     }
     if (snapshot.env != null) {
       snapshot.env = { ...snapshot.env };
-      for (const [key, value] of Object.entries(snapshot.env)) {
-        if (/^(?:NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|BASH_ENV|ENV)$/i.test(key)
-          && value !== undefined && value !== null && value !== '') {
-          throw new SyntaxError('execution redirection environment is unsupported; remove loader and shell startup overrides');
-        }
-      }
+      for (const key of Object.keys(snapshot.env)) rejectExecutionEnvironment(key);
     }
     forwarded[index] = snapshot;
   }
@@ -231,12 +243,25 @@ function normaliseScript(text, depth, optionsOnly = false) {
 function normaliseCommand(words, depth = 0, shell = false) {
   if (depth > MAX_WRAPPERS) throw new SyntaxError('too many wrappers; use direct literal argv');
   if (words.some(word => typeof word !== 'string')) throw new SyntaxError('nonliteral command');
-  if (shell) while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0] ?? '')) words = words.slice(1);
+  if (shell) while (/^[^=]+=/.test(words[0] ?? '')) {
+    validateAssignment(words[0]);
+    words = words.slice(1);
+  }
   if (!words.length) return [];
   const [command, ...argv] = words;
   if (!command || /[\s;|&'"$`~*?\[\]{}()<>]/.test(command)) throw new SyntaxError('unresolved executable word');
   const executable = agentExecutable.exec(command)?.[1];
   if (executable) return [normaliseOptions(argv, executable)];
+  if (shell && ['export', 'declare'].includes(command)) {
+    let i = 0;
+    if (command === 'declare') {
+      if (argv[i++] !== '-x') throw new SyntaxError('unsupported shell declaration; use literal argv');
+    }
+    if (argv[i] === '--') i++;
+    if (i === argv.length) throw new SyntaxError('missing shell assignments; use literal argv');
+    for (; i < argv.length; i++) validateAssignment(argv[i]);
+    return [];
+  }
   if (shellExecutable.test(command)) {
     let i = 0;
     for (; i < argv.length; i++) {
@@ -248,17 +273,20 @@ function normaliseCommand(words, depth = 0, shell = false) {
   const wrapper = command.split(/[/\\]/).at(-1);
   let i = 0;
   if (wrapper === 'env') {
-    while (i < argv.length) {
+    while (i < argv.length && argv[i].startsWith('-')) {
       const word = argv[i];
       if (word === '--') { i++; break; }
-      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || ['-i', '--ignore-environment'].includes(word)) { i++; continue; }
-      if (['-u', '--unset', '-C', '--chdir'].includes(word)) {
-        if (i + 1 === argv.length) throw new SyntaxError('missing env option value');
+      if (['-i', '--ignore-environment'].includes(word)) { i++; continue; }
+      if (['-u', '--unset'].includes(word)) {
+        if (!environmentName.test(argv[i + 1] ?? '')) throw new SyntaxError('missing or unsupported env unset name; use literal argv');
         i += 2; continue;
       }
-      if (/^--(?:unset|chdir)=/.test(word)) { i++; continue; }
-      if (word.startsWith('-')) throw new SyntaxError('unsupported env option');
-      break;
+      if (word.startsWith('--unset=') && environmentName.test(word.slice('--unset='.length))) { i++; continue; }
+      // Split-string and chdir can change the invocation being validated. Never interpret them.
+      throw new SyntaxError('unsupported env option; use literal argv without split-string or chdir');
+    }
+    while (i < argv.length && argv[i].includes('=')) {
+      validateAssignment(argv[i++]);
     }
   } else if (['nohup', 'command', 'exec', 'npx'].includes(wrapper)) {
     while (['--', '--yes', '-y', '--no-install'].includes(argv[i])) i++;

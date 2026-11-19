@@ -18,6 +18,12 @@ vi.mock('../lib/agent-launch.test-seam.mjs', () => {
 const testPrimitive = (...args) => registerAgentLaunchTestPrimitive(vi.fn(...args));
 
 const SID = '12345678-1234-4234-8234-123456789abc';
+const DENIED_ENVIRONMENT_KEYS = [
+  'NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+  'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'BASH_ENV', 'ENV', 'PATH', 'SHELLOPTS',
+  'PS4', 'PROMPT_COMMAND', 'IFS', 'CDPATH', 'GLOBIGNORE', 'BASH_FUNC_injected%%',
+  'node_options', 'Node_Path', 'node_extra_ca_certs', 'ld_preload', 'DyLd_INSERT_LIBRARIES',
+];
 
 // Audit probes use the real boundary with an injected primitive, never an actual agent process.
 it.each([
@@ -34,9 +40,54 @@ it.each([
     name: `R37.24 refuses execution option ${key} with ${omitArgv ? 'omitted' : 'array'} argv`, omitArgv,
     options: { [key]: key === 'execArgv' ? [] : process.execPath }, refused: true,
   }))),
-  ...['NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'BASH_ENV', 'ENV'].map(key => ({
+  ...DENIED_ENVIRONMENT_KEYS.map(key => ({
     name: `R37.24 refuses loader environment ${key}`, options: { env: { [key]: 'untrusted' } }, refused: true,
   })),
+  ...DENIED_ENVIRONMENT_KEYS.flatMap(key => ['', 'untrusted'].flatMap(value => {
+    const assignment = `${key}=${value}`;
+    return [
+      { command: 'env', argv: [assignment, 'claude', '--resume', SID] },
+      { command: 'env', argv: ['-i', '-u', 'SAFE', assignment, 'sh', '-c', `claude --resume ${SID}`] },
+      { command: 'env', argv: ['--ignore-environment', '--unset=SAFE', '--', assignment, 'claude', '--resume', SID] },
+      { command: `FOO=bar ${assignment} claude --resume ${SID}`, argv: [] },
+      { command: `${assignment}; claude --resume ${SID}`, argv: [] },
+      { command: 'sh', argv: ['-c', `export FOO=bar ${assignment}; claude --resume ${SID}`] },
+      { command: 'bash', argv: ['-c', `declare -x FOO=bar ${assignment}; claude --resume ${SID}`] },
+    ].map(invocation => ({
+      name: `R37.26 refuses wrapper assignment ${assignment}: ${JSON.stringify(invocation)}`,
+      ...invocation, resumeId: SID, refused: true, reason: 'execution redirection environment',
+    }));
+  })),
+  ...[
+    ['-S', `NODE_OPTIONS=--require=/x claude --resume ${SID}`],
+    [`-SNODE_OPTIONS=--require=/x claude --resume ${SID}`],
+    ['--split-string', `claude --resume ${SID}`],
+    [`--split-string=claude --resume ${SID}`],
+    ['-C', '.'], ['-C.'], ['--chdir', '.'], ['--chdir=.'],
+  ].map(prefix => ({
+    name: `R37.26 refuses env split-string/chdir ${JSON.stringify(prefix)}`, command: 'env',
+    argv: [...prefix, 'claude', '--resume', SID], resumeId: SID, refused: true, reason: 'unsupported env option',
+  })),
+  ...[
+    ['-u'], ['--unset'], ['--unset='], ['-u', 'FOO=bar'], ['--unknown'], ['=bad'],
+    ['FOO=bar', '-i', 'claude'], ['--', '-u', 'SAFE', 'claude'], ['FOO=bar'],
+  ].map(argv => ({
+    name: `R37.26 unparseable env wrapper refuses with literal argv fallback ${JSON.stringify(argv)}`,
+    command: 'env', argv, refused: true, reason: 'use literal argv',
+  })),
+  ...['export FOO', 'declare -x FOO', 'declare -gx FOO=bar'].map(statement => ({
+    name: `R37.26 unparseable shell assignment refuses ${statement}`, command: 'sh',
+    argv: ['-c', `${statement}; claude --resume ${SID}`], resumeId: SID, refused: true, reason: 'use literal argv',
+  })),
+  ...[
+    { command: 'env', argv: ['FOO=bar', 'claude', '--resume', SID] },
+    { command: 'env', argv: ['-i', '-u', 'NODE_OPTIONS', '--unset=PATH', '--', 'FOO=bar', 'claude', '--resume', SID] },
+    { command: `env FOO=bar claude --resume ${SID}`, argv: [] },
+    { command: `FOO=bar claude --resume ${SID}`, argv: [] },
+    { command: `FOO=bar; claude --resume ${SID}`, argv: [] },
+    { command: 'sh', argv: ['-c', `export FOO=bar; claude --resume ${SID}`] },
+    { command: 'bash', argv: ['-c', `declare -x FOO=bar; claude --resume ${SID}`] },
+  ].map(invocation => ({ name: `R37.26 harmless assignment positive control ${JSON.stringify(invocation)}`, ...invocation, resumeId: SID })),
   { name: 'R37.23 unchecked closure with fresh evidence refuses', opaque: 'closure', command: 'claude', argv: ['-p', 'hello'], refused: true, reason: 'unapproved primitive identity' },
   { name: 'R37.23 registered primitive with fresh evidence positive control', command: 'claude', argv: ['-p', 'hello'] },
   ...['exec', 'e'].flatMap(alias => ['array', 'string', 'argv-string', 'shell'].flatMap(form => {
@@ -333,14 +384,14 @@ describe('launch refusal', () => {
 
 describe('transparent execution', () => {
   it('R37.24 snapshots safe options and environment before a guard can redirect execution', () => {
-    const primitive = testPrimitive(), options = { env: { PATH: 'fixture-bin', NODE_OPTIONS: '' } };
+    const primitive = testPrimitive(), options = { env: { FOO: 'fixture-value' } };
     launchAgent({ mode: 'codex-exec', resumeId: null, launchGuard() {
       options.execPath = process.execPath;
       options.execArgv = ['-e', 'process.exit(0)'];
       options.env.NODE_OPTIONS = '--import=untrusted';
       return true;
     } }, primitive, 'codex', ['exec', '-'], options);
-    expect(primitive).toHaveBeenCalledWith('codex', ['exec', '-'], { env: { PATH: 'fixture-bin', NODE_OPTIONS: '' } });
+    expect(primitive).toHaveBeenCalledWith('codex', ['exec', '-'], { env: { FOO: 'fixture-value' } });
   });
   it.each(['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync'])
   ('R37.24 real %s refuses redirection before the guard', name => {
@@ -353,11 +404,22 @@ describe('transparent execution', () => {
     expect(guard).not.toHaveBeenCalled();
   });
 
+  it.each(['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync'].flatMap(name =>
+    DENIED_ENVIRONMENT_KEYS.flatMap(key => ['', 'untrusted'].map(value => [name, key, value]))))
+  ('R37.26 real %s refuses options.env %s=%j before the guard', (name, key, value) => {
+    const guard = vi.fn(() => false), options = { env: { [key]: value } };
+    const invocation = name === 'exec' || name === 'execSync'
+      ? ['codex exec -', options] : ['codex', ['exec', '-'], options];
+    expect(() => launchAgent({ mode: 'codex-exec', resumeId: null, log() {}, launchGuard: guard },
+      childProcess[name], ...invocation)).toThrow('execution redirection environment');
+    expect(guard).not.toHaveBeenCalled();
+  });
+
   it.each(AGENT_LAUNCH_MODES.flatMap(mode => ['spawn', 'exec'].map(kind => [mode, kind])))
   ('preserves argv identity, option values and return identity for %s via %s', (mode, kind) => {
     const argv = mode === 'codex-exec-resume' ? ['exec', 'resume', SID, 'literal $() `text`', '\n']
       : mode === 'claude-resume' ? ['--resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
-    const env = { PATH: 'fixture-bin', TOKEN: 'fixture-token' };
+    const env = { FOO: 'fixture-value', TOKEN: 'fixture-token' };
     const options = { cwd: 'fixture-lane', env, stdio: ['ignore', 'pipe', 7], timeout: 12, maxBuffer: 48, detached: true };
     const result = {}, io = { [kind]: testPrimitive(() => result) }, primitive = io[kind];
     expect(launchAgent({ mode, resumeId: mode.endsWith('-resume') ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
@@ -552,7 +614,7 @@ describe('resume validation across execution forms', () => {
 describe('completion wrapper', () => {
   it('records argv, env and cwd through injected spawn and collects both output streams', async () => {
     const argv = ['--resume', SID, '-p', 'literal $() `text`'];
-    const env = { PATH: 'fixture-bin' }, child = new EventEmitter();
+    const env = { FOO: 'fixture-value' }, child = new EventEmitter();
     child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = testPrimitive();
     const spawnFn = testPrimitive(() => {
       queueMicrotask(() => {

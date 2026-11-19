@@ -4650,9 +4650,16 @@ The fallback is an approved primitive with explicit literal argv. Tests substitu
 registration and never approves a primitive, even with `VITEST=true` or `NODE_ENV=test`.
 The completion wrapper checks injected spawn identity at the OS boundary. Helpers with their own injection arguments are not approved primitives.
 
-R37.24 refuses execution-redirection options (`execPath`, `execArgv`, custom `shell`)
-and nonempty loader/startup environment overrides (`NODE_OPTIONS`, `NODE_PATH`, `LD_*`,
-`DYLD_*`, `BASH_ENV`, `ENV`). The fallback is literal agent argv without these overrides.
+R37.24 refuses execution-redirection options (`execPath`, `execArgv`, custom `shell`).
+R37.26 applies one environment denylist to every approved primitive's `options.env`,
+literal `env` assignments, shell assignment prefixes and `export` / `declare -x` statements:
+`NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
+`PATH`, `SHELLOPTS`, `PS4`, `PROMPT_COMMAND`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_FUNC_*`.
+Empty assignments are refused too; Node/LD/DYLD names are matched case-insensitively.
+`env` split-string/chdir options and unparseable wrappers refuse with the literal-argv fallback.
+The regression table pairs these refusals with harmless `FOO=bar` assignments, including
+`env -i` / `-u` / `--unset` / `--` combinations. Real primitives must refuse before the guard runs.
+The fallback is literal agent argv without these overrides.
 String-command primitives (`exec`, `execSync`) refuse array-shaped options; options in either
 Node argument position are checked, including with omitted argv.
 Option/environment values are snapshotted before guards run, so captured references cannot
