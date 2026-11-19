@@ -1,6 +1,7 @@
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as prComments from '../../conveyor/pr-comments-complete.mjs';
 import * as ghThrottle from '../gh-throttle.mjs';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1851,8 +1852,58 @@ describe('finished publication hold recovery', () => {
     const readComments = vi.fn(() => [cleanResultComment(f)]);
     const postHold = vi.fn(() => ({ ok: true }));
     const lock = vi.fn(fn => fn());
-    return { ...f, path, readCheck, readComments, postHold, lock };
+    const readStatus = vi.fn(() => ({ total_count: 1, statuses: [{ context: `red-team/publication #${f.pr}`,
+      state: 'failure', description: 'held: finished round publication in progress', creator: { login: 'web-everything' } }] }));
+    return { ...f, path, readCheck, readComments, readStatus, postHold, lock };
   }
+  it('clears only the trusted round writer hold; foreign or unreadable status keeps the marker', () => {
+    for (const kind of ['live', 'foreign', 'untrusted', 'unknown state', 'unreadable', 'incomplete', 'round', 'success', 'absent']) {
+      const f = setup();
+      const combined = f.readStatus();
+      const status = combined.statuses[0];
+      if (kind === 'live') status.description = 'held: live red-team check not clear: awaiting validation';
+      if (kind === 'foreign') status.description = 'held: unknown';
+      if (kind === 'untrusted') status.creator.login = 'mallory';
+      if (kind === 'unknown state') status.state = 'unknown';
+      if (kind === 'success') status.state = 'success';
+      if (kind === 'absent') { combined.statuses = []; combined.total_count = 0; }
+      if (kind === 'incomplete') combined.total_count = 2;
+      f.readStatus.mockImplementation(() => { if (kind === 'unreadable') throw Error('offline'); return combined; });
+      const out = settleFinishedPublicationHold(f);
+      const ok = ['round', 'success', 'absent'].includes(kind);
+      expect(out.ok, kind).toBe(ok);
+      if (['live', 'foreign', 'untrusted', 'unknown state'].includes(kind)) expect(out.reason).toBe(
+        'publication hold not owned by the finished round writer; left to its owner');
+      expect(existsSync(f.path), kind).toBe(!ok);
+      expect(f.postHold.mock.calls.length, kind).toBe(kind === 'round' ? 1 : 0);
+    }
+  });
+  it('default GitHub evidence readers strip the memo from child and throttle environments', () => {
+    const f = setup();
+    f.env.WE_GH_READ_MEMO_DIR = 'stale-memo';
+    const fixtureApp = 12345;
+    f.env.WE_APP_ID = String(fixtureApp);
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(args => {
+      if (args[1].includes('/check-runs?')) return JSON.stringify({ total_count: 1, check_runs: [{
+        id: 1, name: 'red-team', head_sha: f.head, external_id: `${f.repo}#${f.pr}`, app: { id: fixtureApp },
+        status: 'completed', conclusion: 'success', completed_at: new Date(1_800_000_001_000).toISOString(),
+      }] });
+      return JSON.stringify(f.readStatus());
+    });
+    const comments = vi.spyOn(prComments, 'readCompletePrComments').mockImplementation((_pr, { exec }) => {
+      exec('gh', ['api', 'fixture-comments']);
+      return [cleanResultComment(f)];
+    });
+    try {
+      expect(settleFinishedPublicationHold({ ...f, readCheck: undefined, readComments: undefined, readStatus: undefined })).toEqual({ ok: true });
+      expect(gh).toHaveBeenCalledTimes(3);
+      for (const [, options] of gh.mock.calls) {
+        expect(options.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+        expect(options.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
+      }
+      expect(f.env.WE_GH_READ_MEMO_DIR).toBe('stale-memo');
+    } finally { comments.mockRestore(); gh.mockRestore(); }
+  });
   it('clears the hold and marker under the lock, then a second call posts nothing', () => {
     const f = setup();
     expect(readFinishedPublicationHold(f)).toBe(true);

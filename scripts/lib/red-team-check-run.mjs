@@ -619,7 +619,7 @@ const statusPage = (repo, headSha, path, page) =>
 
 /** The combined status (one latest status per context), paged until `total_count` contexts are read. Contexts past the
  * cap leave `statuses` shorter than `total_count`, which every consumer reads as incomplete (fail closed). */
-function readCombinedStatus({ repo, headSha, gh }) {
+export function readCombinedStatus({ repo, headSha, gh }) {
   const first = JSON.parse(gh(['api', statusPage(repo, headSha, 'status', 1)], ioOptions));
   if (!Array.isArray(first?.statuses) || !Number.isSafeInteger(first.total_count)) return first;
   const statuses = [...first.statuses];

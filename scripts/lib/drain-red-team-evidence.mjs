@@ -1,6 +1,7 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
-import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext } from './red-team-check-run.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { createMqLiveReader, redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -74,14 +75,20 @@ export function readFinishedPublicationHold({ repo, pr, head, env = process.env 
 /** Settle a finished writer's outbox, never republish its sealed check. The status claim prevents a round writer
  * changing the marker during confirmation; the shared check lock serializes the live check/hold boundary. */
 export function settleFinishedPublicationHold({ repo, pr, head, env = process.env,
-  gh = (args, options) => runGhSync(args, { env, ...options }),
-  readCheck = key => {
-    const app = resolveWeAppId({ env });
-    return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh }) : app;
-  },
-  readComments = () => readCompletePrComments(pr, { repo, exec: (_file, args, options) => gh(args, options) }),
+  gh, readCheck, readComments, readStatus = readCombinedStatus,
   postHold = postRedTeamPublicationHold,
   lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn) }) {
+  const { WE_GH_READ_MEMO_DIR: _memo, ...freshEnv } = env;
+  // Poster-supplied writer credentials still win; every evidence read also bypasses the throttle memo.
+  gh ??= (args, options) => runGhSync(args, { env: freshEnv, ...options });
+  const liveExec = createMqLiveReader((_file, args, options) => gh(args, options));
+  const liveGh = (args, options = {}) => liveExec('gh', args, { ...options, env: freshEnv,
+    throttle: { ...options.throttle, env: freshEnv } });
+  readCheck ??= key => {
+    const app = resolveWeAppId({ env: freshEnv });
+    return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh: liveGh }) : app;
+  };
+  readComments ??= () => readCompletePrComments(pr, { repo, exec: (_file, args, options) => liveGh(args, options) });
   const path = statusPath({ repo, pr, head }, env);
   try {
     return withRedTeamStatusClaim(path, () => lock(() => {
@@ -99,6 +106,19 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
         return { ok: false, reason: 'red-team check not proven newer than finished marker; operator must inspect publication' };
       const result = redTeamResultCommentForHead(readComments(), pr, head);
       if (!result || result.carriedFrom) return { ok: false, reason: 'no ordinary red-team result on head' };
+      const combined = readStatus({ repo, headSha: head, gh: liveGh });
+      if (!Array.isArray(combined?.statuses) || !Number.isSafeInteger(combined.total_count)
+        || combined.total_count !== combined.statuses.length)
+        return { ok: false, reason: 'publication hold status unreadable or incomplete; operator must inspect' };
+      const current = combined.statuses.find(status => status?.context === redTeamPublicationContext(pr));
+      if (!current || current.state === 'success') {
+        rmSync(`${path}.unpublished`, { force: true });
+        return { ok: true };
+      }
+      if (current.state !== 'failure'
+        || !/^held: (pending|running|finished) round (publication in progress|not confirmed published)$/.test(current.description)
+        || !isTrustedMarkerAuthor({ user: { login: String(current.creator?.login ?? '') } }))
+        return { ok: false, reason: 'publication hold not owned by the finished round writer; left to its owner' };
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });
       if (cleared?.ok !== true) return { ok: false, reason: cleared?.reason ?? 'finished publication hold clear unconfirmed' };
       rmSync(`${path}.unpublished`, { force: true });
