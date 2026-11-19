@@ -39,8 +39,6 @@
  *   parses tolerantly to `[]` so a bad file never wedges a tick.
  */
 
-import { producerBuildContext } from '../operations/build-pr-authorship.mjs';
-import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join, dirname, resolve } from 'node:path';
@@ -698,8 +696,9 @@ function parseArgv(argv) {
 }
 
 /** Historical infra records retain the dispatch context, which owns the full group. */
-export function infraRecoveryCard(entry, { readContext = producerBuildContext } = {}) {
+export function infraRecoveryCard(entry, { readContext } = {}) {
   if (!entry.builderContext) return entry;
+  if (typeof readContext !== 'function') throw new Error('unproven infra recovery identity');
   const context = readContext({ WE_BUILD_PR_CONTEXT: entry.builderContext });
   const card = context?.entry?.payload;
   if (!card || normNum(card.num) !== normNum(entry.num)) throw new Error('unproven infra recovery identity');
@@ -717,7 +716,14 @@ export function infraRecoveryCard(entry, { readContext = producerBuildContext } 
  * {@link markRefusedAttempt} vs {@link markRetryAttempt}. Best-effort — a failure just bumps the attempt (or,
  * for a refusal, does not — see that function's own docblock).
  */
-export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext } = {}) {
+export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext, admission: adapter } = {}) {
+  // Keep this watchdog dependency free of driver policy. Launchers must supply the
+  // shared fresh-read gate; a missing or incomplete adapter requires operator repair.
+  if (typeof adapter?.assertRuntimeAdmitted !== 'function' || typeof adapter?.withRuntimeAdmission !== 'function') {
+    return { ok: false, refused: true, reason: 'runtime admission adapter missing',
+      detail: 'Retry through the build daemon with its runtime admission adapter; entry retained.' };
+  }
+  const { assertRuntimeAdmitted, withRuntimeAdmission } = adapter;
   try { entry = infraRecoveryCard(entry, { readContext }); }
   catch { return { ok: false, refused: true, reason: 'unproven infra recovery identity', detail: 'unproven infra recovery identity' }; }
   // Recheck in the child: tick-local admission does not cross a process boundary.
@@ -809,7 +815,7 @@ export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = e
   }
 }
 
-async function main(argv) {
+export async function runInfraBlocked(argv, { admission, readContext } = {}) {
   const { flags, pos } = parseArgv(argv);
   const sub = pos[0] || 'list';
   const path = resolveInfraStorePath();
@@ -913,7 +919,7 @@ async function main(argv) {
       // action === 'retry' → attempt a resume-open (never a local merge). The resume itself is UNLOCKED (it can
       // block for minutes on pr-land's green-wait); only the short store mutation after it takes the lock.
       retried.push(entry.num);
-      const r = resumeOpen(entry, { localSlug });
+      const r = resumeOpen(entry, { localSlug, admission, readContext });
       if (r.skip) { surfaced.push({ num: entry.num, cause: refined, attempt: entry.attempt, reason: 'cross-repo' }); log(`  ⊘ #${entry.num} ${r.detail}`); continue; }
       if (r.ok) { mutateInfraStore((s) => removeInfraBlock(s, entry.num), { path }); resumed.push({ num: entry.num, pr: r.prNumber ?? null }); continue; }
       if (r.refused) {
@@ -937,7 +943,7 @@ async function main(argv) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main(process.argv.slice(2)).then((code) => process.exit(code || 0)).catch((e) => {
+  runInfraBlocked(process.argv.slice(2)).then((code) => process.exit(code || 0)).catch((e) => {
     process.stderr.write(`infra-blocked: ${String(e?.message || e)}\n`);
     process.exit(1);
   });

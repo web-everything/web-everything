@@ -12,6 +12,7 @@ import { decideRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmission, se
 import { readBuildPrioritySettings } from '../build-queue.mjs';
 import { routeHeldItems } from '../../conveyor/build-dispatch-hold-router.mjs';
 
+const admission = { assertRuntimeAdmitted, withRuntimeAdmission };
 const only = ids => ({ mode: 'only', only: true, ids });
 it.each([
   [{ num: 12 }, only(['12']), true],
@@ -91,12 +92,13 @@ it('infra recovery refuses an unchecked group and scopes admitted retries to one
   expect(refused.failed[0]).toMatchObject({ num: '12', refused: true });
   await withRuntimeAdmissionTick(() => only(['12', '13']), async () => cliRetryInfraBlocked({ exec, readEntries: () => [entry] }));
   expect(exec).toHaveBeenCalledTimes(1);
-  expect(exec.mock.calls[0][1].slice(-2)).toEqual(['retry', '--num=12']);
+  expect(exec.mock.calls[0][1][0]).toMatch(/build-dispatch-daemon\.mjs$/);
+  expect(exec.mock.calls[0][1].slice(-3)).toEqual(['--infra-retry', 'retry', '--num=12']);
 });
 it('infra recovery rechecks settings in resumeOpen before any subprocess, including unreadable settings', () => {
   for (const readSettings of [() => only([]), () => ({ held: true }), () => { throw new Error('unreadable'); }, () => only(['12'])]) {
     const exec = vi.fn();
-    const result = resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12' }, { exec, readSettings });
+    const result = resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12' }, { admission, exec, readSettings });
     expect(result).toMatchObject({ ok: false, refused: true });
     expect(exec).not.toHaveBeenCalled();
   }
@@ -104,7 +106,7 @@ it('infra recovery rechecks settings in resumeOpen before any subprocess, includ
 it('resumeOpen publishes only after admitting lead and every group member', () => {
   const sha = 'a'.repeat(40);
   const exec = vi.fn((cmd, argv) => cmd === 'git' ? sha : JSON.stringify({ pr: 77 }));
-  expect(resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12', sha }, { exec, readSettings: () => only(['12', '13']) }))
+  expect(resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12', sha }, { admission, exec, readSettings: () => only(['12', '13']) }))
     .toMatchObject({ ok: true, prNumber: 77 });
   expect(exec.mock.calls.at(-1)[0]).toBe('node');
   expect(exec.mock.calls.at(-1)[1]).toContain('--label-on-green');
@@ -114,8 +116,9 @@ it('historical infra records recover group membership from the original dispatch
   const readContext = () => ({ entry: { payload: { num: '12', groupMembers: ['13'] } } });
   expect(infraRecoveryCard(entry, { readContext }).groupMembers).toEqual(['13']);
   expect(() => infraRecoveryCard(entry, { readContext: () => null })).toThrow(/unproven/);
+  expect(() => infraRecoveryCard(entry)).toThrow(/unproven/);
   const exec = vi.fn();
-  expect(resumeOpen(entry, { exec, readContext: () => { throw new Error('missing run'); }, readSettings: () => only(['12']) }).refused).toBe(true);
+  expect(resumeOpen(entry, { admission, exec, readContext: () => { throw new Error('missing run'); }, readSettings: () => only(['12']) }).refused).toBe(true);
   expect(exec).not.toHaveBeenCalled();
   expect(parseInfraStore(JSON.stringify([{ num: '12', groupMembers: ['13'] }]))[0].groupMembers).toEqual(['13']);
 });
@@ -192,7 +195,7 @@ it('infra publish rechecks after git reads revoke the whole allowlist', () => {
     if (command === 'git') { settings = only([]); return sha; }
     throw new Error('pr-land must never launch');
   });
-  const result = resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12', sha }, { exec, readSettings: () => settings });
+  const result = resumeOpen({ num: '12', groupMembers: ['13'], ref: 'lane/12', sha }, { admission, exec, readSettings: () => settings });
   expect(result).toMatchObject({ outcome: 'runtime-refused', ok: false, refused: true });
   expect(exec).toHaveBeenCalledTimes(2);
   expect(exec.mock.calls.every(([command]) => command === 'git')).toBe(true);

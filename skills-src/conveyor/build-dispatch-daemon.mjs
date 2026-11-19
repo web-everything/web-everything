@@ -36,7 +36,8 @@ import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedP
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
 import { readBuildPrioritySettings, decideRuntimeAdmission } from '../../scripts/lib/build-queue.mjs';
-import { readInfraStore, resolveInfraStorePath, infraRecoveryCard } from '../../scripts/conveyor/infra-blocked.mjs';
+import { readInfraStore, resolveInfraStorePath, infraRecoveryCard, runInfraBlocked } from '../../scripts/conveyor/infra-blocked.mjs';
+import { producerBuildContext } from '../../scripts/operations/build-pr-authorship.mjs';
 import { withRuntimeAdmission, assertRuntimeAdmitted, withRuntimeAdmissionTick, setRuntimeAdmissionCards } from '../../scripts/lib/runtime-admission.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
@@ -2165,7 +2166,7 @@ export function cliRetryInfraBlocked({
     for (const [index, stored] of entries.entries()) {
       if (now() >= deadline) return deferRemaining(index);
       let entry;
-      try { entry = infraRecoveryCard(stored); }
+      try { entry = infraRecoveryCard(stored, { readContext: producerBuildContext }); }
       catch {
         // A damaged historical context refuses only its own card, never the rest of the pass.
         result.failed.push({ num: stored.num, refused: true, reason: 'unproven infra recovery identity',
@@ -2182,7 +2183,7 @@ export function cliRetryInfraBlocked({
       const remainingMs = Math.floor(deadline - now());
       if (remainingMs <= 0) return deferRemaining(index);
       // Scope the child to this admitted identity; an unrestricted retry can publish other cards' PRs.
-      const text = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', [join(SCRIPTS, 'conveyor', 'infra-blocked.mjs'), 'retry', `--num=${entry.num}`], {
+      const text = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', [fileURLToPath(import.meta.url), '--infra-retry', 'retry', `--num=${entry.num}`], {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, cwd: REPO_ROOT,
         timeout: remainingMs, killSignal: 'SIGTERM',
         env: childEnv,
@@ -3271,6 +3272,11 @@ function rearm(flags) {
 }
 
 async function main(argv) {
+  // This child owns policy imports; infra-blocked stays in the watchdog's small closure.
+  if (argv[0] === '--infra-retry') {
+    process.exitCode = await runInfraBlocked(argv.slice(1), { admission: { assertRuntimeAdmitted, withRuntimeAdmission }, readContext: producerBuildContext });
+    return;
+  }
   installDaemonLog(); // item 68a/68b: ISO stamp, collapse identical repeats, size-rotate (see daemon-log.mjs)
   const flags = parseFlags(argv);
   if (flags['rearm-false-holds']) return rearm(flags);

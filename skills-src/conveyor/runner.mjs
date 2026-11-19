@@ -355,9 +355,9 @@ export function makeCliMechanicalPasses({
       `⚠ mechanical pass ${path} [${key}] failed (non-fatal): ${summarizeMechanicalPassError(e)}\n`,
     );
     const pending = [];
-    const run = (path, args, key, slug, capture = false) => {
+    const run = (path, args, key, slug, capture = false, passName) => {
       const root = resolve(scriptsDir, '..');
-      const name = path.split('/').pop().replace(/\.mjs$/, '');
+      const name = passName ?? path.split('/').pop().replace(/\.mjs$/, '');
       const perPr = ['review-dispatch', 'review-round-tag', 'review-status-tag'].includes(name);
       const pass = { passName: perPr ? `${name}:${args[0]}` : name,
         repo: slug ?? repos.we?.slug ?? CONSTELLATION_REPOS.we.slug,
@@ -374,7 +374,7 @@ export function makeCliMechanicalPasses({
       return job;
     };
     // WE-only: retries WE backlog infrastructure holds.
-    if (!skip('infra-blocked')) run('conveyor/infra-blocked.mjs', ['retry'], 'we', repo);
+    if (!skip('infra-blocked')) run('../skills-src/conveyor/build-dispatch-daemon.mjs', ['--infra-retry', 'retry'], 'we', repo, false, 'infra-blocked');
     // WE-only: reaps the WE delivery pool's leases.
     if (!skip('lease-reaper')) run('conveyor/lease-reaper.mjs', [], 'we', repo);
     // WE-only invocation: session ground truth already resolves repo-aware slugs.

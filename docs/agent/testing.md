@@ -4743,3 +4743,16 @@ in `runtime-admission.test.mjs`, and the readonly exception's allowlist assertio
 Orphan resume pending writes must roll back on final refusal: remove the pending
 marker and restore any previous dead attempt count. The named final-refusal cases
 in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and recovers.
+
+
+## Infra recovery admission injection and watchdog isolation
+
+`infra-blocked.mjs` belongs to the watchdog's pinned small import closure. Keep runtime
+admission policy imports in the build daemon, which launches its `--infra-retry` child
+entry point and injects the historical context reader and both shared admission functions into `runInfraBlocked` and
+`resumeOpen`. Direct recovery without a complete adapter refuses before subprocess IO;
+retry through the build daemon to restore the policy boundary. Preserve the named
+`withRuntimeAdmission` callback at the process primitive so the spawn inventory still
+recognizes fresh admission. `infra-blocked.test.mjs` covers absent/partial adapters;
+`runtime-admission.test.mjs` covers injected whole-group and final-read refusals;
+`driver-watchdog.test.mjs` pins the dependency closure without widening its list.

@@ -7,7 +7,7 @@
  *   mark bumps + reschedules, and the lane-detail derive matches the shape status-board reads. The atomic fs
  *   roundtrip is exercised at the boundary; the live gh/network/pr-land driver is the IO shell (not unit-tested).
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -40,6 +40,7 @@ import {
   DEFAULT_REFUSAL_INTERVAL_MS,
   DEFAULT_MAX_REFUSALS,
   resumeShaDecision,
+  resumeOpen,
 } from '../infra-blocked.mjs';
 
 const T0 = Date.parse('2026-07-24T00:00:00.000Z');
@@ -549,4 +550,16 @@ describe('infra-blocked source guards — resume never strands work and never me
     // execFileSync throws on pr-land's non-zero exit (red/timeout); the catch still reads a pr number off stdout.
     expect(src).toMatch(/if \(res\.pr != null\) return \{ ok: true/);
   });
+});
+
+
+describe('infra recovery requires an injected runtime admission adapter', () => {
+  it.each([undefined, {}, { assertRuntimeAdmitted: () => ({ admitted: true }) }, { withRuntimeAdmission: (_card, _kind, effect) => effect() }])(
+    'refuses missing or incomplete adapter %j before any subprocess', admission => {
+      const exec = vi.fn();
+      expect(resumeOpen({ num: '12', ref: 'lane/12', sha: 'a'.repeat(40) }, { admission, exec }))
+        .toMatchObject({ ok: false, refused: true, reason: 'runtime admission adapter missing',
+          detail: expect.stringContaining('Retry through the build daemon') });
+      expect(exec).not.toHaveBeenCalled();
+    });
 });
