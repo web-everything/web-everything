@@ -1,5 +1,6 @@
 import { HEAD, workflowRow, workflowEvidence } from '../../conveyor/soak/fixtures/workflow-edit-protection.mjs';
 import { resolveRequiredChecks } from '../check-state-predicate.mjs';
+import { gateOnlyRedStates, requiredCheckStates } from '../../conveyor/ci-heal-verdict-recheck.mjs';
 // @vitest-environment node
 import { isCandidacyHold, deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting, excusePrMergeGateHolds } from '../merge-gate-hold-class.mjs';
 import { formatPrResult, workflowEditFact } from '../merge-gate-ci.mjs';
@@ -678,6 +679,30 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     expect(out.statusCheckRollup[0]).toMatchObject({ conclusion: 'FAILURE',
       mergeGateReviewHold: { holds: expect.arrayContaining(['workflow-edit-protection']), jobId: 123 } });
     expect(runGh.mock.calls[0][0]).toEqual(['api', 'repos/owner/repo/actions/jobs/123']);
+  });
+  // The strict resolver (and ci-heal recheck built on it) must read this hold as review work, not CI red.
+  it.each([
+    ['alone', e => e],
+    ['with a missing red-team check', e => { e.log = e.log.replace('pass  red-team  ok', 'hold  red-team  no red-team check run on head'); }],
+  ])('the annotated workflow hold %s is held, never red, for the strict resolver and ci-heal recheck', (_name, mutate) => {
+    const rows = [...probe(mutate).out.statusCheckRollup, { ...green, head_sha: HEAD }];
+    const evidence = { rows, rowsHead: HEAD, rowsComplete: true, head: HEAD, requiredNames: ['merge-gate', 'test'], rosterSource: 'live' };
+    expect(resolveRequiredChecks(evidence)).toMatchObject({ state: 'held', perName: { 'merge-gate': { state: 'held' } } });
+    const recheck = { rollup: rows, requiredChecks: ['merge-gate', 'test'], headSha: HEAD, rowsHead: HEAD, rowsComplete: true, rosterSource: 'live' };
+    expect(gateOnlyRedStates(recheck)).toMatchObject({ gateOnlyRed: true });
+    expect(requiredCheckStates(recheck).red).toEqual([]);
+  });
+  it.each([
+    ['an extra non-review hold id', hold => ({ ...hold, holdIds: [...hold.holdIds, 'codeql'] })],
+    ['no workflow flag', ({ workflowEditProtection, ...hold }) => hold],
+    ['another head', hold => ({ ...hold, headSha: 'b'.repeat(40) })],
+    ['another job', hold => ({ ...hold, jobId: 999 })],
+    ['two review-acceptance ids', hold => ({ ...hold, holdIds: ['review-acceptance', 'review-acceptance'] })],
+  ])('a workflow hold with %s stays red for the strict resolver', (_name, alter) => {
+    const [row] = probe().out.statusCheckRollup;
+    const rows = [{ ...row, mergeGateReviewHold: alter(row.mergeGateReviewHold) }];
+    expect(resolveRequiredChecks({ rows, rowsHead: HEAD, rowsComplete: true, head: HEAD,
+      requiredNames: ['merge-gate'], rosterSource: 'live' }).state).toBe('fail');
   });
   it('also annotates the table hold without a self-check diagnostic', () => {
     const { out } = probe(e => { e.log = e.log.split('\n').filter(l => !l.startsWith('merge-gate:')).concat('merge-gate: HOLD — held').join('\n'); });

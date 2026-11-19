@@ -143,6 +143,12 @@ const evidenceJob = row => {
   } catch { return undefined; }
 };
 
+// The merge-gate producer's workflow-protection review hold (merge-gate-hold-class): exactly one
+// review-acceptance hold, optionally with the red-team check the review itself produces. Nothing else.
+const workflowProtectionHold = hold => hold?.workflowEditProtection === true
+  && hold.holdIds.length <= 2 && hold.holdIds.filter(id => id === 'review-acceptance').length === 1
+  && hold.holdIds.every(id => id === 'review-acceptance' || id === 'red-team');
+
 // In-process producer proof only: JSON check feeds and persisted snapshots cannot forge it.
 // The REST reader binds this after exhausting each attempt's job inventory and proving
 // exactly one job has this name. Job IDs themselves change across Actions reruns.
@@ -226,7 +232,8 @@ export function resolveRequiredChecks({ rows, rowsHead, rowsComplete, requiredNa
       const job = evidenceInteger(evidenceJob(row));
       if (job !== null && candidates.some(hold => evidenceInteger(hold?.jobId) === job
         && rowHead !== null && sha(hold?.headSha) === rowHead && Array.isArray(hold?.holdIds) && hold.holdIds.length
-        && humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only)) state = 'held';
+        && (humanReviewOnlyHold([...hold.holdIds].map(id => ({ id, status: 'hold' }))).only
+          || workflowProtectionHold(hold)))) state = 'held';
     }
     return { row, name, state, reasons: why, rowHead, identity: evidenceIdentity(row), run: evidenceInteger(row?.run_id), attempt: evidenceInteger(row?.run_attempt) };
   });

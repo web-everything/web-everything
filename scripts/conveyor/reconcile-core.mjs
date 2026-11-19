@@ -1580,8 +1580,12 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
  * reviewHoldCiWaivable({ pr, requiredChecks: ['review-gate', 'merge-gate'] });
  */
 export function reviewHoldCiWaivable({ pr, requiredChecks }) {
-  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr?.reviewTiming });
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup,
+    rowsComplete: pr?.rowsComplete === true && pr?.rowsHead === pr?.headRefOid,
+    verifyGreen: pr?.verifyGreen, policy: pr?.reviewTiming });
   if (ci.allowed) return true;
+  // Unknown or incomplete evidence (stale or unpaged snapshot) never waives the CI wait.
+  if (ci.unknown || ci.reason === 'rows-incomplete') return false;
   const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
   const annotated = rollup.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
   return Array.isArray(ci.affected) && ci.affected.length > 0

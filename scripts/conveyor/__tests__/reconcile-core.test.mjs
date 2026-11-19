@@ -3782,8 +3782,21 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 
   it('still waives CI for a review-hold advisory when only the held gates are red', () => {
-    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup() });
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(),
+      rowsComplete: true, rowsHead: pr1563().headRefOid });
     expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(true);
+  });
+
+  it.each([
+    ['incomplete rows', { rowsComplete: false, rowsHead: pr1563().headRefOid }],
+    ['missing provenance', {}],
+    ['a stale snapshot head', { rowsComplete: true, rowsHead: 'f'.repeat(40) }],
+  ])('never waives CI for a review-hold advisory on %s', (_, evidence) => {
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...evidence });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(false);
+    const result = planReconcile({ prs: [source], requiredChecks, agents: [], durableCounts: {}, now: NOW,
+      advisoryReviewOnHumanHandoff: 'on' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
   });
 });
 

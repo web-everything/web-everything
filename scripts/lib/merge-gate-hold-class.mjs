@@ -208,8 +208,10 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
         || !holds?.length || holds.length > 2
         || holds.filter(isWorkflowTouchHold).length !== 1
         || !holds.every(h => isWorkflowTouchHold(h) || isRedTeamMissing(h))) return unchanged;
+      // holdIds/headSha bind the hold for the strict resolver, like every other review-hold annotation.
       const replacement = { ...row, mergeGateReviewHold: {
         holds: [...holds.map(r => r.id), 'workflow-edit-protection'], jobId,
+        holdIds: holds.map(r => r.id), headSha: verdict.head_sha, workflowEditProtection: true,
       } };
       return { rows: rows.map(r => r === row ? replacement : r), excused: false, reviewHold: true };
     }
