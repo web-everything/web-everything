@@ -3,6 +3,7 @@ _site/
 _site-visual-fixtures/
 dist/
 coverage/
+coverage-shards/
 playwright-report/
 test-results/
 .DS_Store
