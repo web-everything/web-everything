@@ -80,10 +80,12 @@ export function existingTrackedPaths(paths, lstat = path => lstatSync(resolve(ro
   });
 }
 
-function readTracked(path) {
+export function readTracked(path, lstat = lstatSync) {
   const filename = resolve(root, path);
-  const stat = lstatSync(filename);
+  const stat = lstat(filename);
   if (stat.isSymbolicLink()) return Buffer.from(readlinkSync(filename));
+  // Forge projects tracked directory links into directories; count each as one link-text line.
+  if (stat.isDirectory()) return Buffer.from(path);
   if (!stat.isFile()) throw new Error(`Cannot count non-file: ${path}`);
   return readFileSync(filename);
 }

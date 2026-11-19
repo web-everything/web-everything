@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'n
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { classify, existingTrackedPaths, runCli, totals } from '../constellation-ownership.mjs';
+import { classify, existingTrackedPaths, readTracked, runCli, totals } from '../constellation-ownership.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const map = JSON.parse(readFileSync(resolve(root, 'config/constellation-ownership.json'), 'utf8'));
@@ -106,6 +106,7 @@ describe('constellation ownership', () => {
       if (targetState === 'existing') writeFileSync(join(scratch, 'target.txt'), 'one\ntwo\nthree\n');
       const link = join(scratch, 'link.txt');
       symlinkSync('target.txt', link);
+      expect(readTracked(relative(root, link))).toEqual(Buffer.from('target.txt'));
       expect(existingTrackedPaths([relative(root, link)])).toEqual([relative(root, link)]);
       // Use the default filesystem reader, not the injected buffer-counting seam.
       const result = totals([{ path: relative(root, link), destination: 'plateau' }]);
@@ -113,6 +114,34 @@ describe('constellation ownership', () => {
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
+  });
+
+  it('counts a Forge-projected directory as one file and one line', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'constellation-ownership-'));
+    try {
+      writeFileSync(join(scratch, 'child.txt'), 'one\ntwo\nthree\n');
+      const path = relative(root, scratch);
+      expect(readTracked(path)).toEqual(Buffer.from(path));
+      expect(totals([{ path, destination: 'plateau' }]).plateau).toEqual({ files: 1, lines: 1 });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('reads regular file contents', () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'constellation-ownership-'));
+    try {
+      const path = join(scratch, 'file.txt');
+      writeFileSync(path, 'one\ntwo\n');
+      expect(readTracked(relative(root, path))).toEqual(Buffer.from('one\ntwo\n'));
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it('still rejects non-file kinds such as FIFOs and sockets', () => {
+    const lstat = () => ({ isSymbolicLink: () => false, isDirectory: () => false, isFile: () => false });
+    expect(() => readTracked('non-file', lstat)).toThrow('Cannot count non-file: non-file');
   });
 
   it.each(['ENOENT', 'ENOTDIR', 'EACCES'])('handles working-tree inventory errors in the CLI (%s)', code => {
