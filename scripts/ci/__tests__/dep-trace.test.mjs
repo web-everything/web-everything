@@ -85,6 +85,14 @@ describe('shadow dependency tracer', () => {
     await expect(promisify(cp.execFile)('node', ['-e', '1'])).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
     expect(custom.mock.calls[0][2].env.WE_TRACE_TEST).toBe(test);
   });
+  it('records fs/promises reads and lists', async () => {
+    const promises = { readFile: vi.fn(async () => 'x'), readdir: vi.fn(async () => []) };
+    const tracer = createTracer({ test, root, record: vi.fn(), env: {}, fs: { promises }, child_process: {} });
+    tracer.install();
+    await promises.readFile('package.json', 'utf8');
+    await promises.readdir('scripts');
+    expect(tracer.snapshot().edges).toEqual([{ file: 'package.json', kind: 'read' }, { file: 'scripts', kind: 'list' }]);
+  });
   it('records all requested reads/lists and forwards arguments, receiver and return value', () => {
     const f = fixture();
     const cb = vi.fn();
@@ -118,6 +126,17 @@ describe('shadow dependency tracer', () => {
     zero.tracer.add('a', 'read');
     expect(zero.record).not.toHaveBeenCalled();
   });
+  it('worker threads persist to a thread-specific file instead of overwriting the process trace', () => {
+    const runtime = { pid: 123, once: vi.fn() };
+    const io = { mkdirSync: vi.fn(), writeFileSync: vi.fn() };
+    const port1 = { on: vi.fn(), unref: vi.fn() };
+    activateTrace({ WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, { maxEdgesPerTest: 5000 }, {
+      fs: io, child_process: {}, process: runtime, receiveMessageOnPort: () => undefined, register: vi.fn(), threadId: 2,
+      syncBuiltinESMExports: vi.fn(), MessageChannel: class { constructor() { this.port1 = port1; this.port2 = {}; } },
+    });
+    runtime.once.mock.calls[0][1]();
+    expect(io.writeFileSync.mock.calls[0][0]).toBe(resolve(root, 'artifacts/trace-123-t2.json'));
+  });
   it('loader forwards successful file loads, skips builtins and preserves errors', async () => {
     const port = { postMessage: vi.fn() };
     initialize({ port });
@@ -140,7 +159,7 @@ describe('shadow dependency tracer', () => {
     });
     const register = vi.fn((_url, options) => initialize(options.data));
     activateTrace({ WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, { maxEdgesPerTest: 5000 }, {
-      fs: io, child_process: {}, process: runtime, receiveMessageOnPort: receive, register,
+      fs: io, child_process: {}, process: runtime, receiveMessageOnPort: receive, register, threadId: 0,
       syncBuiltinESMExports: vi.fn(), MessageChannel: class { constructor() { this.port1 = port1; this.port2 = port2; } },
     });
     await load(pathToFileURL(resolve(root, 'pending.mjs')).href, {}, async () => ({ format: 'module', source: '' }));

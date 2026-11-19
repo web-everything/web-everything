@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import { register, syncBuiltinESMExports } from 'node:module';
-import { MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
+import { MessageChannel, receiveMessageOnPort, threadId } from 'node:worker_threads';
 import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -52,6 +52,14 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     for (const [name, kind] of Object.entries({ readFileSync: 'read', readFile: 'read', readdirSync: 'list', existsSync: 'read' })) {
       const original = io[name];
       if (original) io[name] = function (...args) { add(args[0], kind, process.cwd()); return Reflect.apply(original, this, args); };
+    }
+    // Promise-based reads (fs/promises) are dependencies too; without this they would look like absent edges.
+    const promises = io.promises;
+    if (promises) {
+      for (const [name, kind] of Object.entries({ readFile: 'read', readdir: 'list' })) {
+        const original = promises[name];
+        if (typeof original === 'function') promises[name] = function (...args) { add(args[0], kind, process.cwd()); return Reflect.apply(original, this, args); };
+      }
     }
     for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
       const original = cp[name];
@@ -140,7 +148,7 @@ export async function startTrace({ env = process.env, settings, activate = activ
 /** Runtime seams let mock-only tests exercise registration and synchronous exit persistence together. */
 export function activateTrace(env, settings, { fs: io = fs, child_process: cp = childProcess, process: runtime = process,
   MessageChannel: Channel = MessageChannel, register: registerLoader = register, syncBuiltinESMExports: syncExports = syncBuiltinESMExports,
-  receiveMessageOnPort: receive = receiveMessageOnPort } = {}) {
+  receiveMessageOnPort: receive = receiveMessageOnPort, threadId: tid = threadId } = {}) {
   const tracer = createTracer({ test: env.WE_TRACE_TEST, root: ROOT, env, fs: io, child_process: cp,
     maxEdgesPerTest: settings.maxEdgesPerTest, warn: message => console.error(message) });
   const { port1, port2 } = new Channel();
@@ -155,7 +163,7 @@ export function activateTrace(env, settings, { fs: io = fs, child_process: cp = 
     while ((pending = receive(port1))) tracer.add(pending.message, 'load');
     try {
       io.mkdirSync(env.WE_TRACE_DIR, { recursive: true });
-      io.writeFileSync(resolve(env.WE_TRACE_DIR, `trace-${runtime.pid}.json`), JSON.stringify(tracer.snapshot()));
+      io.writeFileSync(resolve(env.WE_TRACE_DIR, `trace-${runtime.pid}${tid ? `-t${tid}` : ''}.json`), JSON.stringify(tracer.snapshot()));
     } catch (error) { console.error(`dep-trace: incomplete evidence: ${error.code || 'write failed'}`); }
   });
   return tracer;
