@@ -32,6 +32,7 @@ export default {
       const pr = { number: 7106, state: 'OPEN', headRefOid: HEAD, headRefName: 'lane/soak-admission',
         files: [{ path: '.github/workflows/merge-gate.yml' }],
         mergeStateStatus: 'CLEAN', labels: [{ name: 'review:pending' }], comments: [],
+        rowsComplete: true, rowsHead: HEAD, // complete exact-head check evidence (the review CI contract)
         statusCheckRollup: [workflowRow, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
           { name: 'test', status: 'COMPLETED', conclusion: scenario === 'real CI failure' ? 'FAILURE' : 'SUCCESS' }] };
       const prs = excusePrMergeGateHolds([pr], { repo: 'owner/repo', mergeGateSetting: 'on',

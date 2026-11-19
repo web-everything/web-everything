@@ -21,6 +21,10 @@ export default {
     const fx = JSON.parse(readFileSync(join(sourceRoot,
       'scripts/conveyor/__tests__/fixtures/pr-ownership/pr-5157-before-ci-heal.json'), 'utf8'));
     const pr = fx.pr;
+    // Replay as the complete exact-head read the reconcile pass hands the planner: duplicate check names are
+    // re-read as the latest run per name, and a review-hold advisory never waives CI on unknown evidence.
+    const { collapseRollupToLatestPerName } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/rollup-collapse.mjs')).href);
+    Object.assign(pr, { rowsComplete: true, rowsHead: pr.headRefOid, statusCheckRollup: collapseRollupToLatestPerName(pr.statusCheckRollup) });
     const merge = pr.statusCheckRollup.filter(r => r.name === 'merge-gate').at(-1);
     merge.mergeGateReviewHold = { holds: ['test-gaming'], jobId: 1 };
     // The fixture models the full required-check set and the serial review→fix policy, not the production fast-check / joined-fix defaults.
@@ -45,7 +49,7 @@ export default {
         violations.push(`tick ${tick}: the CI-heal refusal must remain visible`);
     }
     const oldHead = pr.headRefOid;
-    pr.headRefOid = 'b'.repeat(40);
+    pr.headRefOid = 'b'.repeat(40); pr.rowsHead = pr.headRefOid; // the moved head's checks are re-read
     const stale = planReconcile({ ...options, advisoryFixCap: 0, roundCapAction: 'person' });
     if (stale.dispatch.length !== 1 || stale.dispatch[0].advisoryReview?.head !== pr.headRefOid
         || stale.dispatch[0].advisoryReview?.ciWaived !== true)
@@ -65,7 +69,7 @@ export default {
     if (referred.length)
       violations.push('recovery reviews must retain the referral guard');
     pr.comments.pop();
-    pr.headRefOid = oldHead;
+    pr.headRefOid = oldHead; pr.rowsHead = oldHead;
     // Genuine required CI failures still belong to ci-heal, even with an admitted advisory.
     pr.statusCheckRollup.filter(r => r.name === 'test').at(-1).conclusion = 'FAILURE';
     if (!planReconcile(options).dispatch.some(d => d.kind === 'ci-heal'))
