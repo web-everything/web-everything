@@ -26,6 +26,8 @@ import { fileURLToPath } from 'node:url';
 import { bindFindingIds, deriveVerdict, findingIdentityEntry, normalizeFindings } from './jury-core.mjs';
 import { findingDefectClass } from './review-round-rules.mjs';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
+import { assertCrossVendorPanel, loadReviewSeatSettings, sanitizeReviewLog } from './review-seat-provider.mjs';
+import { resolveShadowPromotionPrs, resolveShadowPromotionReplaces } from './review-seat-settings.mjs';
 
 /** A quota hold/exhaustion is the agy backend being out of budget: no juror ran, so it is neither a failure of the seat nor evidence about agy. */
 export const isQuotaHeldShadow = (row) => row?.status !== 'ok' && row?.status !== 'voided'
@@ -89,6 +91,18 @@ export function compareShadowAnswers({ claude, agy, prTable = [] }) {
   };
 }
 
+// Validate raw evidence before the display normalizer can coerce or drop malformed findings.
+// The reducer has no exported answer validator; require the canonical summary shape locally.
+function validShadowAnswer(answer) {
+  const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const text = value => typeof value === 'string' && value.trim().length > 0;
+  return object(answer) && text(answer.summary) && Array.isArray(answer.findings)
+    && Array.from(answer.findings).every(finding => object(finding) && text(finding.summary)
+      && ['file', 'path', 'category', 'failure_scenario', 'disposition', 'impactIfUnfixed', 'quote'].every(
+        key => finding[key] == null || typeof finding[key] === 'string')
+      && (finding.line == null || (Number.isSafeInteger(finding.line) && finding.line > 0)));
+}
+
 /**
  * The durable row for one shadow seat run. PURE. Carries counts and identities, never finding text.
  * @param {object} o
@@ -98,8 +112,10 @@ export function buildShadowRow({ at, repo, pr, head, lens, runId, model, agyRun,
   const findings = normalizeFindings(agyAnswer?.findings);
   return {
     at, repo: repo ?? null, pr: pr ?? null, head: head ?? null, lens, runId: runId ?? null,
-    provider: 'agy', model,
+    provider: 'agy', model, servedModel: agyRun.servedModel ?? null,
     status: agyRun.status,
+    claudeValid: validShadowAnswer(claudeAnswer),
+    agyValid: validShadowAnswer(agyAnswer),
     ...(agyRun.reasons?.length ? { reasons: agyRun.reasons.slice(0, 5).map((r) => String(r).slice(0, 300)) } : {}),
     agySessionId: agyRun.sessionId ?? null,
     claudeSessionId: agyRun.claudeSessionId ?? null,
@@ -139,9 +155,17 @@ export function appendShadowRow(row, { path = resolveShadowAgreementPath(), appe
 
 /** Read every row; a missing file is no rows, a malformed line is skipped. */
 export function readShadowRows({ path = resolveShadowAgreementPath(), read = readFileSync } = {}) {
-  let text = '';
+  let text;
   try { text = read(path, 'utf8'); } catch { return []; }
-  return text.split('\n').flatMap((line) => { try { return line.trim() ? [JSON.parse(line)] : []; } catch { return []; } });
+  const rows = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      if (row && typeof row === 'object' && !Array.isArray(row)) rows.push(row);
+    } catch { /* Malformed lines have no PR identity to classify. */ }
+  }
+  return rows;
 }
 
 /**
@@ -181,22 +205,77 @@ export function summarizeShadowAgreement(rows = []) {
   }));
 }
 
-/** The report as text lines. PURE. */
-export function renderShadowReport(summary) {
-  if (!summary.length) return ['agy shadow agreement: no shadow runs recorded yet'];
+/** Classify each PR's Carbon trials, with invalid evidence taking precedence over disagreement. PURE. */
+export function summarizeCarbonPromotion(rows = [], { threshold = 10 } = {}) {
+  if (!Number.isSafeInteger(threshold) || threshold < 10) throw new RangeError('promotion threshold must be a safe integer of at least 10');
+  const prs = new Map();
+  for (const row of rows) {
+    if (!`${row?.servedModel ?? ''} ${row?.model ?? ''}`.toLowerCase().includes('carbon')
+      || row.repo == null || row.pr == null) continue;
+    const key = `${row.repo}#${row.pr}`;
+    // A Carbon answer with no findings cannot be told from an abstention, so it is never agreement evidence: invalid.
+    const valid = row.status === 'ok' && Boolean(row.overlap) && row.overlap.agyCount > 0
+      && typeof row.servedModel === 'string' && row.servedModel.toLowerCase().includes('carbon')
+      && row.claudeValid === true && row.agyValid === true
+      && !Object.hasOwn(row, 'fellBackTo') && !Object.hasOwn(row, 'fallbackFrom');
+    const classification = !valid ? 'invalid' : row.verdictAgree !== true || !(row.overlap.matched > 0) || (row.overlap.claudeOnly ?? row.overlap.claudeCount) !== 0
+      || (row.overlap.agyOnly ?? row.overlap.agyCount) !== 0 ? 'disagree' : 'agree';
+    const previous = prs.get(key);
+    prs.set(key, previous === 'invalid' || classification === 'invalid' ? 'invalid'
+      : previous === 'disagree' || classification === 'disagree' ? 'disagree' : 'agree');
+  }
+  const counts = { agree: 0, disagree: 0, invalid: 0, prs: prs.size, threshold };
+  for (const classification of prs.values()) counts[classification] += 1;
+  return counts;
+}
+
+/** Advisory report: evaluate a proposed replacement without changing or gating any seat. */
+export function renderShadowReport(summary, carbonPromotion = summarizeCarbonPromotion([]), promotionReplaces = 'claude', settings) {
+  const c = carbonPromotion;
+  const replacement = `Carbon promotion would replace one existing ${promotionReplaces} seat; panel size stays fixed.`;
+  const promotion = `Carbon vs Claude: ${c.agree} agree, ${c.disagree} disagree, ${c.invalid} invalid of ${c.prs} PRs; promotion threshold ${c.threshold} agreeing PRs (promotion is manual; the orchestrator flips it)`;
+  let panel, refusal;
+  try {
+    settings ??= loadReviewSeatSettings();
+    const seats = Object.entries(settings.seatProvider).map(([lens, provider]) => ({
+      provider: provider === 'shadow' ? 'claude' : provider,
+      model: provider === 'shadow' || provider === 'claude'
+        ? settings.claudeSeatModel?.[lens] : settings.seatModel?.[lens],
+    }));
+    if (settings.agyCorrectnessAdvisory) seats.push({ provider: 'agy', model: settings.agyModel });
+    const index = seats.findIndex(s => s.provider === promotionReplaces);
+    if (index < 0) throw new Error('replacement target absent; operator must replace an existing seat');
+    panel = seats.map(s => s.model);
+    panel[index] = 'gemini-4-carbon-high';
+  } catch (error) { refusal = error.message; }
+  const checks = ['claude', 'codex', 'agy'].map(builder => {
+    try {
+      if (refusal) throw new Error(refusal);
+      assertCrossVendorPanel(panel, builder);
+      return `Post-promotion cross-vendor panel for ${builder} builder: pass`;
+    } catch (error) { return `Post-promotion cross-vendor panel for ${builder} builder: refused — ${sanitizeReviewLog(error.message)}`; }
+  });
+  if (!summary.length) return ['agy shadow agreement: no shadow runs recorded yet', promotion, replacement, ...checks];
   const pct = (v) => (v == null ? 'n/a' : `${Math.round(v * 100)}%`);
   return [
     'agy shadow agreement, per seat (only the Claude verdict counted on these runs):',
     ...summary.map((s) => `  ${s.lens}: ${s.runs} run(s) on ${s.prs} PR(s) — ${s.compared} compared, `
       + `${s.voided} voided (escaped its lane), ${s.failed} failed, ${s.held} held (agy quota), ${s.skipped} skipped; verdict agreement ${pct(s.verdictAgreement)}, `
       + `mean finding overlap ${pct(s.meanFindingOverlap)}`),
+    promotion, replacement, ...checks,
   ];
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const args = process.argv.slice(2);
-  const summary = summarizeShadowAgreement(readShadowRows());
-  if (args.includes('--json')) process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
-  else process.stdout.write(`${renderShadowReport(summary).join('\n')}\n`);
+  const rows = readShadowRows();
+  const summary = summarizeShadowAgreement(rows);
+  const setting = resolveShadowPromotionPrs();
+  const replaces = resolveShadowPromotionReplaces();
+  const carbonPromotion = { ...summarizeCarbonPromotion(rows, { threshold: setting.value }), promotionReplaces: replaces.value };
+  process.stderr.write(`review.shadowSeats.antigravity.promotionReplaces=${replaces.value} (${replaces.source})\n`);
+  process.stderr.write(`review.shadowSeats.antigravity.promotionAgreeingPrs=${setting.value} (${setting.source})\n`);
+  if (args.includes('--json')) process.stdout.write(`${JSON.stringify({ seats: summary, carbonPromotion }, null, 2)}\n`);
+  else process.stdout.write(`${renderShadowReport(summary, carbonPromotion, replaces.value).join('\n')}\n`);
 }
