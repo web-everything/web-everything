@@ -516,8 +516,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         && !revalidateExemptions(out.canonicalAudit.record, {
           readFile: (path, encoding) => fs.readFileSync(path, encoding), env, now,
           readCard: path => {
-            fetchMain();
-            const result = execute('git', ['show', `refs/remotes/origin/main:${path}`]);
+            // The pay-by card lives on WE main, the same authority the audit writer (readCardFromMain) reads,
+            // even when the daemon repo is a sibling checkout.
+            const fetched = execute('git', ['fetch', '--quiet', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'], repo);
+            if (fetched.code !== 0) throw new Error('current debt card unreadable');
+            const result = execute('git', ['show', `refs/remotes/origin/main:${path}`], repo);
             if (result.code !== 0) throw new Error('current debt card unreadable');
             return result.stdout;
           },
