@@ -83,7 +83,8 @@ test('waiver logging is injectable and log/alert failures do not affect classifi
 for (const kind of ['clean', 'jit', 'code', 'test']) test(`review and red-team ${kind} carry policy`, t => {
   const f = fixture(t, kind), expected = ['clean', 'jit'].includes(kind);
   const record = { sha: f.from, diff: 'a'.repeat(64), humanCleared: true };
-  const facts = { ...f, setting: 'on', record, headSha: f.to, headDiff: 'b'.repeat(64), equivalence: 'strict' };
+  const facts = { ...f, setting: 'on', record, headSha: f.to, headDiff: 'b'.repeat(64), equivalence: 'strict',
+    exec: realExec, fingerprint: () => record.diff };
   const accept = decideAcceptCarryForward(facts); assert.equal(accept.action === 'carry', expected);
   const red = decideRebaseVerdictCarry({ ...f, setting: 'on', prior: record, priorPatchId: 'a'.repeat(40), headPatchId: 'b'.repeat(40), headSha: f.to });
   assert.equal(red.carry, expected);
@@ -213,4 +214,74 @@ test('newer negative ordinary readiness still vetoes a history-carried waiver', 
   const negative = { ref, sha: f.to, tests: 'red', audit: 'NOT WEAKENED', fingerprint: 'b'.repeat(64) };
   assert.ok(readyEvidence([ruled], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }));
   assert.equal(readyEvidence([ruled, negative], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }), null);
+});
+
+test('acceptance mismatch without injected IO stays settled and never invokes history dependencies', () => {
+  const record = { sha: 'a'.repeat(40), diff: 'a'.repeat(64), humanCleared: true };
+  let calls = 0;
+  const unexpected = () => { calls++; throw Error('unexpected history dependency'); };
+  assert.deepEqual(decideAcceptCarryForward({ setting: 'on', record, headSha: 'b'.repeat(40),
+    headDiff: 'b'.repeat(64), fingerprint: unexpected, classify: unexpected }), {
+    from: record.sha, to: 'b'.repeat(40), human: true, action: 'review-owed',
+    reason: `net diff changed since the accept at ${record.sha.slice(0, 9)} — a review of the change is owed; it goes back to the operator`,
+  });
+  assert.equal(calls, 0);
+});
+
+test('acceptance history kill switch performs no injected Git reads', () => {
+  let calls = 0;
+  const result = decideAcceptCarryForward({ setting: 'on', env: { WE_SAME_DIFF_CARRY: 'off' },
+    record: { sha: 'a'.repeat(40), diff: 'a'.repeat(64) }, headSha: 'b'.repeat(40), headDiff: 'b'.repeat(64),
+    exec() { calls++; throw Error('history is disabled'); } });
+  assert.equal(result.action, 'review-owed'); assert.equal(result.retryable, undefined); assert.equal(calls, 0);
+});
+
+for (const kind of ['clean', 'jit', 'code', 'conflict-code', 'test'])
+  test(`acceptance authentic fingerprint and injected Git: ${kind}`, t => {
+    const f = fixture(t, kind), calls = [];
+    const record = { sha: f.from, diff: netDiffFingerprint(f.repo, 'origin/main', f.from), humanCleared: true };
+    const headDiff = netDiffFingerprint(f.repo, 'origin/main', f.to);
+    assert.ok(record.diff); assert.ok(headDiff); assert.notEqual(record.diff, headDiff);
+    const exec = (file, args, options) => {
+      calls.push(args);
+      assert.equal(file, 'git'); assert.deepEqual(args.slice(0, 2), ['-C', f.repo]);
+      assert.equal(options.timeout, 10000); assert.equal(options.maxBuffer, 8 * 1024 * 1024);
+      assert.equal(options.env.GIT_NO_LAZY_FETCH, '1');
+      assert.equal(options.env.GIT_NO_REPLACE_OBJECTS, '1');
+      return realExec(file, args, options);
+    };
+    const result = decideAcceptCarryForward({ ...f, exec, setting: 'on', record, headSha: f.to, headDiff, equivalence: 'strict' });
+    assert.ok(calls.length);
+    assert.equal(result.action, ['clean', 'jit'].includes(kind) ? 'carry' : 'review-owed');
+    assert.equal(result.retryable, undefined);
+    if (result.action === 'review-owed') assert.equal(result.reason,
+      `net diff changed since the accept at ${record.sha.slice(0, 9)} — a review of the change is owed; it goes back to the operator`);
+  });
+
+test('a clean history cannot carry a fingerprint that does not cover the accepted commit', t => {
+  const f = fixture(t, 'clean');
+  let historyCalls = 0;
+  const result = decideAcceptCarryForward({ ...f, exec: realExec, setting: 'on',
+    record: { sha: f.from, diff: 'a'.repeat(64), humanCleared: true },
+    headSha: f.to, headDiff: netDiffFingerprint(f.repo, 'origin/main', f.to),
+    classify: () => { historyCalls++; return { carries: true, commits: [] }; } });
+  assert.equal(historyCalls, 0);
+  assert.equal(result.action, 'review-owed'); assert.equal(result.retryable, undefined);
+  assert.match(result.reason, /^net diff changed since the accept/);
+  assert.doesNotMatch(result.reason, /reviewed-sha|cleared-human|reviewed-diff/);
+});
+
+test('unreadable or oversized accepted fingerprint preserves the settled refusal without ambient IO', t => {
+  const f = fixture(t, 'clean');
+  for (const code of ['ENOENT', 'ENOBUFS']) {
+    let calls = 0, historyCalls = 0;
+    const result = decideAcceptCarryForward({ ...f, setting: 'on',
+      record: { sha: f.from, diff: 'a'.repeat(64) }, headSha: f.to, headDiff: 'b'.repeat(64),
+      exec(file, args, options) {
+        calls++; assert.equal(file, 'git'); assert.equal(options.maxBuffer, 8 * 1024 * 1024);
+        throw Object.assign(Error('unavailable proof'), { code });
+      }, classify: () => { historyCalls++; return { carries: true, commits: [] }; } });
+    assert.equal(calls, 1); assert.equal(historyCalls, 0); assert.equal(result.action, 'review-owed');
+    assert.equal(result.retryable, undefined); assert.match(result.reason, /^net diff changed since the accept/);
+  }
 });

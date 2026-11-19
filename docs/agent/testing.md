@@ -4941,3 +4941,9 @@ Keep readiness candidates separate from history-based negative-evidence vetoes: 
 Normalize colon-delimited line references only on recognized source paths; preserve endpoint ports and other numeric finding content, and test that changing a port refuses waiver admission.
 The node:test cases run through a small Vitest adapter so the host heavy-admission queue remains the test entry point.
 The soak break probes behavior in a temporary repository, including a real hunk-offset fingerprint change.
+
+Acceptance history fallback requires an explicit `exec`; facts-only callers never launch Git.
+Before history can carry a mismatched fingerprint, bind the recorded fingerprint to the accepted commit
+using the same injected runner. Keep the existing settled refusal for a mismatched or unreadable source
+fingerprint. `same-content-carry.cases.mjs` covers authentic carries, missing IO, mismatched evidence,
+content changes and bounded read failures; the original replay assertions must remain unchanged.

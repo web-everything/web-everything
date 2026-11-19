@@ -1,5 +1,5 @@
 /** A clean main merge shifts hunk offsets and used to void the waiver and acceptance. */
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { sameContentRepo } from '../../../lib/__tests__/fixtures/same-content-repo.mjs';
@@ -21,7 +21,7 @@ export async function probe(root) {
       { branch: ref, sha: f.to }, [{ ref, sha: f.from, ruling: 'R12', findings, fingerprint: before }], after,
       { sameContent: (from, to) => classifyHeadMove({ ...f, from, to, allowTestOnly: true }) });
     if (!ready) violations.push('clean merge voided the waiver');
-    const accept = decideAcceptCarryForward({ ...f, setting: 'on', record: { sha: f.from, diff: before }, headSha: f.to, headDiff: after, equivalence: 'strict' });
+    const accept = decideAcceptCarryForward({ ...f, exec: execFileSync, setting: 'on', record: { sha: f.from, diff: before }, headSha: f.to, headDiff: after, equivalence: 'strict' });
     if (accept.action !== 'carry') violations.push('clean merge voided acceptance');
     return { violations };
   } catch (error) { return { violations: [`same-content proof unavailable: ${error.message}`] }; }
