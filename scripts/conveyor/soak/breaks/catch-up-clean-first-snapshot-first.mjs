@@ -37,6 +37,15 @@ export default {
     const plan = planCatchUp({ prs, queued: 0, capacity: 7 });
     check([...plan.run.map(p => p.num), ...plan.later].join(',') === [...clean, ...numbers.slice(0, 3)].join(','),
       'planCatchUp defaults must put clean heads first');
+    const incidentPrs = [{ ...prs[0], num: 99 }, { ...prs[3], num: 7 }];
+    const incident = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1,
+      repo: 'web-everything/web-everything', priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } });
+    check(incident.run[0]?.num === 99, 'BLOCKED P0 incident fix must beat ordinary CLEAN at capacity one');
+    const missed = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1, deprioritize: [7] });
+    check(missed.run[0]?.num === 99, 'recently missed CLEAN must stay behind non-missed BLOCKED');
+    const held = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1, now: 1000,
+      declines: new Map([[7, { reason: 'held', at: 1000 }]]) });
+    check(held.run[0]?.num === 99, 'known-held CLEAN must stay behind non-held BLOCKED');
     const handle = createEnqueueOnEvent({
       cwd: sourceRoot, localSlug: 'example-owner/example-repo', defaultBranch: 'main', env: {}, now: () => 1000,
       resolveSetting: () => setting, log,
@@ -73,7 +82,7 @@ export default {
     try {
       await flush();
       check(starts.join(',') === '7127', 'only the highest-priority clean head should start before the snapshot');
-      if (snapshots[0]) writeFileSync(snapshots[0], JSON.stringify({ repo: 'example-owner/example-repo', writtenAt: 1000, rows: [] }));
+      if (snapshots[0]) writeFileSync(snapshots[0], JSON.stringify({ repo: 'example-owner/example-repo', writtenAt: 1000, rows: [], defaultBranch: 'main' }));
       children[0]?.finish();
       await flush();
       check(starts.join(',') === '7127,7148,7159,7175', 'normal concurrency should fill with the remaining clean heads');

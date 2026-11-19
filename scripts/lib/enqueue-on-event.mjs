@@ -57,7 +57,7 @@
  *   `enqueue-on-event: catch-up`. `tick()` runs it when due; `catchUp()` runs ONLY it, for a daemon whose passes
  *   run back to back (no post-pass sleep window) to call right before each pass.
  *
- *   catchUp.cleanFirst (boolean, default true) stably puts CLEAN/HAS_HOOKS first after all other sorts;
+ *   catchUp.cleanFirst (boolean, default true) stably puts CLEAN/HAS_HOOKS first within priority class and hold/miss groups;
  *   every other state remains a candidate. False retains the previous priority order.
  *   catchUp.snapshotFirst (boolean, default true) allows one catch-up child until the fast-drain reader accepts its round snapshot,
  *   then uses catchUp.concurrency. Missing/invalid/unreadable evidence keeps starts serial; a failed/timed-out
@@ -697,10 +697,13 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
     return typeof h?.reason === 'string' && !!h.reason && Number.isFinite(h.at) && now >= h.at
       && now - h.at < Math.min(CATCH_UP_DECLINE_TTL_MS, Number.isFinite(h.ttlMs) && h.ttlMs > 0 ? h.ttlMs : CATCH_UP_DECLINE_TTL_MS); };
   candidates.sort((a, b) => Number(knownHold(a.num)) - Number(knownHold(b.num)));
-  // Final stable partition: uncertain/blocked states remain candidates, behind clean heads.
+  // Clean heads lead only within the same priority class and hold/miss demotion group.
   if (cleanFirst) {
     const clean = pr => ['CLEAN', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
-    candidates.sort((a, b) => Number(clean(b)) - Number(clean(a)));
+    candidates.sort((a, b) => classes.get(a.num) - classes.get(b.num)
+      || Number(knownHold(a.num)) - Number(knownHold(b.num))
+      || Number(recentMisses.has(a.num)) - Number(recentMisses.has(b.num))
+      || Number(clean(b)) - Number(clean(a)));
   }
   const room = Math.max(0, capacity - queued);
   const plan = { run: candidates.slice(0, room).map(({ num, readyAt }) => ({ num, readyAt })),
@@ -1069,7 +1072,7 @@ export function createEnqueueOnEvent({
       if (!p.catchUp && active.size) { await Promise.race(active.values()); continue; }
       if (p.catchUp && active.size && (s.catchUp?.snapshotFirst ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.snapshotFirst) && listingSnapshot) {
         let published = false;
-        try { published = !!readRoundSnapshot({ path: listingSnapshot, repo: p.repo, env, now: now() }); }
+        try { published = !!readRoundSnapshot({ path: listingSnapshot, repo: p.repo, env, now: now(), requireDefaultBranch: true }); }
         catch { log('enqueue-on-event: round snapshot check threw; keeping catch-up serial'); }
         if (!published) {
           // A writer may publish before it exits. Recheck while it runs; failure/timeout also releases the wait.

@@ -2555,7 +2555,8 @@ Snapshot-first catch-up fixtures must model whether the fast-drain snapshot read
 legacy concurrency contracts inject an already-published snapshot; writer tests hold it absent, publish during an active child,
 and cover invalid/unreadable files and throwing checks keeping starts serial, plus failed/timed-out writers
 releasing the next attempt. A published fixture must pass the real reader; released children must reuse it.
-Clean-first is a final stable partition, so test prior priority/miss ordering within both groups and retain every non-clean candidate.
+Clean-first applies within the same priority class and known-hold/recent-miss demotion group; test a BLOCKED P0 incident fix against an ordinary CLEAN PR at capacity one and retain every non-clean candidate.
+Snapshot readiness and released-child reuse must require `defaultBranch`, as production does; a round file missing it keeps catch-up serial.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
 scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a

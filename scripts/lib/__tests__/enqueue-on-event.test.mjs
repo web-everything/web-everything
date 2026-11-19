@@ -1958,7 +1958,7 @@ describe('concurrent catch-up rounds', () => {
   const concurrent = (extra = {}) => catchUpSetup({
     manualFinish: true,
     // These concurrency contracts model a round whose snapshot has already been published.
-    readRoundSnapshot: () => ({ repo: REPO, writtenAt: 1000, rows: [] }),
+    readRoundSnapshot: () => ({ repo: REPO, writtenAt: 1000, rows: [], defaultBranch: 'main' }),
     resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3, busyIntervalSeconds: 60 } }),
     readCapacity: () => ({ capacity: 8, source: 'test' }),
     readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4, 5].map(n => candidate(n, n)) }),
@@ -2922,7 +2922,7 @@ describe('catch-up clean-first and snapshot-first settings', () => {
   });
 });
 
-describe('planCatchUp final clean-first partition', () => {
+describe('planCatchUp clean-first within priority and demotion groups', () => {
   const prs = [
     candidate(1, 1, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
     candidate(2, 2), candidate(3, 3, { mergeStateStatus: 'HAS_HOOKS', itemIds: ['urgent'] }),
@@ -2930,10 +2930,10 @@ describe('planCatchUp final clean-first partition', () => {
     candidate(6, 6, { mergeStateStatus: undefined }), candidate(7, 7, { mergeStateStatus: 'UNKNOWN' }),
   ];
   const input = { prs, queued: 0, capacity: 2, buildPriority: ['urgent'], deprioritize: [3] };
-  it('puts CLEAN and HAS_HOOKS first after all sorts, retaining priority and every non-clean candidate', () => {
+  it('puts CLEAN and HAS_HOOKS first within a class without undoing miss demotion', () => {
     const plan = planCatchUp(input);
-    expect(plan.run.map(p => p.num)).toEqual([2, 3]);
-    expect(plan.later).toEqual([1, 4, 5, 6, 7]);
+    expect(plan.run.map(p => p.num)).toEqual([2, 1]);
+    expect(plan.later).toEqual([4, 5, 6, 7, 3]);
     expect(plan.skipped).toEqual([]);
     // With no prior miss, build priority stays intact inside the clean partition.
     expect(planCatchUp({ ...input, deprioritize: [] }).run.map(p => p.num)).toEqual([3, 2]);
@@ -2941,6 +2941,26 @@ describe('planCatchUp final clean-first partition', () => {
   it('keeps the existing priority/miss order when cleanFirst is disabled', () => {
     const plan = planCatchUp({ ...input, cleanFirst: false });
     expect([...plan.run.map(p => p.num), ...plan.later]).toEqual([1, 2, 4, 5, 6, 7, 3]);
+  });
+  it('selects BLOCKED P0 incident fix #99 over ordinary CLEAN #7 with one slot', () => {
+    const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      prs: [candidate(7, 0), candidate(99, 900, { mergeStateStatus: 'BLOCKED' })], queued: 0, capacity: 1 });
+    expect(plan.run.map(p => p.num)).toEqual([99]);
+    expect(plan.later).toEqual([7]);
+  });
+  it.each(['CLEAN', 'HAS_HOOKS'])('selects %s before BLOCKED within the same priority class', mergeStateStatus => {
+    const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1,
+      prs: [candidate(99, 0, { mergeStateStatus: 'BLOCKED' }), candidate(7, 900, { mergeStateStatus })] });
+    expect(plan.run.map(p => p.num)).toEqual([7]);
+    expect(plan.later).toEqual([99]);
+  });
+  it.each(['recent miss', 'known hold'])('keeps a CLEAN PR with a %s behind a non-missed BLOCKED PR', demotion => {
+    const plan = planCatchUp({ priority: { mode: 'enforce' }, queued: 0, capacity: 1, now: 1000,
+      prs: [candidate(7, 0), candidate(99, 900, { mergeStateStatus: 'BLOCKED' })],
+      ...(demotion === 'recent miss' ? { deprioritize: [7] }
+        : { declines: new Map([[7, { reason: 'held', at: 1000 }]]) }) });
+    expect(plan.run.map(p => p.num)).toEqual([99]);
+    expect(plan.later).toEqual([7]);
   });
   it('treats unreadable merge state as not clean and retains it', () => {
     const unreadable = candidate(1, 0, { mergeStateStatus: {} });
@@ -2969,16 +2989,16 @@ describe('catch-up snapshot-first scheduling', () => {
       const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).split('=')[1];
       await vi.advanceTimersByTimeAsync(1000);
       expect(f.calls).toHaveLength(1);
-      const snapshot = { repo: REPO, writtenAt: 1000, rows: [] };
+      const snapshot = { repo: REPO, writtenAt: 1000, rows: [], defaultBranch: 'main' };
       writeFileSync(path, JSON.stringify(snapshot));
-      expect(readFastDrainRoundSnapshot({ path, repo: REPO, now: 1000, env: {} })).toEqual(snapshot);
+      expect(readFastDrainRoundSnapshot({ path, repo: REPO, now: 1000, env: {}, requireDefaultBranch: true })).toEqual(snapshot);
       await vi.advanceTimersByTimeAsync(1000);
       expect(f.calls).toHaveLength(3);
       expect(f.calls.every(c => c.args.includes(`--listing-snapshot=${path}`))).toBe(true);
       for (const call of f.calls.slice(1)) {
         const num = Number(call.args.find(a => a.startsWith('--only=')).slice(7));
         const listLive = vi.fn(() => { throw Error('released child listed live'); });
-        await readFastDrainRoundListing({ path, repo: REPO, onlyPr: num, now: 1000, env: {},
+        await readFastDrainRoundListing({ path, repo: REPO, onlyPr: num, now: 1000, env: {}, requireDefaultBranch: true,
           listLive, readTarget: async () => ({ number: num, state: 'OPEN' }), log: () => {} });
         expect(listLive).not.toHaveBeenCalled();
       }
@@ -3017,7 +3037,7 @@ describe('catch-up snapshot-first scheduling', () => {
     }
   });
 
-  it.each(['invalid', 'unreadable', 'check throws'])('keeps catch-up serial when the snapshot is %s, then starts the next writer', async mode => {
+  it.each(['invalid', 'unreadable', 'missing defaultBranch', 'check throws'])('keeps catch-up serial when the snapshot is %s, then starts the next writer', async mode => {
     vi.useFakeTimers();
     const f = fixture(mode === 'check throws' ? { readRoundSnapshot: () => { throw Error('unreadable'); } } : {});
     const round = f.handle.catchUp();
@@ -3026,6 +3046,7 @@ describe('catch-up snapshot-first scheduling', () => {
       expect(f.calls).toHaveLength(1);
       const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).slice(19);
       if (mode === 'invalid') writeFileSync(path, '{}');
+      if (mode === 'missing defaultBranch') writeFileSync(path, JSON.stringify({ repo: REPO, writtenAt: 1000, rows: [] }));
       if (mode === 'unreadable') mkdirSync(path); // A directory cannot be read as a snapshot on any host.
       await vi.advanceTimersByTimeAsync(1000);
       expect(f.calls).toHaveLength(1);
