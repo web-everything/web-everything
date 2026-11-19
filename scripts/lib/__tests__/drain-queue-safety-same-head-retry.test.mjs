@@ -795,7 +795,8 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   }));
 
   it('preserves the two-removal infrastructure retry route without exact-test report evidence', () => exactFixture(f => {
-    f.mqChecks = [check(31, 'test-shard (1)', 800, 'cancelled')];
+    // startup_failure retains the legacy main-green route; complete cancellation evidence has a single retry.
+    f.mqChecks = [check(31, 'test-shard (1)', 800, 'startup_failure')];
     f.artifacts = {}; f.reports = {};
     expect(f.guard().hold).toBe(false);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6903 head \w+ — failed_checks infra retry 2\/2/);

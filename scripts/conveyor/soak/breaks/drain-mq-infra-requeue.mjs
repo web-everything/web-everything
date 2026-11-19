@@ -1,0 +1,46 @@
+/** PR #7103: a timed-out integration job and its derived test aggregate stranded a CLEAN head. */
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { infraFixture } from '../../../lib/__tests__/fixtures/drain-mq-infra.mjs';
+
+const rootHere = fileURLToPath(new URL('../../../../', import.meta.url));
+const fixtureUrl = new URL('../../../lib/__tests__/fixtures/drain-mq-infra.mjs', import.meta.url).href;
+
+export default {
+  id: 'drain-mq-infra-requeue',
+  title: 'PR #7103: a cancelled integration timeout plus derived test failure gets exactly one infrastructure requeue',
+  card: 'PR #7103 merge-group run 44434828048',
+  fixedBy: { sha: 'HEAD', where: 'lane/drain-mq-infra-requeue', paths: [
+    'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-mq-infra-evidence.mjs',
+  ] },
+  fixPresent(root) {
+    // The harness needs a synchronous answer. Exercise the target tree with injected IO;
+    // file names, comments and diagnostic markers cannot claim that the fix is present.
+    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { mqSameHeadGuard } from ${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/drain-queue-safety.mjs')).href)};
+      import { infraFixture } from ${JSON.stringify(fixtureUrl)};
+      const f = infraFixture(mqSameHeadGuard);
+      if (f.guard().hold) process.exit(1);
+      f.secondFailure();
+      if (!f.guard().hold) process.exit(1);
+    `], { env: { ...process.env, WE_UNDER_TEST: '1' }, timeout: 10_000, maxBuffer: 64 * 1024,
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return probe.status === 0;
+  },
+  async run({ sourceRoot = process.env.SOAK_TREE_ROOT || rootHere } = {}) {
+    const { mqSameHeadGuard } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/drain-queue-safety.mjs')).href);
+    const f = infraFixture(mqSameHeadGuard);
+    const violations = [];
+    const first = f.guard();
+    if (first.hold || !first.line?.startsWith('mq-same-head-retry:')) violations.push('first pure infrastructure failure stayed held');
+    f.secondFailure();
+    if (!f.guard().hold) violations.push('second infrastructure failure got another requeue');
+    if (!f.lines.some(line => line.startsWith('mq-infra-requeue-exhausted:'))) violations.push('retry exhaustion was silent');
+    const unreadable = infraFixture(mqSameHeadGuard);
+    delete unreadable.jobs[135261064381];
+    if (!unreadable.guard().hold) violations.push('unreadable job evidence authorized requeue');
+    return { violations };
+  },
+  judge(report) { return report.violations; },
+};

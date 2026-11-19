@@ -1,5 +1,6 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
+import { readMqInfraJobs } from './drain-mq-infra-evidence.mjs';
 import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -159,6 +160,10 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
       else return hold(reason || 'unknown removal reason');
     }
   }
+  const infraJobs = retryEvidence?.infra === 'infra-jobs';
+  if (infraJobs && (failedChecksRemovals > 1 || reenqueuedAfterFailure > 0))
+    return hold('failed_checks (infrastructure requeue already spent: 1/1); operator must inspect history and enqueue manually');
+  const infraJobsRetry = infraJobs && retryEvidence.mergeState === 'CLEAN';
   const cancelledRegroup = retryEvidence?.infra === 'cancelled-regroup';
   const cancelledMax = retryEvidence?.mqCancelledRetryMax ?? 2;
   const cancelledRetry = cancelledRegroup && retryEvidence.mergeState === 'CLEAN'
@@ -178,7 +183,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
-  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
+  if (failedChecksRemovals > 0 && !infraJobsRetry && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -193,7 +198,8 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
   return { hold: false, line: failedChecksRemovals > 0
-    ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
+    ? hold((infraJobsRetry ? `failed_checks infrastructure retry 1/1 (INFRA: ${retryEvidence.infraNames.join(', ')}; PR CLEAN)`
+      : cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
@@ -734,7 +740,8 @@ function readMqRetryEvidence(options) {
     : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: uncachedExec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
-  if (base?.infra === 'cancelled-regroup') return live(base);
+  if (['cancelled-regroup', 'infra-jobs'].includes(base?.infra)) return live(base);
+  if (base?.infraJobsDeclined) return base;
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return live(base);
   // The exact-test reader alone may read ONE job log: the failed shard's, for vitest's final summary block (a bounded tail).
@@ -791,6 +798,19 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       throw new Error('truncated retry evidence; operator must inspect full history');
     };
     const rawChecks = readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs');
+    const infraRead = (path, json = true) => {
+      if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
+      const value = exec('gh', ['api', `repos/${repo}/${path}`], {
+        encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
+        stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
+      });
+      return json ? JSON.parse(value) : value;
+    };
+    const infraJobs = readMqInfraJobs({ checks: rawChecks, repo, commit: oid, removedAt,
+      aggregateJobs: retryPolicy.mqAggregateJobs, readJson: infraRead, readLog: path => infraRead(path, false) });
+    if (infraJobs) return infraJobs.infra === 'infra-jobs'
+      ? { ...infraJobs, mergeState: budget-- > 0 ? readMqMergeState({ repo, pr, head, exec }) : null }
+      : { ...infraJobs, infraJobsDeclined: true };
     const cancelled = check => ['cancelled', 'startup_failure'].includes(check.conclusion);
     const passingCheck = check => ['success', 'neutral', 'skipped'].includes(check.conclusion);
     const rawFailed = rawChecks.filter(check => !passingCheck(check));
@@ -1146,12 +1166,14 @@ function mqRetryDeclineReason(evidence, holdLine) {
   return evidence?.flakeReason ? `${base}; flake evidence: ${evidence.flakeReason}` : base;
 }
 function mqRetryDeclineReasonBase(evidence, holdLine) {
+  if (evidence?.infra === 'infra-jobs' && /already spent/.test(holdLine ?? ''))
+    return 'infrastructure requeue exhausted (1/1); operator must inspect history and enqueue manually';
   if (evidence?.infra === 'cancelled-regroup' && /already spent/.test(holdLine ?? ''))
     return 'cancelled/regroup retry bound reached; operator must inspect history and enqueue manually';
   if (/removals on this head|already spent/.test(holdLine ?? '')) return 'retry bound reached (this head already had its single retry)';
   if (!evidence) return 'retry evidence unreadable or incomplete';
   if (evidence.logReason) return evidence.logReason;
-  if (['quarantined', 'cancelled-regroup'].includes(evidence.infra))
+  if (['quarantined', 'cancelled-regroup', 'infra-jobs'].includes(evidence.infra))
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
   if (!['infra', 'main-red', 'flaky-test', 'exact-test'].includes(evidence.infra))
@@ -1184,6 +1206,8 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
     log(decision.line);
+    if (retryEvidence?.infra === 'infra-jobs' && /already spent/.test(decision.line ?? ''))
+      log(`mq-infra-requeue-exhausted: #${String(pr).replace(/\D/g, '')} head ${currentHead} — automatic infrastructure retry 1/1 spent; operator must inspect history and enqueue manually`);
     if (timelineHasFailedChecks(timeline, currentHead))
       log(`mq-same-head-retry-declined: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${mqRetryDeclineReason(retryEvidence, decision.line)}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}${retryEvidence?.derivedNames?.length && retryEvidence.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`);
     // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.

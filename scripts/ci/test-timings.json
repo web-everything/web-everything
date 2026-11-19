@@ -908,6 +908,8 @@
   "scripts/lib/__tests__/drain-poison-guard.test.mjs": 6.31,
   "scripts/lib/__tests__/drain-prestage.test.mjs": 0.09,
   "scripts/lib/__tests__/drain-queue-safety.test.mjs": 2.01,
+  "scripts/lib/__tests__/drain-queue-safety-infra-requeue.test.mjs": 0.1,
+  "scripts/conveyor/soak/breaks/drain-mq-infra-requeue.soak.test.mjs": 0.2,
   "scripts/lib/__tests__/drain-red-team-evidence.test.mjs": 13.14,
   "scripts/lib/__tests__/drain-skip-reasons.test.mjs": 0.03,
   "scripts/lib/__tests__/drain-workflow-edit-hold.test.mjs": 0.02,

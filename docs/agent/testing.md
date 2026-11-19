@@ -402,6 +402,14 @@ negative answers without file reads remain unverifiable.
 
 ## Drain red-team disposition and retry evidence
 
+Merge-queue check-run conclusions and Actions job conclusions may differ for timeouts; keep both
+in fixtures. Pure cancellation/timeout/runner-loss requeues require complete, commit/run/attempt-bound
+Actions metadata and a CLEAN head. Validate derived aggregate steps separately, retain the strict
+before-removal timestamp boundary, and count re-enqueues from the existing timeline: one automatic
+retry per head, including manual withdrawals. Exercise red main without reading main CI, exhaustion
+on the drain log channel, and unreadable metadata in `drain-queue-safety-infra-requeue.test.mjs`.
+Legacy main-green fixtures use `startup_failure` so they continue testing that separate evidence path.
+
 Stale abandonment publishes a complete marker before replacing the writer, under the shared status
 claim. Its intent binds the old writer digest, evidence digest, timestamp and the exact JSON bytes
 of the abandoned writer. Recovery may finish that intent only while those inputs still match;
