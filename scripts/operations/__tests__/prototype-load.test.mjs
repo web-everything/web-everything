@@ -3465,7 +3465,7 @@ describe('recorder-to-load same-diff waiver admission', () => {
     try {
       const OLD = 'd'.repeat(40), FP = '1'.repeat(64), findings = ['Accepted old-head finding.'];
       const waiverStore = join(dir, 'ruled-weakened.jsonl');
-      const request = { ref: BASE.branch, sha: OLD, ruling: 'untrusted', fingerprint: '9'.repeat(64) };
+      const request = { ref: BASE.branch, sha: OLD, ruling: 'untrusted', fingerprint: '9'.repeat(64), findings };
       const approval = { ref: BASE.branch, sha: OLD, ruling: 'R396' };
       const audit = auditRecord({ head: OLD, fingerprint: FP, verdict: 'WEAKENED', findings });
       expect(recordWaivers({ path: waiverStore, env: { HOME: dir }, repo: '.',
