@@ -1,6 +1,6 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext, readUnsettledPublicationHolds, ownsPublicationHold } from './red-team-check-run.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { isAutomationAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { createMqLiveReader, redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -125,7 +125,11 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       if (markerStat && (!Number.isFinite(completedAt) || !Number.isFinite(markerStat.mtimeMs) || completedAt < markerStat.mtimeMs))
         return { ok: false, reason: 'red-team check not proven newer than finished marker; operator must inspect publication' };
       const result = redTeamResultCommentForHead(readComments(), pr, head);
-      if (!result || result.carriedFrom) return { ok: false, reason: 'no ordinary red-team result on head' };
+      // Only the review App/bot's own result for THIS head counts (marker pr + rev already matched by the reader);
+      // an operator- or foreign-authored comment never releases a merge-gate hold.
+      if (!result || result.carriedFrom || !isAutomationAuthored(result.comment)
+        || result.parsed?.pr !== Number(pr) || result.parsed?.rev !== head)
+        return { ok: false, reason: 'no ordinary red-team result on head' };
       const current = latestPublicationStatus(readStatus({ repo, headSha: head, gh: liveGh }), pr);
       if (!current || current.state === 'success') {
         if (markerStat) rmSync(`${path}.unpublished`, { force: true });

@@ -2048,6 +2048,14 @@ describe('finished publication hold recovery', () => {
     expect(settleFinishedPublicationHold(f).ok).toBe(false);
     expect(existsSync(f.path)).toBe(true);
   });
+  it.each(['operator-authored', 'wrong-round marker'])('never clears on %s result evidence', kind => {
+    const f = setup();
+    f.readComments.mockImplementation(() => [cleanResultComment({ ...f, ...(kind === 'wrong-round marker' ? { head: 'd'.repeat(40) } : {}) })]
+      .map(c => kind === 'operator-authored' ? { ...c, author: { login: 'chalbert' } } : c));
+    expect(settleFinishedPublicationHold(f).ok).toBe(false);
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
   it.each(['absent', 'untrusted', 'different head', 'unreadable'])('keeps the marker with %s result evidence', kind => {
     const f = setup();
     f.readComments.mockImplementation(() => {
