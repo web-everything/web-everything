@@ -34,7 +34,7 @@ const cardOnlyHeads = new Map();
 const MAX_CARD_ONLY_HEADS = 256;
 const DEFAULT_MAX_PROBES = 6;
 const MAX_PROBES_CEILING = 50;
-const probeCap = value => Number.isInteger(value) && value > 0
+const probeCap = value => Number.isInteger(value) && value >= 0
   ? Math.min(value, MAX_PROBES_CEILING) : DEFAULT_MAX_PROBES;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // probed in fair, bounded turns, without occupying a capacity-bound admission.

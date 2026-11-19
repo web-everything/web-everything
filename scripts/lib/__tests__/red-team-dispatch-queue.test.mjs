@@ -1636,6 +1636,15 @@ describe('probe cap setting', () => {
     expect(floor.maxProbesPerTick).toBe(10);
   });
 
+  it.each(['file', 'operator'])('%s setting 0 disables probes and retains blocked entries', source => {
+    const f = savedProbeQueue();
+    const before = f.queue.entries();
+    const floor = probeFloor(source, 0);
+    expect(floor.maxProbesPerTick).toBe(0);
+    expect(probeTick(f, floor)).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+  });
+
   it('setting absent defaults to exactly six probes among ten blocked entries', () => {
     const f = savedProbeQueue();
     const floor = probeFloor('file', undefined, false);
@@ -1666,7 +1675,7 @@ describe('probe cap setting', () => {
 });
 
 describe('invalid probe cap', () => {
-  const invalid = [0, -1, 2.5, '7', NaN, Infinity, null, true];
+  const invalid = [-1, 2.5, '7', NaN, Infinity, null, true];
   describe.each(['file', 'operator'])('%s setting', source => {
     it.each(invalid)('%s falls back to exactly six finite probes', value => {
       const floor = probeFloor(source, value);
@@ -1677,13 +1686,13 @@ describe('invalid probe cap', () => {
   it.each(invalid)('raw floor value %s also falls back to six probes', value => {
     expect(probeTick(savedProbeQueue(), { maxProbesPerTick: value })).toHaveLength(6);
   });
-  it('an unreadable operator store preserves a stricter settings cap of one', () => {
+  it.each([0, 1])('an unreadable operator store preserves a stricter settings cap of %i', cap => {
     const store = join(operatorRoot, 'restrictive-probe-store.json');
     writeFileSync(store, '{');
     const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
-      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: 1 } } }), log: vi.fn() });
-    expect(floor.maxProbesPerTick).toBe(1);
-    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(1);
+      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: cap } } }), log: vi.fn() });
+    expect(floor.maxProbesPerTick).toBe(cap);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(cap);
   });
 
   it('an unreadable operator store returns null policy and uses the finite default', () => {

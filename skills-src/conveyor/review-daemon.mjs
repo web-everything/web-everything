@@ -533,17 +533,19 @@ export function runReviewTick({
       && String(e.message).includes('refusing a partial inventory')
       && !paused && typeof redTeamOnSkip === 'function') {
       try {
-        let host = { admitted: true, maxPerTick: Infinity };
-        try { host = hostAdmission() ?? host; } catch { host = { admitted: false }; }
-        const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
-        const capacity = recoveryCapacity({ host, hostLimit, recoveryStarts: hostLimit });
-        redTeamOnSkip({ repo, plan: { refusals: [] }, rawPrs: [], listPartial: true, capacity, paused,
-          planPartialRecovery: prs => {
-            const agents = readAgents({});
-            const partialPlan = reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => agents });
-            if (partialPlan?.deferred) throw new Error('partial recovery reconcile deferred');
-            return recoveryPlan(partialPlan);
-          } });
+        let host = { admitted: false };
+        try { host = hostAdmission() ?? host; } catch { /* Unknown host admission refuses recovery. */ }
+        const hostLimit = host.admitted === true && Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : 0;
+        if (hostLimit > 0) {
+          const capacity = recoveryCapacity({ host, hostLimit, recoveryStarts: hostLimit });
+          redTeamOnSkip({ repo, plan: { refusals: [] }, rawPrs: [], listPartial: true, capacity, paused,
+            planPartialRecovery: prs => {
+              const agents = readAgents({});
+              const partialPlan = reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => agents });
+              if (partialPlan?.deferred) throw new Error('partial recovery reconcile deferred');
+              return recoveryPlan(partialPlan);
+            } });
+        }
       } catch { log(`review-daemon: ${repo} partial-inventory red-team recovery failed`); }
     }
     return {

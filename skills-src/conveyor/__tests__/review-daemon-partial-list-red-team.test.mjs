@@ -143,7 +143,21 @@ describe('partial inventory recovery safety', () => {
     const { redTeamOnSkip } = failedListTick(inventoryError([], 10), {
       hostAdmission: () => { throw new Error('host unknown'); },
     });
-    expect(redTeamOnSkip.mock.calls[0][0].capacity).toMatchObject({ remainingStarts: 0, startsCeiling: 0 });
+    expect(redTeamOnSkip).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['null host admission', null],
+    ['undefined host admission', undefined],
+    ['denied host admission', { admitted: false, maxPerTick: 2 }],
+    ['missing maxPerTick', { admitted: true }],
+    ['NaN maxPerTick', { admitted: true, maxPerTick: NaN }],
+    ['Infinity maxPerTick', { admitted: true, maxPerTick: Infinity }],
+  ])('partial inventory recovery skips %s without dispatch', (_name, host) => {
+    const { redTeamOnSkip } = failedListTick(inventoryError([], 10), {
+      hostAdmission: () => host,
+    });
+    expect(redTeamOnSkip).not.toHaveBeenCalled();
   });
 
   it('partial inventory recovery fails closed on unreadable recovery lanes', () => {
