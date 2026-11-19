@@ -123,7 +123,8 @@ describe('buildCodexDirectTaskArgv — pure argv for agentic/workspace-write mod
   });
 
   it('always carries exec, --json, workspace-write sandbox, and -C, never a positional prompt', () => {
-    const argv = buildCodexDirectTaskArgv({ cwd: '/tmp/scratch' });
+    // Host PATH may contain a task scratch directory; keep that unrelated value hermetic.
+    const argv = buildCodexDirectTaskArgv({ cwd: '/tmp/scratch', env: { PATH: '/usr/bin:/bin' } });
     expect(argv[0]).toBe('exec');
     expect(argv).toContain('--json');
     expect(flagValue(argv, '-s')).toBe('workspace-write');

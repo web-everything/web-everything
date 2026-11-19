@@ -4642,6 +4642,80 @@ Use an injected HOME and filesystem: the append-only ops store lives under
 share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and grants nothing.
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
+
+## Agent launch normalisation (R37)
+
+Runtime `launchAgent` checks carry the security weight. The static gate is a **tripwire**,
+not proof that arbitrary JavaScript cannot launch a process. Its two inventories have separate jobs:
+
+- `scripts/lib/agent-launch-approved.json` is the reviewed list of agent CLI launchers and local
+  launcher helpers used for agents. The structural test pins whole-function syntax/token
+  fingerprints, plus each launcher's whole-module fingerprint to cover captured constants,
+  defaults, imports and other surrounding definitions. Shell launchers pin the complete script.
+  Updating a fingerprint snapshot cannot approve a new launcher path.
+- `scripts/lib/agent-launch-capability-baseline.json` snapshots **EXISTING** source files importing
+  child_process-class capability (Node execution builtins and process execution packages).
+  It is **NOT approval of agent launching**. A new capability importer fails unless reviewed
+  into the baseline (if it does not launch agents) or the launcher list (if it does).
+  Baseline membership never exempts a file from agent-launch detection or fingerprints.
+
+Regenerate the capability snapshot with `npm run gen:agent-launch-capability-baseline`, then review
+its diff. This command never edits the reviewed launcher list or its fingerprint snapshot.
+Both scans cover `.mjs`, `.cjs`, `.js`, `.mts`, `.cts`, `.ts` sources under `scripts/`, `skills-src/`
+and `.claude/skills/`. Agent launch detection also scans `.sh` and `.bash` command positions.
+Tests/spec files, test and fixture directories, `node_modules` and `.git` enter neither inventory.
+Symlinked source is inspected; unreadable paths, cycles and parse failures stop the scan. Repair
+source or request scanner support before rerunning; an incomplete scan never clears the gate.
+
+The structural tests pair command-position detections with ordinary argv, logging, documentation
+and baseline-only controls. They check helper imports/aliases/re-exports, shell launches, typed
+sources, new-file capability refusal and baseline launch refusal. Dynamic execution beyond this
+static tripwire's inspection still requires runtime validation and source review.
+
+R37.22 canonicalises Codex's `exec` / `e` alias before detecting `resume`, including literal argv,
+argument strings, shell scripts and the standalone id extractor. The runtime audit table pairs
+unchecked `e resume` refusals with matching-id controls.
+R37.23 approves execution functions by imported identity: only Node's `spawn`, `spawnSync`,
+`exec`, `execFile`, `execSync` and `execFileSync`. Node `fork` is refused because its
+JavaScript module/execArgv grammar does not describe an agent CLI invocation. Closures,
+bound functions and proxies cannot ignore the validated arguments: they are refused even with plausible fresh-launch argv.
+The fallback is an approved primitive with explicit literal argv. Tests substitute
+`scripts/lib/agent-launch.test-seam.mjs` at import time using the test loader, with a registry local to that module identity. The production seam always refuses
+registration and never approves a primitive, even with `VITEST=true` or `NODE_ENV=test`.
+The completion wrapper checks injected spawn identity at the OS boundary. Helpers with their own injection arguments are not approved primitives.
+
+R37.24 refuses execution-redirection options (`execPath`, `execArgv`, custom `shell`).
+R37.26 applies one environment denylist to every approved primitive's `options.env`,
+literal `env` assignments, shell assignment prefixes and `export` / `declare -x` statements:
+`NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
+`PATH`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `PROMPT_COMMAND`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_FUNC_*`.
+Empty assignments are refused too; Node/LD/DYLD names are matched case-insensitively.
+`env` split-string/chdir options and unparseable wrappers refuse with the literal-argv fallback.
+The regression table pairs these refusals with harmless `FOO=bar` assignments, including
+`env -i` / `-u` / `--unset` / `--` combinations. Real primitives must refuse before the guard runs.
+The fallback is literal agent argv without these overrides.
+String-command primitives (`exec`, `execSync`) refuse array-shaped options; options in either
+Node argument position are checked, including with omitted argv.
+R37.27 always supplies an explicit frozen environment. Absent/null `options.env` inherits a
+one-time copy with loader and shell-startup variables removed (including `BASHOPTS`); inherited
+`PATH` is preserved for executable lookup, while explicit `PATH` overrides still refuse.
+R37.28 snapshots descriptor fields, command, argv and options before validation or guards.
+Only frozen plain data copies reach execution. Reject proxies (before invoking traps), accessors
+(including non-enumerable/symbol properties), non-plain objects/arrays, cycles and sparse arrays;
+the fallback is dense literal argv and plain data. Never inspect caller references after copying.
+Tests preserve argv/option values and return identity, require detached frozen copies, and run
+real harmless Node/shell probes proving inherited startup code and changing argv stay inert. R37.25 probes ordinary
+Node with `VITEST=true` and requires registration refusal before an unchecked closure can run.
+
+Runtime validation checks every shell segment and requires matching literal native resume IDs.
+Guards are synchronous, receive frozen views, and cannot mutate the validated arguments.
+Claude implicit continuation is refused; Codex resume/fork needs explicit session evidence.
+The focused boundary run comprises `scripts/__tests__/agent-launch.test.mjs`,
+`scripts/__tests__/agent-launch-structure.test.mjs`, `scripts/__tests__/codex-direct-task.test.mjs`
+and `scripts/__tests__/codex-direct-task-resume.test.mjs`, always through heavy admission.
+`scripts/__tests__/agent-launch-structure.test.mjs`,
+`scripts/lib/__tests__/spawn-to-completion.test.mjs` and
+`scripts/__tests__/codex-direct-task-resume.test.mjs`, always through heavy admission.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
 Global and system config point at the same temporary empty file, system config is disabled, and
 inherited indexed config and config-source overrides are removed before applying the hardening
@@ -5076,3 +5150,54 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+## Codex boolean-option resume replay (PR #7022)
+
+Replay the real `launchAgent` export with an injected counting primitive and a synchronous
+`launchGuard` returning true. Use mode `codex-exec-resume`, descriptor `resumeId: 'other-id'`,
+command `codex`, and this exact argv:
+
+```json
+["exec","--ignore-rules","resume","12345678-1234-4234-8234-123456789abc"]
+```
+
+The historical source at `7fdb2bdfa6` calls the primitive once (`launched`). The repaired
+source refuses with `EAGENTLAUNCHREFUSED`, reason `resumeId must equal the native resume id
+in argv`, and zero primitive calls. A descriptor matching the UUID calls the primitive once.
+Moving `--ignore-rules` after `resume` gives the same matching/mismatching results.
+`["exec","resume","--model"]` refuses parsing with zero primitive calls.
+
+`scripts/__tests__/agent-launch.test.mjs` pins both option placements with matching and
+mismatching descriptors and malformed argv through the real boundary. Only allowlisted
+value options consume a following word; `--ignore-rules` is boolean. A resume mode must
+have parsed native evidence equal to its descriptor, including through shell wrappers.
+Use a historical blob import for before-proof when Git writes are prohibited; preserve
+the historical implementation and resolve only its relative dependency import. Never
+disable a current guard to manufacture a failure. No actual agent process is needed.
+
+
+## Agent launch startup locations and completion snapshots (R37.29–30)
+
+The R37 runtime table in `scripts/__tests__/agent-launch.test.mjs` covers startup-directory
+and Git execution/config overrides across options, env wrappers, inline assignments and
+export/declare statements. Preserve inherited HOME and CLAUDE_CONFIG_DIR; remove inherited
+ZDOTDIR/XDG configuration locations and Git overrides. Explicit HOME/ZDOTDIR/XDG locations
+must equal the parent's value. Only plain sh/bash/zsh `-c` wrappers are reviewed; refuse
+other shell modes/flags with a literal-argv fallback. Real bash/zsh probes first demonstrate
+that harmless startup files execute with overridden directories, then prove launcher refusal
+before the guard or startup-file side effect. Plain `-c` positive controls execute aliased Node.
+
+Snapshot caller data as the first statement of each launch/completion entry point, before
+option destructuring or spreading; forward only those copies. Share the plain-data snapshot
+validator with spawnToCompletion and the resume extractor. Getter/Proxy rows assert zero
+side effects, including completion-only options (encoding, timeout, maxBuffer, killSignal),
+injected IO and descriptor fields. Oversized sparse argv refuses with dense literal argv as
+the fallback. Keep old login-shell resume fixtures on plain `-c` so they still exercise resume
+evidence; dedicated startup rows prove login/interactive refusal before guards.
+
+The CI unit shards install zsh when the runner image lacks it. Keep the real startup-file
+and plain-shell probes mandatory; a missing executable is a test-environment failure.
+Local runs of `scripts/__tests__/agent-launch.test.mjs` also require sh, bash and zsh on PATH.
+When merging upstream changes to an approved launcher module, review the module diff before
+refreshing its structural fingerprint, even when the launcher function itself is unchanged.
+Scripts that introduce sandbox tokens must also enter `SANDBOX_BEARING_FILES` in
+`scripts/lib/permission-change.mjs`, preserving its unreadable-diff refusal coverage.
