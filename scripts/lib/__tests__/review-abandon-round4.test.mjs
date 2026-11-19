@@ -56,7 +56,7 @@ it('label-clearance, list, both gate scans, reaper and suspended-referral scans 
   expect(findSuspendedReferralRuns({ repo, pr, head, now, runsDir: dir }).map(r => r.id)).toEqual([id]);
   fixture();
   const reaped = reapDeadReviewRuns({ dir, env, now, apply: true, tool: {}, log: () => {},
-    probes: { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' } });
+    probes: { prStates: (_repo, numbers) => new Map(numbers.map(pr => [pr, 'OPEN'])), reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' } });
   expect(reaped.reaped).toEqual([id]); expect(reaped.scanned).toBe(1);
   expect(warn).toHaveBeenCalledTimes(5);
   for (const [line] of warn.mock.calls) {
@@ -173,6 +173,13 @@ it.each([
   ['refused label result', { effects: [{ ...appliedLabel(), result: { error: 'guard refused', refused: true } }] }],
   ['refusal without error text', { effects: [{ ...appliedLabel(), result: { refused: true } }] }],
   ['unsuccessful label result', { effects: [{ ...appliedLabel(), result: { ok: false } }] }],
+  ...['refused', 'failed', 'error'].flatMap(outcome => [
+    [`label result outcome ${outcome}`, { effects: [{ ...appliedLabel(), result: { outcome } }] }],
+    [`label effect outcome ${outcome}`, { effects: [{ ...appliedLabel(), outcome }] }],
+  ]),
+  ...[{ refused: true }, { ok: false }, { error: 'notice failed' }, { outcome: 'refused' }, { outcome: 'error' }].map(result =>
+    [`applied notice result ${JSON.stringify(result)}`, { effects: [appliedLabel(),
+      { key: 'notice', type: 'review.notice', stepIndex: 9, index: 1, status: 'applied', result }] }]),
 ])('%s replacement escalates past the stuck window and suppresses only while freshly active', (_name, more) => {
   const replacement = replacementFixture(more);
   expect(replacementSignal()).toMatchObject({ escalate: true,
@@ -181,9 +188,40 @@ it.each([
   expect(replacementSignal()).toMatchObject({ escalate: false });
 });
 
+it.each([
+  ['empty effects', { effects: [] }],
+  ['failed effect', { effects: [{ ...appliedLabel(), status: 'failed' }] }],
+  ...['refused', 'failed'].map(outcome => [`${outcome} run outcome`, { outcome }]),
+  ...[{ refused: true }, { ok: false }, { error: 'label write failed' }, { outcome: 'refused' }, { outcome: 'error' }].map(result =>
+    [`applied label result ${JSON.stringify(result)}`, { effects: [{ ...appliedLabel(), result }] }]),
+  ['applied notice refusal', { effects: [appliedLabel(), { key: 'notice', type: 'review.notice',
+    stepIndex: 9, index: 1, status: 'applied', result: { refused: true } }] }],
+])('%s replacement keeps abandonment held in both gate readers and scan paths', (_name, more) => {
+  replacementFixture(more);
+  for (const indexed of [false, true]) {
+    if (indexed) expect(backfillReviewRunIndex({ runsDir: dir, repo, openPrs: new Set([pr]) }).complete).toBe(true);
+    for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+      expect(gate(reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
+    }
+  }
+});
+
+it.each([
+  ['missing effects', { effects: undefined }],
+  ['null effects', { effects: null }],
+  ['missing pending cursor', { pending: undefined }],
+])('%s replacement is rejected as corrupt gate evidence', (_name, more) => {
+  replacementFixture(more);
+  expect(() => gate(readDrainRedTeamEvidence)).toThrow('refusing to read run');
+});
+
 it('replacement with every effect applied suppresses escalation after a long quiet period', () => {
   replacementFixture({ effects: [appliedLabel(), { key: 'notice', type: 'review.notice', stepIndex: 9, index: 1, status: 'applied' }] });
   expect(replacementSignal()).toMatchObject({ escalate: false });
+  for (const indexed of [false, true]) {
+    if (indexed) expect(backfillReviewRunIndex({ runsDir: dir, repo, openPrs: new Set([pr]) }).complete).toBe(true);
+    for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) expect(gate(reader).reason).not.toBe('review-abandoned');
+  }
 });
 
 it.each(['bounded scan', 'complete index'])('%s retains tombstones and requires replacement after abandonment in both readers', mode => {

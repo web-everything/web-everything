@@ -4,6 +4,8 @@ import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { isCompletedReview } from './drain-red-team-evidence.mjs';
 import { listRunIds, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
 import { hasRejectingReviewVerdict, isRunAbandoned, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
 import { reviewJobsDir, readJobRecord } from '../operations/review-job-store.mjs';
@@ -35,7 +37,7 @@ const nonEmpty = value => Array.isArray(value) || typeof value === 'string' ? va
 const hasReadError = v => Array.isArray(v) ? v.some(hasReadError)
   : v && typeof v === 'object' ? Object.entries(v).some(([k, x]) => (k === 'readError' && x != null && x !== false)
     || ((k === 'error' || k === 'errors') && nonEmpty(x)) || hasReadError(x)) : false;
-const identityOf = ({ pr, repo }) => (Number.isInteger(Number(pr)) && Number(pr) > 0 && /^\d+$/.test(String(pr)) && typeof repo === 'string' && repo.trim() ? `${repo}#${Number(pr)}` : null);
+const identityOf = ({ pr, repo }) => (Number.isSafeInteger(Number(pr)) && Number(pr) > 0 && /^\d+$/.test(String(pr)) && typeof repo === 'string' && repo.trim() ? `${repo}#${Number(pr)}` : null);
 const TMP = /^(.+?)\.(\d+)\.[^/]+\.tmp$/;
 /** A live writer (lock sidecar or temp sibling) keeps a record. Malformed lock, unreadable listing, unknown pid = ALIVE. */
 function writerHeld(id, dir, identity) {
@@ -54,16 +56,19 @@ function writerHeld(id, dir, identity) {
 
 /**
  * Injectable synchronous probes: reviewJobs() -> records, pidIdentity(pid, opts) -> {alive},
- * leases()/sessions() -> listing text. Exceptions, including bounded-exec failures, retain ALL candidates.
+ * leases()/sessions() -> listing text; prStates(repo, numbers) -> Map<number, OPEN|CLOSED|MERGED>.
+ * Liveness exceptions retain all candidates; PR-state exceptions retain the affected repo.
  * store overrides the named run-store helpers and stat(path); production never writes run records.
  * Unavailable evidence is retried on a later sweep after the operator restores the failing probe/store.
  */
 export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUNS_DIR?.trim() ? resolve(env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir(env)), now = Date.now(), apply = false,
-  log = console.error, thresholdMs, onlyIds, probes = {}, store = {}, tool } = {}) {
-  const result = { ...resolveReviewRunReaperSettings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {} };
+  log = console.error, thresholdMs, onlyIds, allowResumed = false, ruling, probes = {}, store = {}, tool } = {}) {
+  const result = { ...resolveReviewRunReaperSettings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {}, keptCounts: {} };
   const io = { listRunIds, tryReadRun, runPath, isRunRecordTerminal, markRunAbandoned, stat: statSync, ...store };
-  const keep = (reason, id) => { (result.kept[reason] ??= []).push(id); };
+  const keep = (reason, id) => { (result.kept[reason] ??= []).push(id); result.keptCounts[reason] = result.kept[reason].length; };
   const selected = onlyIds === undefined ? null : new Set(onlyIds);
+  const overrideResume = selected?.size === 1 && allowResumed === true && typeof ruling === 'string' && ruling.trim().length > 0;
+  if (!selected && (allowResumed || ruling !== undefined)) throw Error('resumed override requires an explicit run');
   const candidates = [];
   for (const id of io.listRunIds(dir)) {
     if (selected && !selected.has(id)) continue;
@@ -76,13 +81,14 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
       log('reap-dead-review-runs: retaining possibly rejecting review evidence; inspect the full verdict/effect payload before retrying abandonment');
       keep('rejecting-verdict', id); continue;
     }
+    if (isCompletedReview(record)) { keep('completed', id); continue; }
     if (io.isRunRecordTerminal(record)) { keep('terminal', id); continue; }
     if (isRunAbandoned(id, dir)) { keep('abandoned', id); continue; }
     if (!Array.isArray(record.effects) || record.effects.some(e => !e || typeof e.type !== 'string' || typeof e.status !== 'string')) {
       keep('unreadable', id); continue;
     }
-    if (record.resumeOf != null || record.resumedAt != null) { keep('resumed-run', id); continue; }
-    if (!identityOf(record.input ?? {})) { keep('identity-unreadable', id); continue; }
+    if ((record.resumeOf != null || record.resumedAt != null) && !overrideResume) { keep('resumed-run', id); continue; }
+    if (!identityOf(record.input ?? {})) { keep(selected ? 'identity-unreadable' : 'pr-state-unknown', id); continue; }
     const pending = record.pending;
     if (pending && (pending.kind === 'confirm' || Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of'))) {
       keep('suspended-awaiting-answer', id); continue;
@@ -184,6 +190,57 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     return result;
   }
 
+  // Resolve each repo once per sweep, after liveness has excluded active owners. Unknowns retain the run.
+  // At the list limit absence is inconclusive: use bounded individual views, sharing a 100-call budget.
+  // Exhaustion keeps candidates; inspect PR state and use an explicit --run, or retry a later sweep.
+  if (!selected) {
+    let callsLeft = 100;
+    const ghJson = args => {
+      if (callsLeft-- <= 0) throw Error('PR-state call budget exhausted');
+      return JSON.parse(String((probes.execFileSync ?? execFileSyncThrottled)('gh', args,
+        { cwd: ROOT, env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 })));
+    };
+    const defaultPrStates = (repo, numbers) => {
+      const rows = ghJson(['pr', 'list', '--state', 'open', '--json', 'number', '--limit', '500', '--repo', repo]);
+      if (!Array.isArray(rows) || rows.length > 500 || hasReadError(rows) || rows.some(row => !Number.isSafeInteger(row?.number) || row.number <= 0)) {
+        throw Error('unreadable open PR list');
+      }
+      const open = new Set(rows.map(row => row.number));
+      const states = new Map();
+      for (const pr of numbers) {
+        if (open.has(pr)) states.set(pr, 'OPEN');
+        else if (rows.length < 500) states.set(pr, 'CLOSED');
+        else {
+          try {
+            const view = ghJson(['pr', 'view', String(pr), '--json', 'state', '--repo', repo]);
+            states.set(pr, hasReadError(view) ? null : view?.state);
+          }
+          catch { states.set(pr, null); }
+        }
+      }
+      return states;
+    };
+    const repos = new Map();
+    for (const c of candidates) {
+      if (decisions.has(c.id)) continue;
+      const repo = c.record.input.repo;
+      if (!repos.has(repo)) repos.set(repo, []);
+      repos.get(repo).push(c);
+    }
+    for (const [repo, runs] of repos) {
+      let states;
+      try { states = (probes.prStates ?? defaultPrStates)(repo, [...new Set(runs.map(c => Number(c.record.input.pr)))]); }
+      catch { /* unknown PR state retains every candidate in this repo */ }
+      for (const c of runs) {
+        const state = states instanceof Map ? states.get(Number(c.record.input.pr)) : null;
+        if (state !== 'OPEN') decisions.set(c.id, ['CLOSED', 'MERGED'].includes(state) ? 'pr-not-open' : 'pr-state-unknown');
+      }
+    }
+    if ([...decisions.values()].includes('pr-state-unknown')) {
+      log('reap-dead-review-runs: pr-state-unknown; restore PR-state access and retry; for a truncated list or exhausted 100-call budget, inspect PR state and select an explicit --run');
+    }
+  }
+
   for (const c of candidates) {
     if (decisions.has(c.id)) { keep(decisions.get(c.id), c.id); continue; }
     let changed;
@@ -199,13 +256,14 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     if (changed) { keep('changed-during-sweep', c.id); continue; }
     if (apply !== true) { result.wouldReap.push(c.id); continue; }
     const marked = io.markRunAbandoned({ id: c.id, dir, now, by: 'reap-dead-review-runs',
-      reason: c.stuckEffect
+      reason: (overrideResume && (c.record.resumeOf != null || c.record.resumedAt != null) ? `resumed run overridden; ruling=${ruling}; ` : '') + (c.stuckEffect
         ? `stuck pending/unknown effect or step: pending step ${JSON.stringify(c.record.pending?.step ?? null)}; effects ${JSON.stringify(c.stuckEffect.effects)}; abandoned, effect NOT claimed applied`
-        : `dead: no live pid/handle/lease/session; unchanged for >= ${c.threshold / HOUR}h`,
+        : `dead: no live pid/handle/lease/session; unchanged for >= ${c.threshold / HOUR}h`),
       // Creation excludes other tombstones, not run writers. Bind to the original version so a writer
       // landing after the final check still wins, even if its mtime precedes sidecar creation.
       probes: { recordVersion: version(c.stat), ageMs: c.ageMs, thresholdMs: c.threshold, thresholdSource: c.thresholdSource,
         ...(c.stuckEffect ? { stuckEffect: c.stuckEffect } : {}),
+        ...(overrideResume && (c.record.resumeOf != null || c.record.resumedAt != null) ? { ruling, resumeOverridden: true } : {}),
         reviewJobs: 'dead', handles: 'dead', writers: 'dead', leases: 'absent', sessions: 'absent' } });
     if (marked.written) result.reaped.push(c.id);
     else if (marked.staleUnreplaceable) { // stale sidecar could not be replaced: retry next sweep, keep sweeping others

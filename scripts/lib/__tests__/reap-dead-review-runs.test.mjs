@@ -21,7 +21,7 @@ beforeEach(() => {
   dir = join(root, 'runs'); mkdirSync(dir); mkdirSync(join(root, 'run-tombstones'));
   env = { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json'), OPERATION_REVIEW_JOBS_DIR: join(dir, 'jobs') };
   mkdirSync(env.OPERATION_REVIEW_JOBS_DIR);
-  probes = { reviewJobs: vi.fn(() => []), pidIdentity: vi.fn(() => ({ alive: false })),
+  probes = { prStates: (_repo, numbers) => new Map(numbers.map(pr => [pr, 'OPEN'])), reviewJobs: vi.fn(() => []), pidIdentity: vi.fn(() => ({ alive: false })),
     leases: vi.fn(() => '[]'), sessions: vi.fn(() => '[]') };
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
@@ -325,7 +325,8 @@ it.each([[{ pr: undefined, repo: 'owner/repo' }], [{ pr: 123 }], [{ pr: 'x', rep
   'holds a record whose PR or repo identity is unreadable %j', input => {
     const r = record(); writeRun({ ...r, input }, dir);
     utimesSync(runPath('review-dead', dir), new Date(now - 8 * HOUR), new Date(now - 8 * HOUR));
-    kept('identity-unreadable');
+    kept('pr-state-unknown');
+    kept('identity-unreadable', { onlyIds: ['review-dead'] });
   });
 it('holds when a review-job record has an unreadable PR or repo identity', () => {
   record(); probes.reviewJobs = () => [{ pr: null, repo: 'owner/repo', pid: 1 }]; probes.pidIdentity = () => ({ alive: false });
@@ -500,4 +501,124 @@ it('a writer landing immediately before sidecar creation remains alive', () => {
   expect(statSync(runPath('review-dead', dir)).mtimeMs).toBe(mtime);
   expect(isRunAbandoned('review-dead', dir)).toBe(false);
   expect(isRunTerminalOrAbandoned(updated, 'review-dead', dir, isRunRecordTerminal)).toBe(false);
+});
+
+
+it.each(['CLOSED', 'MERGED'])('sweep keeps %s PRs and reports counts by reason', state => {
+  record(); probes.prStates = vi.fn(() => new Map([[123, state]]));
+  const result = sweep({ apply: false });
+  expect(result.kept['pr-not-open']).toEqual(['review-dead']);
+  expect(result.keptCounts).toEqual({ 'pr-not-open': 1 });
+  expect(result.wouldReap).toHaveLength(0);
+});
+it('sweep would reap a stuck open-PR run and caches injected PR states per repo', () => {
+  record('first'); record('second');
+  probes.prStates = vi.fn(() => new Map([[123, 'OPEN']]));
+  const result = sweep({ apply: false });
+  expect(result.wouldReap).toEqual(['first', 'second']);
+  expect(result.wouldReap).toHaveLength(2);
+  expect(result.keptCounts).toEqual({});
+  expect(probes.prStates).toHaveBeenCalledTimes(1);
+  expect(probes.prStates).toHaveBeenCalledWith('owner/repo', [123]);
+});
+it.each(['throws', 'missing', 'unknown', 'unreadable'])('sweep keeps %s PR-state evidence and names retry fallback', mode => {
+  record(); probes.prStates = () => {
+    if (mode === 'throws') throw Error('lookup failed');
+    return mode === 'unreadable' ? {} : new Map(mode === 'missing' ? [] : [[123, 'UNKNOWN']]);
+  };
+  const log = vi.fn(), result = sweep({ apply: false, log });
+  expect(result.kept['pr-state-unknown']).toEqual(['review-dead']);
+  expect(result.keptCounts['pr-state-unknown']).toBe(1);
+  expect(result.wouldReap).toHaveLength(0);
+  expect(log.mock.calls.flat().join(' ')).toContain('restore PR-state access and retry');
+  expect(isRunAbandoned('review-dead', dir)).toBe(false);
+});
+it.each([null, 'not-a-number', 0])('sweep keeps unresolved PR number %s as pr-state-unknown', pr => {
+  record(undefined, { input: { repo: 'owner/repo', pr } });
+  kept('pr-state-unknown');
+});
+it('completed-all-effects-applied runs stay kept through the shared gate predicate even with a stricter terminal classifier', () => {
+  record(undefined, { pending: null, verdict: { verdict: 'accept' }, effects: [effect('applied')] });
+  probes.prStates = vi.fn();
+  kept('completed', { store: { isRunRecordTerminal: () => false } });
+  expect(probes.prStates).not.toHaveBeenCalled();
+});
+it.each(['new', 'legacy'])('sweep keeps an already tombstoned run in the %s location before PR probes', location => {
+  record();
+  if (location === 'new') markRunAbandoned({ id: 'review-dead', dir, now, reason: 'already abandoned', by: 'fixture', probes: {} });
+  else writeFileSync(join(dir, 'review-dead.abandoned.json'), JSON.stringify({ at: new Date(now).toISOString(), reason: 'legacy', by: 'fixture', probes: {} }));
+  probes.prStates = vi.fn(); kept('abandoned');
+  expect(probes.prStates).not.toHaveBeenCalled();
+});
+it('explicit run bypasses the open-PR requirement without calling PR probes', () => {
+  record(); probes.prStates = vi.fn(() => { throw Error('must not read PR state'); });
+  expect(sweep({ onlyIds: ['review-dead'], apply: false }).wouldReap).toEqual(['review-dead']);
+  expect(probes.prStates).not.toHaveBeenCalled();
+});
+it('default PR probe uses one bounded open list per repo and resolves absence only from a short list', () => {
+  record('first'); record('second'); record('closed', { input: { repo: 'other/repo', pr: 124 } });
+  delete probes.prStates;
+  probes.execFileSync = vi.fn((_cmd, args) => JSON.stringify(args.at(-1) === 'owner/repo' ? [{ number: 123 }] : []));
+  const result = sweep({ apply: false });
+  expect(result.wouldReap).toEqual(['first', 'second']);
+  expect(result.kept['pr-not-open']).toEqual(['closed']);
+  expect(probes.execFileSync.mock.calls.map(c => c.slice(0, 2))).toEqual([
+    ['gh', ['pr', 'list', '--state', 'open', '--json', 'number', '--limit', '500', '--repo', 'other/repo']],
+    ['gh', ['pr', 'list', '--state', 'open', '--json', 'number', '--limit', '500', '--repo', 'owner/repo']],
+  ]);
+  for (const [, , opts] of probes.execFileSync.mock.calls) expect(opts).toMatchObject({ timeout: 10000, maxBuffer: 1024 * 1024 });
+});
+it.each(['OPEN', 'CLOSED', 'MERGED', 'UNKNOWN', 'failure'])('full 500-row list falls back to a bounded cached view returning %s', state => {
+  record('first', { input: { repo: 'owner/repo', pr: 900 } });
+  record('second', { input: { repo: 'owner/repo', pr: 900 } });
+  delete probes.prStates;
+  probes.execFileSync = vi.fn((_cmd, args) => {
+    if (args[1] === 'list') return JSON.stringify(Array.from({ length: 500 }, (_, i) => ({ number: i + 1 })));
+    if (state === 'failure') throw Error('PR not found');
+    return JSON.stringify({ state });
+  });
+  const result = sweep({ apply: false });
+  expect(probes.execFileSync).toHaveBeenCalledTimes(2);
+  expect(probes.execFileSync.mock.calls[1].slice(0, 2)).toEqual(['gh', ['pr', 'view', '900', '--json', 'state', '--repo', 'owner/repo']]);
+  if (state === 'OPEN') expect(result.wouldReap).toEqual(['first', 'second']);
+  else expect(result.kept[['CLOSED', 'MERGED'].includes(state) ? 'pr-not-open' : 'pr-state-unknown']).toEqual(['first', 'second']);
+});
+it.each(['error', 'oversized', 'malformed', 'unknown-shape'])('default PR probe fails closed on %s list evidence', mode => {
+  record(); delete probes.prStates;
+  probes.execFileSync = vi.fn(() => {
+    if (mode === 'error' || mode === 'oversized') throw Error(mode);
+    return mode === 'malformed' ? '[{}]' : '{}';
+  });
+  kept('pr-state-unknown'); expect(probes.execFileSync).toHaveBeenCalledTimes(1);
+});
+it('PR-state call-budget exhaustion keeps excess candidates and exposes explicit-run fallback', () => {
+  for (let i = 0; i < 101; i++) record(`budget-${String(i).padStart(3, '0')}`, { input: { repo: 'owner/repo', pr: 900 + i } });
+  delete probes.prStates;
+  probes.execFileSync = vi.fn((_cmd, args) => JSON.stringify(args[1] === 'list'
+    ? Array.from({ length: 500 }, (_, i) => ({ number: i + 1 })) : { state: 'OPEN' }));
+  const log = vi.fn(), result = sweep({ apply: false, log });
+  expect(probes.execFileSync).toHaveBeenCalledTimes(100);
+  expect(result.wouldReap).toHaveLength(99);
+  expect(result.keptCounts['pr-state-unknown']).toBe(2);
+  expect(log.mock.calls.flat().join(' ')).toContain('select an explicit --run');
+});
+
+it('session-reaper sweep keeps closed PRs and reports reason counts with injected hermetic probes', async () => {
+  const { runSessionReaperCli } = await import('../../conveyor/session-reaper.mjs');
+  record('closed'); record('open', { input: { repo: 'owner/repo', pr: 124 } });
+  probes.prStates = () => new Map([[123, 'CLOSED'], [124, 'OPEN']]);
+  let stdout = '', stderr = '';
+  const reap = vi.fn(options => reapDeadReviewRuns({ ...options, dir, env, now, probes }));
+  const code = runSessionReaperCli(['--reap-dead-review-runs', '--json', '--dry-run',
+    '--no-run-rating', '--no-ground-truth', '--no-completion-record', '--no-hung-detection',
+    '--no-auth-expired-detection', '--no-idle-finished-detection', '--no-pid-dead-detection'],
+    { exec: () => '[]', stdout: s => { stdout += s; }, stderr: s => { stderr += s; }, reapDeadReviewRuns: reap });
+  expect(code).toBe(0);
+  const result = JSON.parse(stdout).deadReviewRuns;
+  expect(result.kept['pr-not-open']).toEqual(['closed']);
+  expect(result.keptCounts['pr-not-open']).toBe(1);
+  expect(result.wouldReap).toEqual(['open']);
+  expect(stderr).toContain('pr-not-open=1');
+  expect(reap.mock.calls[0][0].onlyIds).toBeUndefined();
+  expect(reap.mock.calls[0][0].allowResumed).toBeUndefined();
 });

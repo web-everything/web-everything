@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { cliMain, main } from '../review-abandon.mjs';
 import { assertRunnerFreshness } from '../runner-freshness.mjs';
 import { newRunRecord, runPath, writeRun } from '../run-store.mjs';
+import { newJobBlock } from '../job-record.mjs';
 import { abandonedPath, isRunAbandoned, markRunAbandoned } from '../../lib/run-abandoned.mjs';
 import { COMMENT_SETTLEABLE_REASONS, readDrainRedTeamEvidence, readRecoveryWitness, settleUnknownEvidenceByComment } from '../../lib/drain-red-team-evidence.mjs';
 import { readReviewRunEvidence, findResumableParkedRun } from '../../conveyor/review-referral-hold.mjs';
@@ -57,7 +58,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'review-abandon-'));
   dir = join(root, 'runs'); mkdirSync(dir);
   env = { OPERATION_RUNS_DIR: dir, WE_SHARED_RUNS_DIR: dir, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'prefs.json') };
-  probes = { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
+  probes = { prStates: (_repo, numbers) => new Map(numbers.map(pr => [pr, 'OPEN'])), reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 function fixture(pr = 7109, age = 31 * MIN) {
@@ -88,7 +89,12 @@ function evidence(pr = 7109, reader = readDrainRedTeamEvidence) {
 }
 function completed(r, startedAt, id = 'review-pr-replacement', rev = head) {
   const next = structuredClone(r);
-  next.id = id; next.pending = null; next.effects = []; next.outcome = null; next.verdict = { verdict: 'accept' };
+  next.id = id; next.pending = null; next.outcome = null; next.verdict = { verdict: 'accept' };
+  // Completed accepts deliver the record step's label, ledger and notice effects.
+  next.effects = ['review.label-swap', 'verdict-ledger.append', 'review.notice'].map((type, index) => ({
+    key: `completed-${index}`, type, index, stepIndex: 9, step: 'record', status: 'applied',
+    payload: { to: 'accepted', verdict: 'accept' }, result: { ok: true },
+  }));
   next.findings.read.netBasis.rev = rev;
   next.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: new Date(startedAt).toISOString() }];
   writeRun(next, dir);
@@ -351,4 +357,42 @@ it('retains unreadable settings and corrupt run evidence', () => {
   expect(isRunAbandoned(r.id, dir)).toBe(false);
   rmSync(env.WE_PLATFORM_PREFERENCES_FILE); writeFileSync(runPath(r.id, dir), '{');
   expect(op(['--apply']).result.kept.unreadable).toEqual([r.id]);
+});
+
+
+it.each([[], ['--allow-resumed'], ['--ruling=decision-13']].map(flags => ({ flags })))('explicit resumed run stays kept with incomplete override flags $flags', ({ flags }) => {
+  const r = fixture(); r.resumeOf = 'earlier'; r.resumedAt = new Date(now - 60 * MIN).toISOString();
+  writeRun(r, dir); utimesSync(runPath(r.id, dir), (now - 31 * MIN) / 1000, (now - 31 * MIN) / 1000);
+  const result = op([`--run=${r.id}`, '--apply', ...flags]);
+  expect(result.code).toBe(0);
+  expect(result.result.kept['resumed-run']).toEqual([r.id]);
+  expect(isRunAbandoned(r.id, dir)).toBe(false);
+});
+it.each(['resumeOf', 'resumedAt'])('explicit %s run can be abandoned with both override flags and preserves the ruling verbatim', field => {
+  const r = fixture(); r[field] = field === 'resumeOf' ? 'earlier' : new Date(now - 60 * MIN).toISOString();
+  writeRun(r, dir); utimesSync(runPath(r.id, dir), (now - 31 * MIN) / 1000, (now - 31 * MIN) / 1000);
+  const ruling = 'decision-13: approved $(literal)';
+  const args = [`--run=${r.id}`, '--allow-resumed', `--ruling=${ruling}`];
+  expect(op(args).result.wouldReap).toEqual([r.id]);
+  expect(op([...args, '--apply']).result.reaped).toEqual([r.id]);
+  const tombstone = JSON.parse(readFileSync(abandonedPath(r.id, dir), 'utf8'));
+  expect(tombstone.reason).toContain(`resumed run overridden; ruling=${ruling};`);
+  expect(tombstone.probes).toMatchObject({ ruling, resumeOverridden: true, thresholdMs: 30 * MIN });
+});
+it.each(['live-pid', 'live-writer', 'live-lease', 'live-session', 'young', 'rejecting-verdict'])('ruled resumed override still refuses %s', reason => {
+  const r = fixture(); r.resumeOf = 'earlier';
+  if (reason === 'live-pid') { r.job = { ...newJobBlock({ kind: 'review' }), pid: 1234 }; probes.pidIdentity = () => ({ alive: true }); }
+  if (reason === 'live-writer') { writeFileSync(join(dir, `${r.id}.json.lock`), '1234'); probes.pidIdentity = () => ({ alive: true }); }
+  if (reason === 'live-lease') probes.leases = () => r.id;
+  if (reason === 'live-session') probes.sessions = () => r.id;
+  if (reason === 'rejecting-verdict') r.verdict = { verdict: 'changes' };
+  writeRun(r, dir); utimesSync(runPath(r.id, dir), (now - (reason === 'young' ? 29 : 31) * MIN) / 1000, (now - (reason === 'young' ? 29 : 31) * MIN) / 1000);
+  const result = op([`--run=${r.id}`, '--allow-resumed', '--ruling=decision-13', '--apply']);
+  expect(result.result.kept[reason]).toEqual([r.id]);
+  expect(isRunAbandoned(r.id, dir)).toBe(false);
+});
+it.each([['--allow-resumed'], ['--ruling=decision-13'], ['--allow-resumed', '--ruling=decision-13']].map(flags => ({ flags })))('override flags $flags without --run refuse with exit 2', ({ flags }) => {
+  const r = fixture(); const result = op([...flags, '--apply']);
+  expect(result.code).toBe(2); expect(result.result).toBeNull();
+  expect(isRunAbandoned(r.id, dir)).toBe(false);
 });

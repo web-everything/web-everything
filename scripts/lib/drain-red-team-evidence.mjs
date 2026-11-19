@@ -301,8 +301,17 @@ const settleKind = run => {
   // 'bogus') is a shape this reader does not recognise and fails closed like a non-string one.
   return verdict === 'changes' && run.pending == null ? 'reject' : 'hard';
 };
-/** A replacement completes only with a settled verdict, without pending or refused work. */
-export const isCompletedReview = run => ['accept', 'reject'].includes(settleKind(run));
+/** Shared delivery proof for abandonment discharge and replacement escalation. */
+export const isCompletedReview = run => ['accept', 'reject'].includes(settleKind(run))
+  && run.pending === null
+  && !['refused', 'failed'].includes(run.outcome)
+  // review-pr's completed accept records label-swap, ledger and notice effects even when
+  // the head needs no other work. Empty effects cannot prove a delivered replacement.
+  && Array.isArray(run.effects) && run.effects.length > 0
+  && run.effects.every(effect => effect?.status === 'applied'
+    && !['refused', 'failed', 'error'].includes(effect.outcome)
+    && !(effect.result?.error || effect.result?.refused || effect.result?.ok === false
+      || ['refused', 'failed', 'error'].includes(effect.result?.outcome)));
 // What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).

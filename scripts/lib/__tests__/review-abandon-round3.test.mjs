@@ -18,7 +18,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'review-abandon-round3-'));
   dir = join(root, 'runs'); mkdirSync(dir);
   env = { OPERATION_RUNS_DIR: dir, WE_SHARED_RUNS_DIR: dir, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json') };
-  probes = { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
+  probes = { prStates: (_repo, numbers) => new Map(numbers.map(pr => [pr, 'OPEN'])), reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 function record(more = {}, age = 31 * minute) {
@@ -264,6 +264,24 @@ it('a day-old needs-human replacement without pending work remains incomplete an
   const stalled = recovery();
   expect(stalled.row).toMatchObject({ action: 'skip', why: 'review-abandoned', escalate: true });
   expect(stalled.escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'review-abandoned' });
+});
+
+it.each([
+  ['empty effects', { effects: [] }],
+  ['failed effect', { effects: [effect({ to: 'accepted' }, 'failed')] }],
+  ['failed outcome', { outcome: 'failed' }],
+  ['applied label refusal', { effects: [{ ...effect({ to: 'accepted' }, 'applied'), result: { refused: true } }] }],
+  ['all effects applied', {}],
+])('%s replacement discharges abandonment only with delivery proof in both gate readers', (name, more) => {
+  record(); sweep();
+  record({ id: 'review-pr-delivery-replacement', pending: null, verdict: { verdict: 'accept' },
+    effects: [effect({ to: 'accepted' }, 'applied')],
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now + minute).toISOString() }], ...more });
+  for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+    const result = reader({ repo, pr, head, runsDir: dir, env, now: now + 2 * minute, readScorecards: () => [] });
+    if (name === 'all effects applied') expect(result.reason).not.toBe('review-abandoned');
+    else expect(result).toMatchObject({ ok: false, reason: 'review-abandoned' });
+  }
 });
 
 it('completed replacement discharges abandonment even after a long quiet period', () => {

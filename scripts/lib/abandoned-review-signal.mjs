@@ -6,15 +6,6 @@ import { boundedText } from './host-overload-settings.mjs';
 import { resolveReviewRunReaperSettings, stuckReviewThreshold } from './review-run-reaper-settings.mjs';
 import { isCompletedReview } from './drain-red-team-evidence.mjs';
 
-// Escalation needs proof of delivery as well as the gate's settled verdict.
-const fullyAppliedReplacement = run => isCompletedReview(run)
-  && run.pending === null
-  && !['refused', 'failed'].includes(run.outcome)
-  && Array.isArray(run.effects) && run.effects.length > 0
-  && run.effects.every(effect => effect?.status === 'applied'
-    && (effect.type !== 'review.label-swap'
-      || !(effect.result?.error || effect.result?.refused || effect.result?.ok === false)));
-
 const stalledContext = 'review-abandoned: replacement review is unfinished and quiet past its stuck deadline; inspect the unfinished review';
 const context = 'review-abandoned: replacement review never started; inspect review dispatch and start a fresh same-head review';
 export function readAbandonedReviewSignal({ repo, pr, head, env = process.env, now = Date.now(), log = console.error,
@@ -41,7 +32,7 @@ export function readAbandonedReviewSignal({ repo, pr, head, env = process.env, n
       const readAt = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
       const isAbandoned = abandoned(id) && !hasRejectingReviewVerdict(run);
       if (Number.isFinite(readAt) && readAt <= now && (!latest || readAt > latest.readAt)) {
-        latest = { id, readAt, isAbandoned, unfinished: !fullyAppliedReplacement(run), threshold: stuckReviewThreshold(run, settings).ms };
+        latest = { id, readAt, isAbandoned, unfinished: !isCompletedReview(run), threshold: stuckReviewThreshold(run, settings).ms };
       }
       if (isAbandoned) {
         const at = Date.parse(readTombstone(id)?.at);

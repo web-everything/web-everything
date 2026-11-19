@@ -47,7 +47,8 @@ async function replay(sourceRoot) {
     if (before !== readFileSync(runPath(id, dir), 'utf8')) throw Error('abandonment rewrote the unknown effect');
     // An older completed accept must never become authoritative again, even when touched later.
     const older = structuredClone(run);
-    older.id = 'review-pr-soak-older'; older.pending = null; older.effects = [];
+    older.id = 'review-pr-soak-older'; older.pending = null;
+    older.effects = run.effects.map(effect => ({ ...effect, status: 'applied', result: { ok: true } }));
     older.stepTimings[0].startedAt = new Date(now - 60 * 60000).toISOString();
     writeRun(older, dir);
     if (gate().ok !== false || gate().reason !== 'review-abandoned') throw Error('older acceptance discharged abandonment');

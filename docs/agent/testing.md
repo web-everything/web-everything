@@ -4934,13 +4934,22 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Abandoning stuck review cursors
 
-`run.mjs review-abandon [--run=<review-pr-id>] [--apply] [--json]` shares the session-reaper's
+`run.mjs review-abandon [--run=<review-pr-id>] [--allow-resumed --ruling=<id>] [--apply] [--json]` shares the session-reaper's
 liveness probes and version-bound sidecars. A pending effect uses `reviewRunReaper.abandonStuckAfterMinutes`
 (default 30; `WE_REAP_DEAD_REVIEW_RUNS_STUCK_AFTER_MINUTES` overrides it). A judge or other
 non-confirm pending step uses `reviewRunReaper.abandonStuckJudgeAfterMinutes` (default 30;
 `WE_REAP_DEAD_REVIEW_RUNS_STUCK_JUDGE_AFTER_MINUTES` overrides it), through the same logged
 standard/platform/tool/environment cascade. An explicit `thresholdMs` overrides every horizon.
-Confirm, mandatory-referral, resumed and rejecting-verdict continuations stay kept. Abandonment
+Sweeps target only unfinished, untombstoned runs belonging to a proven OPEN PR. PR reads fail
+closed (`pr-state-unknown`); closed/merged PRs stay kept (`pr-not-open`). Each repo gets one bounded
+500-row open-PR list; a full list requires individual views for absent candidates, within a shared
+100-call budget. Unknowns require restoring access and retrying, or inspecting PR state and selecting
+an explicit `--run` (which bypasses PR state). JSON `keptCounts` reports counts by reason alongside
+`wouldReap.length`. Confirm, mandatory-referral and rejecting-verdict continuations stay kept.
+Resumed runs stay kept unless an explicit `--run` supplies both `--allow-resumed` and a nonempty
+`--ruling=<id>`; the tombstone reason and probes preserve the ruling verbatim and record the override.
+Either flag alone retains resumed runs; neither flag is permitted on a sweep. All age, liveness and
+shared non-rejecting evidence checks still apply. Abandonment
 never reconciles unknown effects: unfinished holds and resumption exclude the unchanged tombstoned record
 so a new panel can start. Shared attempt history retains it for same-head retry, cooldown and exhaustion
 accounting; abandonment never refunds an attempt. Gates return `review-abandoned` until a completed
@@ -4951,10 +4960,13 @@ or unrecognised verdicts, operator `findings.confirm` rejections, and declared/p
 send-back effect payloads retain their original holds through the shared `hasRejectingReviewVerdict` predicate. The queue treats `review-abandoned` as a
 non-runnable wait carrying `awaitingFreshReview: true`. It pages no human initially; after the
 same stuck deadline from the tombstone, absence of a newer same-head read start escalates through
-the existing unfinished-review path. Replacement completeness shares the gate's `isCompletedReview`
-predicate, plus delivery proof: a non-empty effects list with every status `applied`, no
-refused/failed outcome, and no label-swap error/refusal result. Missing or empty effects are
-unfinished evidence. A newer unfinished replacement (including `needs-human`, pending confirmation,
+the existing unfinished-review path. Gate discharge and escalation share the exported `isCompletedReview`
+predicate: a settled verdict, a null pending cursor, a non-empty effects list with every status `applied`, no
+refused/failed run outcome, and no effect outcome or result indicating refusal, failure or error
+(including `result.refused`, `result.ok === false` and `result.outcome`). Missing or empty effects are
+unfinished evidence; completed `review-pr` accepts record label-swap, ledger and notice effects.
+The round-3/4 delivery cases must keep abandonment held in both gate readers and scan paths until this proof exists.
+A newer unfinished replacement (including `needs-human`, pending confirmation,
 missing verdict or open/refused/failed effects) suppresses escalation only while its read start or last record write
 is within its stuck deadline. A completed replacement discharges it; a later tombstone owns a new
 deadline. Missing, unreadable or over-400-record replacement evidence

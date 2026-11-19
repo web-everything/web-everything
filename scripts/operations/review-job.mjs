@@ -17,6 +17,8 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  * WRAPPER SESSION.
  *
  *   node scripts/operations/review-job.mjs run --pr=1234 --repo=web-everything/web-everything   # the arc, foreground
+ *   From a lane, supply --origin=<git remote> or --reference=<absolute primary checkout directory>.
+ *   REVIEW_JOB_LANE_ORIGIN / REVIEW_JOB_LANE_REFERENCE supply defaults; explicit flags take precedence.
  *
  * THE WASTE THIS REMOVES (measured 2026-09-24 → 25, the review daemon's own transcripts). The review daemon
  * (`we:skills-src/conveyor/review-daemon.mjs`) used to start one `claude --bg` session per owed review
@@ -102,9 +104,9 @@ import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mj
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './dispatch-lane-io.mjs';
@@ -408,14 +410,43 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
   } finally { rmSync(configDir, { recursive: true, force: true }); }
 }
 
+/** Explicit CLI sources override REVIEW_JOB_LANE_ORIGIN / REVIEW_JOB_LANE_REFERENCE.
+ * Only acquire needs these trust anchors; release discovers the pool's primary itself. */
+function reviewLaneSource({ origin, reference } = {}, env = process.env) {
+  origin ??= env.REVIEW_JOB_LANE_ORIGIN;
+  reference ??= env.REVIEW_JOB_LANE_REFERENCE;
+  const invalid = message => { throw Object.assign(Error(message), { exitCode: 2 }); };
+  if (origin !== undefined) {
+    let url = false;
+    if (typeof origin === 'string' && /^[a-z][a-z0-9+.-]*:\/\//i.test(origin) && !/\s|[\x00-\x1f\x7f]/.test(origin)) {
+      try { const parsed = new URL(origin); url = Boolean(parsed.hostname || (parsed.protocol === 'file:' && parsed.pathname.startsWith('/'))); } catch { /* Not a URL. */ }
+    }
+    const scp = typeof origin === 'string' && !origin.includes('://') && /^(?:[^/@:\s]+@)?(?:\[[a-f0-9:]+\]|[^/@:\s]+):[^:\s][^\s]*$/i.test(origin)
+      && !/[\x00-\x1f\x7f]/.test(origin);
+    if (!url && !scp) invalid('--origin must be a URL or scp-style git remote');
+  }
+  if (reference !== undefined) {
+    let directory = false;
+    try { directory = typeof reference === 'string' && isAbsolute(reference) && statSync(reference).isDirectory(); } catch { /* Missing or unreadable. */ }
+    if (!directory) invalid('--reference must be an absolute existing directory');
+  }
+  return { ...(origin === undefined ? {} : { origin }), ...(reference === undefined ? {} : { reference }) };
+}
+
+function reviewLaneSourceArgv({ origin, reference }) {
+  return [...(origin === undefined ? [] : [`--origin=${origin}`]), ...(reference === undefined ? [] : [`--reference=${reference}`])];
+}
+
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+  origin, reference, spawnNode = spawnSync,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
+  const laneSourceArgv = reviewLaneSourceArgv(reviewLaneSource({ origin, reference }, env));
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
   const repoIds = new Map();
@@ -424,7 +455,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
+  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnNode(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -621,6 +652,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         'scripts/lane-pool.mjs', 'acquire', `--repo=${laneRepo}`, `--purpose=${REVIEW_LOOP_LANE_PURPOSE}`,
         `--session=${slug}`, `--wait-ms=${waitMs}`, '--adopt',
         ...(Number.isInteger(lane) && lane > 0 ? [`--lane=${lane}`] : []),
+        ...laneSourceArgv,
       ], { actorId, timeoutMs: waitMs + 10 * 60 * 1000 });
       const path = String(r.stdout ?? '').trim().split('\n').filter(Boolean).pop() ?? '';
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
@@ -951,7 +983,7 @@ export function commentReasonSuffix(value, text = (v, fb) => { try { return Stri
   return line ? ` (${line})` : '';
 }
 
-export function runReviewJob(opts = {}, io = createReviewJobIo()) {
+export function runReviewJob(opts = {}, io = createReviewJobIo({ origin: opts.origin, reference: opts.reference })) {
   const seatsBox = {};
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
   // without the hook, is the sequential order: the red team starts only after the review accepts.
@@ -1481,13 +1513,15 @@ function runReviewArc({
 export function dispatchReviewJob({
   ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
+  origin, reference,
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
   isAlive = pidAlive,
-  checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
+  checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env, origin, reference }),
 } = {}) {
+  const laneSourceArgv = reviewLaneSourceArgv(reviewLaneSource({ origin, reference }, env));
   const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io);
   if (refusal) return { pr, repo, ...refusal };
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
@@ -1526,6 +1560,7 @@ export function dispatchReviewJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
+      ...laneSourceArgv,
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1672,14 +1707,14 @@ export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir(
 }
 
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
-export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, trackExit = false } = {}) {
+export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runReviewJob, rate = rateAndRecordReviewJob, trackExit = false, env = process.env } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
     return hit ? hit.slice(name.length + 3) : undefined;
   };
   if (sub !== 'run') {
-    writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo>');
+    writeLineSync(2, 'usage: review-job.mjs run --pr=<n> --repo=<owner/repo> [--origin=<url>] [--reference=<absolute-directory>]');
     process.exitCode = 2;
   } else {
     // Signals can only be handled after a synchronous child returns. SIGKILL is uncatchable and
@@ -1688,10 +1723,13 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
+      if (rest.includes('--origin') || rest.includes('--reference')) throw Object.assign(Error('--origin and --reference require =<value>'), { exitCode: 2 });
+      const laneSource = reviewLaneSource({ origin: flag('origin'), reference: flag('reference') }, env);
       // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
       const redTeamMode = flag('red-team-only') ?? 'fresh';
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
+        ...laneSource,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       onSessionSlug?.(out.sessionSlug);
@@ -1705,7 +1743,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       process.exitCode = out.refused ? 75 : 0;
     } catch (e) {
       writeLineSync(2, `review-job: error: ${String(e?.message ?? e)}`);
-      process.exitCode = 1;
+      process.exitCode = e?.exitCode === 2 ? 2 : 1;
     }
   }
 }

@@ -2557,10 +2557,11 @@ export function runSessionReaperCli(argv, io = {}) {
   const stop = ({ handle }) => stopSessionWithRetry({ handle, exec, sleep });
   const result = runSessionReaperPass({ listAgents, stop, log, groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;
-  // The shared sweep uses the minutes horizon for stuck effects, six hours for other dead cursors.
+  // The shared sweep keeps completed/tombstoned runs and requires a proven OPEN PR; no operator override.
   const deadReviewRuns = runDeadReviewRuns
     ? (io.reapDeadReviewRuns ?? reapDeadReviewRuns)({ apply: flags.apply === true && !dryRun, log }) : null;
-  if (deadReviewRuns) log(`session-reaper dead-review-runs: ${deadReviewRuns.scanned} scanned · ${deadReviewRuns.reaped.length} reaped · ${deadReviewRuns.wouldReap.length} would reap`);
+  if (deadReviewRuns) log(`session-reaper dead-review-runs: ${deadReviewRuns.scanned} scanned · ${deadReviewRuns.reaped.length} reaped · ${deadReviewRuns.wouldReap.length} would reap`
+    + Object.entries(deadReviewRuns.keptCounts ?? {}).map(([reason, count]) => ` · ${reason}=${count}`).join(''));
   const dispatchScratchResult = runDispatchScratchSweep ? runDispatchScratchSweepPass({ dryRun }) : null;
 
   if (result.unreadable) {
