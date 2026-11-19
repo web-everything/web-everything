@@ -95,7 +95,7 @@ export function readRoundPublicationHold({ repo, pr, head, env = process.env,
 /** Settle a finished writer's outbox, never republish its sealed check. The status claim prevents a round writer
  * changing the marker during confirmation; the shared check lock serializes the live check/hold boundary. */
 export function settleFinishedPublicationHold({ repo, pr, head, env = process.env,
-  gh, readCheck, readComments, readStatus = readCombinedStatus,
+  gh, readCheck, readComments, readLivePr, readStatus = readCombinedStatus,
   postHold = postRedTeamPublicationHold,
   lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn) }) {
   const { WE_GH_READ_MEMO_DIR: _memo, ...freshEnv } = env;
@@ -109,6 +109,8 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
     return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh: liveGh }) : app;
   };
   readComments ??= () => readCompletePrComments(pr, { repo, exec: (_file, args, options) => liveGh(args, options) });
+  readLivePr ??= () => JSON.parse(liveGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels'],
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
   const path = statusPath({ repo, pr, head }, env);
   try {
     return withRedTeamStatusClaim(path, () => lock(() => {
@@ -124,13 +126,26 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       const completedAt = Date.parse(fact.completedAt);
       if (markerStat && (!Number.isFinite(completedAt) || !Number.isFinite(markerStat.mtimeMs) || completedAt < markerStat.mtimeMs))
         return { ok: false, reason: 'red-team check not proven newer than finished marker; operator must inspect publication' };
-      const result = redTeamResultCommentForHead(readComments(), pr, head);
+      const comments = readComments();
+      const result = redTeamResultCommentForHead(comments, pr, head);
       // Only the review App/bot's own result for THIS head counts (marker pr + rev already matched by the reader);
       // an operator- or foreign-authored comment never releases a merge-gate hold.
       if (!result || result.carriedFrom || !isAutomationAuthored(result.comment)
         || result.parsed?.pr !== Number(pr) || result.parsed?.rev !== head || !isPublishableRedTeamResult(result.parsed))
         return { ok: false, reason: 'no ordinary red-team result on head' };
+      const live = readLivePr();
+      if (live?.headRefOid !== head || !Array.isArray(live.labels))
+        return { ok: false, reason: 'red-team live head or labels unreadable' };
+      const hold = redTeamEnqueueHold({ repo, pr, head, comments, labels: live.labels,
+        recorded: true, scheduled: true, env });
+      if (hold) return { ok: false, reason: hold };
       const current = latestPublicationStatus(readStatus({ repo, headSha: head, gh: liveGh }), pr);
+      if (current?.state === 'success') {
+        if (!isTrustedMarkerAuthor({ user: { login: String(current.creator?.login ?? '') } }))
+          return { ok: false, reason: 'publication success creator untrusted; operator must inspect publication' };
+        if (readUnsettledPublicationHolds({ repo, headSha: head, gh: liveGh, context: redTeamPublicationContext(pr) }).length)
+          return { ok: false, reason: 'publication success has unsettled holds; operator must inspect publication' };
+      }
       if (!current || current.state === 'success') {
         if (markerStat) rmSync(`${path}.unpublished`, { force: true });
         return { ok: true };

@@ -1850,14 +1850,61 @@ describe('finished publication hold recovery', () => {
     utimesSync(path, 1_800_000_000, 1_800_000_000);
     const readCheck = vi.fn(() => ({ ok: true, completedAt: new Date(1_800_000_001_000).toISOString() }));
     const readComments = vi.fn(() => [cleanResultComment(f)]);
+    const readLivePr = vi.fn(() => ({ headRefOid: f.head, labels: [] }));
     const postHold = vi.fn(() => ({ ok: true }));
     const lock = vi.fn(fn => fn());
     const readStatus = vi.fn(() => ({ total_count: 1, statuses: [{ context: `red-team/publication #${f.pr}`,
       id: 2, created_at: new Date(1_800_000_000_000).toISOString(),
       state: 'failure', description: 'held: finished round publication in progress', creator: { login: 'web-everything' } }] }));
     const gh = vi.fn(() => JSON.stringify(readStatus().statuses));
-    return { ...f, path, readCheck, readComments, readStatus, postHold, lock, gh };
+    return { ...f, path, readCheck, readComments, readLivePr, readStatus, postHold, lock, gh };
   }
+  it('keeps the hold for a newer same-head confirmed break or unreadable live PR; a clean result clears', () => {
+    const f = setup();
+    const clean = { ...cleanResultComment(f), createdAt: '2026-11-13T12:00:00Z' };
+    const broken = { author: { login: 'web-everything' }, createdAt: '2026-11-13T13:00:00Z',
+      body: renderRedTeamComment({ pr: f.pr, rev: f.head, findings: [{ summary: 'break', category: 'edge-case',
+        impactIfUnfixed: 'broken', confirmedByRecheck: true }], provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: 'changes' }) };
+    f.readComments.mockReturnValue([clean, broken]);
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: false,
+      reason: 'post-accept red team confirmed a break requiring send-back' });
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+    f.readComments.mockReturnValue([clean]);
+    for (const live of [undefined, { headRefOid: f.head }, { headRefOid: 'c'.repeat(40), labels: [] }]) {
+      f.readLivePr.mockReturnValue(live);
+      expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: 'red-team live head or labels unreadable' });
+      expect(existsSync(f.path)).toBe(true);
+      expect(f.postHold).not.toHaveBeenCalled();
+    }
+    f.readLivePr.mockReturnValue({ headRefOid: f.head, labels: [] });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(existsSync(f.path)).toBe(false);
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+  });
+  it('keeps the marker for untrusted success or unsettled history; trusted settled success removes it', () => {
+    const f = setup();
+    const success = { ...f.readStatus().statuses[0], state: 'success', creator: { login: 'mallory' } };
+    f.readStatus.mockReturnValue({ total_count: 1, statuses: [success] });
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: expect.stringContaining('creator untrusted') });
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+    success.creator.login = 'web-everything';
+    const buried = { ...success, id: 3, state: 'failure', description: 'held: live red-team check not clear' };
+    f.gh.mockReturnValue(JSON.stringify([buried, success]));
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: expect.stringContaining('unsettled holds') });
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+    f.gh.mockImplementation(() => { throw Error('history offline'); });
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false });
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+    f.gh.mockReturnValue(JSON.stringify([success]));
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(existsSync(f.path)).toBe(false);
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
   it('accepts a stale queued marker like a finished marker', () => {
     const f = setup({ status: 'queued', remoteHold: true });
     expect(readFinishedPublicationHold(f)).toBe(true);
@@ -1979,6 +2026,7 @@ describe('finished publication hold recovery', () => {
     const fixtureApp = 12345;
     f.env.WE_APP_ID = String(fixtureApp);
     const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(args => {
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: f.head, labels: [] });
       if (args[1].includes('/check-runs?')) return JSON.stringify({ total_count: 1, check_runs: [{
         id: 1, name: 'red-team', head_sha: f.head, external_id: `${f.repo}#${f.pr}`, app: { id: fixtureApp },
         status: 'completed', conclusion: 'success', completed_at: new Date(1_800_000_001_000).toISOString(),
@@ -1991,8 +2039,9 @@ describe('finished publication hold recovery', () => {
       return [cleanResultComment(f)];
     });
     try {
-      expect(settleFinishedPublicationHold({ ...f, gh: undefined, readCheck: undefined, readComments: undefined, readStatus: undefined })).toEqual({ ok: true });
-      expect(gh).toHaveBeenCalledTimes(4);
+      expect(settleFinishedPublicationHold({ ...f, gh: undefined, readCheck: undefined, readComments: undefined,
+        readLivePr: undefined, readStatus: undefined })).toEqual({ ok: true });
+      expect(gh).toHaveBeenCalledTimes(5);
       for (const [, options] of gh.mock.calls) {
         expect(options.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
         expect(options.throttle.env).not.toHaveProperty('WE_GH_READ_MEMO_DIR');
