@@ -39,6 +39,7 @@ import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, REVIEW_PR_CHANNEL,
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { countRedTeamFixComments } from './red-team-fix-round-count.mjs';
 
 export const MECHANICAL_ROUNDS_SETTING = 'mechanicalRoundsCountTowardCap';
 export const MECHANICAL_ROUNDS_ENV = 'WE_REVIEW_MECHANICAL_ROUNDS_COUNT_TOWARD_CAP';
@@ -486,7 +487,9 @@ export function enrichPrsWithMechanicalRound(prs, {
     if (hasPendingMechanicalRound(pr)) {
       try { enriched = { ...enriched, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { /* preserve existing behavior */ }
     }
-    if (Array.isArray(pr?.comments) && pr.comments.filter(isFixRoundRearmComment).length >= roundCap) {
+    const rearms = Array.isArray(pr?.comments) ? pr.comments.filter(isFixRoundRearmComment).length : 0;
+    // Red-team receipts share the cap: refund ordinary mechanical rounds before their combined cap check.
+    if (Array.isArray(pr?.comments) && (rearms >= roundCap || (rearms > 0 && countRedTeamFixComments(pr.comments) > 0))) {
       try { enriched = { ...enriched, roundCommits: readCommits({ pr, defaultBranch }) }; }
       catch { enriched = { ...enriched, roundCommits: { head: lc(pr?.headRefOid), ok: false, reason: 'git-read-failed' } }; }
     }

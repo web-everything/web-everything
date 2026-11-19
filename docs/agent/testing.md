@@ -4808,6 +4808,12 @@ rounds at cap 3 through the real planner and each receipt writer. Separately rep
 accepted, red-team-blocked PR with a failing required check through the real planner
 and `runFixCli`: its ordinary CI-heal must read CI evidence and reach the executor.
 
+When red-team receipts contribute to the combined cap, enrich ordinary re-arms with commit
+evidence even below the ordinary cap. Freeze Claude's unused receipt ID in the plan so a
+mechanical-round refund cannot reuse a spent ID, while replaying that same plan still refuses.
+Keep borrowed launch identities unchanged; cover the setting transition from counting
+mechanical rounds to refunding them through a fresh plan and real Claude dispatch.
+
 The reconcile-to-fix planning projection must preserve `roundCap` on both item-backed and
 PR-diff rows. Cap-1 tests exercise both receipt writers after a competing writer consumes
 the live budget. Planned red-team repairs check spent-launch receipts even after labels

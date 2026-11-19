@@ -1,4 +1,6 @@
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile, sharedRoundAttempts } from '../reconcile-core.mjs';
+import { enrichPrsWithMechanicalRound } from '../mechanical-round-cap.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import { acceptedRedTeamRepair, roundCommitGitOutput } from './fixtures/accepted-red-team-repair.mjs';
 import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -2601,6 +2603,32 @@ describe('conflict-fix deadline exemption', () => {
 });
 
 describe('Claude red-team repair round publication', () => {
+  it('refunds mechanical rounds when red-team receipts exhaust the combined cap', () => {
+    const pr = acceptedRedTeamRepair();
+    pr.comments.splice(1, 2); // One ordinary re-arm, proven mechanical by the commit evidence.
+    const evidence = pr.roundCommits;
+    delete pr.roundCommits; // Production discovery has no local Git enrichment.
+    const receipt = attempt => ({ author: { login: 'web-everything' },
+      body: `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${pr.headRefOid} result=old attempt=${attempt}` });
+    const plan = candidate => planReconcile({ prs: [candidate], agents: [], now: Date.now(), roundCap: 3 });
+    for (const spent of [1, 2]) {
+      pr.comments.push(receipt(spent)); // Failed/no-change repairs have no hand-back.
+      const readRoundCommits = vi.fn(() => evidence);
+      const [enriched] = enrichPrsWithMechanicalRound([pr], { roundCap: 3, readRoundCommits });
+      expect(readRoundCommits).toHaveBeenCalledOnce();
+      expect(sharedRoundAttempts(enriched, { requireRoundCommits: true })).toBe(spent);
+      expect(plan(enriched).dispatch).toContainEqual(expect.objectContaining({ mode: 'red-team-sent-back', attempts: spent }));
+    }
+    const [unreadable] = enrichPrsWithMechanicalRound([pr], { roundCap: 3,
+      readRoundCommits: () => { throw Error('unreadable commits'); } });
+    expect(plan(unreadable).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3 }));
+    expect(() => sharedRoundAttempts(unreadable, { requireRoundCommits: true, readCommits: () => ({ ok: false }) }))
+      .toThrow('round commit evidence unreadable');
+    pr.comments.push(receipt(3));
+    const [exhausted] = enrichPrsWithMechanicalRound([pr], { roundCap: 3, readRoundCommits: () => evidence });
+    expect(plan(exhausted).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3 }));
+  });
+
   it.each([[true, false], [false, true], ['unreadable', false]])(
     'the receipt writer honours mechanicalRoundsCountTowardCap=%s (publishes=%s) when conflict rounds fill the cap', (setting, publishes) => {
       const pr = acceptedRedTeamRepair();
@@ -2691,6 +2719,35 @@ describe('Claude red-team repair round publication', () => {
     ensureSessionCwd: p => p, grantConflictHelper: () => {}, isolateSession: () => ({}),
     resolveSettingsEnv: () => ({}), postNotice: () => {}, mintSessionId: () => 'sid' });
 
+  it('a refund never reuses a spent Claude launch id', () => {
+    const pr = acceptedRedTeamRepair();
+    pr.comments.splice(1, 2);
+    pr.comments.push({ author: { login: 'web-everything' }, body: CONFLICT_FIX_COMMENT_MARKER });
+    let setting = true;
+    const freshPlan = () => {
+      const rows = planReconcile({ prs: [pr], agents: [], now: Date.now(), roundCap: 3,
+        mechanicalRoundsCountTowardCap: setting }).dispatch;
+      return planFixesFromReconcile(rows, findItemStub, () => []).planned[0];
+    };
+    const exec = vi.fn((_cmd, args) => pr.comments.push({ author: { login: 'web-everything' }, body: args.at(-1) }));
+    const publishRedTeamRound = request => publishRedTeamFixDispatch(request, { readComments: () => pr.comments,
+      loadMechanicalRoundsSetting: () => ({ value: setting }), exec });
+    const beforeRefund = freshPlan();
+    expect(beforeRefund.attempts).toBe(1);
+    expect(publishRedTeamRound({ repo: 'we', planned: beforeRefund })).toBe(true);
+    expect(pr.comments.at(-1).body).toContain('attempt=2');
+
+    setting = false;
+    const refunded = freshPlan();
+    expect(refunded.attempts).toBe(1);
+    const spawnAgent = vi.fn(() => { expect(countRedTeamFixComments(pr.comments)).toBe(2); return ''; });
+    dispatchFix({ ...refunded, lane: 9 }, { ...options(), spawnAgent, publishRedTeamRound });
+    expect(spawnAgent).toHaveBeenCalledOnce();
+    expect(pr.comments.at(-1).body).toContain('attempt=3');
+    expect(publishRedTeamRound({ repo: 'we', planned: refunded })).toBe(false);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
   it('production row without mode yields a planned Claude repair that receipts before launch after label drift', () => {
     const { comments } = thread();
     const pr = { number: 7031, state: 'OPEN', headRefName: planned.laneRef, headRefOid: head, isDraft: false,
@@ -2730,7 +2787,8 @@ describe('Claude red-team repair round publication', () => {
       const spawnAgent = vi.fn();
       const io = { ...options(), spawnAgent,
         publishRedTeamRound: request => publishRedTeamFixDispatch(request, { readComments: () => comments, exec }) };
-      expect(() => dispatchFix({ ...fixes[0], lane: 9, attempts: 1 }, io)).toThrow('cap exhausted');
+      expect(() => dispatchFix({ ...fixes[0], lane: 9, attempts: 1,
+        redTeamSentBack: { ...fixes[0].redTeamSentBack, attemptId: 2 } }, io)).toThrow('cap exhausted');
       expect(spawnAgent).not.toHaveBeenCalled();
       expect(exec).toHaveBeenCalledOnce();
       expect(countRedTeamFixComments(comments)).toBe(1);

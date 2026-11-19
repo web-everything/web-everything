@@ -1445,7 +1445,7 @@ export function publishRedTeamFixDispatch({ repo, planned }, {
         || !Number.isSafeInteger(planned.attempts) || planned.attempts < 0) {
       throw new Error('red-team repair dispatch evidence unreadable; retry with a fresh reconciliation or ask an operator');
     }
-    return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.attempts + 1,
+    return publishRedTeamFixLaunch({ comments, pr: planned.pr, head, attemptId: planned.redTeamSentBack.attemptId ?? planned.attempts + 1,
       chargedRounds: sharedRoundAttempts({ comments, headRefOid: head, roundCommits: planned.roundCommits },
         { requireRoundCommits: true, readCommits,
           mechanicalRoundsCountTowardCap: receiptCountsMechanicalRounds(loadMechanicalRoundsSetting) }), cap: planned.roundCap,

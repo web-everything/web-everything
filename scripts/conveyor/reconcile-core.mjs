@@ -134,7 +134,7 @@ import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operatio
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
-import { countRedTeamFixComments, RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
+import { countRedTeamFixComments, hasRedTeamFixLaunch, RED_TEAM_FIX_COMMENT_MARKER, RED_TEAM_REARM_COMMENT_MARKER } from './red-team-fix-round-count.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
@@ -2943,9 +2943,12 @@ export function planReconcile({
           refuseCapExhausted({ ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
             why: 'red-team send-back remains unresolved on the accepted head; automatic fix rounds exhausted' }, { allowTakeover: false });
         } else {
+          // Freeze identity in the plan, independently of refundable charges. Replaying this plan stays spent.
+          let attemptId = attempts + 1;
+          while (hasRedTeamFixLaunch(pr.comments, attemptId)) attemptId++;
           dispatch.push({ ...base, ...withPhase, kind: 'fix', mode: 'red-team-sent-back', state: pr.state, findings: findings.length, attempts, roundCap: effectiveRoundCap,
             ...(realFixRounds.ok ? { roundCommits: pr.roundCommits } : {}),
-            redTeamSentBack: { head: pr.headRefOid, findings, resultId: redTeamFact(pr.comments, prNumber, pr.headRefOid)?.value?.resultId },
+            redTeamSentBack: { head: pr.headRefOid, findings, resultId: redTeamFact(pr.comments, prNumber, pr.headRefOid)?.value?.resultId, attemptId },
             why: 'confirmed red-team send-back remains unresolved on this accepted head; repair and push the same branch without rearming' });
         }
         continue;
