@@ -2,7 +2,9 @@
 import { describe, it, expect } from 'vitest';
 import { resolve } from 'node:path';
 import { HOST_PATH_RE, PLACEHOLDER_NAMES, findHostPaths, scanHostPaths } from '../host-path-scan.mjs';
-import { runHostPathLint } from '../../lint-host-paths.mjs';
+import { runHostPathLint, readTrackedFile } from '../../lint-host-paths.mjs';
+
+const root0 = resolve(import.meta.dirname, '../../..');
 
 const hostPath = '/Us' + 'ers/someone/';
 const linuxPath = '/ho' + 'me/someone/';
@@ -83,6 +85,14 @@ describe('host path ratchet', () => {
       baseline: { files: {} },
     });
     expect(errors).toEqual([]);
+  });
+
+  it('skips a Forge-projected directory only when the index records a symlink', () => {
+    const dir = { isSymbolicLink: () => false, isDirectory: () => true };
+    expect(readTrackedFile('/x/agent-memory', () => dir, () => true)).toBeNull();
+    expect(() => readTrackedFile('/x/agent-memory', () => dir, () => false)).toThrow(/EISDIR|ENOENT/);
+    expect(readTrackedFile(resolve(root0, '.claude/agent-memory'), () => dir)).toBeNull();
+    expect(() => readTrackedFile(resolve(root0, '.claude'), () => dir)).toThrow(/EISDIR/);
   });
 
   it('matches the exact baseline over the REAL tracked tree with real IO', () => {
