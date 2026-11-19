@@ -1,4 +1,6 @@
-import { test } from 'node:test';
+// @vitest-environment node
+import { test } from 'vitest';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, symlinkSync, mkdirSync, truncateSync, existsSync } from 'node:fs';
 import { dirname, basename, join } from 'node:path';
@@ -6,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { deriveActions, evaluateExpectations, resolveExpectationSettings, REACTIONS } from '../pass-daemons/pr-expectations.mjs';
 import { runExpectationPass, runExpectationCli, collectExpectationEvidence, readExpectationSettings } from '../pass-daemons/pr-expectation-pass.mjs';
 
-const table = JSON.parse(readFileSync(new URL('../../settings/expectations.json', import.meta.url), 'utf8'));
+const table = JSON.parse(readFileSync(fileURLToPath(new URL('../../settings/expectations.json', import.meta.url)), 'utf8'));
 const settings = resolveExpectationSettings({ tool: table });
 const sha = 'a'.repeat(40), next = 'b'.repeat(40);
 const at = minutes => new Date(Date.UTC(2026, 10, 19) + minutes * 60000).toISOString();
