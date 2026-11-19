@@ -1960,6 +1960,12 @@ describe('finished publication hold recovery', () => {
     expect(existsSync(f.path)).toBe(true);
     expect(f.postHold).not.toHaveBeenCalled();
   });
+  it.each([null, {}, 7])('never clears with a malformed live label entry %j', entry => {
+    const f = setup();
+    f.readLivePr.mockReturnValue({ headRefOid: f.head, labels: [entry] });
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: 'red-team live labels unreadable' });
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
   it('refuses an incomplete marker-only result and a check completed in the same second as the hold', () => {
     const f = setup();
     f.readComments.mockImplementation(() => [{ author: { login: 'web-everything' }, body:

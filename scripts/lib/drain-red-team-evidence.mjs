@@ -139,7 +139,8 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
         return { ok: false, reason: 'red-team live head or labels unreadable' };
       // redTeamEnqueueHold ignores labels, so the live publisher's blocking-label rule is applied here too.
       const labelNames = live.labels.map(label => typeof label === 'string' ? label : label?.name);
-      const blockedBy = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(label => labelNames.includes(label));
+      if (labelNames.some(name => typeof name !== 'string')) return { ok: false, reason: 'red-team live labels unreadable' };
+      const blockedBy =['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(label => labelNames.includes(label));
       if (blockedBy) return { ok: false, reason: `red-team publication held by ${blockedBy}` };
       const hold = redTeamEnqueueHold({ repo, pr, head, comments, labels: live.labels,
         recorded: true, scheduled: true, env });
