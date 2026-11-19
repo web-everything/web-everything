@@ -11,11 +11,21 @@ import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { readRedTeamProbes } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 export function readLiveRedTeamPr({ repo, pr }) {
   if (isUnderTest()) return null; // Hermetic callers inject evidence; never spawn gh under tests.
   return JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
     { encoding: 'utf8', timeout: 15000, maxBuffer: 65536, throttle: { maxAttempts: 1 } }));
+}
+
+export function readPartialRedTeamPr({ repo, pr }) {
+  if (isUnderTest()) return null;
+  const rawPr = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json',
+    'number,state,headRefOid,labels,isDraft,mergeStateStatus'],
+  { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, throttle: { maxAttempts: 1 } }));
+  return { ...rawPr, comments: readCompletePrComments(pr, { repo,
+    exec: (_file, args, options) => runGhSync(args, { ...options, throttle: { maxAttempts: 1 } }) }) };
 }
 
 const transactions = new WeakMap();
@@ -64,7 +74,12 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const operator = readOperatorPolicy('redTeamQueue', { env, log });
   const operatorMinimum = operator?.minConcurrent;
-  if (operator === null) return { maxProbesPerTick: failClosedCapacity('redTeamQueue.maxProbesPerTick', undefined, { log }), minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  if (operator === null) {
+    const maxProbesPerTick = Math.min(probeCap(settings?.maxProbesPerTick), DEFAULT_MAX_PROBES,
+      failClosedCapacity('redTeamQueue.maxProbesPerTick', undefined, { log }));
+    note(log, `maxProbesPerTick=${maxProbesPerTick} (source: settings capped by operator-db-unreadable fallback; ceiling 6)`);
+    return { maxProbesPerTick, minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  }
   const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
@@ -362,14 +377,18 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, listPartial = false, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  floor, listPartial = false, readPartialPr = readPartialRedTeamPr, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const transaction = transactions.get(queue)?.();
   try {
     const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
     const incoming = (listPartial ? [] : plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       .map(row => ({ repo, pr: Number(row.prNumber) }));
-    const liveEvidence = queue.reconcile({ readLivePr, candidates: incoming, ...(listPartial ? { partialRepo: repo } : {}) });
+    const liveEvidence = queue.reconcile({ readLivePr: listPartial ? key => {
+      const rawPr = readPartialPr(key);
+      // Incomplete evidence must defer admission as well as planning, preserving the stored entry.
+      return rawPr?.number === key.pr && Array.isArray(rawPr.labels) && Array.isArray(rawPr.comments) ? rawPr : null;
+    } : readLivePr, candidates: incoming, ...(listPartial ? { partialRepo: repo } : {}) });
     if (listPartial) {
       const known = queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)
         && liveEvidence.get(entry.key)?.state === 'OPEN' && liveEvidence.get(entry.key)?.headRefOid === entry.head);

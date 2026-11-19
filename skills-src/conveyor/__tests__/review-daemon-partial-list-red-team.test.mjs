@@ -4,6 +4,8 @@ vi.mock('../../../scripts/lib/review-facts.mjs', async original => ({
 }));
 import { runReviewTick } from '../review-daemon.mjs';
 import { assertInventoryComplete, PrListUnreadableError } from '../../../scripts/lib/pr-list-paged.mjs';
+import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../../../scripts/lib/red-team-dispatch-queue.mjs';
+import { runRedTeamOnSkip } from '../../../scripts/lib/review-red-team-on-skip.mjs';
 
 const repo = 'example/project';
 function inventoryError(rows, totalCount) {
@@ -37,12 +39,26 @@ describe('partial PR inventory red-team recovery', () => {
   it('list read partial', () => {
     const error = inventoryError([{ number: 1 }], 10);
     expect(error.message).toContain('pages carried 1 unique of 10 open PRs');
-    const { redTeamOnSkip } = failedListTick(error);
+    const { redTeamOnSkip, result, readEvidence, readReviews, queue, head } = recoveryTick(error);
     expect(redTeamOnSkip).toHaveBeenCalledOnce();
     expect(redTeamOnSkip).toHaveBeenCalledWith(expect.objectContaining({
       repo, listPartial: true, rawPrs: [], plan: expect.objectContaining({ refusals: [] }),
     }));
+    expect(result.rows).toEqual([expect.objectContaining({ prNumber: 1, head,
+      action: 'skip', why: 'red-team pass in flight' })]);
+    expect(readEvidence).toHaveBeenCalledWith({ repo, pr: 1, head });
+    expect(readReviews).toHaveBeenCalledWith({ repo, pr: 1 });
+    expect(queue.entries()).toHaveLength(1);
   });
+
+  it.each(['comments missing', 'labels missing', 'unreadable', 'throw', 'wrong number', 'head moved', 'closed'])(
+    '%s defers the known entry without a planner probe or eviction', mode => {
+      const { result, readEvidence, readReviews, queue, before } = recoveryTick(inventoryError([], 10), mode);
+      expect(result.rows).toEqual([]);
+      expect(readEvidence).not.toHaveBeenCalled();
+      expect(readReviews).not.toHaveBeenCalled();
+      expect(queue.entries()).toEqual(before);
+    });
 
   it.each([
     ['page error', () => new PrListUnreadableError({ repo, stage: 'page', page: 2, cause: new Error('page failed') })],
@@ -54,6 +70,37 @@ describe('partial PR inventory red-team recovery', () => {
     expect(redTeamOnSkip).not.toHaveBeenCalled();
   });
 });
+
+function recoveryTick(error, mode) {
+  const head = 'a'.repeat(40);
+  const entry = { key: `${repo}#1`, repo, pr: 1, head, enqueuedAt: 1, attempts: 0, blocked: 'planner-skip' };
+  let stored = JSON.stringify([entry]);
+  const queue = createRedTeamDispatchQueue({ file: 'fixture-queue.json', readFile: () => stored,
+    writeFile: (_path, data) => { stored = data; }, rename: () => {} });
+  const before = queue.entries();
+  const readEvidence = vi.fn(() => ({ inFlight: true }));
+  const readReviews = vi.fn(() => []);
+  let result;
+  const redTeamOnSkip = vi.fn(options => {
+    result = runWithRedTeamQueue({ ...options, queue, run: runRedTeamOnSkip,
+      readPartialPr: ({ pr }) => {
+        if (mode === 'throw') throw Error('offline');
+        if (mode === 'unreadable') return null;
+        return { number: mode === 'wrong number' ? 99 : pr,
+          state: mode === 'closed' ? 'CLOSED' : 'OPEN',
+          headRefOid: mode === 'head moved' ? 'b'.repeat(40) : head,
+          labels: mode === 'labels missing' ? undefined : [{ name: 'review:accepted' }],
+          comments: mode === 'comments missing' ? undefined : [] };
+      },
+      setting: { enabled: true, retryCooldownMin: 30 }, readEvidence, readReviews,
+      readCarry: () => null, readWitness: null, readStatus: () => null, lastDispatch: new Map(),
+      syncLabels: vi.fn(), dispatch: vi.fn(),
+    });
+    return result;
+  });
+  failedListTick(error, { redTeamOnSkip });
+  return { redTeamOnSkip, result, readEvidence, readReviews, queue, before, head };
+}
 
 describe('partial inventory recovery safety', () => {
   it('partial inventory recovery keeps host, recovery-lane and shared-budget bounds', () => {
