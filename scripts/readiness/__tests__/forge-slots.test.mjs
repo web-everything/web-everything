@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {afterEach, describe, expect, it} from 'vitest';
-import {mkdtempSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, symlinkSync} from 'node:fs';
+import {mkdtempSync, readFileSync, writeFileSync, mkdirSync, cpSync, rmSync, symlinkSync, existsSync, readdirSync} from 'node:fs';
 import {tmpdir, hostname} from 'node:os';
 import {join, dirname} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -153,7 +153,7 @@ fi`);
     const timer = setup.slice(setup.indexOf('# Missing units are normal'), setup.indexOf('if ! command -v nft'));
     const sudoers = setup.slice(setup.indexOf('sudoers_pending=$(mktemp'), setup.indexOf('if ! command -v rsync'))
       .replace('/etc/sudoers.d/forge-exec', join(dir, 'sudoers'));
-    const success = setup.slice(setup.lastIndexOf('systemctl enable --now forge-exec-egress.timer'));
+    const success = setup.slice(setup.lastIndexOf('systemctl enable --now forge-exec-egress.timer'), setup.indexOf('# Verify the installed runner'));
     writeFileSync(join(dir, 'forge-setup.sh'), `set -euo pipefail\nFORGE_EXEC_SLOTS=1\n${timer}\n${sudoers}\n[[ "$STAGE" != later ]] || exit 37\n${success}`);
     const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
       encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
@@ -167,6 +167,82 @@ fi`);
     expect(result.stderr.includes('restart it manually')).toBe(restartFails);
     expect(() => readFileSync(pending)).toThrow();
   });
+  it.each(['after-accounts', 'after-egress-install', 'before-enable', 'apply-failure', 'check-failure', 'publish-failure', 'success'])(
+    'two-phase grow keeps slots 9–14 disabled until verified egress: %s', stage => {
+      const dir = fixture(), srv = join(dir, 'srv'), pool = join(srv, 'forge-exec');
+      const log = join(dir, 'log'), sudoers = join(dir, 'sudoers');
+      mkdirSync(pool, {recursive: true});
+      for (let k = 1; k <= 8; k++) mkdirSync(join(pool, `slot-${k}`), {mode: 0o710});
+      const oldSudoers = 'ops ALL=(' + Array.from({length: 8}, (_, i) => `forge-exec-${i + 1}`).join(',') + ') NOPASSWD: /usr/bin/rsync\n';
+      writeFileSync(sudoers, oldSudoers);
+      const fake = (name, body) => writeFileSync(join(dir, name), '#!/bin/bash\n' + body + '\n', {mode: 0o755});
+      fake('getent', 'for k in {1..8}; do echo "forge-exec-$k:x:$((2000+k)):2000::/:/bin/bash"; done');
+      fake('id', '[[ "$1" == forge-exec ]] && exit 0; k=${1##*-}; ((k <= 8))');
+      fake('useradd', 'echo "account:$*" >> "$LOG"');
+      fake('systemctl', 'if [[ "$1" == show ]]; then [[ "$3" == LoadState ]] && echo loaded || echo active; else echo "timer:$*" >> "$LOG"; fi');
+      fake('nft', 'exit 0'); fake('chown', 'exit 0'); fake('visudo', 'exit 0');
+      writeFileSync(join(dir, 'login.defs'), 'SYS_UID_MIN 100\nSYS_UID_MAX 999\n');
+      writeFileSync(join(dir, 'forge-egress.sh'), 'echo "apply:$FORGE_EGRESS_UIDS" >> "$LOG"\n[[ "$STAGE" != apply-failure || ! -e "$READY" ]]\n');
+      // UID coverage semantics are covered in forge-exec-egress-table.test.mjs.
+      // Here the command boundary verifies that setup has not enabled anything yet.
+      fake('node', `echo 'check' >> "$LOG"
+for k in {9..14}; do [[ ! -e "$POOL/slot-$k" ]] || exit 90; done
+[[ "$STAGE" != check-failure ]]`);
+      const prefix = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('# Only ops may create run containers.'));
+      const body = setup.match(/python3 - <<'DIRECTORIES'\n([\s\S]*?)\nDIRECTORIES/)[1];
+      const identities = `import os, pwd, grp, types
+original_fstat = os.fstat
+os.fstat = lambda fd: types.SimpleNamespace(st_uid=0, st_mode=original_fstat(fd).st_mode)
+os.fchown = lambda *args: None
+os.getgrouplist = lambda name, gid: [gid]
+pwd.getpwnam = lambda name: types.SimpleNamespace(pw_uid=2000+int(name.rsplit('-', 1)[1]) if name.startswith('forge-exec-') else 1000, pw_gid=3000+int(name.rsplit('-', 1)[1]) if name.startswith('forge-exec-') else 1000)
+grp.getgrnam = lambda name: types.SimpleNamespace(gr_gid=3000+int(name.rsplit('-', 1)[1]) if name.startswith('forge-exec-') else 1000, gr_mem=[])
+`;
+      const prepare = setup.slice(setup.indexOf('sudoers_pending=$(mktemp'), setup.indexOf('if ! command -v rsync'));
+      const enable = setup.slice(setup.lastIndexOf('systemctl enable --now forge-exec-egress.timer'))
+        .replace('/usr/local/libexec/forge-egress.sh apply', 'bash "$(dirname -- "$0")/forge-egress.sh" apply')
+        .replace('# Final enable:', '[[ "$STAGE" != before-enable ]] || exit 37\n# Final enable:')
+        .replace('import os, sys\nroot =', `import os, sys
+if os.environ['STAGE'] == 'publish-failure':
+    def fail_replace(*args): raise OSError('simulated sudoers publication failure')
+    os.replace = fail_replace
+root =`);
+      // Use the real account, directory, sudoers preparation and final-enable code;
+      // replace unrelated package/runtime installation with explicit failure points.
+      const script = `${prefix}
+[[ "$STAGE" != after-accounts ]] || exit 37
+python3 - <<'DIRECTORIES'
+${identities}${body}
+DIRECTORIES
+${prepare}
+echo egress-installed >> "$LOG"
+touch "$READY"
+[[ "$STAGE" != after-egress-install ]] || exit 37
+${enable}`.replaceAll('/srv', srv).replaceAll('/etc/login.defs', join(dir, 'login.defs'))
+        .replaceAll('/etc/sudoers.d/.forge-exec.XXXXXXXX', join(dir, '.sudoers.XXXXXXXX'))
+        .replaceAll('/etc/sudoers.d/forge-exec', sudoers);
+      writeFileSync(join(dir, 'forge-setup.sh'), script);
+      const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
+        encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+        env: {PATH: dir + ':' + process.env.PATH, FORGE_EXEC_SLOTS: '14', STAGE: stage, LOG: log, POOL: pool, READY: join(dir, 'installed')},
+      });
+      expect(result.status, result.stderr).toBe(stage === 'success' ? 0 : stage.includes('failure') ? 1 : 37);
+      const usable = readdirSync(pool).filter(name => /^slot-[1-9]\d*$/.test(name));
+      expect(usable).toHaveLength(stage === 'success' ? 14 : 8);
+      for (let k = 9; k <= 14; k++) {
+        expect(existsSync(join(pool, `slot-${k}`))).toBe(stage === 'success');
+        expect(readFileSync(sudoers, 'utf8').includes(`forge-exec-${k}`)).toBe(stage === 'success');
+      }
+      const events = readFileSync(log, 'utf8').trim().split('\n');
+      expect(events.filter(line => line.startsWith('account:'))).toHaveLength(6);
+      const restoresTimer = ['after-accounts', 'after-egress-install'].includes(stage);
+      expect(events.includes('timer:start forge-exec-egress.timer')).toBe(restoresTimer);
+      expect(events.includes('timer:enable --now forge-exec-egress.timer')).toBe(!restoresTimer);
+      if (stage === 'success') {
+        expect(events.slice(-2)).toEqual(['apply:2001 2002 2003 2004 2005 2006 2007 2008 999 998 997 996 995 994', 'check']);
+        expect(events.indexOf('egress-installed')).toBeLessThan(events.lastIndexOf('check'));
+      } else expect(readFileSync(sudoers, 'utf8')).toBe(oldSudoers);
+    });
   it('setup passes its effective count into both sweep and egress units', () => {
     expect(setup).toContain('Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS');
     expect(setup).toContain(`printf 'Environment=FORGE_EXEC_SLOTS=%s\\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service`);

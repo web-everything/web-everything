@@ -191,6 +191,12 @@ try:
             identities.add(worker.pw_uid)
             groups.add(group.gr_gid)
             name = "slot-" + str(k)
+            # Directory names are the runner's usable-slot list (including old runners).
+            # Keep new slots undiscoverable until the final enable transaction.
+            try:
+                os.stat(name, dir_fd=root, follow_symlinks=False)
+            except FileNotFoundError:
+                name = ".disabled-" + name
             try:
                 os.mkdir(name, 0o700, dir_fd=root)
             except FileExistsError:
@@ -236,8 +242,6 @@ sudoers_pending=$(mktemp /etc/sudoers.d/.forge-exec.XXXXXXXX)
 visudo -cf "$sudoers_pending"
 chown root:root "$sudoers_pending"
 chmod 440 "$sudoers_pending"
-mv -f -- "$sudoers_pending" /etc/sudoers.d/forge-exec
-sudoers_pending=''
 if ! command -v rsync >/dev/null 2>&1; then
   apt-get install -y rsync
 fi
@@ -579,4 +583,45 @@ systemctl enable forge-exec-egress.service
 systemctl start forge-exec-egress.service
 systemctl enable --now forge-exec-egress.timer
 restore_egress_timer=false
+# Verify the installed runner sees coverage for every target UID, after the new
+# service and timer are installed. A restored old timer on an earlier failure
+# cannot expose new slots: their directories and sudoers are still unpublished.
+FORGE_EGRESS_UIDS="${slot_uids[*]}" /usr/local/libexec/forge-egress.sh apply
+node --input-type=module - "${slot_uids[@]}" <<'EGRESS_CHECK'
+import {createRunner} from '/usr/local/libexec/forge-exec-run.mjs';
+const runner = createRunner();
+for (const uid of process.argv.slice(2)) await runner.egressReady(Number(uid));
+EGRESS_CHECK
+# Final enable: publish the usable directory names, then atomically replace the
+# validated sudoers file. Roll back directory publication if any operation fails.
+python3 - "$sudoers_pending" <<'ENABLE_SLOTS'
+import os, sys
+root = os.open("/srv/forge-exec", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+published = []
+try:
+    for k in range(1, int(os.environ["FORGE_EXEC_SLOTS"]) + 1):
+        name = "slot-" + str(k)
+        pending = ".disabled-" + name
+        try:
+            os.stat(pending, dir_fd=root, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        # Never overwrite an already-usable slot, including on a retry.
+        try:
+            os.stat(name, dir_fd=root, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError("forge-setup: slot appeared during grow; inspect setup before retrying")
+        os.rename(pending, name, src_dir_fd=root, dst_dir_fd=root)
+        published.append((name, pending))
+    os.replace(sys.argv[1], "/etc/sudoers.d/forge-exec")
+except BaseException:
+    for name, pending in reversed(published):
+        os.rename(name, pending, src_dir_fd=root, dst_dir_fd=root)
+    raise
+finally:
+    os.close(root)
+ENABLE_SLOTS
+sudoers_pending=''
 printf 'forge-setup: ok\n'
