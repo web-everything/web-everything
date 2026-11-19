@@ -592,6 +592,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
       if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.', ...ciRefusal });
+        if (ciRefusal && ciRefusal.detail !== 'ci-api-unavailable') return stop('no-ready', ciRefusal);
         let ledger, shards, expectedSteps, origin;
         try {
           origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));

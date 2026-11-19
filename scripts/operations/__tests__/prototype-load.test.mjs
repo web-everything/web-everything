@@ -3350,12 +3350,8 @@ describe('default test check-run reader (production wiring)', () => {
   });
   it.each([
     ['unavailable repository API (nonzero)', { fail: 'repo' }],
-    ['unavailable raw checks (API nonzero)', { fail: 'checks' }],
-    ['unavailable workflow binding (API nonzero)', { fail: 'runs' }],
-    ['absent check', { checks: { total_count: 0, check_runs: [] } }],
     ['queued CI', { checks: { total_count: 1, check_runs: [run({ status: 'queued', conclusion: null })] } }],
     ['pending CI', { checks: { total_count: 1, check_runs: [run({ status: 'in_progress', conclusion: null })] } }],
-    ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
   ])('urgent requires a signed receipt with %s', async (_, options) => {
     const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
     expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
@@ -3365,6 +3361,11 @@ describe('default test check-run reader (production wiring)', () => {
     expect(missing.readyWrites).toEqual([]);
   });
   it.each([
+    ['unreadable repository identity', { repositoryRaw: '{}' }],
+    ['unavailable raw checks (API nonzero)', { fail: 'checks' }],
+    ['unavailable workflow binding (API nonzero)', { fail: 'runs' }],
+    ['absent check', { checks: { total_count: 0, check_runs: [] } }],
+    ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
     ['check response buffer overflow', { fail: 'overflow' }],
     ['invalid check JSON', { checksRaw: '{' }],
     ['missing check array', { checks: { total_count: 0 } }],
@@ -3379,7 +3380,12 @@ describe('default test check-run reader (production wiring)', () => {
     ['foreign workflow', { runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }],
   ])('urgent refuses %s before reading a signed receipt', async (_, options) => {
     const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
-    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: options.runs || options.runsRaw ? (_.startsWith('foreign') ? 'ci-workflow-unbound' : 'ci-workflows-unreadable') : 'ci-checks-unreadable', fallback: expect.any(String) });
+    const detail = options.repositoryRaw ? 'ci-repository-unreadable'
+      : options.fail === 'runs' || options.runs || options.runsRaw ? (_.startsWith('foreign') ? 'ci-workflow-unbound' : 'ci-workflows-unreadable')
+      : _ === 'absent check' || options.checks?.check_runs?.[0]?.head_sha === TREE ? 'ci-test-check-missing' : 'ci-checks-unreadable';
+    const recovery = detail === 'ci-workflow-unbound' ? 'Bind every test check suite'
+      : detail === 'ci-test-check-missing' ? 'Complete the GitHub Actions test check' : 'Repair';
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail, fallback: expect.stringContaining(recovery) });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
     expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
   });
