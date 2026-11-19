@@ -401,10 +401,12 @@ export function reportReaderWaitTimeout({
 
 /** Job result producer: local reader drain and host smoke capacity remain separate clocks. */
 export function buildRebuildJobResult(input, r, timeout, nowMs = Date.now()) {
+  // Accept pre-migration child output as well as the explicit CLI timing record.
+  const timing = r.timing ?? r;
   return {
     launchedBy: input.launchedBy ?? 'tick-start',
-    waitInFlightTickMs: (input.waitInFlightTickMs ?? 0) + (r.waitInFlightTickMs ?? 0),
-    waitSmokeSlotMs: r.waitSmokeSlotMs ?? null,
+    waitInFlightTickMs: (input.waitInFlightTickMs ?? 0) + (timing.waitInFlightTickMs ?? 0),
+    waitSmokeSlotMs: timing.waitSmokeSlotMs ?? null,
     finishedAt: nowMs, reason: r.reason ?? null, ...(r.mutation ? { mutation: r.mutation } : {}),
     readyRecorded: !!r.readyRecorded, target: r.target ?? r.plan?.finalSha ?? null,
     alerts: (r.alerts || []).map((a) => a.kind), ...(timeout ?? {}),

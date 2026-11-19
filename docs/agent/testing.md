@@ -4857,6 +4857,12 @@ sequentially. Keep fake executable PATH setup in `beforeAll` and all large-outpu
 assertions inside the original per-test deadlines; increasing the setup timeout does not resolve the import stall.
 ## Ready-candidate adoption during overlay churn
 
+`rebuildClone` keeps phase waits in a non-enumerable `timing` record to preserve existing result
+equality. The rebuild CLI explicitly serializes it for detached jobs; `daemon-rebuild-early-timing.test.mjs`
+checks the legacy shape and runs the actual CLI subprocess to verify timing transfer into the job result.
+Do not reconstruct CLI serialization in the test: removing the producer's timing serialization must fail it.
+Adoption latency remains in adoption state.
+
 `daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
 refs and descendant advances remain pending after adoption, and the next adopt-only tick
 must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an

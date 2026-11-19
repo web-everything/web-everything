@@ -162,7 +162,8 @@ async function runCli(argv) {
     ...(entries.length ? { entries } : {}),
   });
   if (flags.json) {
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    // Phase timing is intentionally non-enumerable for in-process callers, but the job needs it.
+    process.stdout.write(`${JSON.stringify({ ...result, ...(result.timing ? { timing: result.timing } : {}) })}\n`);
   } else {
     process.stdout.write(`daemon-rebuild: ${root} moved=${result.moved} reason=${result.reason || ''}\n`);
     for (const a of result.alerts || []) process.stdout.write(`  ! ${a.kind}\n`);

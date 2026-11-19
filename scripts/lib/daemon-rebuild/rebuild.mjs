@@ -102,11 +102,16 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  *   mainOnly?:boolean, admissionWaitMs?:number, now?:()=>number, sleep?:(ms:number)=>Promise<void>,
  *   emitEvent?:Function, dispatchSmoke?:{settings?:object, run?:Function, match?:Function}}} o — injected
  *   pieces of the real dispatch smoke the candidate smoke runs for a new dispatch-touching overlay (default: #4481's).
- * @returns {Promise<object>}
+ * @returns {Promise<object>} Legacy result shape, with phase waits in a non-enumerable `timing` record.
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const startedAtMs = Date.now();
-  const result = await rebuildCloneInternal(options);
+  const { waitInFlightTickMs, waitSmokeSlotMs, ...result } = await rebuildCloneInternal(options);
+  // Keep the caller's enumerable result contract stable. The CLI explicitly serializes this record
+  // for the detached job; ordinary equality checks, spreads and JSON retain the legacy shape.
+  if (waitInFlightTickMs !== undefined || waitSmokeSlotMs !== undefined) {
+    Object.defineProperty(result, 'timing', { value: { waitInFlightTickMs, waitSmokeSlotMs } });
+  }
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
