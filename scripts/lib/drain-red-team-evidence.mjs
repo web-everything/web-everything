@@ -1,6 +1,7 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId, readCombinedStatus, redTeamPublicationContext, readUnsettledPublicationHolds, ownsPublicationHold } from './red-team-check-run.mjs';
 import { isAutomationAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { createMqLiveReader, redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -136,6 +137,10 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       const live = readLivePr();
       if (live?.headRefOid !== head || !Array.isArray(live.labels))
         return { ok: false, reason: 'red-team live head or labels unreadable' };
+      // redTeamEnqueueHold ignores labels, so the live publisher's blocking-label rule is applied here too.
+      const labelNames = live.labels.map(label => typeof label === 'string' ? label : label?.name);
+      const blockedBy = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(label => labelNames.includes(label));
+      if (blockedBy) return { ok: false, reason: `red-team publication held by ${blockedBy}` };
       const hold = redTeamEnqueueHold({ repo, pr, head, comments, labels: live.labels,
         recorded: true, scheduled: true, env });
       if (hold) return { ok: false, reason: hold };

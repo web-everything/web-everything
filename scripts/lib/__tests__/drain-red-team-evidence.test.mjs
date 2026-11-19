@@ -1953,6 +1953,13 @@ describe('finished publication hold recovery', () => {
       expect(settleFinishedPublicationHold(f).ok).toBe(['absent', 'success'].includes(kind));
       expect(f.postHold).not.toHaveBeenCalled();
     });
+  it.each(['red-team:pending', 'red-team:blocked', 'review:human'])('never clears while the live PR carries %s', label => {
+    const f = setup();
+    f.readLivePr.mockReturnValue({ headRefOid: f.head, labels: [{ name: label }] });
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: expect.stringContaining(label) });
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
   it('refuses an incomplete marker-only result and a check completed in the same second as the hold', () => {
     const f = setup();
     f.readComments.mockImplementation(() => [{ author: { login: 'web-everything' }, body:
