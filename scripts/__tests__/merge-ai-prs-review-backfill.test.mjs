@@ -7,6 +7,36 @@ import { backfillAllReviewRuns, backfillOpenReviewRuns } from '../lib/review-run
 import { newRunRecord } from '../operations/run-record.mjs';
 import { backfillDrainReviewRuns } from '../merge-ai-prs.mjs';
 
+it.each(['reported', 'unknown', 'throwing'])('repeated drain ticks complete the full backfill with saturated %s open hints', spend => {
+  const root = mkdtempSync(join(tmpdir(), 'drain-backfill-progress-'));
+  try {
+    const context = { contextComplete: true, prsByRepo: new Map([['o/r', [{ number: 7 }]]]) };
+    const records = Array.from({ length: 101 }, (_, i) => newRunRecord({
+      id: `review-pr-progress-${String(i).padStart(3, '0')}`, op: 'review-pr', input: { repo: 'o/r', pr: 7 },
+    }));
+    let complete = false;
+    for (let tick = 0; tick < 5; tick++) {
+      let openReads = 0, fullReads = 0;
+      backfillDrainReviewRuns(context, { resolveDir: () => join(root, 'runs'),
+        backfill: (_context, { maxParses = 50 }) => {
+          openReads = maxParses; // An open pass that needs its entire allocation every tick.
+          if (spend === 'throwing') throw Error('open pass unavailable after reading');
+          if (spend === 'unknown') return {};
+          return { complete: false, parsed: openReads };
+        },
+        backfillAll: options => {
+          complete = backfillAllReviewRuns({ ...options,
+            list: () => records.map(record => record.id), stat: () => ({ mtimeMs: 2000 }),
+            read: id => { fullReads++; return records.find(record => record.id === id); },
+          }).complete;
+        },
+      });
+      expect(openReads + fullReads).toBeLessThanOrEqual(50);
+    }
+    expect(complete).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 it.each(['persistence', 'listing churn', 'read warning'])('an aborted open-PR backfill leaves only the actual remainder after %s', failure => {
   const root = mkdtempSync(join(tmpdir(), 'drain-backfill-budget-'));
   try {
@@ -62,21 +92,24 @@ it('drain tick shares ONE 50-parse budget between the open-PR and the full backf
   const context = { contextComplete: true, prsByRepo: new Map() };
   const budgets = [];
   const run = parsed => backfillDrainReviewRuns(context, { resolveDir: () => 'runs',
-    backfill: () => ({ parsed }), backfillAll: options => { budgets.push(options.maxParsesPerCall); } });
-  run(30);
-  expect(budgets).toEqual([20]);
-  run(50);
+    backfill: (_context, options) => { expect(options.maxParses).toBe(25); return { parsed }; },
+    backfillAll: options => { budgets.push(options.maxParsesPerCall); } });
+  run(20);
+  expect(budgets).toEqual([30]);
+  run(25);
   run(undefined);
-  expect(budgets).toEqual([20]); // nothing left (or spend unknown): the full backfill is not run this tick
+  expect(budgets).toEqual([30, 25, 25]); // Exhausted or unknown open spend still leaves the reserved allocation.
   run(0);
-  expect(budgets).toEqual([20, 50]);
+  expect(budgets).toEqual([30, 25, 25, 50]);
+  run(50); // Defensive accounting for an injected backfill that violates its allocation.
+  expect(budgets).toEqual([30, 25, 25, 50]);
 });
-it('a throwing open-PR backfill leaves no budget for the full backfill, and a throwing full backfill is soft', () => {
+it('a throwing open-PR backfill retains the full reservation, and a throwing full backfill is soft', () => {
   const context = { contextComplete: true, prsByRepo: new Map() };
   let all = 0;
   backfillDrainReviewRuns(context, { resolveDir: () => 'runs', backfill: () => { throw Error('x'); },
-    backfillAll: () => { all++; } });
-  expect(all).toBe(0);
+    backfillAll: options => { all++; expect(options.maxParsesPerCall).toBe(25); } });
+  expect(all).toBe(1);
   expect(backfillDrainReviewRuns(context, { resolveDir: () => 'runs', backfill: () => ({ parsed: 1 }),
     backfillAll: () => { throw Error('y'); } })).toBe(context);
 });
@@ -86,5 +119,5 @@ it('drain backfill receives the resolved directory and local repository', () => 
   expect(backfillDrainReviewRuns(context, { resolveDir: () => 'runs', localSlug: 'o/r',
     backfill: (...args) => { received = args; },
   })).toBe(context);
-  expect(received).toEqual([context, { runsDir: 'runs', localSlug: 'o/r' }]);
+  expect(received).toEqual([context, { runsDir: 'runs', localSlug: 'o/r', maxParses: 25 }]);
 });

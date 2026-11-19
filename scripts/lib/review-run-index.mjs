@@ -3,7 +3,7 @@
  * Backfill stages a complete pass over review ids, at most 50 payloads per drain tick.
  */
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { isValidRunId, parseRunRecord } from '../operations/run-record.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
@@ -41,6 +41,16 @@ function validEntries(index) {
   return index && typeof index === 'object' && !Array.isArray(index) && Object.keys(index).length <= MAX_KEYS
     && Object.entries(index).every(([key, entries]) => key.length <= 256 && Array.isArray(entries) && entries.length <= MAX_IDS
       && entries.every(row => reviewId(row?.id) && Number.isFinite(row.mtimeMs)));
+}
+// Bind completeness to the exact rebuilt entries and loss markers. Stat-only
+// file coverage cannot detect deleted keys/rows in an otherwise intact sidecar.
+// This is a consistency check, not authentication against a writer forging both.
+function fullEntriesDigest(full) {
+  return createHash('sha256').update(JSON.stringify([full.entries, full.evicted])).digest('hex');
+}
+function hasFullEntriesProof(full) {
+  return typeof full?.completeness?.entriesDigest === 'string'
+    && full.completeness.entriesDigest === fullEntriesDigest(full);
 }
 function load(path) {
   const index = readJson(path, FULL_MAX_BYTES);
@@ -95,7 +105,7 @@ function readIndexedRuns(runsDir, repo, pr, full, {
     const key = keyOf(repo, pr);
     if (!key || !validEntries(index?.entries)) return null;
     const rows = index.entries[key] ?? [];
-    if (full && (proof?.validationVersion !== FULL_VALIDATION_VERSION || proof?.all !== true || !Array.isArray(index.evicted)
+    if (full && (!hasFullEntriesProof(index) || proof?.validationVersion !== FULL_VALIDATION_VERSION || proof?.all !== true || !Array.isArray(index.evicted)
       || index.evicted.some(key => typeof key !== 'string') || index.evicted.includes(key)
       || (Object.hasOwn(index.entries, key) && rows.length === 0))) return null;
     if (!proof || !Number.isFinite(proof.completeThroughMtimeMs)
@@ -292,7 +302,7 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
       try { index = load(path); } catch { index = { version: 2, entries: {} }; }
       const files = listing(runsDir, list, stat), poisons = poisonNames(path);
       const full = index.fullReviewRuns;
-      if (validEntries(full?.entries) && Array.isArray(full.evicted) && full.completeness?.all === true
+      if (validEntries(full?.entries) && hasFullEntriesProof(full) && Array.isArray(full.evicted) && full.completeness?.all === true
         && full.completeness.validationVersion === FULL_VALIDATION_VERSION
         && Number.isFinite(full.completeness.completeThroughMtimeMs)
         && JSON.stringify(full.completeness.files) === JSON.stringify(files)
@@ -316,6 +326,7 @@ export function backfillAllReviewRuns({ runsDir, maxParsesPerCall = 50,
         }
         index.fullReviewRuns = { entries, evicted,
           completeness: { validationVersion: FULL_VALIDATION_VERSION, all: true, files, poisons: state.poisons,
+            entriesDigest: fullEntriesDigest({ entries, evicted }),
             completeThroughMtimeMs: files.reduce((max, row) => Math.max(max, row.mtimeMs), 0) } };
       } else {
         index.fullReviewRuns = { entries: full?.entries ?? {}, evicted: full?.evicted ?? [], backfill: state };

@@ -191,12 +191,14 @@ import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-
 export function backfillDrainReviewRuns(context, {
   backfill = backfillOpenReviewRuns, backfillAll = backfillAllReviewRuns, resolveDir = resolveRunsDir, localSlug,
 } = {}) {
-  // One shared budget per drain tick: the full backfill only gets what the open-PR backfill left of the 50 parses.
+  // Reserve half the shared tick budget for full-store progress, even if the open
+  // pass repeatedly exhausts its allocation or cannot report its spend.
   const TICK_PARSE_BUDGET = 50;
-  let used = TICK_PARSE_BUDGET; // unknown spend (a throw) leaves nothing for the second backfill: fail toward fewer reads
+  const OPEN_PARSE_BUDGET = 25;
+  let used = OPEN_PARSE_BUDGET; // Unknown spend consumes the entire assigned allocation.
   try {
-    const spent = backfill(context, { runsDir: resolveDir(), localSlug });
-    used = Number.isSafeInteger(spent?.parsed) && spent.parsed >= 0 ? spent.parsed : TICK_PARSE_BUDGET;
+    const spent = backfill(context, { runsDir: resolveDir(), localSlug, maxParses: OPEN_PARSE_BUDGET });
+    used = Number.isSafeInteger(spent?.parsed) && spent.parsed >= 0 ? spent.parsed : OPEN_PARSE_BUDGET;
   } catch { /* The unchanged bounded evidence scan remains authoritative. */ }
   const left = TICK_PARSE_BUDGET - used;
   if (left > 0) {

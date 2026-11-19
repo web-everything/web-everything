@@ -333,6 +333,33 @@ it('a missed append cannot reuse completeness after an unindexed record is repla
 });
 
 // Negative evidence requires a full-store proof, independently of the open-PR hint.
+it.each(['deleted key', 'append after deleted key', 'missing row', 'deleted eviction', 'legacy proof without digest'])('full proof refuses %s and the next backfill repairs it', kind => {
+  const n = negativeFixture();
+  n.f.run.findings.read.netBasis.rev = n.f.head;
+  n.records.push({ ...n.f.run, id: 'review-pr-another-head',
+    findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } });
+  if (kind === 'deleted eviction') n.records.push(...Array.from({ length: 112 }, (_, i) => ({
+    ...n.f.run, id: `review-pr-z-${i}`, input: { repo: 'extra/repo', pr: i + 1 },
+  })));
+  n.fill(); n.fill(); expect(n.fill().complete).toBe(true);
+  const path = reviewRunIndexPath(n.f.runsDir), index = JSON.parse(readFileSync(path));
+  const full = index.fullReviewRuns, key = `${n.f.repo}#${n.f.pr}`;
+  if (kind.endsWith('deleted key')) delete full.entries[key];
+  if (kind === 'missing row') full.entries[key] = full.entries[key].filter(row => row.id !== n.f.run.id);
+  if (kind === 'legacy proof without digest') delete full.completeness.entriesDigest;
+  if (kind === 'deleted eviction') {
+    expect(full.evicted).toContain(key);
+    full.evicted = full.evicted.filter(entry => entry !== key);
+  }
+  writeFileSync(path, JSON.stringify(index));
+  if (kind === 'append after deleted key') expect(appendReviewRunIndex(n.records[1], n.f.runsDir, 2000)).toBe(true);
+  expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
+  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
+  expect(n.fill()).toEqual({ complete: false, parsed: 200 });
+  n.fill(); expect(n.fill().complete).toBe(true);
+  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
+});
+
 function negativeFixture() {
   const f = fixture();
   f.run.findings.read.netBasis.rev = 'b'.repeat(40);
