@@ -21,6 +21,12 @@ const defaults = { enabled: true, maxEdgesPerTest: 5000 };
 /** Pure construction: only install() mutates the injected objects; record receives unique edges. */
 export function createTracer({ test, root, record = () => {}, fs: io = {}, child_process: cp = {},
   env = {}, maxEdgesPerTest = 5000, warn = () => {} }) {
+  // Test setup may scrub process.env; trace identity and destination belong to activation.
+  // Keep ordinary inherited environment values live, but resolve the destination before chdir.
+  const traceEnv = { WE_TRACE_TEST: env.WE_TRACE_TEST,
+    WE_TRACE_DIR: env.WE_TRACE_DIR === undefined ? undefined : resolve(env.WE_TRACE_DIR) };
+  if (env.WE_CI_SELECTION !== undefined) traceEnv.WE_CI_SELECTION = env.WE_CI_SELECTION;
+  const initialNodeOptions = env.NODE_OPTIONS;
   const edges = new Map();
   const exists = io.statSync?.bind(io);
   function path(value, cwd = root) {
@@ -65,6 +71,8 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
       const original = cp[name];
       if (!original) continue;
       const prepare = (command, args) => {
+        // Node accepts an explicit null/undefined args slot before options.
+        if (args.length && args[0] == null) args[0] = [];
         const index = Array.isArray(args[0]) ? 1 : 0;
         const hasOptions = args[index] && typeof args[index] === 'object';
         const options = hasOptions ? args[index] : {};
@@ -73,10 +81,10 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
           if (path(value, cwd) === null) continue;
           try { if (exists?.(resolve(cwd, value)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
         }
-        const childEnv = { ...(options.env ?? env), WE_TRACE_TEST: env.WE_TRACE_TEST, WE_TRACE_DIR: resolve(process.cwd(), env.WE_TRACE_DIR) };
-        if (env.WE_CI_SELECTION !== undefined) childEnv.WE_CI_SELECTION = env.WE_CI_SELECTION;
-        childEnv.NODE_OPTIONS = inheritOptions(childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS);
-        args.splice(index, hasOptions ? 1 : 0, { ...options, env: childEnv });
+        const childEnv = { ...(options.env ?? env), ...traceEnv };
+        childEnv.NODE_OPTIONS = inheritOptions(childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions);
+        // Replace an options placeholder too, so a following callback keeps its position.
+        args.splice(index, hasOptions || (index < args.length && args[index] == null) ? 1 : 0, { ...options, env: childEnv });
         return [command, ...args];
       };
       cp[name] = function (command, ...args) { return Reflect.apply(original, this, prepare(command, args)); };
@@ -149,6 +157,7 @@ export async function startTrace({ env = process.env, settings, activate = activ
 export function activateTrace(env, settings, { fs: io = fs, child_process: cp = childProcess, process: runtime = process,
   MessageChannel: Channel = MessageChannel, register: registerLoader = register, syncBuiltinESMExports: syncExports = syncBuiltinESMExports,
   receiveMessageOnPort: receive = receiveMessageOnPort, threadId: tid = threadId } = {}) {
+  const outputDir = resolve(env.WE_TRACE_DIR);
   const tracer = createTracer({ test: env.WE_TRACE_TEST, root: ROOT, env, fs: io, child_process: cp,
     maxEdgesPerTest: settings.maxEdgesPerTest, warn: message => console.error(message) });
   const { port1, port2 } = new Channel();
@@ -162,8 +171,8 @@ export function activateTrace(env, settings, { fs: io = fs, child_process: cp = 
     let pending;
     while ((pending = receive(port1))) tracer.add(pending.message, 'load');
     try {
-      io.mkdirSync(env.WE_TRACE_DIR, { recursive: true });
-      io.writeFileSync(resolve(env.WE_TRACE_DIR, `trace-${runtime.pid}${tid ? `-t${tid}` : ''}.json`), JSON.stringify(tracer.snapshot()));
+      io.mkdirSync(outputDir, { recursive: true });
+      io.writeFileSync(resolve(outputDir, `trace-${runtime.pid}${tid ? `-t${tid}` : ''}.json`), JSON.stringify(tracer.snapshot()));
     } catch (error) { console.error(`dep-trace: incomplete evidence: ${error.code || 'write failed'}`); }
   });
   return tracer;

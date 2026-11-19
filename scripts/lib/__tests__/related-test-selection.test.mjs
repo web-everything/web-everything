@@ -262,7 +262,7 @@ describe('S1 static edges', () => {
     expect(selectTests(options)).toMatchObject({ mode: 'shrink', partial: true, selectedFiles: ['direct.test.mjs'],
       reasons: expect.arrayContaining([expect.stringContaining('partial:')]) });
     expect(selectTests({ ...options, env: { ...options.env, CI: 'true' } })).toMatchObject({ partial: false,
-      selectedFiles: ['deep.test.mjs', 'direct.test.mjs'] });
+      selectedFiles: ['deep.test.mjs', 'direct.test.mjs', 'docs/hub.mjs'] });
   });
 });
 
@@ -271,6 +271,27 @@ describe('readiness graph selection fails closed', () => {
   const select = (files, readFile = path => files[path], changed = 'docs/x.mjs') => selectTests({
     env: { WE_DIFF_TEST_SELECTION: '1' }, files: Object.keys(files), readFile,
     runGit: args => args[0] === 'merge-base' ? 'abc' : changed,
+  });
+
+  it.each([
+    'import /* multi\nline */ x from /* multi\nline */ "./helper"',
+    'export * from /* multi\nline */ "./helper"',
+    'import /* multi\nline */ "./helper"',
+    'import /* multi\nline */ ("./helper")',
+  ])('retains Vitest related targets when a nonempty regex graph misses valid syntax: %s', source => {
+    const helper = 'blocks/example/__tests__/helper.ts';
+    const visible = 'blocks/example/__tests__/visible.test.ts';
+    const missed = 'blocks/example/__tests__/missed.test.ts';
+    const files = { [helper]: 'export default 1', [visible]: 'import x from "./helper"', [missed]: source };
+    const reverse = graph(files);
+    expect(reverse.unreadable).toBe(0);
+    expect(testDepths([helper], reverse).has(visible)).toBe(true);
+    const result = select(files, undefined, helper);
+    // selectedFiles are inputs to `vitest related`: the helper retains BOTH importers
+    // even when the supplemental regex graph recognizes only the ordinary import.
+    expect(result).toMatchObject({ mode: 'shrink', partial: false });
+    expect(result.selectedFiles).toContain(helper);
+    expect(result.selectedFiles).toContain(visible);
   });
 
   it('runs the full suite when a non-test change reaches zero graph tests', () => {
@@ -284,7 +305,7 @@ describe('readiness graph selection fails closed', () => {
     const files = { 'docs/x.mjs': '', 'docs/__tests__/x.test.mjs': 'import /* c */ "../x.mjs"' };
     expect(resolvedImportsOf('docs/__tests__/x.test.mjs', files['docs/__tests__/x.test.mjs'], new Set(Object.keys(files))))
       .toEqual(['docs/x.mjs']);
-    expect(select(files)).toMatchObject({ mode: 'shrink', selectedFiles: ['docs/__tests__/x.test.mjs'] });
+    expect(select(files)).toMatchObject({ mode: 'shrink', selectedFiles: ['docs/__tests__/x.test.mjs', 'docs/x.mjs'] });
   });
 
   it('counts injected EACCES sources and runs the full suite despite a surviving test edge', () => {

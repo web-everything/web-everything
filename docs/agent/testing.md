@@ -4888,8 +4888,10 @@ ambiguous literal expressions can add tests. Sibling aliases retain their textua
 key and match a tracked vendored counterpart when available; they do not read sibling
 repositories. CI uses the unlimited `ci.selection.maxTestsInCi` setting; local
 `relatedMaxTests` stays caller-owned. Truncation carries `partial: true`.
-Before graph-reachable tests replace changed-file targets, require every changed target
-in the tracked inventory; an absent target (including a committed deletion) forces the full suite.
+Untruncated selection retains changed-file targets for `vitest related` and adds graph-reachable
+tests: regex discovery is supplemental, never proof that all valid imports were parsed.
+Require every changed target in the tracked inventory; an absent target (including a
+committed deletion) forces the full suite.
 
 `selection-replay.mjs` compares import-only and static selection on the current tracked
 tree. PR diff test paths are only related-test proxies. Supply `--evidence=relative.json`

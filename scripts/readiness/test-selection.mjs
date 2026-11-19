@@ -365,7 +365,9 @@ export function selectTests({ base = 'origin/main', runGit, env = process.env, f
     if (selection.fullTestCount === 0 && changedFiles.some(path => !isVitestTestFile(path))) return { ...decision, mode: 'full',
       reasons: ['graph selection yielded zero tests for non-test changed files — full suite'] };
     return { ...decision, selection, partial: selection.partial,
-      selectedFiles: selection.tests ?? selection.reachableTests,
+      // Regex-discovered edges supplement Vitest's module graph; they cannot prove
+      // it complete. Retain changed targets so valid syntax the scan misses still runs.
+      selectedFiles: selection.tests ?? [...new Set([...decision.selectedFiles, ...selection.reachableTests])].sort(),
       reasons: [...decision.reasons, `${selection.partial ? 'partial: ' : ''}${selection.reason}`] };
   }
   return decision;

@@ -76,6 +76,51 @@ describe('shadow dependency tracer', () => {
     f.child_process.fork('script.mjs', { cwd: root });
     expect(f.originals.fork.mock.calls[0][1].cwd).toBe(root);
   });
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => [undefined, null].map(args => [name, args])))('preserves %s options after an explicit %s args list', (name, args) => {
+    const f = fixture();
+    const callback = vi.fn();
+    const options = { cwd: '/', env: { ONLY: 'x' }, input: 'console.log(process.cwd(),process.env.ONLY)', encoding: 'utf8' };
+    f.child_process[name]('node', args, options, callback);
+    expect(f.originals[name].mock.calls[0]).toEqual(['node', [], {
+      ...options, env: expect.objectContaining({ ONLY: 'x', WE_TRACE_TEST: test }),
+    }, callback]);
+    expect(options.env).toEqual({ ONLY: 'x' });
+  });
+  it.each([undefined, null])('preserves execFile callbacks after an explicit %s options placeholder', options => {
+    const f = fixture();
+    const callback = vi.fn();
+    f.child_process.execFile('node', [], options, callback);
+    expect(f.originals.execFile.mock.calls[0]).toEqual(['node', [], expect.objectContaining({ env: expect.any(Object) }), callback]);
+  });
+  it('retains captured trace configuration after environment cleanup and cwd changes', () => {
+    const f = fixture();
+    delete f.env.WE_TRACE_TEST;
+    delete f.env.WE_TRACE_DIR;
+    f.env.CUSTOM = 'current';
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue('/');
+    try {
+      expect(f.child_process.spawnSync('node', ['-e', '0'])).toBe('child');
+      expect(f.originals.spawnSync.mock.calls[0][2].env).toMatchObject({
+        WE_TRACE_TEST: test, WE_TRACE_DIR: resolve(root, 'artifacts'), CUSTOM: 'current',
+      });
+    } finally { cwd.mockRestore(); }
+  });
+  it('persists evidence after setup removes the trace environment and changes cwd', () => {
+    const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' };
+    const runtime = { pid: 123, once: vi.fn() };
+    const io = { mkdirSync: vi.fn(), writeFileSync: vi.fn() };
+    activateTrace(env, { maxEdgesPerTest: 5000 }, {
+      fs: io, child_process: {}, process: runtime, receiveMessageOnPort: () => undefined, register: vi.fn(), threadId: 0,
+      syncBuiltinESMExports: vi.fn(), MessageChannel: class { constructor() { this.port1 = { on: vi.fn(), unref: vi.fn() }; this.port2 = {}; } },
+    });
+    delete env.WE_TRACE_TEST;
+    delete env.WE_TRACE_DIR;
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue('/');
+    try { runtime.once.mock.calls[0][1](); } finally { cwd.mockRestore(); }
+    expect(io.mkdirSync).toHaveBeenCalledWith(resolve(root, 'artifacts'), { recursive: true });
+    expect(io.writeFileSync).toHaveBeenCalledWith(resolve(root, 'artifacts/trace-123.json'),
+      JSON.stringify({ test, truncated: false, edges: [] }));
+  });
   it('preserves execFile util.promisify.custom contract and still injects the trace env', async () => {
     const custom = vi.fn(async () => ({ stdout: 'ok', stderr: 'err' }));
     const cp = Object.fromEntries(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].map(name => [name, vi.fn(() => 'child')]));
@@ -84,6 +129,8 @@ describe('shadow dependency tracer', () => {
     tracer.install();
     await expect(promisify(cp.execFile)('node', ['-e', '1'])).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
     expect(custom.mock.calls[0][2].env.WE_TRACE_TEST).toBe(test);
+    await expect(promisify(cp.execFile)('node', undefined, { cwd: '/', encoding: 'utf8' })).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
+    expect(custom.mock.calls[1]).toEqual(['node', [], expect.objectContaining({ cwd: '/', encoding: 'utf8', env: expect.any(Object) })]);
   });
   it('records fs/promises reads and lists', async () => {
     const promises = { readFile: vi.fn(async () => 'x'), readdir: vi.fn(async () => []) };
