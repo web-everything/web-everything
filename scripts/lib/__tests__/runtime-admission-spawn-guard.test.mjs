@@ -278,6 +278,7 @@ const processInventory = [
   {"file": "scripts/operations/dispatch-providers/prepare-decision.mjs", "status": "gated", "reason": "Launches admitted prepare-decision delivery work through the detached spawner."},
   {"file": "scripts/operations/dispatch-providers/probation-worker.mjs", "status": "gated", "reason": "Launches admitted probation-worker delivery work through the detached spawner."},
   { file: 'scripts/lib/gh-app-shim.mjs', status: 'readonly', reason: 'Generates credential and throttle shims; no delivery launch owner.' },
+  { file: 'scripts/lib/daemon-rebuild/overlay-prune.mjs', status: 'readonly', reason: 'Reads the clone origin URL with git for stale-overlay detection; no removal and no delivery launch.' },
   {"file": "scripts/backlog-stranded-sweep.mjs", "status": "readonly", "reason": "Reads backlog Git history and merged PR evidence."},
   {"file": "scripts/bootstrap-session.mjs", "status": "readonly", "reason": "Bootstraps checkout dependencies; no delivery dispatch."},
   {"file": "scripts/ci-card-only.mjs", "status": "readonly", "reason": "Reads CI diff evidence to classify card-only changes."},
