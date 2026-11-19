@@ -275,7 +275,7 @@ describe('runCli wiring', () => {
   });
   it('runCli routes its context read and its ci-lifecycle writes through those two seams', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    const run = src.slice(src.indexOf('async function runCli('));
+    const run = src.slice(src.indexOf('async function main('));
     const seam = run.indexOf('await repollThenCollectContext({');
     expect(seam).toBeGreaterThan(0);
     const trigger = run.indexOf('await triggerMergeabilityRecompute({', seam);

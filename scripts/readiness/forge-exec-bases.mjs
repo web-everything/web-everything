@@ -335,7 +335,11 @@ def descend(parent, values, create=False):
             if create:
                 try: os.mkdir(name, 0o755, dir_fd=fd)
                 except FileExistsError: pass
-            child = os.open(name, flags, dir_fd=fd)
+            try: child = os.open(name, flags, dir_fd=fd)
+            except PermissionError:
+                # Traverse-only ancestors (mode 0710) cannot be opened for reading; O_PATH needs no read bit.
+                if not hasattr(os, 'O_PATH'): raise
+                child = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
         return fd
