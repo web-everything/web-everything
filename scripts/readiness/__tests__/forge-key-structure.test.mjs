@@ -50,6 +50,17 @@ describe('Forge key structure slice 1',()=>{
     blocked(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[{r:'a',d:'b',t:'c'}]}).replace('[','/* x */[')));
     expect(keyStructureFinding(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[]})))).toBeFalsy();
   });
+  it('blocks a JWK after stray double quotes or an unclosed string (red-team #7076)',()=>{
+    const jwk=JSON.stringify({kty:'oct',k:'abcdefghijklm'+'n'});
+    const quote='"';
+    for(const lead of [quote+' ',quote+' a '+quote+' b '+quote+' ','say '+quote+'hello '+quote+'x '+quote+'y\n','an unclosed '+quote+'string, '])
+      blocked(Buffer.from(lead+jwk));
+    expect(keyStructureFinding(Buffer.from('prose with a '+quote+' and {not json} only'))).toBeFalsy();
+    // key name spelled with a JSON escape, and an object longer than the per-candidate bound (fails closed, never skipped)
+    blocked(Buffer.from(quote+' '+jwk.replace('kty','k\\u0074y')));
+    const long=JSON.stringify({kty:'oct',k:'abcdefghijklm'+'n',pad:'x'.repeat(66000)});
+    expect(keyStructureFinding(Buffer.from(quote+' '+long))).toBeTruthy();
+  });
   it('I1 decode once then detect (mixed alphabets, comments in byte arrays, hex, PEM)',()=>{
     for(const bytes of keys)for(const encode of Object.values(views))blocked(Buffer.from(encode(bytes)));
   });
