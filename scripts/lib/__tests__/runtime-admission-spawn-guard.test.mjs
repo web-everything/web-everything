@@ -373,7 +373,6 @@ const processInventory = [
   {"file": "scripts/lib/lane-salvage.mjs", "status": "readonly", "reason": "Salvages an existing lane via Git."},
   {"file": "scripts/lib/lane-verify.mjs", "status": "readonly", "reason": "Reads CI runs for existing lane verification."},
   {"file": "scripts/lib/main-staleness.mjs", "status": "readonly", "reason": "Reads main staleness and reexecutes operator CLIs."},
-  {"file": "scripts/lib/memory-available.mjs", "status": "readonly", "reason": "Reads host memory availability."},
   {"file": "scripts/lib/merge-queue-adaptive-batching.mjs", "status": "readonly", "reason": "Reads merge queue batch evidence."},
   {"file": "scripts/lib/merge-queue-affected.mjs", "status": "readonly", "reason": "Reads changed paths for merge selection."},
   {"file": "scripts/lib/merge-queue-enqueue.mjs", "status": "readonly", "reason": "Reads workflow runs for merge admission."},
@@ -512,6 +511,12 @@ it('rejects a newly imported unlisted child_process module in a temporary tree',
     const file = 'nested/new-worker.mjs';
     expect(inventoryErrors(tree, ['entry.mjs'], [{ file, status: 'gated', reason: 'Delivery launch.' }]))
       .toEqual([expect.stringContaining('unguarded launch:')]);
+    // A process module can remain on disk after a helper split removes its import edge.
+    writeFileSync(join(tree, 'nested/reexport.mjs'), 'export const pureHelper = true;');
+    expect(inventoryErrors(tree, ['entry.mjs'], [{ file, status: 'readonly', reason: 'Removed import.' }]))
+      .toEqual([`stale process module: ${file}`]);
+    expect(inventoryErrors(tree, ['entry.mjs'], [])).toEqual([]);
+    writeFileSync(join(tree, 'nested/reexport.mjs'), "import './new-worker.mjs';");
     writeFileSync(join(tree, file), 'export const noProcess = true;');
     expect(inventoryErrors(tree, ['entry.mjs'], [{ file, status: 'readonly', reason: 'Removed read.' }]))
       .toEqual([`stale process module: ${file}`]);
