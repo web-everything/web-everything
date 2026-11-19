@@ -272,7 +272,12 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   }
   // Token and whitespace-wrapped runs share ONE base64 decoder. Node accepts + / - _ together.
   let run='',end=-1;
+  const decodedRuns=new Set();
   const decode=value=>{
+    // Repeated prose runs yield identical candidates in every phase. Keep this
+    // cache bounded; once full, uncached runs still take the complete path.
+    if(decodedRuns.has(value))return;
+    if(decodedRuns.size<LIMITS.candidates)decodedRuns.add(value);
     // Prose can change quartet alignment or add padding before the material.
     // Decode each padding-delimited segment at all four phases; the byte walker
     // finds embedded structures. Every candidate still shares the global budgets.
@@ -327,13 +332,13 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
 
 // A negative result proves none of the pipeline's entry representations are present,
 // including non-key candidates that could consume the shared scan budgets.
-// In particular, base64 chunks of ONE character may join across whitespace. Do not
+// In particular, base64 chunks of ONE character may join across punctuation too. Do not
 // require a long individual token or a particular alphabet/prefix. High bytes go
 // to the full scan (they may be Unicode whitespace); NUL covers UTF-16 decoding.
 // Colon admits the canonicalizer's (?:[\da-f]{2}:)+[\da-f]{2} hex entry pattern.
 export function keyStructurePrecheck(buffer) {
   if(!Buffer.isBuffer(buffer)||buffer.length>PRECHECK_SAFE_BYTES)return true;
-  let run=0,hexRun=0;
+  let alphabet=0,hexRun=0;
   for(const byte of buffer) {
     // Slash covers comment emissions; even a two-character hex token can emit
     // a candidate. Reject non-ASCII here so byte and token bounds coincide.
@@ -343,8 +348,8 @@ export function keyStructurePrecheck(buffer) {
     } else hexRun=0;
     if((byte>=65&&byte<=90)||(byte>=97&&byte<=122)||(byte>=48&&byte<=57)
       ||[43,45,47,61,95].includes(byte)) {
-      if(++run>=8)return true;
-    } else if(byte<128&&![9,10,11,12,13,32].includes(byte))run=0;
+      if(++alphabet>=8)return true;
+    }
   }
   // No emissions means only the root candidate's bytes are charged, candidate
   // and decode depths cannot grow, and only disjoint closing-container/base64
