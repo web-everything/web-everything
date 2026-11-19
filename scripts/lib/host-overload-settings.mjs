@@ -18,6 +18,8 @@ export function boundedText(path, maxBytes = 256 * 1024) {
   } finally { closeSync(fd); }
 }
 export const DEFAULT_PREFS_MAX_BYTES = 2 * 1024 * 1024;
+/** Ceiling for the configurable limit: the read allocates its limit up front, so it must stay small. */
+export const MAX_PREFS_MAX_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_HOST_MAX_WAIT_MS = 15 * 60 * 1000;
 export const DEFAULT_MIN_MEMORY_HEADROOM_MB = 2048;
 export const DEFAULT_SNAPSHOT_MAX_FRESH_MS = 20000;
@@ -94,7 +96,7 @@ export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = pr
 }
 export function loadHostOverloadSettings({ env = process.env, log = (s) => process.stderr.write(`${s}\n`), prefsMaxBytes = DEFAULT_PREFS_MAX_BYTES, toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/host-overload.json') } = {}) {
   const limit = env.WE_HOST_OVERLOAD_PREFS_MAX_BYTES === undefined ? prefsMaxBytes : Number(env.WE_HOST_OVERLOAD_PREFS_MAX_BYTES);
-  if (!Number.isSafeInteger(limit) || limit <= 0) throw Error('host-overload invalid WE_HOST_OVERLOAD_PREFS_MAX_BYTES');
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit > MAX_PREFS_MAX_BYTES) throw Error('host-overload invalid WE_HOST_OVERLOAD_PREFS_MAX_BYTES');
   log(`policy-cascade · host-overload: prefsMaxBytes=${limit} (${env.WE_HOST_OVERLOAD_PREFS_MAX_BYTES === undefined ? (prefsMaxBytes === DEFAULT_PREFS_MAX_BYTES ? 'standard' : 'setting') : 'env'})`);
   const readPrefs = (path) => {
     try { return boundedText(path, limit); }
