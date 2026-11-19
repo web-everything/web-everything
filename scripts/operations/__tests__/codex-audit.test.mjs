@@ -76,7 +76,7 @@ describe('canonical audit', () => {
     expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main', ref: null, mode: 'full',
       questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`${CANONICAL_QUESTION}\n\n${EXHAUSTIVE_INSTRUCTION}`);
-    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`Review this exact resolved range: git diff --no-ext-diff --no-textconv --ignore-submodules=none --text ${BASE}...${HEAD}`);
     expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
     expect(f.deps.appendRecord.mock.invocationCallOrder[0]).toBeGreaterThan(f.deps.runCodex.mock.invocationCallOrder[0]);
   });

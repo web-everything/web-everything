@@ -20,6 +20,7 @@ function fixture(answer = `NOT WEAKENED\nFIXED: ${finding}`) {
     refsPointingAt: vi.fn(() => [REF]), recordPath: () => 'audits.jsonl', convergeRecordPath: () => 'audits-converge.jsonl',
     readRecords: vi.fn(path => path === 'audits.jsonl' ? full : converge),
     isAncestor: vi.fn((a, b) => a <= b),
+    isShallow: vi.fn(() => false), remoteMainSha: vi.fn(() => BASE), hasCommit: vi.fn(() => true),
     runCodex: vi.fn(() => answer), fingerprint: vi.fn(() => 'e'.repeat(64)),
     appendRecord: vi.fn((record, path) => (path === 'audits-converge.jsonl' ? converge : full).push(record)),
     now: () => AT, stdout: text => out.push(text), stderr: text => err.push(text),
@@ -35,7 +36,7 @@ describe('R1081 converge rounds', () => {
     expect(CONVERGE_QUESTION_HASH).toBe(createHash('sha256').update(CONVERGE_QUESTION).digest('hex'));
     expect(CONVERGE_QUESTION_HASH).not.toBe(QUESTION_HASH);
     const prompt = f.deps.runCodex.mock.calls[0][0];
-    expect(prompt).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${PRIOR} ${HEAD}\n`);
+    expect(prompt).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${PRIOR} ${HEAD}\n`);
     expect(prompt).not.toContain(`git diff ${BASE}...${HEAD}`);
     expect(prompt).not.toContain('Judge the WHOLE diff');
     expect(prompt).toContain(`full audit ${original.at} on ${PRIOR}`);
@@ -114,7 +115,7 @@ describe('R1081 converge rounds', () => {
     expect(f.deps.runCodex).not.toHaveBeenCalled();
   });
 
-  it.each(['readRecords', 'isAncestor'])('fails closed on unreadable %s evidence', async key => {
+  it.each(['readRecords', 'isAncestor', 'isShallow', 'remoteMainSha'])('fails closed on unreadable %s evidence', async key => {
     const f = fixture(); f.deps[key].mockImplementation(() => { throw new Error('unreadable'); });
     expect(await main(ARGS, f.deps)).toBe(3);
     expect(f.err.join('')).toContain('human review of the full diff');
@@ -180,6 +181,7 @@ describe('R1081 converge rounds', () => {
       at: '2026-11-17T12:00:00Z', findings: ['latest:1 gap', 'latest:1 gap'] };
     f.full.push(latest);
     f.deps.resolveSha.mockImplementation(ref => ref === 'origin/main' ? narrowBase : ref);
+    f.deps.remoteMainSha.mockReturnValue(narrowBase);
     // Disposing only the latest audit's finding must fail closed.
     f.deps.runCodex.mockReturnValue('NOT WEAKENED\nFIXED: latest:1 gap');
     expect(await main(ARGS, f.deps)).toBe(3);
@@ -188,7 +190,7 @@ describe('R1081 converge rounds', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.converge[0].priorHead).toBe(anchorHead);
     const prompt = f.deps.runCodex.mock.calls[1][0];
-    expect(prompt).toContain(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${anchorHead} ${HEAD}`);
+    expect(prompt).toContain(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${anchorHead} ${HEAD}`);
     const fenced = prompt.split('<findings>\n')[1].split('\n</findings>')[0];
     for (const record of [original, latest]) {
       expect(fenced).toContain(`full audit ${record.at} on ${record.head}:`);
@@ -260,22 +262,54 @@ describe('R1081 converge rounds', () => {
     expect(f.deps.appendRecord).not.toHaveBeenCalled();
   });
 
-  it.each([undefined, 'bad', new Error('missing main')])('refuses unreadable or unresolved origin/main %s', async mainSha => {
+  it.each([undefined, 'bad', new Error('ls-remote failed')])('fails closed on unavailable remote main %s', async mainSha => {
     const f = fixture();
-    f.deps.resolveSha.mockImplementation(ref => {
-      if (ref !== 'origin/main') return ref;
+    f.deps.remoteMainSha.mockImplementation(() => {
       if (mainSha instanceof Error) throw mainSha;
       return mainSha;
     });
-    expect(await main([`--base=${BASE}`, ...ARGS.slice(1)], f.deps)).toBe(2);
-    expect(f.err.join('')).toContain('run a full audit');
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.err.join('')).toContain('human review of the full diff');
     expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it('refuses shallow history before any ancestry check', async () => {
+    const f = fixture(); f.deps.isShallow.mockReturnValue(true);
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('fetch origin first');
+    expect(f.deps.isAncestor).not.toHaveBeenCalled();
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([false, new Error('missing object')])('requires the remote main commit locally: %s', async result => {
+    const f = fixture(); f.deps.hasCommit.mockImplementation(() => {
+      if (result instanceof Error) throw result;
+      return result;
+    });
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.deps.hasCommit).toHaveBeenCalledWith(BASE);
+    expect(f.err.join('')).toContain('fetch origin first');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it('uses remote main despite a local origin/main pointing at the branch head in discontinuous coverage', async () => {
+    const f = fixture(); const c = 'ab'.repeat(20), d = 'bc'.repeat(20);
+    f.full.push({ ...original, base: c, head: d });
+    f.deps.resolveSha.mockImplementation(ref => ref === 'origin/main' ? HEAD : ref);
+    expect(await main([`--base=${d}`, ...ARGS.slice(1)], f.deps)).toBe(2);
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(d, BASE);
+    expect(f.deps.remoteMainSha).toHaveBeenCalledOnce();
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
   });
 
   it('allows the base to advance to head without narrowing the unrestricted delta', async () => {
-    const f = fixture(); f.deps.resolveSha.mockReturnValue(HEAD);
+    const f = fixture(); f.deps.resolveSha.mockReturnValue(HEAD); f.deps.remoteMainSha.mockReturnValue(HEAD);
     expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${PRIOR} ${HEAD}\n`);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${PRIOR} ${HEAD}\n`);
   });
 
   it('declares converge and optional ref as operation inputs for the generic CLI', () => {
@@ -394,6 +428,32 @@ describe('converge IO boundaries', () => {
     expect(deps.readRecords('valid')).toEqual([original]);
   });
 
+  it('reads exactly one remote main line with bounded argv and checks local commit availability', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: `${BASE}\trefs/heads/main\n` }));
+    const deps = createAuditDeps({ spawnSync });
+    expect(deps.remoteMainSha()).toBe(BASE);
+    expect(spawnSync.mock.calls[0]).toEqual(['git', ['ls-remote', 'origin', 'refs/heads/main'], expect.objectContaining({ timeout: 30_000, maxBuffer: 8 * 1024 * 1024 })]);
+    expect(deps.hasCommit(BASE)).toBe(true);
+    expect(spawnSync.mock.calls.at(-1)[1]).toEqual(['--no-replace-objects', 'cat-file', '-e', `${BASE}^{commit}`]);
+    for (const stdout of ['', 'bad', `${BASE}\trefs/heads/main\n\n`, `${BASE}\trefs/heads/other\n`, `${BASE}\trefs/heads/main\n${BASE}\trefs/heads/main\n`, `${BASE}0\trefs/heads/main\n`]) {
+      spawnSync.mockReturnValue({ status: 0, stdout });
+      expect(() => deps.remoteMainSha()).toThrow();
+    }
+    spawnSync.mockReturnValue({ status: 1 });
+    expect(() => deps.remoteMainSha()).toThrow();
+    expect(() => deps.hasCommit(BASE)).toThrow();
+  });
+
+  it('rejects unknown shallow status and subprocess failures', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: 'true\n' }));
+    const deps = createAuditDeps({ spawnSync });
+    expect(deps.isShallow()).toBe(true);
+    expect(spawnSync.mock.calls[0][1]).toEqual(['rev-parse', '--is-shallow-repository']);
+    spawnSync.mockReturnValue({ status: 0, stdout: 'false\n' }); expect(deps.isShallow()).toBe(false);
+    spawnSync.mockReturnValue({ status: 0, stdout: '' }); expect(() => deps.isShallow()).toThrow();
+    spawnSync.mockReturnValue({ status: 128 }); expect(() => deps.isShallow()).toThrow();
+  });
+
   it('bounds git reads, uses argv, and distinguishes non-ancestry from IO failure', () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: `origin/${REF}\n` }));
     const deps = createAuditDeps({ spawnSync, cwd: '/repo' });
@@ -401,6 +461,8 @@ describe('converge IO boundaries', () => {
     expect(spawnSync.mock.calls[0][1]).toEqual(['for-each-ref', `--points-at=${HEAD}`, '--format=%(refname:short)', 'refs/remotes/origin/']);
     spawnSync.mockReturnValue({ status: 1 }); expect(deps.isAncestor(PRIOR, HEAD)).toBe(false);
     spawnSync.mockReturnValue({ status: 0 }); expect(deps.isAncestor(PRIOR, HEAD)).toBe(true);
+    expect(spawnSync.mock.calls.at(-1)[1]).toEqual(['--no-replace-objects', 'merge-base', '--is-ancestor', PRIOR, HEAD]);
+    expect(spawnSync.mock.calls.at(-1)[2].env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: expect.stringContaining('no-grafts') });
     spawnSync.mockReturnValue({ status: 128 }); expect(() => deps.isAncestor(PRIOR, HEAD)).toThrow();
     spawnSync.mockReturnValue({ status: null, error: new Error('maxBuffer exceeded') });
     expect(() => deps.isAncestor(PRIOR, HEAD)).toThrow();

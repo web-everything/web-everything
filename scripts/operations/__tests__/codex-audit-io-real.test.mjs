@@ -1,7 +1,7 @@
 /** @file Real Git resolution and filesystem persistence for audit IO. */
 import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
@@ -35,6 +35,9 @@ describe('codex-audit real IO', () => {
       const current = head();
       git(['update-ref', 'refs/remotes/origin/lane/audit', current]);
       git(['update-ref', 'refs/remotes/origin/main', current]);
+      git(['remote', 'add', 'origin', repo]);
+      git(['config', 'core.bigFileThreshold', '1']);
+      writeFileSync(join(repo, '.git/info/attributes'), '* binary\n');
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
       expect(deps.refsPointingAt(current)).toContain('lane/audit');
       expect(deps.isAncestor(prior, current)).toBe(true);
@@ -47,7 +50,7 @@ describe('codex-audit real IO', () => {
         now: () => '2026-11-18T00:00:00Z', appendRecord: () => {}, stdout: () => {}, stderr: () => {},
         runCodex: prompt => {
           const command = prompt.split('\n').find(line => line.startsWith('git diff '));
-          expect(command).toBe(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${prior} ${current}`);
+          expect(command).toBe(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${prior} ${current}`);
           const delta = String(git(command.split(' ').slice(1)));
           expect(delta).toContain('<material>.mjs');
           expect(delta).toContain('-improved guard');
@@ -75,6 +78,8 @@ describe('codex-audit real IO', () => {
       commit({ 'other.txt': 'other\n' });
       const unrelated = head();
       git(['update-ref', 'refs/remotes/origin/main', base]);
+      git(['update-ref', 'refs/heads/main', base]);
+      git(['remote', 'add', 'origin', repo]);
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
       const errors = [];
       const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
@@ -90,7 +95,7 @@ describe('codex-audit real IO', () => {
     });
   });
 
-  it('refuses real Git B→A then C→D audits that leave A→C uncovered', async () => {
+  it('refuses real Git B→A then C→D despite local origin/main at branch head', async () => {
     await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
       const b = head();
       git(['update-ref', 'refs/remotes/origin/main', b]);
@@ -102,6 +107,10 @@ describe('codex-audit real IO', () => {
       const d = head();
       commit({ 'h.txt': 'delta\n' });
       const h = head();
+      git(['checkout', '--quiet', '--detach', h]);
+      git(['update-ref', 'refs/heads/main', b]);
+      git(['update-ref', 'refs/remotes/origin/main', h]);
+      git(['remote', 'add', 'origin', repo]);
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
       const errors = [];
       let reviews = 0;
@@ -117,6 +126,27 @@ describe('codex-audit real IO', () => {
       expect(await main([`--base=${d}`, `--head=${h}`, '--ref=lane/audit', '--converge'], overrides)).toBe(2);
       expect(reviews).toBe(0);
       expect(errors).toEqual(Array(2).fill('converge needs a main-line base covered by the last full audit; run a full audit\n'));
+    });
+  });
+
+  it('ignores replace refs and grafts that fake ancestry in real Git', async () => {
+    await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
+      const base = head();
+      commit({ 'prior.txt': 'prior\n' }); const prior = head();
+      git(['checkout', '--quiet', '--detach', base]);
+      commit({ 'other.txt': 'other\n' }); const other = head();
+      const deps = createAuditDeps({ cwd: repo, scratchRoot: tmp });
+      expect(deps.isAncestor(prior, other)).toBe(false);
+      git(['replace', '--graft', other, prior]);
+      expect(spawnSync('git', ['merge-base', '--is-ancestor', prior, other], { cwd: repo }).status).toBe(0);
+      expect(deps.isAncestor(prior, other)).toBe(false);
+      git(['replace', '-d', other]);
+      writeFileSync(join(repo, '.git/info/grafts'), `${other} ${prior}\n`);
+      expect(spawnSync('git', ['merge-base', '--is-ancestor', prior, other], { cwd: repo }).status).toBe(0);
+      expect(deps.isAncestor(prior, other)).toBe(false);
+      expect(deps.isShallow()).toBe(false);
+      writeFileSync(join(repo, '.git/shallow'), `${other}\n`);
+      expect(deps.isShallow()).toBe(true);
     });
   });
 

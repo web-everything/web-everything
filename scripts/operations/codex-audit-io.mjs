@@ -73,10 +73,35 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     },
     refsPointingAt: head => run('git', ['for-each-ref', `--points-at=${head}`, '--format=%(refname:short)', 'refs/remotes/origin/'], 30_000)
       .split(/\r?\n/).filter(Boolean).map(ref => ref.replace(/^origin\//, '')),
+    isShallow() {
+      const value = run('git', ['rev-parse', '--is-shallow-repository'], 30_000).trim();
+      if (!['true', 'false'].includes(value)) throw new Error('audit shallow status unavailable');
+      return value === 'true';
+    },
+    remoteMainSha() {
+      const output = run('git', ['ls-remote', 'origin', 'refs/heads/main'], 30_000);
+      const match = /^([0-9a-f]{40})\trefs\/heads\/main\r?\n?$/.exec(output);
+      if (!match || match[0] !== output) throw new Error('audit remote main unavailable');
+      return match[1];
+    },
+    hasCommit(sha) {
+      run('git', ['--no-replace-objects', 'cat-file', '-e', `${sha}^{commit}`], 30_000,
+        { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' });
+      return true;
+    },
     isAncestor(prior, head) {
-      const result = spawnSync('git', ['merge-base', '--is-ancestor', prior, head], { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000 });
-      if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
-      return result.status === 0;
+      // A fresh directory guarantees this graft path does not exist, regardless of repo config.
+      const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-history-'));
+      try {
+        const result = spawnSync('git', ['--no-replace-objects', 'merge-base', '--is-ancestor', prior, head], {
+          cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+          env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: join(scratch, 'no-grafts') },
+        });
+        if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
+        return result.status === 0;
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
     },
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),

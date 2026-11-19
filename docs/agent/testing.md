@@ -4822,16 +4822,21 @@ fails closed with exit 3; malformed evidence requires retry or human review of t
 An unreadable candidate head also fails closed rather than silently excluding its findings.
 Missing anchors, exact-head anchors, no ancestral heads and empty full audits (`base === head`,
 including older union members) require a full audit (exit 2). Independently require
-`isAncestor(record.base, record.head)` for every used record (exit 2 on false). Resolve
-`origin/main` and require `isAncestor(anchor.base, base)`, `isAncestor(base, originMain)`
-and `isAncestor(anchor.head, head)`. Unresolved main or failed coverage checks exit 2 with
+`isAncestor(record.base, record.head)` for every used record (exit 2 on false). Before any
+ancestry check, reject shallow repositories (exit 2; fetch origin first to unshallow).
+Ancestry disables replace objects and points `GIT_GRAFT_FILE` at a nonexistent scratch path.
+Read main via `git ls-remote origin refs/heads/main`, accepting exactly one 40-hex main line
+(failure or malformed output exits 3). Require that commit locally with `git cat-file -e`
+(exit 2, "fetch origin first"); never trust local `origin/main` for coverage. Require
+`isAncestor(anchor.base, base)`, `isAncestor(base, mainLine)` and
+`isAncestor(anchor.head, head)`. Failed coverage checks exit 2 with
 "converge needs a main-line base covered by the last full audit; run a full audit".
 The anchor's full `anchor.base...anchor.head` review and the `anchor.head..head` delta
 cover all branch-only changes of `base...head` when the requested base is on main and
 covered by the anchor base. Stacked branches whose base is off main use full audits;
 selecting a later anchor alone cannot bridge a gap between B→A and C→D audits.
 
-Every round reviews the unrestricted `git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames <anchor.head> <head>` and the
+Every round reviews the unrestricted `git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text <anchor.head> <head>` and the
 exact-text deduplicated union of every used record's findings, including previously FIXED
 findings. An older broad audit's findings survive a later audit with a narrower base and
 fewer findings. Cite each source record's timestamp and head inside the untrusted findings
@@ -4844,9 +4849,11 @@ Keep these paths covered in `codex-audit-converge.test.mjs`; real Git regression
 `codex-audit-io-real.test.mjs` cover forward/backward bases, reverted guards, renames and
 `<material>.mjs` remaining in scope even when the requested base advances to head on main.
 Named regressions refuse discontinuous B→A then C→D coverage, off-main requested bases,
-empty anchors and older union records, and unresolved main; delta assertions pin all four flags.
+empty anchors and older union records, shallow history, missing local main and failed remote reads.
+Delta assertions pin all five flags; real Git probes cover binary attributes, replace refs and grafts.
 External diff drivers, text conversion and submodule-ignore settings cannot narrow the delta.
-The canonical question hash stays stable: exhaustive full-pass instructions live outside its text.
+Full prompts name `git diff --no-ext-diff --no-textconv --ignore-submodules=none --text <base>...<head>`.
+The canonical question hash stays stable: hardened full-pass instructions live outside its text.
 
 Canonical audit lookup rejects non-full positive records even with the current question hash,
 while current-question negative records still block prior-hash fallback regardless of mode.
