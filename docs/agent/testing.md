@@ -4042,6 +4042,15 @@ review loop with in-memory runs, ledger IO and effect sinks. It replays an accep
 a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
 broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
 
+## Review label body-file checkout regression
+
+Keep staging `root` separate from the label child's `cwd`: `--cwd` reaches the sinks through
+`resolveOperation`. Test checkout A staging against checkout B's `bodyFileRoots`, with a separate
+temp root so a host-temp fixture cannot hide the mismatch. The `review-label-body-child-cwd`
+soak break probes the real sink to decide fix presence and checks private-copy cleanup. Its replay
+and the unit regression inject hermetic IO via `resolveOperation`'s `sinkFactory`; only the
+operation builder supplies `cwd`, so removing that forwarding must fail their existing assertions.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
@@ -4290,8 +4299,18 @@ so a crashed re-review cannot hold a PR forever. A run waiting on a pending step
 abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
 Unreadable records still throw, never skip.
 
-The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
-test `settings-files`; use heavy admission.
+Review discovery first tries the bounded `<runs-dir-name>-review-index.json` sidecar beside the
+resolved runs directory. The run-store writer updates it fail-soft under a file lock; drain's complete
+open-PR context advances persisted per-id verification (50 review records total per tick). Partial
+backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
+unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
+`scan-capped` still holds. Indexed payload read attempts and the fallback share one
+`runs.scan.maxParses` budget, including failed reads; cached indexed payloads count once.
+Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
+overflow becomes an empty sentinel, forcing fallback instead of silently discarding a review.
+On a persistent backfill error or overflow, inspect omitted records manually; the index cannot clear
+unknown evidence. The scoped regressions are `review-run-index`, `drain-red-team-evidence`,
+`stream-filter-runs`, and the settings layout test `settings-files`; use heavy admission.
 
 
 ## Refused referral reviews re-read standing rulings
@@ -4756,6 +4775,30 @@ Keep binary health/cache under the evidence directory's `binary/` subfolder; roo
 Register binary maintenance's exclusive lock in `LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`.
 The source scan in `scripts/operations/__tests__/audit-verdict.test.mjs` requires every lock holder
 to stay on the protected audit floor, so concurrency findings block publication.
+
+## Review index completeness proof
+
+Appending a review id is only a discovery hint. Trust requires a completed backfill's
+`completeThroughMtimeMs`, stat-only id/mtime/file-identity snapshot, rebuilt PR keys, and acknowledged
+create-only poison markers. Listing or open-set changes retain verified id/mtime/file-identity
+and ownership rows; requeue changed/new ids and drop removed ids. An unreadable or mismatched
+candidate aborts the batch without publishing completeness, persists verified progress, and
+records a blocking id with a 60-second retry cooldown. Other ids advance during cooldown;
+completeness remains unpublished until every blocking record is verified or removed. Failed appends poison the whole sidecar independently of its write lock; only a
+complete rebuild acknowledges those markers. Readers stat the current listing before parsing
+indexed ids. Unknown or rewritten unindexed ids require strict record identity verification
+(at most 20 reads, sharing the evidence scan budget); unrelated PR ownership permits the hit.
+Same-PR, unreadable or over-bound unknown evidence, missing watermarks, unreadable listings
+or new poison markers force the unchanged bounded fallback. File identity also detects atomic replacements with
+unchanged mtimes when marker creation fails. Even an older/coarse mtime cannot hide an unknown id.
+Oversized snapshots retain the bounded scan and its scan-capped
+HOLD; inspect omitted runs manually. Optional backfill side effects, including argument and
+directory resolution, must return the drain context unchanged on exceptions.
+For every bounded-read risk, the test plan must name a regression counting actual read attempts
+or asserting the read range, including the default shared budget across repositories. Inject a
+failure after a successful staged read to prove no partial completeness can be published.
+Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
+through heavy admission.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
@@ -4812,6 +4855,25 @@ planner together using a rollup with `detailsUrl` and no check id. Workflow prot
 head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
 step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
 negative cases, rather than matching planner source text.
+## Overlay main-sync interrupted test evidence
+
+A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
+report. Retry the same chunk once with a distinct report path; a second interruption fails closed
+with the structured cause ahead of the cleaned diagnostic tail and asks for operator review.
+Remote termination unconfirmed remains a skip, including on the retry. Ordinary test failures
+retain the failed-file flake reruns and plain-main comparison. The killed-run soak proves the retry
+by executing an injected killed-once, then green runner; its presence probe uses behavior, not source markers.
+Stop text in stderr cannot classify an ordinary exit (0 or 1) as interrupted. Retry an interrupted
+attempt only when neither stdout nor stderr (ANSI stripped) nor partial JSON contains red evidence.
+TAP `not ok`, Vitest `FAIL`/`×`/`✗`, positive failed summary counts, and failed JSON rows (including
+extra files and unnamed assertions) block immediately with the interruption cause, `attempts: 1`,
+and failing names preserved in the diagnostic tail. A green retry cannot erase an observed failure.
+Vitest's `Unhandled Errors`/`Unhandled Rejection` headers and `Errors N error(s)` summaries also
+block retry in either output stream. Only ENOENT at the initial report stat is absent evidence:
+an existing report that cannot be read, parsed or structurally validated, or exceeds 8 MiB, blocks
+the first attempt with the report failure in the diagnostic and an operator-review escalation.
+Keep ordinary flake rerun identity/count coverage checks unchanged. Run `overlay-main-sync-rerun.test.mjs`,
+`daemon-rebuild-overlay-main-sync.test.mjs`, and the killed-run soak through heavy admission.
 ## Owed CI rerun execution
 
 The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
