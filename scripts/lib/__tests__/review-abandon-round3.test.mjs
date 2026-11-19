@@ -126,10 +126,11 @@ it('an abandoned judge escalates exactly through the existing unfinished path if
   expect(escalate).toHaveBeenCalledOnce();
   expect(escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'review-abandoned' });
 });
-it('a newer same-head read after the tombstone prevents missing-dispatch escalation', () => {
+it('a newer same-head read suppresses missing-dispatch escalation only within its stuck window', () => {
   record(); sweep();
   record({ id: 'review-pr-replacement', stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now + minute).toISOString() }] });
-  expect(signal({ now: now + 31 * minute })).toMatchObject({ awaitingFreshReview: true, escalate: false });
+  expect(signal({ now: now + 30 * minute })).toMatchObject({ awaitingFreshReview: true, escalate: false });
+  expect(signal({ now: now + 31 * minute })).toMatchObject({ awaitingFreshReview: true, escalate: true });
 });
 it.each(['older', 'other-head'])('%s review cannot hide an overdue replacement', kind => {
   record(); sweep();
@@ -220,4 +221,43 @@ it('a replacement that is later abandoned gets its own deadline instead of inher
   markRunAbandoned({ id: replacement, dir, now: now + 20 * minute, reason: 'judge stuck', probes: {}, by: 'fixture' });
   expect(signal({ now: now + 31 * minute }).escalate).toBe(false);
   expect(signal({ now: now + 50 * minute }).escalate).toBe(true);
+});
+
+
+it.each(['pending confirm', 'no verdict', 'open effect'])('%s replacement escalates when quiet past the stuck window, but not while active', kind => {
+  record({}, 2 * 24 * 60 * minute);
+  markRunAbandoned({ id, dir, now: now - 24 * 60 * minute, reason: 'stuck review', probes: {}, by: 'fixture' });
+  const replacement = 'review-pr-quiet-replacement';
+  record({ id: replacement,
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - 40 * minute).toISOString() }],
+    pending: kind === 'pending confirm' ? { kind: 'confirm', step: 'confirm', stepIndex: 9 } : null,
+    verdict: kind === 'no verdict' ? null : { verdict: 'accept' },
+    effects: kind === 'open effect' ? [effect({ to: 'accepted', addLabel: 'review:accepted' })] : [],
+  });
+  utimesSync(runPath(replacement, dir), (now - 29 * minute) / 1000, (now - 29 * minute) / 1000);
+  expect(signal()).toMatchObject({ awaitingFreshReview: true, escalate: false });
+  const active = recovery();
+  expect(active.row.escalate).toBe(false); expect(active.escalate).not.toHaveBeenCalled();
+  utimesSync(runPath(replacement, dir), (now - 31 * minute) / 1000, (now - 31 * minute) / 1000);
+  expect(signal()).toMatchObject({ awaitingFreshReview: true, escalate: true,
+    escalationContext: expect.stringContaining('replacement review is unfinished') });
+  const stalled = recovery();
+  expect(stalled.row).toMatchObject({ action: 'skip', why: 'review-abandoned', escalate: true });
+  expect(stalled.escalate).toHaveBeenCalledOnce();
+  expect(stalled.escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'review-abandoned' });
+});
+
+it('completed replacement discharges abandonment even after a long quiet period', () => {
+  record(); sweep();
+  record({ id: 'review-pr-completed-replacement', pending: null, verdict: { verdict: 'accept' }, effects: [],
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now + minute).toISOString() }] });
+  expect(signal({ now: now + 24 * 60 * minute })).toMatchObject({ awaitingFreshReview: true, escalate: false });
+});
+
+it('replacement activity metadata fails closed with operator escalation', () => {
+  record(); sweep();
+  record({ id: 'review-pr-unreadable-activity',
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now + minute).toISOString() }] });
+  expect(signal({ now: now + 2 * minute, stat: () => { throw Error('activity metadata unreadable'); } }))
+    .toMatchObject({ escalate: true, escalationContext: expect.stringContaining('inspect') });
 });

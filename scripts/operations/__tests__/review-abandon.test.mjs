@@ -268,7 +268,7 @@ it('planner ignores abandoned parked runs, including cached/injected evidence, a
   const parked = { ...rows[0], retryableRecordEffect: true };
   expect(findResumableParkedRun(pr, [parked], { repo, runsDir: dir })?.id).toBe(r.id);
   op(['--apply']);
-  expect(readReviewRunEvidence({ dir, persist: false })).toEqual([]);
+  expect(readReviewRunEvidence({ dir, persist: false }).map(r => r.id)).toEqual([r.id]); // abandonment retains the spent retry
   expect(findResumableParkedRun(pr, [parked], { repo, runsDir: dir })).toBeNull();
   expect(defaultFindResumableRun({ repo, pr: 7109 }, { env, readPr: () => pr, readRuns: () => [parked] })).toBeNull();
   r.findings.progress = true; writeRun(r, dir);

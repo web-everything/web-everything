@@ -4820,16 +4820,20 @@ non-confirm pending step uses `reviewRunReaper.abandonStuckJudgeAfterMinutes` (d
 `WE_REAP_DEAD_REVIEW_RUNS_STUCK_JUDGE_AFTER_MINUTES` overrides it), through the same logged
 standard/platform/tool/environment cascade. An explicit `thresholdMs` overrides every horizon.
 Confirm, mandatory-referral, resumed and rejecting-verdict continuations stay kept. Abandonment
-never reconciles unknown effects: planners exclude the unchanged tombstoned record so a new panel
-starts. Gates return `review-abandoned` until a completed same-head panel's read starts strictly after
-the tombstone's `at` (including legacy sidecars); earlier acceptance and result comments cannot discharge it.
+never reconciles unknown effects: unfinished holds and resumption exclude the unchanged tombstoned record
+so a new panel can start. Shared attempt history retains it for same-head retry, cooldown and exhaustion
+accounting; abandonment never refunds an attempt. Gates return `review-abandoned` until a completed
+same-head panel's read starts strictly after the tombstone's `at` (including legacy sidecars); earlier acceptance and result comments cannot discharge it.
 Runs without a pending cursor or active effect retain the configured `abandonAfterHours` horizon.
 Historical tombstones on rejecting
 or unrecognised verdicts, operator `findings.confirm` rejections, and declared/pending/in-flight
 send-back effect payloads retain their original holds through the shared `hasRejectingReviewVerdict` predicate. The queue treats `review-abandoned` as a
 non-runnable wait carrying `awaitingFreshReview: true`. It pages no human initially; after the
 same stuck deadline from the tombstone, absence of a newer same-head read start escalates through
-the existing unfinished-review path. Missing, unreadable or over-400-record replacement evidence
+the existing unfinished-review path. A newer unfinished replacement (including pending confirmation,
+missing verdict or open effects) suppresses escalation only while its read start or last record write
+is within its stuck deadline. A completed replacement discharges it; a later tombstone owns a new
+deadline. Missing, unreadable or over-400-record replacement evidence
 escalates for operator inspection. Test cached readers and rewritten records as well as the operation; a record rewrite invalidates
 the tombstone. The `review-abandon-redo` soak detects the fix by running the operation and gate.
 

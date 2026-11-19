@@ -79,7 +79,7 @@ it.each(['new', 'legacy'])('%s tombstones hold gates and planners, including cac
   strayNames();
   expect(isRunAbandoned(id, dir)).toBe(true);
   for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) expect(gate(reader).reason).toBe('review-abandoned');
-  expect(readReviewRunEvidence({ dir, persist: false })).toEqual([]);
+  expect(readReviewRunEvidence({ dir, persist: false }).map(r => r.id)).toEqual([id]); // abandonment retains the spent retry
   // Attempts remain visible to the repeated-review alert even after abandonment.
   expect(readReviewRuns({ dir, now }).map(r => r.id)).toEqual([id]);
   expect(findResumableParkedRun(subject, [parked], { repo, runsDir: dir })).toBeNull();

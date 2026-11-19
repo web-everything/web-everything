@@ -197,7 +197,9 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = filterRunFileNames(names).filter(n => n.startsWith('review-pr-') && !isRunAbandoned(n.slice(0, -5), dir)).map(name => {
+  // Tombstoned attempts still spend same-head retries and cooldown releases. Selection of a
+  // live hold or resumable run excludes them separately; abandonment never refunds work.
+  const rows = filterRunFileNames(names).filter(n => n.startsWith('review-pr-')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
@@ -353,9 +355,13 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
  */
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
-  cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
+  cardReadable = ref => referralCardReadable(ref, REPO_ROOT),
+  runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env) } = {}) {
   const attempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(attempts);
+  // A later abandoned attempt still consumes an older parked run's release. It cannot hold
+  // or resume itself, and must fall through to the full same-head budget, not revive that release.
+  if (last && isRunAbandoned(last.id, runsDir)) return { hold: null, released: null };
   const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
   // The referral step succeeded but publication is still owed. This release also keeps the same-head hold from
