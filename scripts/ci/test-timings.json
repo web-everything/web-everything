@@ -1962,7 +1962,10 @@
   "webcases/__tests__/requirementValidator.test.ts": 0.01,
   "webtraits/__tests__/intentProfileResolver.test.ts": 0.01,
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
-  "wrapper-conformance/__tests__/runner.test.ts": 0.01
+  "wrapper-conformance/__tests__/runner.test.ts": 0.01,
+  "scripts/lib/__tests__/daemon-rebuild-early-launch.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-early-timing.test.mjs": 1,
+  "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
@@ -2296,6 +2299,8 @@
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
-  "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1
  }
 }

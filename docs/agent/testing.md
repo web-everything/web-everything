@@ -4880,6 +4880,12 @@ sequentially. Keep fake executable PATH setup in `beforeAll` and all large-outpu
 assertions inside the original per-test deadlines; increasing the setup timeout does not resolve the import stall.
 ## Ready-candidate adoption during overlay churn
 
+`rebuildClone` keeps phase waits in a non-enumerable `timing` record to preserve existing result
+equality. The rebuild CLI explicitly serializes it for detached jobs; `daemon-rebuild-early-timing.test.mjs`
+checks the legacy shape and runs the actual CLI subprocess to verify timing transfer into the job result.
+Do not reconstruct CLI serialization in the test: removing the producer's timing serialization must fail it.
+Adoption latency remains in adoption state.
+
 `daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
 refs and descendant advances remain pending after adoption, and the next adopt-only tick
 must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
@@ -5136,3 +5142,42 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## Between-tick rebuild launch probes
+
+`daemon-rebuild-early-launch.test.mjs` runs with Node's test runner and also registers with Vitest.
+Its hermetic `withSelfSync` probe drives the injected watcher timer between ticks, with real job-store
+queue tests and no Git/network children. `daemon-rebuild-early-timing.test.mjs` advances separate
+reader-lock, planning, smoke-slot and smoke clocks so planning/smoke time cannot masquerade as queue wait.
+The early-launch setting is off by default; `daemon-rebuild-settings.json` `earlyLaunch.entries`
+opts in an entry such as `health-watch.mjs`. `WE_DAEMON_REBUILD_EARLY_LAUNCH=0|1` overrides enablement;
+`WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS` overrides the trailing debounce. Missing or oversized event
+history defers to tick-start. The declared self-sync rebuild path must resolve to job mode;
+`WE_DAEMON_REBUILD_AS_JOB=0` or an inline setting prevents early launch. The watcher only queues a job; ready candidates still adopt at tick boundaries.
+`launchOnly` must run the shared adopt-only preparation with `readyOnly: true` before queuing, so sticky
+rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests__/rebuild-job.test.mjs`
+checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
+Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is empty state.
+The job fixture injects EACCES/EIO and corrupt JSON, asserting refusal without a queued job;
+the legacy fail-open reader remains unchanged for other consumers. Strict admission must precede
+preparation/adoption and reattachment: real preparation can overwrite corrupt state through that legacy
+reader. Assert the original state bytes survive refusal. Repair unreadable state before retrying.
+Job admission also strictly reads pending adoptions before job bookkeeping. Any `state-unreadable`
+refusal logs the repair requirement and skips pending-adoption notifications/rewrites, including at
+tick-start; the mixed overdue/malformed-record fixture asserts that the wrapper preserves file bytes.
+Only explicit `launchOnly: true`, `asJob: true` early/recovery launches outside adopt-only skip failure
+events and force-watch on refusal. Inline, adopt-only, tick-start and unknown launch sources retain
+force-watch health checks and rollback even when carrying `launchOnly: true`.
+Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
+regression cannot turn the protected behaviour into an expected failure.
+
+Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
+and the `rebuild-held-recovery` soak break. Environment timeout
+backoff lives on `state.held`, leaving candidate rejection semantics intact. Legacy holds
+without a deadline derive one from `updatedAt`/`since`; invalid timestamps stay held for
+operator repair. Recovery settings use the shared policy cascade and the detached job
+queue retains its in-flight guard before considering any recovery trigger.
+Recovery uses the existing rebuild minimum interval (including jitter), even after a ready-recorded
+job; a `still-rejected` adopt-only result never launches recovery. The overdue threshold must be
+at most 15 minutes (the default); settings may only shorten it, and oversized settings clamp
+to that maximum and log the originating policy layer. The unit fixture drives the real ready-only rebuild through a
+timeout and a later passing smoke on unchanged inputs; the soak fixture checks queueing only.

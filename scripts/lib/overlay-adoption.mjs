@@ -40,6 +40,21 @@ export function readPendingAdoptions(root, { env = process.env, fs = nodeFs } = 
   } catch { return []; }
 }
 
+/** Recovery admission: never discard malformed records or hide unreadable evidence. */
+export function readPendingAdoptionsStrict(root, { env = process.env, fs = nodeFs } = {}) {
+  let text;
+  try { text = fs.readFileSync(pendingAdoptionPath(root, env), 'utf8'); }
+  catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
+  const list = JSON.parse(text);
+  if (!Array.isArray(list) || !list.every(r => r && !Array.isArray(r)
+    && typeof r.ref === 'string' && r.ref.length > 0 && typeof r.sha === 'string' && FULL_SHA.test(r.sha)
+    && typeof r.at === 'string' && Number.isFinite(Date.parse(r.at))
+    && (r.overdueSent === undefined || typeof r.overdueSent === 'boolean'))) {
+    throw new Error('Invalid pending-adoptions evidence');
+  }
+  return list;
+}
+
 function writePending(root, env, fs, list) {
   const file = pendingAdoptionPath(root, env);
   if (!list.length) { fs.rmSync(file, { force: true }); return; }
