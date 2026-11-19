@@ -114,6 +114,9 @@ function isBetweenTickLaunch(options) {
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const strict = options.launchedBy === 'early' || options.launchedBy === 'recovery';
   if (!strict) return rebuildCloneWithReaders(emitEvent, options, false);
+  // Health checks and owed rollbacks precede strict evidence refusal, outside its
+  // reader scope so unrelated corrupt evidence cannot suppress watch maintenance.
+  await forceWatch(options, emitEvent, Date.now());
   const readers = createRebuildReaders({ strict, read: options.evidenceRead });
   return withRebuildReaders(readers, async () => {
     try {
@@ -166,7 +169,7 @@ async function rebuildCloneWithReaders(emitEvent, options, strict) {
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
-  await forceWatch(options, emitEvent, startedAtMs);
+  if (!strict) await forceWatch(options, emitEvent, startedAtMs);
   return result;
 }
 
