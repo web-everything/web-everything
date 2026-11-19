@@ -286,7 +286,8 @@ jobs:
           skip_args=()
           read -r -a skip_args <<< "$skip" || true
           first_exit=0
-          npm run test:coverage:shard -- --coverage.reportOnFailure=true --reporter=default --reporter=./scripts/ci/unit-json-reporter.mjs --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" "${skip_args[@]}" || first_exit=$?
+          mkdir -p coverage
+          WE_TEARDOWN_FAILURE_FILE="$PWD/coverage/teardown-failed-unit-${{ matrix.shard }}" npm run test:coverage:shard -- --coverage.reportOnFailure=true --reporter=default --reporter=./scripts/ci/unit-json-reporter.mjs --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" "${skip_args[@]}" || first_exit=$?
           if [ "$first_exit" -ne 0 ]; then
             node scripts/ci/rerun-failed-once.mjs --shard=${{ matrix.shard }} --mode=covered --first-exit="$first_exit" -- "${skip_args[@]}"
           fi
@@ -305,7 +306,8 @@ jobs:
           skip_args=()
           read -r -a skip_args <<< "$skip" || true
           first_exit=0
-          npm run test:unit -- --reporter=default --reporter=./scripts/ci/unit-json-reporter.mjs --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" "${skip_args[@]}" || first_exit=$?
+          mkdir -p coverage
+          WE_TEARDOWN_FAILURE_FILE="$PWD/coverage/teardown-failed-unit-${{ matrix.shard }}" npm run test:unit -- --reporter=default --reporter=./scripts/ci/unit-json-reporter.mjs --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" "${skip_args[@]}" || first_exit=$?
           if [ "$first_exit" -ne 0 ]; then
             node scripts/ci/rerun-failed-once.mjs --shard=${{ matrix.shard }} --mode=nocov --first-exit="$first_exit" -- "${skip_args[@]}"
           fi

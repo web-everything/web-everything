@@ -1,6 +1,7 @@
 // Run-scoped temp root for every vitest run — see scripts/lib/test-tmp-root.mjs for the leak it stops and
 // the WE_TMP_LEAK_* policy knobs. Runs in the main vitest process BEFORE workers spawn; vitest builds the
 // worker env from `process.env` at run time, so the TMPDIR set here reaches every worker and spawned child.
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -38,6 +39,12 @@ export default function setup() {
     }
     removeSharedDir(root);
     const verdict = finishRunTmpRoot({ root, policy: resolveTmpLeakPolicy() });
-    if (verdict.failed) process.exitCode = 1;
+    if (verdict.failed) {
+      process.exitCode = 1;
+      // CI's unit-shard retry (scripts/ci/rerun-failed-once.mjs) must see a teardown failure: the JSON report is
+      // written before teardown, so without this marker a file retry could erase it.
+      const marker = process.env.WE_TEARDOWN_FAILURE_FILE;
+      if (marker) writeFileSync(marker, 'tmp-leak policy failed in global teardown\n');
+    }
   };
 }

@@ -5,7 +5,7 @@
  * and widespread failures stay red for operator inspection. This is evidence collection, not quarantine.
  * Usage (only after a nonzero first run): node scripts/ci/rerun-failed-once.mjs --shard=N --mode=covered|nocov --first-exit=<code> -- [quarantine args]
  */
-import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -90,7 +90,7 @@ export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCo
 }
 
 /** IO boundary, injectable so orchestration and fail-closed reads can be exercised hermetically. */
-export async function rerunOnce({ shard, mode, firstExit, skipArgs = [], env = process.env, root = process.cwd(),
+export async function rerunOnce({ shard, mode, firstExit, teardownFailed = file => existsSync(file), skipArgs = [], env = process.env, root = process.cwd(),
   policy, read = file => readFileSync(file, 'utf8'), write = (file, data) => writeFileSync(file, data),
   remove = file => rmSync(file, { force: true }), run = args => spawnSync('npm', args, { cwd: root, env, stdio: 'inherit' }),
   listFiles, warn = console.log, error = console.error } = {}) {
@@ -100,6 +100,8 @@ export async function rerunOnce({ shard, mode, firstExit, skipArgs = [], env = p
     // Vitest exits 1 for test failures. Any other first-run exit (a crash, a kill, a coverage or teardown error)
     // is a process failure a file retry cannot clear, even when the report also lists failed files.
     if (String(firstExit) !== '1') throw new Error(`first run exit ${firstExit} is not a plain test failure (1)`);
+    // Exit 1 is also what the global teardown's tmp-leak policy sets (vitest.globalSetup.mjs); it leaves this marker.
+    if (teardownFailed(`coverage/teardown-failed-unit-${shard}`)) throw new Error('first run failed in global teardown; a file retry cannot clear it');
     const first = planRetry(read(`coverage/timing-unit-${shard}.json`), policy, root);
     // Vitest positional filters are substrings: refuse ambiguous filters rather than run extra files.
     const all = await listFiles();

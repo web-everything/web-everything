@@ -116,7 +116,7 @@ describe('single failed-file retry core', () => {
 });
 
 function fixture(overrides = {}) {
-  return { shard: '2', mode: 'nocov', firstExit: '1', root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
+  return { shard: '2', mode: 'nocov', firstExit: '1', teardownFailed: vi.fn(() => false), root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
     skipArgs: ['--exclude=quarantined.test.mjs'],
     read: vi.fn(file => file.includes('timing') ? firstText : report(passingEntry())),
     write: vi.fn(), remove: vi.fn(), run: vi.fn(() => ({ status: 0 })),
@@ -149,6 +149,19 @@ describe('retry IO boundary', () => {
     expect(await rerunOnce(io)).toBe(1);
     expect(io.run).not.toHaveBeenCalled();
     expect(io.error).toHaveBeenCalledWith(expect.stringMatching(/not a plain test failure.*inspect original run/));
+  });
+  it('the teardown marker is written by the global teardown and set on both unit steps', async () => {
+    const { readFileSync } = await import('node:fs');
+    const setup = readFileSync(new URL('../../../vitest.globalSetup.mjs', import.meta.url), 'utf8');
+    expect(setup).toMatch(/if \(verdict\.failed\) \{[\s\S]*process\.exitCode = 1;[\s\S]*WE_TEARDOWN_FAILURE_FILE[\s\S]*writeFileSync\(marker/);
+    const ci = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+    expect(ci.match(/WE_TEARDOWN_FAILURE_FILE="\$PWD\/coverage\/teardown-failed-unit-\$\{\{ matrix\.shard \}\}" npm run test:(coverage:shard|unit) -- /g)).toHaveLength(2);
+  });
+  it('refuses to retry when the first run left a global-teardown failure marker', async () => {
+    const io = fixture({ teardownFailed: vi.fn(file => file === 'coverage/teardown-failed-unit-2') });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).not.toHaveBeenCalled();
+    expect(io.error).toHaveBeenCalledWith(expect.stringMatching(/global teardown.*inspect original run/));
   });
   it.each([undefined, 'unknown'])('refuses missing or unknown coverage mode %s before launching a retry', async mode => {
     const io = fixture({ mode });
