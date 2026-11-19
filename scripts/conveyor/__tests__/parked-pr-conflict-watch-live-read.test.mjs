@@ -1,8 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { defaultReadPrLive, defaultDrainRebaseEvidence, defaultRevertBounce, loadDrainGraceSetting,
+import { defaultReadPrLive, defaultRevertBounce,
   defaultPostConflictFinding } from '../parked-pr-conflict-watch.mjs';
 import { invalidateConflictFinding } from '../../lib/conflict-finding.mjs';
-import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { runReviewLabelCli } from '../../review-set-label.mjs';
 
 const head = 'a'.repeat(40), moved = 'b'.repeat(40);
@@ -21,39 +20,6 @@ describe('default conflict-watch GitHub readers', () => {
   it('propagates unreadable/oversized GitHub output for the caller to hold', () => {
     const exec = () => { throw new Error('maxBuffer exceeded'); };
     expect(() => defaultReadPrLive({ pr, repo, exec })).toThrow('maxBuffer');
-    expect(() => defaultDrainRebaseEvidence({ pr, repo, exec, identity: {} })).toThrow('maxBuffer');
-  });
-  it.each(['not-json', '{"message":"API error"}', 'null', '[]'])('rejects unreadable commit evidence %s', output => {
-    const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ headRefOid: head }))
-      .mockReturnValueOnce(output);
-    expect(() => defaultDrainRebaseEvidence({ pr, repo, exec, identity: {} })).toThrow();
-  });
-  it.each(['{}', 'null', '{"headRefOid":"short"}'])('rejects unreadable live evidence %s', output => {
-    expect(() => defaultDrainRebaseEvidence({ pr, repo, exec: () => output, identity: {} })).toThrow();
-  });
-  const identity = { roles: { merger: { botLogin: 'drain-app[bot]' }, worker: { botLogin: 'worker-app[bot]' } } };
-  function evidence({ author = 'drain-app[bot]', committer = 'drain-app[bot]', date = '2026-09-27T22:22:19Z', message = 'ordinary update' } = {}) {
-    const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ headRefOid: moved, mergeable: 'CONFLICTING' }))
-      .mockReturnValueOnce(JSON.stringify({ sha: moved, author: { login: author }, committer: { login: committer },
-        commit: { message, committer: { date } } }));
-    return { value: defaultDrainRebaseEvidence({ pr, repo, exec, identity }), exec };
-  }
-  it('uses the live commit identity and API timestamp, even after the list head moved', () => {
-    const result = evidence();
-    expect(result.value).toEqual({ by: 'drain', atMs: Date.parse('2026-09-27T22:22:19Z') });
-    expect(result.exec.mock.calls[1][1]).toEqual(['api', `repos/o/n/commits/${moved}`]);
-  });
-  it('rejects a drain committer with a non-drain author', () => {
-    expect(evidence({ author: 'someone', committer: 'drain-app[bot]' }).value).toBeNull();
-  });
-  it('rejects an old drain-authored commit cherry-picked by someone else with a fresh committer date', () => {
-    expect(evidence({ committer: 'someone' }).value).toBeNull();
-  });
-  it.each(['someone', 'worker-app[bot]', 'web-everything[bot]'])('ignores message claims from %s', author => {
-    expect(evidence({ author, message: 'merge drain rebased this PR' }).value).toBeNull();
-  });
-  it.each([null, '', 'not a date'])('holds for a missing/invalid API timestamp (%s)', date => {
-    expect(() => evidence({ date })).toThrow('unreadable committer date');
   });
   it.each([
     ['concurrent rejection', ['review:changes', 'advisory:changes'], head],
@@ -97,23 +63,6 @@ describe('default conflict-watch GitHub readers', () => {
     const exec = vi.fn();
     defaultPostConflictFinding({ pr, repo, headRefOid: head, exec });
     expect(exec.mock.calls[0][1]).toContain(`--expect-head=${head}`);
-  });
-});
-
-describe('drain grace setting', () => {
-  it('defaults to 15 minutes', () => {
-    expect(loadDrainGraceSetting({ env: {}, read: () => ({}), platform: {}, log: () => {} }).drainGraceMinutes).toBe(15);
-  });
-  it('resolves platform, tool and environment and logs provenance', () => {
-    resetCascadeLogForTest();
-    const log = vi.fn();
-    expect(loadDrainGraceSetting({ env: { WE_CONFLICT_WATCH_DRAIN_GRACE_MINUTES: '3', WE_POLICY_CASCADE_LOG: '1' },
-      platform: { drainGraceMinutes: 12 }, read: () => ({ conflictWatch: { drainGraceMinutes: 9 } }), log }).drainGraceMinutes).toBe(3);
-    expect(log.mock.calls.flat().join(' ')).toContain('drainGraceMinutes');
-  });
-  it('rejects invalid and unbounded values', () => {
-    expect(loadDrainGraceSetting({ env: { WE_CONFLICT_WATCH_DRAIN_GRACE_MINUTES: 'Infinity' },
-      platform: {}, read: () => ({}), log: () => {} }).drainGraceMinutes).toBe(15);
   });
 });
 

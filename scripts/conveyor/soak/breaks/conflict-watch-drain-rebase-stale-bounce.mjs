@@ -7,21 +7,20 @@ function probe(watch = watchParkedPrConflicts) {
   const pr = { number: 7183, headRefName: 'lane/7183', baseRefName: 'main', headRefOid: oldHead,
     mergeable: 'CONFLICTING', labels: ['review:accepted', 'ready-to-merge', CONFLICT_LABEL] };
   const violations = [];
-  for (const recentDrain of [false, true]) {
+  for (const mergeable of ['MERGEABLE', 'CONFLICTING']) {
     let bounces = 0;
     const entries = watch({ repo: 'web-everything/web-everything', listPrs: () => [pr], now,
-      sameLineConflict: 'stand-down', conflictWatchSettings: { drainGraceMinutes: 15 },
+      sameLineConflict: 'stand-down',
       inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1,
       computeConflictDisposition: () => null, computeConflictingPaths: () => null,
       listPrFiles: () => [{ path: 'scripts/x.mjs' }], listPrComments: () => [],
-      drainRebaseEvidence: () => recentDrain ? { by: 'drain', atMs: now - 10_000 } : null,
-      readPrLive: () => ({ headRefOid: newHead, mergeable: 'CONFLICTING' }),
+      readPrLive: () => ({ headRefOid: newHead, mergeable }),
       postFinding: () => { bounces++; }, postStandDown: () => { bounces++; },
       provider: {}, log: () => {},
     });
-    if (bounces || entries[0]?.error || !entries[0]?.routedTo?.includes(recentDrain ? 'deferred-to-drain' : 'conflict-cleared-before-bounce'))
-      violations.push(`two-head #7183 sequence bounced or failed (recent drain: ${recentDrain})`);
+    if (bounces || entries[0]?.error || !entries[0]?.routedTo?.includes('conflict-cleared-before-bounce'))
+      violations.push(`two-head #7183 sequence bounced or failed (live mergeable: ${mergeable})`);
   }
   return { violations };
 }

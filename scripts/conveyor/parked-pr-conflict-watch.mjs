@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { buildConflictFindingBody, defaultPostConflictFinding, invalidateConflictFinding } from '../lib/conflict-finding.mjs';
+import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
  * @file scripts/conveyor/parked-pr-conflict-watch.mjs
@@ -171,9 +171,6 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
 import { readInCardGroup, readCardGroupStateUnreadable } from '../lib/card-group.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { readSettings } from '../lib/settings-files.mjs';
-import { readDeliveryIdentity, roleOfBotLogin } from '../lib/github-app-identity.mjs';
 import { loadSameLineConflictSetting } from './conflict-watch-same-line.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
 import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
@@ -1292,16 +1289,6 @@ function classifyStatuteConflict(files, {
   return { isStatuteTier, appendOnlyStatute, reviewHumanFixable };
 }
 
-/** Resolve the declared drain grace through the shared standard/platform/tool/env cascade. */
-export function loadDrainGraceSetting({ env = process.env, read = readSettings, platform, log = line => console.error(`${new Date().toISOString()} ${line}`) } = {}) {
-  return cascadePolicy('conflictWatch', read()?.conflictWatch, {
-    standard: { drainGraceMinutes: 15 }, platform, env, log,
-    envValues: { drainGraceMinutes: env.WE_CONFLICT_WATCH_DRAIN_GRACE_MINUTES === undefined
-      ? undefined : Number(env.WE_CONFLICT_WATCH_DRAIN_GRACE_MINUTES) },
-    valid: { drainGraceMinutes: value => Number.isFinite(value) && value >= 0 },
-  }).value;
-}
-
 const liveReadOptions = repo => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
   timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
   env: { ...process.env, GH_REPO: repo, WE_GH_THROTTLE_PERSONAL_ROUTE: '0' },
@@ -1310,22 +1297,6 @@ const liveReadOptions = repo => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', '
 export function defaultReadPrLive({ pr, repo, exec = execFileSyncThrottled }) {
   return JSON.parse(String(exec('gh', ['pr', 'view', String(pr.number), '--repo', repo,
     '--json', 'headRefOid,mergeable'], liveReadOptions(repo))));
-}
-
-/** One commit at the live head, not commit-message claims or a locally observed clock. */
-export function defaultDrainRebaseEvidence({ pr, repo, exec = execFileSyncThrottled, identity = readDeliveryIdentity() }) {
-  const live = defaultReadPrLive({ pr, repo, exec });
-  if (!/^[a-f0-9]{40}$/i.test(live?.headRefOid ?? '')) throw new Error('drain evidence: unreadable live head');
-  const commit = JSON.parse(String(exec('gh', ['api', `repos/${repo}/commits/${live.headRefOid}`], liveReadOptions(repo))));
-  if (commit?.sha !== live.headRefOid || !commit?.commit?.committer) throw new Error('drain evidence: unreadable commit');
-  const isDrain = person => {
-    const role = roleOfBotLogin(person?.login, identity);
-    return role === 'merger' || (role === 'legacy' && !identity?.roles?.merger);
-  };
-  if (!isDrain(commit.author) || !isDrain(commit.committer)) return null;
-  const atMs = Date.parse(commit.commit?.committer?.date ?? '');
-  if (!Number.isFinite(atMs)) throw new Error('drain evidence: unreadable committer date');
-  return { by: 'drain', atMs };
 }
 
 export function defaultRevertBounce({ pr, repo, headRefOid, findingToken, provider = createGhProvider() }) {
@@ -1439,8 +1410,7 @@ export function watchParkedPrConflicts({
   inCardGroupFn = readInCardGroup, // xym8nt4 — open card-group members are the drain grouping's to handle
   cardGroupStateUnreadable = () => readCardGroupStateUnreadable(), // membership unknown → hold (fail closed)
   sameLineConflict = loadSameLineConflictSetting().value,
-  conflictWatchSettings = loadDrainGraceSetting(),
-  readPrLive = defaultReadPrLive, drainRebaseEvidence = defaultDrainRebaseEvidence,
+  readPrLive = defaultReadPrLive,
   revertBounce = options => defaultRevertBounce({ ...options, provider }),
   log = line => console.error(line),
   postFinding = defaultPostConflictFinding, postStandDown = defaultPostConflictStandDown,
@@ -1827,21 +1797,10 @@ export function watchParkedPrConflicts({
 
         // Keep this check next to the write, after all slower classification reads.
         const bounce = (extra, beforeWrite = () => {}) => {
-          let evidence = null;
-          let evidenceUnreadable = false;
-          try { evidence = drainRebaseEvidence({ pr, repo: resolvedRepo }); } catch { evidenceUnreadable = true; }
-          const grace = conflictWatchSettings?.drainGraceMinutes ?? 15;
-          let reason = evidenceUnreadable ? 'drain-evidence-unreadable' : null;
-          if (evidence?.by === 'drain' && Number.isFinite(evidence.atMs)
-            && now >= evidence.atMs && now - evidence.atMs <= grace * 60_000) {
-            reason = 'deferred-to-drain (recent drain rebase)';
-          }
           let live = null;
-          if (!reason) {
-            try { live = readPrLive({ pr, repo: resolvedRepo }); } catch { /* fail closed */ }
-            if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') || live?.headRefOid !== pr.headRefOid
-              || live?.mergeable !== 'CONFLICTING') reason = 'conflict-cleared-before-bounce';
-          }
+          try { live = readPrLive({ pr, repo: resolvedRepo }); } catch { /* fail closed */ }
+          const reason = !/^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') || live?.headRefOid !== pr.headRefOid
+            || live?.mergeable !== 'CONFLICTING' ? 'conflict-cleared-before-bounce' : null;
           if (reason) {
             entry.routedTo = reason;
             log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${reason}`);
@@ -1853,13 +1812,7 @@ export function watchParkedPrConflicts({
           let after = null;
           try { after = readPrLive({ pr, repo: resolvedRepo }); } catch { /* cannot confirm write */ }
           if (after?.headRefOid !== headRefOid || after?.mergeable !== 'CONFLICTING') {
-            const skipped = revertBounce({ pr, repo: resolvedRepo, headRefOid, findingToken: finding?.findingToken,
-              beforeRestore: () => {
-                if (finding?.findingToken) invalidateConflictFinding({
-                  findingToken: finding.findingToken, pr, repo: resolvedRepo, headRefOid, provider, listPrComments,
-                });
-              },
-            });
+            const skipped = revertBounce({ pr, repo: resolvedRepo, headRefOid, findingToken: finding?.findingToken });
             entry.routedTo = skipped || (after?.headRefOid !== headRefOid
               ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed');
             log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${entry.routedTo}`);

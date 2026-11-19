@@ -1,6 +1,5 @@
 {
   "conflictWatch": {
-    "sameLineConflict": "fixer",
-    "drainGraceMinutes": 15
+    "sameLineConflict": "fixer"
   }
 }

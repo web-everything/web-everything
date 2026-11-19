@@ -5187,13 +5187,14 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 ## Accepted-conflict bounce races (#7183)
 
 Queued-conflict fixtures must provide a full snapshot `headRefOid`, a `readPrLive` port
-returning that same conflicting head before and after the write, and explicit drain
-evidence. Missing live evidence holds the PR for the next sweep. Drain grace trusts
-GitHub commit author/committer App identity and API time, never commit-message text.
+returning that same conflicting head before and after the write. Missing live
+evidence holds the PR for the next sweep.
 The two-head soak break exercises the real watcher decision with all IO injected.
 
 A bounced conflict finding is itself durable deduplication state. Rollback tests
-must persist the real transport body and receipt, invalidate that exact comment
-before restoring approval labels, and run a second conflicting sweep. If comment
-invalidation fails, keep the bounce and surface the error; label-only rollback
-would strand an accepted PR behind the surviving finding.
+must persist the real transport body and receipt, drive `defaultRevertBounce` with
+injected provider IO, and run a second conflicting sweep. Concurrent verdicts or
+a moved head skip rollback without editing labels or comments. When our bounce
+still owns the live state, guarded acceptance restoration is unavailable: retain
+the bounce and its finding, surface the human review/rearm error, and verify the
+next sweep deduplicates the surviving finding.
