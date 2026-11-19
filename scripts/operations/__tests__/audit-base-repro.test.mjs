@@ -1,7 +1,9 @@
 /** @file R1053 S1a base reproduction: every incomplete proof remains blocking. */
 import { describe, expect, it, vi } from 'vitest';
-import { cardHash, cardLine, classifyPreExisting, parseDiffChangedLines, parseReproAnswer, REPRO_QUESTION } from '../audit-base-repro.mjs';
+import { cardHash, cardLine, classifyPreExisting, parseDiffChangedLines, parseReproAnswer, PREEXISTING_ELIGIBLE, REPRO_QUESTION } from '../audit-base-repro.mjs';
+import { symbolRangeAt } from '../../lib/audit-finding-key.mjs';
 import { AUDITOR_FLOOR } from '../../lib/audit-settings.mjs';
+import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
 
 const source = 'function X() {\n  return unsafe();\n}\nfunction Y() {\n  return fixed();\n}\n';
 const finding = { text: 'lib/x.mjs:2 missing guard', sourceText: source };
@@ -9,8 +11,10 @@ const answer = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') =>
   `#1 ${status} ${relation} CLASS=${cls} BASE=lib/x.mjs:2\nQUOTE: return unsafe();`;
 const diff = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -5 +5 @@\n-  return old();\n+  return fixed();\n';
 const stat = '1\t1\tlib/x.mjs\n';
+const receipt = () => ({ written: true, expedite: true, needsYou: true });
 const options = over => ({ findings: [finding], answers: parseReproAnswer(answer(), 1), baseSha: 'base-sha', headSha: 'head-sha',
-  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, cardWritten: () => true, ...over });
+  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false },
+  cardWritten: receipt, ...over });
 const classify = over => classifyPreExisting(options(over));
 
 describe('strict reproduction protocol', () => {
@@ -56,10 +60,172 @@ describe('strict reproduction protocol', () => {
 });
 
 describe('pre-existing classification', () => {
+  it('exports exactly the eligible classes and permits each on unprotected unchanged source', () => {
+    expect(PREEXISTING_ELIGIBLE).toEqual(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D2']);
+    for (const cls of PREEXISTING_ELIGIBLE) expect(classify({ answers: parseReproAnswer(answer(cls), 1),
+      cardWritten: () => cls.startsWith('B') ? receipt() : true })[0].blocking).toBe(false);
+  });
+  it.each(['E1', 'E2'])('production stage blocks %s', cls => {
+    expect(classify({ auditPolicy: { releaseStage: 'prod', requirePayBy: false, requireOnMain: true },
+      answers: parseReproAnswer(answer(cls), 1) })[0].blocking).toBe(true);
+  });
+  it('missing or incomplete policy blocks with human review fallback', () => {
+    for (const auditPolicy of [undefined, null, {}, { releaseStage: 'prerelease' }]) {
+      expect(classify({ auditPolicy })[0]).toMatchObject({ blocking: true, reason: expect.stringContaining('human review required') });
+    }
+  });
+  it('required pay-by uses only a persisted card and a valid future date', () => {
+    const opts = { auditPolicy: { releaseStage: 'prerelease', requirePayBy: true, requireOnMain: true },
+      findings: [{ ...finding, card: 'backlog/debt.md', text: finding.text + ' mustPayBefore: 2099-01-01' }],
+      answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true };
+    for (const body of [null, '', 'mustPayBefore: 2000-01-01', 'mustPayBefore: 2099-02-31']) {
+      expect(classify({ ...opts, readCard: () => body })[0].blocking).toBe(true);
+    }
+    expect(classify({ ...opts, readCard: () => 'mustPayBefore: 2099-01-01' })[0].blocking).toBe(false);
+    expect(classify({ ...opts, readCard: () => 'mustPayBefore: prod' })[0].blocking).toBe(false);
+    expect(classify({ ...opts, auditPolicy: { ...opts.auditPolicy, releaseStage: 'prod' },
+      readCard: () => 'mustPayBefore: prod' })[0].blocking).toBe(true);
+  });
+  it('requireOnMain blocks a held card without a persisted main card', () => {
+    expect(classify({ auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+      answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true })[0])
+      .toMatchObject({ blocking: true, reason: expect.stringContaining('human review required') });
+    expect(classify({ findings: [{ ...finding, card: 'backlog/debt.md' }],
+      auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+      readCard: () => '# Persisted main card' })[0].blocking).toBe(false);
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s requires confirmed expedite and needs-you', cls => {
+    const opts = { answers: parseReproAnswer(answer(cls), 1) };
+    expect(classify({ ...opts, cardWritten: () => ({ written: true, expedite: true, needsYou: true }) })[0])
+      .toMatchObject({ blocking: false, expedite: true, needsYou: true });
+    for (const receipt of [true, { written: true, expedite: true, needsYou: false }, { written: true, expedite: false, needsYou: true }]) {
+      expect(classify({ ...opts, cardWritten: () => receipt })[0].blocking).toBe(true);
+    }
+  });
+  it('uses one-based inclusive base symbol ranges and permits shifted base lines', () => {
+    expect(symbolRangeAt(source, 2)).toEqual({ symbol: 'X', start: 1, end: 3 });
+    expect(symbolRangeAt(source, 7)).toBe(null);
+    const answers = parseReproAnswer(answer().replace(':2', ':3'), 1);
+    expect(classify({ answers, readBaseFile: () => `\n${source}` })[0].blocking).toBe(false);
+  });
+  it.each(['changed', 'removed', 'unknown'])('nested B2 retains human review for an %s enclosing auth guard', kind => {
+    const base = ['function outer(req) {', '  requireAuth(req);', '  const route = req.route;', '  function inner() {',
+      '    return unsafe();', '  }', '  return inner();', '}'].join('\n');
+    const sourceText = kind === 'removed' ? base.replace('  requireAuth(req);\n', '')
+      : kind === 'unknown' ? base.replace('outer(req)', 'outer(req): Response').replace('requireAuth', 'skipAuth')
+      : base.replace('requireAuth', 'skipAuth');
+    const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    const changedLines = parseDiffChangedLines(hdr + (kind === 'removed'
+      ? '@@ -2 +1,0 @@\n-  requireAuth(req);\n'
+      : '@@ -2 +2 @@\n-  requireAuth(req);\n+  skipAuth(req);\n'), `${kind === 'removed' ? 0 : 1}\t1\tlib/x.mjs\n`);
+    const opts = { findings: [{ text: `lib/x.mjs:${kind === 'removed' ? 4 : 5} missing guard`, sourceText }],
+      answers: parseReproAnswer(answer().replace(':2', ':5'), 1), readBaseFile: () => base, changedLines };
+    expect(classify(opts)[0]).toMatchObject({ blocking: true, reason: expect.stringContaining(
+      kind === 'unknown' ? 'unknown symbol extent' : 'symbol touched by the diff') });
+    expect(classify({ ...opts, findings: [{ text: 'lib/x.mjs:5 missing guard', sourceText: base }],
+      changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
+  });
+  it.each([
+    ['regexp', 'const end = /}/;'],
+    ['string', 'const end = "}";'],
+    ['template literal', 'const end = `}`;'],
+  ])('a brace in a %s cannot hide a changed serve guard', (_kind, literal) => {
+    const base = ['function serve(req) {', '  unsafeResponse(req);', `  ${literal}`,
+      '  requireAuth(req);', '}'].join('\n');
+    const sourceText = base.replace('requireAuth', 'skipAuth');
+    const changedLines = parseDiffChangedLines(diff.replace('@@ -5 +5 @@', '@@ -4 +4 @@')
+      .replace('return old();', 'requireAuth(req);').replace('return fixed();', 'skipAuth(req);'), stat);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
+    expect(changedLines.complete).toBe(true);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:2 unsafe', sourceText }], answers,
+      readBaseFile: () => base, changedLines })[0]).toMatchObject({ blocking: true,
+      reason: expect.stringContaining('human review required') });
+  });
+  it.each(['base', 'head'])('parser rejects a truncated regexp range on the %s side independently', side => {
+    const plain = 'function serve(req) {\n  unsafeResponse(req);\n  const end = 0;\n  requireAuth(req);\n}';
+    const truncated = plain.replace('const end = 0;', 'const end = /}/;');
+    expect(symbolRangeAt(truncated, 2)).toEqual({ symbol: 'serve', start: 1, end: 3 });
+    const base = side === 'base' ? truncated : plain;
+    const sourceText = (side === 'head' ? truncated : plain).replace('requireAuth', 'skipAuth');
+    // An addition isolates the HEAD extent: there are no removed BASE lines to catch it.
+    const changedLines = side === 'head'
+      ? parseDiffChangedLines('diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -3,0 +4 @@\n+  skipAuth(req);\n', '1\t0\tlib/x.mjs\n')
+      : parseDiffChangedLines(diff.replace('@@ -5 +5 @@', '@@ -4 +4 @@'), stat);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:2 unsafe', sourceText }], answers,
+      readBaseFile: () => base, changedLines })[0]).toMatchObject({ blocking: true,
+      reason: expect.stringContaining(side === 'base' ? 'base quote outside the finding symbol' : 'unknown symbol extent in a changed file') });
+  });
+  it.each([
+    'function serve(req) {\n  return unsafeResponse(req);\n}',
+    'serve(req) {\n  return unsafeResponse(req);\n}',
+    'const serve = req => unsafeResponse(req);',
+  ])('parser accepts complete function, method and arrow ranges: %s', sourceText => {
+    const line = sourceText.includes('\n') ? 2 : 1;
+    const quote = sourceText.split('\n')[line - 1].trim();
+    const answers = parseReproAnswer(`#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:${line}\nQUOTE: ${quote}`, 1);
+    expect(classify({ findings: [{ text: `lib/x.mjs:${line} unsafe`, sourceText }], answers,
+      readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
+  });
+  it('rejects a scanned range whose first line does not contain its symbol name', () => {
+    const sourceText = 'function\nserve(req) {\n  unsafeResponse(req);\n}';
+    expect(symbolRangeAt(sourceText, 3)).toEqual({ symbol: 'serve', start: 1, end: 4 });
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:3\nQUOTE: unsafeResponse(req);', 1);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:3 unsafe', sourceText }], answers,
+      readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0])
+      .toMatchObject({ blocking: true, reason: expect.stringContaining('base quote outside the finding symbol') });
+  });
+  it('qualifies finding paths so SAME evidence produces a publishable held card', () => {
+    const path = 'blocks/widget.ts', text = `${path}:2 unsafe return; backlog/debt.md`;
+    const answers = parseReproAnswer(answer().replace('lib/x.mjs', path), 1);
+    expect(classify({ findings: [{ text, sourceText: source }], answers,
+      changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
+    const card = cardLine({ date: '2026-11-18 07:00', cls: 'B2', path, symbol: 'X', sha10: '1234567890', text });
+    expect(card).toContain('we:blocks/widget.ts:2 unsafe return; we:backlog/debt.md');
+    expect(() => assertPublishableContent('backlog/held-card.md', `# held\n\n${card}`)).not.toThrow();
+  });
+  it('unresolvable bare basenames block with a held-card publishability fallback', () => {
+    expect(classify({ findings: [{ ...finding, text: `${finding.text}; unknown-file.mjs` }] })[0])
+      .toMatchObject({ blocking: true, reason: 'held card not publishable; human review required' });
+  });
+  it('blocks a valid quote borrowed from a different base symbol', () => {
+    const answers = parseReproAnswer(answer().replace(':2', ':5').replace('unsafe', 'fixed'), 1);
+    expect(classify({ answers })[0].blocking).toBe(true);
+  });
+  it('blocks a quote extending outside the enclosing base symbol', () => {
+    const a = parseReproAnswer(answer(), 1)[0];
+    expect(classify({ answers: [{ ...a, quote: 'return unsafe();\n}\nfunction Y() {' }] })[0].blocking).toBe(true);
+  });
+  it('bounds top-level quotes to three lines around the reported base line', () => {
+    const sourceText = 'const value = unsafe();\n\n\n\nconst other = unsafe();';
+    const a = { ...parseReproAnswer(answer(), 1)[0], base: { path: 'lib/x.mjs', line: 1 }, quote: sourceText };
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText, answers: [a] })[0].blocking).toBe(true);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      answers: [{ ...a, quote: 'const value = unsafe();' }] })[0].blocking).toBe(true);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      changedLines: parseDiffChangedLines(diff.replaceAll('lib/x.mjs', 'lib/y.mjs'), stat.replace('lib/x.mjs', 'lib/y.mjs')),
+      answers: [{ ...a, quote: 'const value = unsafe();' }] })[0].blocking).toBe(false);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      answers: [{ ...a, base: { path: 'lib/x.mjs', line: 5 }, quote: 'const other = unsafe();' }] })[0].blocking).toBe(true);
+  });
+  it.each(['D1', 'D3', 'X1', 'X2', 'Z9'])('never exempts ineligible class %s', cls => {
+    const a = parseReproAnswer(answer(), 1)[0];
+    expect(classify({ answers: [{ ...a, class: cls }] })[0].blocking).toBe(true);
+  });
+  it.each(['scripts/readiness/file-locks.mjs', 'scripts/operations/audit-verdict.mjs', '.githooks/pre-commit'])('never exempts protected path %s', path => {
+    const a = parseReproAnswer(answer(), 1)[0], cardWritten = vi.fn();
+    expect(classify({ findings: [{ ...finding, text: `${path}:2 unsafe` }],
+      answers: [{ ...a, base: { path, line: 2 } }], cardWritten })[0].blocking).toBe(true);
+    expect(cardWritten).not.toHaveBeenCalled();
+  });
+  it('uses the injected path protection check and fails closed on unreadable protection', () => {
+    expect(classify({ isProtectedPath: () => true })[0].blocking).toBe(true);
+    expect(classify({ isProtectedPath: () => { throw Error('unreadable'); } })[0].blocking).toBe(true);
+  });
   it('a1 finding in X while PR edits Y is non-blocking with a stable card identity', () => {
-    const readBaseFile = vi.fn(() => source), cardWritten = vi.fn(() => true);
+    const readBaseFile = vi.fn(() => source), cardWritten = vi.fn(receipt);
     const [result] = classify({ readBaseFile, cardWritten });
-    expect(result).toEqual({ blocking: false, reason: 'verified pre-existing finding', preExisting: {
+    expect(result).toEqual({ blocking: false, expedite: true, tag: 'security', needsYou: true, reason: 'verified pre-existing finding', preExisting: {
       line: finding.text, key: 'lib/x.mjs|X|B2', base: { sha: 'base-sha', path: 'lib/x.mjs', line: 2, quote: 'return unsafe();' },
       relation: 'SAME', cardHash: cardHash('lib/x.mjs|X|B2'),
     } });
@@ -94,6 +260,43 @@ describe('pre-existing classification', () => {
     const wrongPath = parseReproAnswer(answer().replace('BASE=lib/x.mjs', 'BASE=lib/y.mjs'), 1);
     expect(classify({ answers: wrongPath })[0].blocking).toBe(true);
   });
+  it('configured protected paths and a missing list block', () => {
+    expect(classify({ protectedPaths: ['lib/x.mjs'] })[0].blocking).toBe(true);
+    expect(classify({ protectedPaths: undefined })[0].blocking).toBe(true);
+  });
+  it('a removed guard in the finding symbol blocks although no head line was added', () => {
+    const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    const guard = parseDiffChangedLines(`${hdr}@@ -1 +0,0 @@\n-  requireAuth();\n`, '0\t1\tlib/x.mjs\n');
+    expect(guard.complete).toBe(true);
+    expect(classify({ changedLines: guard })[0].blocking).toBe(true);
+    const baseLine = parseDiffChangedLines(`${hdr}@@ -2 +1,0 @@\n-  return unsafe();\n`, '0\t1\tlib/x.mjs\n');
+    expect(classify({ changedLines: baseLine })[0].blocking).toBe(true);
+    const otherFn = parseDiffChangedLines(`${hdr}@@ -5 +4,0 @@\n-  return old();\n`, '0\t1\tlib/x.mjs\n');
+    expect(classify({ changedLines: otherFn })[0].blocking).toBe(false);
+  });
+  it.each([
+    'function serve(req = defaultRequest()) {',
+    'function serve(req): Response {',
+    'function serve(req): { body: string } {',
+    'const serve = (req = defaultRequest()) => {',
+    'const serve = (req): Response => {',
+    'serve(req = defaultRequest()): Response {',
+  ])('unknown symbol syntax retains distant guard changes: %s', declaration => {
+    const base = [declaration, '  requireAuth(req);', ...Array.from({ length: 6 }, (_, i) => `  const v${i} = ${i};`),
+      '  return unsafeResponse(req);', '}'].join('\n');
+    const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:9\nQUOTE: return unsafeResponse(req);', 1);
+    for (const removed of [false, true]) {
+      const sourceText = removed ? base.replace('  requireAuth(req);\n', '') : base.replace('requireAuth', 'skipAuth');
+      const changedLines = parseDiffChangedLines(removed ? `${hdr}@@ -2 +1,0 @@\n-  requireAuth(req);\n`
+        : `${hdr}@@ -2 +2 @@\n-  requireAuth(req);\n+  skipAuth(req);\n`, `${removed ? 0 : 1}\t1\tlib/x.mjs\n`);
+      const cardWritten = vi.fn(receipt);
+      expect(changedLines.complete).toBe(true);
+      expect(classify({ findings: [{ text: `lib/x.mjs:${removed ? 8 : 9} unsafe`, sourceText }], answers,
+        readBaseFile: () => base, changedLines, cardWritten })[0].blocking).toBe(true);
+      expect(cardWritten).not.toHaveBeenCalled();
+    }
+  });
   it('a2 flagged changed head line blocks before carding', () => {
     const cardWritten = vi.fn();
     expect(classify({ changedLines: Object.assign(new Map([['lib/x.mjs', new Set([2])]]), { complete: true }), cardWritten })[0].blocking).toBe(true);
@@ -125,7 +328,7 @@ describe('pre-existing classification', () => {
     expect(classify({ answers: parseReproAnswer(answer('B2', 'REPRODUCES', 'WORSENED'), 1) })[0].blocking).toBe(true);
   });
   it('a5 excess findings block with explicit human-review fallback and no card attempt', () => {
-    const cardWritten = vi.fn(() => true);
+    const cardWritten = vi.fn(receipt);
     const result = classify({ findings: [finding, finding], answers: [parseReproAnswer(answer(), 1)[0], parseReproAnswer(answer(), 1)[0]], recheckMax: 1, cardWritten });
     expect(result.map(r => r.blocking)).toEqual([false, true]);
     expect(result[1].reason).toContain('human review required');
@@ -149,5 +352,10 @@ describe('diff and card helpers', () => {
     expect(cardLine({ date: '2026-11-18 07:00', cls: 'B2', path: 'lib/x.mjs', symbol: 'X', sha10: '1234567890', text: 'guard missing' }))
       .toBe('- [R1053] 2026-11-18 07:00 ET: pre-existing audit finding (B2) in we:lib/x.mjs#X, reproduces on main 1234567890: guard missing');
     expect(cardHash('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  });
+  it('card path qualification preserves explicit loci, URLs and npm scopes', () => {
+    const text = 'we:lib/x.mjs fui:blocks/widget.ts https://example.com/debt.md @scope/widget.ts';
+    expect(cardLine({ date: '2026-11-18 07:00', cls: 'B2', path: 'lib/x.mjs', symbol: 'X',
+      sha10: '1234567890', text })).toContain(`: ${text}`);
   });
 });

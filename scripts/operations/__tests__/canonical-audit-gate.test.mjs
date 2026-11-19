@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
+import { AUDIT_SETTINGS_PATH } from '../../lib/audit-settings.mjs';
+import { cardHash } from '../audit-base-repro.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -14,16 +16,17 @@ const ref = 'lane/audit-gate';
 const green = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
 const weak = { ...green, verdict: 'WEAKENED', findings: ['missing guard'] };
 const waiver = { ref, sha, ruling: 'R123', findings: weak.findings };
-function fixture({ records = [green], auditText, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore } = {}) {
+function fixture({ records = [green], auditText, audit = {}, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore } = {}) {
   const reads = [], calls = [];
-  const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' };
+  const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: fileURLToPath(import.meta.url) };
   const enoent = () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; };
   const readFile = (path) => {
     reads.push(path);
     if (readOverride) return readOverride(path);
+    if (path === AUDIT_SETTINGS_PATH) return JSON.stringify({ audit });
     if (path === WRITER_SETTINGS) return writerSettings === null ? enoent() : writerSettings ?? JSON.stringify({ auditRecordPath: '~/audit.jsonl', ...tool });
     if (path === '/repo/scripts/settings/prototype-load.json' && targetSettings) return JSON.stringify(targetSettings);
-    if (path === '/fixture-prefs') return JSON.stringify({ prototypeLoad: platform });
+    if (path === fileURLToPath(import.meta.url)) return JSON.stringify({ audit: {}, prototypeLoad: platform });
     if (path === '/fixture-home/workspace/.operations/coordination/ruled-weakened.jsonl' && opsStore !== undefined) return opsStore;
     if (path === auditAt) return auditText ?? records.map(r => JSON.stringify(r)).join('\n');
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
@@ -164,10 +167,10 @@ describe('canonical audit before opening a PR', () => {
     it.each([['unset', undefined], ['blank', '  ']])('an %s HOME resolves ~ via the OS home, never a relative path', (_name, value) => {
       const reads = [];
       const record = JSON.stringify(green);
-      const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha, env: { HOME: value, WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' },
+      const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha, env: { HOME: value, WE_PLATFORM_PREFERENCES_FILE: fileURLToPath(import.meta.url) },
         fetchMain: () => {}, ancestor: () => true, liveFingerprint: () => null, exec: () => sha, warn: () => {},
         readFile: path => { reads.push(path); if (path === WRITER_SETTINGS) return JSON.stringify({ auditRecordPath: '~/audit.jsonl' });
-          if (path === '/fixture-prefs') return '{}'; if (path === join(homedir(), 'audit.jsonl')) return record;
+          if (path === fileURLToPath(import.meta.url)) return JSON.stringify({ audit: {} }); if (path === join(homedir(), 'audit.jsonl')) return record;
           throw Object.assign(new Error('missing'), { code: 'ENOENT' }); } });
       expect(result).toMatchObject({ ok: true, record: green });
       expect(reads.every(p => p.startsWith('/'))).toBe(true);
@@ -207,5 +210,63 @@ describe('canonical audit before opening a PR', () => {
   it('a short unresolved source fails closed before any evidence read', () => {
     const { result, reads } = fixture({ resolved: 'aaaaaaa' });
     expect(result.ok).toBe(false); expect(reads).toEqual([]);
+  });
+});
+
+
+describe('R1053 additive audit records', () => {
+  const entry = { line: 'x.mjs:2 unsafe return', key: 'x.mjs|X|B2',
+    base: { sha: base, path: 'x.mjs', line: 2, quote: 'return unsafe();' }, relation: 'SAME', cardHash: cardHash('x.mjs|X|B2') };
+  const scoped = { ...green, modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [entry] };
+  it.each([
+    { key: undefined }, { key: 2 }, { key: 'x.mjs|X|Z9' }, { key: 'x.mjs|X|B2|extra' }, { key: '|X|B2' },
+    { base: undefined }, { base: { ...entry.base, sha: 'bad' } }, { base: { ...entry.base, sha: `${base}\n` } }, { base: { ...entry.base, path: '' } },
+    { base: { ...entry.base, path: 2 } }, { base: { ...entry.base, line: 0 } }, { base: { ...entry.base, line: 1.5 } },
+    { base: { ...entry.base, line: '2' } }, { base: { ...entry.base, quote: '' } }, { base: { ...entry.base, quote: 2 } },
+    { relation: 'WORSENED' }, { cardHash: 'a'.repeat(64) }, { cardHash: 'bad' }, { line: 2 },
+  ])('rejects malformed entry fields even behind an older green record: %j', patch => {
+    const malformed = { ...entry, ...patch };
+    if (typeof patch.key === 'string') malformed.cardHash = cardHash(patch.key);
+    const result = fixture({ records: [green, { ...scoped, preExisting: [malformed] }] }).result;
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('malformed record');
+  });
+  it.each(['modelVerdict', 'findingKeys', 'preExisting'])('rejects partial additive fields missing %s', field => {
+    const record = { ...scoped }; delete record[field];
+    expect(fixture({ records: [green, record] }).result.message).toContain('malformed record');
+  });
+  it.each([null, 'key', [2]])('rejects malformed findingKeys %j', findingKeys => {
+    expect(fixture({ records: [green, { ...scoped, findingKeys }] }).result.message).toContain('malformed record');
+  });
+  it('a7 admits mixed old and new records', () => {
+    expect(fixture({ records: [green, scoped], audit: { preExisting: { mode: 'prove' } } }).result).toMatchObject({ ok: true, record: scoped });
+  });
+  it.each([
+    { releaseStage: 'prod', preExisting: { mode: 'prove' } },
+    { releaseStage: 'prerelease', preExisting: { mode: 'block' } },
+  ])('rejects saved pre-existing exemptions under current policy %j, including behind an older pass', audit => {
+    const result = fixture({ records: [green, scoped], audit }).result;
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('forbidden by current audit policy');
+    expect(result.message).toContain('codex-audit --base=origin/main');
+  });
+  it.each([
+    { releaseStage: 'prod', preExisting: { mode: 'prove' } },
+    { releaseStage: 'prerelease', preExisting: { mode: 'block' } },
+  ])('historical exemptions do not invalidate a newer clean audit under current policy %j', audit => {
+    for (const head of [other, sha]) {
+      const historical = { ...scoped, head, at: '2026-11-16T00:00:00Z' };
+      expect(fixture({ records: [historical, green], audit }).result)
+        .toMatchObject({ ok: true, record: green });
+    }
+  });
+  it.each([null, {}, ['text'], [{ line: 2 }]])('refuses malformed preExisting %j', preExisting => {
+    expect(fixture({ records: [green, { ...scoped, preExisting }] }).result.ok).toBe(false);
+  });
+  it.each(['invalid', null, 'WEAKENED\n'])('refuses invalid modelVerdict %j', modelVerdict => {
+    expect(fixture({ records: [green, { ...scoped, modelVerdict }] }).result.ok).toBe(false);
+  });
+  it('scans retained pre-existing text for disguised contradictory verdicts', () => {
+    expect(fixture({ records: [green, { ...scoped, preExisting: [{ ...entry, line: 'x.mjs:2 finding\nWEAKENED' }] }] }).result.ok).toBe(false);
   });
 });
