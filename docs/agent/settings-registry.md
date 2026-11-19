@@ -20,7 +20,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 - Declared leaves: 632 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 152.
 - Instant capacity leaves: 9.
-- Constants to settle: 108.
+- Constants to settle: 312.
 - Instant gaps: 28.
 
 ## Instant settings
@@ -243,36 +243,97 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | workerCapacity.ceiling | Repo shadow measurement setting; not an enforced worker bound. | make capacity leaf | Tune the shadow ceiling live; enforcement still needs separate implementation. |
 | workerCapacity.targetLoad | Repo shadow measurement target. | read per tick | Fresh policy reads are required for live shadow target changes. |
 
+## Discovery convergence
+
+| Pass | Family | Scope | New items | New H-impact items |
+| --- | --- | --- | --- | --- |
+| A | Claude (mechanical script) | declared settings, platform files, capacity leaves, operator prefs keys, env vars | inventory (see summary) | - |
+| B | Codex | scripts/conveyor, scripts/lib, scripts/operations, skills-src (top 60) | 60 | 45 |
+| C | Claude | scripts/readiness, ci, hooks, operator, autofix, backlog, top-level scripts | 50 | 15 |
+| D | Codex | conveyor/operations remainder, skills-src remainder, workflows, model pins | 56 | 17 |
+| E | Claude | top-level scripts, conveyor drain/merge/red-team/overlay/rebuild | 50 | 14 |
+| F | Codex | lib/readiness/operations/skills-src files not named before | 18 | 1 |
+| G | Claude | whole scripts/ and skills-src/ sweep | 40 | 7 |
+| H | Codex | whole sweep incl. workflows | 17 | 2 |
+| I | Claude | whole sweep incl. workflows | 23 | 0 |
+
+H-impact discovery converged (fewer than 5 new H items in passes H and I); the M-impact tail had not fallen below 5 per pass when discovery stopped; agy-gemini (a third model family) is off by ruling and can be added as an optional extra pass if the operator enables it.
+
+## Top 10 proposals
+
+Prioritised for throughput and stuck-work impact, favouring capacity and concurrency controls that should be instant; these remain proposals.
+
+| Impact | Proposed key | Identifier | Current | Range | Instant candidate | Pass | Location |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| H | ghThrottle.acquireTimeoutMs | DEFAULT_ACQUIRE_TIMEOUT_MS | 120,000 ms; env override | 0–300,000 ms | yes | B | scripts/lib/gh-throttle.mjs:214 |
+| H | ghThrottle.retryMaxAttempts | DEFAULT_RETRY_MAX_ATTEMPTS | 5; env override | 1–10 | yes | B | scripts/lib/gh-throttle.mjs:226 |
+| H | heavyAdmission.ceilingMs | DEFAULT_ADMISSION_CEILING_MS | 120 min | 10-240 min | yes | C | scripts/readiness/heavy-admission.mjs:202 |
+| H | infraRetry.streakCap | INFRA_RETRY_CAP | 4 | 1–10 | yes | B | scripts/conveyor/reconcile-core.mjs:913 |
+| H | laneCapacity.maxConcurrent | DEFAULT_MAX_CONCURRENT_LANES | 8; env override | 1–64 | yes | B | scripts/lib/lane-concurrency.mjs:38 |
+| H | prepReview.maxPerTick | PREP_REVIEW_MAX_PER_TICK | 3 | 0–20 | yes | B | scripts/conveyor/prep-review.mjs:470 |
+| H | reviewSeatPool.maxSlots | SEAT_POOL_MAX_SLOTS | 16 | 1–64 | yes | B | scripts/lib/review-seat-pool.mjs:13 |
+| H | reviewSeats.providerDailyCaps | PROVIDER_CAP_DEFAULT | codex: 80, agy-claude: 300, agy-gemini: 0 calls/day; env overrides | 0–2,000 per provider | yes | B | scripts/lib/review-seat-caps.mjs:30 |
+| H | verify.suiteTimeoutMs | VERIFY_TIMEOUT_MS | 30 min | 5–120 min | yes | B | scripts/operations/verify-io.mjs:51 |
+| H | workerWrapper.timeoutMsByRole | WRAPPED_TIMEOUT_MS_BY_ROLE | fix 120, ci-heal 120, review 60 min | 10-240 min | yes | G | scripts/operations/worker-wrapper-launch.mjs:57 |
+
 ## Hard-coded constants to settle
 
 | Impact | Proposed key | Identifier | Current | Range | Instant candidate | Pass | Location |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | H | advisoryFix.maxRounds | ADVISORY_FIX_ROUND_CAP | 3 | 1–10 | yes | B | scripts/conveyor/reconcile-core.mjs:627 |
+| H | awaitVerify.maxReds | AWAIT_VERIFY_LIMITS.maxReds | 3 | 1–10 | yes | D | scripts/conveyor/await-verify-pass.mjs:67 |
+| H | awaitVerify.maxResumeFailures | AWAIT_VERIFY_LIMITS.maxResumeFailures | 3 | 1–10 | yes | D | scripts/conveyor/await-verify-pass.mjs:67 |
+| H | awaitVerify.maxRetries | AWAIT_VERIFY_LIMITS.maxRetries | 2 | 0–10 | yes | D | scripts/conveyor/await-verify-pass.mjs:67 |
+| H | buildDispatch.claimTtlMinutes | DEFAULT_BUILD_DISPATCH_CLAIM_TTL_MINUTES | 240 min | 60-720 | yes | E | scripts/conveyor/build-dispatch-claim.mjs:42 |
+| H | buildDispatch.holdMinutes | DEFAULT_BUILD_DISPATCH_HOLD_MINUTES | 240 min | 15-720 min | yes | G | scripts/conveyor/build-dispatch-claim.mjs:134 |
+| H | buildDispatch.orphanAdopt.maxResumeAttempts | MAX_RESUME_ATTEMPTS | 3 | 0-10 | yes | E | scripts/conveyor/build-dispatch-orphan-adopt.mjs:143 |
 | H | buildPrepare.deadSessionGraceMs | PREPARE_SESSION_DEAD_GRACE_MS | 20 min | 1–60 min | yes | B | skills-src/conveyor/build-dispatch-daemon.mjs:120 |
 | H | buildPrepare.refusalHoldMs | PREPARE_REFUSAL_HOLD_MS | 30 min | 1–120 min | yes | B | skills-src/conveyor/build-dispatch-daemon.mjs:123 |
+| H | ci.hetznerUnitShardCount | test-shard.strategy.matrix.shard | 10 jobs | 2–32; synchronize shard partitioning | no | D | .github/workflows/hetzner-jobs.yml:27 |
+| H | ci.soakShardCount | soak-shard.strategy.matrix.shard | 8 jobs | 1–32 | no | D | .github/workflows/ci.yml:592 |
+| H | ci.unitShardCount | test-shard.strategy.matrix.shard | 10 jobs: 9 coverage + 1 without coverage | 2–32; synchronize divisors and coverage merge | no | D | .github/workflows/ci.yml:203 |
+| H | ciHeal.launchWaveSize | LAUNCH_WAVE | 4 | 1–16 | yes | F | scripts/operations/ci-heal-pr-dispatch.mjs:422 |
 | H | codexDirect.{taskTimeoutMs,installTimeoutMs,cloneTimeoutMs,gitStepTimeoutMs} | task / install / clone / git-step timeouts | 30 / 5 / 10 / 5 min | 1-120 min | no | C | scripts/codex-direct-task.mjs:143 |
 | H | conflictFix.maxRoundsPerTarget | CONFLICT_FIX_ROUND_CAP | 3 | 1–10 | yes | B | scripts/conveyor/reconcile-core.mjs:591 |
 | H | conflictFix.maxTotalRounds | CONFLICT_FIX_ABSOLUTE_CEILING | 9 (round cap × 3) | 3–30; ≥ per-target cap | yes | B | scripts/conveyor/reconcile-core.mjs:612 |
+| H | conveyor.ciHeal.retryCap | DEFAULT_CI_HEAL_RETRY_CAP | 3 (copied in operations/land-advance-repair.mjs) | 1-10 | yes | E | scripts/conveyor/tick-core.mjs:358 |
+| H | conveyor.fix.retryCap | DEFAULT_FIX_RETRY_CAP | 3 | 1-10 | yes | E | scripts/conveyor/tick-core.mjs:333 |
+| H | conveyor.guardTtl.buildTicks | DEFAULT_BUILD_TTL_TICKS | 3 ticks | 1-20 | yes | E | scripts/conveyor/tick-core.mjs:314 |
+| H | conveyor.guardTtl.prepareItemTicks | DEFAULT_PREPARE_ITEM_TTL_TICKS | 20 ticks | 5-60 | yes | E | scripts/conveyor/tick-core.mjs:323 |
 | H | conveyor.passIntervalMs | DEFAULT_PASS_INTERVAL_MS | 120,000 ms | 10,000–900,000 ms | yes | B | skills-src/conveyor/daemon-manifest.mjs:34 |
+| H | conveyor.prepareItem.retryCap | DEFAULT_PREPARE_ITEM_RETRY_CAP | 2 | 0-10 | yes | E | scripts/conveyor/tick-core.mjs:329 |
 | H | conveyor.stallMs | DEFAULT_STALL_MS | 180000 | 1-30 min | no | C | scripts/readiness/conveyor-state.mjs:74 |
 | H | daemonJobs.foreignStaleMs | DEFAULT_FOREIGN_STALE_MS | 30 min | 5 min–6 h | yes | B | scripts/lib/daemon-jobs.mjs:71 |
 | H | daemonJobs.heartbeatStaleMs | DEFAULT_HEARTBEAT_STALE_MS | 60,000 ms | 30,000–600,000 ms; > heartbeat interval | yes | B | scripts/lib/daemon-jobs.mjs:68 |
 | H | daemonJobs.launchGraceMs | DEFAULT_LAUNCH_GRACE_MS | 30,000 ms | 5,000–300,000 ms | yes | B | scripts/lib/daemon-jobs.mjs:74 |
+| H | delivery.agentTimeoutMs | DELIVERY_AGENT_SPAWN_TIMEOUT_MS | 60 min | 15-240 min | yes | G | scripts/operations/deliver-item-wrapper.mjs:1126 |
+| H | dispatchLaunch.timeoutMs | LAUNCH_TIMEOUT_MS | 15 min | 1–60 min | yes | D | scripts/conveyor/pending-launches.mjs:18 |
+| H | dispatchRetry.baseMs | BACKOFF_DEFAULTS.baseMs | 5 min; env override | 10 s–30 min | yes | D | scripts/conveyor/retry-backoff.mjs:10 |
+| H | dispatchRetry.maxAttempts | BACKOFF_DEFAULTS.maxAttempts | 6; env override | 1–20 | yes | D | scripts/conveyor/retry-backoff.mjs:10 |
+| H | dispatchRetry.maxMs | BACKOFF_DEFAULTS.maxMs | 60 min; env override | 1 min–6 h; ≥ base | yes | D | scripts/conveyor/retry-backoff.mjs:10 |
+| H | fix.claimTtlMinutes | DEFAULT_FIX_CLAIM_TTL_MINUTES | 20 min | 5-120 | yes | E | scripts/conveyor/fix-procedure.mjs:75 |
 | H | fixBorrow.maxUnproductiveRuns | BORROW_MAX_UNPRODUCTIVE | 2 | 1–5 | yes | B | scripts/lib/fix-slot-borrow.mjs:153 |
+| H | fixExecutor.rungRoutes.codexAlt | FIX_EXECUTOR_RUNGS.codex-alt.policyRoute | codex / gpt-6-astra / high | Supported provider/model/effort combinations | yes | D | scripts/lib/fix-executor-chain.mjs:12 |
 | H | fixRouting.maxCodexUnproductiveRuns | ROUTED_CODEX_MAX_UNPRODUCTIVE | 2 | 1–5 | yes | B | scripts/lib/fix-slot-borrow.mjs:157 |
 | H | forge.execSlots | FORGE_EXEC_SLOTS | getent count 1..128 | 1-128 | yes | C | scripts/readiness/forge-exec-limits.mjs:98 |
 | H | forge.runWallMs | FORGE_RUN_WALL_MS | 29 min | 10-60 min | no | C | scripts/readiness/forge-exec-run.mjs:16 |
 | H | forge.slots.runlessDeadGraceMs | RUNLESS_DEAD_GRACE_MS | 15 min | 2-60 min | no | C | scripts/readiness/forge-slot-markers.mjs:17 |
 | H | ghThrottle.acquireTimeoutMs | DEFAULT_ACQUIRE_TIMEOUT_MS | 120,000 ms; env override | 0–300,000 ms | yes | B | scripts/lib/gh-throttle.mjs:214 |
 | H | ghThrottle.headerWaitCapMs | DEFAULT_HEADER_WAIT_CAP_MS | 600,000 ms; env override | 0–3,600,000 ms | yes | B | scripts/lib/gh-throttle.mjs:895 |
+| H | ghThrottle.pointsBudgetPerMin | DEFAULT_GH_POINTS_BUDGET_PER_MIN | 300; env override | 50–800 | yes | H | scripts/lib/gh-throttle.mjs:266 |
 | H | ghThrottle.priorityHeadroom | GH_PRIORITY_THRESHOLDS | background: 25%, normal: 10%, critical: 0% remaining | 0–90% per priority; ordered | yes | B | scripts/lib/gh-throttle.mjs:540 |
 | H | ghThrottle.retryCapMs | DEFAULT_RETRY_CAP_MS | 60,000 ms; env override | 1,000–300,000 ms | yes | B | scripts/lib/gh-throttle.mjs:223 |
 | H | ghThrottle.retryMaxAttempts | DEFAULT_RETRY_MAX_ATTEMPTS | 5; env override | 1–10 | yes | B | scripts/lib/gh-throttle.mjs:226 |
+| H | ghThrottle.writeBudgetPerMin | DEFAULT_GH_WRITE_BUDGET_PER_MIN | 40; env override | 5–80 | yes | H | scripts/lib/gh-throttle.mjs:292 |
+| H | healthJobs.prewarmFailedHoldMs | PREWARM_FAILED_HOLD_MS | 30 min | 1–120 min | yes | D | scripts/conveyor/health-watch-job.mjs:125 |
 | H | healthWatch.maxConcurrentJobs | HEALTH_WATCH_JOB_CAP | 2 | 1–8 | yes | B | skills-src/conveyor/daemon-manifest.mjs:220 |
 | H | heavyAdmission.ceilingMs | DEFAULT_ADMISSION_CEILING_MS | 120 min | 10-240 min | yes | C | scripts/readiness/heavy-admission.mjs:202 |
 | H | heavyAdmission.leaseMinutes | ADMISSION_LEASE_MINUTES | 60 | 15-180 | no | C | scripts/readiness/heavy-admission.mjs:213 |
 | H | heavyAdmission.load.minIdlePct | DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT | 15 | 5-50 | yes | C | scripts/readiness/heavy-admission.mjs:1702 |
 | H | heavyAdmission.timeoutMs | DEFAULT_TIMEOUT_MS | 20 min | 1-120 min | yes | C | scripts/readiness/heavy-admission.mjs:198 |
+| H | hungSession.noOutcome.<kind>.{windowMin,ceilingMin} | NO_OUTCOME_DEFAULT_MINUTES | conveyor 45/240, fix 30/120, review 30/60, prepare 45/180 | 10-480 min | yes | E | scripts/conveyor/hung-session.mjs:255 |
+| H | hungSession.thresholdMs | DEFAULT_HUNG_THRESHOLD_MS | 30 min; env | 5-180 min | yes | E | scripts/conveyor/hung-session.mjs:76 |
+| H | infraBlocked.maxAttempts | DEFAULT_MAX_ATTEMPTS | 6 | 1-20 | yes | E | scripts/conveyor/infra-blocked.mjs:68 |
 | H | infraRetry.cooloffMs | INFRA_RETRY_COOLOFF_MS | 15 min; env override | 1–120 min | yes | B | scripts/conveyor/reconcile-core.mjs:877 |
 | H | infraRetry.exhaustedCooloffMs | INFRA_RETRY_CAPPED_COOLOFF_MS | 1 h | 15 min–6 h | yes | B | scripts/conveyor/reconcile-core.mjs:918 |
 | H | infraRetry.streakCap | INFRA_RETRY_CAP | 4 | 1–10 | yes | B | scripts/conveyor/reconcile-core.mjs:913 |
@@ -286,6 +347,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | H | lanePool.acquireHardMax.<repo> | ACQUIRE_HARD_MAX | 90 / 30 | 10-300 | yes | C | scripts/lane-pool.mjs:4784 |
 | H | lanePool.acquireWaitMs | ACQUIRE_DEFAULT_WAIT_MS | 8000 | 0-60000 | yes | C | scripts/lane-pool.mjs:1007 |
 | H | lanePool.trimCap.<repo> | TRIM_DEFAULT_CAP | web-everything 60, frontierui/plateau-app 20 | 5-200 | yes | C | scripts/lane-pool.mjs:4743 |
+| H | mainRedRecovery.hungThresholdMs | DEFAULT_HUNG_THRESHOLD_MS | 45 min | 10-180 min | yes | E | scripts/conveyor/main-red-recovery.mjs:981 |
 | H | operator.agentTimeoutMs | DEFAULT_AGENT_TIMEOUT_MS | 60 min | 10-180 min | no | C | scripts/operator/dispatch.mjs:56 |
 | H | orphanFix.graceMs | DEFAULT_ORPHAN_GRACE_MS | 15 min | 1–60 min | yes | B | scripts/conveyor/orphan-fix-round.mjs:62 |
 | H | orphanFix.maxEvidencelessRounds | EVIDENCELESS_ROUND_CAP | 2 | 1–5 | yes | B | scripts/conveyor/orphan-fix-round.mjs:65 |
@@ -295,35 +357,136 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | H | permissionRetry.streakCap | PERMISSION_RETRY_CAP | 3 | 1–10 | yes | B | scripts/conveyor/reconcile-core.mjs:933 |
 | H | prepReview.budgetUsd | PREP_REVIEW_BUDGET_USD | $0.25 | $0.05–$2 | yes | B | scripts/conveyor/prep-review.mjs:41 |
 | H | prepReview.maxPerTick | PREP_REVIEW_MAX_PER_TICK | 3 | 0–20 | yes | B | scripts/conveyor/prep-review.mjs:470 |
+| H | prepareFailure.infraRetryBudget | INFRA_RETRY_BUDGET | 2 | 0–10 | yes | D | scripts/conveyor/prepare-failure-policy.mjs:12 |
 | H | providerQuota.codexFullPercent | CODEX_QUOTA_FULL_PERCENT | 98% | 80–100% | yes | B | scripts/lib/provider-quota-hold.mjs:3 |
 | H | providerQuota.unknownResetCooloffMs | QUOTA_COOLOFF_MS | 1 h | 5 min–6 h | yes | B | scripts/lib/provider-quota-hold.mjs:2 |
+| H | reconcileFixDaemon.intervalMs | DEFAULT_INTERVAL_MS | 120000 | 15000-600000 | yes | G | skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:138 |
 | H | referralPersistence.retryDelaysMs | REFERRAL_RETRY_MS | 15, 30, 60 min | 1–6 increasing delays, each 1–120 min | yes | B | scripts/conveyor/review-referral-hold.mjs:48 |
+| H | review.judgeModel | JUDGE_MODEL | sonnet | sonnet/opus/haiku | yes | G | scripts/operations/review-pr.mjs:1074 |
+| H | review.jurorBudgetUsd | DEFAULT_BUDGET_USD | 1.50 USD per juror | 0.25-10 | yes | G | scripts/lib/judge-spawn.mjs:510 |
+| H | review.jurorTimeoutMs | JUDGE_TIMEOUT_MS | 20 min | 5-60 min | yes | G | scripts/lib/judge-spawn.mjs:190 |
+| H | reviewJob.loopTimeoutMs | DEFAULT_LOOP_TIMEOUT_MS | 45 min; env override | 10–120 min | yes | D | scripts/operations/review-job.mjs:177 |
+| H | reviewJob.maxLaneDeferrals | MAX_LANE_DEFERRALS | 5 | 1–20 | yes | D | scripts/operations/review-job.mjs:169 |
 | H | reviewNoVerdictRetry.cooldownBaseMs | VERDICT_COOLDOWN_BASE_MS | 1 h | 5 min–4 h | yes | B | scripts/conveyor/review-referral-hold.mjs:413 |
 | H | reviewNoVerdictRetry.cooldownCapMs | VERDICT_COOLDOWN_CAP_MS | 8 h | 1–24 h; ≥ base | yes | B | scripts/conveyor/review-referral-hold.mjs:414 |
 | H | reviewNoVerdictRetry.verdictGraceMs | VERDICT_GRACE_MS | 10 min | 30 s–30 min | yes | B | scripts/conveyor/review-referral-hold.mjs:448 |
 | H | reviewResume.maxAttempts | RESUME_MAX_ATTEMPTS | 3 | 1–10 | yes | B | scripts/conveyor/review-referral-hold.mjs:30 |
 | H | reviewSeatPool.maxSlots | SEAT_POOL_MAX_SLOTS | 16 | 1–64 | yes | B | scripts/lib/review-seat-pool.mjs:13 |
 | H | reviewSeats.providerDailyCaps | PROVIDER_CAP_DEFAULT | codex: 80, agy-claude: 300, agy-gemini: 0 calls/day; env overrides | 0–2,000 per provider | yes | B | scripts/lib/review-seat-caps.mjs:30 |
+| H | reviewSeats.timeoutMs | DEFAULT_SEAT_TIMEOUT_MS | 12 min; env override | 2–60 min | yes | D | scripts/operations/review-extra-seats.mjs:104 |
 | H | scope.claimTtlMinutes | DEFAULT_TTL_MINUTES | 120 | 30-480 | no | C | scripts/readiness/claimScope.mjs:35 + scripts/readiness/reservations.mjs:35 |
+| H | stuckPrWatch.maxConcurrentInspections | DEFAULT_MAX_CONCURRENT_INSPECTIONS | 2; env | 0-10 | yes | E | scripts/conveyor/stuck-pr-watch-core.mjs:236 |
 | H | supervisor.idleMaxBackoffMs | DEFAULT_IDLE_MAX_BACKOFF_MS | 900,000 ms; CLI override | 30,000–1,800,000 ms | yes | B | skills-src/conveyor/supervisor.mjs:77 |
 | H | verify.suiteTimeoutMs | VERIFY_TIMEOUT_MS | 30 min | 5–120 min | yes | B | scripts/operations/verify-io.mjs:51 |
+| H | verifyDispatch.timeoutMs | DEFAULT_VERIFY_DISPATCH_TIMEOUT_MS | 30 min; env | 10-120 min | yes | E | scripts/conveyor/verify-dispatch.mjs:149 |
+| H | worker.maxAwaitResumes | MAX_AWAIT_RESUMES | 6 | 1–20 | yes | D | scripts/operations/worker-wrapper.mjs:54 |
+| H | workerWrapper.timeoutMsByRole | WRAPPED_TIMEOUT_MS_BY_ROLE | fix 120, ci-heal 120, review 60 min | 10-240 min | yes | G | scripts/operations/worker-wrapper-launch.mjs:57 |
+| M | acceptCarry.{backoffBaseMs,backoffMaxMs} | TRANSIENT_BACKOFF_BASE_MS / MAX | 1 / 30 min | 10 s-120 min | yes | E | scripts/conveyor/accept-carry-sweep.mjs:37 |
+| M | advisoryConversion.targetedCheckBudgetUsd | TARGETED_CHECK_BUDGET_USD | $0.50 | $0.05–$5 | yes | H | scripts/conveyor/convert-advisory-dispatch.mjs:83 |
+| M | alreadyDone.doneCooldownMs | ALREADY_DONE_DONE_COOLDOWN_MS | 24 h; env override | 1–168 h | yes | F | scripts/readiness/already-done-cache.mjs:19 |
+| M | alreadyDone.networkChecksPerTick | NETWORK_CHECKS_PER_TICK | 2 | 1–20 | yes | F | scripts/readiness/already-done-refresh.mjs:11 |
+| M | alreadyDone.notDoneCooldownMs | ALREADY_DONE_NOT_DONE_COOLDOWN_MS | 30 min; env override | 1–120 min | yes | F | scripts/readiness/already-done-cache.mjs:17 |
+| M | antigravity.judgeModel | ANTIGRAVITY_MODEL | gemini-4-carbon-high | model id | yes | G | scripts/lib/antigravity-judge-spawn.mjs:171 |
+| M | autoRoundGrant.stuckAfterGrantMs | STUCK_AFTER_GRANT_MS | 20 min | 5-120 min | yes | E | scripts/conveyor/auto-round-grant-io.mjs:236 |
 | M | autofix.model | DEFAULT_MODEL | claude-opus-4-8 | model ids | no | C | scripts/autofix/modelFixer.mjs:162 |
+| M | awaitChecks.maxTimeoutMinutes | MAX_TIMEOUT_MIN | 120 min | 15–360 min | yes | D | scripts/operations/await-checks.mjs:16 |
+| M | awaitChecks.minPollMs | MIN_POLL_MS | 60 s | 30–300 s | yes | D | scripts/operations/await-checks.mjs:15 |
+| M | awaitVerify.loadDeferMaxMs | AWAIT_LOAD_DEFER_MAX_MS | 2 h | 15 min-6 h | yes | G | scripts/conveyor/await-verify-pass.mjs:66 |
+| M | awaitVerify.selfReviewMaxMs | AWAIT_VERIFY_LIMITS.selfReviewMaxMs | 30 min | 5–120 min | yes | D | scripts/conveyor/await-verify-pass.mjs:67 |
+| M | awaitVerify.workingClaimWindowMinutes | WORKING_CLAIM_WINDOW_MINUTES | 60 | 30-180 | yes | I | scripts/conveyor/await-verify-loop.mjs:338 |
+| M | branchSync.{maxAttempts,backoffBaseMs,backoffCapMs} | DEFAULT_MAX_ATTEMPTS / BASE / CAP | 5 / 1 min / 20 min | 1-20 | yes | E | scripts/conveyor/branch-sync.mjs:73 |
+| M | brandMark.panelBudgetUsd | mark panel --max-total-budget-usd | $2 | $0.25–$10 | yes | D | skills-src/brand-mark-loop/SKILL.md:64 |
 | M | buildDispatch.infraRetryTimeoutMs | INFRA_RETRY_TIMEOUT_MS | 60,000 ms | 5,000–120,000 ms | yes | B | skills-src/conveyor/build-dispatch-daemon.mjs:128 |
+| M | buildDispatch.orphanAdopt.sessionActiveWindowMs | SESSION_ACTIVE_WINDOW_MS | 30 min | 5-120 min | yes | E | scripts/conveyor/build-dispatch-orphan-adopt.mjs:385 |
+| M | buildDispatch.redDraftStaleMinutes | DEFAULT_RED_DRAFT_MINUTES | 60; env only | 15-240 | yes | I | skills-src/conveyor/build-dispatch-daemon.mjs:2548 |
+| M | buildDispatch.resumeSpawnGraceMs | RESUME_SPAWN_GRACE_MS | 5 min | 1-30 min | yes | I | scripts/conveyor/build-dispatch-orphan-adopt.mjs:151 |
 | M | buildPrepare.stampRecoveryLeaseMinutes | STAMP_RECOVERY_LEASE_MINUTES | 360 min | 15–720 min | yes | B | skills-src/conveyor/build-dispatch-daemon.mjs:2488 |
+| M | child.defaultTimeoutMs | DEFAULT_CHILD_TIMEOUT_MS | 5 min; env override | 30 s–30 min | yes | H | scripts/lib/bounded-child.mjs:23 |
+| M | ci.drainVerdictCron | schedule.cron | */10 * * * * | 5-60 min | no | I | .github/workflows/drain-verdict.yml:12 |
+| M | ci.drainVerdictTimeoutMinutes | classify.timeout-minutes | 30 min | 5–90 min | no | D | .github/workflows/drain-verdict.yml:28 |
+| M | ci.hetznerIntegrationTimeoutMinutes | integration.timeout-minutes | 20 min | 10–90 min | no | D | .github/workflows/hetzner-jobs.yml:133 |
+| M | ci.hetznerUnitTimeoutMinutes | test-shard.timeout-minutes | 25 min | 10–90 min | no | D | .github/workflows/hetzner-jobs.yml:23 |
+| M | ci.integrationTimeoutMinutes | integration.timeout-minutes | 20 | 10-90 | no | I | .github/workflows/ci.yml:426 |
+| M | ci.liveTestsTimeoutMinutes | live.timeout-minutes | 20 min | 5–90 min | no | D | .github/workflows/live-tests.yml:29 |
+| M | ci.mergeGateTimeoutMinutes | merge-gate.timeout-minutes | 15 min | 5–60 min | no | D | .github/workflows/merge-gate.yml:104 |
+| M | ci.smokeTimeoutMinutes | smoke.timeout-minutes | 20 min | 10–60 min | no | D | .github/workflows/ci.yml:668 |
+| M | ci.soakShardTimeoutMinutes | soak-shard.timeout-minutes | 30 min | 20–120 min; > scenario timeout | no | D | .github/workflows/ci.yml:588 |
+| M | ci.standardsTimeoutMinutes | standards.timeout-minutes | 20 | 10-60 | no | I | .github/workflows/ci.yml:120 |
+| M | ci.unitShardTimeoutMinutes | test-shard.timeout-minutes | 25 min | 10–90 min | no | D | .github/workflows/ci.yml:193 |
+| M | ciHeal.infraCancelledMaxReruns | DEFAULT_INFRA_CANCELLED_MAX_RERUNS | 6 | 0-20 | yes | E | scripts/conveyor/infra-cancelled.mjs:19 |
+| M | ciHeal.maxVerdictVoidsPerHead | MAX_VERDICT_VOIDS_PER_HEAD | 3 | 0–10 | yes | D | skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:580 |
+| M | ciHeal.timeoutFollowupMaxAgeMs | TIMEOUT_PENDING_MAX_AGE_MS | 7 days | 1–30 days | yes | F | scripts/operations/ci-heal-pr-dispatch.mjs:920 |
 | M | ciHealOwed.maxAgeMs | OWED_MAX_AGE_MS | 6 h | 1–48 h | yes | B | scripts/conveyor/ci-heal-owed.mjs:44 |
 | M | ciHealOwed.maxAttempts | OWED_MAX_ATTEMPTS | 24 | 1–100 | yes | B | scripts/conveyor/ci-heal-owed.mjs:47 |
+| M | ciQueueWatch.{hungFloorSec,hungCeilingSec} | DEFAULT_HUNG_FLOOR_SEC / CEILING | 30 / 90 min | 5-240 min | yes | G | scripts/conveyor/ci-queue-watch.mjs:199 |
+| M | ciQueueWatch.{hungMaxReruns,cancelGraceMs} | DEFAULT_HUNG_MAX_RERUNS / CANCEL_GRACE_MS | 1 / 5 min | 0-5 / 1-30 min | yes | E | scripts/conveyor/ci-queue-watch.mjs:217 |
 | M | conflictDisposition.maxPerPass | CONFLICT_DISPOSITION_MAX_PER_PASS | 20 | 1–100 | yes | B | scripts/conveyor/reconcile-pass.mjs:1388 |
+| M | converge.editorModel | converge editor --model | sonnet | alias | yes | G | scripts/operations/deliver-item-wrapper.mjs:2076 |
+| M | converge.panelBudgetUsd | converge panel --max-total-budget-usd | $8 | $0.50–$50 | yes | D | skills-src/converge/SKILL.md:121 |
+| M | converge.{panelMaxBudgetUsd,maxLoopSteps} | CONVERGE_PANEL_MAX_BUDGET_USD / CONVERGE_MAX_LOOP_STEPS | 8 USD / 200 | 1-50 / 20-500 | yes | G | scripts/operations/deliver-item-wrapper.mjs:1912 |
+| M | conveyor.guardTtl.{prepareTicks,fixTicks,ciHealTicks} | PREPARE/FIX/CI_HEAL TTL_TICKS | 5 / 5 / 5 | 2-30 | yes | E | scripts/conveyor/tick-core.mjs:316 |
+| M | conveyor.idleWindowMs | DEFAULT_IDLE_WINDOW_MS | 15 min | 5-120 min | yes | E | scripts/conveyor/tick-core.mjs:360 |
 | M | conveyor.instrument.{pollIntervalS,saturationThreshold} | DEFAULT_POLL_INTERVAL_S / DEFAULT_SATURATION_THRESHOLD | 60 / 0.5 | 15-600 / 0.1-1 | no | C | scripts/readiness/conveyor-instrument.mjs:74,75 |
+| M | conveyor.prepareRefusal.{limit,windowMs} | PREPARE_REFUSAL_LIMIT / WINDOW | 2 / 24 h | 1-10 / 1-72 h | yes | E | scripts/conveyor/tick-core.mjs:635 |
 | M | conveyor.runJsonTimeoutMs | RUN_JSON_TIMEOUT_MS | 2 min | 30 s-10 min | no | C | scripts/readiness/conveyor-state.mjs:676 |
+| M | coordination.tickClaimStaleMs | DEFAULT_CLAIM_STALE_MS | 10 min | 1–60 min | yes | D | scripts/operations/tick-throttle.mjs:36 |
+| M | coordination.tickMinIntervalMs | DEFAULT_MIN_INTERVAL_MS | 60 s; env override | 0–300 s | yes | D | scripts/operations/tick-throttle.mjs:35 |
+| M | coroner.sampleBudgetUsd | DEFAULTS.budgetUsd | $0.25 per call; env override | $0.05–$2 | yes | D | scripts/operations/coroner-sample.mjs:28 |
+| M | coroner.sampleConcurrency | DEFAULTS.concurrency | 4; env override | 1–16 | yes | D | scripts/operations/coroner-sample.mjs:28 |
+| M | coroner.sampleEffort | DEFAULTS.effort | low | Supported effort levels for selected model | yes | D | scripts/operations/coroner-sample.mjs:28 |
 | M | daemonJobs.backoffBaseMs | DEFAULT_BACKOFF_BASE_MS | 30,000 ms | 1,000–300,000 ms | yes | B | scripts/lib/daemon-jobs.mjs:77 |
+| M | daemonRebuild.childTimeoutMs | REBUILD_CHILD_TIMEOUT_MS | 60 min | 15-180 min | yes | E | scripts/lib/daemon-rebuild/rebuild-job.mjs:58 |
+| M | daemonRebuild.depsCloneTimeoutMs | node_modules clone timeout | 5 min | 1–30 min | yes | F | scripts/lib/daemon-rebuild/deps-job.mjs:121 |
+| M | daemonRebuild.depsCopyTimeoutMs | node_modules fallback copy timeout | 10 min | 2–60 min | yes | F | scripts/lib/daemon-rebuild/deps-job.mjs:123 |
+| M | daemonRebuild.depsMaxAttempts | DEPS_JOB_KIND.maxAttempts | 2 | 1–8 | yes | F | scripts/lib/daemon-rebuild/deps-job.mjs:72 |
+| M | daemonRebuild.envLoadRetryBaseMs | DEFAULT_ENV_LOAD_RETRY_BASE_MS | 5 min; env override | 30 s–30 min | yes | H | scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs:29 |
+| M | daemonRebuild.envLoadRetryMaxMs | DEFAULT_ENV_LOAD_RETRY_MAX_MS | 60 min; env override | 5–240 min; ≥ base | yes | H | scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs:30 |
+| M | daemonRebuild.{leaseStaleMs,readyMaxAgeMs} | DEFAULT_REBUILD_LEASE_STALE_MS / READY_MAX_AGE | 20 min / 2 h; env | 5-60 min / 30 min-12 h | yes | E | scripts/lib/daemon-rebuild/lease.mjs:90 |
+| M | daemonVersion.smokeBackoffBaseMs | SMOKE_BACKOFF_BASE_MS | 5 min | 30 s–30 min | yes | F | scripts/lib/daemon-version-runtime.mjs:29 |
+| M | daemonVersion.smokeBackoffMaxMs | SMOKE_BACKOFF_MAX_MS | 60 min | 5–240 min; ≥ base | yes | F | scripts/lib/daemon-version-runtime.mjs:30 |
+| M | delivery.implLaneAcquireWaitMs | IMPL_LANE_ACQUIRE_WAIT_MS | 60 s | 0-15 min | yes | I | scripts/operations/deliver-item-wrapper.mjs:915 |
+| M | delivery.restrictedProviderModel | restricted provider model / effort | sonnet / medium | alias | yes | G | scripts/operations/minimal-context-provider.mjs:173 |
+| M | delivery.{agentModel,agentEffort} | spawn default model / effort | sonnet / medium | alias; low-max | yes | G | scripts/operations/deliver-item-wrapper.mjs:1230 |
+| M | derive from conveyor.passIntervalMs | TTL_MS_PER_TICK | 120000 (hand copy of tick interval) | = tick | yes | E | scripts/conveyor/tick-core.mjs:344 |
+| M | derive from heavyAdmission.ceilingMs | DEFAULT_AWAIT_VERIFY_TTL_MS | 150 min (hand copy of ceiling + 30) | ceiling + margin | yes | E | scripts/conveyor/await-verify.mjs:22 |
 | M | derive from heavyAdmission.ceilingMs | ORPHAN_RUN_BOUND_MS | 120 min (hand copy of admission ceiling) | = ceiling | no | C | scripts/readiness/forge-slot-markers.mjs:552 |
+| M | designRefs.visionModel | DEFAULT_MODEL | claude-opus-4-8; env override | Supported vision-capable model IDs | yes | D | scripts/design-refs/providers/anthropic-vision.mjs:25 |
 | M | dispatch.alreadyDone.ageGateMs | ALREADY_DONE_AGE_GATE_MS | 2 h | 15 min-24 h | no | C | scripts/readiness/dispatch-plan.mjs:306 |
 | M | dispatch.alreadyDone.{notDoneCooldownMs,doneCooldownMs} | NOT_DONE / DONE cooldowns | 30 min / 24 h | 5 min-7 d | yes | C | scripts/readiness/already-done-cache.mjs:17 |
+| M | dispatch.spawnTimeoutMs | SPAWN_TIMEOUT_MS | 60 s | 15 s-5 min | yes | I | scripts/operations/dispatch-lane-io.mjs:1146 |
+| M | dispatch.tickTimeoutMs | TICK_TIMEOUT_MS | 5 min | 1-15 min | yes | I | scripts/operations/dispatch-lane-io.mjs:1231 |
+| M | drain.followUpMaxAttempts | FOLLOW_UP_MAX_ATTEMPTS | 5 | 1-10 | yes | G | scripts/lib/drain-merge-strategy.mjs:72 |
+| M | drain.panelBudgetUsd | drain panel --max-total-budget-usd | $8 | $0.50–$50 | yes | D | skills-src/drain/SKILL.md:362 |
+| M | drain.poisonGuardMaxMainReads | MAX_MAIN_READS | 64 | 16–512 | yes | F | scripts/lib/drain-poison-guard.mjs:15 |
+| M | drain.{mqMergeConflictRetryCap,mqMainGreenMaxAgeMs} | MQ_MERGE_CONFLICT_RETRY_CAP / MQ_MAIN_GREEN_MAX_AGE_MS | 3 / 2 h | 1-10 / 30 min-12 h | yes | E | scripts/lib/drain-queue-safety.mjs:20 |
 | M | drain.{numberingLeaseMinutes,landLeaseMinutes} | NUMBERING / POC_LAND lease | 5 / 20 min | 1-60 | no | C | scripts/readiness/drain-lock.mjs:75,277 |
+| M | drain.{unknownMergeabilityRetries,watchIntervalSec} | UNKNOWN_MERGEABILITY_RETRY.retries / watch interval | 3 / 30 s | 0-10 / 10-300 s | yes | E | scripts/merge-ai-prs.mjs:1217 |
+| M | driverWatchdog.staleAfterMs | DEFAULT_STALE_AFTER_MS | 20 min | 5-120 min | yes | E | scripts/conveyor/driver-watchdog.mjs:83 |
+| M | explore.maxPanelSize | MAX_PANEL_SIZE | 5 | 1–12 | yes | D | scripts/operations/explore.mjs:109 |
+| M | fix.dispatchClaimMaxRefreshMs | MAX_FIX_DISPATCH_CLAIM_REFRESH_MS | 4 h | 1-12 h | yes | E | scripts/conveyor/fix-dispatch-claim.mjs:319 |
+| M | fix.dispatchClaimTtlMinutes | DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES | 10 min | 2-60 | yes | E | scripts/conveyor/fix-claim-store.mjs:21 |
+| M | fix.idleClaimObservationGapMs | MAX_IDLE_CLAIM_OBSERVATION_GAP_MS | 20 min | 10-60 min | yes | I | scripts/conveyor/fix-dispatch-claim.mjs:323 |
 | M | fixBorrow.failureWindowMs | BORROW_FAILURE_WINDOW_MS | 1 h | 5 min–6 h | yes | B | scripts/lib/fix-slot-borrow.mjs:154 |
 | M | fixBorrow.waitGapMs | BORROW_WAIT_GAP_MS | 20 min | 2–120 min | yes | B | scripts/lib/fix-slot-borrow.mjs:144 |
+| M | fixDispatch.queueCapRefusalCap | QUEUE_CAP_REFUSAL_CAP | 3 | 1-10 | yes | G | scripts/conveyor/queue-cap-refusal-count.mjs:48 |
+| M | fixRun.pendingRearmMaxAgeMs | PENDING_REARM_MAX_AGE_MS | 7 days | 1–30 days | yes | D | scripts/operations/fix-run.mjs:75 |
+| M | fixTakeover.maxVoids | TAKEOVER_MAX_VOIDS | 2 | 0-5 | yes | G | scripts/conveyor/fix-takeover.mjs:214 |
+| M | fixerReclaim.waitLoopGraceMinutes | DEFAULT_WAIT_LOOP_GRACE_MINUTES | 15 | 5-60 | yes | G | scripts/conveyor/fixer-stuck-reclaim.mjs:47 |
 | M | forge.maxGateTimeoutMs | MAX_GATE_TIMEOUT_MS | 60 min | 15-120 min | no | C | scripts/readiness/forge-exec-run.mjs:38 |
 | M | forge.reapGraceMs | REAP_GRACE_MS | 15 min | 5-60 min | no | C | scripts/readiness/forge-exec-run.mjs:802 |
+| M | harvestLearnings.panelBudgetUsd | harvest panel --max-total-budget-usd | $6 | $0.50–$30 | yes | D | skills-src/harvest-learnings/SKILL.md:116 |
+| M | healthFileRequest.attemptTimeoutMs | ATTEMPT_TIMEOUT_MS | 30 min | 5–120 min | yes | D | scripts/conveyor/health-file-request.mjs:59 |
+| M | healthFileRequest.maxPerDay | MAX_PER_DAY | 3 | 0–20 | yes | D | scripts/conveyor/health-file-request.mjs:57 |
+| M | healthJobs.ghProbeTimeoutMs | GH_PROBE_TIMEOUT_MS | 10 min | 1–30 min | yes | D | scripts/conveyor/health-watch-job.mjs:51 |
+| M | healthJobs.prewarmBackoffBaseMs | PREWARM_BACKOFF_BASE_MS | 60 s | 5 s–10 min | yes | D | scripts/conveyor/health-watch-job.mjs:122 |
+| M | healthJobs.prewarmMaxAttempts | PREWARM_MAX_ATTEMPTS | 3 | 1–10 | yes | D | scripts/conveyor/health-watch-job.mjs:123 |
+| M | healthJobs.prewarmMaxMs | PREWARM_MAX_MS | 25 min | 5–90 min | yes | D | scripts/conveyor/health-watch-job.mjs:120 |
+| M | healthWatch.forgeDiskUsedPctMax | DISK_USED_PCT_MAX | 80% | 60–95% | yes | D | scripts/conveyor/health-smells/forge-disk-prune.mjs:15 |
+| M | healthWatch.forgePruneRefusedMax | PRUNE_REFUSED_MAX | 3 | 1–10 | yes | D | scripts/conveyor/health-smells/forge-disk-prune.mjs:16 |
+| M | healthWatch.forgeTelemetryMaxAgeMs | TELEMETRY_MAX_AGE_MS | 15 min | 1–60 min | yes | D | scripts/conveyor/health-smells/forge-disk-prune.mjs:17 |
+| M | healthWatch.ghCadenceMs | GH_CADENCE_MS | 15 min | 2-60 min | yes | E | scripts/conveyor/health-watch.mjs:136 |
+| M | healthWatch.intervalMs / healthResponder.intervalMs | HEALTH_WATCH_INTERVAL_MS (+ responder :144) | 5 min / 60 s | 1-30 min / 15-600 s | yes | G | skills-src/conveyor/daemon-manifest.mjs:139 |
+| M | heavyAdmission.arrivalWindowMinutes | DEFAULT_ARRIVAL_WINDOW_MINUTES | 10 | 3-30 | yes | I | scripts/readiness/heavy-queue-projection.mjs:87 |
 | M | heavyAdmission.fastLane.{queueMaxWaitMin,maxFiles,runTimeoutMs} | fast lane queue wait / max files / run timeout | 30 / 30 / 8 min | 5-120 / 5-200 / 2-30 min | no | C | scripts/readiness/heavy-queue-projection.mjs:81,134,141 |
 | M | heavyAdmission.load.window | DEFAULT_LOAD_ADMISSION_WINDOW | 4 samples | 1-20 | yes | C | scripts/readiness/heavy-admission.mjs:1712 |
 | M | heavyAdmission.pollMs | DEFAULT_POLL_MS | 2000 | 500-10000 | no | C | scripts/readiness/heavy-admission.mjs:190 |
@@ -331,23 +494,97 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | M | heavyAdmission.remote.manifestConcurrency | MANIFEST_CONCURRENCY | 16 | 1-64 | no | C | scripts/readiness/remote-exec.mjs:39 |
 | M | heavyAdmission.remote.unreachableBackoffMs | UNREACHABLE_BACKOFF_MS | 15000 | 5-300 s | no | C | scripts/readiness/forge-remote-health.mjs:64 |
 | M | heavyAdmission.waitingTtlMinutes | WAITING_TTL_MINUTES | 30 | 5-120 | no | C | scripts/readiness/heavy-admission.mjs:219 |
+| M | hungSession.idleFinishedThresholdMs | DEFAULT_IDLE_FINISHED_THRESHOLD_MS | 10 min | 2-60 min | yes | G | scripts/conveyor/hung-session.mjs:420 |
+| M | infraBlocked.{backoffBaseMs,backoffCapMs} | DEFAULT_BASE_MS / DEFAULT_CAP_MS | 30 s / 30 min | 5 s-120 min | yes | E | scripts/conveyor/infra-blocked.mjs:62 |
+| M | infraBlocked.{maxAutoRearms,rearmCooloffMs} | DEFAULT_MAX_AUTO_REARMS / DEFAULT_REARM_COOLOFF_MS | 2 / 60 min | 0-10 / 10 min-6 h | yes | E | scripts/conveyor/infra-blocked.mjs:77 |
+| M | infraBlocked.{maxRefusals,refusalIntervalMs} | DEFAULT_MAX_REFUSALS / DEFAULT_REFUSAL_INTERVAL_MS | 12 / 5 min | 1-50 / 1-30 min | yes | E | scripts/conveyor/infra-blocked.mjs:74 |
+| M | infraCancelled.hungJobMinutes | DEFAULT_HUNG_JOB_MINUTES | 10; env | 5-60 | yes | G | scripts/conveyor/infra-cancelled.mjs:28 |
+| M | jury.{negotiationRoundCap,roundCap} | NEGOTIATION_ROUND_CAP / DEFAULT_ROUND_CAP | 5 / 5 | 1-10 | yes | G | scripts/lib/jury-core.mjs:1294 |
+| M | landAdvance.singleFlightLeaseMinutes | SINGLE_FLIGHT_LEASE_MINUTES | 10 | 2-60 | no | I | scripts/operations/land-advance-gate.mjs:27 |
+| M | landing.openPrTimeoutMs | OPEN_PR_TIMEOUT_MS | 45 min (copied at sweep-orphan-backlog-cards.mjs:108) | 10-90 min | yes | I | scripts/operations/land-prevention-card.mjs:316 |
+| M | landing.shortOpenPrTimeoutMs | OPEN_PR_TIMEOUT_MS | 10 min (copied at build-dispatch-hold-route-land.mjs:45) | 5-60 min | yes | I | scripts/operations/health-file-request-land.mjs:77 |
 | M | lanePool.acquirePollMs | ACQUIRE_POLL_MS | 1000 | 250-5000 | no | C | scripts/lane-pool.mjs:1006 |
 | M | lanePool.healLockStaleMs | HEAL_LOCK_STALE_MS | 15 min | 2-60 min | no | C | scripts/lane-pool.mjs:731 |
+| M | lanePool.installTimeoutMs | NPM_INSTALL_TIMEOUT_MS | 10 min | 2–60 min | yes | H | scripts/lib/bounded-child.mjs:43 |
 | M | lanePool.list.{cacheTtlMs,scanTimeoutMs} | DEFAULT_LIST_CACHE_TTL_MS / DEFAULT_LIST_SCAN_TIMEOUT_MS | 30 s / 120 s | 5 s-5 min | yes | C | scripts/lane-pool.mjs:4012,4013 |
 | M | lanePool.lsRemoteTimeoutMs | LS_TIMEOUT_MS | 15000 | 5-60 s | no | C | scripts/lane-pool.mjs:860 |
+| M | lanePool.networkGitTimeoutMs | NETWORK_GIT_TIMEOUT_MS | 10 min | 1–30 min | yes | H | scripts/lib/bounded-child.mjs:46 |
 | M | lanePool.provisionMaxNew | ACQUIRABLE_PROVISION_MAX_NEW_DEFAULT | 4 | 0-32 | yes | C | scripts/lane-pool.mjs:1796 |
 | M | lanePool.trimCap.default | TRIM_DEFAULT_CAP_FALLBACK | 20 | 5-200 | yes | C | scripts/lane-pool.mjs:4749 |
 | M | lanePool.verdictMemoMaxAgeMs | DEFAULT_VERDICT_MEMO_MAX_AGE_MS | 10 min | 1-60 min | no | C | scripts/lane-pool.mjs:4055 |
+| M | lanePoolHealth.salvageMaxPerTick | DEFAULT_SALVAGE_MAX_PER_TICK | 20; env | 0-100 | yes | E | scripts/conveyor/lane-pool-health-watch.mjs:559 |
+| M | laneRepair.deepCheckIntervalMs | DEEP_CHECK_INTERVAL_MS | 10 min | 1–60 min | yes | H | scripts/lib/lane-repair.mjs:463 |
+| M | laneRepair.recloneBackoffMs | RECLONE_BACKOFF_MS | 60 min | 5–240 min | yes | H | scripts/lib/lane-repair.mjs:451 |
+| M | laneVerify.ttlMinutes | DEFAULT_VERIFY_TTL_MINUTES | 30 | 10-120 | yes | G | scripts/lib/lane-verify.mjs:315 |
+| M | leaseReaper.quietMs | DEFAULT_QUIET_MS | 30 min | 5-180 min | yes | E | scripts/conveyor/lease-reaper.mjs:555 |
 | M | locks.fileLeaseMinutes | DEFAULT_LEASE_MINUTES | 15 | 5-120 | no | C | scripts/readiness/file-locks.mjs:47 |
+| M | mainCiRed.flakeRerunRounds | FLAKE_RERUN_ROUNDS | 2 | 1-5 | yes | E | scripts/conveyor/main-ci-red-core.mjs:253 |
+| M | mainRedRecovery.maxHungRetriesPerSha | DEFAULT_MAX_HUNG_RETRIES_PER_SHA | 2 | 0-5 | yes | E | scripts/conveyor/main-red-recovery.mjs:988 |
+| M | mainRedRecovery.maxRebaseRetriesPerSha | DEFAULT_MAX_REBASE_RETRIES_PER_SHA | 2 | 0-5 | yes | E | scripts/conveyor/main-red-recovery.mjs:773 |
+| M | mainRedRecovery.missingRun.{thresholdMs,maxRetriesPerSha} | DEFAULT_MISSING_RUN_THRESHOLD_MS / MAX_MISSING_RUN_RETRIES | 10 min / 2 | 2-60 min / 0-5 | yes | E | scripts/conveyor/main-red-recovery.mjs:1223 |
 | M | mergeOrphanSweep.intervalMs | MERGE_ORPHAN_SWEEP_INTERVAL_MS | 15 min | 1–60 min | yes | B | skills-src/conveyor/daemon-manifest.mjs:136 |
+| M | openPr.timeoutMs | OPEN_PR_TIMEOUT_MS | 30 min | 10-90 min | yes | I | scripts/operations/open-pr-io.mjs:88 |
+| M | orphanCardSweep.contentValidationMaxAttempts | CONTENT_VALIDATION_MAX_ATTEMPTS | 5 | 1–15 | yes | F | scripts/operations/sweep-orphan-backlog-cards.mjs:343 |
 | M | orphanClaimRelease.intervalMs | ORPHAN_CLAIM_INTERVAL_MS | 6 h | 15 min–24 h | yes | B | skills-src/conveyor/daemon-manifest.mjs:99 |
+| M | orphanClaimRelease.minAgeMs | DEFAULT_MIN_AGE_MS | 48 h | 6 h-14 d | yes | E | scripts/conveyor/orphan-claim-release.mjs:72 |
+| M | overlayAutoRebase.commandTimeoutMs | executeAsync.timeout | 30 min | 5–120 min | yes | F | scripts/lib/daemon-rebuild/auto-rebase.mjs:79 |
+| M | overlayMainSync.relatedMaxFiles | overlayRelatedTestCap fallback | 150 files; env override | 10–1,000 | yes | F | scripts/lib/daemon-rebuild/overlay-main-sync.mjs:576 |
+| M | overlayMainSync.retryDelaysMs | RETRY_DELAYS | 10, 20, 30 min | 1–8 increasing delays, each 1–120 min | yes | F | scripts/lib/daemon-rebuild/overlay-main-sync.mjs:114 |
+| M | overlayMainSync.staleRefRetryMs | STALE_REF_MS | 60 min | 5–240 min | yes | F | scripts/lib/daemon-rebuild/overlay-main-sync.mjs:115 |
+| M | parkedConflict.queuedGraceMs | QUEUED_CONFLICT_GRACE_MS | 30 min | 5-120 min | yes | E | scripts/conveyor/parked-pr-conflict-watch.mjs:209 |
+| M | parkedConflict.{rearmDeferredBoundMs,retryWindowMs} | REARM_DEFERRED_BOUND_MS / CONFLICT_RETRY_WINDOW_MS | 90 / 20 min | 15-360 / 5-120 min | yes | E | scripts/conveyor/parked-pr-conflict-watch.mjs:592 |
+| M | pocLand.maxAttempts | MAX_LAND_ATTEMPTS | 3 | 1-10 | yes | G | scripts/operations/poc-land.mjs:69 |
+| M | prListPaging.appLookupCap | APP_LOOKUP_CAP | 20 | 1–100 | yes | F | scripts/lib/pr-list-paged.mjs:98 |
+| M | prListPaging.commitLookupCap | COMMIT_LOOKUP_CAP | 30 | 1–100 | yes | F | scripts/lib/pr-list-paged.mjs:154 |
+| M | prReadyStuck.retryCooldownMs | RETRY_COOLDOWN_MS | 60 min | 5-240 min | yes | E | scripts/conveyor/pass-daemons/pr-ready-stuck.mjs:26 |
+| M | prSweep.fixClaimLiveMs | FIX_CLAIM_LIVE_MS | 3 h | 15 min–12 h | yes | D | scripts/operations/pr-sweep-core.mjs:41 |
+| M | prSweep.stalledAfterMinutes | STALLED_AFTER_MINUTES_DEFAULT | 45 min; env override | 5–240 min | yes | D | scripts/operations/pr-sweep.mjs:12 |
 | M | prepReview.effort | PREP_REVIEW_EFFORT | low | Supported effort levels for selected model | yes | B | scripts/conveyor/prep-review.mjs:40 |
 | M | prepReview.maxBlockRounds | PREP_REVIEW_MAX_BLOCK_ROUNDS | 1 | 0–5 | yes | B | scripts/conveyor/prep-review.mjs:39 |
+| M | probation.gateTimeoutMs | GATE_TIMEOUT_MS | 20 min (copied at probation-heal-run.mjs:250) | 10-90 min | yes | I | scripts/operations/probation-build-run.mjs:117 |
+| M | probation.turnTimeoutMs | PROBATION_TURN_TIMEOUT_MS | 30 min | 5–120 min | yes | H | scripts/lib/probation-launcher.mjs:38 |
+| M | providerRouting.agyGeminiSimpleModel | AGY_GEMINI_SIMPLE_MODEL | gemini-3.8-flash-high | model id | yes | G | scripts/lib/provider-routing.mjs:163 |
 | M | readiness.proposer.{model,maxTokens} | MODEL (+max_tokens 1024) | claude-opus-4-8 | model ids / 256-8192 | no | C | scripts/readiness/model-proposer.mjs:20 |
+| M | rebase.unownedAttemptCap | UNOWNED_REBASE_ATTEMPT_CAP | 3 | 1-10 | yes | G | scripts/conveyor/unowned-rebase-attempt-count.mjs:51 |
+| M | reconcile.acceptLabelGraceMs | ACCEPT_LABEL_GRACE_MS | 15 min | 2-60 min | yes | I | scripts/conveyor/reconcile-core.mjs:1436 |
+| M | reconcile.authorLookup.{budget,deadlineMs,timeoutMs} | AUTHOR_LOOKUP_BUDGET (+ deadline 12 s, timeout 8 s) | 16 | 4-64 | yes | I | scripts/conveyor/reconcile-pass.mjs:361 |
+| M | reconcile.blockedCancelledRerunCap | BLOCKED_CANCELLED_RERUN_CAP | 2 | 0-5 | yes | G | scripts/conveyor/reconcile-core.mjs:577 |
+| M | reconcile.concurrentAuthorQuietMs | CONCURRENT_AUTHOR_QUIET_MS | 20 min | 5-60 min | yes | I | scripts/conveyor/reconcile-core.mjs:358 |
+| M | reconcile.liveSessionOverrunMs | LIVE_SESSION_OVERRUN_MS | 90 min | 30-240 min | yes | G | scripts/conveyor/reconcile-core.mjs:948 |
+| M | reconcile.planMaxAgeMs | RECONCILE_PLAN_MAX_AGE_MS | 15 min | 1–30 min | yes | D | skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs:797 |
+| M | reconcile.restoreReviewLabelGraceMs | RESTORE_REVIEW_LABEL_GRACE_MS | 10 min | 2-60 min | yes | I | scripts/conveyor/reconcile-core.mjs:2181 |
+| M | reconcile.scopeOverlapMaxWaitMinutes | DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES | 60; env | 10-240 | yes | E | scripts/conveyor/reconcile-fix-dispatch.mjs:2683 |
+| M | reconcile.timeoutRetryEscalateMs | TIMEOUT_RETRY_PENDING_ESCALATE_MS | 30 min | 10-120 min | yes | G | scripts/conveyor/reconcile-core.mjs:575 |
+| M | redMainQuarantine.defaultTtlMs | QUARANTINE_DEFAULT_TTL_MS | 6 h | 30 min-24 h | yes | G | scripts/lib/red-main-quarantine.mjs:31 |
+| M | review.planRoundCap | PLAN_ROUND_CAP | 2 | 1–8 | yes | H | scripts/lib/review-core.mjs:415 |
+| M | reviewDaemon.intervalMs | DEFAULT_INTERVAL_MS | 120000; env/flag | 10000-600000 | yes | G | skills-src/conveyor/review-daemon.mjs:156 |
+| M | reviewHold.strandedBackoffMs | STRANDED_BACKOFF_MS | 5 min | 30 s–30 min | yes | H | scripts/conveyor/review-hold-reconcile.mjs:162 |
+| M | reviewHold.strandedRecheckMs | STRANDED_RECHECK_MS | 30 min | 5–120 min | yes | H | scripts/conveyor/review-hold-reconcile.mjs:161 |
+| M | reviewJob.laneWaitMs | REVIEW_JOB_LANE_WAIT_MS | 60 s | 0–300 s | yes | D | scripts/operations/review-job.mjs:166 |
+| M | reviewPrep.judgeModel | JUDGE_MODEL | sonnet | model alias | yes | G | scripts/operations/review-prep.mjs:114 |
+| M | reviewSeatPool.leaseMs | SEAT_LEASE_DEFAULT_MS | 6 h | 30 min-12 h | yes | G | scripts/lib/review-seat-pool.mjs:15 |
+| M | reviewSeats.probeIntervalMs | DEFAULT_PROBE_INTERVAL_MS | 30 min; env | 5-240 min | yes | G | scripts/operations/review-extra-seats.mjs:251 |
+| M | reviewSeats.{recheckModel,recheckBudgetUsd} | RECHECK_MODEL / RECHECK_BUDGET_USD | sonnet / 1.00 USD | alias / 0.25-5 | yes | G | scripts/operations/review-extra-seats.mjs:1273 |
+| M | runner.tickIntervalMs | DEFAULT_TICK_INTERVAL_MS | 120000; flag | 30000-600000 | yes | G | skills-src/conveyor/runner.mjs:59 |
+| M | scheduledSweep.budgetUsd | opusCommand --max-budget-usd | $5 | $0.25–$20 | yes | D | scripts/operations/scheduled-sweep.mjs:284 |
+| M | scheduledSweep.model | opusCommand --model | opus | Supported Claude model IDs or aliases | yes | D | scripts/operations/scheduled-sweep.mjs:282 |
 | M | scope.ghostGraceMs | GHOST_GRACE_MS | 5 min | 1-30 min | no | C | scripts/readiness/scope-lease-collect.mjs:174 |
+| M | sessionReaper.idleReapThresholdMs | DEFAULT_IDLE_REAP_THRESHOLD_MS | 6 h | 0-48 h | yes | E | scripts/conveyor/session-reaper.mjs:1964 |
+| M | sessionReaper.maxPrViewCallsPerTick | MAX_GH_PR_VIEW_CALLS_PER_TICK | 25 | 5-100 | yes | E | scripts/conveyor/session-reaper.mjs:778 |
+| M | sessionReaper.{maxStopsPerPass,maxDurationMs} | DEFAULT_REAP_MAX_STOPS_PER_PASS / MAX_DURATION | 150 / 45 s; env | 10-1000 / 10-110 s | yes | E | scripts/conveyor/session-reaper.mjs:1982 |
+| M | sessionVerdicts.maxPrSignalLookupsPerTick | MAX_PR_SIGNAL_LOOKUPS_PER_TICK | 10 | 2-50 | yes | I | scripts/conveyor/session-verdicts-io.mjs:29 |
+| M | sessionVerdicts.stallMinutes | DEFAULT_STALL_MINUTES | 30 | 10-120 | yes | G | scripts/conveyor/session-verdicts.mjs:59 |
+| M | stallSweep.staleRunMs | STALE_RUN_MS | 120 min | 30-240 min | yes | I | scripts/conveyor/pr-stall-sweep.mjs:32 |
+| M | stuckPrWatch.thresholdMinutes | DEFAULT_STUCK_THRESHOLD_MINUTES | review 45 / fix 45 / approved 30 / conflict 45 | 10-240 | yes | G | scripts/conveyor/stuck-pr-watch-core.mjs:79 |
 | M | supervisor.baseBackoffMs | DEFAULT_BASE_BACKOFF_MS | 5,000 ms; CLI override | 1,000–60,000 ms | yes | B | skills-src/conveyor/supervisor.mjs:63 |
 | M | supervisor.idleBaseBackoffMs | DEFAULT_IDLE_BASE_BACKOFF_MS | 30,000 ms; CLI override | 5,000–300,000 ms | yes | B | skills-src/conveyor/supervisor.mjs:76 |
 | M | supervisor.maxBackoffMs | DEFAULT_MAX_BACKOFF_MS | 300,000 ms; CLI override | 10,000–1,800,000 ms | yes | B | skills-src/conveyor/supervisor.mjs:64 |
+| M | verifiedPushSalvage.maxAttempts | resolveSalvageTuning.maxAttempts | 12; env override | 1–50 | yes | H | scripts/conveyor/verified-push-salvage.mjs:35 |
+| M | verifiedPushSalvage.retryBaseMs | resolveSalvageTuning.retryMs | 2 min × attempts; env override | 30 s–30 min | yes | H | scripts/conveyor/verified-push-salvage.mjs:36 |
+| M | verifiedPushSalvage.ttlMs | resolveSalvageTuning.ttlMs | 12 h; env override | 1–72 h | yes | H | scripts/conveyor/verified-push-salvage.mjs:34 |
+| M | verifyDaemon.adoptedCeilingMs | DEFAULT_ADOPTED_CEILING_MS | 125 min | 30-240 min | yes | G | skills-src/conveyor/verify-daemon.mjs:458 |
+| M | verifyDaemon.intervalMs | DEFAULT_INTERVAL_MS | 120000 | 15000-600000 | yes | G | skills-src/conveyor/verify-daemon.mjs:93 |
+| M | wake.stuckEscalationHours | STUCK_ESCALATION_HOURS | 6 | 1-48 | yes | I | scripts/operations/wake.mjs:284 |
 | L | converge.intervalSec | DEFAULT_INTERVAL_SEC | 900 | 60-3600 | yes | C | scripts/converge-daemon-install.mjs:44 |
 | L | drain.classifyBatchCap | BATCH_PR_CAP | 10 | 1-50 | no | C | scripts/drain-classify-only.mjs:8 |
 | L | drain.unknownMergeabilityMaxRecompute | UNKNOWN_MERGEABILITY_MAX_RECOMPUTE | 10 | 1-30 | no | C | scripts/merge-ai-prs.mjs:1218 |

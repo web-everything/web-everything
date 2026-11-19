@@ -28,7 +28,7 @@ function fixture(t) {
       description: `Fixture ${key}.`, owner: key === 'alpha' ? 'scripts/dispatch-settings.json' : 'scripts/settings/feature.json', changeVia: 'pr', instant: false,
     }])),
     capacityLeaves: Object.fromEntries(Object.keys(CAPACITY_LEAVES).map(key => [key, { description: 'Fixture capacity.', range: 'fixture range' }])),
-    instantGaps: [], toSettle: [],
+    instantGaps: [], toSettle: [], discoveryPasses: [],
   };
   const build = () => { write(META, meta); return buildRegistry({ root }); };
   return { root, write, meta, build };
@@ -98,6 +98,45 @@ test('render escapes table cells, bounds defaults and sorts constants by impact 
 });
 test('real repository metadata is complete and committed documentation matches the render', () => {
   const registry = buildRegistry({ root: ROOT }); assert.deepEqual(registry.problems, []);
+  assert.ok([0, 10].includes(registry.toSettle.filter(row => row.top === true).length));
+  const identities = registry.toSettle.map(row => `${row.identifier}:${row.where.replace(/:\d+$/, '')}`);
+  assert.equal(new Set(identities).size, identities.length, 'identifier+file pairs must be unique');
   assert.equal(registry.capacityRows.length, Object.keys(CAPACITY_LEAVES).length);
   assert.equal(readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8'), renderMarkdown(registry));
+});
+test('top proposals allow zero or ten and refuse incomplete, oversized or non-boolean selections', t => {
+  const f = fixture(t);
+  for (const count of [0, 1, 9, 10, 11]) {
+    f.meta.toSettle = Array.from({ length: count }, (_, i) => ({ identifier: `ITEM_${i}`, proposedKey: `key${i}`, impact: 'H', top: true }));
+    const registry = f.build();
+    if ([0, 10].includes(count)) assert.deepEqual(registry.problems, []);
+    else assert.throws(() => renderMarkdown(registry), /top proposals must number 10 or 0/);
+  }
+  f.meta.toSettle = [{ top: 'true' }];
+  assert.throws(() => renderMarkdown(f.build()), /invalid top proposal boolean/);
+});
+test('discovery metadata refuses missing, unreadable or incomplete evidence', t => {
+  const f = fixture(t);
+  for (const value of [undefined, {}, [null], [{ pass: 'A', family: 'Codex', scope: 'scripts/' }],
+    [{ pass: 'A', family: 'Codex', scope: 'scripts/', newItems: -1, newHighImpactItems: 0 }]]) {
+    f.meta.discoveryPasses = value;
+    assert.throws(() => renderMarkdown(f.build()), /invalid (metadata section: discoveryPasses|discovery pass)/);
+  }
+});
+test('discovery convergence and only selected proposals render before the full inventory', t => {
+  const f = fixture(t);
+  f.meta.discoveryPasses = [{ pass: 'A', family: 'Family | test', scope: 'scripts/', newItems: 'inventory (see summary)', newHighImpactItems: '-' },
+    { pass: 'I', family: 'Claude', scope: 'whole sweep', newItems: 23, newHighImpactItems: 0 }];
+  f.meta.toSettle = Array.from({ length: 11 }, (_, i) => ({ identifier: `ITEM_${i}`, proposedKey: `key${i}`, impact: 'H', top: i < 10 }));
+  const md = renderMarkdown(f.build());
+  const discovery = md.indexOf('## Discovery convergence');
+  const top = md.indexOf('## Top 10 proposals');
+  const full = md.indexOf('## Hard-coded constants to settle');
+  assert.ok(discovery < top && top < full);
+  assert.ok(md.includes('| I | Claude | whole sweep | 23 | 0 |'));
+  assert.ok(md.includes('Family \\| test'));
+  assert.ok(md.includes('H-impact discovery converged (fewer than 5 new H items in passes H and I)'));
+  assert.equal((md.slice(top, full).match(/ITEM_/g) ?? []).length, 10);
+  assert.ok(!md.slice(top, full).includes('ITEM_10'));
+  assert.ok(md.slice(full).includes('ITEM_10'));
 });
