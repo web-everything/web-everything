@@ -73,12 +73,16 @@ const integer = value => Number.isSafeInteger(value) && value >= 0;
 const count = integer;
 const position = value => shape(value, ['line', 'column']) && integer(value.line) && integer(value.column);
 const location = value => shape(value, ['start', 'end']) && position(value.start) && position(value.end);
-const map = (value, valid) => object(value) && Object.entries(value).every(([key, entry]) => /^\d+$/.test(key) && valid(entry));
+const map = (value, valid) => object(value) && Object.entries(value).every(([key, entry]) => /^(0|[1-9]\d*)$/.test(key) && Number.isSafeInteger(Number(key)) && valid(entry));
 // Free text is the exfiltration channel: names must also bind to HEAD source
-// below; branch types are a closed set and hashes are hex digests.
-const label = value => typeof value === 'string' && (/^[A-Za-z_$][\w$]{0,99}$/.test(value) || /^\(anonymous_\d{1,6}\)$/.test(value));
-const BRANCH_TYPES = new Set(['if', 'binary-expr', 'cond-expr', 'switch', 'default-arg', 'logical-assignment']);
-const digest = value => typeof value === 'string' && /^[a-f0-9]{1,64}$/.test(value);
+// below; branch types are a closed set. vitest.config.ts uses coverage-v8:
+// its bundled v8-to-istanbul getInnerIstanbul writes neither hash nor
+// _coverageSchema, and istanbul-lib-coverage preserves arbitrary extra fields.
+// There is no provider schema constant or HEAD-computable hash to authorize:
+// refuse both fields (including hex strings), rather than treating encoding as binding.
+const ANONYMOUS_NAME = /^\(anonymous_(0|[1-9]\d{0,5})\)$/;
+const label = value => typeof value === 'string' && (/^[A-Za-z_$][\w$]{0,99}$/.test(value) || ANONYMOUS_NAME.test(value));
+const BRANCH_TYPES = new Set(['if', 'binary-expr', 'cond-expr', 'switch', 'default-arg', 'logical-assignment', 'branch']);
 const fn = value => shape(value, ['name', 'decl', 'loc'], ['line']) && label(value.name)
   && location(value.decl) && location(value.loc) && (!Object.hasOwn(value, 'line') || integer(value.line));
 const branch = value => shape(value, ['type', 'loc', 'locations'], ['line']) && BRANCH_TYPES.has(value.type)
@@ -95,12 +99,13 @@ export async function validateCoverage({ content, cwd, tree, refuse, path, exec 
     const repoPath = isAbsolute(key) ? relative(cwd, key) : key;
     // Reject normalization tricks, paths outside cwd and paths not in the pinned tree.
     try { pathParts(Buffer.from(repoPath)); } catch { throw invalid(); }
+    if (isAbsolute(key) && key !== join(cwd, repoPath)) throw invalid();
     const blob = tree.entries.get(Buffer.from(repoPath).toString('base64'));
     if (!blob || !['100644', '100755'].includes(blob.mode)
-      || !shape(value, ['path', 'statementMap', 'fnMap', 'branchMap', 's', 'f', 'b'], ['_coverageSchema', 'hash'])
+      || !shape(value, ['path', 'statementMap', 'fnMap', 'branchMap', 's', 'f', 'b'], ['all'])
       || value.path !== key || !map(value.statementMap, location) || !map(value.fnMap, fn) || !map(value.branchMap, branch)
       || !map(value.s, count) || !map(value.f, count) || !map(value.b, hits => Array.isArray(hits) && hits.every(count))
-      || ['_coverageSchema', 'hash'].some(field => Object.hasOwn(value, field) && !digest(value[field]))) throw invalid();
+      || (Object.hasOwn(value, 'all') && typeof value.all !== 'boolean')) throw invalid();
     const sameKeys = (hits, locations) => Object.keys(hits).length === Object.keys(locations).length
       && Object.keys(locations).every(key => Object.hasOwn(hits, key));
     if (!sameKeys(value.s, value.statementMap) || !sameKeys(value.f, value.fnMap) || !sameKeys(value.b, value.branchMap)
@@ -115,15 +120,27 @@ export async function validateCoverage({ content, cwd, tree, refuse, path, exec 
     const lines = source.split(/\r\n|[\n\r\u2028\u2029]/);
     const line = n => Number.isSafeInteger(n) && n >= 1 && n <= lines.length;
     const boundedPosition = p => line(p.line) && p.column <= lines[p.line - 1].length + 1;
-    const boundedLocation = loc => boundedPosition(loc.start) && boundedPosition(loc.end);
+    const boundedLocation = loc => boundedPosition(loc.start) && boundedPosition(loc.end)
+      && (loc.start.line < loc.end.line || loc.start.line === loc.end.line && loc.start.column <= loc.end.column);
+    // Audit of the remaining fields: paths name a HEAD blob; names are HEAD
+    // identifiers or source-bounded anonymous indices; types and all are closed
+    // enums. Map indices/array lengths and positions are bounded by HEAD source;
+    // hit counts are safe nonnegative integers attached to those locations.
+    const boundedKeys = map => Object.keys(map).every(key => Number(key) <= source.length);
     // Token boundaries include Unicode identifier continuations so an ASCII
     // substring inside a larger JS identifier cannot authorize an arbitrary name.
     const identifiers = new Set(source.match(/(?<![$\u200c\u200d\p{ID_Continue}])[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*/gu) ?? []);
-    if (!Object.values(value.statementMap).every(boundedLocation)
+    const sourceName = name => {
+      const anonymous = ANONYMOUS_NAME.exec(name);
+      return anonymous ? Number(anonymous[1]) <= source.length : identifiers.has(name);
+    };
+    if (![value.statementMap, value.fnMap, value.branchMap].every(boundedKeys)
+      || !Object.values(value.statementMap).every(boundedLocation)
       || !Object.values(value.fnMap).every(fn => boundedLocation(fn.decl) && boundedLocation(fn.loc)
         && (!Object.hasOwn(fn, 'line') || line(fn.line))
-        && (/^\(anonymous_\d{1,6}\)$/.test(fn.name) || identifiers.has(fn.name)))
-      || !Object.values(value.branchMap).every(branch => boundedLocation(branch.loc) && branch.locations.every(boundedLocation)
+        && sourceName(fn.name))
+      || !Object.values(value.branchMap).every(branch => boundedLocation(branch.loc)
+        && branch.locations.length > 0 && branch.locations.length <= source.length + 1 && branch.locations.every(boundedLocation)
         && (!Object.hasOwn(branch, 'line') || line(branch.line)))) throw invalid();
   }
 }

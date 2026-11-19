@@ -4830,12 +4830,30 @@ exceptions and binary allowlist, and count sibling bytes against the main manife
 Size/type refusals keep their manifest reason and are logged; operators can run locally or
 review a path+oid size exception. Legacy sibling behavior remains unchanged.
 
+The configured `@vitest/coverage-v8` provider's bundled `v8-to-istanbul` writes
+neither `hash` nor `_coverageSchema`; `istanbul-lib-coverage` preserves extra fields
+without validating them. `istanbul-lib-instrument` is not installed by this checkout.
+Tracked admission therefore refuses either field, even hexadecimal values: there is
+no provider schema constant or HEAD-derived hash to bind here. The real-provider
+fixture calls `V8CoverageProvider.convertCoverage` on committed source and admits
+its `branch` type and boolean `all` flag. Numeric map keys must be canonical safe
+integers bounded by HEAD source length; anonymous indices and branch-array lengths
+are also source-bounded. Absolute paths must equal the canonical checkout path,
+so normalization cannot hide arbitrary text in discarded segments. Refusal retains
+the operator's local-execution fallback.
+
 Every tracked refusal and every legacy shadow verdict appends metadata only to
 `~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.
-Shadow evaluation runs only with the real default executor and filesystem and without
-an injected inventory (`listFiles`); injected callers retain the legacy exec/fs call sequence.
+`buildManifest` takes an explicit `shadow` option, default false. `runRemote` selects
+it once from the original options, before `bindGit` wraps the executor, and carries
+it through delta assembly and full retries. Shadow evaluation runs only when the
+caller supplied no executor, filesystem or inventory (`listFiles`); injected callers
+retain the legacy exec/fs call sequence.
 `FORGE_MANIFEST_SHADOW=0` disables the default-on shadow for costly trees. Logging and
 shadow failures never alter legacy admission. Tests must point the log at their temp root.
+The real-Git `runRemote` regression replaces only SSH/rsync executables on PATH and
+asserts a completed legacy run still ships an untracked file while logging its
+shadow refusal; the injected-executor case compares calls against shadow disabled.
 `forge-manifest-tracked.test.mjs` exercises local fallback without remote dispatch,
 HEAD hashes, size bounds, binary extensions, coverage structure and setting provenance.
 For the non-UTF-8 refusal-log case, inject the raw Git inventory record: filesystem

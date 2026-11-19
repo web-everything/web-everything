@@ -594,7 +594,7 @@ async function siblingPathReferences(config){
 }
 
 export async function buildManifest(options = {}) {
-  const {manifestMode = 'legacy', trackedOnly = false, env = process.env} = options;
+  const {manifestMode = 'legacy', trackedOnly = false, env = process.env, shadow = false} = options;
   // Sibling snapshots retain their established index-based contract and do not shadow.
   if (trackedOnly) return buildManifestInventory(options);
   let head = options.head;
@@ -605,10 +605,6 @@ export async function buildManifest(options = {}) {
     catch (error) { await logManifestVerdict({env,mode:'tracked',error,head}); throw error; }
   }
   if (manifestMode !== 'legacy') throw manifestRefusal('mode','.');
-  // Shadow only real IO: injected callers must retain the legacy exec/fs call sequence.
-  const shadow = (options.exec === undefined || options.exec === defaultExec)
-    && (options.fs === undefined || options.fs === filesystem) && options.listFiles === undefined
-    && env.FORGE_MANIFEST_SHADOW !== '0';
   // Never let an unavailable Git probe, shadow verdict or telemetry write change legacy output/refusals.
   try { return await buildManifestInventory(options); }
   finally {
@@ -986,7 +982,7 @@ export async function rankBases({cwd=process.cwd(),exec=defaultExec,env=process.
 export async function selectBase(options={}) {return (await rankBases(options))[0]??null;}
 const manifestFailure=error=>String(error?.message??error??'Base evidence unavailable').replace(/[\x00-\x1f\x7f-\x9f]/g,' ').slice(0,200)||'Base evidence unavailable';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming,onWarning}={}) {
+export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=filesystem,base,head,env=process.env,beginSub=noTiming,onWarning,shadow=false}={}) {
   exec=await bindGit({cwd,env,exec});
   if(!base || digestManifest(base.manifest)!==base.manifestDigest)throw new Error('Base manifest digest mismatch');
   const snapshot=decodeManifest(base.manifest);
@@ -1085,7 +1081,7 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
     } finally {await reader?.close();}
     manifestMode='git-delta';
   } catch {manifestReason ??='base or git evidence unavailable';reuse=undefined;}
-  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub,onWarning});
+  const manifest=await buildManifest({cwd,exec,fs,head,reuse,env,beginSub,onWarning,shadow});
   // Transfer decisions still compare the complete manifest, including fresh modes.
   const final=new Set(manifest.entries.map(e=>e.path.toString('hex')));
   const deltaPaths=manifest.entries.filter(entry=>{
@@ -1218,7 +1214,7 @@ async function stageSnapshot({fs,stageDirectory,source:sourceRoot,destination:de
 
 // Shared by the run and presync: one base selection and one delta manifest
 // builder, so both apply identical exclusion and walk checks.
-async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming,onWarning}) {
+async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,head,beginSub=noTiming,onWarning,shadow=false}) {
   const gitDir=exec[gitBinding]?.dir;
   if(discovery.code!==0)throw new Error('No base capabilities');
   const caps=JSON.parse(protocolText(discovery.stdout,8192));
@@ -1246,7 +1242,7 @@ async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,h
     if(selected)break;
   }
   if(!selected)throw lastError;
-  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub,onWarning});
+  return buildDeltaManifest({cwd,exec,fs,base:selected,head,env,beginSub,onWarning,shadow});
 }
 
 // Presync (card 7515): ship a lane's delta leaves to a per-lane Forge cache
@@ -1368,6 +1364,10 @@ export function logLocalLocation(result,log) {
 }
 
 export async function runRemote(options={}) {
+  // Decide from the original caller options, before bindGit wraps the executor.
+  // Carry this decision through retries; injected IO retains its legacy call sequence.
+  const shadow=options.exec===undefined && options.fs===undefined && options.listFiles===undefined
+    && (options.env??process.env).FORGE_MANIFEST_SHADOW!=='0';
   const clock=options.clock??Date.now,timings=[],start=clock();
   const pending=new Map();
   const begin=stage=>{
@@ -1375,7 +1375,7 @@ export async function runRemote(options={}) {
     timings.push(item);pending.set(item,at);
     return extra=>{pending.delete(item);Object.assign(item,{ms:Math.max(0,Math.round(clock()-at)),...extra});};
   };
-  const result=await executeRemote({...options,clock,timings,begin});
+  const result=await executeRemote({...options,shadow,clock,timings,begin});
   logLocalLocation(result,options.log);
   for(const [item,at] of pending)item.ms=Math.max(0,Math.round(clock()-at));
   timings.push({stage:'total',startedAtET:easternTimestamp(start),ms:Math.max(0,Math.round(clock()-start))});
@@ -1417,7 +1417,7 @@ export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit,unproven=select
   try{return route({argv,cwd}).local===true||unproven({argv,cwd})===true;}catch{return true;}
 }
 
-async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, manifestMode = 'legacy', onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, manifestMode = 'legacy', shadow = false, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   let warningCount=0;
   // The credential-warn log is what a later re-tightening reads: never drop a warning silently. With no callback,
   // or when the callback throws, append it to remote-fallbacks.jsonl; a failed write is logged, never fatal.
@@ -1546,14 +1546,14 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       // subcommand; their full-ship path retains its existing admission order.
       try {
         if(disableDelta || manifestMode === 'tracked')throw new Error('Full ship selected');
-        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,onWarning:reportWarning});
+        delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,onWarning:reportWarning,shadow});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
         manifest=delta;
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning,manifestMode});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning,manifestMode,shadow});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Scanners may skip nonexistent paths. Require the entire requested scope
@@ -1700,7 +1700,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1734,7 +1734,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
