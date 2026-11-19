@@ -9,7 +9,7 @@ import { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
-import { memoryFreePct, memoryAvailableMb } from './memory-available.mjs';
+import { memoryFreePctUnrounded, memoryAvailableMb } from './memory-available.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
 
@@ -141,7 +141,7 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
         floorSource: sources['host.capacity.memAvailableFloorMb'] ?? 'standard' };
     } catch { memPolicy = null; }
     const needPolicy = () => { if (!memPolicy) throw Error('memory policy unreadable'); return memPolicy; };
-    const memFreePct = probe('memFreePct', () => memoryFreePct({ metric: needPolicy().metric, exec: run, freemem, totalmem }));
+    const memFreePct = probe('memFreePct', () => memoryFreePctUnrounded({ metric: needPolicy().metric, exec: run, freemem, totalmem }));
     const memAvailableMb = probe('memAvailableMb', () => memoryAvailableMb({ metric: needPolicy().metric, exec: run, freemem }));
     const swapText = probe('swapUsedPct', () => {
       const text = run('sysctl', ['-n', 'vm.swapusage']);

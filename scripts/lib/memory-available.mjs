@@ -40,10 +40,15 @@ export function memoryAvailableBytes({ metric = DEFAULT_MEMORY_METRIC, exec = ex
 /** Memory-free percent (0-100) under `metric`. Throws on unreadable evidence. */
 export function memoryFreePct({ metric = DEFAULT_MEMORY_METRIC, exec = execFileSync, platform = process.platform,
   freemem = os.freemem, totalmem = os.totalmem } = {}) {
+  return Math.round(memoryFreePctUnrounded({ metric, exec, platform, freemem, totalmem }) * 10) / 10;
+}
+
+/** Unrounded bytes ratio for admission comparisons; display rounding must not admit below a threshold. */
+export function memoryFreePctUnrounded({ totalmem = os.totalmem, ...options } = {}) {
   const total = totalmem();
   if (!Number.isFinite(total) || total <= 0) throw Error('invalid memory totals');
-  const bytes = memoryAvailableBytes({ metric, exec, platform, freemem });
-  return Math.round(Math.min(100, bytes / total * 100) * 10) / 10;
+  const bytes = memoryAvailableBytes(options);
+  return Math.min(100, bytes / total * 100);
 }
 
 /** Available memory in whole MB (rounded down). Throws on unreadable evidence. */
@@ -53,7 +58,7 @@ export const DEFAULT_MEM_AVAILABLE_FLOOR_MB = 2048;
 export const DEFAULT_WARN_MIN_FREE_PCT = 20;
 export const DEFAULT_WARN_SWAP_GROWTH_MB = 256;
 
-/** Pure pressure check. Sticky warn needs scarcity; with neither corroborator readable it fails closed. */
+/** Pure pressure check. Only level 2 can relax, and readable, clean free memory is mandatory. */
 export function decideMemoryPressure({ pressureLevel, minPressureLevel = 2, freePct, swapGrowthMb,
   warnMinFreePct = DEFAULT_WARN_MIN_FREE_PCT, warnSwapGrowthMb = DEFAULT_WARN_SWAP_GROWTH_MB } = {}) {
   freePct = Number.isFinite(freePct) && freePct >= 0 && freePct <= 100 ? freePct : null;
@@ -61,11 +66,12 @@ export function decideMemoryPressure({ pressureLevel, minPressureLevel = 2, free
   const inputs = { freePct, swapGrowthMb, warnMinFreePct, warnSwapGrowthMb };
   const scarce = (freePct !== null && freePct < warnMinFreePct)
     || (swapGrowthMb !== null && swapGrowthMb > warnSwapGrowthMb);
-  const unknown = freePct === null && swapGrowthMb === null;
+  const unknown = freePct === null;
   const critical = Number.isFinite(pressureLevel) && pressureLevel >= 4;
-  const held = critical || (Number.isFinite(pressureLevel) && pressureLevel >= minPressureLevel && (scarce || unknown));
+  const nonWarn = Number.isFinite(pressureLevel) && pressureLevel > 1 && pressureLevel !== 2;
+  const held = nonWarn || (Number.isFinite(pressureLevel) && pressureLevel >= minPressureLevel && (scarce || unknown));
   const evidence = `free ${freePct ?? '?'}% (${freePct === null ? '?' : freePct < warnMinFreePct ? '<' : '>='}${warnMinFreePct}%), swap ${swapGrowthMb === null ? '?' : swapGrowthMb >= 0 ? `+${swapGrowthMb}` : swapGrowthMb}MB (${swapGrowthMb === null ? '?' : swapGrowthMb > warnSwapGrowthMb ? '>' : '<='}${warnSwapGrowthMb}MB)`;
-  return { held, ...inputs, reason: `mem pressure ${pressureLevel} (>=${minPressureLevel}) ${critical ? 'critical' : unknown ? 'warn corroboration unavailable' : scarce ? 'corroborated' : 'uncorroborated'}: ${evidence}` };
+  return { held, ...inputs, reason: `mem pressure ${pressureLevel} (>=${minPressureLevel}) ${critical ? 'critical' : nonWarn ? 'non-warn pressure' : unknown ? 'warn corroboration unavailable' : scarce ? 'corroborated' : 'uncorroborated'}: ${evidence}` };
 }
 /** macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical. */
 const PRESSURE_NAME = { 1: 'normal', 2: 'warn', 3: 'warn', 4: 'critical' };

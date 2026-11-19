@@ -951,15 +951,15 @@ describe('stale-waiter reap (xaipsbs)', () => {
 // "Test plan (each fails before the fix)" bullets.
 
 describe('loadAdmissionDecision (pure)', () => {
-  it.each([2, 3])('admits sticky warn %s with 45%% free and flat swap, exposing all decision inputs', (pressureLevel) => {
-    expect(loadAdmissionDecision({ idlePctSamples: [81], pressureLevel, freePct: 45, swapGrowthMb: 0 }))
+  it('admits sticky warn with 45% free and flat swap, exposing all decision inputs', () => {
+    expect(loadAdmissionDecision({ idlePctSamples: [81], pressureLevel: 2, freePct: 45, swapGrowthMb: 0 }))
       .toMatchObject({ held: false, freePct: 45, swapGrowthMb: 0, warnMinFreePct: 20, warnSwapGrowthMb: 256 });
   });
 
-  it.each([2, 3])('holds warn %s with low free memory and logs both corroborators', (pressureLevel) => {
-    const d = loadAdmissionDecision({ idlePctSamples: [81], pressureLevel, freePct: 10, swapGrowthMb: 0 });
+  it('holds warn with low free memory and logs both corroborators', () => {
+    const d = loadAdmissionDecision({ idlePctSamples: [81], pressureLevel: 2, freePct: 10, swapGrowthMb: 0 });
     expect(d.held).toBe(true);
-    expect(d.reason).toBe(`mem pressure ${pressureLevel} (>=2) corroborated: free 10% (<20%), swap +0MB (<=256MB)`);
+    expect(d.reason).toBe('mem pressure 2 (>=2) corroborated: free 10% (<20%), swap +0MB (<=256MB)');
   });
 
   it('holds warn with swap growth above the threshold despite plenty of free memory', () => {
@@ -979,10 +979,19 @@ describe('loadAdmissionDecision (pure)', () => {
       expect(d.reason).toContain('warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)');
     });
 
-  it.each([{ freePct: 45 }, { swapGrowthMb: 0 }, { freePct: 20, swapGrowthMb: 256 }, { swapGrowthMb: -512 }])
-    ('one clean corroborator suffices, including exact thresholds and shrinking swap: %j', (inputs) => {
+  it.each([{ freePct: 45 }, { freePct: 45, swapGrowthMb: NaN }, { freePct: 20, swapGrowthMb: 256 }, { freePct: 45, swapGrowthMb: -512 }])
+    ('readable clean free memory suffices, including unknown swap, exact thresholds and shrinking swap: %j', (inputs) => {
       expect(loadAdmissionDecision({ pressureLevel: 2, ...inputs }).held).toBe(false);
     });
+  it.each([undefined, null, NaN, -1, 101])('warn holds unreadable free percent %s despite clean swap', freePct => {
+    expect(loadAdmissionDecision({ pressureLevel: 2, freePct, swapGrowthMb: 0 }).held).toBe(true);
+  });
+  it.each([3, 4, 5, 2.5])('non-warn pressure %s holds despite clean free memory and swap', pressureLevel => {
+    expect(loadAdmissionDecision({ pressureLevel, freePct: 45, swapGrowthMb: 0 }).held).toBe(true);
+  });
+  it('warn holds unrounded 19.96% free at a 20% threshold', () => {
+    expect(loadAdmissionDecision({ pressureLevel: 2, freePct: 19.96, swapGrowthMb: 0 }).held).toBe(true);
+  });
 
   it('uncorroborated warn continues to the load backstop and CPU checks', () => {
     const inputs = { pressureLevel: 2, freePct: 45, swapGrowthMb: 0 };
@@ -1217,6 +1226,18 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
     expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, swapGrowthMb: 512 });
     expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 1 }).swapGrowthMb).toBeNull();
   });
+  it('telemetry warn holds missing free-memory evidence despite flat swap', () => {
+    seedMemory({ available: null, free: null });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, freePct: null, swapGrowthMb: 0 });
+  });
+  it('telemetry warn admits readable clean free memory with only one swap sample', () => {
+    seedMemory({ swaps: [100] });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: false, freePct: 45, swapGrowthMb: null });
+  });
+  it('telemetry preserves the bytes ratio: 19.96% holds at the 20% threshold', () => {
+    seedMemory({ available: 19.96 });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, freePct: 19.96 });
+  });
 
   it('uses the admission settings cascade, environment and validated call overrides', () => {
     seedMemory({ available: 10, swaps: [100, 612] });
@@ -1228,10 +1249,39 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
     expect(resolveLoadAdmission({ ...options, env: { ...env, WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } })).toMatchObject({ held: true, warnMinFreePct: 15 });
     expect(resolveLoadAdmission({ ...options, warnSwapGrowthMb: 256 })).toMatchObject({ held: true, warnSwapGrowthMb: 256 });
     expect(resolveLoadAdmission({ ...options, warnMinFreePct: NaN, warnSwapGrowthMb: -1 })).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
-    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 5 }, tool: { warnSwapGrowthMb: 1024 }, env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } });
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 5, warnSwapGrowthMb: 2048 }, tool: { warnSwapGrowthMb: 1024 }, env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } });
     expect(formatAdmissionPolicy(p)).toContain('warnMinFreePct=15 (env WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT)');
     expect(formatAdmissionPolicy(p)).toContain('warnSwapGrowthMb=1024 (tool)');
     expect(resolveAdmissionPolicy({ platform: { warnMinFreePct: 101, warnSwapGrowthMb: -1 } }).invalid).toHaveLength(2);
+  });
+  it.each([
+    [{ warnMinFreePct: 5, warnSwapGrowthMb: 1024 }, 20, 256, 'platform'],
+    [{ warnMinFreePct: 25, warnSwapGrowthMb: 128 }, 25, 128, 'tool'],
+    [{ warnMinFreePct: 20, warnSwapGrowthMb: 256 }, 20, 256, 'tool'],
+    [{ warnMinFreePct: NaN, warnSwapGrowthMb: -1 }, 20, 256, 'platform'],
+  ])('checkout-local warn overrides only tighten shared settings: %j', (tool, min, growth, source) => {
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 20, warnSwapGrowthMb: 256 }, tool });
+    expect(p.settings).toMatchObject({ warnMinFreePct: min, warnSwapGrowthMb: growth });
+    expect(p.sources).toMatchObject({ warnMinFreePct: source, warnSwapGrowthMb: source });
+    if (source === 'platform' && Number.isFinite(tool.warnMinFreePct)) {
+      expect(p.ignored).toHaveLength(2);
+      expect(formatAdmissionPolicy(p)).toContain('may only tighten shared setting');
+    }
+  });
+  it('per-call warn overrides only tighten resolved operator settings and preserve valid env on invalid input', () => {
+    seedMemory({ available: 10, swaps: [100, 612] });
+    const options = { env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15', WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB: '400' }, root: telemetryRoot, now: NOW };
+    for (const overrides of [{ warnMinFreePct: 5, warnSwapGrowthMb: 1024 }, { warnMinFreePct: NaN, warnSwapGrowthMb: -1 }]) {
+      expect(resolveLoadAdmission({ ...options, ...overrides })).toMatchObject({ held: true, warnMinFreePct: 15, warnSwapGrowthMb: 400 });
+    }
+    expect(resolveLoadAdmission({ ...options, warnMinFreePct: 25, warnSwapGrowthMb: 128 }))
+      .toMatchObject({ held: true, warnMinFreePct: 25, warnSwapGrowthMb: 128 });
+  });
+  it('environment remains the operator settings layer and may loosen the platform thresholds', () => {
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 20, warnSwapGrowthMb: 256 },
+      env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '5', WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB: '1024' } });
+    expect(p.settings).toMatchObject({ warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+    expect(p.sources).toMatchObject({ warnMinFreePct: 'env WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT', warnSwapGrowthMb: 'env WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB' });
   });
 
   it('the real shared admit({kind}) path uses the same settings and corroboration in enforce mode', async () => {
@@ -1240,11 +1290,16 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
     mkdirSync(join(telemetryRoot, 'resource'));
     const snapshot = { sampledAt: NOW.toISOString(), freshUntil: new Date(NOW.getTime() + 10000).toISOString(),
       cpu: { idlePct: 81, loadAvg: [1] }, memory: { pressureLevel: 2, freePct: 45, swapGrowthMb: 0 } };
-    const decide = (env = {}) => resolveLoadAdmission({ env, root: telemetryRoot, now: NOW, mode: 'enforce', shadow: () => undefined,
+    const decide = (env = {}, overrides = {}) => resolveLoadAdmission({ env, ...overrides, root: telemetryRoot, now: NOW, mode: 'enforce', shadow: () => undefined,
       admitFn: (args) => admit({ ...args, root: telemetryRoot }) });
     writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
     expect(decide()).toMatchObject({ held: false, resourceAdmission: { decidedBy: 'admit', legacyHeld: false } });
     expect(decide({ WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '50' })).toMatchObject({ held: true, resourceAdmission: { legacyHeld: true } });
+    expect(decide({}, { warnMinFreePct: 50 })).toMatchObject({ held: true, resourceAdmission: { legacyHeld: true } });
+    snapshot.memory = { pressureLevel: 2, freePct: 10, swapGrowthMb: 512 };
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide({}, { warnMinFreePct: 5, warnSwapGrowthMb: 1024 }))
+      .toMatchObject({ held: true, warnMinFreePct: 20, warnSwapGrowthMb: 256, resourceAdmission: { decidedBy: 'admit' } });
     snapshot.memory = { pressureLevel: 3, freePct: 45, swapGrowthMb: 512 };
     writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
     expect(decide().reason).toContain('swap +512MB (>256MB)');

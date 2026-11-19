@@ -2425,6 +2425,13 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
+Memory-warn regression cases must distinguish missing free-memory evidence (hold, even with flat swap)
+from missing swap growth (admit when free memory is readable and clean). Only pressure level 2 may relax;
+level 3 and unknown levels above 1 still hold. Exercise the sampler's unrounded bytes ratio at 19.96% and
+20%, and verify checkout-local/per-call warn overrides only tighten the resolved settings. Environment
+variables remain the operator settings layer. Scoped coverage lives in `memory-available`,
+`resource-sampler`, `resource-admission`, `resource-gate`, and `heavy-admission` tests.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.

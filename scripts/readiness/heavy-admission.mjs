@@ -315,8 +315,10 @@ const ADMISSION_ENV = {
   warnMinFreePct: 'WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT', warnSwapGrowthMb: 'WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
+/** Leaves that shape this caller's execution policy; warn thresholds may only tighten shared settings. */
 const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite', 'warnMinFreePct', 'warnSwapGrowthMb']);
+const tightensWarn = (leaf, value, setting) => leaf === 'warnMinFreePct' ? value >= setting
+  : leaf === 'warnSwapGrowthMb' ? value <= setting : true;
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
@@ -396,6 +398,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       }
       if (layer === 'tool' && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
+        continue;
+      }
+      if (layer === 'tool' && valid(v) && !tightensWarn(leaf, v, value)) {
+        ignored.push(`tool.${leaf}=${v} (may only tighten shared setting ${value})`);
         continue;
       }
       if (valid(v)) { value = v; sources[leaf] = layer; }
@@ -1792,7 +1798,7 @@ export function isLoadAdmissionOff(env = process.env) {
  *      readings) is below `minIdlePct` (default {@link DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT}).
  *   2. **mem-pressure** — the LATEST `pressureLevel` is `>= minPressureLevel` (default
  *      {@link DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL}, macOS "warn") with corroborating scarcity, or no
- *      readable corroboration data. Critical (>=4) always holds. Free percent uses latest available/total bytes;
+ *      readable free-memory data. Only level 2 can relax; every other level above 1 holds. Free percent uses latest available/total bytes;
  *      swap growth uses oldest/latest bytes in the sample window. Defaults: free <20% or swap growth >256 MB,
  *      from heavyAdmission.warnMinFreePct / warnSwapGrowthMb and WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT /
  *      WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB.
@@ -1942,9 +1948,14 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
   if (minPressureLevel !== undefined) effectiveEnv[LOAD_ADMISSION_MIN_PRESSURE_LEVEL_ENV] = String(minPressureLevel);
   if (backstopPerCore !== undefined) effectiveEnv[LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV] = String(backstopPerCore);
   if (window !== undefined) effectiveEnv[LOAD_ADMISSION_WINDOW_ENV] = String(window);
-  if (warnMinFreePct !== undefined) effectiveEnv[ADMISSION_ENV.warnMinFreePct] = String(warnMinFreePct);
-  if (warnSwapGrowthMb !== undefined) effectiveEnv[ADMISSION_ENV.warnSwapGrowthMb] = String(warnSwapGrowthMb);
-  const pressureSettings = loadMemoryPressureSettings({ env: effectiveEnv });
+  // Environment is the operator's settings layer; function parameters can only tighten its resolved policy.
+  const pressureSettings = loadMemoryPressureSettings({ env });
+  for (const [leaf, value] of Object.entries({ warnMinFreePct, warnSwapGrowthMb })) {
+    if (ADMISSION_VALID[leaf](value) && tightensWarn(leaf, value, pressureSettings[leaf])) {
+      pressureSettings[leaf] = value;
+      effectiveEnv[ADMISSION_ENV[leaf]] = String(value);
+    }
+  }
   const minIdle = resolveLoadAdmissionMinIdlePct(effectiveEnv);
   const minPressure = resolveLoadAdmissionMinPressureLevel(effectiveEnv);
   const backstop = resolveLoadAdmissionBackstopPerCore(effectiveEnv);

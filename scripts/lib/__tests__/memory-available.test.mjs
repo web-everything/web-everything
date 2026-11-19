@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { memoryFreePct, parseVmStatAvailableBytes, decideMemoryFloor, memoryAvailableMb } from '../memory-available.mjs';
+import { memoryFreePct, memoryFreePctUnrounded, parseVmStatAvailableBytes, decideMemoryPressure, decideMemoryFloor, memoryAvailableMb } from '../memory-available.mjs';
 import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
 import * as hostOverloadSettings from '../host-overload-settings.mjs';
 import { createSampler } from '../resource-sampler.mjs';
@@ -56,7 +56,7 @@ describe('memory-available', () => {
     expect(() => resolveHostOverloadSettings({ ...base, env: { WE_HOST_CAPACITY_MEMORY_METRIC: 'x' } })).toThrow();
   });
   it.each([
-    ['available', 43],
+    ['available', (215784 + 1392455 + 41509 + 1289) * 16384 / TOTAL * 100],
     ['free', 6.9],
   ])('the sampler honors host.capacity.memoryMetric=%s on macOS', (metric, expectedPct) => {
     const policy = resolveHostOverloadSettings({ platform: {}, tool: {},
@@ -80,10 +80,26 @@ describe('memory-available', () => {
 describe('R553 hard memory floor (fail closed)', () => {
   const ok = { availableMb: 8192, floorMb: 2048, pressureLevel: 1 };
   it('admits a healthy host', () => { expect(decideMemoryFloor(ok)).toMatchObject({ admit: true }); });
-  it.each([2, 3])('admits sticky warn %s with a clean corroborator and still enforces the MB floor', (pressureLevel) => {
-    expect(decideMemoryFloor({ ...ok, pressureLevel, freePct: 45 }).admit).toBe(true);
-    expect(decideMemoryFloor({ ...ok, pressureLevel, swapGrowthMb: 0 }).admit).toBe(true);
-    expect(decideMemoryFloor({ ...ok, pressureLevel, freePct: 45, availableMb: 1000 }).admit).toBe(false);
+  it('admits warn with readable clean free memory and unknown swap, while enforcing the MB floor', () => {
+    expect(decideMemoryFloor({ ...ok, pressureLevel: 2, freePct: 45 }).admit).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel: 2, freePct: 45, availableMb: 1000 }).admit).toBe(false);
+  });
+  it.each([undefined, null, NaN, -1, 101])('warn refuses unreadable free percent %s even with clean swap', freePct => {
+    expect(decideMemoryPressure({ pressureLevel: 2, freePct, swapGrowthMb: 0 }).held).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel: 2, freePct, swapGrowthMb: 0 }).admit).toBe(false);
+  });
+  it.each([3, 4, 5, 2.5])('never relaxes non-warn pressure %s despite clean free memory and swap', pressureLevel => {
+    expect(decideMemoryPressure({ pressureLevel, freePct: 45, swapGrowthMb: 0 }).held).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel, freePct: 45, swapGrowthMb: 0 }).admit).toBe(false);
+  });
+  it('compares unrounded bytes ratios: 19.96% holds at 20%, and exactly 20% admits', () => {
+    const options = { metric: 'free', totalmem: () => 10000, freemem: () => 1996 };
+    expect(memoryFreePct(options)).toBe(20);
+    const freePct = memoryFreePctUnrounded(options);
+    expect(freePct).toBe(19.96);
+    expect(decideMemoryPressure({ pressureLevel: 2, freePct }).held).toBe(true);
+    expect(decideMemoryFloor({ ...ok, pressureLevel: 2, freePct }).admit).toBe(false);
+    expect(decideMemoryFloor({ ...ok, pressureLevel: 2, freePct: 20 }).admit).toBe(true);
   });
   it('uses shared thresholds for warn corroboration and reports the decision inputs', () => {
     const inputs = { ...ok, pressureLevel: 2, freePct: 10, swapGrowthMb: 512 };

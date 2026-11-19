@@ -393,6 +393,20 @@ describe('dynamic fixer cap', () => {
         gate: () => ({ admit: true }), log: quiet });
       expect(t.tryAdmit('fix').admit).toBe(true);
     });
+    it.each([undefined, null, NaN, -1, 101])('warn refuses unreadable free percent %s despite flat swap', freePct => {
+      const s = snap({ pressure: 2, freePct });
+      s.memory.swapGrowthMb = 0;
+      expect(mk(() => s).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it.each([3, 4, 5, 2.5])('refuses non-warn pressure %s despite clean free memory and swap', pressure => {
+      const s = snap({ pressure, freePct: 45 });
+      s.memory.swapGrowthMb = 0;
+      expect(mk(() => s).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it('warn compares unrounded free memory and allows unknown swap growth', () => {
+      expect(mk(() => snap({ pressure: 2, freePct: 19.96 })).tryAdmit('fix').admit).toBe(false);
+      expect(mk(() => snap({ pressure: 2, freePct: 20 })).tryAdmit('fix').admit).toBe(true);
+    });
     it.each([['no snapshot', () => null], ['read throws', () => { throw Error('x'); }], ['stale', () => snap({ ageMs: 600000 })],
       ['no available reading', () => snap({ availableMb: null })],
       ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {

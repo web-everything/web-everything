@@ -12,7 +12,7 @@ import { decideMemoryPressure } from './memory-available.mjs';
 //   load-flake-rearm a 20% floor (admits 68%): its re-dispatched fixer re-runs timing-sensitive tests.
 // - maxDiskBusyPct stays null (record, never gate): disk read 100% busy in 100% of samples, CPU 45% idle included —
 //   on this NVMe host busy% means "I/Os in flight", not saturation. A tool override or platform preference can set one.
-// - Memory warn can be sticky: levels 2/3 require scarcity corroboration; critical always holds.
+// - Memory warn can be sticky: only level 2 permits scarcity corroboration; other levels above 1 hold.
 const kindPolicy = (cpu, cost = 'heavy') => Object.freeze({ class: cost, minCpuIdlePct: cpu,
   maxMemPressureLevel: 2, maxDiskBusyPct: null, waitMinutes: 2 });
 // Fixes tolerate busier CPUs; timing-sensitive flake re-verification needs a quiet host.
@@ -81,8 +81,8 @@ export function decideAdmission({ kind, snapshot, policy = RESOURCE_POLICY_STAND
     projectedWaitMinutes: verdict === 'admit' ? 0 : rule.waitMinutes, snapshotAge, unknown, inputs });
   if (!snapshot || !Number.isFinite(sampledAt) || !Number.isFinite(freshUntil)) return result(cost === 'heavy' ? 'hold' : 'admit', 'snapshot-missing', true);
   if (nowMs > freshUntil + resolved.staleGraceMs) return result(cost === 'heavy' ? 'hold' : 'admit', 'snapshot-stale (age ' + snapshotAge + 's)', true);
-  // A normal-only policy is a hard ceiling; policies tolerating warn use scarcity corroboration below.
-  if (rule.maxMemPressureLevel < 2 && inputs.memPressureLevel !== null && inputs.memPressureLevel > rule.maxMemPressureLevel)
+  // Ceilings remain hard limits, including level 3; only warn (2) may relax below a ceiling.
+  if (inputs.memPressureLevel !== null && inputs.memPressureLevel > rule.maxMemPressureLevel)
     return result('hold', `memory pressure ${inputs.memPressureLevel} > ${rule.maxMemPressureLevel}; ${pressure.reason}`);
   if (pressure.held) return result('hold', pressure.reason);
   if (inputs.cpuIdlePct !== null && inputs.cpuIdlePct < rule.minCpuIdlePct)

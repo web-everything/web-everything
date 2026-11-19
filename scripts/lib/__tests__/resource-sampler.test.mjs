@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { decideAdmission } from '../resource-policy.mjs';
+import { decideMemoryFloor } from '../memory-available.mjs';
 import { cpuIdlePctFromTimes, parseIoregDiskStats, diskFromDeltas, parsePsCpu, fseventsCpuPct, countAgentSessions, memoryPressureLevel, swapUsedPct, buildSnapshot, createSampler, resourcePaths, writeSnapshot, readSnapshot, appendResourceLog } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'resource-')); roots.push(root); return root; };
@@ -76,6 +78,24 @@ describe('resource sampler', () => {
     expect(sampler.sample().memory.swapGrowthMb).toBeNull();
     used = 0;
     expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 0, swapGrowthMb: -100 });
+  });
+  it('publishes the unrounded bytes ratio so both admission gates hold at 19.96% free', () => {
+    const policy = vi.spyOn(hostSettings, 'loadHostOverloadSettings').mockReturnValue({
+      settings: { host: { capacity: { snapshotMaxFreshMs: 20000, memoryMetric: 'free', memAvailableFloorMb: 1024 } } }, sources: {} });
+    try {
+      let freeMb = 1996;
+      const sampler = createSampler({ exec: cmd => cmd === 'sysctl' ? '2' : '', now: () => 0, cpus: () => [],
+        freemem: () => freeMb * 1024 * 1024, totalmem: () => 10000 * 1024 * 1024,
+        readHeavySlots: () => ({}), countLanes: () => 0 });
+      const s = sampler.sample();
+      expect(s.memory.freePct).toBe(19.96);
+      expect(decideAdmission({ kind: 'build', snapshot: s, nowMs: 0 }).verdict).toBe('hold');
+      expect(decideMemoryFloor({ ...s.memory, floorMb: 1024 }).admit).toBe(false);
+      freeMb = 2000;
+      const clean = sampler.sample();
+      expect(decideAdmission({ kind: 'build', snapshot: clean, nowMs: 0 }).verdict).toBe('admit');
+      expect(decideMemoryFloor({ ...clean.memory, floorMb: 1024 }).admit).toBe(true);
+    } finally { policy.mockRestore(); }
   });
   it('isolates probe failures and uses elapsed deltas with bounded subprocesses', () => {
     let tick = 0;
