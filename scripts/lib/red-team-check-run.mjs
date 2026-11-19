@@ -84,6 +84,19 @@ export const redTeamWriterEnv = (env = process.env) => {
   return out;
 };
 
+/** Resolve an installation token before any publication write. Personal gh credentials never authorize it.
+ * Keep the resolved token in the child env only; neither results nor diagnostics expose it. */
+export function resolveRedTeamWriter({ env = process.env, gh = runGhSync } = {}) {
+  try {
+    const writerEnv = redTeamWriterEnv(env);
+    const token = String(gh(['auth', 'token', '--hostname', 'github.com'], { ...ioOptions, env: writerEnv })).trim();
+    if (!/^ghs_[A-Za-z0-9_]+$/.test(token)) throw Error('not an installation token');
+    const pinnedEnv = { ...writerEnv, GH_TOKEN: token, GITHUB_TOKEN: token,
+      WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(token).digest('hex') };
+    return { ok: true, gh: (args, options = {}) => gh(args, { ...options, env: pinnedEnv }) };
+  } catch { return failure('red-team App token unavailable; restore App authentication before retrying publication'); }
+}
+
 /**
  * The WE App id readers trust and the writer authors as (#6535; operator ruling R907 → setting R905). It is a SETTING,
  * `redTeamGate.appId` in scripts/settings/red-team.json (5037855), resolved standard → platform → tool →
@@ -168,7 +181,8 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
     ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
-  return { ok: true, reason: 'red-team check run succeeded on head' };
+  return { ok: true, reason: 'red-team check run succeeded on head', runId: runs[0].id,
+    completedAt: runs[0].completed_at ?? null, liveCheck: isLiveCheckRun(runs[0]) };
 }
 
 /** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs
@@ -567,11 +581,11 @@ export function postRedTeamPublicationHold({ repo, pr, headSha, held, reason = '
   try {
     const context = redTeamPublicationContext(pr);
     if (!validHead(headSha) || !/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !context) throw Error('invalid red-team publication hold identity (repo, PR number and head required)');
-    const description = String(held ? `held: ${reason || 'red-team round not confirmed published'}` : 'red-team publication confirmed')
+    const description = String(held ? `held: ${reason || 'red-team round not confirmed published'}` : reason || 'red-team publication confirmed')
       .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 140);
-    gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
+    const response = gh(['api', `repos/${repo}/statuses/${headSha}`, '--method', 'POST', '--input', '-'],
       { ...ioOptions, input: JSON.stringify({ state: held ? 'failure' : 'success', context, description }), env: redTeamWriterEnv(env) });
-    return { ok: true };
+    return { ok: true, status: JSON.parse(response || '{}') };
   } catch (error) {
     // A definite rejection (HTTP 4xx) created or changed no status. Read it from the FULL error text, before the
     // reason is truncated, so a long message never hides the code.
@@ -619,7 +633,7 @@ const statusPage = (repo, headSha, path, page) =>
 
 /** The combined status (one latest status per context), paged until `total_count` contexts are read. Contexts past the
  * cap leave `statuses` shorter than `total_count`, which every consumer reads as incomplete (fail closed). */
-function readCombinedStatus({ repo, headSha, gh }) {
+export function readCombinedStatus({ repo, headSha, gh = runGhSync }) {
   const first = JSON.parse(gh(['api', statusPage(repo, headSha, 'status', 1)], ioOptions));
   if (!Array.isArray(first?.statuses) || !Number.isSafeInteger(first.total_count)) return first;
   const statuses = [...first.statuses];
@@ -639,7 +653,7 @@ function readCombinedStatus({ repo, headSha, gh }) {
 /** The newest-first status history, paged until `decisive` matches a status on `context` (every newer status is then
  * already read) or the list ends. Unrelated contexts can fill any number of pages ahead of this PR's context.
  * `complete` is false only when the cap stopped the read first. */
-function readStatusHistory({ repo, headSha, gh, context, decisive }) {
+export function readStatusHistory({ repo, headSha, gh = runGhSync, context, decisive = () => false }) {
   const statuses = [];
   for (let page = 1; page <= STATUS_PAGE_CAP; page++) {
     const batch = JSON.parse(gh(['api', statusPage(repo, headSha, 'statuses', page)], ioOptions));
@@ -677,6 +691,21 @@ const isLiveHoldDescription = description => typeof description === 'string' && 
  * only: no labels, trusted result or enqueue hold), so it never clears, or rides on, a live helper's hold: that one
  * may cover a live success that failed its own checks (a crash, or a supersede that did not land). */
 const isPolicyClearHoldDescription = description => description === `held: ${POLICY_CLEAR_HOLD_PENDING}`;
+
+/** Non-success entries above the newest trusted success, ordered only by GitHub status id.
+ * Recovery always supplies a complete history, including entries below the prior success. */
+export function readUnsettledPublicationHolds({ statuses, context, complete }) {
+  if (complete !== true || !Array.isArray(statuses)) throw Error('publication history incomplete; operator must inspect full commit status history');
+  const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
+  const settled = ordered.findIndex(status => status.state === 'success'
+    && isTrustedMarkerAuthor({ user: status.creator }));
+  return (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
+}
+
+/** A recognized writer description and trusted GitHub-assigned creator are both required. */
+export function ownsPublicationHold(status, ownsHold) {
+  return ownsHold(status.description, status) && isTrustedMarkerAuthor({ user: status.creator });
+}
 
 /** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears
  * only when every hold on this PR's context above the newest trusted success is that helper's own (its description,

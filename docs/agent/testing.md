@@ -4462,6 +4462,17 @@ missing main refs, origin mismatches, hostile Git overrides and read-only refres
 
 ## Recovering a red-team result whose check was never published
 
+Publication republish takes the local status claim before the check lock and reads full, memo-bypassing
+status histories S1 and S2 (up to 10 pages; incomplete evidence requires operator inspection). Order
+statuses by id only: timestamps and marker mtimes establish no publication authority. S2 must contain
+our automation-created success id and every S1 id; any new non-success id, even below ours, or a changed
+latest App run restores a held status and retains `.unpublished`. Tests inject GitHub IO, including
+installation-token resolution, and exercise each race separately. Result authors use the gate's
+`isTrustedMarkerAuthor` rule. A no-op rerun posts nothing; CLI dry-run returns S1 and the decision
+without publication or outbox removal. Round writers must resolve the App token before any remote hold;
+not-owed transitions persist local state without publishing. The finished-publication-hold soak probes
+planner behavior for fix presence and unconditionally requires both the fix and its race-recovery scenario.
+
 The already-reviewed-head recovery in `review-red-team-on-skip.mjs` can publish a missing
 head-bound check without dispatching another seat. Read trusted check evidence before planning
 and again at publication; unreadable or existing runs never authorize replacement. The guarded

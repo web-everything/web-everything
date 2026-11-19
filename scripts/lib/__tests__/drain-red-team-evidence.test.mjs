@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
 import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
-import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus as recordStatusWithPublication, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
@@ -16,6 +16,11 @@ import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-chec
 import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
 import { RED_TEAM_UNSEALED_HOLD_PREFIX, RED_TEAM_NO_RESULT_HOLD_PREFIX, statusOwesPublication } from '../drain-red-team-evidence.mjs';
 
+// These older round-writer tests inject the write/evidence channels separately.
+// Token resolution is exercised with real injected gh in red-team-republish.test.mjs.
+const recordRedTeamStatus = (input, options = {}) => recordStatusWithPublication(input, {
+  resolveWriter: ({ gh }) => ({ ok: true, gh }), ...options,
+});
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {

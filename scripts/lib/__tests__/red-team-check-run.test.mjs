@@ -157,7 +157,7 @@ describe('red-team check run contract', () => {
     it('the last-resort publication hold is NOT behind the check lock and posts while the lock is held', () => {
       const io = { ...fixture(), lockTimeoutMs: 10 };
       const out = api.withRedTeamCheckLock(io, () => api.postRedTeamPublicationHold({ ...io, held: true, reason: 'x' }));
-      expect(out).toEqual({ ok: true });
+      expect(out).toEqual({ ok: true, status: {} });
       expect(io.gh).toHaveBeenCalled();
     });
 
@@ -1413,8 +1413,8 @@ describe('GitHub-visible red-team publication hold (commit status)', () => {
     const { postRedTeamPublicationHold } = await import('../red-team-check-run.mjs');
     const calls = [];
     const gh = (args, opts) => { calls.push({ args, body: JSON.parse(opts.input) }); return ''; };
-    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, reason: `x\n${'y'.repeat(300)}`, gh })).toEqual({ ok: true });
-    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: false, gh })).toEqual({ ok: true });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, reason: `x\n${'y'.repeat(300)}`, gh })).toEqual({ ok: true, status: {} });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: false, gh })).toEqual({ ok: true, status: {} });
     expect(calls.map(c => c.args.slice(0, 4))).toEqual([['api', `repos/o/r/statuses/${head}`, '--method', 'POST'], ['api', `repos/o/r/statuses/${head}`, '--method', 'POST']]);
     expect(calls.map(c => [c.body.state, c.body.context])).toEqual([['failure', 'red-team/publication #7'], ['success', 'red-team/publication #7']]);
     expect(calls[0].body.description).toHaveLength(140);
@@ -1534,8 +1534,8 @@ describe('the publication hold is bound to its PR, not only its head (#6535 roun
     const { postRedTeamPublicationHold, readRedTeamPublicationHoldFact } = await import('../red-team-check-run.mjs');
     const posted = [];
     const writer = (args, opts) => { posted.push({ id: posted.length + 1, creator: bot, ...JSON.parse(opts.input) }); return ''; };
-    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, gh: writer })).toEqual({ ok: true });
-    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 8, headSha: head, held: false, gh: writer })).toEqual({ ok: true });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 7, headSha: head, held: true, gh: writer })).toEqual({ ok: true, status: {} });
+    expect(postRedTeamPublicationHold({ repo: 'o/r', pr: 8, headSha: head, held: false, gh: writer })).toEqual({ ok: true, status: {} });
     expect(new Set(posted.map(s => s.context)).size).toBe(2);
     const reader = args => {
       const newestFirst = [...posted].reverse();

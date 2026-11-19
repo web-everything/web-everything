@@ -3169,3 +3169,53 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
 });
+
+
+describe('publication republish recovery on an already-reviewed head', () => {
+  const comments = () => [{ author: { login: 'web-everything' }, body:
+    `<!-- we:red-team-advisory pr=${pr} rev=${head} -->\n### Post-accept red team — no break found` }];
+  const options = (over = {}) => runFixture({
+    rawPrs: [{ number: pr, headRefOid: head, comments: comments(), labels: [], reviews: [] }],
+    readFinishedHold: () => true, republishPublication: vi.fn(() => ({ ok: true })), ...over });
+  it('plans and executes publication recovery before result-check recovery', () => {
+    const o = options({ readCheckFact: vi.fn(() => ({ ok: false })) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'republish-publication', why: 'red-team publication confirmed from live evidence' });
+    expect(o.republishPublication).toHaveBeenCalledWith({ repo, pr, head }); expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('escalates a failed republish and retries once per separate cooldown', () => {
+    const clock = 2_000_000, history = new Map([[`${repo}#${pr}@${head}#carried-check`, clock]]);
+    const o = options({ lastDispatch: history, republishPublication: vi.fn(() => ({ ok: false, reason: 'offline' })), escalate: vi.fn() });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'republish-publication', escalate: true, escalationContext: 'publication unconfirmed: offline' });
+    expect(o.escalate).toHaveBeenCalledTimes(1);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'publication unconfirmed; retry cooldown active' });
+    expect(o.republishPublication).toHaveBeenCalledTimes(1);
+    expect(runRedTeamOnSkip({ ...o, now: () => clock + 30 * 60_000 }).rows[0].action).toBe('republish-publication');
+    expect(o.republishPublication).toHaveBeenCalledTimes(2);
+  });
+  it('dry run does not republish or consume cooldown', () => {
+    const o = options({ dryRun: true });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'republish-publication', why: 'dry run (publication republish)' });
+    expect(o.republishPublication).not.toHaveBeenCalled(); expect(o.lastDispatch.size).toBe(0);
+  });
+  it('escalates a kept pending label before recovery', () => {
+    const o = options({ rawPrs: [{ number: pr, headRefOid: head, comments: comments(), labels: ['red-team:pending'], reviews: [] }], escalate: vi.fn() });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', escalate: true });
+    expect(o.republishPublication).not.toHaveBeenCalled(); expect(o.escalate).toHaveBeenCalledTimes(1);
+  });
+  it('routes a finished hold with no posted check to publish-result', () => {
+    const o = options({ readFinishedHold: vi.fn(() => true),
+      readCheckFact: vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' })), publishCheck: vi.fn(() => ({ ok: true })) });
+    expect(runRedTeamOnSkip(o).rows[0].action).toBe('publish-result');
+    expect(o.republishPublication).not.toHaveBeenCalled(); expect(o.readFinishedHold).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'unreadable', 'untrusted', 'other head'])('does not nominate recovery with %s evidence', kind => {
+    const o = options({ readFinishedHold: () => { if (kind === 'unreadable') throw Error('unreadable'); return kind !== 'missing'; } });
+    if (kind === 'untrusted') o.rawPrs[0].comments[0].author.login = 'mallory';
+    if (kind === 'other head') o.rawPrs[0].comments[0].body = o.rawPrs[0].comments[0].body.replace(head, 'b'.repeat(40));
+    expect(runRedTeamOnSkip(o).rows[0].action).not.toBe('republish-publication'); expect(o.republishPublication).not.toHaveBeenCalled();
+  });
+  it('escalates when no republisher is available', () => {
+    const o = options({ republishPublication: null, escalate: vi.fn() });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'republish-publication', escalate: true });
+  });
+});

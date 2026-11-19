@@ -1,6 +1,10 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
-import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher,
+  readRedTeamCheckFact, resolveWeAppId, resolveRedTeamWriter, redTeamWriterEnv, readStatusHistory, readCombinedStatus,
+  redTeamPublicationContext, readUnsettledPublicationHolds, ownsPublicationHold } from './red-team-check-run.mjs';
+import { createMqLiveReader, redTeamEnqueueHold } from './drain-queue-safety.mjs';
+import { isAutomationAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { REVIEW_HOLD_LABELS } from './review-escalation.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -28,7 +32,7 @@ export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
   }
 }
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
+import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
@@ -59,6 +63,125 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
   } catch (error) {
     return error.code === 'ENOENT' ? null : `${reason} (publication hold unreadable; operator must inspect)`;
   }
+}
+
+const knownPublicationHold = description => typeof description === 'string' && (
+  /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(description)
+  || description.startsWith('held: live red-team check not clear:')
+  || description === 'held: red-team round not confirmed published'
+  || description === 'held: publication republish unconfirmed; operator must inspect');
+
+/** Cheap nomination only; the executor rechecks all evidence under both writer locks. */
+export function readRoundPublicationHold({ repo, pr, head, env = process.env, gh = runGhSync }) {
+  if (readRedTeamPublicationHold({ repo, pr, head, env })) return true;
+  try {
+    const combined = readCombinedStatus({ repo, headSha: head, gh: (args, options) => gh(args, { ...options, env }) });
+    if (!Array.isArray(combined?.statuses) || combined.total_count !== combined.statuses.length) return false;
+    return combined.statuses.some(status => status.context === redTeamPublicationContext(pr)
+      && status.state !== 'success' && ownsPublicationHold(status, knownPublicationHold));
+  } catch { return false; }
+}
+
+/** Republish the current successful App check's intent. Status ids, never clocks, detect concurrent holds.
+ * Both reads cover the entire bounded history: an unseen hold below our success still restores failure. */
+export function republishPublicationStatus({ repo, pr, head, env = process.env, gh = runGhSync, dryRun = false,
+  readStatus = readRedTeamStatus, isAlive = pidExistence, readHistory = readStatusHistory,
+  readCheck, readComments, readLivePr, enqueueHold = redTeamEnqueueHold, postHold = postRedTeamPublicationHold,
+  resolveWriter = resolveRedTeamWriter,
+  lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn) } = {}) {
+  let before = null, posted = false, writer;
+  const fail = reason => ({ ok: false, reason: safeText(reason), ...(dryRun ? { before, decision: 'refuse' } : {}) });
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !redTeamPublicationContext(pr) || !/^[a-f0-9]{40}$/i.test(head ?? ''))
+    return fail('invalid publication identity');
+  const path = statusPath({ repo, pr, head }, env);
+  const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
+  const exec = createMqLiveReader((_file, args, options) => gh(args, options));
+  const liveGh = (args, options = {}) => exec('gh', args, { ...options, env: freshEnv });
+  readCheck ??= key => {
+    const app = resolveWeAppId({ env: freshEnv });
+    return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh: liveGh }) : app;
+  };
+  readComments ??= () => readCompletePrComments(pr, { repo, gh: args => JSON.parse(liveGh(args,
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 })) });
+  readLivePr ??= () => JSON.parse(liveGh(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels'],
+    { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 }));
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    return withRedTeamStatusClaim(path, () => lock(() => {
+      try {
+        // 1. Persisted local state is head-bound by the shared reader.
+        const local = readStatus({ repo, pr, head, env });
+        if (local?.status !== 'finished' || !['ran', 'resumed'].includes(typeof local.result === 'string' ? local.result : local.result?.status)
+          || local.sendBack === true || local.result?.sendBack === true) return fail('local round is not finished ran/resumed without sendBack');
+        if (local.pid != null && ((local.host && local.host !== hostname())
+          || (local.pidNamespace && local.pidNamespace !== pidNamespace()))) return fail('writer pid belongs to another host or namespace; operator must inspect');
+        if (local.pid != null && (!Number.isInteger(local.pid) || local.pid <= 0 || isAlive(local.pid)))
+          return fail('local writer pid live or unreadable; operator must inspect');
+        // 2. Full S1, sorted by id only. Unknown entries never authorize recovery.
+        const history = () => {
+          const value = readHistory({ repo, headSha: head, gh: liveGh });
+          if (value?.complete !== true || !Array.isArray(value.statuses)) throw Error('publication history incomplete; operator must inspect full commit status history');
+          if (value.statuses.some(s => !Number.isSafeInteger(s?.id) || s.id <= 0 || typeof s.context !== 'string'
+            || !['success', 'failure', 'pending', 'error'].includes(s.state))
+            || new Set(value.statuses.map(s => s.id)).size !== value.statuses.length) throw Error('publication history unreadable; operator must inspect');
+          return value.statuses.filter(s => s.context === redTeamPublicationContext(pr)).sort((a, b) => b.id - a.id);
+        };
+        before = history();
+        const holds = readUnsettledPublicationHolds({ statuses: before, context: redTeamPublicationContext(pr), complete: true });
+        if (!holds.length && before.some(s => s.state === 'success' && isTrustedMarkerAuthor({ user: s.creator })))
+          return { ok: true, noop: true, ...(dryRun ? { before, decision: 'noop' } : {}) };
+        if (holds.some(s => !ownsPublicationHold(s, knownPublicationHold))) return fail('unknown writer description or untrusted publication hold author; operator must inspect');
+        // 3. Bind both observations to the latest App run id.
+        const fact = readCheck({ repo, pr, headSha: head });
+        if (fact?.ok !== true || !Number.isSafeInteger(fact.runId) || fact.runId <= 0) return fail(fact?.reason ?? 'latest App check unreadable');
+        // 4. Recompute the current intent with fresh reads, using gate-parity author trust.
+        const live = readLivePr();
+        if (live?.headRefOid !== head || !Array.isArray(live.labels)) return fail('live head moved or labels unreadable');
+        const labels = live.labels.map(l => typeof l === 'string' ? l : l?.name);
+        if (labels.some(l => typeof l !== 'string')) return fail('live labels unreadable');
+        const blocked = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(l => labels.includes(l));
+        if (blocked) return fail(`blocking label: ${blocked}`);
+        const comments = readComments();
+        if (!Array.isArray(comments)) return fail('result comments unreadable');
+        const result = redTeamResultCommentForHead(comments, pr, head);
+        if (!result || !isTrustedMarkerAuthor(result.comment) || !isPublishableRedTeamResult(result.parsed))
+          return fail('publishable result with trusted author absent on head');
+        const hold = enqueueHold({ repo, pr, head, comments, labels: live.labels, recorded: true, scheduled: true, env });
+        if (hold !== null) return fail(hold ?? 'enqueue hold unreadable');
+        writer = resolveWriter({ env: freshEnv, gh });
+        if (writer?.ok !== true) return fail(writer?.reason ?? 'App token unresolved');
+        if (dryRun) return { ok: true, dryRun: true, before, runId: fact.runId, decision: 'republish' };
+        // 5. From here every doubt restores a held status, including ambiguous POST errors.
+        posted = true;
+        const out = postHold({ repo, pr, headSha: head, held: false,
+          reason: `red-team publication confirmed (check ${fact.runId})`, gh: writer.gh, env: redTeamWriterEnv(freshEnv) });
+        const success = out?.status;
+        if (out?.ok !== true || !Number.isSafeInteger(success?.id) || success.id <= 0
+          || success.context !== redTeamPublicationContext(pr) || success.state !== 'success'
+          || !isAutomationAuthored({ user: success.creator })) throw Error('publication POST id/state/context or automation creator unconfirmed');
+        // 6. S2 must contain our id and EVERY S1 id. Any new non-success, even below ours, is a race.
+        const after = history(), ids = new Set(before.map(s => s.id));
+        if (!after.some(s => s.id === success.id && s.state === 'success' && isAutomationAuthored({ user: s.creator }))
+          || before.some(s => !after.some(t => t.id === s.id && t.state === s.state))
+          || after.some(s => s.state !== 'success' && !ids.has(s.id))) throw Error('publication history changed or missing ids after POST');
+        const check = readCheck({ repo, pr, headSha: head });
+        if (check?.ok !== true || check.runId !== fact.runId) throw Error('latest App check changed after POST');
+        // 7. Only confirmed publication removes the local outbox.
+        rmSync(`${path}.unpublished`, { force: true });
+        return { ok: true, runId: fact.runId, statusId: success.id };
+      } catch (error) {
+        let reason = safeText(error);
+        if (posted) {
+          try {
+            const restored = postHold({ repo, pr, headSha: head, held: true,
+              reason: 'publication republish unconfirmed; operator must inspect', gh: writer.gh, env: redTeamWriterEnv(freshEnv) });
+            if (restored?.ok !== true) reason += '; hold restore unconfirmed; operator must inspect';
+          } catch { reason += '; hold restore unconfirmed; operator must inspect'; }
+        }
+        return fail(reason);
+      }
+    }));
+  } catch (error) { return fail(error); }
 }
 
 /** Carried-check outbox (#6606): a verdict carry settles the head without a round, so no round writer republishes its
@@ -672,7 +795,8 @@ export function withRedTeamStatusClaim(path, write, { readPidStart = pidStartTim
 /** CAS and atomic rename share a reclaimable recovery claim; a loser never rolls back the winner. */
 export function recordRedTeamStatus(input, options = {}) {
   const underTest = isUnderTest(options.env) || isUnderTest();
-  const publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
+  const notOwed = (typeof input.result === 'string' ? input.result : input.result?.status) === 'not-owed';
+  const publish = !notOwed && (typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest);
   const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
   mkdirSync(dirname(path), { recursive: true });
   return withRedTeamStatusClaim(path, () => {
@@ -720,11 +844,16 @@ export function recordRedTeamStatus(input, options = {}) {
       try {
         const head = input.loopPayload?.findings?.read?.netBasis?.rev;
         // A publisher alone must not opt terminal evidence reads into real GitHub IO.
-        const gh = options.gh ?? (underTest ? () => { throw Error('test publication evidence requires injected gh'); }
+        let gh = options.gh ?? (underTest ? () => { throw Error('test publication evidence requires injected gh'); }
           // A writer's own `opts.env` (the WE App identity, redTeamWriterEnv) wins over the drain's env (#6535).
           : (args, opts) => runGhSync(args, { env: options.env ?? process.env, ...opts }));
         // Test runs need explicit IO for this channel too: a check publisher alone does not opt into status writes.
         const statusChannel = typeof options.postPublicationHold === 'function' || typeof options.gh === 'function' || !underTest;
+        if (statusChannel) {
+          const writer = (options.resolveWriter ?? resolveRedTeamWriter)({ env: options.env ?? process.env, gh });
+          if (writer?.ok !== true) return report({ published: false, reason: writer?.reason ?? 'red-team App token unresolved' });
+          gh = writer.gh;
+        }
         // A clear makes a success merge-visible, so it takes the writers' host lock (#6606 send-back item 1, self-review):
         // the live helper holds, posts, validates and clears under that lock, and a status is last-wins, so a round clear
         // landing inside that sequence would expose its unvalidated success. A hold only blocks (fail closed) and stays
@@ -927,7 +1056,7 @@ export function carriedStoredFindings(prior, result, status = 'finished') {
 const LEGACY_PENDING = 'unreadable-pending-pass';
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
+function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId, sendBack = false }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
@@ -935,11 +1064,11 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
   // The publisher's status lock (red-team-withheld-publish): its seal and this rewrite never interleave, so neither
   // drops the other's write (PR #6622). The publisher never takes the retry claim, so the order cannot deadlock.
   // The publisher holds it across its gh reads and post, so wait longer than the 5s default before reporting busy.
-  return withFileLock(`${path}.lock`, () => writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId },
+  return withFileLock(`${path}.lock`, () => writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId, sendBack },
     { env, host, namespace, readPidStart }), { timeoutMs: lockTimeoutMs });
 }
 
-function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId }, { env, host, namespace, readPidStart }) {
+function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId, sendBack }, { env, host, namespace, readPidStart }) {
   // Retry admission survives running/finished rewrites, including lost seat-row appends.
   // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
   let prior;
@@ -986,7 +1115,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
   const durableRetryCount = refund ? claimed : Math.max(spent ?? 0, retryCount ?? 0, claimed);
   // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
-  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
+  writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result, ...(sendBack ? { sendBack: true } : {}),
     ...(admissionId ? { admissionId } : {}),
     // The sealed stored breaks and the legacy hold flag survive a rewrite that keeps the sealed result (a retry or recovery
     // that has no new result yet) (PR #6622): dropping them lifts the hold. A NEW result drops them, so the status reads
