@@ -7,7 +7,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 export default {
   id: 'host-handoff-cache-write-race',
   title: 'Ownership cannot survive a failed fresh read after handoff',
-  card: 'PR #6945 / x2fybk1',
+  card: 'PR #6945 / 8581',
   fixedBy: { sha: 'PR #6945 R970 R971 repair', where: 'lane/daemon-host-guard',
     paths: ['scripts/lib/daemon-host-guard.mjs', 'scripts/operations/daemon-preflight.mjs'] },
   fixPresent() {
@@ -26,7 +26,7 @@ export default {
     } catch (error) {
       return { violations: [`host guard module import failed: ${error?.message ?? error}`] };
     }
-    const missing = [['getThisHost', guard], ['resolveHostRole', guard], ['createGitHubOwnershipSource', guard],
+    const missing = [['getThisHost', guard], ['decideHostRole', guard], ['resolveHostRole', guard], ['createGitHubOwnershipSource', guard],
       ['cliIO', preflight], ['main', preflight]].filter(([name, mod]) => typeof mod[name] !== 'function');
     if (missing.length) return { violations: [`missing callable exports: ${missing.map(([name]) => name).join(', ')}`] };
     const { cliIO, main } = preflight;
@@ -61,20 +61,45 @@ export default {
         });
       }
       if (reads !== 10) violations.push('a call reused earlier ownership');
-      for (const [configured, expected] of [[undefined, 'standby'], ['legacy-alpha=' + first + '\n', 'standby'],
-        ['legacy-beta=' + first, 'standby'], ['legacy-alpha=' + second, 'standby'], ['legacy-alpha', 'standby'],
-        ['legacy-alpha=' + first, 'active']]) {
-        const env = { HOME: join(home, 'first'), WE_DAEMON_LEGACY_OWNER_VALUES: configured };
-        const migration = cliIO(env, { legacyHost: 'legacy-alpha', execFileSync: (_file, args) => JSON.stringify(
-          args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: 'a'.repeat(40) } }
-            : { type: 'file', encoding: 'base64', content: Buffer.from('legacy-alpha\n').toString('base64') },
-        ) });
-        const decision = await migration.resolveRole();
-        const standbyReason = configured === 'legacy-alpha=' + second ? 'owner-is-other-host' : 'owner-unreadable';
-        if (decision.role !== expected || (expected === 'standby' && decision.reason !== standbyReason)) {
-          violations.push('legacy migration ignored local alias configuration');
+      const alias = 'legacy-alpha';
+      const shared = { host: alias, version: 'fixture', legacyOwnerValues: { [alias]: first } };
+      for (const thisHost of [first, second]) {
+        const input = { thisHost, owner: alias, legacyHost: alias, ownerReadAt: 1000, now: 1000,
+          legacyOwnerValues: { [alias]: thisHost } };
+        const localOnly = guard.decideHostRole(input);
+        if (localOnly.role !== 'standby' || localOnly.reason !== 'owner-alias-ambiguous') {
+          violations.push('per-host alias binding activated a host without shared authority');
+        }
+        if (guard.decideHostRole({ ...input, ownerRecord: shared }).role !== (thisHost === first ? 'active' : 'standby')) {
+          violations.push('shared alias binding did not select exactly one UUID');
+        }
+        if (guard.decideHostRole({ ...input, owner: thisHost }).role !== 'active') violations.push('direct UUID owner did not activate');
+      }
+      for (const [bindings, expected] of [[undefined, ['standby', 'standby']],
+        [alias + '=' + first, ['active', 'standby']], [alias + '=' + second, ['standby', 'active']],
+        [alias + '=' + first + ',' + alias + '=' + second, ['standby', 'standby']],
+        ['legacy-beta=' + first, ['standby', 'standby']], [alias + '=invalid', ['standby', 'standby']]]) {
+        const contents = alias + (bindings === undefined ? '' : '\n' + bindings) + '\n';
+        for (const [index, thisHost] of [first, second].entries()) {
+          const migration = cliIO({ WE_DAEMON_LEGACY_OWNER_VALUES: alias + '=' + thisHost }, {
+            legacyHost: alias, execFileSync: (_file, args) => JSON.stringify(
+              args[1].includes('/git/ref/') ? { object: { type: 'commit', sha: 'a'.repeat(40) } }
+                : { type: 'file', encoding: 'base64', content: Buffer.from(contents).toString('base64') }),
+          });
+          const decision = await migration.resolveRole({ thisHost });
+          const ambiguous = expected.every((role) => role === 'standby');
+          if (decision.role !== expected[index] || (ambiguous && decision.reason !== 'owner-alias-ambiguous')) {
+            violations.push('preflight did not use the shared alias authority');
+          }
         }
       }
+      // A failed local host-name lookup must resolve as an explicit unknown that preflight refuses, never owner-is-other-host.
+      const unknown = await guard.resolveHostRole({ thisHost: first, legacyHost: null,
+        source: { readOwner: async () => shared } });
+      if (unknown.reason !== 'host-identity-unknown') violations.push('failed host lookup did not resolve as unknown');
+      const unknownPreflight = await preflight.runPreflight({ thisHost: first, io: { resolveRole: async () => unknown,
+        which: () => true, keyFiles: () => [], cloneDirs: () => [], parsePreferences: () => ({}), sshForge: () => ({ status: 0 }) } });
+      if (unknownPreflight.checks?.find((c) => c.name === 'role')?.ok !== false) violations.push('preflight accepted an unknown host identity');
       owner = null;
       const io = cliIO({ HOME: join(home, 'first') }, { source });
       const lines = [];

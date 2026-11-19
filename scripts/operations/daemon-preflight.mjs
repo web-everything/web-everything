@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, delimiter, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createGitHubOwnershipSource, getLegacyOwnerValues, getThisHost, resolveHostRole, runGhApi } from '../lib/daemon-host-guard.mjs';
+import { createGitHubOwnershipSource, getThisHost, resolveHostRole, runGhApi } from '../lib/daemon-host-guard.mjs';
 import { DAEMON_CLONE_SEED, classifyOverlayRecord } from '../lib/daemon-clone-registry.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 
@@ -25,7 +25,7 @@ export async function runPreflight({ thisHost, io, env = process.env, now = Date
   await check('role', async () => {
     const result = await io.resolveRole({ thisHost, now });
     return { ok: ['active', 'standby'].includes(result?.role) && typeof result?.reason === 'string'
-      && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable'].includes(result.reason),
+      && result.source !== 'remote-failed' && !['invalid-input', 'owner-unreadable', 'owner-alias-ambiguous', 'host-identity-unknown'].includes(result.reason),
     detail: `role=${result?.role} reason=${result?.reason}` };
   });
   for (const tool of ['node', 'claude', 'gh', 'codex']) {
@@ -108,11 +108,9 @@ export function cliIO(env = process.env, options = {}) {
   const { source, legacyHost, execFileSync: exec = execFileSync,
     spawnSync: spawn = spawnSync, daemonCloneRoots: cloneRoots = discoverCloneDirs } = options;
   const checkout = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-  const legacyOwnerValues = getLegacyOwnerValues(env);
   return {
     resolveRole: ({ thisHost = getThisHost({ home: env.HOME || homedir(), create: false }) } = {}) =>
-      resolveHostRole({ thisHost, legacyHost, legacyOwnerValues, source: source ?? createGitHubOwnershipSource({
-        legacyOwnerValues,
+      resolveHostRole({ thisHost, legacyHost, source: source ?? createGitHubOwnershipSource({
         // Forward the remaining deadline: the sync child must carry its own timeout (a timer cannot interrupt it).
         ghApi: (path, readOptions) => runGhApi(path, { ...readOptions,
           execFile: (file, args, options) => exec(file, args, { ...options, env }) }),

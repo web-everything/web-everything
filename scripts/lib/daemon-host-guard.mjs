@@ -21,18 +21,21 @@ const validAlias = (value) => typeof value === 'string' && value.length <= 253
 const isBindings = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const legacyOwner = (value, bindings) => validAlias(value) && isBindings(bindings)
   && Object.hasOwn(bindings, value) && validId(bindings[value]);
-const validOwner = (value, bindings) => validId(value) || legacyOwner(value, bindings);
+const validOwner = (value) => validId(value) || validAlias(value);
 const standby = (reason) => ({ role: 'standby', reason });
 const lineValue = (value) => value.replace(/\r?\n$/, '');
 const NO_BINDINGS = Object.freeze(Object.create(null));
 
 /**
- * Deprecated migration aliases from local env only: comma-separated `alias=uuid`.
- * An alias only NAMES a host; it is bound to that host's UUID and never replaces
- * the UUID check. Any invalid or duplicate entry disables migration entirely.
+ * Deprecated local configuration reader retained for callers doing discovery.
+ * Its output is NOT ownership evidence; only a source record can authorize an alias.
  */
 export function getLegacyOwnerValues(env = process.env) {
-  const raw = env.WE_DAEMON_LEGACY_OWNER_VALUES;
+  return parseLegacyOwnerValues(env.WE_DAEMON_LEGACY_OWNER_VALUES);
+}
+
+/** Comma-separated `alias=uuid`; invalid or duplicate entries disable all bindings. */
+function parseLegacyOwnerValues(raw) {
   if (typeof raw !== 'string' || raw.length > 1024) return NO_BINDINGS;
   const bindings = Object.create(null);
   for (const entry of raw.split(',')) {
@@ -78,31 +81,34 @@ export function getThisHost({ home = homedir(), create = true } = {}) {
   } catch { return ''; }
 }
 
-/** Local name consulted only for deprecated aliases; any failure fails closed (no OS-hostname fallback). */
-export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = getLegacyOwnerValues(),
+/** Local name for deprecated aliases; null means lookup failure, '' a readable mismatch or no bindings. No OS-hostname fallback. */
+export function getLegacyHost({ exec = execFileSync, legacyOwnerValues = NO_BINDINGS,
   timeoutMs = READ_TIMEOUT_MS } = {}) {
   if (!isBindings(legacyOwnerValues) || Object.keys(legacyOwnerValues).length === 0) return '';
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return '';
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return null;
   const timeout = Math.min(READ_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
   let name;
   try {
     name = String(exec('scutil', ['--get', 'HostName'], {
       encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
     })).trim();
-  } catch { return ''; }
+  } catch { return null; }
+  if (!name) return null;
   return legacyOwner(name, legacyOwnerValues) ? name : '';
 }
 
-/** Pure decision over fresh evidence; timestamps in the future fail closed. */
-export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost = '', legacyOwnerValues = NO_BINDINGS } = {}) {
+/** Pure decision over fresh evidence. ownerRecord must come from the same shared read as owner. */
+export function decideHostRole({ thisHost, owner, ownerReadAt, now, legacyHost = '', ownerRecord } = {}) {
   if (!validId(thisHost) || !Number.isFinite(now)) return standby('invalid-input');
   if (!Number.isFinite(ownerReadAt) || ownerReadAt > now || now - ownerReadAt > FRESH_READ_MS) {
     return standby('owner-unreadable');
   }
   if (owner === '') return standby('owner-unset');
-  if (!validOwner(owner, legacyOwnerValues)) return standby('owner-unreadable');
-  // An alias is only a name: it activates this host solely when bound to this host's UUID.
-  return owner === thisHost || (legacyOwner(owner, legacyOwnerValues) && owner === legacyHost
+  if (!validOwner(owner)) return standby('owner-unreadable');
+  const legacyOwnerValues = ownerRecord?.host === owner ? ownerRecord.legacyOwnerValues : NO_BINDINGS;
+  if (validAlias(owner) && !legacyOwner(owner, legacyOwnerValues)) return standby('owner-alias-ambiguous');
+  // Local bindings are deliberately ignored: every host must use the shared record's UUID binding.
+  return owner === thisHost || (owner === legacyHost && legacyOwner(owner, legacyOwnerValues)
     && legacyOwnerValues[owner] === thisHost)
     ? { role: 'active', reason: 'fresh-owner-is-this-host' }
     : standby('owner-is-other-host');
@@ -126,8 +132,14 @@ export function runGhApi(path, { execFile = execFileSync, timeoutMs = READ_TIMEO
   }
 }
 
-/** OwnershipSource: readOwner() -> Promise<{host: string, version: string}>. */
-export function createGitHubOwnershipSource({ ghApi: api = runGhApi, legacyOwnerValues = getLegacyOwnerValues() } = {}) {
+/**
+ * OwnershipSource: readOwner() -> Promise<{host, version, legacyOwnerValues?}>.
+ * The shared `host` file holds a UUID or alias on line one. For alias migration,
+ * line two holds comma-separated `alias=uuid` bindings (e.g. `legacy-alpha=<UUID>`).
+ * Both lines are read at the same commit; duplicate/malformed bindings are ambiguous.
+ * LF and CRLF are supported. A plain UUID file keeps its original format and behavior.
+ */
+export function createGitHubOwnershipSource({ ghApi: api = runGhApi } = {}) {
   return {
     /** `deadline` is an absolute `clock()` time shared by both reads; each read gets only the time left. */
     async readOwner({ deadline, clock = () => performance.now() } = {}) {
@@ -154,16 +166,17 @@ export function createGitHubOwnershipSource({ ghApi: api = runGhApi, legacyOwner
       }
       const bytes = Buffer.from(encoded, 'base64');
       if (bytes.toString('base64') !== encoded) throw new Error('noncanonical owner encoding');
-      const host = lineValue(bytes.toString('utf8'));
-      if (host !== '' && !validOwner(host, legacyOwnerValues)) throw new Error('invalid owner ID');
-      return { host, version };
+      const [host, bindings, ...extra] = lineValue(bytes.toString('utf8')).split(/\r?\n/);
+      if (host !== '' && !validOwner(host)) throw new Error('invalid owner ID');
+      if (extra.length || (bindings !== undefined && !validAlias(host))) throw new Error('invalid owner record');
+      return bindings === undefined ? { host, version }
+        : { host, version, legacyOwnerValues: parseLegacyOwnerValues(bindings) };
     },
   };
 }
 
 /** Each invocation performs its own bounded read, including startup and retries. */
-export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerValues = getLegacyOwnerValues(),
-  source = createGitHubOwnershipSource({ legacyOwnerValues }),
+export async function resolveHostRole({ thisHost = getThisHost(), source = createGitHubOwnershipSource(),
   legacyHost, clock = () => performance.now(), timeoutMs = READ_TIMEOUT_MS } = {}) {
   let timer;
   try {
@@ -176,25 +189,27 @@ export async function resolveHostRole({ thisHost = getThisHost(), legacyOwnerVal
       Promise.resolve().then(() => source.readOwner({ deadline, clock })),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('owner read timeout')), timeoutMs); }),
     ]);
-    if (!result || Object.keys(result).some((key) => !['host', 'version'].includes(key))
-      || (result.host !== '' && !validOwner(result.host, legacyOwnerValues))
+    if (!result || Object.keys(result).some((key) => !['host', 'version', 'legacyOwnerValues'].includes(key))
+      || (result.host !== '' && !validOwner(result.host))
       || typeof result.version !== 'string' || result.version.length < 1 || result.version.length > 128
       || /[^A-Za-z0-9._-]/.test(result.version)) {
       throw new Error('unexpected owner result');
     }
+    const legacyOwnerValues = result.legacyOwnerValues;
     let localAlias = '';
     if (legacyOwner(result.host, legacyOwnerValues)) {
-      if (legacyHost != null) localAlias = legacyHost;
+      if (legacyHost !== undefined) localAlias = legacyHost;
       else {
         const remaining = Math.max(0, deadline - clock());
-        if (remaining > 0) localAlias = getLegacyHost({ legacyOwnerValues, timeoutMs: remaining });
+        localAlias = remaining > 0 ? getLegacyHost({ legacyOwnerValues, timeoutMs: remaining }) : null;
       }
+      if (localAlias == null) return { ...standby('host-identity-unknown'), source: 'remote' };
     }
     const finished = clock();
     if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started
       || finished - started >= timeoutMs) throw new Error('owner read expired');
     return { ...decideHostRole({ thisHost, owner: result.host, ownerReadAt: started, now: finished,
-      legacyHost: localAlias, legacyOwnerValues }),
+      legacyHost: localAlias, ownerRecord: result }),
       source: 'remote' };
   } catch {
     return { ...standby('owner-unreadable'), source: 'remote-failed' };

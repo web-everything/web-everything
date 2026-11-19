@@ -1,10 +1,11 @@
 ---
+bornAs: x9m6r3t
 kind: story
 size: 2
 status: open
 dateOpened: "2026-11-17"
 tags: []
-related: ["x2fybk1"]
+related: ["8581"]
 ---
 
 # Superseded: throttle successful owner reads when cache persistence fails
