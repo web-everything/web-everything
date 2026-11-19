@@ -1126,7 +1126,10 @@ positive integers, and adds the Codex simplicity and then correctness advisory s
 as needed. These answers stay advisory. A skipped/unavailable answer does not count;
 a shortfall (including a minimum above the two available Codex lenses) is recorded on
 the verdict and printed in both the verdict write-up and human advisory note. Saved
-runs retain their original roster, with the same explicit shortfall reporting.
+runs retain their original roster and persisted minimum. Historical runs saved before
+both `seatSteps` and `minNonClaudeSeats` existed resume with their original zero minimum;
+incomplete modern policy records still use the live minimum. `review-ruling-resume.test.mjs`
+pins that migration and drives a historical two-seat panel through reduction.
 These settings resolve through standard → platform `review` → tool
 `scripts/settings/review.json` → env, logging effective values and sources.
 Validate each complete scalar before cascading: nested and empty objects, arrays,
@@ -4940,6 +4943,23 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+External agy review jurors bound silent launches with `review.externalJurors.firstOutputMs`
+(default 120000; 0 disables). A silent kill records `provider-unresponsive` and uses the
+existing quota evidence store's root for a hold across every backend, for `cooldownMs`
+(default 1800000). Advisory skips retain the window and cooldown in their summary;
+mandatory skips and an unmet `minNonClaudeSeats` block on infrastructure. New runs seat
+the fifth juror through `advisorySeats.antigravityReview` (default off), independently of
+probation; a saved run retains its roster. Regressions: `external-juror-liveness.test.mjs`,
+`review-pr.test.mjs`, and `agy-juror-first-output.soak.test.mjs` (the latter uses the soak
+Vitest config). Run only the affected files through heavy-admission.
+
+## Antigravity advisory seating and unavailable-provider evidence
+
+`external-juror-liveness.test.mjs` pins `advisorySeats.antigravityReview=probation` to the
+old unset-env model-probation check, forced on/off and environment precedence. Antigravity
+graceful skips require an existing explicit `fallbackDecision` skip decision; absent, unknown
+or `none` evidence must propagate validation and tool-denial errors. The #3481 replay in
+`review-pr-io.test.mjs` checks that unset-env probation retains unruled referral holds.
 ## Urgent prototype verification
 
 `node scripts/operations/run.mjs urgent-verify --sha=<full sha>` requires a clean checkout at
