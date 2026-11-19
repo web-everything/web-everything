@@ -45,6 +45,10 @@ describe('Forge key structure slice 1',()=>{
     expect(createPrivateKey({key:Buffer.from(text,'base64'),format:'der',type:'pkcs1'}).type).toBe('private');
     blocked(Buffer.from(text));
   });
+  it('blocks AES-encrypted PKCS#8 DER in every view (audit #7076)',()=>{
+    const encrypted=generateKeyPairSync('ed25519').privateKey.export({format:'der',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'pw'});
+    for(const encode of Object.values(views))blocked(Buffer.from(encode(encrypted)));
+  });
   it('blocks RSA multiprime oth private members without a top-level d (red-team #7076)',()=>{
     blocked(Buffer.from(JSON.stringify({kty:'RSA',oth:[{r:'a',d:'b',t:'c'}]})));
     blocked(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[{r:'a',d:'b',t:'c'}]}).replace('[','/* x */[')));
