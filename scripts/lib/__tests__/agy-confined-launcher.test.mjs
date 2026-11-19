@@ -88,7 +88,12 @@ it.each(['direct', 'homebrew-symlink', 'missing-login'])('production sandbox cal
     expect(transcriptDir.startsWith(`${host.home}/workspace/`)).toBe(false);
     expect([...writeRule.matchAll(/\(subpath "([^"]+)"\)/g)].map(m => m[1]))
       .toEqual([realpathSync(options.dir), privateTemp, join(host.home, '.gemini/antigravity-cli/log')]);
-    expect(profile).not.toContain('(allow file-read*');
+    const readAllow = profile.split('\n').find(line => line.startsWith('(allow file-read*'));
+    const installDir = dirname(realpathSync(options.cli));
+    expect(readAllow).toContain(`(subpath ${JSON.stringify(installDir)})`);
+    if (installation === 'homebrew-symlink') expect(readAllow).toContain(`(subpath ${JSON.stringify(homebrewPrefix)})`);
+    expect(profile.indexOf(`(deny file-read* (subpath ${JSON.stringify(host.home)}))`)).toBeLessThan(profile.indexOf(readAllow));
+    expect(profile.indexOf(`(subpath ${JSON.stringify(join(host.home, 'Library/Keychains'))})`)).toBeGreaterThan(profile.indexOf(readAllow));
     expect(opts.env).not.toHaveProperty('GH_TOKEN');
     expect(opts.env).not.toHaveProperty('SSH_AUTH_SOCK');
     expect(opts.env).not.toHaveProperty('ANTIGRAVITY_QUOTA_DIR');
@@ -127,6 +132,26 @@ it('resolves the binary symlink and refuses a target under home/workspace', asyn
   symlinkSync(target, link);
   await expect(defaultSpawnAgy({ ...options, cli: link })).rejects.toThrow('binary overlaps workspace');
   expect(spawn).not.toHaveBeenCalled();
+});
+
+it('keeps a symlinked secret target denied even inside the readable clone', async () => {
+  const { options } = fixture();
+  const target = join(options.dir, 'secret-target');
+  mkdirSync(target);
+  symlinkSync(target, join(host.home, '.secrets'));
+  spawn.mockImplementation((bin, args) => {
+    const profile = readFileSync(args[1], 'utf8');
+    const readAllow = profile.split('\n').find(line => line.startsWith('(allow file-read*'));
+    expect(profile.indexOf(`(subpath ${JSON.stringify(target)})`)).toBeGreaterThan(profile.indexOf(readAllow));
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    queueMicrotask(() => child.emit('close', 0));
+    return child;
+  });
+  expect(await defaultSpawnAgy(options)).toMatchObject({ code: 0 });
+  expect(spawn).toHaveBeenCalledOnce();
 });
 
 it('fails closed on an unresolved executable with an operator fallback', async () => {
@@ -178,16 +203,26 @@ it('refuses a redirected log directory with operator fallback and cleans launche
 });
 
 it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
-  'REAL launcher uses real-HOME login, allows log writes, denies other home writes and cleans only private temp', async () => {
+  'REAL launcher uses real-HOME login, allows log writes, denies other home reads/writes and cleans only private temp', async () => {
     const { options } = fixture();
     mkdirSync(join(host.home, '.gemini/antigravity-cli/log'));
     const login = join(host.home, '.gemini/antigravity-cli/antigravity-oauth-token');
     writeFileSync(login, 'fixture-login');
+    mkdirSync(join(host.home, '.ssh'));
+    writeFileSync(join(host.home, '.ssh/probe'), 'fixture-secret');
+    writeFileSync(join(host.home, 'personal-notes'), 'fixture-secret');
+    writeFileSync(join(options.dir, 'clone-probe'), 'fixture-clone');
+    writeFileSync(join(options.dir, '.env.local'), 'fixture-secret');
     writeFileSync(options.cli, `#!/bin/sh
 /bin/cat "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" || exit 2
 printf logged > "$HOME/.gemini/antigravity-cli/log/probe" || exit 3
 if (printf blocked > "$HOME/.gemini/other"); then exit 4; fi
 printf '\nother-home-write-denied\n'
+if /bin/cat "$HOME/.ssh/probe"; then exit 5; fi
+if /bin/cat "$HOME/personal-notes"; then exit 6; fi
+if /bin/cat .env.local; then exit 7; fi
+/bin/cat clone-probe || exit 8
+printf '\nhome-secret-reads-denied\n'
 `);
     const actual = await vi.importActual('node:child_process');
     let privateTemp;
@@ -197,9 +232,12 @@ printf '\nother-home-write-denied\n'
       return actual.spawn(bin, args, opts);
     });
     const result = await defaultSpawnAgy(options);
-    expect(result.code).toBe(0);
+    expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain('fixture-login');
     expect(result.stdout).toContain('other-home-write-denied');
+    expect(result.stdout).toContain('home-secret-reads-denied');
+    expect(result.stdout).toContain('fixture-clone');
+    expect(result.stdout).not.toContain('fixture-secret');
     expect(result.stderr).toMatch(/EPERM|Operation not permitted/i);
     expect(readFileSync(join(host.home, '.gemini/antigravity-cli/log/probe'), 'utf8')).toBe('logged');
     expect(existsSync(join(host.home, '.gemini/other'))).toBe(false);

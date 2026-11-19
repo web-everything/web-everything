@@ -47,20 +47,29 @@ describe('pure sandbox profile', () => {
     const extra = join(f.root, 'denied');
     mkdirSync(extra);
     const profile = buildSandboxProfile({ ...f, extraDeniedPaths: [extra] });
-    const readRule = profile.split('\n').filter(line => line.startsWith('(deny file-read*')).at(-1);
-    expect(profile.trim().endsWith(readRule)).toBe(true);
+    const readRule = profile.split('\n').filter(line => line.startsWith('(deny file-read*')).at(-2);
+    expect(profile.trim().endsWith('(deny file-read* (regex #"/\\.env[^/]*$"))')).toBe(true);
     for (const p of [...sandboxSecretPaths(f.homeDir), join(f.homeDir, 'workspace'), f.workspaceOps, extra])
       expect(readRule).toContain(`(subpath ${JSON.stringify(p)})`);
   });
-  it('keeps real-HOME login, Keychain, application state and binary reads unrestricted', () => {
+  it('denies home reads before allowing only clone, private temp, agy state and install roots', () => {
     const f = fixture();
-    const profile = buildSandboxProfile(f);
-    const readRule = profile.split('\n').find(s => s.startsWith('(deny file-read*'));
-    for (const p of ['/Users', '/Volumes', '/private/tmp', '/tmp', f.homeDir,
-      join(f.homeDir, '.gemini'), join(f.homeDir, 'Library/Keychains'),
-      join(f.homeDir, 'Library/Application Support/antigravity')])
-      expect(readRule).not.toContain(`(subpath ${JSON.stringify(p)})`);
-    expect(profile).not.toContain('(allow file-read*');
+    const agyBinDir = join(f.homeDir, 'bin');
+    const homebrewPrefix = join(f.homeDir, 'brew');
+    const profile = buildSandboxProfile({ ...f, agyBinDir, homebrewPrefix });
+    const rules = profile.split('\n');
+    const homeDeny = `(deny file-read* (subpath ${JSON.stringify(f.homeDir)}))`;
+    const allow = rules.find(line => line.startsWith('(allow file-read*'));
+    expect(allow).toBe(`(allow file-read* ${[f.cloneDir, f.privateTempDir, join(f.homeDir, '.gemini'), agyBinDir, homebrewPrefix]
+      .map(p => `(subpath ${JSON.stringify(p)})`).join(' ')})`);
+    expect(rules.indexOf(homeDeny)).toBeGreaterThan(-1);
+    expect(rules.indexOf(allow)).toBeGreaterThan(rules.indexOf(homeDeny));
+    const secretDeny = rules.at(-3);
+    expect(rules.indexOf(secretDeny)).toBeGreaterThan(rules.indexOf(allow));
+    expect(sandboxSecretPaths(f.homeDir)).toEqual(['.ssh', '.aws', '.gnupg', '.netrc', '.secrets', '.config/gh',
+      'Library/Keychains', '.plateau'].map(p => join(f.homeDir, p)));
+    for (const path of sandboxSecretPaths(f.homeDir)) expect(secretDeny).toContain(`(subpath ${JSON.stringify(path)})`);
+    expect(rules.at(-2)).toBe('(deny file-read* (regex #"/\\.env[^/]*$"))');
   });
   it.each(['agyBinDir', 'homebrewPrefix'])('refuses a binary root overlapping workspace: %s', key => {
     const f = fixture();
@@ -124,7 +133,7 @@ describe('pure sandbox profile', () => {
 it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))(
   'REAL sandbox allows clone/temp/log writes and real-HOME login reads, denies outside writes and secret reads with EPERM', () => {
     const f = fixture();
-    const denied = join(f.root, 'extra-denied');
+    const denied = join(f.cloneDir, 'extra-denied');
     mkdirSync(denied);
     writeFileSync(join(denied, 'secret'), 'fixture secret');
     mkdirSync(join(f.homeDir, '.gemini/antigravity-cli/conversations'));
@@ -137,7 +146,8 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
       return spawnSync('/usr/bin/sandbox-exec', argv, { cwd: f.cloneDir, encoding: 'utf8', timeout: 10_000 });
     };
     const inside = join(f.cloneDir, 'allowed');
-    expect(run('printf allowed > "$1"', inside).status).toBe(0);
+    const cloneWrite = run('printf allowed > "$1"', inside);
+    expect(cloneWrite.status, cloneWrite.stderr).toBe(0);
     expect(existsSync(inside)).toBe(true);
     const cloneRead = run('/bin/cat "$1"', inside);
     expect(cloneRead.status).toBe(0);
@@ -170,6 +180,16 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
       expect(write.stderr).toMatch(/EPERM|Operation not permitted/i);
       expect(existsSync(outside)).toBe(false);
     }
+    // These files exist: a missing-file error would not prove read confinement.
+    for (const path of [join(f.homeDir, 'personal-notes'), join(f.cloneDir, '.env'),
+      join(f.privateTempDir, '.env.local'), join(f.homeDir, '.gemini/.env.credentials')]) {
+      writeFileSync(path, 'fixture secret');
+      const read = run('/bin/cat "$1"', path);
+      expect(read.error).toBeUndefined();
+      expect(read.status, path).not.toBe(0);
+      expect(read.stderr).toMatch(/EPERM|Operation not permitted/i);
+      expect(read.stdout).toBe('');
+    }
     const realLogin = run('/bin/cat "$1"', join(f.homeDir, '.gemini/antigravity-cli/antigravity-oauth-token'));
     expect(realLogin.status).toBe(0);
     for (const root of [...sandboxSecretPaths(f.homeDir), f.workspaceOps, denied]) {
@@ -183,10 +203,10 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
   },
 );
 
-it('documents that direct file-write confinement excludes service-mediated writes', () => {
+it('documents that direct write and home-read confinement excludes service-mediated writes', () => {
   for (const path of ['../agy-sandbox.mjs', '../../../docs/agent/testing.md']) {
     const text = readFileSync(new URL(path, import.meta.url), 'utf8');
-    expect(text).toContain("process's own file writes only");
+    expect(text).toContain("process's own file writes and home reads");
     expect(text).toContain('Mach/XPC/LaunchServices-mediated writes');
     for (const command of ['defaults', 'open', 'osascript', 'launchctl']) expect(text).toContain(command);
     expect(text).toContain('out of scope');

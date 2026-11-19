@@ -2,8 +2,8 @@ import { isAbsolute, join, normalize } from 'node:path';
 
 // Exactly what agy needs for state writes; extend only with measured evidence.
 export const AGY_STATE_WRITE_DIRS = ['.gemini/antigravity-cli/log'];
-export const sandboxSecretPaths = home => ['.ssh', '.aws', '.gnupg', '.config/gh',
-  '.plateau'].map(p => join(home, p));
+export const sandboxSecretPaths = home => ['.ssh', '.aws', '.gnupg', '.netrc', '.secrets', '.config/gh',
+  'Library/Keychains', '.plateau'].map(p => join(home, p));
 const safePath = p => {
   if (typeof p !== 'string' || !isAbsolute(p) || normalize(p) !== p || /["\\\x00-\x1f\x7f-\x9f]/.test(p))
     throw new Error('unsafe sandbox path; use another provider or request operator review');
@@ -11,7 +11,7 @@ const safePath = p => {
 };
 const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 
-/** Confines the process's own file writes only. Mach/XPC/LaunchServices-mediated writes
+/** Confines the process's own file writes and home reads. Mach/XPC/LaunchServices-mediated writes
  * (defaults, open, osascript, launchctl) are out of scope; this is not a service sandbox.
  * Pure SBPL builder. Inputs are canonical absolute paths resolved by the launcher.
  * deniedPaths lets the launcher resolve secret symlinks; extraDeniedPaths supports isolated probes. */
@@ -36,7 +36,10 @@ export function buildSandboxProfile({ transcriptDir, cloneDir, privateTempDir, l
   const subpath = p => `(subpath ${JSON.stringify(p)})`;
   return ['(version 1)', '(allow default)', '(deny file-write*)',
     `(allow file-write* ${writable.map(subpath).join(' ')} (literal "/dev/null") (literal "/dev/tty") (literal "/dev/dtracehelper"))`,
-    `(deny file-read* ${[...deniedPaths, workspaceDir, join(homeDir, 'workspace'), workspaceOps, ...extraDeniedPaths].map(subpath).join(' ')})`, ''].join('\n');
+    `(deny file-read* ${subpath(homeDir)})`,
+    `(allow file-read* ${[cloneDir, privateTempDir, join(homeDir, '.gemini'), ...binaryRoots].map(subpath).join(' ')})`,
+    `(deny file-read* ${[...deniedPaths, workspaceDir, join(homeDir, 'workspace'), workspaceOps, ...extraDeniedPaths].map(subpath).join(' ')})`,
+    '(deny file-read* (regex #"/\\.env[^/]*$"))', ''].join('\n');
 }
 
 export function buildSandboxEnv(env, privateTempDir, homeDir) {
