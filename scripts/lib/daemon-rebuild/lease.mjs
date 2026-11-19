@@ -1,6 +1,8 @@
 /** @file scripts/lib/daemon-rebuild/lease.mjs — Lock waits, writer preference (rebuild starvation), and the
  * single-flight build lease. Split out of daemon-rebuild.mjs (move-only).
  */
+import { rebuildReaders } from './evidence-context.mjs';
+
 
 import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -21,12 +23,13 @@ export const DEFAULT_STARVE_ESCALATE_AFTER = 2;
 export const STARVED_LOCK_WAIT_ENV = 'WE_DAEMON_REBUILD_STARVED_WAIT_MS';
 export const DEFAULT_STARVED_LOCK_WAIT_MS = 3 * 60_000;
 
-function starvePath(root, env = process.env) {
+export function starvePath(root, env = process.env) {
   return join(stateDir(env), `${cloneKey(root)}.starve.json`);
 }
 
 /** Consecutive `tick-in-progress` give-ups for this clone (missing/corrupt = 0). */
 export function readRebuildStarvation(root, env = process.env) {
+  if (rebuildReaders()) return rebuildReaders().starvation(root, env);
   try {
     const n = JSON.parse(readFileSync(starvePath(root, env), 'utf8'))?.count;
     return Number.isInteger(n) && n > 0 ? n : 0;
@@ -34,6 +37,7 @@ export function readRebuildStarvation(root, env = process.env) {
 }
 
 export function writeRebuildStarvation(root, count, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   try {
     const file = starvePath(root, env);
     mkdirSync(dirname(file), { recursive: true });

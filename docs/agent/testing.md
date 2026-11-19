@@ -5216,3 +5216,23 @@ job; a `still-rejected` adopt-only result never launches recovery. The overdue t
 at most 15 minutes (the default); settings may only shorten it, and oversized settings clamp
 to that maximum and log the originating policy layer. The unit fixture drives the real ready-only rebuild through a
 timeout and a later passing smoke on unchanged inputs; the soak fixture checks queueing only.
+
+
+### Detached rebuild evidence policy
+
+Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
+recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
+`createRebuildReaders` derives one strict policy from that provenance at `rebuildClone` entry.
+Its async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
+cleanup and ready publication. Keep evidence entry points connected to this scope when adding
+readers; do not add a child-specific permissive fallback. Tick-start installs no policy.
+The build lease lives in the strictly validated rebuild state. Ready, pending adoptions,
+overlay registry/events, starvation, force request/watch, conflict wakes and pending drops
+also refuse malformed or unreadable evidence; only ENOENT is absent. Writes revalidate evidence
+before replacing or deleting it. Refusal requires operator repair of the persisted evidence.
+`daemon-rebuild/__tests__/evidence-readers.test.mjs` tables both provenances against each reader
+and corrupt JSON, EACCES and wrong shapes, at entry and after waiting for the write lock,
+asserting unchanged bytes. It also pins indirect legacy-reader inheritance and late ready
+corruption before publication/cleanup. The recovery suite pins both recovery launch origins
+and successful strict-child smoke/ready publication. Existing real CLI child probes retain
+legacy tick-start behavior and prove early/recovery entry refusal before Git IO.

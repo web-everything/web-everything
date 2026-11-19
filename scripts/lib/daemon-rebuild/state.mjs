@@ -1,6 +1,8 @@
 /** @file scripts/lib/daemon-rebuild/state.mjs — Per-clone state files.
  * Split out of daemon-rebuild.mjs (move-only).
  */
+import { rebuildReaders } from './evidence-context.mjs';
+
 
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { overlayFilePath, cloneKey } from '../daemon-overlays.mjs';
@@ -60,7 +62,7 @@ const EMPTY_STATE = Object.freeze({
  *   unverified:{head:string, prevHead:string}|null, building:object|null, smokePassed:Array<{key:string, tree:string, passedAt:string}>|null}}
  */
 export function readRebuildState(root, env = process.env) {
-  return readState(root, env, false);
+  return rebuildReaders() ? rebuildReaders().state(root, env) : readState(root, env, false);
 }
 
 /** Launch admission: only ENOENT means empty; unreadable/corrupt evidence throws for refusal. */
@@ -137,6 +139,7 @@ function readState(root, env, strict, read = readFileSync) {
 
 /** Atomic write — `<file>.tmp-<pid>` then `renameSync`, same posture as `daemon-overlays.mjs#writeOverlays`. */
 export function writeRebuildState(root, state, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   const file = rebuildStatePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
@@ -173,6 +176,7 @@ export function readyCandidatePath(root, env = process.env) {
 
 /** The recorded ready candidate, or `null` (missing/corrupt reads as none — never throws). */
 export function readReadyCandidate(root, env = process.env) {
+  if (rebuildReaders()) return rebuildReaders().ready(root, env);
   try {
     const r = JSON.parse(readFileSync(readyCandidatePath(root, env), 'utf8'));
     return r && typeof r === 'object' && r.adopt?.finalSha && r.prevHead ? r : null;
@@ -204,6 +208,7 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
 }
 
 export function writeReadyCandidate(root, record, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   try {
     const file = readyCandidatePath(root, env);
     mkdirSync(dirname(file), { recursive: true });
@@ -217,5 +222,6 @@ export function writeReadyCandidate(root, record, env = process.env) {
 }
 
 export function clearReadyCandidate(root, env = process.env) {
+  rebuildReaders()?.validate(root, env);
   try { unlinkSync(readyCandidatePath(root, env)); } catch { /* already gone */ }
 }

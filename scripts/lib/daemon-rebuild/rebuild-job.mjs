@@ -324,7 +324,7 @@ export async function rebuildCloneAsJob({
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, launchedBy, waitInFlightTickMs, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
+      input: { root: resolve(root), entries, launchedBy: recover ? 'recovery' : launchedBy, waitInFlightTickMs, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
         daemonReader: { root: resolve(root), owner: `${hostname()}:${process.pid}`, pid: process.pid, startedMs: processStartMs(process.pid) } },
     });
   } catch (e) {

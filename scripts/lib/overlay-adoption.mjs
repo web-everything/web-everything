@@ -7,6 +7,8 @@
  * before ancestry probes; the oldest registrations yield to new ones at capacity. Retryable event-write
  * failures retain records within those bounds. Terminal loader outcomes clear only their own nonce.
  */
+import { rebuildReaders } from './daemon-rebuild/evidence-context.mjs';
+
 import { spawnSync } from 'node:child_process';
 import nodeFs from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -34,6 +36,7 @@ function readPendingStrict(root, env, fs) {
 }
 
 export function readPendingAdoptions(root, { env = process.env, fs = nodeFs } = {}) {
+  if (rebuildReaders()) return rebuildReaders().pending(root, env);
   try {
     const list = JSON.parse(fs.readFileSync(pendingAdoptionPath(root, env), 'utf8'));
     return Array.isArray(list) ? list.filter((r) => r && typeof r.ref === 'string' && FULL_SHA.test(r.sha || '')) : [];
@@ -79,7 +82,7 @@ function updatePending(root, env, fs, change, { staleMs = 10000, waitMs = 3000 }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
   }
-  try { writePending(root, env, fs, change(readPendingStrict(root, env, fs))); }
+  try { writePending(root, env, fs, change(rebuildReaders() ? rebuildReaders().pending(root, env) : readPendingStrict(root, env, fs))); }
   finally { try { fs.rmdirSync(lock); } catch { /* best effort */ } }
 }
 

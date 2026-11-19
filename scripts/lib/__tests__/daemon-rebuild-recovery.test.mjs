@@ -145,6 +145,20 @@ describe('environment-timeout recovery deadlines', () => {
     expect(readReadyCandidate(f.root, f.env).adopt.inputsKey).toBe(f.plan.inputsKey);
   });
 
+  it.each(['early', 'recovery'])('%s child with clean evidence records a passed candidate', async launchedBy => {
+    const f = fixture(null);
+    vi.spyOn(locks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(candidate, 'materializeCandidate').mockReturnValue({ ok: true, path: f.root });
+    vi.spyOn(candidate, 'removeCandidate').mockImplementation(() => {});
+    const runSmoke = vi.fn().mockResolvedValue({ verdict: 'pass', smoke: { results: [] } });
+    expect(await rebuildClone({ root: f.root, env: f.env, run: f.run, log: { error() {} },
+      now: () => 2000, readyOnly: true, launchedBy, asJob: false, mainOnly: true, versions: null, runSmoke,
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: () => {}, match: () => false } }))
+      .toMatchObject({ reason: 'ready-recorded', readyRecorded: true, target: f.plan.finalSha });
+    expect(readReadyCandidate(f.root, f.env).adopt.inputsKey).toBe(f.plan.inputsKey);
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+  });
+
   it('legacy attempts start at one and successive retry delays cap at the configured maximum', () => {
     const first = envTimeoutRetry({ reason: 'smoke-env-timeout', since: at(100) }, 1000, settings);
     expect(first).toEqual({ attempts: 1, retryAt: at(2000) });
@@ -180,6 +194,15 @@ describe('overdue recovery launch bounds', () => {
     f.advance(1);
     expect((await f.invoke()).reason).toBe('rebuild-job-started');
     expect(f.store.list().records).toHaveLength(2);
+  });
+
+  it.each(['env-timeout retryAt', 'overdue registration'])('marks %s launches as recovery', async trigger => {
+    const f = queueFixture();
+    const readState = trigger === 'env-timeout retryAt'
+      ? () => ({ held: { reason: 'smoke-env-timeout', retryAt: at(2_000_000) } }) : () => ({});
+    expect((await f.invoke('needs-build', { readState,
+      readPending: () => trigger === 'env-timeout retryAt' ? [] : [{ at: at(0) }] })).reason).toBe('rebuild-job-started');
+    expect(f.store.list().records[0].input.launchedBy).toBe('recovery');
   });
 
   it('does not launch unchanged sticky-rejected inputs even after the interval expires', async () => {

@@ -1,6 +1,8 @@
 /** @file scripts/lib/daemon-rebuild/prepare.mjs — Locked preparation phase.
  * Split out of daemon-rebuild.mjs (move-only).
  */
+import { rebuildReaders } from './evidence-context.mjs';
+
 
 import { timeoutRetryAt, resolveRecovery } from './recovery.mjs';
 
@@ -42,6 +44,7 @@ import {
 
 /** Read the overlay audit trail, returning no evidence when it is missing or unreadable. */
 export function readOverlayEventLog(root, env) {
+  if (rebuildReaders()) return rebuildReaders().overlayEvents(root, env);
   try {
     const file = overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl');
     return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line));
@@ -142,6 +145,7 @@ export async function prepareRebuild({
   let state;
   try {
     // Detached/re-attached jobs carry provenance, never the admission snapshot.
+    rebuildReaders()?.validate(root, stEnv);
     state = strictState ? readRebuildStateStrict(root, stEnv) : readRebuildState(root, stEnv);
   } catch {
     return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: alertsList };

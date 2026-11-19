@@ -1,4 +1,6 @@
 /** Rebuild herd spacing: stable identity, bounded additive jitter, and historical settings. */
+import { withRebuildReaders } from '../evidence-context.mjs';
+
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -544,16 +546,17 @@ it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'hold', 'l
     writeRebuildState(root, {}, env);
     const file = rebuildStatePath(root, env);
     const strictRead = stateIO.readRebuildStateStrict;
+    const readLocks = [];
     const readState = vi.spyOn(stateIO, 'readRebuildStateStrict').mockImplementation((...args) => {
-      expect(cloneLocks.inspectCloneLock(root, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: 1000 }).writerLive)
-        .toBe(readState.mock.calls.length > 1);
+      readLocks.push(cloneLocks.inspectCloneLock(root, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: 1000 }).writerLive);
       return strictRead(...args);
     });
     let bytes, persistedRejection;
     const withWriteLock = cloneLocks.withWriteLock;
     vi.spyOn(cloneLocks, 'withWriteLock').mockImplementation((...args) => {
       // A sibling publishes new evidence after the early strict read, before we acquire the lock.
-      expect(readState).toHaveBeenCalledOnce();
+      expect(readLocks.length).toBeGreaterThan(0);
+      expect(readLocks.every(held => !held)).toBe(true);
       const state = ['sticky', 'backoff', 'interrupted'].includes(kind) ? {
         rejected: { inputsKey: kind !== 'backoff' ? 'inputs' : 'older', reason: 'failed', at: stamp,
           ...(kind === 'backoff' ? { harnessBroken: true, retryAt: new Date(2000).toISOString() } : {}) },
@@ -564,7 +567,7 @@ it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'hold', 'l
       } : kind === 'hold' ? { held: { reason: 'smoke-env-timeout', since: stamp, updatedAt: stamp,
         retryAt: new Date(2000).toISOString(), attempts: 1 } }
         : kind === 'lease' ? { building: { ...completeState().building, host: 'other-host', startedAt: stamp } } : {};
-      writeRebuildState(root, state, env);
+      withRebuildReaders(undefined, () => writeRebuildState(root, state, env));
       persistedRejection = JSON.parse(readFileSync(file, 'utf8')).rejected;
       if (kind === 'unreadable') writeFileSync(file, '{new-unreadable-state');
       bytes = readFileSync(file, 'utf8');
@@ -596,8 +599,10 @@ it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'hold', 'l
     expect(result.reason).toBe(['sticky', 'interrupted'].includes(kind) ? 'still-rejected' : kind === 'backoff'
       ? 'smoke-harness-broken-backoff' : kind === 'hold' ? 'smoke-env-timeout-backoff'
         : kind === 'lease' ? 'rebuild-in-progress' : kind === 'unreadable' ? 'state-unreadable'
-          : kind === 'up-to-date' ? 'up-to-date' : 'rebuild-job-started');
-    expect(readState).toHaveBeenCalledTimes(2); expect(legacyRead).not.toHaveBeenCalled();
+          : kind === 'up-to-date' ? 'state-unreadable' : 'rebuild-job-started');
+    expect(readLocks[0]).toBe(false);
+    expect(readLocks).toContain(true);
+    expect(legacyRead).not.toHaveBeenCalled();
     if (kind === 'unreadable') expect(run).not.toHaveBeenCalled();
     if (kind === 'interrupted') {
       const persisted = JSON.parse(readFileSync(file, 'utf8'));
@@ -605,7 +610,7 @@ it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'hold', 'l
       expect(persisted.rejected).toEqual(persistedRejection);
     } else if (kind === 'up-to-date') {
       expect(readFileSync(readyCandidatePath(root, env), 'utf8')).toBe('{new-unreadable-evidence');
-      expect(JSON.parse(readFileSync(file, 'utf8')).adopted.head).toBe('head');
+      expect(readFileSync(file, 'utf8')).toBe(bytes);
     } else expect(readFileSync(file, 'utf8')).toBe(bytes);
     expect(store.list().records).toHaveLength(kind === 'clean' ? 1 : 0);
   });
@@ -662,7 +667,7 @@ it.each(['early', 'recovery', 'tick-start', 'unknown', undefined].flatMap(source
     expect(rebuildJob.parseRebuildChildOutput(stdout)).toMatchObject(strict
       ? { moved: false, reason: 'state-unreadable' }
       : { moved: false, reason: 'readonly-job-mutation-due', mutation: 'wrong-branch-heal' });
-    expect(readFileSync(observed, 'utf8')).toBe('true\n');
+    expect(readFileSync(observed, 'utf8')).toBe(strict ? 'false\n' : 'true\n');
     expect(readFileSync(file)).toEqual(bytes);
   });
 
