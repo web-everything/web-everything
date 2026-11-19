@@ -4821,8 +4821,10 @@ non-confirm pending step uses `reviewRunReaper.abandonStuckJudgeAfterMinutes` (d
 standard/platform/tool/environment cascade. An explicit `thresholdMs` overrides every horizon.
 Confirm, mandatory-referral, resumed and rejecting-verdict continuations stay kept. Abandonment
 never reconciles unknown effects: planners exclude the unchanged tombstoned record so a new panel
-starts. Gates return `review-abandoned` until a completed same-head panel has a strictly later read
-start; older acceptance and result comments cannot discharge it. Historical tombstones on rejecting
+starts. Gates return `review-abandoned` until a completed same-head panel's read starts strictly after
+the tombstone's `at` (including legacy sidecars); earlier acceptance and result comments cannot discharge it.
+Runs without a pending cursor or active effect retain the configured `abandonAfterHours` horizon.
+Historical tombstones on rejecting
 or unrecognised verdicts, operator `findings.confirm` rejections, and declared/pending/in-flight
 send-back effect payloads retain their original holds through the shared `hasRejectingReviewVerdict` predicate. The queue treats `review-abandoned` as a
 non-runnable wait carrying `awaitingFreshReview: true`. It pages no human initially; after the
@@ -4841,8 +4843,12 @@ Keep `review-abandon-round4.test.mjs` in the scoped gate: exercise real label-cl
 reaper, planner and suspended-referral scans with stray names, both tombstone locations, and a
 rewritten record. Writer-lock/temp scans still inspect their sidecars for liveness.
 
-Historical effects can omit `payload`: omission alone is not a rejecting verdict. Keep the
-named round-3 historical label/notice regressions alongside explicit null, malformed and
-send-back payload holds. Archive retention must admit valid `.retiring-<run>.json.<uuid>`
+Open effects require readable object payloads and a known non-rejecting sink/accept-class target;
+missing historical payloads, unknown sinks and unproven label/verdict effects retain the hold.
+Inspect nested objects and arrays alike: over 16 levels, 4096 entries or 256 KiB of text retains
+the hold and directs the operator to inspect the full verdict/effect payload before retrying.
+Abandoned attempts still count toward the merge-watch repeated-review pause alert, including cached scans.
+Keep the named round-3 missing-payload, nested-array and oversized-payload holds with the #7109/#7120
+readable accepting payload regressions. Archive retention must admit valid `.retiring-<run>.json.<uuid>`
 recovery files before filtering run records; failed restores still emit `ALERT` and continue
 retention even when the alert emitter fails. Invalid parked run names remain untouched.

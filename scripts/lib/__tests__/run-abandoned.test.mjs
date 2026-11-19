@@ -3,11 +3,28 @@ import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isValidRunId, listRunIds } from '../../operations/run-store.mjs';
-import { abandonedPath, markRunAbandoned, isRunAbandoned, isAbandonedGivenStats, isRunTerminalOrAbandoned, runRecordVersion } from '../run-abandoned.mjs';
+import { abandonedPath, markRunAbandoned, isRunAbandoned, isAbandonedGivenStats, isRunTerminalOrAbandoned, runRecordVersion, hasRejectingReviewVerdict } from '../run-abandoned.mjs';
 
 let root, dir;
 const id = 'review-dead';
 const options = () => ({ id, dir, reason: 'dead', probes: { pid: false }, by: 'test', now: 1800000000000 });
+it.each(['declared', 'pending', 'in-flight'])('only proven non-rejecting %s effects permit abandonment', status => {
+  for (const type of ['review.label-swap', 'verdict-ledger.append', 'review.notice', 'review.ledger-events', 'review.scoped-rereview-shadow', 'unknown']) {
+    for (const payload of [undefined, null, false, 'accept', []]) {
+      expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload }] })).toBe(true);
+    }
+    expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload: { to: 'accepted', verdict: 'accept' } }] }))
+      .toBe(type === 'unknown');
+    expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload: { to: 'accepted', nested: [[{ verdict: 'changes' }]] } }] })).toBe(true);
+  }
+  for (const type of ['review.label-swap', 'verdict-ledger.append', 'review.notice', 'unknown']) {
+    expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload: {} }] })).toBe(true);
+  }
+});
+it('unreadable effect payload retains the hold instead of throwing or permitting abandonment', () => {
+  const effect = { type: 'review.label-swap', status: 'pending', get payload() { throw Error('unreadable'); } };
+  expect(hasRejectingReviewVerdict({ effects: [effect] })).toBe(true);
+});
 beforeEach(() => { root = fs.mkdtempSync(join(tmpdir(), 'run-abandoned-')); dir = join(root, 'runs'); fs.mkdirSync(dir); fs.mkdirSync(join(root, 'run-tombstones')); fs.writeFileSync(join(dir, `${id}.json`), '{}'); });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 it.each([[10, 9, true], [10, 10, true], [10, 11, false], [NaN, 1, false], [1, undefined, false]])(

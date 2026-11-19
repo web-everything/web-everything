@@ -1,7 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { isRunAbandoned, markRunAbandoned } from '../../../lib/run-abandoned.mjs';
 import { runMergeWatchSignals, pausedReviewSignal, readReviewRuns } from '../pr-merge-watch-signals.mjs';
 
 const repo = 'example/widgets', head = 'a'.repeat(40), other = 'b'.repeat(40);
@@ -26,6 +27,32 @@ function harness(runs, { labels = [], pr: prOverride = {}, receipt = {} } = {}) 
 const paused = sent => sent.filter(e => e.kind === 'review-paused-no-verdict');
 
 describe('review-paused-no-verdict event', () => {
+  it('counts repeated abandoned reviews toward the pause threshold on fresh and cached scans', async () => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'abandoned-paused-runs-')), dir = join(root, 'runs');
+    mkdirSync(dir);
+    try {
+      const at = Date.now();
+      for (let i = 0; i < 3; i++) {
+        const id = `review-pr-abandoned-${i}`;
+        writeFileSync(join(dir, `${id}.json`), JSON.stringify({ id, input: { repo, pr: 6889 },
+          findings: { read: { netBasis: { rev: head } } }, pending: { kind: 'judge' }, verdict: null, effects: [] }));
+      }
+      const warm = readReviewRuns({ dir, now: at });
+      expect(warm).toHaveLength(3);
+      for (const { id } of warm) {
+        markRunAbandoned({ id, dir, now: at, reason: 'stuck judge', by: 'fixture', probes: {} });
+        expect(isRunAbandoned(id, dir)).toBe(true);
+      }
+      for (const offset of [1000, 61_000]) {
+        const rows = readReviewRuns({ dir, now: at + offset });
+        expect(rows).toHaveLength(3);
+        const h = harness(rows);
+        await h.run();
+        expect(paused(h.sent)).toEqual([expect.objectContaining({ repo, pr: 6889,
+          detail: expect.objectContaining({ head, runs: 3 }) })]);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('publishes one event for a paused review with no verdict on the head (live #6889 state)', async () => {
     const h = harness([parked('r1'), parked('r2'), parked('r3')]);
     await h.run();

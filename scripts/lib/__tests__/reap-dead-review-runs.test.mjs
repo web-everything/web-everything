@@ -25,7 +25,7 @@ beforeEach(() => {
     leases: vi.fn(() => '[]'), sessions: vi.fn(() => '[]') };
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
-const effect = (status, more = {}) => ({ key: `effect-${status}`, type: 'review', stepIndex: 0, index: 0, status, ...more });
+const effect = (status, more = {}) => ({ key: `effect-${status}`, type: 'review.ledger-events', payload: { verdict: 'accept' }, stepIndex: 0, index: 0, status, ...more });
 function record(id = 'review-dead', more = {}, age = 8 * HOUR) {
   const r = { ...newRunRecord({ id, op: 'review-pr', input: { pr: 123, repo: 'owner/repo' } }),
     pending: { kind: 'effect', step: 'review', stepIndex: 0 }, ...more };

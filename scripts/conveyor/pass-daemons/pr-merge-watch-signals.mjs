@@ -1,5 +1,4 @@
 /** Bounded evidence readers; all publication receipts belong to the current head. */
-import { isRunAbandoned } from '../../lib/run-abandoned.mjs';
 import { openSync, closeSync, fstatSync, readSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -99,10 +98,11 @@ let runCache = { at: 0, dir: '', rows: [] };
 /** Summaries of recent review-pr run records on disk, one scan shared by every PR in a pass (60 s cache; no GitHub reads).
  * Throws on an unreadable directory or record so the caller fails closed. */
 export function readReviewRuns({ dir = process.env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(), now = Date.now() } = {}) {
-  if (runCache.dir === dir && now - runCache.at < minute && now >= runCache.at) return runCache.rows.filter(r => !isRunAbandoned(r.id, dir));
+  if (runCache.dir === dir && now - runCache.at < minute && now >= runCache.at) return runCache.rows;
   let listing;
   try { listing = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; } // a runs folder that was never created holds no runs
-  const names = filterRunFileNames(listing).filter(n => n.startsWith('review-pr-') && !isRunAbandoned(n.slice(0, -5), dir))
+  // Abandoned attempts still count toward the repeated-review pause alert.
+  const names = filterRunFileNames(listing).filter(n => n.startsWith('review-pr-'))
     .map(n => ({ n, t: statSync(join(dir, n)).mtimeMs })).filter(f => f.t > now - RUN_AGE)
     .sort((a, b) => b.t - a.t);
   if (names.length > RUN_FILES) throw Error('incomplete bounded evidence: review run file cap');

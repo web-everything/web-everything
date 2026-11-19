@@ -45,6 +45,12 @@ it.each([
   ['in-flight send-back notice', { effects: [effect({ notice: renderReviewNotice({ event: 'cleared', repo, pr, outcome: 'changes' }) }, 'in-flight', 'review.notice')] }],
   ['unknown confirm shape', { findings: { confirm: { answer: 'changes' }, read: { netBasis: { rev: head } } } }],
   ['unreadable label payload', { effects: [effect(null)] }],
+  ...['declared', 'pending', 'in-flight'].flatMap(status => [
+    ...['review.label-swap', 'review.notice', 'verdict-ledger.append', 'unknown-effect'].map(type =>
+      [`${status} ${type} missing payload`, { effects: [effect(undefined, status, type)] }]),
+    [`${status} unknown sink with accepting payload`, { effects: [effect({ verdict: 'accept' }, status, 'unknown-effect')] }],
+    [`${status} nested array rejection`, { effects: [effect({ to: 'accepted', nested: [[{ verdict: 'changes' }]] }, status)] }],
+  ]),
 ])('%s is never abandoned and both gate readers retain review-unfinished even with a prior tombstone', (_name, more) => {
   const run = record(more);
   expect(sweep().kept['rejecting-verdict']).toEqual([id]);
@@ -148,17 +154,17 @@ it('unreadable nested payload and unknown verdict fields fail closed', () => {
   }
 });
 
-it.each(['review.label-swap', 'review.notice'])('historical %s effects without payloads remain abandonable, while present unreadable payloads hold', type => {
+it.each(['review.label-swap', 'review.notice'])('historical %s effects without payloads retain the hold, as do present unreadable payloads', type => {
   const historical = effect(undefined, 'pending', type);
   delete historical.payload;
   record({ effects: [historical] });
-  expect(hasRejectingReviewVerdict({ effects: [historical] })).toBe(false);
+  expect(hasRejectingReviewVerdict({ effects: [historical] })).toBe(true);
   for (const payload of [null, false, {}, { verdict: 'changes' }]) {
     expect(hasRejectingReviewVerdict({ effects: [{ ...historical, payload }] })).toBe(true);
   }
-  expect(sweep().reaped).toEqual([id]);
+  expect(sweep().kept['rejecting-verdict']).toEqual([id]);
   for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
-    expect(gate(reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
+    expect(gate(reader)).toMatchObject({ ok: false, reason: 'review-unfinished' });
   }
 });
 
@@ -184,6 +190,21 @@ it('payload nesting beyond the inspection bound retains rejection and unfinished
   record({ verdict: { verdict: 'accept' }, effects: [effect(payload)] });
   expect(sweep().kept['rejecting-verdict']).toEqual([id]);
   expect(gate(readDrainRedTeamEvidence)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+});
+it.each([
+  ['nested arrays', () => ({ to: 'accepted', nested: Array.from({ length: 18 }).reduce(value => [value], { verdict: 'accept' }) })],
+  ['wide array', () => ({ to: 'accepted', nested: Array(4097).fill('accept') })],
+  ['wide object', () => ({ to: 'accepted', nested: Object.fromEntries(Array.from({ length: 4097 }, (_, i) => [`k${i}`, 'accept'])) })],
+  ['large string', () => ({ to: 'accepted', note: 'x'.repeat(256 * 1024 + 1) })],
+])('oversized %s retains the hold and directs the operator to inspect the full payload', (_name, payload) => {
+  record({ verdict: { verdict: 'accept' }, effects: [effect(payload())] });
+  const log = vi.fn();
+  expect(sweep({ log }).kept['rejecting-verdict']).toEqual([id]);
+  expect(log.mock.calls.flat().join('\n')).toContain('inspect the full verdict/effect payload');
+  expect(isRunAbandoned(id, dir)).toBe(false);
+  for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+    expect(gate(reader)).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  }
 });
 
 it('keeps a judge whose own job pid is live even before a handle is recorded', () => {

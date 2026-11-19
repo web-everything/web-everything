@@ -80,7 +80,8 @@ it.each(['new', 'legacy'])('%s tombstones hold gates and planners, including cac
   expect(isRunAbandoned(id, dir)).toBe(true);
   for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) expect(gate(reader).reason).toBe('review-abandoned');
   expect(readReviewRunEvidence({ dir, persist: false })).toEqual([]);
-  expect(readReviewRuns({ dir, now })).toEqual([]);
+  // Attempts remain visible to the repeated-review alert even after abandonment.
+  expect(readReviewRuns({ dir, now }).map(r => r.id)).toEqual([id]);
   expect(findResumableParkedRun(subject, [parked], { repo, runsDir: dir })).toBeNull();
   expect(readAbandonedReviewSignal({ repo, pr, head, runsDir: dir, env, now, tool: {}, log: () => {} }))
     .toMatchObject({ awaitingFreshReview: true, escalate: false });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../review-abandon.mjs';
@@ -25,11 +25,12 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 function fixture(pr = 7109, age = 31 * MIN) {
   const id = `review-pr-${pr}`;
   const r = newRunRecord({ id, op: 'review-pr', input: { repo, pr } });
-  const types = ['review.comment', 'review.label-swap', 'review.ledger-events', 'review.follow-up'];
+  const types = ['review.label-swap', 'verdict-ledger.append', 'review.notice', 'review.ledger-events'];
   const pendingIndex = pr === 7120 ? 5 : 1;
   r.effects = Array.from({ length: pendingIndex + 3 }, (_, index) => ({ key: `e${index}`, index, stepIndex: 9,
     step: 'record', type: index === pendingIndex ? (pr === 7120 ? 'review.ledger-events' : 'review.label-swap') : types[index % types.length],
     status: index < pendingIndex ? 'applied' : index === pendingIndex ? 'pending' : 'declared',
+    payload: { to: 'accepted', verdict: 'accept' },
     ...(index === pendingIndex ? { unknownAttempts: 1 } : {}) }));
   r.pending = { kind: 'effect', step: 'record', stepIndex: 9 };
   r.verdict = { verdict: 'accept' };
@@ -145,7 +146,7 @@ it('complete same-head read keeps abandonment owed outside its warm summary cach
   op(['--apply']);
   // New time avoids the per-lookup answer memo; exercises the warm record-summary cache.
   expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + 2 * MIN })).toEqual({ ok: false, reason: 'review-abandoned', complete: true, blocked: true });
-  completed(r, now - MIN);
+  completed(r, now + 1000);
   expect(before.settleBounds.completeHeadRead({ pr: 7109, head, at: now + 3 * MIN })).toEqual({ complete: true, blocked: false });
 });
 it.each([readDrainRedTeamEvidence, readRecoveryWitness])('does not resurrect older same-head acceptance, even if its mtime is newer', reader => {
@@ -154,16 +155,17 @@ it.each([readDrainRedTeamEvidence, readRecoveryWitness])('does not resurrect old
   utimesSync(runPath(old.id, dir), now / 1000, now / 1000);
   op(['--apply']);
   expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
-  const next = completed(r, now - MIN);
+  const next = completed(r, now + 1000);
   const result = evidence(7109, reader);
   expect(result.ok).not.toBe(false);
   expect(result.loopPayload ?? result.newest).toMatchObject({ id: next.id });
 });
-it.each(['same start', 'older start', 'other head', 'pending', 'refused'])('requires a NEWER completed SAME-head panel: %s cannot discharge abandonment', kind => {
+it.each(['same start', 'older start', 'before tombstone', 'at tombstone', 'other head', 'pending', 'refused'])('requires a completed SAME-head panel STARTED AFTER the tombstone: %s cannot discharge abandonment', kind => {
   const r = fixture(), before = evidence();
   op(['--apply']);
   const startedAt = Date.parse(r.stepTimings[0].startedAt);
-  const next = completed(r, kind === 'same start' ? startedAt : kind === 'older start' ? startedAt - MIN : now - MIN,
+  const next = completed(r, kind === 'same start' ? startedAt : kind === 'older start' ? startedAt - MIN
+    : kind === 'before tombstone' ? now - MIN : kind === 'at tombstone' ? now : now + 1000,
     'review-pr-replacement', kind === 'other head' ? 'b'.repeat(40) : head);
   if (['pending', 'refused'].includes(kind)) {
     next.effects = [{ ...r.effects[1], status: kind,
@@ -180,8 +182,45 @@ it.each([null, { verdict: 'needs-human' }, { verdict: 'prevention-outstanding' }
   expect(result).toMatchObject({ ok: false, reason: 'review-abandoned' });
   expect(COMMENT_SETTLEABLE_REASONS).not.toContain('review-abandoned');
   expect(settleUnknownEvidenceByComment(result, [], 7109, head)).toBe(result);
-  completed(r, now - MIN);
+  completed(r, now + 1000);
   expect(evidence().ok).not.toBe(false);
+});
+it.each(['new', 'legacy'])('%s tombstone time requires a complete same-head review started after abandonment in both readers', location => {
+  const r = fixture();
+  const before = [readDrainRedTeamEvidence, readRecoveryWitness].map(reader => evidence(7109, reader));
+  op(['--apply']);
+  if (location === 'legacy') renameSync(abandonedPath(r.id, dir), join(dir, `${r.id}.abandoned.json`));
+  // This accept both started and completed after the old read start but before abandonment.
+  completed(r, now - MIN);
+  for (const [index, reader] of [readDrainRedTeamEvidence, readRecoveryWitness].entries()) {
+    expect(evidence(7109, reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
+    expect(before[index].settleBounds.completeHeadRead({ pr: 7109, head, at: now + MIN }))
+      .toMatchObject({ reason: 'review-abandoned', complete: true, blocked: true });
+  }
+  completed(r, now + 1000);
+  for (const [index, reader] of [readDrainRedTeamEvidence, readRecoveryWitness].entries()) {
+    expect(evidence(7109, reader).ok).not.toBe(false);
+    expect(before[index].settleBounds.completeHeadRead({ pr: 7109, head, at: now + 2 * MIN }))
+      .toEqual({ complete: true, blocked: false });
+  }
+});
+it.each(['platform', 'tool'])('does not shorten %s abandonAfterHours for runs without a pending cursor or active effect', source => {
+  const r = fixture(); r.pending = null; r.effects = [];
+  writeRun(r, dir);
+  utimesSync(runPath(r.id, dir), (now - 8 * 60 * MIN) / 1000, (now - 8 * 60 * MIN) / 1000);
+  const settings = { abandonAfterHours: 9, abandonStuckAfterMinutes: 1, abandonStuckJudgeAfterMinutes: 1 };
+  if (source === 'platform') writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ reviewRunReaper: settings }));
+  const extra = { tool: source === 'tool' ? settings : {} };
+  expect(op(['--apply'], extra).result.kept.terminal).toEqual([r.id]);
+  // Exercise the ordinary horizon even if a caller supplies a stricter terminal classifier.
+  extra.store = { isRunRecordTerminal: () => false };
+  const held = op(['--apply'], extra);
+  expect(held.result.kept.young).toEqual([r.id]);
+  expect(held.result.thresholdMs).toBe(9 * 60 * MIN);
+  expect(held.result.thresholdSource).toBe(source);
+  expect(held.err.mock.calls.flat().join(' ')).toContain(`abandonAfterHours=9 (${source})`);
+  expect(isRunAbandoned(r.id, dir)).toBe(false);
+  expect(op(['--apply'], { ...extra, thresholdMs: 7 * 60 * MIN }).result.reaped).toEqual([r.id]);
 });
 it.each(['missing head', 'missing start'])('unreadable abandoned %s never proves a replacement', kind => {
   const r = fixture();

@@ -72,7 +72,10 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     catch { result.scanned++; keep('unreadable', id); continue; }
     if (record.op !== 'review-pr') continue;
     result.scanned++;
-    if (hasRejectingReviewVerdict(record)) { keep('rejecting-verdict', id); continue; }
+    if (hasRejectingReviewVerdict(record)) {
+      log('reap-dead-review-runs: retaining possibly rejecting review evidence; inspect the full verdict/effect payload before retrying abandonment');
+      keep('rejecting-verdict', id); continue;
+    }
     if (io.isRunRecordTerminal(record)) { keep('terminal', id); continue; }
     if (isRunAbandoned(id, dir)) { keep('abandoned', id); continue; }
     if (!Array.isArray(record.effects) || record.effects.some(e => !e || typeof e.type !== 'string' || typeof e.status !== 'string')) {

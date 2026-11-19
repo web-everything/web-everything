@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { hasRejectingReviewVerdict, isRunAbandoned } from './run-abandoned.mjs';
+import { hasRejectingReviewVerdict, isRunAbandoned, readRunAbandonment } from './run-abandoned.mjs';
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -314,10 +314,10 @@ const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run
   rejecting: hasRejectingReviewVerdict(run), startedAt: reviewStartedAt({ run }),
   // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
   orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run) });
-// Only a completed same-head panel with a strictly later READ start discharges abandonment.
+// Only a completed same-head panel whose READ started after the tombstone discharges abandonment.
 // Missing head/start cannot prove a replacement; comments and mtimes never stand in for one.
 const reviewAbandoned = (abandoned, completed) => abandoned.some(s => s.rev === null || !Number.isFinite(s.startedAt)
-  || !(completed.get(s.rev) > s.startedAt));
+  || !Number.isFinite(s.abandonedAt) || !(completed.get(s.rev) > s.abandonedAt));
 const rememberCompleted = (completed, s, now) => {
   if (['accept', 'reject'].includes(s.kind) && s.rev !== null && Number.isFinite(s.startedAt)
     && s.startedAt <= now + RUN_MTIME_SLACK_MS) {
@@ -360,7 +360,8 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) continue;
-      if (isRunAbandoned(id, runsDir) && !s.rejecting) { abandoned.push(s); continue; }
+      const tombstone = readRunAbandonment(id, runsDir);
+      if (tombstone && !s.rejecting) { abandoned.push({ ...s, abandonedAt: Date.parse(tombstone.at) }); continue; }
       summaries.push({ s, st });
       rememberCompleted(completed, s, now);
     }
@@ -461,10 +462,10 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       unreadTombstones.delete(id);
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
-        const tombstoned = isRunAbandoned(id, runsDir) && !hasRejectingReviewVerdict(run);
-        if (tombstoned) {
+        const tombstone = readRunAbandonment(id, runsDir);
+        if (tombstone && !hasRejectingReviewVerdict(run)) {
           const s = summarizeRun(run);
-          if (s.rev === null || s.rev === cleanRev(head)) abandoned.push(s);
+          if (s.rev === null || s.rev === cleanRev(head)) abandoned.push({ ...s, abandonedAt: Date.parse(tombstone.at) });
         } else if (!abandonedReview(hit, now)) {
           rememberCompleted(completed, summarizeRun(run), now);
           count++;

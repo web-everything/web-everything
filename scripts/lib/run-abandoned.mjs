@@ -13,13 +13,19 @@ import { runPath, resolveRunsDir } from '../operations/run-store.mjs';
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonRejecting = ['accept', 'accepted', 'prevention-outstanding', 'needs-human', 'abstain', 'review:accepted', 'review:pending', 'clear-human', 'rearm'];
 const decisionKeys = new Set(['to', 'target', 'addLabel', 'label', 'verdict', 'outcome', 'decision']);
-function rejectingPayload(payload, depth = 0) {
-  if (!object(payload) || depth > 16) return true;
-  for (const [key, value] of Object.entries(payload)) {
+// Exhausting either bound retains the review hold; an operator must inspect the full payload.
+function rejectingPayload(payload, budget, depth = 0) {
+  if (depth > 16 || --budget.nodes < 0) return true;
+  if (typeof payload === 'string') return (budget.chars -= payload.length) < 0;
+  if (payload === null || typeof payload !== 'object') return false;
+  const keys = Object.keys(payload);
+  if (keys.length > budget.nodes) return true;
+  for (const key of keys) {
+    if ((budget.chars -= key.length) < 0) return true;
+    const value = payload[key];
     if (decisionKeys.has(key) && (typeof value !== 'string' || !nonRejecting.includes(value))) return true;
     if (key === 'notice' && (typeof value !== 'string' || !/^PR .+ — human review accepted(?: by .+)?\.$/.test(value))) return true;
-    if (object(value) && rejectingPayload(value, depth + 1)) return true;
-    if (Array.isArray(value) && value.some(item => object(item) && rejectingPayload(item, depth + 1))) return true;
+    if (rejectingPayload(value, budget, depth + 1)) return true;
   }
   return false;
 }
@@ -36,21 +42,27 @@ export function hasRejectingReviewVerdict(run) {
   // Missing effects occur in historical records; a present unreadable list is never proof of safety.
   if (run.effects === undefined) return false;
   if (!Array.isArray(run.effects)) return true;
+  const budget = { nodes: 4096, chars: 256 * 1024 };
+  if (run.effects.length > budget.nodes) return true;
   return run.effects.some(effect => {
-    if (!object(effect) || typeof effect.status !== 'string' || typeof effect.type !== 'string') return true;
-    if (['applied', 'failed', 'skipped'].includes(effect.status)) return false;
-    if (!['declared', 'pending', 'in-flight', 'refused'].includes(effect.status)) return true;
-    // Historical effect records omit payloads. Absence carries no rejection evidence;
-    // a present malformed payload still fails closed below.
-    if (effect.payload === undefined) return false;
-    if (rejectingPayload(effect.payload)) return true;
-    if (['review.label-swap', 'review.notice'].includes(effect.type)) {
-      if (!object(effect.payload)) return true;
-      return effect.type === 'review.label-swap'
-        ? !['to', 'target', 'addLabel', 'label', 'verdict'].some(key => Object.hasOwn(effect.payload, key))
-        : !['notice', 'to', 'target', 'verdict', 'outcome'].some(key => Object.hasOwn(effect.payload, key));
-    }
-    return false;
+    try {
+      if (!object(effect) || typeof effect.status !== 'string' || typeof effect.type !== 'string') return true;
+      if (['applied', 'failed', 'skipped'].includes(effect.status)) return false;
+      if (!['declared', 'pending', 'in-flight', 'refused'].includes(effect.status)) return true;
+      const payload = effect.payload;
+      if (!object(payload) || rejectingPayload(payload, budget)) return true;
+      const has = keys => keys.some(key => Object.hasOwn(payload, key));
+      switch (effect.type) {
+        case 'review.label-swap': return !has(['to', 'target', 'addLabel', 'label']);
+        case 'verdict-ledger.append': return !has(['to', 'target', 'verdict', 'outcome', 'decision']);
+        case 'review.notice': return !has(['notice', 'verdict', 'outcome']);
+        // These sinks only record bookkeeping/advisory evidence, never a review verdict or label swap.
+        case 'review.ledger-events':
+        case 'review.scoped-rereview-shadow':
+        case 'review.advisory-note': return false;
+        default: return true; // Unknown sinks cannot prove that they will not send the PR back.
+      }
+    } catch { return true; } // An unreadable payload is not evidence of a non-rejecting effect.
   });
 }
 

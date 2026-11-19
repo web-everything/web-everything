@@ -52,7 +52,10 @@ async function replay(sourceRoot) {
     writeRun(older, dir);
     if (gate().ok !== false || gate().reason !== 'review-abandoned') throw Error('older acceptance discharged abandonment');
     const fresh = structuredClone(older);
-    fresh.id = 'review-pr-soak-fresh'; fresh.stepTimings[0].startedAt = new Date(now - 60000).toISOString();
+    fresh.id = 'review-pr-soak-before-tombstone'; fresh.stepTimings[0].startedAt = new Date(now - 60000).toISOString();
+    writeRun(fresh, dir);
+    if (gate().reason !== 'review-abandoned') throw Error('accept started before tombstone discharged abandonment');
+    fresh.id = 'review-pr-soak-fresh'; fresh.stepTimings[0].startedAt = new Date(now + 1000).toISOString();
     writeRun(fresh, dir);
     const released = gate();
     if (released.ok === false || released.loopPayload?.id !== fresh.id) throw Error('newer completed same-head review did not release abandonment');
