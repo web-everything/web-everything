@@ -3,7 +3,7 @@
  * Claude re-checks its claims; a confirmed break is a miss for the accepting seat and the builder. No real codex,
  * agy, claude, git or GitHub process: every effect is a fake.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,6 +26,7 @@ import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { resolveOperationRoute } from '../../lib/dispatch-routing-policy-io.mjs';
+import { DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePolicyRoute } from '../../lib/dispatch-routing-policy.mjs';
 
 vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => ({
   ...await importOriginal(),
@@ -61,6 +62,7 @@ function fakeIo(over = {}) {
   const trials = [];
   const ledgerBox = {};
   const io = {
+    readSeatSettings: () => ({ tool: {}, platform: {} }),
     now: () => NOW,
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: (l) => calls.push(['log', l]),
@@ -80,7 +82,7 @@ function fakeIo(over = {}) {
     makeScratch: (o) => { calls.push(['scratch', o]); return '/tmp/x00g3tt-scratch'; },
     removeScratch: (d) => calls.push(['rm', d]),
     writeFile: (p, t) => calls.push(['write', p, t]),
-    readHeadMessage: () => 'fix: guard\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n',
+    readHeadMessage: (_dir, rev) => rev ? '' : 'fix: guard\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n',
     runSeat: async (o) => { calls.push(['seat', o]); return { report: report(o.provider, answer([BREAK])) }; },
     runRecheck: async (o) => { calls.push(['recheck', o]); return { checks: [{ index: 0, confirmed: true, reason: 'the diff divides by n with no zero check' }] }; },
     logTrial: (row) => { trials.push(row); return row; },
@@ -916,7 +918,7 @@ describe('red-team scheduling status', () => {
 });
 
 
-it('reloads red-team routing each pass, enables unset Gemini, preserves explicit zero, and restores disable on clear', async () => {
+it('reloads red-team routing each pass, preserves explicit zero, and restores Gemini default-off on clear', async () => {
   const { createRoutingPolicyReader } = await import('../../lib/dispatch-routing-policy-io.mjs');
   const { DEFAULT_ROUTING_POLICY, resolveOperationRoute: pureRoute } = await import('../../lib/dispatch-routing-policy.mjs');
   let overrides = { 'review-seat:red-team': { provider: 'agy-gemini', model: 'pro', disabledProviders: ['codex', 'agy-claude'] } };
@@ -988,5 +990,145 @@ describe('security classification policy transitions', () => {
       else process.env.WE_PLATFORM_PREFERENCES_FILE = previous;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('R1077 builder company routing', () => {
+  beforeEach(() => resolveOperationRoute.mockImplementation(resolvePolicyRoute));
+  const input = body => ({ pr: 5, repo: REPO, lanePath: '/lane', read: payload('accept', body).findings.read, env: {} });
+  const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6.1-sol' : 'claude-sonnet-5-5', taskType: 'bugfix' });
+  const policyIo = over => fakeIo({ readRoutingPolicy: () => structuredClone(DEFAULT_ROUTING_POLICY), readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
+
+  it.each([['codex', 'codex', 'gpt-6.1-sol'], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
+    const { io, calls } = policyIo();
+    expect((await speculateRedTeam(input(marker(builder)), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model });
+  });
+
+  it('routes a Codex builder to Gemini when enabled through its live setting', async () => {
+    const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
+    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+  });
+
+  it('uses the pinned head co-author stamp when the PR has no builder marker', async () => {
+    const { io, calls } = policyIo({ readHeadMessage: vi.fn(() => 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>') });
+    await speculateRedTeam(input('no marker'), io);
+    expect(io.readHeadMessage).toHaveBeenCalledWith('/lane', REV);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+  });
+
+  it.each(['codex', 'claude'])('falls back and logs when the cross-company provider for %s is capped', async builder => {
+    const preferred = builder === 'codex' ? 'agy-gemini' : 'codex';
+    const { io, calls } = policyIo({ readRecords: () => [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+      provider: preferred, callId: 'spent', scoredAt: new Date(NOW).toISOString(), status: 'ok' }] });
+    const args = input(marker(builder));
+    args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', [PROVIDER_CAP_ENV[preferred]]: '1' };
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe(preferred === 'codex' ? 'agy-gemini' : 'codex');
+    expect(calls.some(c => c[0] === 'log' && /daily-cap.*fallback to/.test(c[1]))).toBe(true);
+    if (builder === 'codex') expect(calls.some(c => c[0] === 'log' && /same-vendor codex fallback accepted/.test(c[1]))).toBe(true);
+  });
+
+  it('retries the other provider when the preferred reservation races with another caller', async () => {
+    const { io, calls } = policyIo({ readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 20 } }, platform: {} }) });
+    const reserve = io.reserveCalls;
+    io.reserveCalls = o => o.provider === 'agy-gemini' ? { used: o.dailyCap, callIds: [] } : reserve(o);
+    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('codex');
+    expect(calls.some(c => c[0] === 'log' && /fallback to codex/.test(c[1]))).toBe(true);
+  });
+
+  it.each(['default', 'routing', 'environment', 'settings'])('falls back to Codex and logs same-vendor acceptance when Gemini is disabled by %s', async source => {
+    const { io, calls } = policyIo(source === 'settings' ? {
+      readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 0 } }, platform: {} }),
+    } : {});
+    if (source === 'routing') {
+      io.readRoutingPolicy = () => {
+        const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+        policy.operations['review-seat:red-team'].disabledProviders = ['agy-gemini'];
+        return policy;
+      };
+    }
+    const args = input(marker('codex'));
+    if (source === 'environment') args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '0';
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+    expect(calls.some(c => c[0] === 'log' && /same-vendor codex fallback accepted/.test(c[1]))).toBe(true);
+  });
+
+  it.each(['codex', 'claude', 'unknown'])('uses and logs emergency agy-claude only when both ordinary providers are capped for %s', async builder => {
+    const { io, calls } = policyIo({ readHeadMessage: () => '' });
+    const args = input(builder === 'unknown' ? 'no marker' : marker(builder));
+    args.env = { WE_REVIEW_SEAT_CAP_CODEX: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+    expect(calls.some(c => c[0] === 'log' && /emergency fallback to agy-claude/.test(c[1]))).toBe(true);
+  });
+
+  it('keeps the emergency seat when capped ordinary providers also lack their CLIs', async () => {
+    const { io, calls } = policyIo({ cliAvailable: p => p === 'agy-claude' });
+    const args = input(marker('codex'));
+    args.env = { WE_REVIEW_SEAT_CAP_CODEX: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+  });
+
+  it('uses emergency budget after both ordinary reservations race to their caps', async () => {
+    const { io, calls } = policyIo();
+    const reserve = io.reserveCalls;
+    io.reserveCalls = o => o.provider !== 'agy-claude' ? { used: o.dailyCap, callIds: [] } : reserve(o);
+    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+  });
+
+  it('holds when even the emergency budget is exhausted', async () => {
+    const { io, calls } = policyIo();
+    const args = input(marker('codex'));
+    args.env = { WE_REVIEW_SEAT_CAP_CODEX: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' };
+    expect(await speculateRedTeam(args, io)).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+  });
+
+  it('does not use emergency agy-claude for a missing ordinary CLI with budget left', async () => {
+    const { io, calls } = policyIo({ cliAvailable: p => p === 'agy-claude' });
+    expect((await speculateRedTeam(input(marker('codex')), io)).status).toBe('skipped');
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+  });
+
+  it.each([true, false])('falls back and logs for a capped unknown-builder policy route with routeByBuilder=%s', async enabled => {
+    const { io, calls } = policyIo({ readHeadMessage: () => '',
+      readSeatSettings: () => ({ tool: { redTeam: { routeByBuilder: enabled } }, platform: {} }),
+    });
+    io.readRoutingPolicy = () => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'astra', effort: 'high',
+        fallback: [{ provider: 'agy-gemini', model: 'flash', effort: 'medium' }] };
+      return policy;
+    };
+    const args = input('no marker');
+    args.env.WE_REVIEW_SEAT_CAP_CODEX = '0';
+    args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '20';
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-gemini');
+    expect(calls.some(c => c[0] === 'log' && /fallback to agy-gemini/.test(c[1]))).toBe(true);
+  });
+
+  it('refuses invalid routing evidence even with an ordinary provider at cap', async () => {
+    const { io, calls } = policyIo({ readHeadMessage: () => '' });
+    resolveOperationRoute.mockImplementationOnce(() => { throw new Error('invalid routing evidence'); });
+    const args = input('no marker');
+    args.env.WE_REVIEW_SEAT_CAP_CODEX = '0';
+    args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '20';
+    expect(await speculateRedTeam(args, io)).toMatchObject({ status: 'skipped', reason: expect.stringContaining('invalid routing evidence') });
+    expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
+  });
+
+  it.each([['unknown', true], ['codex', false], ['claude', false]])('keeps existing routing for builder=%s, routeByBuilder=%s', async (builder, enabled) => {
+    const { io, calls } = policyIo({ readHeadMessage: () => '', readSeatSettings: () => ({ platform: {}, tool: { redTeam: { routeByBuilder: enabled } } }) });
+    resolveOperationRoute.mockReturnValueOnce({ provider: 'codex', model: 'gpt-6-astra', effort: 'high' });
+    await speculateRedTeam(input(builder === 'unknown' ? 'no marker' : marker(builder)), io);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
   });
 });
