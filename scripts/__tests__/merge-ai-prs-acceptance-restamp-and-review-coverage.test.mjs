@@ -495,8 +495,8 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
   it("a merge-base basis reports `basisKind:'merge-base'` and `basisNarrowed:true`", () => {
     const { exec } = fakeExec({
       'git merge-base origin/main origin/lane/x': { stdout: 'forkpoint\n' },
-      'git diff --numstat forkpoint origin/lane/x': { stdout: '3\t1\tREADME.md\n' },
-      'git diff forkpoint origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n' },
+      'git diff --numstat --no-textconv --ignore-submodules=none forkpoint origin/lane/x': { stdout: '3\t1\tREADME.md\n' },
+      'git diff --no-textconv --ignore-submodules=none forkpoint origin/lane/x': { stdout: 'diff --git a/README.md b/README.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.scored).toBe(true);
@@ -507,9 +507,9 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
   it("an ancestry basis reports `basisKind:'ancestry'` and is still NARROWED — it is the PR's own file set", () => {
     const { exec } = fakeExec({
       'git merge-base origin/main origin/lane/x': { throw: 'no common ancestors' },
-      'git diff --numstat origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
-      'git log --numstat --diff-merges=first-parent --pretty=format: origin/main..origin/lane/x --': { stdout: '2\t0\tbacklog/a.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
+      'git diff --numstat --no-textconv --ignore-submodules=none origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
+      'git log --numstat --no-textconv --ignore-submodules=none --diff-merges=first-parent --pretty=format: origin/main..origin/lane/x --': { stdout: '2\t0\tbacklog/a.md\n' },
+      'git diff --no-textconv --ignore-submodules=none origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.basisKind).toBe('ancestry');
@@ -520,8 +520,8 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
   it("a base-tip basis reports `basisNarrowed:false` — the signal the producer threads into the human gate", () => {
     const { exec } = fakeExec({
       'git merge-base origin/main origin/lane/x': { throw: 'no common ancestors' },
-      'git diff --numstat origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
-      'git diff origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
+      'git diff --numstat --no-textconv --ignore-submodules=none origin/main origin/lane/x': { stdout: '2\t0\tbacklog/a.md\n4\t4\tdocs/agent/platform-decisions.md\n' },
+      'git diff --no-textconv --ignore-submodules=none origin/main origin/lane/x': { stdout: 'diff --git a/backlog/a.md b/backlog/a.md\n' },
     });
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', fetchExtraRefs: ['lane/x'] });
     expect(sig.basisKind).toBe('base-tip');

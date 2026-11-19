@@ -9,7 +9,7 @@ import { contributionPatchId } from '../rebase-verdict-carry.mjs';
 import { checkCanonicalAuditForOpen } from '../../operations/canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../../operations/codex-audit.mjs';
 import { createReviewJobIo } from '../../operations/review-job.mjs';
-import { computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis } from '../../merge-ai-prs.mjs';
+import { computeNetDiffChangedFiles, computeNetDiffPaths, computeNetDiffText, resolveNetDiffBasis } from '../../merge-ai-prs.mjs';
 
 // Expose the nested review-job proof callback without running settlement's label/comment effects.
 vi.mock('../red-team-carry-io.mjs', () => ({ createRedTeamCarryIo: options => options }));
@@ -106,6 +106,20 @@ it('rebase verdict contribution proof hardens all git calls', () => {
   expect(contributionPatchId({ exec: io.exec, sha: head, env: hostile() })).toMatch(/^[a-f0-9]{40}$/);
   expect(io.calls.some(c => c.args.includes('patch-id'))).toBe(true);
   hardened(io.calls);
+  // A configured diff.ignoreSubmodules must not hide a submodule change from the patch id.
+  const diff = io.calls.find(c => c.args[0] === 'diff');
+  expect(diff.args).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--ignore-submodules=none']));
+});
+
+it('merge net-diff text and scoring diffs ignore textconv and submodule-ignore config', () => {
+  const io = reader(), input = { exec: io.exec, rev: 'proof' };
+  expect(computeNetDiffText({ ...input, pinRev: true }).scored).toBe(true);
+  const text = io.calls.find(c => c.args[0] === 'diff' && !c.args.includes('--numstat') && !c.args.includes('--name-only'));
+  expect(text.args).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--ignore-submodules=none']));
+  io.calls.length = 0;
+  expect(resolveNetDiffBasis(input).ok).toBe(true);
+  const numstat = io.calls.find(c => c.args[0] === 'diff' && c.args.includes('--numstat'));
+  if (numstat) expect(numstat.args).toContain('--ignore-submodules=none');
 });
 
 it.each(['direct card move', 'settlement card move', 'contribution'])('review-job %s proof hardens caller env', mode => {
@@ -144,4 +158,59 @@ it('a real git replace object cannot change netDiffFingerprint', () => {
     expect(git('rev-parse', `${head}^{tree}`)).not.toBe(originalTree);
     expect(netDiffFingerprint(repo, base, head, { env: hostile() })).toBe(before);
   } finally { git('replace', '-d', head); }
+});
+
+
+it('real git submodule-ignore config cannot preserve a contribution patch id or hide scoring paths', () => {
+  const root = mkdtempSync(join(tmpdir(), 'carry-submodule-hardening-'));
+  const run = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const commit = message => {
+    run('-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', 'commit', '-qm', message);
+    return run('rev-parse', 'HEAD');
+  };
+  try {
+    run('init', '-q', '-b', 'main');
+    run('config', 'user.name', 'test');
+    run('config', 'user.email', 'test@example.invalid');
+    run('config', 'diff.ignoreSubmodules', 'all');
+    writeFileSync(join(root, 'code.txt'), 'base\n');
+    run('add', 'code.txt');
+    const first = commit('initial');
+    writeFileSync(join(root, 'code.txt'), 'base for module\n');
+    run('add', 'code.txt');
+    const second = commit('second module target');
+    run('update-index', '--add', '--cacheinfo', `160000,${first},dependency`);
+    const fork = commit('base with submodule');
+    run('update-ref', 'refs/remotes/origin/main', fork);
+    writeFileSync(join(root, 'code.txt'), 'reviewed text patch\n');
+    run('add', 'code.txt');
+    const reviewed = commit('reviewed contribution');
+    run('update-index', '--cacheinfo', `160000,${second},dependency`);
+    const changed = commit('unreviewed submodule pointer');
+    const exec = (file, args, options) => args[0] === 'fetch' ? ''
+      : execFileSync(file, args, { ...options, cwd: root });
+    const unprotectedId = sha => execFileSync('git', ['patch-id', '--verbatim'], {
+      cwd: root, encoding: 'utf8', input: run('diff', '--no-ext-diff', '--no-textconv', '--binary', fork, sha),
+    }).trim();
+    // Prove the configured default hides exactly the added pointer change.
+    expect(unprotectedId(changed)).toBe(unprotectedId(reviewed));
+    expect(run('diff', '--numstat', reviewed, changed)).toBe('');
+    const priorId = contributionPatchId({ exec, sha: reviewed });
+    const nextId = contributionPatchId({ exec, sha: changed });
+    expect(priorId).toMatch(/^[a-f0-9]{40}$/);
+    expect(nextId).toMatch(/^[a-f0-9]{40}$/);
+    expect(nextId).not.toBe(priorId);
+    expect(computeNetDiffChangedFiles({ exec, rev: changed })).toMatchObject({
+      scored: true, changedFiles: ['code.txt', 'dependency'], humanBasisFiles: ['code.txt', 'dependency'],
+    });
+    expect(computeNetDiffChangedFiles({ exec, rev: changed, baseRev: reviewed })).toMatchObject({
+      scored: true, changedFiles: ['dependency'], diffLines: 2,
+    });
+    expect(computeNetDiffPaths({ exec, rev: changed })).toMatchObject({
+      scored: true, paths: ['code.txt', 'dependency'],
+    });
+    expect(computeNetDiffText({ exec, rev: changed })).toMatchObject({ scored: true,
+      text: expect.stringContaining(`+Subproject commit ${second}`) });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

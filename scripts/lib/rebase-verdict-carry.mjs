@@ -20,7 +20,7 @@ export function contributionPatchId({ exec, sha, base = 'origin/main', env = pro
     const git = (args, input) => String(exec('git', args, { encoding: 'utf8', input, maxBuffer: 64 * 1024 * 1024 }));
     const mb = git(['merge-base', base, sha]).trim();
     if (!HEX.test(mb)) return null;
-    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--binary', mb, sha, '--', '.', ':(exclude).lane-manifest.json']);
+    const diff = git(['diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--binary', mb, sha, '--', '.', ':(exclude).lane-manifest.json']);
     const id = git(['patch-id', '--verbatim'], diff).trim().split(/\s+/)[0];
     return HEX.test(id) ? id : null;
   } catch { return null; }
