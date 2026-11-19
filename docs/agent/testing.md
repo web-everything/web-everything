@@ -5214,6 +5214,8 @@ exercise it without filesystem access. Shadow JSONL append/rotation belongs to t
 runs; off mode skips that sink. Validate recent red-team evidence with `buildSlotReport`
 before treating a source as complete. Missing PIDs retain holders; unexpected PID probe
 errors close the source, and only ESRCH or a proven identity mismatch releases capacity.
+
+
 ## Open-pr preflight
 
 `open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
