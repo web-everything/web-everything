@@ -1773,11 +1773,11 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         let reaped;
         try {reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});}
         catch(error) {if(!fencedRun)throw error;}
-        if(reaped?.code!==0) {
-          // Still unconfirmed: the slot stays fenced (executing lock and run state untouched). A kept verdict is still returned.
-          if(fencedRun&&receipt)return receipt;
-          throw new Error('Worker cleanup unconfirmed');
-        }
+        // Still unconfirmed: fail closed exactly as before; the slot stays fenced and no receipt is returned.
+        if(reaped?.code!==0)throw new Error('Worker cleanup unconfirmed');
+        // A fenced run's sweep was already unconfirmed once: also require the credential-based probe (it sees
+        // non-dumpable workers the /proc scan cannot), as cancellation does, before the lock is released.
+        if(fencedRun&&await reapProbe.uidBusy((await identity(record.slot)).uid))throw new Error('Worker cleanup unconfirmed; uid still busy');
         settled=true;
       }
       // The worker owns work and may remove ops' write permission. Only the
