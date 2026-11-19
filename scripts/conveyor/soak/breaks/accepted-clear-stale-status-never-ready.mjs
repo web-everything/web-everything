@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url';
 
 const HEAD = 'c'.repeat(40);
 const bot = { login: 'web-everything' };
-const prState = (head) => ({ number: 7103, headRefOid: head, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [],
+const prState = (head) => ({ number: 7103, headRefOid: head, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }],
   comments: [
     { author: bot, createdAt: '2026-11-18T20:00:00Z', body: `**Verdict:** accept\n**Advisory outcome:** accept\nNet basis: \`${'a'.repeat(12)}..${HEAD}\`` },
     { author: bot, createdAt: '2026-11-18T20:01:00Z', body: `<!-- we:red-team-gate pr=7103 rev=${HEAD} outcome=card-queued -->` },
@@ -37,7 +37,7 @@ export default {
       const provider = { readLabels: () => labels, ensureLabel() {}, setLabels: (_r, _p, d) => { if (d.add) adds.push(d.add); removes.push(...(d.remove ?? [])); } };
       try {
         tagReviewStatus({ pr: 7103, repo: 'web-everything/web-everything', provider, agents: [], prState: prState(head), signalFix: () => {},
-          readRequiredChecks: () => ({ source: 'live', checks: [] }), loadStatusSettings: () => { throw new Error('x'); } });
+          readRequiredChecks: () => ({ source: 'live', checks: ['build'] }), loadStatusSettings: () => { throw new Error('x'); } });
       } catch (e) { violations.push(`tagger threw: ${e?.message}`); }
       return { adds, removes };
     };

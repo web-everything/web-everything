@@ -6,7 +6,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { tagReviewStatus } from '../review-status-tag.mjs';
-import { readyFromDecisionLabels } from '../pr-status-label.mjs';
+import { readyFromDecisionLabels as readyRaw } from '../pr-status-label.mjs';
+
+const readyFromDecisionLabels = (o) => readyRaw({ requiredChecks: ['build', 'review-gate'], ...o });
 
 const HEAD = 'c1f2b695540f266880d13a2113475c2d4cd92012';
 const OLD = 'a'.repeat(40);
@@ -74,6 +76,21 @@ describe('status from decision labels', () => {
     expect(readyFromDecisionLabels({ pr: snapshot(), labels: LIVE[7028], requiredChecks: ['build', 'review-gate'] }).ready).toBe(true);
     const gates = snapshot({ statusCheckRollup: [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }, ...checks] });
     expect(readyFromDecisionLabels({ pr: gates, labels: LIVE[7028], requiredChecks: ['build', 'merge-gate', 'review-gate'] }).ready).toBe(false);
+  });
+
+  it('fails closed on mechanical or red-team holds and on unknown or empty required checks', () => {
+    for (const extra of ['review:held-mechanical', 'red-team:pending']) {
+      expect(readyFromDecisionLabels({ pr: snapshot(), labels: [...LIVE[7103], extra] }).ready).toBe(false);
+    }
+    const running = snapshot({ statusCheckRollup: [{ name: 'build', status: 'IN_PROGRESS', conclusion: null }] });
+    for (const requiredChecks of [[], null, undefined]) {
+      expect(readyRaw({ pr: running, labels: LIVE[7103], requiredChecks }).reason).toBe('required-checks-unknown');
+    }
+    const writes = [];
+    tagReviewStatus({ pr: 1, repo: 'web-everything/web-everything', agents: [], prState: snapshot(), signalFix: () => {},
+      provider: { readLabels: () => LIVE[7103], ensureLabel() {}, setLabels: (_r, _p, d) => writes.push(d) },
+      readRequiredChecks: () => { throw new Error('unavailable'); }, loadStatusSettings: () => { throw new Error('x'); } });
+    expect(writes).toEqual([]);
   });
 
   it('fails closed on a missing or still-running required check', () => {

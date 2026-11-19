@@ -71,7 +71,7 @@ function requiredCiRed(pr, labels, requiredChecks, settings) {
 }
 
 const DECISION_BLOCK_LABELS = ['review:human', 'review:changes', 'review:pending', 'red-team:blocked', 'ci:failed',
-  'review-status:draft-withdrawn'];
+  'review-status:draft-withdrawn', 'review:held-mechanical', 'red-team:pending'];
 // A status label already on the PR that is not stale-prone (needs-you, stood-down, escalated…) is a live hold.
 const STALE_PRONE_STATUS = new Set(['sent-back-review', 'at-round-limit', 'awaiting-review', 'awaiting-ci', 'waiting-on-base',
   'red-team', 'ready-to-merge']);
@@ -83,8 +83,10 @@ const STALE_PRONE_STATUS = new Set(['sent-back-review', 'at-round-limit', 'await
  * (merge-gate and review-gate excluded — they follow this decision). Anything else fails closed.
  * @returns {{ready:boolean, reason:string|null}}
  */
-export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = FALLBACK_REQUIRED_STATUS_CHECKS, settings = PR_STATUS_SETTING_DEFAULTS } = {}) {
+export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = null, settings = PR_STATUS_SETTING_DEFAULTS } = {}) {
   const l = names(labels ?? pr?.labels);
+  // Unknown or empty requirements cannot prove green CI: fail closed rather than guess a fallback set.
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return { ready: false, reason: 'required-checks-unknown' };
   if (!l.includes('review:accepted')) return { ready: false, reason: 'not-accepted' };
   if (!l.includes('red-team:clear')) return { ready: false, reason: 'red-team-not-clear' };
   const blocker = DECISION_BLOCK_LABELS.find((name) => l.includes(name));
@@ -107,9 +109,8 @@ export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = FALL
   // Every required check must be present and finished green. The review-gate follows this decision (as in
   // derivePrStatusLabel); a failing merge-gate counts unless the caller already excused it on the head-bound evidence.
   const rollup = collapseRollupToLatestPerName(Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []);
-  const required = withoutImpliedRequiredChecks(requiredChecks ?? FALLBACK_REQUIRED_STATUS_CHECKS, rollup)
-    .filter((name) => !(merged.reviewGateSignal === 'review' && name === 'review-gate'));
-  const green = (c) => (c?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion))
+  const required = withoutImpliedRequiredChecks(requiredChecks, rollup)
+    .filter((name) => !(merged.reviewGateSignal === 'review' && name === 'review-gate'));  const green = (c) => (c?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion))
     || c?.state === 'SUCCESS';
   const notGreen = required.find((name) => !green(rollup.find((c) => (c.name ?? c.context) === name)));
   if (notGreen) return { ready: false, reason: `required-check-not-green:${notGreen}` };
