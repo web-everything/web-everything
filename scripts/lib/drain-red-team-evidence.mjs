@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, readRedTeamCheckFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -59,6 +59,48 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
   } catch (error) {
     return error.code === 'ENOENT' ? null : `${reason} (publication hold unreadable; operator must inspect)`;
   }
+}
+
+/** Only a readable finished marker for this exact head authorizes ordinary-round settlement.
+ * Old markers have no identity fields: their head-bound filename is the binding. */
+export function readFinishedPublicationHold({ repo, pr, head, env = process.env }) {
+  try {
+    const marker = JSON.parse(readFileSync(`${statusPath({ repo, pr, head }, env)}.unpublished`, 'utf8'));
+    return marker?.status === 'finished' && (marker.head === undefined || marker.head === head)
+      && (marker.repo === undefined || marker.repo === repo) && (marker.pr === undefined || Number(marker.pr) === Number(pr));
+  } catch { return false; }
+}
+
+/** Settle a finished writer's outbox, never republish its sealed check. The status claim prevents a round writer
+ * changing the marker during confirmation; the shared check lock serializes the live check/hold boundary. */
+export function settleFinishedPublicationHold({ repo, pr, head, env = process.env,
+  gh = (args, options) => runGhSync(args, { ...options, env }),
+  readCheck = key => {
+    const app = resolveWeAppId({ env });
+    return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh }) : app;
+  },
+  readComments = () => readCompletePrComments(pr, { repo, exec: (_file, args, options) => gh(args, options) }),
+  postHold = postRedTeamPublicationHold,
+  lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn) }) {
+  const path = statusPath({ repo, pr, head }, env);
+  try {
+    return withRedTeamStatusClaim(path, () => lock(() => {
+      try { statSync(`${path}.unpublished`); }
+      catch (error) {
+        return error.code === 'ENOENT' ? { ok: true } : { ok: false, reason: 'finished publication marker unreadable' };
+      }
+      if (!readFinishedPublicationHold({ repo, pr, head, env }))
+        return { ok: false, reason: 'publication marker is not a finished round for this head' };
+      const fact = readCheck({ repo, pr, headSha: head });
+      if (fact?.ok !== true) return { ok: false, reason: fact?.reason ?? 'red-team check not confirmed ok' };
+      const result = redTeamResultCommentForHead(readComments(), pr, head);
+      if (!result || result.carriedFrom) return { ok: false, reason: 'no ordinary red-team result on head' };
+      const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });
+      if (cleared?.ok !== true) return { ok: false, reason: cleared?.reason ?? 'finished publication hold clear unconfirmed' };
+      rmSync(`${path}.unpublished`, { force: true });
+      return { ok: true };
+    }));
+  } catch (error) { return { ok: false, reason: safeText(error) }; }
 }
 
 /** Carried-check outbox (#6606): a verdict carry settles the head without a round, so no round writer republishes its

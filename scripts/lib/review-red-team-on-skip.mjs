@@ -13,7 +13,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
-  readCarriedCheckUnpublished, createCarriedCheckPublisher } from './drain-red-team-evidence.mjs';
+  readCarriedCheckUnpublished, createCarriedCheckPublisher, readFinishedPublicationHold, settleFinishedPublicationHold } from './drain-red-team-evidence.mjs';
 import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
@@ -480,7 +480,7 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
-  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
+  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false, readFinishedHold = () => false }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -512,6 +512,18 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         return now - (lastDispatch.get(carriedCheckRetryKey(repo, pr, head)) ?? -Infinity) < setting.retryCooldownMin * 60_000
           ? skip('carried red-team check unconfirmed; retry cooldown active')
           : { ...row, action: 'publish-carried-check', why: 'carried red-team check unconfirmed; republishing from live evidence' };
+      }
+      const result = redTeamResultCommentForHead(rawPr?.comments, pr, head);
+      let finishedHold = false;
+      if (result && !result.carriedFrom) {
+        try { finishedHold = readFinishedHold({ repo, pr, head }) === true; } catch { /* unreadable is not authority to clear */ }
+      }
+      if (finishedHold) {
+        const escalation = pendingEscalation();
+        if (escalation) return { ...skip('red-team result already on head'), ...escalation };
+        return now - (lastDispatch.get(finishedHoldRetryKey(repo, pr, head)) ?? -Infinity) < setting.retryCooldownMin * 60_000
+          ? skip('finished publication hold unconfirmed; retry cooldown active')
+          : { ...row, action: 'clear-finished-hold', why: 'finished round publication unconfirmed; checking live evidence' };
       }
       if (readCheckFact) {
         const fact = readCheckFact({ repo, pr, headSha: head });
@@ -766,7 +778,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
 }
 
 const lastDispatch = new Map();
-/** Cooldown key of a carried-check republish, separate from a round dispatch's key on the same head. */
+/** Publication recovery cooldowns are separate from a round dispatch and from each other. */
+const finishedHoldRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#finished-hold`;
+export const FINISHED_HOLD_ESCALATION = 'finished red-team publication hold not cleared after retry; operator must inspect the head\'s check history';
 const carriedCheckRetryKey = (repo, pr, head) => `${repo}#${pr}@${head}#carried-check`;
 export const CARRIED_CHECK_ESCALATION = 'carried red-team check not confirmed after retry; operator must inspect the head\'s check history';
 const safeLine = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 600);
@@ -880,6 +894,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   readCarriedCheck = isUnderTest() || isUnderTest(env) ? () => false : key => readCarriedCheckUnpublished({ ...key, env }),
   // The shared writer resolves the App id from the setting (the daemon never sets WE_APP_ID) and lets the writer env win.
   publishCarriedCheck = isUnderTest() || isUnderTest(env) ? null : carriedCheckPublisher({ repo, env }),
+  readFinishedHold = isUnderTest() || isUnderTest(env) ? () => false : key => readFinishedPublicationHold({ ...key, env }),
+  clearFinishedHold = isUnderTest() || isUnderTest(env) ? null : key => settleFinishedPublicationHold({ ...key, env }),
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   sealStored = isUnderTest() || isUnderTest(env) ? null : publishStoredRedTeamResult,
   isLegacyRan = isUnderTest() || isUnderTest(env) ? null : key => {
@@ -946,7 +962,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
       readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
-      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
+      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck, readFinishedHold,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
     const escalateRow = row => {
@@ -1056,6 +1072,22 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
             }
           }
         } catch (error) { row.settleError = safeErrorText(error); }
+      }
+      if (row.action === 'clear-finished-hold') {
+        if (dryRun) row.why = 'dry run (finished publication hold)';
+        else {
+          history.set(finishedHoldRetryKey(repo, row.prNumber, row.head), at);
+          let out;
+          try { out = clearFinishedHold?.({ repo, pr: row.prNumber, head: row.head }); }
+          catch (error) { out = { ok: false, reason: safeErrorText(error) }; }
+          if (out?.ok === true) row.why = 'finished red-team publication hold cleared from live evidence';
+          else {
+            row.why = FINISHED_HOLD_ESCALATION;
+            row.escalate = true;
+            row.escalationContext = `finished publication hold not cleared: ${safeErrorText(out?.reason ?? 'hold clearer unavailable')}`;
+            escalateRow(row);
+          }
+        }
       }
       if (row.action === 'publish-carried-check') {
         if (dryRun) row.why = 'dry run (carried check)';

@@ -1,11 +1,12 @@
+import { writeJsonAtomic } from '../atomic-json-file.mjs';
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as ghThrottle from '../gh-throttle.mjs';
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
-import { readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
+import { readFinishedPublicationHold, settleFinishedPublicationHold, readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
@@ -1835,5 +1836,72 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(result).toEqual({ ok: false, reason: 'review-unfinished' });
     expect(result.settleBounds.unreadBoundaryAt).toBeDefined();
     expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
+  });
+});
+
+
+describe('finished publication hold recovery', () => {
+  function setup(marker = { status: 'finished', remoteHold: true }) {
+    const f = fixture();
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json.unpublished`);
+    mkdirSync(redTeamStatusDir(f.env), { recursive: true });
+    writeJsonAtomic(path, marker);
+    const readCheck = vi.fn(() => ({ ok: true }));
+    const readComments = vi.fn(() => [cleanResultComment(f)]);
+    const postHold = vi.fn(() => ({ ok: true }));
+    const lock = vi.fn(fn => fn());
+    return { ...f, path, readCheck, readComments, postHold, lock };
+  }
+  it('clears the hold and marker under the lock, then a second call posts nothing', () => {
+    const f = setup();
+    expect(readFinishedPublicationHold(f)).toBe(true);
+    f.postHold.mockImplementation(() => { expect(existsSync(f.path)).toBe(true); return { ok: true }; });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(f.lock).toHaveBeenCalledTimes(1);
+    expect(f.postHold).toHaveBeenCalledWith(expect.objectContaining({ headSha: f.head, held: false }));
+    expect(existsSync(f.path)).toBe(false);
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(f.readCheck).toHaveBeenCalledTimes(1);
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each(['not ok', 'unknown', 'throws'])('keeps the marker when the live check is %s', kind => {
+    const f = setup();
+    f.readCheck.mockImplementation(() => { if (kind === 'throws') throw Error('offline'); return kind === 'unknown' ? undefined : { ok: false }; });
+    expect(settleFinishedPublicationHold(f).ok).toBe(false);
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
+  it.each(['fails', 'throws'])('keeps the marker when the hold post %s', kind => {
+    const f = setup();
+    f.postHold.mockImplementation(() => { if (kind === 'throws') throw Error('offline'); return { ok: false, definite: true }; });
+    expect(settleFinishedPublicationHold(f).ok).toBe(false);
+    expect(existsSync(f.path)).toBe(true);
+  });
+  it.each(['absent', 'untrusted', 'different head', 'unreadable'])('keeps the marker with %s result evidence', kind => {
+    const f = setup();
+    f.readComments.mockImplementation(() => {
+      if (kind === 'unreadable') throw Error('offline');
+      return kind === 'absent' ? [] : [cleanResultComment({ ...f, ...(kind === 'different head' ? { head: 'c'.repeat(40) } : {}) })]
+        .map(c => kind === 'untrusted' ? { ...c, author: { login: 'mallory' } } : c);
+    });
+    expect(settleFinishedPublicationHold(f).ok).toBe(false);
+    expect(existsSync(f.path)).toBe(true);
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
+  it.each([{ status: 'running' }, { status: 'finished', head: 'c'.repeat(40) }, { status: 'finished', repo: 'other/repo' },
+    { status: 'finished', pr: 999 }])('never clears a mismatching marker %j', marker => {
+    const f = setup(marker);
+    expect(readFinishedPublicationHold(f)).toBe(false);
+    expect(settleFinishedPublicationHold(f).ok).toBe(false);
+    expect(f.readCheck).not.toHaveBeenCalled();
+    expect(existsSync(f.path)).toBe(true);
+  });
+  it('refuses malformed markers and re-reads them after acquiring the lock', () => {
+    const f = setup();
+    f.lock.mockImplementation(fn => { writeFileSync(f.path, '{'); return fn(); });
+    expect(settleFinishedPublicationHold(f).ok).toBe(false);
+    expect(readFinishedPublicationHold(f)).toBe(false);
+    expect(f.readCheck).not.toHaveBeenCalled();
+    expect(existsSync(f.path)).toBe(true);
   });
 });

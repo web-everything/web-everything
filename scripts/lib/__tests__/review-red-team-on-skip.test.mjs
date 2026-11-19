@@ -3169,3 +3169,52 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
 });
+
+
+describe('finished publication hold recovery on an already-reviewed head', () => {
+  const comments = () => [{ author: { login: 'web-everything' }, body:
+    `<!-- we:red-team-advisory pr=${pr} rev=${head} -->\n### Post-accept red team — no break found` }];
+  const options = (over = {}) => runFixture({
+    rawPrs: [{ number: pr, headRefOid: head, comments: comments(), labels: [], reviews: [] }],
+    readFinishedHold: () => true, clearFinishedHold: vi.fn(() => ({ ok: true })), ...over });
+  it('plans and executes a finished hold clear before result-check recovery', () => {
+    const o = options({ readCheckFact: vi.fn(() => ({ ok: false })) });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear-finished-hold', why: 'finished red-team publication hold cleared from live evidence' });
+    expect(o.clearFinishedHold).toHaveBeenCalledWith({ repo, pr, head });
+    expect(o.readCheckFact).not.toHaveBeenCalled();
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
+  it('escalates a failed clear and retries once per separate cooldown', () => {
+    const clock = 2_000_000, history = new Map([[`${repo}#${pr}@${head}#carried-check`, clock]]);
+    const o = options({ lastDispatch: history, clearFinishedHold: vi.fn(() => ({ ok: false, reason: 'offline' })), escalate: vi.fn() });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear-finished-hold', escalate: true, escalationContext: 'finished publication hold not cleared: offline' });
+    expect(o.escalate).toHaveBeenCalledTimes(1);
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'finished publication hold unconfirmed; retry cooldown active' });
+    expect(o.clearFinishedHold).toHaveBeenCalledTimes(1);
+    expect(runRedTeamOnSkip({ ...o, now: () => clock + 30 * 60_000 }).rows[0].action).toBe('clear-finished-hold');
+    expect(o.clearFinishedHold).toHaveBeenCalledTimes(2);
+  });
+  it('dry run does not clear or consume the cooldown', () => {
+    const o = options({ dryRun: true });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear-finished-hold', why: 'dry run (finished publication hold)' });
+    expect(o.clearFinishedHold).not.toHaveBeenCalled();
+    expect(o.lastDispatch.size).toBe(0);
+  });
+  it('escalates a kept pending label before clearing', () => {
+    const o = options({ rawPrs: [{ number: pr, headRefOid: head, comments: comments(), labels: ['red-team:pending'], reviews: [] }], escalate: vi.fn() });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', escalate: true });
+    expect(o.clearFinishedHold).not.toHaveBeenCalled();
+    expect(o.escalate).toHaveBeenCalledTimes(1);
+  });
+  it.each(['missing', 'unreadable', 'untrusted', 'other head'])('does not plan settlement with %s evidence', kind => {
+    const o = options({ readFinishedHold: () => { if (kind === 'unreadable') throw Error('unreadable'); return kind !== 'missing'; } });
+    if (kind === 'untrusted') o.rawPrs[0].comments[0].author.login = 'mallory';
+    if (kind === 'other head') o.rawPrs[0].comments[0].body = o.rawPrs[0].comments[0].body.replace(head, 'b'.repeat(40));
+    expect(runRedTeamOnSkip(o).rows[0].action).not.toBe('clear-finished-hold');
+    expect(o.clearFinishedHold).not.toHaveBeenCalled();
+  });
+  it('escalates when no clearer is available', () => {
+    const o = options({ clearFinishedHold: null, escalate: vi.fn() });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'clear-finished-hold', escalate: true });
+  });
+});

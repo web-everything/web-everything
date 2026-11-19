@@ -2237,6 +2237,7 @@
   "scripts/conveyor/soak/breaks/blocked-draft-reconcile-promotion.soak.test.mjs": 0.97,
   "scripts/conveyor/soak/breaks/card-filer-releases-dirty-lane.soak.test.mjs": 20.45,
   "scripts/conveyor/soak/breaks/carried-hold-and-norun-required-check-refresh.soak.test.mjs": 0.72,
+  "scripts/conveyor/soak/breaks/finished-red-team-publication-hold.soak.test.mjs": 0.72,
   "scripts/conveyor/soak/breaks/claude-auth-needs-you.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/claude-fix-push-after-ci.soak.test.mjs": 0.83,
   "scripts/conveyor/soak/breaks/daemon-build-stale-history.soak.test.mjs": 0,

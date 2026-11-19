@@ -5085,3 +5085,12 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+
+Finished red-team publication recovery keeps the ordinary writer's `.unpublished` outbox separate from the
+carried-check outbox. A posted ordinary result plus a readable finished marker schedules a cooldown-bound
+clear; the executor re-reads under both the status claim and check lock and requires a live successful check
+and trusted same-head ordinary result before clearing the remote hold and deleting the marker. Unknown
+checks, unreadable markers, missing comments and rejected posts retain the marker for operator inspection.
+`finished-red-team-publication-hold.soak.test.mjs` replays the stranded PR #6945 state and probes planner
+behaviour to decide fix presence.
