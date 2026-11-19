@@ -82,7 +82,34 @@ describe('PREP Markdown forms and boundaries', () => {
     expect(parsePrep(`## Acceptance\nconcrete acceptance criteria\nPREP\nTests: focused unit tests`))
       .toMatchObject({ present: true, missing: ['Acceptance', 'Pre-mortem', 'Files'], empty: [] });
   });
-  it.each(['PREP', '## PREP', '**PREP**'])('stops continuation content at another %s marker', (marker) => {
-    expect(parsePrep(`PREP\nTests:\n${marker}\nlong unrelated prose`).empty).toEqual(['Tests']);
+  it.each(['PREP', '## PREP', '**PREP**'])('resets sections at another %s marker', (marker) => {
+    expect(parsePrep(`PREP\nTests:\n${marker}\nlong unrelated prose`))
+      .toMatchObject({ present: true, missing: sections, empty: [] });
+  });
+  const footer = '🤖 Generated with [Claude Code](https://claude.ai/code)\nhttps://claude.ai/code\nCo-Authored-By: Claude <claude@example.com>\nClaude-Session: concrete-session-id';
+  it.each(['PREP:', '## PREP'])('refuses Tests: TODO followed by a PR footer under %s', (marker) => {
+    const body = `${marker}\n${populated.replace('Tests: concrete section content', 'Tests: TODO')}\n${footer}`;
+    expect(parsePrep(body)).toMatchObject({ present: true, missing: [], empty: ['Tests'] });
+    expect(prepVerdict(body).ok).toBe(false);
+  });
+  it.each(['---', '***', '___', '🤖 Generated with Claude Code', 'Generated with Claude Code',
+    'Co-Authored-By: Claude <claude@example.com>', 'Claude-Session: concrete-session-id',
+    'https://claude.ai/code', 'http://example.com/session'])('ends continuation at %s without borrowing later prose', (boundary) => {
+    const body = `PREP:\n${populated.replace('Tests: concrete section content', 'Tests: TODO')}\n${boundary}\nUnrelated footer prose`;
+    expect(parsePrep(body)).toMatchObject({ missing: [], empty: ['Tests'] });
+    expect(prepVerdict(body).ok).toBe(false);
+  });
+  it('refuses two incomplete PREP blocks that jointly cover all required headings', () => {
+    const body = 'PREP:\nAcceptance: concrete acceptance criteria\nPre-mortem: concrete failure risks\n## PREP\nFiles: scripts/example.mjs\nTests: focused unit tests';
+    expect(parsePrep(body)).toMatchObject({ present: true, missing: ['Acceptance', 'Pre-mortem'], empty: [] });
+    expect(prepVerdict(body).ok).toBe(false);
+  });
+  it('accepts a complete PREP block followed by a PR footer', () => {
+    expect(prepVerdict(`PREP:\n${populated}\n${footer}`)).toEqual({ ok: true, reason: '', waived: false });
+  });
+  it.each(['PREP:', '## PREP'])('refuses a complete block followed by a second incomplete %s block', (marker) => {
+    const body = `PREP:\n${populated}\n${marker}\nTests: focused unit tests`;
+    expect(parsePrep(body)).toMatchObject({ present: true, missing: ['Acceptance', 'Pre-mortem', 'Files'], empty: [] });
+    expect(prepVerdict(body).ok).toBe(false);
   });
 });

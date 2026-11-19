@@ -42,7 +42,13 @@ export function parsePrep(text) {
           : HEADINGS.find((heading) => heading.toLowerCase() === name) || 'Threat model';
       if (!sections.has(current)) sections.set(current, []);
       sections.get(current).push(heading[2] || '');
-    } else if (/^PREP(?::|$)/i.test(clean) || /^Slot:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
+    } else if (/^PREP(?::|$)/i.test(clean)) {
+      sections.clear();
+      current = undefined;
+    } else if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line.trim())
+      || /^(?:🤖|Generated with|Co-Authored-By:|Claude-Session:)/i.test(clean)
+      || /^https?:\/\/\S+$/i.test(clean)
+      || /^Slot:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
       current = undefined;
     } else if (current) sections.get(current).push(line);
   }
