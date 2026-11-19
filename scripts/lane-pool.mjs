@@ -1575,9 +1575,36 @@ function historyQuarantine(repo, n) {
   try {
     const record = JSON.parse(readFileSync(file, 'utf8'));
     if (typeof record.reason !== 'string' || !record.reason) throw new Error('missing reason');
-    if (isHostWideGitFailure(`${record.reason} ${record.firstError ?? ''}`)) {
+    if (isHostWideGitFailure(Object.hasOwn(record, 'lastError') ? record.firstError : `${record.reason} ${record.firstError ?? ''}`)
+        && (!Object.hasOwn(record, 'lastError') || isHostWideGitFailure(record.lastError))) {
       try {
         const dir = laneDir(repo, n);
+        const lines = readFileSync(file.replace(/\.json$/, '.evidence.jsonl'), 'utf8').split('\n');
+        let evidenceCount = 0;
+        for (const line of lines) {
+          let evidence;
+          try { evidence = JSON.parse(line); } catch { continue; }
+          if (!evidence || !Object.hasOwn(evidence, 'sha') || !Object.hasOwn(evidence, 'refs')) {
+            throw new Error('incomplete quarantine evidence');
+          }
+          evidenceCount++;
+          const requireCommit = (sha) => {
+            if (typeof sha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha)) {
+              throw new Error('invalid quarantine evidence sha');
+            }
+            git(['cat-file', '-e', `${sha}^{commit}`], dir);
+          };
+          if (evidence.sha) requireCommit(evidence.sha);
+          else if (evidence.sha !== null && evidence.sha !== '') throw new Error('invalid quarantine evidence sha');
+          if (evidence.refs !== null && typeof evidence.refs !== 'string') throw new Error('invalid quarantine evidence refs');
+          for (const ref of (evidence.refs ?? '').split('\n').filter(Boolean)) {
+            const match = /^(\S+) (refs\/\S+)$/.exec(ref);
+            if (!match) throw new Error('invalid quarantine evidence ref');
+            requireCommit(match[1]);
+            git(['rev-parse', '--verify', `${match[2]}^{commit}`], dir);
+          }
+        }
+        if (!evidenceCount) throw new Error('missing quarantine evidence');
         git(['--version'], dir);
         probeLaneHistory(dir);
         unlinkSync(file);
@@ -1622,11 +1649,12 @@ function probeLaneHistory(dir) {
 
 function requireReadableLaneHistory(repo, n, { allowRepair = !flags['no-reset'] } = {}) {
   const dir = laneDir(repo, n);
-  let firstError;
+  let firstError, lastError;
   // Exactly one retry, including timeouts/output-limit errors. Preserve the initial diagnostic.
   for (let attempt = 0; attempt < 2; attempt++) {
     try { probeLaneHistory(dir); return; } catch (e) {
-      firstError ??= msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+      lastError = msgOf(e).replace(/[\x00-\x1f\x7f]/g, ' ').trim().slice(0, 2000);
+      firstError ??= lastError;
     }
     if (attempt === 0) {
       const sha = tryGit(['rev-parse', '--verify', '--quiet', 'HEAD'], dir);
@@ -1653,7 +1681,7 @@ function requireReadableLaneHistory(repo, n, { allowRepair = !flags['no-reset'] 
   const file = historyQuarantinePath(repo, n);
   const reason = `history unreadable after two probes: ${firstError}`;
   mkdirSync(join(repo.poolDir, '.quarantine-state'), { recursive: true });
-  writeFileSync(file, JSON.stringify({ lane: n, reason, at: new Date().toISOString(), firstError }) + '\n');
+  writeFileSync(file, JSON.stringify({ lane: n, reason, at: new Date().toISOString(), firstError, lastError }) + '\n');
   throw new Error(`lane-${n} QUARANTINED: ${reason}; host-wide git failures auto-clear on the next acquire/reclaim once git works; for real history corruption, inspect/repair history, then remove ${file} manually`);
 }
 

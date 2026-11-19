@@ -188,6 +188,8 @@ it.each([
   saved.firstError = 'You have not agreed to the Xcode license agreements';
   saved.reason = 'history unreadable after two probes: exit status 69';
   writeFileSync(record, JSON.stringify(saved));
+  // The real quarantine path writes this evidence line first; git was failing, so no sha/refs were captured.
+  writeFileSync(record.replace(/\.json$/, '.evidence.jsonl'), JSON.stringify({ lane: 1, sha: null, refs: null }) + '\n');
   const result = runPool(args);
   expect(existsSync(record), result.stderr).toBe(false);
   expect(result.stderr).not.toContain('QUARANTINED');

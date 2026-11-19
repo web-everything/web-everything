@@ -27,22 +27,84 @@ beforeEach(() => {
   mkdirSync(join(repo.poolDir, '.quarantine-state'));
   file = join(repo.poolDir, '.quarantine-state', 'lane-1.json');
   evidence = file.replace('.json', '.evidence.jsonl');
-  writeFileSync(evidence, 'original evidence\n');
+  writeFileSync(evidence, JSON.stringify({ sha: null, refs: '' }) + '\n');
   journal = vi.fn();
   api = load(join, readFileSync, unlinkSync, git, (r, n) => join(r.poolDir, `lane-${n}`), journal, () => env);
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
-function record(reason = 'history unreadable after two probes', firstError = 'You have not agreed to the Xcode license agreements') {
-  const value = { lane: 1, reason, firstError, at: new Date().toISOString() };
+function record(reason = 'history unreadable after two probes', firstError = 'You have not agreed to the Xcode license agreements', lastError = firstError) {
+  const value = { lane: 1, reason, firstError, lastError, at: new Date().toISOString() };
   writeFileSync(file, JSON.stringify(value));
   return value;
 }
 it('releases a license-text quarantine only after git and healthy clone history pass; keeps evidence and journals', () => {
   record();
+  const preserved = readFileSync(evidence, 'utf8');
   expect(api.historyQuarantine(repo, 1)).toBeNull();
   expect(existsSync(file)).toBe(false);
-  expect(readFileSync(evidence, 'utf8')).toBe('original evidence\n');
+  expect(readFileSync(evidence, 'utf8')).toBe(preserved);
   expect(journal).toHaveBeenCalledWith(dir, expect.objectContaining({ action: 'quarantine-auto-released' }));
+});
+it.each(['refs/heads/deleted', 'refs/stash'])('keeps quarantine when a recorded ref no longer exists: %s', ref => {
+  const saved = record();
+  const sha = git(['rev-parse', 'HEAD'], dir);
+  git(['update-ref', ref, sha], dir);
+  const oldEvidence = JSON.stringify({ sha, refs: `${sha} ${ref}` });
+  git(['update-ref', '-d', ref], dir);
+  // Check all records, including earlier attempts; malformed lines are ignored.
+  writeFileSync(evidence, oldEvidence + '\ninvalid json\n' + JSON.stringify({ sha: null, refs: '' }) + '\n');
+  expect(api.historyQuarantine(repo, 1)).toEqual(saved);
+  expect(existsSync(file)).toBe(true);
+  expect(journal).not.toHaveBeenCalled();
+});
+it('keeps quarantine when the final probe reports corruption after a host-wide first error', () => {
+  const saved = record(undefined, undefined, 'local history tip missing or not a commit');
+  expect(api.historyQuarantine(repo, 1)).toEqual(saved);
+  expect(existsSync(file)).toBe(true);
+  expect(journal).not.toHaveBeenCalled();
+});
+it('releases a healthy legacy record without lastError after validating preserved commits and refs', () => {
+  const saved = record();
+  delete saved.lastError;
+  writeFileSync(file, JSON.stringify(saved));
+  const sha = git(['rev-parse', 'HEAD'], dir);
+  writeFileSync(evidence, 'invalid json\n' + JSON.stringify({ sha, refs: `${sha} refs/heads/main` }) + '\n');
+  expect(api.historyQuarantine(repo, 1)).toBeNull();
+  expect(existsSync(file)).toBe(false);
+  expect(existsSync(evidence)).toBe(true);
+});
+it.each(['missing', 'directory', 'unparsable', 'incomplete'])('keeps quarantine when evidence is unreadable or incomplete: %s', kind => {
+  const saved = record();
+  unlinkSync(evidence);
+  if (kind === 'directory') mkdirSync(evidence);
+  if (kind === 'unparsable') writeFileSync(evidence, 'invalid json\n');
+  if (kind === 'incomplete') writeFileSync(evidence, '{}\n');
+  expect(api.historyQuarantine(repo, 1)).toEqual(saved);
+  expect(existsSync(file)).toBe(true);
+  expect(journal).not.toHaveBeenCalled();
+});
+it('keeps quarantine when a preserved commit is missing even though current history is healthy', () => {
+  const saved = record();
+  writeFileSync(evidence, JSON.stringify({ sha: 'a'.repeat(40), refs: '' }) + '\n');
+  expect(api.historyQuarantine(repo, 1)).toEqual(saved);
+  expect(existsSync(file)).toBe(true);
+  expect(journal).not.toHaveBeenCalled();
+});
+it('persists the sanitized final probe error separately from the first error', () => {
+  const retrySection = source.slice(source.indexOf('function requireReadableLaneHistory'), source.indexOf('function laneStatus'));
+  const probe = vi.fn()
+    .mockImplementationOnce(() => { throw Error('Xcode license\nfirst'); })
+    .mockImplementationOnce(() => { throw Error('missing objects\u0000' + 'x'.repeat(2100)); });
+  const requireHistory = new Function('laneDir', 'probeLaneHistory', 'msgOf', 'tryGit', 'mkdirSync', 'join', 'writeFileSync', 'historyQuarantinePath',
+    retrySection + '; return requireReadableLaneHistory;')(
+    () => dir, probe, e => e.message, () => null, mkdirSync, join, writeFileSync, () => file,
+  );
+  expect(() => requireHistory(repo, 1, { allowRepair: false })).toThrow(/QUARANTINED/);
+  expect(probe).toHaveBeenCalledTimes(2);
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  expect(saved.firstError).toBe('Xcode license first');
+  expect(saved.lastError).toBe(('missing objects ' + 'x'.repeat(2100)).slice(0, 2000));
+  expect(api.historyQuarantine(repo, 1)).toEqual(saved);
 });
 it('keeps a license-text quarantine when a history object is missing', () => {
   const saved = record();
