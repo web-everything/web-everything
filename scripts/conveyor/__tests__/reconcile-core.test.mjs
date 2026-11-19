@@ -33,7 +33,7 @@ import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-ga
 import { describe, it, expect } from 'vitest';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
-  staleRequiredBaseRepair, reviewHoldOnlyRed, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
+  staleRequiredBaseRepair, reviewHoldOnlyRed, reviewHoldCiWaivable, planReconcile as planReconcileCore, fixWaitingSince, countFindings, bindAgents, assessLiveness, isAwaitingPermission, startedAtMs, releasedFixClaim, isReleasedClaimSession,
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
@@ -3755,6 +3755,22 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     const result = planReconcile({ prs: [source], requiredChecks, agents: [], durableCounts: {}, now: NOW,
       advisoryReviewOnHumanHandoff: 'on' });
     expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(false);
+  });
+
+  it.each(['SKIPPED', 'NEUTRAL'])('does not waive CI for a review-hold advisory when a required check concluded %s', conclusion => {
+    const required = [...requiredChecks, 'lint'];
+    const rollup = [...heldRollup(), check('lint', conclusion)];
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks: required })).toBe(false);
+    const result = planReconcile({ prs: [source], requiredChecks: required, agents: [], durableCounts: {}, now: NOW,
+      advisoryReviewOnHumanHandoff: 'on' });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
+
+  it('still waives CI for a review-hold advisory when only the held gates are red', () => {
+    const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup() });
+    expect(reviewHoldCiWaivable({ pr: source, requiredChecks })).toBe(true);
   });
 });
 

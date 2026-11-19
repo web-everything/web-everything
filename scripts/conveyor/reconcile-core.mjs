@@ -1570,6 +1570,26 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
     reviewPending: reviewCanFinish, requiredChecks });
 }
 
+/**
+ * PURE: a review-hold advisory may skip the CI wait only when the strict start gate is satisfied except for the
+ * held gates themselves (review-gate, or a merge-gate annotated as a review hold). Pending, skipped, neutral,
+ * missing or wrong-head required checks all keep the strict refusal, exactly as on the reader path.
+ * @param {{ pr: object, requiredChecks: string[] }} input PR row and required check names.
+ * @returns {boolean} Whether CI may be waived for the review-hold advisory.
+ * @example
+ * reviewHoldCiWaivable({ pr, requiredChecks: ['review-gate', 'merge-gate'] });
+ */
+export function reviewHoldCiWaivable({ pr, requiredChecks }) {
+  const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr?.reviewTiming });
+  if (ci.allowed) return true;
+  const rollup = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const annotated = rollup.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
+  return Array.isArray(ci.affected) && ci.affected.length > 0
+    && ci.affected.every(row => FAILED_CHECK_CONCLUSIONS.includes(String(row.reason).toUpperCase())
+      && (row.name === 'review-gate' || (row.name === 'merge-gate' && annotated)))
+    && reviewHoldOnlyRed(rollup, requiredChecks, pr?.headRefOid);
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewStartGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup, verifyGreen: pr?.verifyGreen, policy: pr.reviewTiming });
@@ -3010,7 +3030,7 @@ export function planReconcile({
         roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
         extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason,
           // A review-hold advisory waives only the held gate: any other required check still pending/red keeps the CI wait.
-          ciWaived: reason !== 'review-hold' || reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks, pr?.headRefOid),
+          ciWaived: reason !== 'review-hold' || reviewHoldCiWaivable({ pr, requiredChecks }),
           why: reason === 'human-handoff'
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });
