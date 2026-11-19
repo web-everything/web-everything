@@ -9,4 +9,6 @@ Do not seat Gemini as a PR reviewer — not as an extra review seat and not as t
 
 **Why:** operator, 2026-10-02: "I think Gemini might be too weak for review for now until v4", then "review from agy are not reliable … well, more Gemini". Live evidence: the gemini-3.1-pro seat claimed a CONFIRMED bug that did not exist (an undeclared variable at pr-status.mjs:179 that is declared at line 172), which looped PR #3432's review about 80 times overnight; Antigravity Claude seats all failed with quota-exhausted the same day.
 
-**How to apply:** keep `WE_REVIEW_SEAT_CAP_AGY_GEMINI=0` and `REVIEW_PR_ANTIGRAVITY_REVIEW=0` on the review daemon (set 2026-10-02) until the default-off code change lands; when routing reviewers, pick Claude or Codex. Gemini stays fine for other work only where its value is proven (see [[gemini-only-where-confident-of-value]]).
+**UPDATE** 2026-11-18 (R1062, operator 'Go'): Gemini 4 Carbon (gemini-4-carbon-high) is v4. It may take a watch-only (shadow) review seat now; its verdicts count only after it agrees with Claude on 10 PRs. Older Gemini models stay off. agy may write code for small jobs only, confined to a throwaway copy with only in-scope hunks applied.
+
+**How to apply (pre-Carbon models):** keep `WE_REVIEW_SEAT_CAP_AGY_GEMINI=0` and `REVIEW_PR_ANTIGRAVITY_REVIEW=0` on the review daemon (set 2026-10-02) until the default-off code change lands; when routing reviewers, pick Claude or Codex. Gemini stays fine for other work only where its value is proven (see [[gemini-only-where-confident-of-value]]).
