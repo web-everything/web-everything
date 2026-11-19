@@ -140,6 +140,15 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.reasons).toContain('transcript malformed — escape check incomplete');
   });
 
+  it('a step that names run_command under an unknown step_type is still a tool call and voids', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { step_type: 'mystery', tool_name: 'run_command' }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('run_command');
+  });
+
   it('a later update that renames the same step to run_command voids even with a valid in-lane path', async () => {
     const fx = fixture();
     const out = await fx.run(undefined, (cwd) => [

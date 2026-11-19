@@ -258,11 +258,14 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   for (const event of parseJsonlEvents(String(transcriptText ?? ''))) {
     const step = event?.event === 'step_update' ? event.step_update : null;
     if (!step) continue;
-    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (step.step_type === 'tool' ? `#${n++}` : null);
+    // Anything that names a tool counts as a tool step, whatever its `step_type` says (an unknown type must not hide a command).
+    const namesTool = typeof step.tool_name === 'string' || typeof step.tool_info?.name === 'string';
+    const isToolStep = step.step_type === 'tool' || namesTool;
+    const key = step.step_index != null ? JSON.stringify([step.conversation_id ?? null, step.step_index]) : (isToolStep ? `#${n++}` : null);
     if (key == null) continue;
     const cur = steps.get(key) ?? { isTool: false, name: undefined, params: undefined, updates: [], errored: false };
     cur.updates.push(step.tool_info?.parameters);
-    if (step.step_type === 'tool') {
+    if (isToolStep) {
       if (cur.params == null) cur.params = step.tool_info?.parameters;
       cur.isTool = true;
       cur.name ??= step.tool_name ?? step.tool_info?.name;
@@ -291,6 +294,7 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
   for (const step of steps.values()) {
     if (!step.isTool) continue;
     if (step.names && step.names.size > 1) { out.push(`<tool changed mid-step: ${[...step.names].join('>')}>`); continue; }
+    // NOTE (R1052, carded must-fix before promotion): errored tools other than read_file are still exempt here.
     if (step.errored && step.name !== 'read_file') continue;
     const name = step.name;
     if (typeof name !== 'string' || !READ_ONLY_AGY_TOOLS.includes(name)) { out.push(typeof name === 'string' ? name : '<unnamed tool>'); continue; }
