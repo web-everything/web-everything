@@ -762,8 +762,12 @@ export function enrichPrsWithReferralHolds(prs, { repo, now = Date.now(), env = 
     if (Array.isArray(pr.comments) && pr.comments.length >= GH_LIST_COMMENT_CAP
       && runs.some(r => r.repo === repo && r.pr === Number(pr.number) && r.head === pr.headRefOid)) {
       try {
-        const full = readComments({ repo, number: pr.number });
-        if (Array.isArray(full)) pr = { ...pr, comments: full, commentsComplete: true };
+        const read = readComments({ repo, number: pr.number });
+        // A reader may report { comments, complete }; a bare array is complete only when it is below the
+        // list cap (a capped page, such as `gh pr view --json comments`, may hide later events and stays incomplete).
+        const full = Array.isArray(read) ? read : read?.comments;
+        const complete = Array.isArray(read) ? read.length < GH_LIST_COMMENT_CAP : read?.complete === true;
+        if (Array.isArray(full)) pr = { ...pr, comments: full, commentsComplete: complete };
       }
       catch { /* Keep the list snapshot when the full thread is unavailable. */ }
     }

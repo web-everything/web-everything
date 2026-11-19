@@ -243,7 +243,7 @@ describe('complete long threads with ruled referral-kind holds', () => {
   ])('enrichment of a capped snapshot marks completeness only for a %s', (_name, read, complete) => {
     const full = complete ? read() : null;
     const snapshot = thread('not-real').slice(0, GH_LIST_COMMENT_CAP);
-    const readComments = vi.fn(complete ? () => full : read);
+    const readComments = vi.fn(complete ? () => ({ comments: full, complete: true }) : read);
     const [pr] = enrichPrsWithReferralHolds([asPr(fx, snapshot)], {
       repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments,
     });
@@ -257,6 +257,17 @@ describe('complete long threads with ruled referral-kind holds', () => {
     } else {
       expect(pr.comments).toBe(snapshot);
       expect(pr.commentsComplete).not.toBe(true);
+      expect(decide(pr, hold)).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/may be truncated/) });
+    }
+  });
+
+  it('a capped array read (or a reader reporting incomplete) stays incomplete, so the hold stays', () => {
+    const snapshot = thread('not-real').slice(0, GH_LIST_COMMENT_CAP);
+    for (const read of [() => snapshot, () => ({ comments: snapshot, complete: false }), () => ({ comments: snapshot })]) {
+      const [pr] = enrichPrsWithReferralHolds([asPr(fx, snapshot)], {
+        repo, readRuns: () => fx.runs, now: Date.parse(fx.capturedAt), env: {}, readComments: read,
+      });
+      expect(pr.commentsComplete).toBe(false);
       expect(decide(pr, hold)).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/may be truncated/) });
     }
   });
