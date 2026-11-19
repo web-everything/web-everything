@@ -1058,8 +1058,11 @@ describe('head clearance for parked recovery reviews', () => {
     ['no verdict', { verdict: null }, {}, false],
     ['rejection', { verdict: { verdict: 'changes' } }, {}, false],
     ['non-advisory pending step', { pending: { kind: 'effect', step: 'label' } }, {}, false],
-    ['refused effect', { pending: null, effects: [{ type: 'review.label-swap', status: 'refused' }] }, {}, true],
-    ['refused outcome', { pending: null, effects: [], outcome: 'refused' }, {}, true],
+    ['refused label effect', { pending: null, effects: [{ type: 'review.label-swap', status: 'refused' }] }, {}, false],
+    ['failed label effect', { effects: [{ type: 'review.label-swap', status: 'failed' }] }, {}, false],
+    ['refused advisory effect', { pending: null, outcome: 'refused', effects: [{ type: 'review.advisory-note', status: 'refused' }] }, {}, true],
+    ['refused label outcome', { pending: null, outcome: 'refused', effects: [{ type: 'review.label-swap', status: 'refused' }] }, {}, false],
+    ['unexplained refused outcome', { pending: null, effects: [], outcome: 'refused' }, {}, false],
     ['refused effect without clearance', { pending: null, effects: [{ status: 'refused' }] }, { clearance: undefined }, false],
     ['refused outcome without clearance', { pending: null, effects: [], outcome: 'refused' }, { clearance: undefined }, false],
     ['unreadable record', {}, { read: () => { throw Error('unreadable'); } }, false],
@@ -1090,7 +1093,7 @@ describe('head clearance for parked recovery reviews', () => {
 
 describe('completed accepts release later advisory bookkeeping in recovery', () => {
   it.each(['accept', 'prevention-outstanding', 'accept-written-later', 'alone', 'other-head', 'other-pr', 'other-repo',
-    'label', 'no-verdict', 'changes', 'refused-effect', 'refused-outcome', 'incomplete-accept', 'unreadable', 'scan-capped'])(
+    'label', 'no-verdict', 'changes', 'refused-effect', 'refused-outcome', 'incomplete-accept', 'empty-effects', 'missing-effects', 'no-applied-label', 'failed-accept-label', 'unreadable', 'scan-capped'])(
     'fails closed unless the same-head completed accept is observed: %s', kind => {
       const f = fixture();
       const completed = { id: 'review-pr-completed', op: 'review-pr', input: { repo: f.repo, pr: f.pr },
@@ -1110,6 +1113,10 @@ describe('completed accepts release later advisory bookkeeping in recovery', () 
       if (kind === 'refused-effect') parked.effects = [{ type: 'review.label-swap', status: 'refused' }];
       if (kind === 'refused-outcome') parked.outcome = 'refused';
       if (kind === 'incomplete-accept') completed.pending = { kind: 'effect', step: 'record' };
+      if (kind === 'empty-effects') completed.effects = [];
+      if (kind === 'missing-effects') delete completed.effects;
+      if (kind === 'no-applied-label') completed.effects = [{ type: 'review.notice', status: 'applied' }];
+      if (kind === 'failed-accept-label') completed.effects[0].status = 'failed';
       const args = { ...f, now: 30_000,
         list: () => kind === 'alone' ? [parked.id] : [completed.id, parked.id],
         read: id => { if (kind === 'unreadable' && id === completed.id) throw Error('unreadable accept'); return id === completed.id ? completed : parked; },
@@ -1156,6 +1163,37 @@ describe('cleared quarantined recovery reviews', () => {
         } else expect(result.newest).toBeNull();
       }
     });
+});
+
+describe('quarantine clearance supersedes only record-step bookkeeping', () => {
+  const effects = [
+    ['review.label-swap', 'failed', true], ['review.label-swap', 'pending', true], ['review.label-swap', 'declared', true],
+    ['verdict-ledger.append', 'declared', true], ['verdict-ledger.append', 'pending', true],
+    ['review.notice', 'declared', true], ['review.notice', 'pending', true],
+    ['review.label-swap', 'refused', false], ['review.label-swap', 'in-flight', false],
+    ['verdict-ledger.append', 'failed', false], ['review.notice', 'failed', false],
+    ['review.notice', 'refused', false], ['review.notice', 'in-flight', false],
+    ['review.other', 'pending', false], ['review.other', 'failed', false], ['review.other', 'refused', false],
+  ];
+  it.each([...effects.map(([type, status, ok]) => [type + ' ' + status, { type, status }, {}, ok]),
+    ['wrong effect step', { type: 'review.label-swap', status: 'failed', stepIndex: 2 }, {}, false],
+    ['wrong pending step', { type: 'review.label-swap', status: 'failed' }, { pending: { kind: 'effect', step: 'advise', stepIndex: 3 } }, false],
+    ['refused outcome', { type: 'review.label-swap', status: 'pending' }, { outcome: 'refused' }, false],
+    ['null pending with recorded step', { type: 'review.label-swap', status: 'failed' }, { pending: null }, true],
+    ['null pending without recorded step', { type: 'review.label-swap', status: 'failed' }, { pending: null, stepTimings: [] }, false],
+    ['all applied', { type: 'review.other', status: 'applied' }, { pending: null }, true],
+  ])('%s', (_name, effect, patch, ok) => {
+    const f = fixture(), dir = join(f.runsDir, '..', 'runs-quarantine');
+    const run = { ...newRunRecord({ id: 'review-pr-record', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...payload(f.head), pending: { kind: 'effect', step: 'record', stepIndex: 3 },
+      stepTimings: [{ step: 'record', stepIndex: 3, startedAt: new Date(10_000).toISOString() }],
+      effects: [{ key: 'record-effect', index: 0, stepIndex: 3, ...effect,
+        ...(effect.status === 'refused' ? { attempts: 1, error: 'SELF-CLEAR REFUSED — nothing was changed (#2844)' } : {}) }], ...patch };
+    utimesSync(writeRun(run, dir), 20, 20);
+    const read = () => readRecoveryWitness({ ...f, clearance: { sha: f.head, at: 20_000 } });
+    if (ok) expect(read().newest).toEqual(run);
+    else expect(read).toThrow(/quarantined review conflict.*inspect/);
+  });
 });
 
 describe('bounded review evidence scans', () => {

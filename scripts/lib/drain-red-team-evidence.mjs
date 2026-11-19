@@ -262,10 +262,11 @@ const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEf
 const advisoryParkedReview = (run, head, allowRefused = false) => {
   if (run.findings?.read?.netBasis?.rev !== head
     || !['accept', 'prevention-outstanding', 'needs-human'].includes(verdictOf(run))
-    || (!allowRefused && run.outcome === 'refused') || !Array.isArray(run.effects)) return false;
+    || !Array.isArray(run.effects)) return false;
+  if (run.outcome === 'refused' && (!allowRefused || !run.effects.some(effect => effect?.status === 'refused'))) return false;
   if (run.pending != null && !(run.pending.kind === 'effect' && run.pending.step === 'advise')) return false;
-  return run.effects.every(effect => effect?.status === 'applied' || (allowRefused && effect?.status === 'refused')
-    || (['declared', 'pending', 'in-flight', 'failed'].includes(effect?.status)
+  return run.effects.every(effect => effect?.status === 'applied'
+    || ((['declared', 'pending', 'in-flight', 'failed'].includes(effect?.status) || (allowRefused && effect?.status === 'refused'))
       && typeof effect.type === 'string'
       && (effect.type.startsWith('review.advisory-') || effect.type === 'review.scoped-rereview-shadow')));
 };
@@ -505,7 +506,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           if (allowCompletedAccept && run.findings?.read?.netBasis?.rev === head
             && ['accept', 'prevention-outstanding'].includes(verdictOf(run)) && run.pending == null
             && run.outcome !== 'refused' && Array.isArray(run.effects)
-            && run.effects.every(effect => effect?.status === 'applied')) completedAccept = true;
+            && run.effects.every(effect => effect?.status === 'applied')
+            && run.effects.some(effect => effect.type === 'review.label-swap' && effect.status === 'applied')) completedAccept = true;
           if (unfinishedReview(run) && !supersededUnfinished(run, head) && !clearedParkedReview(run, head, at, clearance)) {
             if (allowCompletedAccept && advisoryParkedReview(run, head)) parked.push(hit);
             else recordUnfinished(hit);
@@ -592,6 +594,16 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 }
 
 /** Raw, head-scoped evidence only. Never select an older accepting verdict over a newer rejection. */
+const supersededRecordEffects = run => {
+  if (run.outcome === 'refused' || !Array.isArray(run.effects)) return false;
+  if (run.pending != null && !(run.pending.kind === 'effect' && run.pending.step === 'record')) return false;
+  const recordIndex = run.pending?.stepIndex ?? run.stepTimings?.find(row => row.step === 'record')?.stepIndex;
+  const allowed = { 'review.label-swap': ['failed', 'pending', 'declared'],
+    'verdict-ledger.append': ['declared', 'pending'], 'review.notice': ['declared', 'pending'] };
+  return run.effects.every(effect => effect?.status === 'applied'
+    || (Number.isInteger(recordIndex) && effect?.stepIndex === recordIndex && allowed[effect.type]?.includes(effect.status)));
+};
+
 function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSettings, warn,
   dir = join(dirname(runsDir), 'runs-quarantine'), list = listRunIds, read = readRun, stat = statSync }) {
   const clearedAt = typeof clearance?.at === 'number' ? clearance.at : Date.parse(clearance?.at);
@@ -604,7 +616,7 @@ function clearedQuarantinedReview({ repo, pr, head, clearance, runsDir, scanSett
     if (run.id !== id) throw Error('quarantined review identity unreadable; hold and inspect quarantine evidence');
     if (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr)
       || run.findings?.read?.netBasis?.rev !== head) return false;
-    if (at > clearedAt || run.carriedFrom != null
+    if (at > clearedAt || run.carriedFrom != null || !supersededRecordEffects(run)
       || (!['accept', 'prevention-outstanding'].includes(verdictOf(run)) && !redTeamOwedFor(run))) conflict = true;
     // Two different panels cannot stand in for one another without an operator choosing the evidence.
     if (selected && JSON.stringify([selected.run.verdict, selected.run.findings]) !== JSON.stringify([run.verdict, run.findings])) conflict = true;
