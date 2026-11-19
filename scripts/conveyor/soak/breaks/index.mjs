@@ -48,6 +48,7 @@
  * `superseded-omits-retired-merged-overlay.mjs` uses the same automatic registration.
  * `restamp-comment-does-not-retrigger-merge-gate.mjs` uses the same automatic registration.
  * `live-changes-stale-accepted-phase.mjs` uses the same automatic registration.
+ * `smoke-queue-force-priority.mjs` uses the same automatic registration.
  *
  * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
  * `gh-log-escape-sequences-block-ci-heal.mjs` uses the same automatic registration.
