@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  QUARANTINE_REF, validateQuarantineList, canWriteQuarantine, addEntries, removeEntries, pruneOnGreen, testsToSkip,
+  QUARANTINE_REF, validateQuarantineList, canWriteQuarantine, addEntries, removeEntries, pruneOnGreen, setMode, setFixPrs, testsToSkip,
   classifyQuarantinedFailure, decideQuarantineHold, testArea, vitestExcludeArgs, resolveFixFiles, listedPrFiles, QUARANTINE_MAX_TTL_MS, QUARANTINE_DEFAULT_TTL_MS,
 } from '../red-main-quarantine.mjs';
 import { redMainSignal, resolveRedMainMode } from '../red-main-hold.mjs';
@@ -255,6 +255,18 @@ describe('orchestrator quarantine authority', () => {
       removeEntries(listWith([TEST]), { ...options, orchestratorAuthority }),
       pruneOnGreen(listWith([TEST]), { ...options, mainGreen: true, orchestratorAuthority })]) {
       expect(result).toMatchObject({ ok: false, error: expect.stringContaining('orchestrator.authority.redMainQuarantine') });
+    }
+  });
+  it.each([
+    ['setMode', setMode, { mode: 'stop' }],
+    ['setFixPrs', setFixPrs, { fixPrs: [99] }],
+  ])('%s refuses orchestrator even with authority enabled', (_, change, value) => {
+    const list = { ...listWith([TEST]), mode: 'quarantine', fixPrs: [12] };
+    const before = structuredClone(list);
+    expect(change(list, { ...options, ...value, orchestratorAuthority: true })).toMatchObject({ ok: false, error: expect.stringContaining('refused') });
+    expect(list).toEqual(before);
+    for (const actor of ['red-main-safety-net', 'operator']) {
+      expect(change(list, { ...options, ...value, actor }).ok).toBe(true);
     }
   });
   it('allows authorized adds and removals with the orchestrator audit actor', () => {

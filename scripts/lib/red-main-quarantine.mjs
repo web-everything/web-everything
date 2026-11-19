@@ -134,10 +134,10 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
 
 /**
  * Publish the red-main mode the writer resolved on the list, so CI (which reads ONLY this list) applies the same mode
- * as the daemon. Only a writer may set it. Unchanged ⇒ no event. PURE.
+ * as the daemon. Only the safety net or operator may set it. Unchanged ⇒ no event. PURE.
  */
-export function setMode(list, { mode, actor, now, orchestratorAuthority = false }) {
-  if (!canWriteQuarantine(actor, { orchestratorAuthority })) return { ok: false, error: quarantineWriterError(actor) };
+export function setMode(list, { mode, actor, now }) {
+  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" refused: only red-main-safety-net or operator may set mode` };
   if (!RED_MAIN_MODES.includes(mode)) return { ok: false, error: `mode "${mode}" is not a red-main mode` };
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   if (base.mode === mode) return { ok: true, list: base, events: [] };
@@ -177,11 +177,11 @@ export function removeEntries(list, { tests = [], actor, now, orchestratorAuthor
 
 /**
  * Record the main-fix PR numbers on the list, so CI (which reads ONLY the list's ops ref) can run the quarantined
- * tests for them. Only a writer may set it; the numbers come from the safety net's owner-PR recognition
+ * tests for them. Only the safety net or operator may set it; the numbers come from the safety net's owner-PR recognition
  * (`main-ci-red-core.mjs#findOwnerPrs`), never from a PR's own tree. PURE.
  */
-export function setFixPrs(list, { fixPrs, actor, now, orchestratorAuthority = false }) {
-  if (!canWriteQuarantine(actor, { orchestratorAuthority })) return { ok: false, error: quarantineWriterError(actor) };
+export function setFixPrs(list, { fixPrs, actor, now }) {
+  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" refused: only red-main-safety-net or operator may set fix PRs` };
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   const nums = [...new Set((fixPrs ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
   const next = { ...base, version: 1, entries: [...base.entries], fixPrs: nums };

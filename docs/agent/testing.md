@@ -5091,14 +5091,19 @@ same locked library helper; recovery failure must prevent retirement and unload 
 
 `resolveOrchestratorAuthority` reads repo `authority.redMainQuarantine` from the discovered
 `scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
-through `readPlatformPreferences().prefs.orchestrator`. Unreadable platform evidence denies authority.
+through `readPlatformPreferences().prefs.orchestrator` using only its default paths. Missing current
+platform or operator files deny authority; absent optional legacy files are allowed. Unreadable or
+invalid platform evidence still denies authority. The repo reader uses
+`readSettingsChecked`: duplicate ownership or read taint denies authority even over a platform grant.
 For this explicit authority grant, platform wins over
 repo in both directions; only boolean `true` grants access, and invalid values deny it. There is
-no authority environment override; the shared platform-file override remains available for tests.
+no authority environment override, including platform-file path overrides. Tests inject
+`platform`/`tool` or the `readFile` IO seam instead of redirecting the authority files.
 The resolver logs the effective value and actual source through the shared policy diagnostics.
 
 The IO writer and CLI add/remove/prune resolve authority; pure quarantine functions receive
 `orchestratorAuthority` explicitly. Keep owner validation, TTL limits, and actor audit records
-on the same path as operator and safety-net writes. The authority settings tests cover closed
+on the same path as operator and safety-net writes. `setMode` and `setFixPrs` remain limited to
+the safety net and operator even with orchestrator authority enabled. The authority settings tests cover closed
 defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
 verifies persisted events and commit messages against a temporary local Git origin.
