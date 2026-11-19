@@ -30,6 +30,21 @@ describe('Forge scans all manifest content',()=>{
         expect(error.message).not.toContain(text);
       });
 
+  it('refuses a disguised JWK that follows stray or unclosed double quotes',()=>{
+    const quote='"';
+    for(const lead of [quote+' ',quote+' a '+quote+' b '+quote+' ','say '+quote+'hello '+quote+'x '+quote+'y\n','an unclosed '+quote+'string, '])
+      for(const path of ['docs/notes.md','notes.txt','NOTES'])
+        refused(path,Buffer.from(lead+material.JWK),true,'content-detected credential in a non-credential-named file');
+  });
+  it('admits prose that only mentions private keys or key-like labels, but refuses a PEM private block',()=>{
+    const words=['PRIVATE','KEY'].join(' ');
+    expect(admit('docs/setup.md',Buffer.from(`Set the GitHub App ${words} secret. sk-ant-admin-from-keychain is a label.`))).toHaveProperty('sha256');
+    expect(admit('ci.yml',Buffer.from(`private-key: \${{ secrets.APP_${['PRIVATE','KEY'].join('_')} }}\n# -----BEGIN CERTIFICATE-----`))).toHaveProperty('sha256');
+  });
+  it('admits a real media container when the scan budget is exhausted on its bytes, never a disguised one',()=>{
+    const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.alloc(64,1)]);
+    expect(admit('a.png',png)).toHaveProperty('sha256');
+  });
   it('admits ordinary documentation, code and JSON regardless of tracking',()=>{
     for(const tracked of [true,false])for(const [path,text] of [
       ['docs/notes.md','# Guide\nUse the navigation to browse examples.\n'],

@@ -6,6 +6,16 @@ export const CONTENT_SCAN_BINARY_EXTENSIONS=Object.freeze([
   'png','jpg','jpeg','gif','webp','ico','avif','woff','woff2','ttf','otf','pdf',
   'mp4','webm','mp3','wav','zip','gz','wasm',
 ]);
+const mediaMagics={
+  png:[[0,'89504e470d0a1a0a']],jpg:[[0,'ffd8ff']],jpeg:[[0,'ffd8ff']],gif:[[0,'47494638']],
+  webp:[[0,'52494646'],[8,'57454250']],ico:[[0,'00000100']],avif:[[4,'66747970']],pdf:[[0,'255044462d']],
+  woff:[[0,'774f4646']],woff2:[[0,'774f4632']],ttf:[[0,'00010000']],otf:[[0,'4f54544f']],
+  mp4:[[4,'66747970']],webm:[[0,'1a45dfa3']],wav:[[0,'52494646'],[8,'57415645']],zip:[[0,'504b0304']],gz:[[0,'1f8b']],wasm:[[0,'0061736d']],
+};
+const mediaMagic=(content,extension)=>{
+  const checks=mediaMagics[extension];
+  return !!checks&&checks.every(([at,hex])=>content.subarray(at,at+hex.length/2).equals(Buffer.from(hex,'hex')));
+};
 const sha=value=>createHash('sha256').update(value).digest('hex');
 // Paths remain bytes throughout inventory, transport, hashing and verification.
 export function pathParts(path) {
@@ -216,6 +226,23 @@ export function credentialBufferFinding(content) {
   return textFinding(swapped.toString('utf16le'))??keyStructureFinding(content);
 }
 
+// Ordinary (non credential-named) files: high-confidence evidence only. The loose words `-----BEGIN` and
+// `PRIVATE KEY` appear in real docs and workflow files; a refusal falls the whole Forge run back to local,
+// so those words alone must not block. A PEM private-key block with a body, every token format and the
+// structural key detectors still do.
+const pemPrivateBlock=/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]{0,16}[A-Za-z0-9+/_-]{40}/;
+// `sk-` needs a digit here: prose such as `sk-ant-admin-from-keychain` is a label, not a token.
+const ordinaryPatterns=[...secretText.slice(2).filter(([,name])=>name!=='sk-token'),[/\bsk-(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{16,}/,'sk-token']];
+const ordinaryTextFinding=text=>pemPrivateBlock.test(text)?'private-key-block':ordinaryPatterns.find(([pattern])=>pattern.test(text))?.[1]??null;
+export function ordinaryBufferFinding(content) {
+  for(const encoding of ['latin1','utf8','utf16le']) {
+    const finding=ordinaryTextFinding(content.toString(encoding));
+    if(finding)return finding;
+  }
+  const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
+  return ordinaryTextFinding(swapped.toString('utf16le'))??keyStructureFinding(content);
+}
+
 function entropy(text) {
   // Count code points on both sides: UTF-16 length would dilute astral characters.
   const chars=[...text],counts=new Map();for(const char of chars)counts.set(char,(counts.get(char)??0)+1);
@@ -421,7 +448,10 @@ export function manifestEntry(path,content,executable,tracked,onWarning) {
     if(finding)throw Object.assign(new Error(`Excluded credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
     warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
   } else if(!oversized) {
-    const finding=credentialBufferFinding(content);
+    let finding=ordinaryBufferFinding(content);
+    // Scan-budget exhaustion on a genuine media container (allowlisted extension AND matching magic bytes) is
+    // noise from random binary data; any definite finding above still refuses.
+    if(finding==='private-key-scan-budget-exhausted-use-local'&&CONTENT_SCAN_BINARY_EXTENSIONS.includes(extension)&&mediaMagic(content,extension))finding=null;
     if(finding)throw Object.assign(new Error(`Excluded content-detected credential in a non-credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
   // Only explicitly allowlisted large binary assets skip scanning, bounding scan
