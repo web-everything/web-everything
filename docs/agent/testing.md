@@ -5085,3 +5085,20 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+
+### Orchestrator quarantine authority
+
+`resolveOrchestratorAuthority` reads repo `authority.redMainQuarantine` from the discovered
+`scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
+through `readPlatformPreferences().prefs.orchestrator`. Unreadable platform evidence denies authority.
+For this explicit authority grant, platform wins over
+repo in both directions; only boolean `true` grants access, and invalid values deny it. There is
+no authority environment override; the shared platform-file override remains available for tests.
+The resolver logs the effective value and actual source through the shared policy diagnostics.
+
+The IO writer and CLI add/remove/prune resolve authority; pure quarantine functions receive
+`orchestratorAuthority` explicitly. Keep owner validation, TTL limits, and actor audit records
+on the same path as operator and safety-net writes. The authority settings tests cover closed
+defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
+verifies persisted events and commit messages against a temporary local Git origin.
