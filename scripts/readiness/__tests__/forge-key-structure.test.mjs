@@ -45,6 +45,11 @@ describe('Forge key structure slice 1',()=>{
     expect(createPrivateKey({key:Buffer.from(text,'base64'),format:'der',type:'pkcs1'}).type).toBe('private');
     blocked(Buffer.from(text));
   });
+  it('blocks RSA multiprime oth private members without a top-level d (red-team #7076)',()=>{
+    blocked(Buffer.from(JSON.stringify({kty:'RSA',oth:[{r:'a',d:'b',t:'c'}]})));
+    blocked(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[{r:'a',d:'b',t:'c'}]}).replace('[','/* x */[')));
+    expect(keyStructureFinding(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[]})))).toBeFalsy();
+  });
   it('I1 decode once then detect (mixed alphabets, comments in byte arrays, hex, PEM)',()=>{
     for(const bytes of keys)for(const encode of Object.values(views))blocked(Buffer.from(encode(bytes)));
   });

@@ -62,7 +62,11 @@ function jwkFinding(bytes) {
   for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]:,]/g)) {
     const token=match[0];
     if(token[0]==='/')continue;
-    if(token==='{'||token==='[')depth++;
+    if(token==='{'||token==='[') {
+      // RFC 7518 6.3.2.7: `oth` (other primes: r, d, t) is private multiprime RSA material even without a top-level d.
+      if(depth===1&&key==='oth'&&!/^\s*(?:\/\/[^\r\n]*[\r\n]|\/\*[\s\S]*?\*\/\s*)*[\]}]/.test(text.slice(match.index+1)))priv=true;
+      depth++;
+    }
     else if(token==='}'||token===']')depth--;
     else if(depth!==1)continue;
     else if(token===':') {key=pending;pending=null;}
