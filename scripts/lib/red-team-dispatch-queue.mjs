@@ -367,7 +367,7 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, readLivePr, drain = false, drainPr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  floor, readCpuIdlePct, readLivePr, drain = false, drainPr, drainPass, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const transaction = transactions.get(queue)?.();
   try {
     const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
@@ -409,12 +409,13 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
       if (!drain && current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
       else candidates.push(entry);
     }
-    if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
+    const prepareCapacity = !drain || !drainPass?.capacityPrepared;
+    if (prepareCapacity && floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
       let cpuIdlePct;
       try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
       applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log });
     }
-    if (drain) {
+    if (drain && prepareCapacity) {
       // The timer uses the planner's live budget: reservations made by earlier repositories
       // count toward the floor too. Unknown evidence holds dispatch until the next interval.
       const budget = capacity?.budget;
@@ -429,6 +430,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
         capacity.startsCeiling = Math.min(capacity.startsCeiling ?? 0, room);
       }
       if (!room) note(log, 'drain has no readable floor capacity; retained for next interval; inspect host/lane/queue limits if persistent');
+      if (drainPass) drainPass.capacityPrepared = true;
     }
     queue.sync(repo, candidates);
     // Exhausted but readable capacity: the runner refuses ("no review capacity left") before any retry is spent,

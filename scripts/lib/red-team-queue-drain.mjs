@@ -36,6 +36,8 @@ export async function drainRedTeamQueue({ queue, runQueue, readPrs, capacity, al
   // Include every queued head, even drafts and heads absent from the fresh open-PR list.
   // Shared reconciliation retains unknown evidence and replaces stale heads before admission.
   const snapshots = new Map();
+  // Prepare the shared capacity once; later entries must not replenish spent starts via the floor.
+  const drainPass = {};
   // An empty pass still repairs a previously failed post-dispatch persistence transaction.
   for (const entry of entries.length ? entries : [{ repo: undefined }]) {
     const repo = entry.repo;
@@ -48,7 +50,7 @@ export async function drainRedTeamQueue({ queue, runQueue, readPrs, capacity, al
       if (repo && !snapshots.get(repo)) { note(`${repo}: open PR list unreadable; retry next interval`); continue; }
       const result = await runQueue({ repo, plan: { refusals: queue.entries().filter(current => current.repo === repo)
         .map(current => ({ kind: 'already-reviewed-head', prNumber: current.pr, headSha: current.head })) },
-        rawPrs: snapshots.get(repo) ?? [], capacity, drain: true, drainPr: entry.pr });
+        rawPrs: snapshots.get(repo) ?? [], capacity, drain: true, drainPr: entry.pr, drainPass });
       summary.dispatched += result?.dispatched?.length ?? 0;
     } catch (error) { note(`recovery failed; retry next interval: ${error?.message ?? error}`); }
   }

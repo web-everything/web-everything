@@ -69,6 +69,14 @@ describe('red-team queue drain through shared recovery', () => {
     expect(f.dispatch.mock.calls.map(([d]) => d.pr)).toEqual([1]);
     expect(f.open().entries()).toHaveLength(2);
   });
+  it.each([repo, 'example/other'])('never replenishes a host allowance of one with floor three and three queued heads (%s)', async middleRepo => {
+    const f = fixture([{ pr: 1 }, { pr: 2, repo: middleRepo }, { pr: 3 }]);
+    Object.assign(f.options.capacity, { remainingStarts: 1, startsCeiling: 1 });
+    expect(await drainRedTeamQueue(f.options)).toMatchObject({ dispatched: 1 });
+    expect(f.dispatch.mock.calls.map(([d]) => d.pr)).toEqual([1]);
+    expect(f.options.capacity).toMatchObject({ remainingStarts: 0, lanes: 9, budget: { left: 9 } });
+    expect(f.open().entries().map(entry => entry.pr)).toEqual([2, 3]);
+  });
   it.each(['host', 'lanes', 'budget', 'unknown-live', 'oversized-live'])('holds capacity for the next interval when %s refuses', async reason => {
     const f = fixture();
     if (reason === 'host') Object.assign(f.options.capacity, { remainingStarts: 0, startsCeiling: 0 });
