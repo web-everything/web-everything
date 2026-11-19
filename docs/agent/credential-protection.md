@@ -29,6 +29,13 @@ the resolved mode to `require`; it cannot select `auto` or `off`.
 Custom `protectedPaths` always extend the built-in floor: `~/.ssh`, `~/.gnupg`,
 `~/.aws`, `~/.docker`, `~/.kube`, `~/.netrc`, `~/.secrets`,
 `~/.config/gh/hosts.yml`, and `.env*`. Platform and file lists are unioned with the built-in floor; later layers cannot remove earlier paths.
+The credential loader captures raw files through the shared preference loader's read
+hook: legacy, repository platform, and operator platform files each contribute paths
+and their strictest mode/decision. An explicit `WE_PLATFORM_PREFERENCES_FILE` selects
+only that file, as defined by the shared loader. The shared merge helper itself is
+last-leaf-wins and cannot recover discarded arrays or stricter earlier values. An
+injected loader that exposes only merged preferences can protect only those visible
+values plus the standard and tool floors; supply its raw reads to preserve all layers.
 `.env*` matches the basename in any directory, including outside the repository.
 
 Empty, malformed, unreadable, or oversized pre-push evidence refuses both `auto`
@@ -59,8 +66,11 @@ Shell word escapes, locale `$"..."` quotes, adjacent quote fragments, and ANSI-C
 repeated separators, dot segments and lexical parent segments resolve. Glob patterns
 that can reach protected paths also deny. Recursive reads of an ancestor of a protected
 path (including home, `/`, and `~/.config/gh`) deny for archives, copies, recursive
-searches, find content/output actions, and Git add/commit paths. Tar/zip `-C`
-operands resolve against that directory. Use explicit non-protected subpaths such as
+searches, find content/output actions, and Git add/commit paths. Literal `cd`/`pushd` targets carry the working directory into later compound
+segments; subshell parentheses restore the outer directory. Tar/zip directory options
+and Git `-C` resolve operands within their command. Computed directory targets
+(including `cd -`) make the directory unknown: later relative credential names deny
+with advice to use an explicit absolute path. Metadata listings still pass. Use explicit non-protected subpaths such as
 `~/projects` instead. Metadata listings and non-recursive reads of unrelated files
 remain allowed; `.env*` retains its basename rule rather than forbidding all directories.
 Git, gh, scp, rsync, and curl deny protected path arguments;

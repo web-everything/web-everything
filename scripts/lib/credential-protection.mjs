@@ -219,17 +219,10 @@ function recursiveAncestorHit(words, options) {
 
 export function classifyBashCommand(command, options = {}) {
   if (typeof command !== 'string') return pass();
-  // Preserve quoted/escaped whitespace in operands before shell quote removal.
-  for (const segment of command.replace(/\\\n/g, '').split(/&&|\|\||[;|\n()`]/)) {
-    const words = (segment.match(/(?:\$?'(?:\\.|[^'\\])*'|\$?"(?:\\.|[^"\\])*"|\\[\s\S]|[^\s"'\\])+/g) ?? []).map(normalizeWord);
-    while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
-    const hit = recursiveAncestorHit(words, options);
-    if (hit.decision === 'deny') return hit;
-  }
   // Retain substitutions for the SSH check; normalize adjacent shell fragments
   // before tokenization so escaping cannot conceal a protected directory.
   const text = normalizeWord(command.replace(/\\\n/g, ''));
-  const references = segment => {
+  const references = (segment, context = options) => {
     const expanded = expandHome(segment, options.home ?? '');
     for (const entry of withProtectedPathFloor(options.protectedPaths)) {
       if (entry.path === '.env*' || !/\s/.test(options.home ?? '')) continue;
@@ -241,11 +234,61 @@ export function classifyBashCommand(command, options = {}) {
     // Keep braces and brackets within glob words, including brace commas.
     const words = segment.split(/[\s;&|<>()=:+`]+/).filter(Boolean);
     for (const word of words) {
-      const hit = patternHit(word.replace(/^@/, ''), options);
+      const hit = patternHit(word.replace(/^@/, ''), context);
       if (hit.decision === 'deny') return hit;
     }
     return pass();
   };
+  // A lexical cwd follows compound commands. Null means a computed/unknown cwd.
+  const directory = (word, cwd) => {
+    if (!word || word === '-' || /[$`*?\[{}]/.test(word.replace(/\$\{HOME\}|\$HOME\b/g, ''))) return null;
+    const expanded = expandHome(word, options.home ?? '');
+    return expanded.startsWith('/') ? resolve(expanded) : cwd ? resolve(cwd, expanded) : null;
+  };
+  let cwd = options.repoRoot;
+  const stack = [];
+  const segments = command.replace(/\\\n/g, '').split(/(&&|\|\||[;|\n()`])/);
+  for (const [index, segment] of segments.entries()) {
+    if (segment === '(' || segment === '`') { stack.push(cwd); continue; }
+    if (segment === ')') { if (stack.length) cwd = stack.pop(); continue; }
+    const words = (segment.match(/(?:\$?'(?:\\.|[^'\\])*'|\$?"(?:\\.|[^"\\])*"|\\[\s\S]|[^\s"'\\])+/g) ?? []).map(normalizeWord);
+    while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
+    const name = basename(words[0] ?? '');
+    if (['cd', 'pushd'].includes(name)) {
+      const args = words.slice(1).filter(w => w !== '--');
+      cwd = directory(args[0] ?? (name === 'cd' && !['`', '('].includes(segments[index + 1]) ? '~' : '-'), cwd);
+      continue;
+    }
+    let localCwd = cwd;
+    if (['tar', 'zip', 'git'].includes(name)) {
+      for (let i = 1; i < words.length; i++) {
+        const w = words[i];
+        if (w === '--') break;
+        if (w === '-C' || (name !== 'git' && w === '--directory')) localCwd = directory(words[++i], localCwd);
+        else if (w.startsWith('-C')) localCwd = directory(w.slice(2), localCwd);
+        else if (name !== 'git' && w.startsWith('--directory=')) localCwd = directory(w.slice(12), localCwd);
+      }
+    }
+    const context = { ...options, repoRoot: localCwd ?? options.repoRoot };
+    const recursive = recursiveAncestorHit(words, { ...options, repoRoot: (name === 'git' ? localCwd : cwd) ?? options.repoRoot });
+    if (recursive.decision === 'deny') return recursive;
+    // Listings exempt only operands, never redirects or nested commands.
+    const redirects = [...segment.matchAll(/[<>]+\s*([^\s;&|<>()]+)/g)].map(m => m[1]);
+    const operands = name === 'ls' ? redirects : ['ssh', 'ssh-add'].includes(name)
+      ? [...words.slice(1).filter((word, i, args) => !['-i', '-F'].includes(args[i - 1])), ...redirects]
+      : words.slice(1);
+    for (const word of operands) {
+      if (localCwd === null && !expandHome(word, options.home ?? '').startsWith('/')) {
+        const parts = word.replace(/^\.\//, '').split('/');
+        if (parts.some(part => /^(?:\.ssh|\.gnupg|\.aws|\.docker|\.kube|\.netrc|\.secrets|hosts\.yml)$/.test(part)
+          || (part.startsWith('.env') && !examples.has(part)))) {
+          return { decision: 'deny', path: word, reason: 'Unknown working directory may reach credentials; use an explicit absolute path and retry' };
+        }
+      }
+      const hit = references(word, context);
+      if (hit.decision === 'deny') return hit;
+    }
+  }
   // Examine each SSH segment before splitting nested shell constructs.
   for (const segment of text.split(/&&|\|\||[;|\n]/)) {
     const words = segment.trim().split(/\s+/);
@@ -283,7 +326,7 @@ export function classifyBashCommand(command, options = {}) {
   for (const segment of text.split(/&&|\|\||[;|\n()`]/)) {
     const words = segment.trim().split(/\s+/);
     while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
-    if (['ls', 'ssh', 'ssh-add'].includes(basename(words[0] ?? ''))) continue;
+    if (['ls', 'ssh', 'ssh-add', 'cd', 'pushd'].includes(basename(words[0] ?? ''))) continue;
     const hit = references(segment);
     if (hit.decision === 'deny') return hit;
   }

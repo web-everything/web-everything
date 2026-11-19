@@ -58,6 +58,32 @@ test('relative recursive operands resolve against the supplied working directory
     ['/home/operator/projects', '.', 'pass'], ['/repo', '..', 'deny'], ['/repo', './src', 'pass'],
   ]) assert.equal(classifyBashCommand(`cp -R ${path} /dest`, { ...options, repoRoot }).decision, decision, `${repoRoot}: ${path}`);
 });
+for (const command of [
+  'cd ~; cat .ssh/key', 'cd ~/.ssh && cat id_rsa', 'pushd ~/.aws; head credentials',
+  '(cd ~ && cat .netrc)', 'cd ~ && tar czf x.tgz .ssh',
+  'cd ~; cd .config; cat gh/hosts.yml', 'cd /; cd home/operator; cat .netrc',
+  'git -C ~/.ssh show id_rsa', 'git -C ~ add .', 'tar -C ~/.ssh -cf x.tar id_rsa',
+  'cd ~; ls .ssh < .netrc', 'cd ~; ls $(cat .netrc)', 'cd ~; ssh host .netrc',
+]) test(`compound cwd protects relative reads: ${command}`, () => {
+  assert.equal(classifyBashCommand(command, options).decision, 'deny');
+});
+for (const target of ['-', '$VAR', '$(pwd)', '`pwd`']) {
+  for (const operand of ['.ssh/key', '.gnupg/key', '.aws/credentials', '.docker/config.json',
+    '.kube/config', '.netrc', '.secrets', '.env.local', 'gh/hosts.yml']) {
+    test(`unknown cwd fails closed: cd ${target}; cat ${operand}`, () => {
+      const hit = classifyBashCommand(`cd ${target}; cat ${operand}`, options);
+      assert.equal(hit.decision, 'deny');
+      assert.match(hit.reason, /Unknown working directory|Environment secrets/);
+    });
+  }
+}
+for (const command of ['cd ~/projects && cat README.md', 'cd ~ && ls .ssh', 'cd /tmp && cat x',
+  'cd -; cat README.md', 'cd $VAR; cd /tmp; cat x', '(cd ~; ls .ssh); cat README.md',
+  'git -C ~/projects show README.md', 'tar -C ~/projects -cf x.tar README.md']) {
+  test(`compound cwd near-miss passes: ${command}`, () => {
+    assert.equal(classifyBashCommand(command, options).decision, 'pass');
+  });
+}
 test('recursive ancestors honor custom paths and quoted homes with spaces', () => {
   assert.equal(classifyBashCommand('tar cf x.tar "$HOME"', { ...options, home: '/home/an operator' }).decision, 'deny');
   assert.equal(classifyBashCommand('cp -R "/home/an operator/.config" /dest', { ...options, home: '/home/an operator' }).decision, 'deny');
@@ -241,6 +267,50 @@ test('protected paths union platform custom paths, tool paths and the built-in f
   }
   assert.equal(sources.protectedPaths, 'standard+platform+tool');
   assert.match(logs.join(''), /standard\+platform\+tool/);
+});
+
+test('raw platform files retain additive paths and strictest policy before shared merging', () => {
+  const files = [];
+  const logs = [];
+  const result = loadCredentialProtection({ env: {}, toolPath: 'tool.json', log: line => logs.push(line),
+    read: path => {
+      if (path === 'tool.json') return JSON.stringify({ protectedPaths: [{ path: '~/.tool', reason: 'Tool' }], gitleaks: { mode: 'off' } });
+      files.push(path);
+      return JSON.stringify({ credentialProtection: {
+        protectedPaths: [{ path: `~/.layer${files.length}`, reason: 'Platform secret' }],
+        gitleaks: { mode: files.length === 1 ? 'require' : 'off' },
+        agentBashDecision: files.length === 1 ? 'deny' : 'pass',
+      } });
+    } });
+  assert.equal(files.length, 3); // legacy, repository platform, operator platform
+  for (const path of ['~/.layer1', '~/.layer2', '~/.layer3', '~/.tool', '~/.ssh']) {
+    assert.ok(result.settings.protectedPaths.some(p => p.path === path), path);
+  }
+  assert.equal(result.settings.gitleaks.mode, 'require');
+  assert.equal(result.settings.agentBashDecision, 'deny');
+  assert.equal(result.sources.gitleaks, `platform:${files[0]}`);
+  assert.match(logs.join(''), /gitleaks=.*require.*platform:/);
+});
+test('invalid earlier raw platform layer closes even when later merge hides it', () => {
+  let layer = 0;
+  const result = loadCredentialProtection({ env: {}, toolPath: 'tool.json', log: () => {},
+    read: path => path === 'tool.json' ? '{}' : JSON.stringify({ credentialProtection:
+      ++layer === 1 ? { gitleaks: { mode: 'invalid' } } : { gitleaks: { mode: 'off' } } }) });
+  assert.equal(result.settings.gitleaks.mode, 'require');
+  assert.equal(result.sources.fallback, 'strict-defaults');
+});
+test('explicit platform override is the only reachable raw file; merged-only loader retains its visible floor', () => {
+  const seen = [];
+  const result = loadCredentialProtection({ env: { WE_PLATFORM_PREFERENCES_FILE: 'override.json' }, toolPath: 'tool.json',
+    log: () => {}, read: path => { seen.push(path); return path === 'tool.json' ? '{}' : JSON.stringify({ credentialProtection: {
+      protectedPaths: [{ path: '~/.override', reason: 'Override' }], gitleaks: { mode: 'require' },
+    } }); } });
+  assert.deepEqual(seen, ['tool.json', 'override.json']);
+  assert.ok(result.settings.protectedPaths.some(p => p.path === '~/.override'));
+  const merged = loadCredentialProtection({ read: () => '{}', log: () => {},
+    readPlatform: () => ({ prefs: { credentialProtection: { gitleaks: { mode: 'off' } } }, errors: [] }) });
+  assert.equal(merged.settings.gitleaks.mode, 'auto');
+  assert.equal(merged.settings.agentBashDecision, 'deny');
 });
 
 test('hook denies agents and asks operator, with protected path and reason', () => {
