@@ -279,7 +279,8 @@ function settings(budget, budgetSource) {
       const supplied = budget?.[section]?.[key];
       const valid = (key === 'capBytes' && supplied === null)
         || (typeof supplied === 'number' && Number.isFinite(supplied) && supplied >= 0
-          && (!['scanEntryBound', 'maxRunDirsPerTick'].includes(key) || Number.isSafeInteger(supplied)));
+          && (key !== 'scanEntryBound' || (Number.isSafeInteger(supplied) && supplied >= 1000 && supplied <= 1000000))
+          && (key !== 'maxRunDirsPerTick' || (Number.isSafeInteger(supplied) && supplied >= 1 && supplied <= 10000)));
       result[section][key] = valid ? supplied : fallback;
       budgetSource[`${section}.${key}`] = valid ? 'budget' : supplied === undefined
         ? 'default' : 'default (invalid budget value)';
@@ -311,7 +312,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
     summary.candidates[category].push(relative(base, path));
   }
   async function slots() {
-    let examined = 0, remaining = 0;
+    let reclaimed = 0, remaining = 0;
     const names = await directory(root);
     const workers = (await directory(receipts)).filter(name => WORKER.test(name));
     async function clean(parent, worker, slot) {
@@ -343,8 +344,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
         for (const name of parent ? await directory(parent) : []) {
           const run = originalName(name);
           if (!RUN_DIR.test(run) || run === reserved) continue;
-          if (examined >= effective.slots.maxRunDirsPerTick) { remaining++; continue; }
-          examined++;
+          if (reclaimed >= effective.slots.maxRunDirsPerTick) { remaining++; continue; }
           const path = join(parent, name);
           const st = await fs.lstat(path);
           if (!st.isDirectory() || await hasLiveRecord(receipts, run)) continue;
@@ -358,6 +358,7 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
           }
           if (now - tree.newest > effective.slots.leakAgeHours * HOUR) {
             await remove(path, 'runDirs', 'runDirs', tree.bytes, root, tree);
+            reclaimed++;
           }
         }
       } finally { await held.release(); }
@@ -375,7 +376,9 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
     if (names.some(name => RUN_DIR.test(originalName(name))) || workers.includes('worker-active')) {
       try { await clean(root, 'worker-active'); } catch (error) { refuse('slots', error); }
     }
-    if (remaining) summary.partial.push({consumer: 'slots', reason: 'run-dir bound', examined, remaining});
+    if (reclaimed >= effective.slots.maxRunDirsPerTick) {
+      summary.partial.push({consumer: 'slots', reason: 'run-dir bound', reclaimed, remaining});
+    }
   }
   async function presync() {
     const parent = join(root, 'presync');

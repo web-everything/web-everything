@@ -96,41 +96,65 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
     const budget = {slots: {maxRunDirsPerTick: 2}};
     const first = await go({budget});
     expect(first.candidates.runDirs).toEqual(['slot-1/' + run(1), 'slot-1/' + run(2)]);
-    expect(first.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', examined: 2, remaining: 3}]);
+    expect(first.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', reclaimed: 2, remaining: 3}]);
     expect(first.refusals).toEqual([]);
     expect(await Promise.all(paths.map(exists))).toEqual([true, false, false, true]);
     expect(await exists(legacy)).toBe(true);
     const second = await go({budget});
     expect(second.candidates.runDirs).toEqual(['slot-1/' + run(3), 'slot-2/' + run(4)]);
-    expect(second.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', examined: 2, remaining: 1}]);
+    expect(second.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', reclaimed: 2, remaining: 1}]);
     expect(await Promise.all(paths.map(exists))).toEqual([false, false, false, false]);
     expect((await go({budget})).candidates.runDirs).toEqual([run(5)]);
   });
-  it('counts recent and over-bound trees against the tick budget', async () => {
-    const recent = await runDir(1, 1, 1), huge = await runDir(1, 2, 500), deferred = await runDir(1, 3, 500);
-    await writeFile(join(huge, 'extra'), '');
-    const summary = await go({budget: {slots: {maxRunDirsPerTick: 2, scanEntryBound: 1}}});
-    expect(summary.counts.runDirs).toBe(0);
-    expect(summary.partial).toContainEqual({consumer: 'slots', reason: 'run-dir bound', examined: 2, remaining: 1});
-    expect(await Promise.all([recent, huge, deferred].map(exists))).toEqual([true, true, true]);
+  it.each([false, true])('protected dirs before stale dirs do not starve reclamation (apply=%s)', async apply => {
+    const recent = await runDir(1, 1, 1), reserved = await runDir(1, 2, 500);
+    const live = await runDir(1, 3, 500), huge = await runDir(1, 4, 500);
+    await reserve(1, 2); await receipt(run(3) + '.running', 500);
+    for (let i = 0; i < 1000; i++) await writeFile(join(huge, 'extra-' + i), '');
+    const stale = [];
+    for (const n of [5, 6, 7]) stale.push(await runDir(1, n, 500));
+    const budget = {slots: {maxRunDirsPerTick: 2, scanEntryBound: 1000}};
+    const summary = await go({apply, budget});
+    expect(summary.counts.runDirs).toBe(2);
+    expect(summary.candidates.runDirs).toEqual(['slot-1/' + run(5), 'slot-1/' + run(6)]);
+    expect(summary.refusals).toEqual([]);
+    expect(summary.partial).toEqual([
+      expect.objectContaining({consumer: 'slots', reason: 'tree scan bound exceeded', path: 'slot-1/' + run(4)}),
+      {consumer: 'slots', reason: 'run-dir bound', reclaimed: 2, remaining: 1},
+    ]);
+    expect(await Promise.all([recent, reserved, live, huge].map(exists))).toEqual([true, true, true, true]);
+    expect(await Promise.all(stale.map(exists))).toEqual([!apply, !apply, true]);
+    const next = await go({apply, budget});
+    expect(next.candidates.runDirs).toEqual(apply ? ['slot-1/' + run(7)] : summary.candidates.runDirs);
+    expect(await exists(stale[2])).toBe(!apply);
+  });
+  it('records the reached reclaim bound with no unexamined candidates', async () => {
+    await runDir(1, 1, 500);
+    const summary = await go({budget: {slots: {maxRunDirsPerTick: 1}}});
+    expect(summary.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', reclaimed: 1, remaining: 0}]);
   });
   it('reports default and overridden scan and tick budget sources', async () => {
     expect(DEFAULT_BUDGET.slots).toMatchObject({scanEntryBound: 200000, maxRunDirsPerTick: 200});
     const defaults = await go();
     expect(defaults.budgetSource).toMatchObject({'slots.scanEntryBound': 'default', 'slots.maxRunDirsPerTick': 'default'});
-    const overridden = await go({budget: {slots: {scanEntryBound: 12, maxRunDirsPerTick: 2}}});
+    const overridden = await go({budget: {slots: {scanEntryBound: 1000, maxRunDirsPerTick: 2}}});
     expect(overridden.budgetSource).toMatchObject({'slots.scanEntryBound': 'budget', 'slots.maxRunDirsPerTick': 'budget'});
   });
-  it.each([-1, 0.5, Infinity, '2', Number.MAX_SAFE_INTEGER + 1])('rejects invalid integer bounds %s', async value => {
-    const summary = await go({budget: {slots: {scanEntryBound: value, maxRunDirsPerTick: value}}});
-    expect(summary.budgetSource).toMatchObject({'slots.scanEntryBound': 'default (invalid budget value)',
-      'slots.maxRunDirsPerTick': 'default (invalid budget value)'});
-  });
-  it('a zero tick budget preserves all candidate dirs with an explicit carry-over note', async () => {
+  it.each([
+    ['scanEntryBound', 0], ['scanEntryBound', 999], ['scanEntryBound', 1000001],
+    ['maxRunDirsPerTick', 0], ['maxRunDirsPerTick', 10001],
+    ...['scanEntryBound', 'maxRunDirsPerTick'].flatMap(key =>
+      [-1, 1000.5, NaN, Infinity, '1000', null, Number.MAX_SAFE_INTEGER + 1].map(value => [key, value])),
+  ])('rejects invalid %s budget %s and uses the default', async (key, value) => {
     const path = await runDir(1, 1, 500);
-    const summary = await go({budget: {slots: {maxRunDirsPerTick: 0}}});
-    expect(summary.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', examined: 0, remaining: 1}]);
-    expect(await exists(path)).toBe(true);
+    const summary = await go({budget: {slots: {[key]: value}}});
+    expect(summary.budgetSource['slots.' + key]).toBe('default (invalid budget value)');
+    expect(summary.counts.runDirs).toBe(1);
+    expect(await exists(path)).toBe(false);
+  });
+  it.each([[1000, 1], [1000000, 10000]])('accepts inclusive scan/tick endpoints %s/%s', async (scanEntryBound, maxRunDirsPerTick) => {
+    const summary = await go({budget: {slots: {scanEntryBound, maxRunDirsPerTick}}});
+    expect(summary.budgetSource).toMatchObject({'slots.scanEntryBound': 'budget', 'slots.maxRunDirsPerTick': 'budget'});
   });
 
   it('keeps the reserved run while other old runs in the same slot are deleted', async () => {
@@ -228,8 +252,8 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
 describe('presync keys', () => {
   it('uses the shared scan bound and preserves oversized keys as partial while reclaiming proven keys', async () => {
     const large = await presyncKey(1, 100), small = await presyncKey(2, 100);
-    await writeFile(join(large, 'extra'), '');
-    const summary = await go({budget: {slots: {scanEntryBound: 1}}});
+    for (let i = 0; i < 1000; i++) await writeFile(join(large, 'extra-' + i), '');
+    const summary = await go({budget: {slots: {scanEntryBound: 1000}}});
     expect(summary.refusals).toEqual([]);
     expect(summary.partial).toEqual([expect.objectContaining({consumer: 'presync', reason: 'tree scan bound exceeded'})]);
     expect(await exists(large)).toBe(true); expect(await exists(small)).toBe(false);
@@ -414,8 +438,8 @@ describe('descriptor-pinned tree deletion and recovery', () => {
   });
   it('preserves an over-bound tree and continues reclaiming the next proven tree', async () => {
     const path = await runDir(1, 1, 500), next = await runDir(1, 2, 500);
-    await writeFile(join(path, 'extra'), '');
-    const summary = await go({budget: {slots: {scanEntryBound: 1}}});
+    for (let i = 0; i < 1000; i++) await writeFile(join(path, 'extra-' + i), '');
+    const summary = await go({budget: {slots: {scanEntryBound: 1000}}});
     expect(summary.refusals).toEqual([]);
     expect(summary.partial).toEqual([expect.objectContaining({consumer: 'slots', reason: 'tree scan bound exceeded',
       path: 'slot-1/' + run(1), fallback: expect.stringContaining('inspect manually')})]);
