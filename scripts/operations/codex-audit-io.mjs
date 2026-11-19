@@ -80,9 +80,9 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     },
     remoteMainSha() {
       const output = run('git', ['ls-remote', 'origin', 'refs/heads/main'], 30_000);
-      const match = /^([0-9a-f]{40})\trefs\/heads\/main\r?\n?$/.exec(output);
+      const match = /^([0-9a-fA-F]{40})\trefs\/heads\/main\r?\n?$/.exec(output);
       if (!match || match[0] !== output) throw new Error('audit remote main unavailable');
-      return match[1];
+      return match[1].toLowerCase();
     },
     hasCommit(sha) {
       run('git', ['--no-replace-objects', 'cat-file', '-e', `${sha}^{commit}`], 30_000,
@@ -119,7 +119,8 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
-          { ...process.env, GIT_INDEX_FILE: scratchIndex }));
+          { ...process.env, GIT_INDEX_FILE: scratchIndex, GIT_NO_REPLACE_OBJECTS: '1',
+            GIT_GRAFT_FILE: join(scratch, 'no-grafts') }));
         if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
           throw new Error('Codex failed or returned incomplete evidence');
         }

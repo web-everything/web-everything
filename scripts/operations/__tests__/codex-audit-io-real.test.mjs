@@ -49,8 +49,8 @@ describe('codex-audit real IO', () => {
           questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: ['guard.mjs:1 gap'] }],
         now: () => '2026-11-18T00:00:00Z', appendRecord: () => {}, stdout: () => {}, stderr: () => {},
         runCodex: prompt => {
-          const command = prompt.split('\n').find(line => line.startsWith('git diff '));
-          expect(command).toBe(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${prior} ${current}`);
+          const command = prompt.split('\n').find(line => line.startsWith('git --no-replace-objects diff '));
+          expect(command).toBe(`git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames ${prior} ${current}`);
           const delta = String(git(command.split(' ').slice(1)));
           expect(delta).toContain('<material>.mjs');
           expect(delta).toContain('-improved guard');
@@ -62,6 +62,40 @@ describe('codex-audit real IO', () => {
       });
       expect(code).toBe(0);
       expect(reviewed).toBe(true);
+    });
+  });
+
+  it('runs auditor Git from a subdirectory without relative narrowing, replacements or grafts', async () => {
+    await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
+      commit({ 'scripts/marker.txt': 'marker\n', 'outside.txt': 'before\n' });
+      const base = head();
+      commit({ 'outside.txt': 'after\n' });
+      const current = head();
+      git(['config', 'diff.relative', 'true']);
+      git(['replace', current, base]);
+      const cwd = join(repo, 'scripts');
+      const args = ['--no-replace-objects', 'diff', '--no-relative', '--no-ext-diff',
+        '--no-textconv', '--ignore-submodules=none', '--text', `${base}...${current}`];
+      let scratch;
+      const deps = createAuditDeps({ cwd, scratchRoot: tmp, spawnSync: (command, argv, options) => {
+        if (command === 'git') return spawnSync(command, argv, options);
+        expect(command).toBe(process.execPath);
+        scratch = dirname(options.env.GIT_INDEX_FILE);
+        expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+        expect(options.env.GIT_GRAFT_FILE).toBe(join(scratch, 'no-grafts'));
+        expect(existsSync(options.env.GIT_GRAFT_FILE)).toBe(false);
+        const delta = spawnSync('git', args, options);
+        expect(delta.status).toBe(0);
+        expect(delta.stdout).toContain('diff --git a/outside.txt b/outside.txt');
+        expect(delta.stdout).toContain('+after');
+        return { status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' }) };
+      } });
+      expect(deps.runCodex('replacement probe')).toBe('NOT WEAKENED');
+      expect(existsSync(scratch)).toBe(false);
+      git(['replace', '-d', current]);
+      writeFileSync(join(repo, '.git/info/grafts'), `${base} ${current}\n`);
+      expect(deps.runCodex('graft probe')).toBe('NOT WEAKENED');
+      expect(existsSync(scratch)).toBe(false);
     });
   });
 

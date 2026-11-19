@@ -76,7 +76,7 @@ describe('canonical audit', () => {
     expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main', ref: null, mode: 'full',
       questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`${CANONICAL_QUESTION}\n\n${EXHAUSTIVE_INSTRUCTION}`);
-    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`Review this exact resolved range: git diff --no-ext-diff --no-textconv --ignore-submodules=none --text ${BASE}...${HEAD}`);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`Review this exact resolved range: git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text ${BASE}...${HEAD}`);
     expect(f.deps.resolveSha.mock.calls).toEqual([['origin/main'], [HEAD]]);
     expect(f.deps.appendRecord.mock.invocationCallOrder[0]).toBeGreaterThan(f.deps.runCodex.mock.invocationCallOrder[0]);
   });
@@ -288,7 +288,8 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     expect(f.spawnSync.mock.calls[0][2].env).toBeUndefined();
     expect(f.fs.copyFileSync).toHaveBeenCalledWith(indexPath.startsWith('/') ? indexPath : '/repo/' + indexPath,
       '/scratch/audit-1/index');
-    expect(f.spawnSync.mock.calls[1][2].env).toEqual({ ...process.env, GIT_INDEX_FILE: '/scratch/audit-1/index' });
+    expect(f.spawnSync.mock.calls[1][2].env).toEqual({ ...process.env, GIT_INDEX_FILE: '/scratch/audit-1/index',
+      GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/scratch/audit-1/no-grafts' });
     expect(f.fs.copyFileSync.mock.invocationCallOrder[0]).toBeLessThan(f.spawnSync.mock.invocationCallOrder[1]);
     expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
   });

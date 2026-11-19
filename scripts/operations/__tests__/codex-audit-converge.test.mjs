@@ -29,6 +29,16 @@ function fixture(answer = `NOT WEAKENED\nFIXED: ${finding}`) {
 }
 const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
 
+describe('remote-main SHA normalization', () => {
+  it('accepts uppercase SHA hex while requiring the exact main ref name', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: `${BASE.toUpperCase()}\trefs/heads/main\n` }));
+    const deps = createAuditDeps({ spawnSync });
+    expect(deps.remoteMainSha()).toBe(BASE);
+    spawnSync.mockReturnValue({ status: 0, stdout: `${BASE}\trefs/heads/MAIN\n` });
+    expect(() => deps.remoteMainSha()).toThrow('audit remote main unavailable');
+  });
+});
+
 describe('R1081 converge rounds', () => {
   it('uses its own hashed question and the unrestricted delta plus verbatim full-audit findings', async () => {
     const f = fixture();
@@ -36,7 +46,7 @@ describe('R1081 converge rounds', () => {
     expect(CONVERGE_QUESTION_HASH).toBe(createHash('sha256').update(CONVERGE_QUESTION).digest('hex'));
     expect(CONVERGE_QUESTION_HASH).not.toBe(QUESTION_HASH);
     const prompt = f.deps.runCodex.mock.calls[0][0];
-    expect(prompt).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${PRIOR} ${HEAD}\n`);
+    expect(prompt).toContain(`\ngit --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames ${PRIOR} ${HEAD}\n`);
     expect(prompt).not.toContain(`git diff ${BASE}...${HEAD}`);
     expect(prompt).not.toContain('Judge the WHOLE diff');
     expect(prompt).toContain(`full audit ${original.at} on ${PRIOR}`);
@@ -106,6 +116,39 @@ describe('R1081 converge rounds', () => {
     expect(await main(ARGS, f.deps)).toBe(2);
     expect(f.err.join('')).toContain('already fully audited at this head');
     expect(f.deps.runCodex).not.toHaveBeenCalled();
+  });
+
+  it('refuses an uppercase-head empty full record before review', async () => {
+    const f = fixture('NOT WEAKENED');
+    f.full[0] = { ...original, base: PRIOR, head: PRIOR.toUpperCase(), verdict: 'NOT WEAKENED', findings: [] };
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('Empty full audit');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.converge).toEqual([]);
+  });
+
+  it('refuses an uppercase exact-head anchor before review', async () => {
+    const f = fixture();
+    f.full.push({ ...original, head: HEAD.toUpperCase() });
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('already fully audited at this head');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.converge).toEqual([]);
+  });
+
+  it('normalizes resolved, union-member, anchor and remote-main SHAs before use', async () => {
+    const f = fixture(`NOT WEAKENED\nFIXED: ${finding}\nFIXED: latest:1 gap`);
+    f.full[0] = { ...original, base: BASE.toUpperCase(), head: PRIOR.toUpperCase() };
+    f.full.push({ ...original, base: BASE.toUpperCase(), head: PRIOR.toUpperCase(), findings: ['latest:1 gap'] });
+    f.deps.resolveSha.mockImplementation(ref => ref === 'origin/main' ? BASE.toUpperCase() : HEAD.toUpperCase());
+    f.deps.remoteMainSha.mockReturnValue(BASE.toUpperCase());
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.refsPointingAt).toHaveBeenCalledWith(HEAD);
+    expect(f.deps.hasCommit).toHaveBeenCalledWith(BASE);
+    expect(f.deps.isAncestor.mock.calls.every(args => args.every(sha => sha === sha.toLowerCase()))).toBe(true);
+    expect(f.converge[0]).toMatchObject({ base: BASE, head: HEAD, priorHead: PRIOR });
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`on ${PRIOR}:`);
+    expect(f.full[0].head).toBe(PRIOR.toUpperCase());
   });
 
   it('refuses a non-ancestor as rebased and requires a full audit', async () => {
@@ -190,7 +233,7 @@ describe('R1081 converge rounds', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.converge[0].priorHead).toBe(anchorHead);
     const prompt = f.deps.runCodex.mock.calls[1][0];
-    expect(prompt).toContain(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${anchorHead} ${HEAD}`);
+    expect(prompt).toContain(`git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames ${anchorHead} ${HEAD}`);
     const fenced = prompt.split('<findings>\n')[1].split('\n</findings>')[0];
     for (const record of [original, latest]) {
       expect(fenced).toContain(`full audit ${record.at} on ${record.head}:`);
@@ -309,7 +352,7 @@ describe('R1081 converge rounds', () => {
   it('allows the base to advance to head without narrowing the unrestricted delta', async () => {
     const f = fixture(); f.deps.resolveSha.mockReturnValue(HEAD); f.deps.remoteMainSha.mockReturnValue(HEAD);
     expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames --text ${PRIOR} ${HEAD}\n`);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames ${PRIOR} ${HEAD}\n`);
   });
 
   it('declares converge and optional ref as operation inputs for the generic CLI', () => {
