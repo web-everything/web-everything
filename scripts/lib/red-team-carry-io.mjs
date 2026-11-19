@@ -1,4 +1,3 @@
-import { classifyHeadMove } from './same-content-carry.mjs';
 /** Live guards and observable effects for the not-owed carry machine. */
 import { createHash } from 'node:crypto';
 import { readDrainRedTeamEvidence, readRedTeamStatus, recordRedTeamStatus } from './drain-red-team-evidence.mjs';
@@ -21,7 +20,7 @@ function isCurrentHeadRestamp(comment, head) {
 export function createRedTeamCarryIo({ env = process.env, readEvidence = readDrainRedTeamEvidence,
   readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readLive, readComments,
   proveMove = proveCardOnlyHeadMove, skipPolicy = () => readRedTeamProbes({ env }).value.skipCardOnly,
-  applyLabel, postResult, checkpoint, lanePath, classify = classifyHeadMove } = {}) {
+  applyLabel, postResult, checkpoint, lanePath } = {}) {
   let live, comments, proved = false, witness;
   const key = state => ({ repo: state.repo, pr: state.pr, head: state.head, env });
   return {
@@ -52,14 +51,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
       if (evidence?.carryConflict || !(cardOnlyHeadMoveCandidate(evidence, state.head)
         || cardOnlySkipSettlementCandidate(evidence, state.head))) return false;
       // Once per execution, including a retry whose pinned read already names the new head.
-      if (!proved) {
-        proved = from === state.head || proveMove({ fromSha: from, toSha: state.head, cwd: lanePath })?.ok === true;
-        if (!proved && lanePath) {
-          const move = classify({ repo: lanePath, from, to: state.head, allowTestOnly: false, env });
-          proved = move.carries === true;
-          if (proved) state.sameContentCarry = { from, to: state.head, commits: move.commits };
-        }
-      }
+      if (!proved) proved = from === state.head || proveMove({ fromSha: from, toSha: state.head, cwd: lanePath })?.ok === true;
       return proved;
     },
     intentRecorded(state) {
@@ -69,7 +61,7 @@ export function createRedTeamCarryIo({ env = process.env, readEvidence = readDra
         && JSON.stringify(status.loopPayload) === JSON.stringify(state.loopPayload);
     },
     recordIntent(state) {
-      writeStatus({ ...key(state), ...(state.sameContentCarry ? { sameContentCarry: state.sameContentCarry } : {}), loopPayload: state.loopPayload, status: 'finished',
+      writeStatus({ ...key(state), loopPayload: state.loopPayload, status: 'finished',
         result: { status: 'skipped', policy: 'card-only' } }, { env });
     },
     labelApplied(state) {

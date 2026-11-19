@@ -3389,3 +3389,19 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
     settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
   expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
 });
+
+
+describe('clean-main-merge waiver finding equality', () => {
+  it('requires identical ordered findings in the live ready record and ruling', () => {
+    const from = 'a'.repeat(40), to = 'b'.repeat(40), ref = 'lane/waiver';
+    const sameContent = () => ({ carries: true, commits: [{ sha: to, kind: 'clean-main-merge' }] });
+    const entry = { ref, sha: from, ruling: 'R12', findings: ['A', 'B'] };
+    const ready = { ref, sha: to, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: entry.findings };
+    const judge = record => prototypeLoad.readyEvidence([record], { branch: ref, sha: to }, [entry], null, { sameContent });
+    expect(judge(ready)).toMatchObject({ sameContentCarry: { from, to } });
+    for (const auditDisclosed of [['A'], ['B', 'A'], ['A', 'A'], []])
+      expect(judge({ ...ready, auditDisclosed })).toBeNull();
+    expect(judge({ ...ready, sha: from })).toBeNull();
+    expect(judge({ ...ready, tests: 'red' })).toBeNull();
+  });
+});

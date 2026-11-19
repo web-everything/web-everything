@@ -9,7 +9,7 @@ export function createSameContentProof({ repo, exec, env = process.env } = {}) {
   const memo = new Map();
   return (from, to) => {
     const key = `${from}:${to}`;
-    if (!memo.has(key)) memo.set(key, classifyHeadMove({ repo, exec, env, from, to, allowTestOnly: true }));
+    if (!memo.has(key)) memo.set(key, classifyHeadMove({ repo, exec, env, from, to }));
     return memo.get(key);
   };
 }

@@ -4957,20 +4957,17 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Same-content carry history proofs
 
-`scripts/lib/same-content-carry.mjs` owns the history classifier shared by waiver and verdict carries.
-Use real temporary Git histories to verify mechanical main merges, conflict resolutions and JIT backlog renames;
-only waivers may allow test-only edits. A history proof never substitutes for finding coverage or later-verdict guards.
-Green readiness and tests are per SHA: no predecessor record authorizes a successor, even with matching fingerprints. Waiver rulings alone may follow the history proof or exact net-diff fingerprints; canonical audits carry only by fingerprint. Reject deleted test paths and net-removal test diffs (including merge resolutions); require a fresh audit/review instead. Match findings as an exact-text multiset: each live finding consumes one identical ruled finding, including line/column locations and whitespace.
-Test that a shifted source line or changed endpoint port refuses waiver admission. History Git calls use `laneHistoryProofEnv`; proof-specific wrapper environments must preserve its replacement, graft and commit-graph protections.
-Keep generic loader and daemon runners on their ordinary environments; apply hardening only to the executor passed to carry/history proof helpers.
-The node:test cases run through a small Vitest adapter so the host heavy-admission queue remains the test entry point.
-The soak break probes behavior in a temporary repository, including a real hunk-offset fingerprint change.
-
-Acceptance history fallback requires an explicit `exec`; facts-only callers never launch Git.
-Before history can carry a mismatched fingerprint, bind the recorded fingerprint to the accepted commit
-using the same injected runner. Keep the existing settled refusal for a mismatched or unreadable source
-fingerprint. `same-content-carry.cases.mjs` covers authentic carries, missing IO, mismatched evidence,
-content changes and bounded read failures; the original replay assertions must remain unchanged.
+`scripts/lib/same-content-carry.mjs` proves WAIVER carry across clean automatic merges of main only:
+two parents, one in the base, and a tree identical to `git merge-tree --write-tree`.
+Use real temporary histories to pin refusal of test-only commits, card renames and hand-resolved merges.
+The live SHA needs its own green tests and canonical audit; history never supplies either.
+The live audit findings, ready record's `auditDisclosed`, and ruling's findings must be exactly equal,
+including order, duplicates, source locations and whitespace. Subsets refuse.
+Keep the setting provenance and `WE_SAME_DIFF_CARRY=off` kill-switch tests.
+Git proof wrappers merge caller environments before applying `laneHistoryProofEnv`, whose pins win.
+Keep ordinary loader and daemon IO on its ordinary environment. The Vitest adapter runs the real
+Git node:test cases through the host heavy-admission queue. The soak break independently probes
+clean merge admission and conflicting merge refusal, and exercises a real hunk-offset fingerprint change.
 
 ## Verify failed-file recovery
 
@@ -5158,9 +5155,11 @@ The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarant
 
 Merge caller environments before applying `laneHistoryProofEnv`; never spread caller values after its pins.
 The carry cases plant grafts and hostile commit-graph settings and inspect the actual subprocess options.
-A carried ready record's disclosure must equal the canonical findings in order and multiplicity, while consuming
-distinct findings from the ruling. Keep the ready `[A]`, ruling `[A,B]`, audit `[B]` refusal regression.
-Soak fix presence uses separate clean/conflicting repositories and classifier-only checks. Shipped breaks marked
-`requiresFix` fail when that probe refuses; they never downgrade to expected failures. The harness regression stubs
-broken classifiers and checks both refusal and ordinary test failure registration.
+A carried waiver's ready disclosure, ruling and live canonical findings must match exactly in order
+and multiplicity. Keep ready `[A]`, ruling `[A,B]`, audit `[B]` as a refusal at readiness admission.
+Soak fix presence uses separate clean/conflicting repositories and classifier-only checks; its regression
+stubs broken classifiers to verify both admission and refusal independently of the break itself.
+Mark shipped fixes `requiresFix: true`: a failed presence probe must register an ordinary failing test,
+never `it.fails`. Keep the named regression **broken classifier presence makes the shipped break fail,
+never pass as an expected failure**, including a green behavioral stub so the presence guard itself is exercised.
 Proof wrappers in IO factories must use the injected runner; a direct global reader defeats fixture isolation and may attempt live fallback fetches.

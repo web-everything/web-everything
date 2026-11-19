@@ -1714,7 +1714,6 @@ export function runReviewLabelCli({
     }
     let humanCarry = decideAcceptCarryForward({
       setting: resolveAcceptCarryForward().value,
-      exec: execFileSyncThrottled,
       record,
       headSha,
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,

@@ -100,7 +100,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
         const carry = entry.sha.toLowerCase() !== fullSha ? sameContent(entry.sha.toLowerCase(), fullSha) : null;
         const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { sameContent, ruledWeakened: {
           ...(carry ? { sameContentCarry: carry } : {}),
-          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
+          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null, auditDisclosed: entry.findings },
         } });
         if (waived.ok && waived.record?.head === fullSha) {
           evidence = waived;

@@ -1,5 +1,4 @@
-import { findingsSubset, testOnlyHistory } from '../lib/same-content-carry.mjs';
-export { normalizeFinding } from '../lib/same-content-carry.mjs';
+import { findingsEqual } from '../lib/same-content-carry.mjs';
 /**
  * @file Declared prototype admission and pure evidence decisions.
  * WHY (incident 2026-10-22): combined tops repeated tests, reverted main fixes three times,
@@ -91,9 +90,7 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
       && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
       && Array.isArray(ruledWeakened) && ruledWeakened.find((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
         && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
-        && (!testOnlyHistory(proof(e.sha)) || r.sha === live)
-        && (moved(e.sha) ? findingsSubset(r.auditDisclosed, e.findings)
-          : e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
+        && findingsEqual(r.auditDisclosed, e.findings));
     return match ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) }, ...(moved(match.sha) ? { sameContentCarry: { from: lowerSha(match.sha), to: live, ruling: match.ruling, matched: r.auditDisclosed, commits: sameContent(lowerSha(match.sha), live).commits } } : {}) } : null;
   };
   // Precedence (R503 red team rounds 1–2). The records file is append-only, so file order is time order:
@@ -170,11 +167,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
       && (record.head === lowerSha(gate.record.sha) || (gate.sameContentCarry && record.head === sha)
         || (carriesAcross(record.fingerprint, liveFp) && carriesAcross(gate.record.fingerprint, liveFp)))
       && Array.isArray(record.findings)
-      && (gate.sameContentCarry ? findingsSubset(record.findings, gate.ruledWeakened.findings)
-        : JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings))
+      && findingsEqual(record.findings, gate.ruledWeakened.findings)
       // Readiness discloses the live audit exactly; a broader ruling cannot substitute other findings.
-      && (!gate.sameContentCarry || !Object.hasOwn(gate.record, 'auditDisclosed')
-        || JSON.stringify(record.findings) === JSON.stringify(gate.record.auditDisclosed))
+      && (!gate.sameContentCarry || findingsEqual(record.findings, gate.record.auditDisclosed))
       && covered(record.base);
   };
   // Unruled own WEAKENED stops before git; a matching ruling still needs canonical base coverage.
@@ -209,7 +204,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     if (carriedWeak.some((d) => !(Date.parse(text(d.record.at)) < ownAt))) return { ok: false, reason: 'weakened' };
   }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
-  const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
+  const passes = own.length || auditOptions.ruledWeakened?.sameContentCarry ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp));
   let pass = null;
   for (const { base, record } of passes) {
     // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry

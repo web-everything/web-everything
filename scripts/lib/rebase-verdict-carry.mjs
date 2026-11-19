@@ -1,5 +1,4 @@
 import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
-import { classifyHeadMove } from './same-content-carry.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -56,13 +55,9 @@ export function findCarriableVerdict({ comments, headSha, pr } = {}) {
     gateOutcomes: [...gateOutcomesForHead(trusted, number, sha)], advisory: advisory?.parsed ?? null, advisoryBody: advisory?.body ?? null };
 }
 
-/** Fingerprint fast path, then the shared local history proof; all later verdict guards stay mandatory. */
-export function decideRebaseVerdictCarry({ setting, prior, priorPatchId, headPatchId, headSha, repo, exec, env, classify = classifyHeadMove } = {}) {
+/** PURE: no readable equal patch IDs means the original review path. */
+export function decideRebaseVerdictCarry({ setting, prior, priorPatchId, headPatchId } = {}) {
   const carry = setting === 'on' && !!prior && HEX.test(priorPatchId ?? '') && HEX.test(headPatchId ?? '') && priorPatchId === headPatchId;
-  if (!carry && setting === 'on' && prior && !prior.laterVerdict && !prior.laterBodyDerivedHold) {
-    const move = classify({ repo, exec, env, from: prior.sha, to: headSha, allowTestOnly: false });
-    if (move.carries) return { carry: true, commits: move.commits, reason: `same content from ${prior.sha} to ${headSha}; commits ${JSON.stringify(move.commits)}` };
-  }
   return { carry, reason: carry ? 'identical whitespace-sensitive contribution patch' : 'no proven identical contribution to carry' };
 }
 

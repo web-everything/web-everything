@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { classifyHeadMove } from '../lib/same-content-carry.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
@@ -583,8 +582,6 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
       return { headSha: view.headRefOid, comments };
     },
-    sameContentMove: ({ from, to, repo }) => classifyHeadMove({ from, to, repo: planReviewDispatch({ pr: 1, repo }).laneRepo,
-      env, exec: (f, a, o) => exec(f, a, { ...o, env: laneHistoryProofEnv({ ...env, ...o.env }) }) }),
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
       exec: (f, a, o) => exec(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env: laneHistoryProofEnv({ ...env, ...o.env }) }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
@@ -1238,8 +1235,7 @@ function runReviewArc({
           if (prior) {
             const priorPatchId = io.contributionPatchId({ sha: prior.sha, repo: planned.repo });
             const headPatchId = io.contributionPatchId({ sha: evidence.headSha, repo: planned.repo });
-            const decision = decideRebaseVerdictCarry({ setting: setting.value, prior, priorPatchId, headPatchId, headSha: evidence.headSha,
-              classify: facts => io.sameContentMove?.({ ...facts, repo: planned.repo }) || { carries: false } });
+            const decision = decideRebaseVerdictCarry({ setting: setting.value, prior, priorPatchId, headPatchId });
             if (decision.carry) {
               // #6606: carry only a result the live publisher accepts once re-keyed to this head (the same predicate),
               // decided before any restamp, owed marker or comment. Anything else re-reviews instead of stranding.
@@ -1255,7 +1251,7 @@ function runReviewArc({
               const gate = !decided ? prior.gateOutcomes.map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome))
                 : decided.resultId !== redTeamResultId(prior.advisory) ? []
                   : [...decided.outcomes].map(outcome => redTeamGateMarker(planned.pr, evidence.headSha, outcome, decided.resultId));
-              const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId, commits: decision.commits }),
+              const body = [...gate, buildVerdictCarriedMarker({ fromSha: prior.sha, toSha: evidence.headSha, patchId: headPatchId }),
                 'Review verdict carried across an identical contribution.',
                 carriedAdvisory].join('\n');
               // #6606: mark the check owed BEFORE the comment. Recovery skips a head whose result is on it, so a crash
@@ -1271,7 +1267,7 @@ function runReviewArc({
               } catch (error) {
                 io.log(`review-job ${slug}: carried check not published (${tail(safeErrorText(error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' '), 300)})`);
               }
-              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId, ...(decision.commits ? { commits: decision.commits } : {}), checkPublished };
+              classified = { outcome: 'carried', fromSha: prior.sha, headSha: evidence.headSha, patchId: headPatchId, checkPublished };
               return result(classified);
             }
           }

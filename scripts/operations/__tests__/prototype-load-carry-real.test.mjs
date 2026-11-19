@@ -199,3 +199,24 @@ describe('prototype-load default dispatch smoke (real worktree)', () => {
     }, { wrapExec: stuck });
   });
 });
+
+
+it('a real clean main merge carries only an exact waiver and requires a live canonical audit', async () => {
+  const { sameContentRepo } = await import('../../lib/__tests__/fixtures/same-content-repo.mjs');
+  const { createSameContentProof } = await import('../../lib/same-content-waiver-io.mjs');
+  const { readyEvidence, canonicalAuditEvidence } = await import('../prototype-load.mjs');
+  const { QUESTION_HASH } = await import('../codex-audit.mjs');
+  const f = sameContentRepo('clean');
+  try {
+    const ref = 'lane/waiver', findings = ['A', 'B'], sameContent = createSameContentProof(f);
+    const entry = { ref, sha: f.from, ruling: 'R12', findings };
+    const ready = { ref, sha: f.to, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: findings };
+    const gate = readyEvidence([ready], { branch: ref, sha: f.to }, [entry], null, { sameContent });
+    expect(gate).toMatchObject({ sameContentCarry: { commits: [{ sha: f.to, kind: 'clean-main-merge' }] } });
+    const audit = { head: f.to, base: f.root, verdict: 'WEAKENED', findings, questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z' };
+    const judge = records => canonicalAuditEvidence(records, f.to, () => true, 'c'.repeat(64), { ruledWeakened: gate });
+    expect(judge([audit]).ok).toBe(true);
+    expect(judge([{ ...audit, head: f.from, fingerprint: 'c'.repeat(64) }]).ok).toBe(false);
+    for (const findings of [['A'], ['B', 'A'], ['A', 'A']]) expect(judge([{ ...audit, findings }]).ok).toBe(false);
+  } finally { f.cleanup(); }
+});

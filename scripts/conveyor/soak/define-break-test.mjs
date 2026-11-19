@@ -4,6 +4,8 @@
  * GREEN. When it does not (the fix lives on another branch still in review), the test is EXPECTED-FAIL — titled
  * with the missing fix and its card, and `it.fails` still REQUIRES the break to reproduce, so it is never a
  * silent skip; it flips to a required pass by itself the moment the fix lands on this tree.
+ * Shipped fixes marked `requiresFix` always register ordinary tests: a failed presence probe
+ * fails before the scenario runs and can never authorize an expected failure.
  */
 
 import { resolve } from 'node:path';
