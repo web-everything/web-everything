@@ -631,6 +631,10 @@ describe('conflictFixesPerPass setting and live operator capacity', () => {
     expect(FIX_SETTINGS_DEFAULTS.conflictFixesPerPass).toBe(16);
     expect(resolve()).toMatchObject({ conflictFixesPerPass: 16, sources: { conflictFixesPerPass: 'standard' } });
   });
+  it('inherits sixteen when the settings file is missing', () => {
+    expect(resolve({ read: () => { throw Object.assign(Error('missing'), { code: 'ENOENT' }); } }))
+      .toMatchObject({ conflictFixesPerPass: 16, sources: { conflictFixesPerPass: 'standard' } });
+  });
   it('resolves platform, tool and environment in order with provenance', () => {
     const platform = { conflictFixesPerPass: 5 };
     const read = () => '{"fix":{"conflictFixesPerPass":6}}';
@@ -640,16 +644,22 @@ describe('conflictFixesPerPass setting and live operator capacity', () => {
       .toMatchObject({ conflictFixesPerPass: 24, sources: { conflictFixesPerPass: 'env' } });
     expect(resolve({ env: { WE_CONFLICT_FIXES_PER_PASS: '0' } }).conflictFixesPerPass).toBe(0);
   });
-  it.each([-1, 25, 1.5, null, false, [], {}, '', 'bad', '9007199254740992'])('falls back to sixteen for invalid bound %j at each layer', bad => {
-    expect(resolve({ platform: { conflictFixesPerPass: bad } }).conflictFixesPerPass).toBe(16);
-    expect(resolve({ read: () => JSON.stringify({ fix: { conflictFixesPerPass: bad } }) }).conflictFixesPerPass).toBe(16);
-    expect(resolve({ env: { WE_CONFLICT_FIXES_PER_PASS: bad } }).conflictFixesPerPass).toBe(16);
+  it.each([-1, 25, 1.5, null, false, [], {}, '', 'bad', '9007199254740992'])('disables allowance for invalid bound %j at each layer', bad => {
+    expect(resolve({ platform: { conflictFixesPerPass: bad } }))
+      .toMatchObject({ conflictFixesPerPass: 0, sources: { conflictFixesPerPass: 'platform' } });
+    expect(resolve({ platform: { conflictFixesPerPass: 5 }, read: () => JSON.stringify({ fix: { conflictFixesPerPass: bad } }) }))
+      .toMatchObject({ conflictFixesPerPass: 0, sources: { conflictFixesPerPass: 'tool' } });
+    expect(resolve({ platform: { conflictFixesPerPass: 5 }, env: { WE_CONFLICT_FIXES_PER_PASS: bad } }))
+      .toMatchObject({ conflictFixesPerPass: 0, sources: { conflictFixesPerPass: 'env' } });
   });
-  it.each(['not JSON', '{"fix":false}'])('falls back to sixteen for unreadable settings %s', raw => {
-    expect(resolve({ read: () => raw }).conflictFixesPerPass).toBe(16);
+  it.each(['not JSON', '{"fix":false}'])('disables allowance for unreadable settings %s', raw => {
+    expect(resolve({ read: () => raw }).conflictFixesPerPass).toBe(0);
   });
-  it('falls back to sixteen on a failed settings read', () => {
-    expect(resolve({ read: () => { throw Error('EACCES'); } }).conflictFixesPerPass).toBe(16);
+  it('disables allowance on a failed settings read and retries next pass', () => {
+    const read = vi.fn().mockImplementationOnce(() => { throw Error('EACCES'); })
+      .mockReturnValue('{"fix":{"conflictFixesPerPass":6}}');
+    expect(resolve({ read }).conflictFixesPerPass).toBe(0);
+    expect(resolve({ read }).conflictFixesPerPass).toBe(6);
   });
   it('rereads both operator leaves instantly above env and fails closed on unreadable or oversized evidence', () => {
     const dir = mkdtempSync(join(tmpdir(), 'fix-pass-operator-'));
@@ -660,8 +670,8 @@ describe('conflictFixesPerPass setting and live operator capacity', () => {
       const write = (cap, exempt) => writeFileSync(operatorFixture.file, JSON.stringify({
         'fix.conflictFixesPerPass': cap, 'fix.conflictFixExemptPerPass': exempt,
       }));
-      write(24, 24);
-      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 24, conflictFixExemptPerPass: 24,
+      write(24, 10);
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 24, conflictFixExemptPerPass: 10,
         sources: { conflictFixesPerPass: 'operator-db', conflictFixExemptPerPass: 'operator-db' } });
       write(0, 0);
       expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 0, conflictFixExemptPerPass: 0 });
@@ -670,6 +680,8 @@ describe('conflictFixesPerPass setting and live operator capacity', () => {
       expect(resolve({ env: { WE_CONFLICT_FIXES_PER_PASS: '0', WE_CONFLICT_FIX_EXEMPT_PER_PASS: '0' } }))
         .toMatchObject({ conflictFixesPerPass: 0, conflictFixExemptPerPass: 0 });
       write(25, 3);
+      expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 1, conflictFixExemptPerPass: 1 });
+      write(24, 11);
       expect(resolve({ env, read })).toMatchObject({ conflictFixesPerPass: 1, conflictFixExemptPerPass: 1 });
     } finally {
       operatorFixture.file = undefined;

@@ -14,7 +14,7 @@ export const CAPACITY_LEAVES = Object.freeze({
   'reviewConcurrency.maxLiveReviewRounds': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 3),
   'host.maxReviewDispatchPerTick': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.review), 'cap', 2),
   'fix.conflictFixesPerPass': capacityLeaf(integer(0, OPERATOR_CAPACITY_MAX.fix), 'cap', 1),
-  'fix.conflictFixExemptPerPass': capacityLeaf(integer(0, OPERATOR_CAPACITY_MAX.fix), 'cap', 1),
+  'fix.conflictFixExemptPerPass': capacityLeaf(integer(0, 10), 'cap', 1), // existing exemption operational maximum
   'resourceGate.fixCap.floor': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.fix), 'cap', 2),
   'resourceGate.fixCap.ceiling': capacityLeaf(integer(1, OPERATOR_CAPACITY_MAX.fix), 'cap', 6),
   'resourceGate.fixCap.raiseMinMemFreePct': capacityLeaf(v => Number.isFinite(v) && v >= 25 && v <= 60, 'threshold', 40),

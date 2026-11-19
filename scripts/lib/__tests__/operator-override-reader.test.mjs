@@ -24,17 +24,30 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('lock-free operator override reader', () => {
-  it.each(['fix.conflictFixesPerPass', 'fix.conflictFixExemptPerPass'])('accepts and bounds capacity leaf %s', key => {
+  it.each([
+    ['fix.conflictFixesPerPass', 24],
+    ['fix.conflictFixExemptPerPass', 10],
+  ])('accepts and bounds capacity leaf %s at %i', (key, max) => {
     expect(() => validateKey(key)).not.toThrow();
-    for (const value of [0, 16, 24]) {
+    for (const value of [0, 3, max]) {
       writeFileSync(file, JSON.stringify({ [key]: value }));
       expect(readOperatorOverrides({ file }).values[key]).toBe(value);
     }
-    for (const value of [-1, 25, 1.5, '6']) {
+    for (const value of [-1, max + 1, 25, 1.5, '6']) {
       writeFileSync(file, JSON.stringify({ [key]: value }));
       expect(readOperatorOverrides({ file, log: () => {} })).toMatchObject({ values: {}, invalidPolicies: ['fix'] });
     }
     expect(CAPACITY_LEAVES[key]).toMatchObject({ direction: 'cap', failClosedFallback: 1 });
+  });
+
+  it.each([11, 24])('rejects persisted exemption %i and invalidates the whole fix policy', value => {
+    writeFileSync(file, JSON.stringify({
+      'fix.conflictFixesPerPass': 24,
+      'fix.conflictFixExemptPerPass': value,
+    }));
+    expect(readOperatorOverrides({ file, log: () => {} })).toEqual({
+      readable: true, values: {}, invalidPolicies: ['fix'],
+    });
   });
 
   it.each([1, 8, 16])('accepts persisted live-review capacity %i', value => {

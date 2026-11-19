@@ -137,7 +137,7 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
     && /^(0|[1-9]\d*)$/.test(String(value)) && Number.isSafeInteger(Number(value)) && Number(value) <= 10 ? Number(value) : 0); // enforced operational maximum 10; larger or invalid disables
   const conflictCap = value => value === undefined ? undefined : ((typeof value === 'number' || typeof value === 'string')
     && /^(0|[1-9]\d*)$/.test(String(value)) && Number.isSafeInteger(Number(value)) && Number(value) <= 24
-    ? Number(value) : FIX_SETTINGS_DEFAULTS.conflictFixesPerPass);
+    ? Number(value) : 0); // invalid or unreadable evidence disables the allowance; a missing value inherits
   const envAutoProceed = env.WE_FIX_STAND_DOWN_AUTO_PROCEED;
   // Standard → platform → tool → env. Opus is reachable only through the critical-work verdict.
   // The shared cascade reads capacity operator overrides on every call, above env (R1040).
