@@ -176,11 +176,15 @@ describe('merge-ai-prs — #4138: a PR about to be closed by the stacked-base ca
     expect(src.indexOf('const landLock = withLandWriteLock(', call)).toBeGreaterThan(call);
     // The green-event shortcut runs it through `beforeEnqueue`, which enqueuePrestage awaits before its lock.
     // Shadow timing adds work inside this callback; scope the return assertion to the hook so a call in
-    // another branch cannot satisfy it, and keep checking the fresh comments and cached base arguments.
-    const hookStart = src.indexOf('      beforeEnqueue: (c, sha, entry) => {');
+    // another branch cannot satisfy it, and keep checking the fresh comments argument. The base passed on is the
+    // default branch verified live in this process (the prepared base is only a hint), after the hold check.
+    const hookStart = src.indexOf('      beforeEnqueue: async (c, sha, entry) => {');
     expect(hookStart).toBeGreaterThan(-1);
     const hookEnd = src.indexOf('\n      },', hookStart);
     expect(hookEnd).toBeGreaterThan(hookStart);
-    expect(src.slice(hookStart, hookEnd)).toMatch(/return announceAndRetargetBeforeLand\(c, \{ preread: fetchPrComments\(c\.repo, c\.num\), defaultBranch: entry\.baseRefName \}\);/);
+    const hook = src.slice(hookStart, hookEnd);
+    expect(hook).toMatch(/const liveBranch = await .*verifyDefaultBranch\(/);
+    expect(hook).toMatch(/const hold = defaultBranchHold\(entry\.baseRefName, liveBranch\);\s*if \(hold\) throw new Error\(hold\);/);
+    expect(hook).toMatch(/return announceAndRetargetBeforeLand\(c, \{ preread: fetchPrComments\(c\.repo, c\.num\), defaultBranch: liveBranch \}\);/);
   });
 });
