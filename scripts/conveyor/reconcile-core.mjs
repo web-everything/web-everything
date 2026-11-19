@@ -2997,7 +2997,9 @@ export function planReconcile({
       // Card 273, #5157: review-pr INVARIANT 2 never accepts a review:human PR.
       dispatchReviewRow({ pr, requiredChecks, withPhase, base, attempts: roundAttempts(),
         roundCap: effectiveRoundCap, now, refuse: folded, refuseCapExhausted: capExhaustedVia(folded), dispatch,
-        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason, ciWaived: true,
+        extra: { humanHandoffAdvisory: true }, advisoryReview: { head: headSha, reason,
+          // A review-hold advisory waives only the held gate: any other required check still pending/red keeps the CI wait.
+          ciWaived: reason !== 'review-hold' || reviewHoldOnlyRed(pr?.statusCheckRollup, requiredChecks),
           why: reason === 'human-handoff'
             ? 'ci-heal handed this head to a human, so one advisory AI review runs so the human gets its verdict; it never accepts a review:human PR'
             : 'review holds handed this head to review, so one advisory AI review supplies its verdict; it never accepts a review:human PR' } });

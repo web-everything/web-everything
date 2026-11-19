@@ -3737,6 +3737,15 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
       kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
     }));
   });
+
+  it('does not waive CI for a review-hold advisory while another required check is still pending', () => {
+    const rollup = heldRollup().map(row => row.name === 'test' ? { name: 'test', status: 'IN_PROGRESS', conclusion: '' } : row);
+    const result = planReconcile({
+      prs: [pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: rollup })],
+      requiredChecks, agents: [], durableCounts: {}, now: NOW, advisoryReviewOnHumanHandoff: 'on',
+    });
+    expect(result.dispatch.some(row => row.kind === 'review')).toBe(false);
+  });
 });
 
 describe('fix waiting episode', () => {
