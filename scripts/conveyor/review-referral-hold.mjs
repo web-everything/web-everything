@@ -4,12 +4,12 @@
  * (no new panel), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { isValidRunId, resolveRunsDir, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -184,9 +184,35 @@ function writeEvidenceDiskCache(file, entries) {
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
+// Stray records are untrusted. Oversized/unreadable files retain the invalid-entry alert for operator repair.
+export const INVALID_RUN_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
-  let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  const entries = runFileEntries(dir, { includeInvalid: true });
+  const invalidEvidence = entries.flatMap(name => {
+    if (!name.startsWith('review-pr-') || isValidRunId(name.slice(0, -5))) return [];
+    let fd;
+    try {
+      const path = join(dir, name);
+      // Nonblocking open avoids hanging on a FIFO before we can reject its descriptor's type.
+      fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > INVALID_RUN_EVIDENCE_MAX_BYTES) return [];
+      const buffer = Buffer.alloc(INVALID_RUN_EVIDENCE_MAX_BYTES + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const bytes = readSync(fd, buffer, length, buffer.length - length, null);
+        if (bytes === 0) break;
+        length += bytes;
+      }
+      if (length > INVALID_RUN_EVIDENCE_MAX_BYTES) return [];
+      const run = JSON.parse(buffer.toString('utf8', 0, length));
+      if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) return [];
+      const evidence = reviewRunEvidence(run);
+      return evidence?.parked && evidence.pending.length ? [evidence] : [];
+    } catch { return []; } // enumeration already emitted the operator-visible invalid-entry alert
+    finally { if (fd !== undefined) closeSync(fd); }
+  });
+  const names = entries.filter(name => isValidRunId(name.slice(0, -5)));
   const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
   let disk = null;
   let dirty = false;
@@ -196,7 +222,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).map(name => {
+  const rows = names.filter(n => n.startsWith('review-pr-')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
@@ -226,7 +252,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     disk ??= readEvidenceDiskCache(file);
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
   }
-  return out;
+  return [...out, ...invalidEvidence];
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
