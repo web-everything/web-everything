@@ -1,6 +1,11 @@
 import {createHash} from 'node:crypto';
 import {keyStructureFinding} from './forge-key-structure.mjs';
 const LIMIT=4*1024*1024;
+export const CONTENT_SCAN_MAX_BYTES=8*1024*1024;
+export const CONTENT_SCAN_BINARY_EXTENSIONS=Object.freeze([
+  'png','jpg','jpeg','gif','webp','ico','avif','woff','woff2','ttf','otf','pdf',
+  'mp4','webm','mp3','wav','zip','gz','wasm',
+]);
 const sha=value=>createHash('sha256').update(value).digest('hex');
 // Paths remain bytes throughout inventory, transport, hashing and verification.
 export function pathParts(path) {
@@ -406,11 +411,21 @@ export function warnCredential(onWarning,path,finding) {
 export function manifestEntry(path,content,executable,tracked,onWarning) {
   pathParts(path);
   if(typeof tracked!=='boolean')throw new Error('Missing manifest tracking evidence');
-  if(classifyManifestPath(path).credentialSource) {
+  const policy=classifyManifestPath(path);
+  const oversized=content.length>CONTENT_SCAN_MAX_BYTES;
+  const extension=policy.names.at(-1).split('.').slice(1).at(-1);
+  if(oversized&&!CONTENT_SCAN_BINARY_EXTENSIONS.includes(extension))
+    throw Object.assign(new Error('Excluded source file over the scan size cap: use local fallback'),{code:'excluded-source-file'});
+  if(policy.credentialSource) {
     const finding=tracked?credentialContentFinding(path,content):'untracked';
     if(finding)throw Object.assign(new Error(`Excluded credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
     warnCredential(onWarning,path.toString('utf8'),credentialContentWarning(path,content));
+  } else if(!oversized) {
+    const finding=credentialBufferFinding(content);
+    if(finding)throw Object.assign(new Error(`Excluded content-detected credential in a non-credential-named file (${finding}): use local fallback`),{code:'excluded-source-file'});
   }
+  // Only explicitly allowlisted large binary assets skip scanning, bounding scan
+  // cost while retaining media shipping. Credential-named sources never skip their scan.
   return {path,sha256:sha(content),executable,tracked};
 }
 export function decodeManifest(manifest) {

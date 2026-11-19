@@ -4580,3 +4580,13 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+
+## Forge manifest content admission
+
+`forge-manifest-scan-all.test.mjs` generates private keys at runtime and checks disguised
+ordinary paths for both tracked and untracked files. Every admitted file at or below
+`CONTENT_SCAN_MAX_BYTES` gets a byte-safe credential scan, including binaries. Over-cap
+files require local fallback unless their extension is on the explicit binary allowlist;
+those large assets skip the ordinary scan to bound cost. Credential-named sources retain
+the stricter content scan and tracked-only rule. The soak break decides fix presence by
+calling `manifestEntry` on a generated key at `docs/notes.md`, never by source markers.

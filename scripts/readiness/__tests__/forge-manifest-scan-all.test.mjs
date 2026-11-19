@@ -1,0 +1,93 @@
+// @vitest-environment node
+import {generateKeyPairSync} from 'node:crypto';
+import {performance} from 'node:perf_hooks';
+import {describe,expect,it} from 'vitest';
+import {CONTENT_SCAN_MAX_BYTES,manifestEntry} from '../forge-exec-manifest.mjs';
+
+const {privateKey}=generateKeyPairSync('rsa',{modulusLength:1024});
+const jwk=privateKey.export({format:'jwk'});
+const material={
+  PEM:privateKey.export({format:'pem',type:'pkcs8'}),
+  JWK:JSON.stringify(jwk),
+  DER:privateKey.export({format:'der',type:'pkcs1'}).toString('base64'),
+  oth:JSON.stringify({kty:jwk.kty,n:jwk.n,e:jwk.e,oth:[{r:jwk.p,d:jwk.dp,t:jwk.qi}]}),
+};
+const admit=(path,content,tracked=true)=>manifestEntry(Buffer.from(path),content,false,tracked);
+const refused=(path,content,tracked,message)=>{
+  let error;
+  try {admit(path,content,tracked);} catch (caught) {error=caught;}
+  expect(error).toMatchObject({code:'excluded-source-file'});
+  expect(error.message).toContain(message);
+  return error;
+};
+
+describe('Forge scans all manifest content',()=>{
+  for(const tracked of [true,false])for(const path of ['docs/notes.md','notes.txt','data.json','NOTES'])
+    for(const [format,text] of Object.entries(material))
+      it(`refuses disguised ${format} at ${path} (tracked=${tracked}) without exposing material`,()=>{
+        const error=refused(path,Buffer.from(text),tracked,'content-detected credential in a non-credential-named file');
+        expect(error.message).not.toContain(jwk.d);
+        expect(error.message).not.toContain(text);
+      });
+
+  it('admits ordinary documentation, code and JSON regardless of tracking',()=>{
+    for(const tracked of [true,false])for(const [path,text] of [
+      ['docs/notes.md','# Guide\nUse the navigation to browse examples.\n'],
+      ['src/main.mjs','export const double = value => value * 2;\n'],
+      ['data.json',JSON.stringify({title:'Guide',items:[1,2,3]})],
+    ])expect(admit(path,Buffer.from(text),tracked)).toMatchObject({tracked});
+  });
+
+  it('scans token formats and UTF-16 content at ordinary paths',()=>{
+    const token='gh'+'p_'+'A1b2C3d4'.repeat(5);
+    for(const bytes of [Buffer.from(token),Buffer.from(token,'utf16le'),Buffer.from(token,'utf16le').swap16()])
+      refused('docs/notes.md',bytes,true,'content-detected credential');
+  });
+
+  it('admits invalid text encodings in small binaries but still scans their bytes',()=>{
+    expect(admit('image.png',Buffer.from([255,0,254,1,128]))).toHaveProperty('sha256');
+    refused('image.png',Buffer.concat([Buffer.from([255,0]),Buffer.from(material.DER)]),false,'content-detected credential');
+    refused('image.png',privateKey.export({format:'der',type:'pkcs1'}),true,'content-detected credential');
+  });
+
+  it('refuses files over the scan size cap with unknown or missing extensions and names local fallback',()=>{
+    const bytes=Buffer.alloc(CONTENT_SCAN_MAX_BYTES+1,32);
+    for(const path of ['notes.unknown','NOTES','notes.md'])for(const tracked of [true,false]) {
+      const error=refused(path,bytes,tracked,'over the scan size cap');
+      expect(error.message).toContain('use local fallback');
+    }
+  });
+
+  it('admits over-cap allowlisted binaries without scanning (also uppercase extensions)',()=>{
+    const bytes=Buffer.alloc(CONTENT_SCAN_MAX_BYTES+1,32);
+    bytes.write(material.PEM);
+    for(const path of ['image.png','image.PNG'])for(const tracked of [true,false])
+      expect(admit(path,bytes,tracked)).toMatchObject({tracked});
+  });
+
+  it('does not weaken the credential-named scan for oversized allowlisted binaries',()=>{
+    const bytes=Buffer.alloc(CONTENT_SCAN_MAX_BYTES+1,32);
+    bytes.write(material.PEM);
+    for(const tracked of [true,false])refused('token.png',bytes,tracked,'credential-named file');
+  });
+
+  it('scans exactly-at-cap ordinary files and allowlisted binaries through the last byte',()=>{
+    const key=Buffer.from(material.PEM);
+    const bytes=Buffer.concat([Buffer.alloc(CONTENT_SCAN_MAX_BYTES-key.length,32),key]);
+    for(const path of ['notes.md','image.png'])for(const tracked of [true,false])
+      refused(path,bytes,tracked,'content-detected credential');
+  });
+
+  it('scans 2000 realistic ordinary files of about 10 KB within 30 seconds',()=>{
+    const files=Array.from({length:2000},(_,index)=>({
+      path:`docs/page-${index}.md`,
+      content:Buffer.from(`# Component ${index}\n`+Array.from({length:100},(_,line)=>
+        `Section ${line}: components expose browser events and render accessible navigation for the application.\n`).join('')),
+    }));
+    const started=performance.now();
+    for(const file of files)admit(file.path,file.content);
+    const elapsed=performance.now()-started;
+    console.log(`Forge manifest scan: 2000 ordinary files in ${elapsed.toFixed(1)} ms`);
+    expect(elapsed).toBeLessThan(30000);
+  },35000);
+});
