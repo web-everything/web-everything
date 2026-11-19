@@ -45,7 +45,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       // The shared Claude file cannot identify an account. Never attribute it to both accounts.
       if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
-      const seed = def.operatorReading, seedAt = epoch(seed?.asOf);
+      const seed = env.WE_CAPACITY_READERS === 'off' ? undefined : def.operatorReading, seedAt = epoch(seed?.asOf);
       const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > s.operatorReadingMaxAgeHours * HOUR);
       const liveUsable = owner.readers?.some(r => r.type === 'codex-rollout') || (at <= now && now - at <= s.staleHours * HOUR);
       const add = (name, w, source = 'live') => {

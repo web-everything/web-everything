@@ -155,6 +155,9 @@ if (hermetic) {
 }
 
 process.env.WE_UNDER_TEST = '1';
+// Capacity is unknown by default, independent of host usage and shipped operator readings.
+// Capacity tests inject readers or pass their own env to exercise persisted evidence.
+process.env.WE_CAPACITY_READERS = 'off';
 // Set after the ambient WE_* strip, including for tiers that opt out of hermetic HOME.
 // Callers may still inject a private sink; the default and child processes use this file's sink.
 process.env.WE_DAEMON_EVENTS = lazyRoot('daemon-events.jsonl');

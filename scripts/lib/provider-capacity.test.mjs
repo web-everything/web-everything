@@ -7,7 +7,7 @@ import { PROVIDER_DEFAULTS, readProviderCapacity, scoreProvider, chooseBuilder, 
 import { effectiveBuilder } from './routing-settings.mjs';
 import { resolveFixExecutorChain, pickChainRung } from './fix-executor-chain.mjs';
 import { recordCapacityDecision, observeCapacity } from './provider-capacity-io.mjs';
-import { readCodexQuota } from './codex-usage-ledger.mjs';
+import { readCodexQuota, readCodexBurnRate } from './codex-usage-ledger.mjs';
 import { capacityCalendar, renderCalendar } from '../operations/capacity-calendar.mjs';
 
 const now = Date.parse('2026-11-19T12:00:00Z'), hour = 3600000;
@@ -17,6 +17,40 @@ const providers = PROVIDER_DEFAULTS.providers.map(p => ({ ...p, accounts: undefi
 const choose = (capacities, settings = {}, kind = 'fix') => chooseBuilder({ kind, capacities, settings: { ...settings, now }, fallback: 'claude' });
 const repo = { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } };
 const chain = capacities => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: capacities, now, quota: () => null, record: () => {} }).value;
+
+test('shared setup disables capacity host readers by default', () => {
+  assert.equal(process.env.WE_CAPACITY_READERS, 'off');
+  assert.ok(observeCapacity({ now }).every(c => !c.known && !c.held && c.currentRatePerHour === null));
+});
+
+test('capacity readers off ignores persisted usage and operator seeds but preserves injected readers', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-off-'));
+  try {
+    const env = { HOME: dir, CODEX_HOME: dir, CONVEYOR_STATE_ROOT: dir,
+      WE_CODEX_USAGE_LEDGER: join(dir, 'codex.jsonl'), WE_CAPACITY_LEDGER: join(dir, 'decisions.jsonl') };
+    const raw = { at: now, used_percent: 27, resets_at: (now + hour) / 1000 };
+    mkdirSync(join(dir, 'sessions'));
+    writeFileSync(join(dir, 'sessions', 'rollout.jsonl'), JSON.stringify({ type: 'event_msg', payload: {
+      type: 'token_count', rate_limits: { limit_id: 'codex', primary: raw } } }));
+    mkdirSync(join(dir, '.plateau'));
+    const usage = { at: now, five_hour: { used_percentage: 20, resets_at: now + hour } };
+    for (const file of ['claude-usage.json', 'agy-usage.json']) writeFileSync(join(dir, '.plateau', file), JSON.stringify(usage));
+    writeFileSync(env.WE_CODEX_USAGE_LEDGER, [2, 1].map(h => JSON.stringify({ at: new Date(now - h * hour).toISOString(), quota: { after_used_percent: 27 - h } })).join('\n'));
+    writeFileSync(env.WE_CAPACITY_LEDGER, 'invalid ledger');
+    const settings = { claudeUsageAccount: 'claude-a', providers: PROVIDER_DEFAULTS.providers.map(p => ({ ...p,
+      operatorReading: { asOf: now, usedPercent: 10, resetsAt: now + hour } })) };
+    assert.equal(readCodexQuota(env).used_percent, 27);
+    const window = { resetsAt: now + hour, lengthHours: 5, usedPercent: 27 };
+    assert.equal(readCodexBurnRate({ env, now, window }), 1);
+    assert.ok(observeCapacity({ env, now, settings, records: [] }).some(c => c.known));
+    const disabled = { ...env, WE_CAPACITY_READERS: 'off' };
+    assert.equal(readCodexQuota(disabled), null);
+    assert.equal(readCodexBurnRate({ env: disabled, now, window }), null);
+    assert.ok(observeCapacity({ env: disabled, now, settings }).every(c => !c.known && !c.held && c.currentRatePerHour === null));
+    assert.equal(observeCapacity({ env: disabled, now, readers: { codex: () => raw } })[0].known, true);
+    assert.equal(observeCapacity({ env: disabled, now, quota: () => raw })[0].known, true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('expiring Codex 27% beats Claude 10% with five days remaining', () => {
   assert.equal(choose([cap('codex', 27, 2), cap('claude', 10, 120)]).provider, 'codex');

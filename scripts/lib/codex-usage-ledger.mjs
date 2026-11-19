@@ -37,6 +37,7 @@ export function codexUsageLedgerPath(env = process.env) {
 
 /** Only the newest persisted rollout with a Codex bucket is used; never invoke Codex to probe quota. */
 export function readCodexQuota(env = process.env) {
+  if (env.WE_CAPACITY_READERS === 'off') return null;
   try {
     const files = [];
     const walk = (dir) => {
@@ -75,6 +76,7 @@ export function readCodexQuota(env = process.env) {
 
 /** Read a bounded ledger tail. Legacy rows infer resets from percentage drops; new rows identify windows. */
 export function readCodexBurnRate({ env = process.env, now = Date.now(), lookbackHours = 24, window } = {}) {
+  if (env.WE_CAPACITY_READERS === 'off') return null;
   let fd;
   try {
     if (!Number.isFinite(lookbackHours) || lookbackHours <= 0 || !window) return null;

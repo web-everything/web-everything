@@ -45,8 +45,9 @@ export function recentCapacityRates(path, now) {
   } catch { return new Map(); } finally { if (fd !== undefined) closeSync(fd); }
 }
 export function observeCapacity({ env = process.env, now = Date.now(), settings = {}, quota = readCodexQuota, records, readers } = {}) {
+  const readersOff = env.WE_CAPACITY_READERS === 'off';
   const root = join(env.HOME || homedir(), '.plateau');
-  records ??= jsonFile(join(daemonConveyorStateRoot(env), '.conveyor', 'run-scorecards.json'))?.records ?? [];
+  records ??= readersOff ? [] : jsonFile(join(daemonConveyorStateRoot(env), '.conveyor', 'run-scorecards.json'))?.records ?? [];
   const configured = {};
   for (const p of settings.providers ?? PROVIDER_DEFAULTS.providers) for (const account of p.accounts ?? [{ id: p.id }]) {
     const specs = account.readers ?? p.readers;
@@ -54,7 +55,7 @@ export function observeCapacity({ env = process.env, now = Date.now(), settings 
       for (const spec of specs ?? []) {
         let raw;
         if (spec.type === 'codex-rollout') raw = quota(env);
-        else if (spec.type === 'plateau-usage-file' && typeof spec.file === 'string' && !isAbsolute(spec.file) && !spec.file.split(/[\\/]/).includes('..')) raw = jsonFile(join(root, spec.file));
+        else if (!readersOff && spec.type === 'plateau-usage-file' && typeof spec.file === 'string' && !isAbsolute(spec.file) && !spec.file.split(/[\\/]/).includes('..')) raw = jsonFile(join(root, spec.file));
         if (raw) return raw;
       }
       return null;
@@ -63,7 +64,7 @@ export function observeCapacity({ env = process.env, now = Date.now(), settings 
   const capacities = readProviderCapacity({ env, now, settings, readers: readers ?? { ...configured,
     hold: (p, at) => providerQuotaHold(records, p.startsWith('agy-') ? 'antigravity' : p, at),
   } });
-  const rates = recentCapacityRates(env.WE_CAPACITY_LEDGER || join(daemonConveyorStateRoot(env), 'capacity-decisions.jsonl'), now);
+  const rates = readersOff ? new Map() : recentCapacityRates(env.WE_CAPACITY_LEDGER || join(daemonConveyorStateRoot(env), 'capacity-decisions.jsonl'), now);
   return capacities.map(c => ({ ...c, currentRatePerHour: (c.quotaOf ?? c.provider) === 'codex'
     ? readCodexBurnRate({ env, now, lookbackHours: settings.rateLookbackHours ?? 24, window: bindingWindow(c) })
     : rates.get(`${c.quotaOf ?? c.provider}/${c.account ?? ''}`) ?? null }));

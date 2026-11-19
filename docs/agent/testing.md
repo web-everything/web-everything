@@ -3743,6 +3743,12 @@ failure cleanup and parent-directory removal through the heavy-admission queue. 
 transform configs can substitute mutations without editing the working implementation.
 ## Live operator routing fixtures
 
+The shared Vitest setup sets `WE_CAPACITY_READERS=off`: default capacity observations and
+the legacy Codex threshold see unknown usage, without reading host rollouts, usage files,
+scorecards or rate ledgers, and ignore shipped operator readings. Inject `readers`/`quota`
+for capacity cases; pass a private `env` without the switch to test persisted fixture evidence.
+Production readers remain enabled unless the switch is explicitly set.
+
 Review-seat roster fixtures must cover scoped added seats as well as exact keys. Use
 `rosterForKey` at every lookup: exact settings-backed contracts win, and other `review-seat:`
 keys return the shared added-seat roster by identity so provider caps still apply. Pin primary
