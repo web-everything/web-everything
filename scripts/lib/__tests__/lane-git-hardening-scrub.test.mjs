@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS, GIT_REPO_ENV_KEYS, GIT_REPO_LOCATION_ENV_KEYS, LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
+import { pinDeveloperDir, scrubRiskyLaneConfig, riskyLaneConfig, LANE_CONFIG_LIST_ARGS, GIT_REPO_ENV_KEYS, GIT_REPO_LOCATION_ENV_KEYS, LANE_GIT_CONFIG_PINS, laneGitHardeningEnv, scrubGitLocationEnv, scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -93,7 +93,7 @@ it('scrubGitRepoEnv drops every inherited repo redirect and env config source, a
     ['GIT_CONFIG_KEY_0', 'gc.reflogExpire'], ['GIT_CONFIG_VALUE_0', 'now'], ['GIT_CONFIG_KEY_99', 'x.y'], ['GIT_CONFIG_VALUE_99', 'z'],
     ['PATH', '/bin'], ['GIT_TERMINAL_PROMPT', '0']]);
   // GIT_REF_PARANOIA=0 would let gc/prune skip a broken ref's objects: it is forced back on.
-  expect(scrubGitRepoEnv(inherited)).toEqual({ PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_REF_PARANOIA: '1' });
+  expect(scrubGitRepoEnv(inherited)).toEqual({ ...pinDeveloperDir({}), PATH: '/bin', GIT_TERMINAL_PROMPT: '0', GIT_REF_PARANOIA: '1' });
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_SHALLOW_FILE', 'GIT_GRAFT_FILE']) {
     expect(GIT_REPO_ENV_KEYS).toContain(key);
   }
@@ -107,7 +107,7 @@ it('scrubGitRepoEnv drops every inherited repo redirect and env config source, a
 it('scrubGitLocationEnv drops every repo/ref/reachability redirect but keeps env config (lane-pool git calls)', () => {
   const config = { GIT_CONFIG_GLOBAL: '/hermetic', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'a.b', GIT_CONFIG_VALUE_0: 'c' };
   const inherited = { ...Object.fromEntries(GIT_REPO_LOCATION_ENV_KEYS.map(key => [key, '/elsewhere'])), ...config, PATH: '/bin' };
-  expect(scrubGitLocationEnv(inherited)).toEqual({ ...config, PATH: '/bin', GIT_REF_PARANOIA: '1' });
+  expect(scrubGitLocationEnv(inherited)).toEqual({ ...pinDeveloperDir({}), ...config, PATH: '/bin', GIT_REF_PARANOIA: '1' });
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_CONFIG', 'GIT_REFERENCE_BACKEND', 'GIT_SHALLOW_FILE']) {
     expect(GIT_REPO_LOCATION_ENV_KEYS).toContain(key);
   }
