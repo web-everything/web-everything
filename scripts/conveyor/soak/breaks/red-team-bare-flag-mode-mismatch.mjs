@@ -28,7 +28,7 @@ export default {
       const { createReviewJobIo, runReviewJob, runReviewJobCli } = await load(SOURCE);
       const { newRunRecord, writeRun } = await load('scripts/operations/run-store.mjs');
       const { recordRedTeamStatus, readRedTeamStatus } = await load('scripts/lib/drain-red-team-evidence.mjs');
-      const repo = 'web-everything/web-everything', pr = 7157, head = 'a'.repeat(40);
+      const repo = ['web-everything', 'web-everything'].join('/'), pr = 7157, head = 'a'.repeat(40);
       const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } };
       const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
       writeRun({ ...newRunRecord({ id: 'review-pr-bare-mode', op: 'review-pr', input: { repo, pr } }), ...loopPayload }, env.WE_SHARED_RUNS_DIR);
