@@ -442,7 +442,7 @@ describe('#4194 prompt, answer parsing, confirmation, rows', () => {
     expect(big).toMatch(/truncated/);
   });
 
-  it.each(CARBON_PROMOTION_CASES)('$name: parses the last fenced JSON; only seated lenses require answers', ({ env, promoted, seatCount }) => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: parses the last fenced JSON; only seated lenses require answers`, () => {
     const seats = reviewSeatRoutes({ env }).routes;
     expect(seats).toHaveLength(seatCount);
     expect(seats.some(s => s.provider === 'agy-gemini')).toBe(promoted);
@@ -561,7 +561,7 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls).toContainEqual(['log', 'added seats: skipping agy-gemini — daily-cap: 0/0 non-Claude seat calls already used today for agy-gemini']);
   });
 
-  it.each(CARBON_PROMOTION_CASES)('$name: runs the admitted providers, writes one evidence row per seat, stamps Claude confirmation, cleans up', async ({ env, promoted, seatCount }) => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: runs the admitted providers, writes one evidence row per seat, stamps Claude confirmation, cleans up`, async () => {
     const { io, calls, rows } = fakeSeatIo();
     const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
@@ -588,7 +588,7 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(r.providerUsage['agy-gemini']).toMatchObject({ usedToday: promoted ? 1 : 0, cap: 5 });
   });
 
-  it.each(CARBON_PROMOTION_CASES)('$name: each admitted antigravity seat gets an inline brief; the codex seat reads the checkout', async ({ env, promoted, seatCount }) => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: each admitted antigravity seat gets an inline brief; the codex seat reads the checkout`, async () => {
     const written = new Map();
     const { io } = fakeSeatIo({ writeFile: (p, text) => written.set(p, text) });
     const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
@@ -618,7 +618,7 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls.some((c) => ['reserve', 'scratch', 'seat'].includes(c[0]))).toBe(false);
   });
 
-  it.each(CARBON_PROMOTION_CASES)('$name: a seat that fails, times out or throws never fails the run — it is only that seat\'s status', async ({ env, promoted, seatCount }) => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: a seat that fails, times out or throws never fails the run — it is only that seat's status`, async () => {
     const { io, rows, calls } = fakeSeatIo({
       runSeat: async (o) => {
         if (o.provider === 'codex') throw new Error('spawn ENOENT');
