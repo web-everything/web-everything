@@ -345,15 +345,15 @@ const RANKS = Object.freeze({
   releaseStage: ['prod', 'prerelease'],
 });
 export const AUDIT_SETTINGS_ENV = Object.freeze({
-  verdictMode: 'WE_AUDIT_VERDICT_MODE', preExistingMode: 'WE_AUDIT_PREEXISTING_MODE', releaseStage: 'WE_AUDIT_RELEASE_STAGE',
+  verdictMode: 'WE_AUDIT_VERDICT_MODE', preExistingMode: 'WE_AUDIT_PREEXISTING_MODE', preExistingShadow: 'WE_AUDIT_PREEXISTING_SHADOW', releaseStage: 'WE_AUDIT_RELEASE_STAGE',
   raceBlockPaths: 'WE_AUDIT_RACE_BLOCK_PATHS', guardFloorPaths: 'WE_AUDIT_GUARD_FLOOR_PATHS',
   recheckMax: 'WE_AUDIT_RECHECK_MAX', baseRecheckMax: 'WE_AUDIT_BASE_RECHECK_MAX',
   requireOnMain: 'WE_AUDIT_CARDS_REQUIRE_ON_MAIN', requirePayBy: 'WE_AUDIT_CARDS_REQUIRE_PAY_BY',
 });
 const MAX_RECHECK = 3;
-const STRICTEST = Object.freeze({ verdictMode: 'shadow', preExistingMode: 'block', releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0,
+const STRICTEST = Object.freeze({ verdictMode: 'shadow', preExistingMode: 'block', preExistingShadow: false, releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0,
   requireOnMain: true, requirePayBy: true });
-const DEFAULTS = Object.freeze({ verdictMode: 'model', preExistingMode: 'block', releaseStage: 'prerelease', recheckMax: 1, baseRecheckMax: 3,
+const DEFAULTS = Object.freeze({ verdictMode: 'model', preExistingMode: 'block', preExistingShadow: false, releaseStage: 'prerelease', recheckMax: 1, baseRecheckMax: 3,
   requireOnMain: true, requirePayBy: true });
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -378,7 +378,7 @@ const validHashes = v => Array.isArray(v) && v.length <= 64
 const validCount = v => Number.isInteger(v) && v >= 0 && v <= MAX_RECHECK;
 const enumOf = key => v => RANKS[key].includes(v);
 const VALID = Object.freeze({ verdictMode: enumOf('verdictMode'), preExistingMode: enumOf('preExistingMode'), releaseStage: enumOf('releaseStage'),
-  recheckMax: validCount, baseRecheckMax: validCount, requireOnMain: v => typeof v === 'boolean', requirePayBy: v => typeof v === 'boolean' });
+  recheckMax: validCount, baseRecheckMax: validCount, preExistingShadow: v => typeof v === 'boolean', requireOnMain: v => typeof v === 'boolean', requirePayBy: v => typeof v === 'boolean' });
 
 function readFile(path, read) {
   try {
@@ -397,7 +397,7 @@ function auditVariants(obj) {
 // A key for a warning: JSON-quoted, with every non-printable-ASCII character escaped so an invisible one shows.
 const showKey = k => JSON.stringify(k).replace(/[^\x20-\x7e]/gu, c => `\\u${c.codePointAt(0).toString(16).padStart(4, '0')}`);
 const SECTION_PATHS = Object.freeze({ __proto__: null, verdictMode: ['verdict', 'mode'], preExistingMode: ['preExisting', 'mode'],
-  baseRecheckMax: ['preExisting', 'baseRecheckMax'], recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'],
+  preExistingShadow: ['preExisting', 'shadow'], baseRecheckMax: ['preExisting', 'baseRecheckMax'], recheckMax: ['recheck', 'max'], requireOnMain: ['cards', 'requireOnMain'],
   requirePayBy: ['cards', 'requirePayBy'] });
 // A null-prototype map: a polluted Object.prototype can never turn a setting name into an inherited path.
 const pathOf = key => SECTION_PATHS[key] ?? [key];
@@ -470,7 +470,7 @@ function unknownKeys(layer) {
 const parseEnv = (key, raw) => {
   if (typeof raw !== 'string') return undefined;
   if (['recheckMax', 'baseRecheckMax'].includes(key)) return /^\d+$/.test(raw) ? Number(raw) : undefined;
-  if (['requireOnMain', 'requirePayBy'].includes(key)) return raw === 'true' ? true : raw === 'false' ? false : undefined;
+  if (['requireOnMain', 'requirePayBy', 'preExistingShadow'].includes(key)) return raw === 'true' ? true : raw === 'false' ? false : undefined;
   return raw;
 };
 // The value a setting takes effect as: preExisting mode allow is never trusted and resolves to block.
@@ -479,6 +479,7 @@ const effective = (key, v) => (key === 'preExistingMode' && v === 'allow' ? 'blo
 function tighter(key, candidate, current) {
   if (RANKS[key]) return RANKS[key].indexOf(effective(key, candidate)) <= RANKS[key].indexOf(effective(key, current));
   if (key === 'recheckMax' || key === 'baseRecheckMax') return candidate <= current;
+  if (key === 'preExistingShadow') return candidate === false || current === true;
   return candidate === true || current === false;
 }
 
