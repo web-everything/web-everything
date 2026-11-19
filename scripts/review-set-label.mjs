@@ -1166,6 +1166,8 @@ export function runReviewLabelCli({
   // #5649 — the ledger sink for the `approval` row beside a `clear-human` verdict; injected only by tests (a refused
   // append), production writes through the same `appendVerdict` the verdict row uses.
   appendApproval = appendVerdict,
+  // Verdict append seam also exercises thrown transport failures before the label swap.
+  appendLedgerVerdict = appendVerdict,
   closeConfirmRuns = closeConfirmRunsAfterClearance,
   // The fix daemon's wake signal after a `review:changes` write; injected by tests so no run touches a real mailbox.
   signalFix = signalFixDispatch,
@@ -2043,7 +2045,7 @@ export function runReviewLabelCli({
   let clearingLedgerMiss = false;
   let clearingLedgerError;
   try {
-    const appended = appendVerdict(buildVerdictRecord({
+    const appended = appendLedgerVerdict(buildVerdictRecord({
       repo,
       pr: Number(pr),
       verdict: ledgerVerdict,
@@ -2097,7 +2099,11 @@ export function runReviewLabelCli({
       }
     }
   } catch (e) {
-    process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, non-fatal) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+    if (to === 'clear-human' && normalizeChannel(channelArg) === 'daemon') {
+      clearingLedgerMiss = true;
+      clearingLedgerError = String((e && e.message) || e).split('\n')[0];
+    }
+    process.stderr.write(`review-set-label: verdict-ledger append failed (#3007 shadow, ${clearingLedgerMiss ? 'fatal' : 'non-fatal'}) — ${String((e && e.message) || e).split('\n')[0]}\n`);
   }
   // Outside the try on purpose: a stubbed or real `process.exit` must never be swallowed by the non-fatal catch above.
   if (clearingLedgerMiss) {

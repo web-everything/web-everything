@@ -12,14 +12,14 @@ const pr = (over = {}) => ({ number: 7, headRefOid: HEAD, labels, ...over });
 const advisory = (head = HEAD, outcome = 'accept') => ({ author: { login: 'web-everything' },
   body: `**Verdict:** accept\n**Advisory outcome:** ${outcome}\nNet basis: \`${OTHER}..${head}\`` });
 const row = (name = 'test', conclusion = 'SUCCESS', startedAt = '2026-11-19T12:00:00Z') =>
-  ({ name, status: 'COMPLETED', conclusion, head_sha: HEAD, startedAt });
+  ({ name, status: 'COMPLETED', conclusion, head_sha: HEAD, startedAt, app: { id: 1, slug: 'ci' } });
 const deps = (over = {}) => ({
   readPr: p => p, readComments: () => [advisory()],
   readRedTeam: () => ({ clear: true, evidence: { ok: true } }), readPublicationHold: () => null,
   readReview: () => ({ head: HEAD, findings: [] }),
   readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source: 'live' }),
   readChecks: () => [row(), row('merge-gate', 'FAILURE')],
-  scoreNet: () => ({ scored: true, signals: {}, files: 3, diffLines: 10 }),
+  scoreNet: () => ({ scored: true, humanRequired: false, signals: {}, files: 3, diffLines: 10 }),
   readFiles: () => ['src/a.mjs'], readLiveHead: () => HEAD, ...over,
 });
 const evaluate = (over = {}, p = pr()) => evaluateEligibility(p, deps(over));
@@ -101,12 +101,50 @@ describe('seven-clause predicate', () => {
     expect(evaluate({ readChecks: () => [row(), row('advisory', 'FAILURE')] }).failed).toContain('other-check');
     expect(evaluate({ readChecks: () => [row(), row('merge-gate', 'FAILURE'), row('review-gate', 'FAILURE')] }).eligible).toBe(true);
   });
-  it.each([['FAILURE', 'SUCCESS', true], ['SUCCESS', 'FAILURE', false]])('latest row wins over old %s then %s', (old, latest, ok) => {
-    expect(evaluate({ readChecks: () => [row('test', latest, '2026-11-19T13:00:00Z'), row('test', old)] }).eligible).toBe(ok);
+  it.each([['FAILURE', 'SUCCESS', true], ['SUCCESS', 'FAILURE', false]])('same-identity later attempt supersedes %s with %s', (old, latest, ok) => {
+    const rows = [
+      { ...row('test', latest, '2026-11-19T13:00:00Z'), id: 10, run_id: 20, run_attempt: 2 },
+      { ...row('test', old), id: 10, run_id: 20, run_attempt: 1 },
+    ];
+    expect(evaluate({ readChecks: () => rows }).eligible).toBe(ok);
+  });
+  it.each([
+    [{ id: 1, slug: 'ci' }, { id: 2, slug: 'other' }, {}, {}],
+    [{ id: 1, slug: 'ci' }, { id: 1, slug: 'ci' }, { workflow_id: 1 }, { workflow_id: 2 }],
+  ])('different app/workflow success cannot hide a required failure (%j, %j)', (app, otherApp, workflow, otherWorkflow) => {
+    const rows = [
+      { ...row('test', 'FAILURE'), app, ...workflow, id: 10, run_id: 20, run_attempt: 1 },
+      { ...row('test', 'SUCCESS', '2026-11-19T13:00:00Z'), app: otherApp, ...otherWorkflow, id: 11, run_id: 21, run_attempt: 1 },
+    ];
+    const result = evaluate({ readChecks: () => rows });
+    expect(result.failed).toContain('required-checks');
+    expect(result.failed).toContain('other-check');
+    expect(result.evidence.checkRows).toEqual(rows);
+  });
+  it('timestamps alone cannot supersede a failing required attempt', () => {
+    const result = evaluate({ readChecks: () => [row('test', 'FAILURE'),
+      row('test', 'SUCCESS', '2026-11-19T13:00:00Z')] });
+    expect(result.failed).toContain('required-checks');
+  });
+  it('same-identity later success supersedes an optional failure', () => {
+    expect(evaluate({ readChecks: () => [row(), row('optional', 'FAILURE'),
+      row('optional', 'SUCCESS', '2026-11-19T13:00:00Z')] }).eligible).toBe(true);
+  });
+  it.each([undefined, { id: 1, slug: 'ci' }])('ambiguous optional producer identity refuses (%j)', app => {
+    const result = evaluate({ readChecks: () => [row(), { ...row('optional', 'FAILURE'), app: undefined },
+      { ...row('optional', 'SUCCESS', '2026-11-19T13:00:00Z'), app }] });
+    expect(result.failed).toContain('unreadable-check-identities');
   });
   it('unordered duplicate rows fail closed', () => expect(evaluate({ readChecks: () => [row(), row('test', 'FAILURE')] }).eligible).toBe(false));
   it('foreign-head checks refuse', () => expect(evaluate({ readChecks: () => [{ ...row(), head_sha: OTHER }] }).eligible).toBe(false));
-  it('gateSelf refuses', () => expect(evaluate({ scoreNet: () => ({ scored: true, signals: { gateSelf: ['gate.mjs'] } }) }).failed).toContain('gate-self'));
+  it('gateSelf refuses', () => expect(evaluate({ scoreNet: () => ({ scored: true, humanRequired: false, signals: { gateSelf: ['gate.mjs'] } }) }).failed).toContain('gate-self'));
+  it.each([true, undefined, null, 0, 'false'])('humanRequired %j refuses automatic clearance', humanRequired => {
+    expect(evaluate({ scoreNet: () => ({ scored: true, humanRequired, signals: {} }) }).failed).toContain('human-required');
+  });
+  it('missing and unscored scores refuse automatic clearance', () => {
+    expect(evaluate({ scoreNet: () => undefined }).failed).toContain('human-required');
+    expect(evaluate({ scoreNet: () => ({ scored: false, humanRequired: false, signals: {} }) }).failed).toContain('unreadable-score');
+  });
   it('workflow edit refuses', () => expect(evaluate({ readFiles: () => ['.github/workflows/ci.yml'] }).failed).toContain('workflow-edit'));
   it('head re-read must match H', () => expect(evaluate({ readLiveHead: () => OTHER }).failed).toContain('head-moved'));
   it('fresh PR head must match H', () => expect(evaluate({ readPr: () => pr({ headRefOid: OTHER }) }).failed).toContain('head-moved'));

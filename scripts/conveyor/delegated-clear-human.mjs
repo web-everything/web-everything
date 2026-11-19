@@ -57,21 +57,33 @@ export function loadDelegatedClearHumanMode({ env = process.env, readDeclared = 
   } catch { return { value: 'off', source: 'unreadable' }; }
 }
 
-/** Latest timestamp per name; unordered contradictory duplicates are unreadable. */
+/** Latest timestamp per producer identity; ambiguous duplicates are unreadable. */
 export function latestCheckRows(rows) {
   if (!Array.isArray(rows)) throw Error('checks unreadable');
-  const byName = new Map();
+  const byIdentity = new Map(), identitiesByName = new Map();
   for (const row of rows) {
     const name = row?.name ?? row?.context;
     if (typeof name !== 'string' || !name) throw Error('check name unreadable');
-    const old = byName.get(name);
-    if (!old) { byName.set(name, row); continue; }
+    const producer = [row.app?.id, row.app?.slug, row.app_id, row.app_slug,
+      row.workflow_id, row.workflow?.id, row.workflow?.path, row.workflow?.name,
+      row.workflowName, row.workflow_name, row.workflowId,
+      typeof row.workflow === 'string' ? row.workflow : null];
+    if (producer.some(value => value != null && (typeof value !== 'string' && typeof value !== 'number'
+      || String(value).trim() === ''))) throw Error('check identity unreadable');
+    // A classic commit status (`context`, no `name`) is its own producer bucket; a check run with no producer
+    // fields at all cannot be told apart from another same-name run, so it stays ambiguous (refuse).
+    const known = producer.some(value => value != null) || row?.name == null;
+    if (identitiesByName.has(name) && (!known || !identitiesByName.get(name))) throw Error('check identity ambiguous');
+    identitiesByName.set(name, known);
+    const key = JSON.stringify([name, producer, row.head_sha ?? null]);
+    const old = byIdentity.get(key);
+    if (!old) { byIdentity.set(key, row); continue; }
     const time = r => Date.parse(r.startedAt ?? r.started_at ?? r.createdAt ?? r.created_at ?? r.completedAt ?? r.completed_at);
     const a = time(old), b = time(row);
     if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) throw Error('check order unreadable');
-    if (b > a) byName.set(name, row);
+    if (b > a) byIdentity.set(key, row);
   }
-  return [...byName.values()];
+  return [...byIdentity.values()];
 }
 
 /** All IO is injected. No mutation; each missing/throwing reader is a refusal. */
@@ -123,18 +135,24 @@ export function evaluateEligibility(candidate, readers = {}) {
   if (evidence.securityFindings?.length) reject('security-finding');
   const roster = read('required-checks', () => readers.readRequiredChecks(candidate, head));
   evidence.requiredChecks = roster;
-  const rows = read('checks', () => latestCheckRows(readers.readChecks(candidate, head)));
+  const rows = read('checks', () => {
+    const raw = readers.readChecks(candidate, head);
+    if (!Array.isArray(raw)) throw Error('checks unreadable');
+    return raw;
+  });
   evidence.checkRows = rows;
   const required = Array.isArray(roster?.checks) ? roster.checks.filter(n => !ignoredCheck(n)) : null;
-  const checks = resolveRequiredChecks({ rows: rows?.filter(r => !ignoredCheck(r.name ?? r.context)),
+  const checks = resolveRequiredChecks({ rows: rows?.filter(r => !ignoredCheck(r?.name ?? r?.context)),
     rowsHead: head, rowsComplete: Array.isArray(rows), requiredNames: required, rosterSource: roster?.source, head });
   evidence.checkResolution = checks;
   if (checks.state !== 'pass') reject('required-checks');
-  if (rows?.some(r => !ignoredCheck(r.name ?? r.context)
+  const latestRows = read('check-identities', () => latestCheckRows(rows?.filter(r => !ignoredCheck(r?.name ?? r?.context))));
+  if (latestRows?.some(r => !ignoredCheck(r.name ?? r.context)
     && !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(r.conclusion ?? r.state ?? '').toUpperCase()))) reject('other-check');
   evidence.score = read('score', () => readers.scoreNet(candidate, head));
   if (evidence.score?.scored !== true) reject('unreadable-score');
   if (!evidence.score?.signals || typeof evidence.score.signals !== 'object') reject('unreadable-score');
+  if (evidence.score?.humanRequired !== false) reject('human-required');
   if (evidence.score?.signals?.gateSelf?.length) reject('gate-self');
   const files = read('files', () => readers.readFiles(candidate, head));
   evidence.files = files;
