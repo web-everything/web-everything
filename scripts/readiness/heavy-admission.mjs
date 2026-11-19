@@ -1014,8 +1014,10 @@ export function createRemoteExec({
       (error, stdout) => error ? reject(error) : resolve(stdout.trim()));
   }),
   notice = remoteClientNotice, runOverride = null,
-  // Best-effort persistence deadline; injectable so a loaded host (CI coverage shard) cannot race the audit write in tests.
-  provenanceBudgetMs = 100,
+  // Best-effort persistence deadline. It runs after the remote result is known and the CLI drain is capped at
+  // CLIENT_PROVENANCE_SETTLE_MAX_MS, so it never delays the run; 100 ms was too tight for a loaded host (a CI
+  // shard dropped the client-override.json write, ENOENT) and silently lost the audit state. Injectable for tests.
+  provenanceBudgetMs = 1000,
 } = {}) {
   return async (options) => {
     const scope = runOverride != null ? 'run' : 'host';
