@@ -7,6 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
+import { revalidateExemptions } from './canonical-audit-gate.mjs';
 import { readStore, storePath } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
@@ -511,6 +512,20 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const liveFp = liveFingerprint(auditRecords);
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
         { ruledWeakened: out.gate }) };
+      if (out.canonicalAudit.ok && out.canonicalAudit.record?.preExisting?.length
+        && !revalidateExemptions(out.canonicalAudit.record, {
+          readFile: (path, encoding) => fs.readFileSync(path, encoding), env, now,
+          readCard: path => {
+            fetchMain();
+            const result = execute('git', ['show', `refs/remotes/origin/main:${path}`]);
+            if (result.code !== 0) throw new Error('current debt card unreadable');
+            return result.stdout;
+          },
+        })) {
+        out.canonicalAudit = { mode: 'refuse', ok: false, reason: 'exemption-stale', record: null };
+        return stop('no-canonical-audit', {
+          fallback: 'Restore current exemption policy/card evidence or request human review, then rerun codex-audit and retry prototype-load.' });
+      }
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
