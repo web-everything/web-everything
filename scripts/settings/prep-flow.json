@@ -1,0 +1,92 @@
+{
+  "enforce": {
+    "buildStart": "advise",
+    "openPr": "advise",
+    "audit": "advise",
+    "guard": "advise"
+  },
+  "classes": {
+    "guard": {
+      "globs": [
+        "scripts/guard-*",
+        "scripts/**/guard-*",
+        ".claude/settings.json",
+        "scripts/lib/lane-lease.mjs"
+      ]
+    },
+    "daemon": {
+      "globs": [
+        "scripts/conveyor/**",
+        "scripts/*daemon*",
+        "scripts/settings/*daemon*"
+      ]
+    },
+    "merge": {
+      "globs": [
+        "scripts/merge-ai-prs*",
+        "scripts/operations/open-pr*",
+        "scripts/operations/review-job*",
+        "scripts/open-pr*",
+        "scripts/**/canonical-audit-gate*",
+        "scripts/**/merge-queue*"
+      ]
+    },
+    "review": {
+      "globs": [
+        "scripts/review-*",
+        "scripts/**/review-*"
+      ]
+    },
+    "label": {
+      "globs": [
+        "scripts/lib/review-labels.mjs",
+        "scripts/*label*",
+        "scripts/**/*label*",
+        "scripts/apply-review-request.mjs",
+        "scripts/lane-resume.mjs",
+        "scripts/pr-land.mjs",
+        "scripts/merge-ai-prs.mjs",
+        "scripts/operator/dispatch.mjs",
+        "scripts/operations/review-pr-io.mjs",
+        "scripts/operations/card-batch-seal-io.mjs",
+        "scripts/operations/land-human-only-io.mjs",
+        "scripts/operations/land-prevention-card.mjs",
+        "scripts/lib/drain-merge-strategy.mjs",
+        "scripts/lib/drain-mq-failure-recovery-io.mjs",
+        "scripts/lib/merge-gate-refresh.mjs",
+        "scripts/lib/forge-land-provider.mjs",
+        "scripts/conveyor/stand-down.mjs",
+        "scripts/conveyor/review-status-tag.mjs",
+        "scripts/conveyor/review-round-tag.mjs",
+        "scripts/conveyor/ci-red-recovery-watch.mjs",
+        "scripts/conveyor/ruling-resolved-stand-down.mjs",
+        "scripts/conveyor/orphan-fix-round.mjs",
+        "scripts/conveyor/fix-push-ci.mjs",
+        "scripts/conveyor/ci-heal-mark.mjs"
+      ]
+    }
+  },
+  "sensitivePrefixes": [
+    "scripts/lib/",
+    "scripts/operations/",
+    "scripts/conveyor/",
+    "scripts/settings/",
+    ".github/",
+    ".claude/hooks/",
+    "hooks/",
+    ".githooks/"
+  ],
+  "fastPath": {
+    "maxFiles": 3,
+    "maxLoc": 80
+  },
+  "threatModelTriggers": [
+    "untrusted",
+    "parse",
+    "fail-closed",
+    "bypass",
+    "race",
+    "ordering"
+  ],
+  "storeDir": "~/workspace/.operations/coordination/prep"
+}

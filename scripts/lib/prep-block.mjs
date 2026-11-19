@@ -13,7 +13,7 @@ export function isPrepExempt(text) {
   return EXEMPT_TASK.test(statement);
 }
 
-function nonTrivial(line) {
+export function nonTrivial(line) {
   const item = line.trim().replace(/^(?:[-*+]\s+|\d+[.)]\s*)/, '').replace(/\*\*/g, '').trim();
   return item.replace(/\s/g, '').length >= 8
     && !/^(?:<[^<>]*>\s*)+$/.test(item)

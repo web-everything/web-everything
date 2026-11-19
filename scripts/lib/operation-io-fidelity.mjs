@@ -166,9 +166,10 @@ const HELPER_DYNAMIC_IMPORT = new RegExp(`\\bimport\\s*\\(\\s*['"][^'"]*${esc(HE
 
 // THE NAMES the helper exports. A test satisfies the fidelity rule only by USING one of them — see
 // `importsRealRepoHelper` for why importing is not enough.
-const HELPER_EXPORTS = ['withRealRepo', 'withBareOrigin', 'withNarrowClone'];
+// Filesystem-only operations still need real effects, but cannot benefit from clone geometry.
+const HELPER_EXPORTS = ['withRealRepo', 'withBareOrigin', 'withNarrowClone', 'withRealDirectory'];
 
-export function importsRealRepoHelper(content) {
+export function importsRealRepoHelper(content, { allowDirectory = true } = {}) {
   const src = String(content ?? '');
   if (!HELPER_STATIC_IMPORT.test(src)) return false;
 
@@ -205,7 +206,8 @@ export function importsRealRepoHelper(content) {
       const local = alias || exported;
       // Only names the harness actually exports count: importing `FIXTURE_SLUG` is not evidence that a real
       // repo is driven.
-      if (local && HELPER_EXPORTS.includes(exported)) locals.add(local);
+      if (local && HELPER_EXPORTS.includes(exported)
+        && (allowDirectory || exported !== 'withRealDirectory')) locals.add(local);
     }
   }
   if (locals.size === 0) return false;
@@ -287,6 +289,7 @@ const asSet = (v) => new Set(v ?? []);
  *
  * @param {object} o
  * @param {string[]} o.ioModules - module names (the `<name>` of `scripts/operations/<name>-io.mjs`)
+ * @param {Record<string, string>} [o.ioSources] - module sources; missing evidence requires a repo helper
  * @param {Array<{file: string, content: string}>} o.tests - every test source under the operations test tree
  * @param {Iterable<string>} [o.allowlist] - the debt register; defaults to the shipped one
  * @param {Iterable<string>} [o.baseline] - the day-one census; defaults to the shipped one
@@ -294,6 +297,7 @@ const asSet = (v) => new Set(v ?? []);
  */
 export function findIoModulesWithoutFidelityTest({
   ioModules = [],
+  ioSources = {},
   tests = [],
   allowlist = UNCONVERTED_IO_MODULES,
   baseline = RATCHET_BASELINE,
@@ -330,7 +334,14 @@ export function findIoModulesWithoutFidelityTest({
 
   for (const name of ioModules || []) {
     const file = `scripts/operations/${name}-io.mjs`;
-    const proof = fidelityTests.find((t) => testCoversIoModule(t.content, name));
+    // Only observed source without Git references can use directory-only proof.
+    // Strip comments so documentation about Git does not classify filesystem IO as Git IO.
+    const source = ioSources[name];
+    const allowDirectory = typeof source === 'string' && !/\bgit\b/i.test(source
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/(^|[^:])\/\/[^\n]*/g, '$1'));
+    const proof = fidelityTests.find((t) => testCoversIoModule(t.content, name)
+      && importsRealRepoHelper(t.content, { allowDirectory }));
     const listed = allow.has(name);
 
     // ── PROPERTY 1: converted, but still exempt. The edge that makes the list shrink. ────────────────────
@@ -439,6 +450,7 @@ export function scanOperationIoFidelity(root, over = {}) {
 
   return findIoModulesWithoutFidelityTest({
     ioModules,
+    ioSources: Object.fromEntries(ioModules.map(name => [name, readFileSync(join(opsDir, `${name}-io.mjs`), 'utf8')])),
     tests,
     allowlist: over.allowlist ?? UNCONVERTED_IO_MODULES,
     baseline: over.baseline ?? RATCHET_BASELINE,

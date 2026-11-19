@@ -5172,3 +5172,13 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+
+## Filesystem-only operation fidelity
+
+Local-store operations with no Git dependency use `withRealDirectory` from
+`scripts/operations/__tests__/helpers/real-repo.mjs`. It shares the repository
+fixtures' unique task-temporary directory and cleanup contract while invoking no
+Git commands. Exercise actual writes, atomic replacement, re-reading, and cleanup;
+injected GitHub readers remain separate decision fixtures. The preparation store
+example is `scripts/operations/__tests__/prep-io.test.mjs`.
