@@ -1925,6 +1925,7 @@
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
+  "scripts/conveyor/soak/breaks/added-seats-concurrent-head-binding.soak.test.mjs": 4.67,
   "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 8.81,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
   "scripts/conveyor/soak/breaks/approved-human-head-review-churn.soak.test.mjs": 1.4,

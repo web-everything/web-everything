@@ -127,10 +127,10 @@ import { resolveProviderCap } from './review-seat-policy.mjs';
 import { INFRA_RETRY_COOLOFF_MS, markSelfReportedDone } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
+  createRedTeamIo, extraSeatsEnabled, recordDiscardedSeats, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
 } from './review-extra-seats.mjs';
 import {
-  decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
+  decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, loadConcurrentSeats, READ_SINK_ENV,
 } from '../lib/review-speculative-red-team.mjs';
 import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
@@ -637,7 +637,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       };
     },
     releaseLane: (slug) => node(['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${slug}`], { timeoutMs: 5 * 60 * 1000 }),
-    // #4194 — the ADDED non-Claude seats, run in their own process AFTER the verdict is decided, under a hard wall.
+    // Added non-Claude seats: single-shot compatibility path under a hard wall.
     // Whatever happens in there comes back as a status; nothing here can throw into the arc.
     runExtraSeats: ({ pr, repo, lanePath, loopPayload, slug }) => {
       if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
@@ -699,6 +699,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    concurrentSeatsSetting: () => loadConcurrentSeats({ env }),
     // R365 fix 5 — `review.finalHeadSeats` (see `../lib/review-final-head-seats.mjs`) and the PR's live head.
     finalHeadSeatsSetting: () => resolveFinalHeadSeats({ env }),
     liveHead: ({ pr, repo }) => {
@@ -797,6 +798,72 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     cleanupSpeculativeRedTeam: (handle) => {
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
     },
+    startSpeculativeSeats: ({ pr, repo, lanePath, slug, waitMs, readSink }) => {
+      if (!extraSeatsEnabled(env)) return null;
+      mkdirSync(dir, { recursive: true });
+      const base = join(dir, `${slug}.spec-seats`);
+      const handle = { ownsReadSink: !readSink, readSink: readSink ?? `${base}.read.json`, passFile: `${base}.pass.json`, reservedFile: `${base}.pass.json.reserved`, logFile: `${base}.log` };
+      for (const f of [...(handle.ownsReadSink ? [handle.readSink] : []), handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
+      const fd = openSync(handle.logFile, 'w');
+      try {
+        const child = spawn(process.execPath, [
+          ...heapCapArgs('review-extra-seats'),
+          'scripts/operations/review-extra-seats.mjs', 'seats-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
+          `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
+        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        child.unref();
+        if (!child.pid) return null;
+        return { ...handle, pid: child.pid, startedAt: Date.now(), wallMs: resolveSeatTimeoutMs(env) + 5 * 60_000 };
+      } finally { closeSync(fd); }
+    },
+    awaitSpeculativeSeats: (handle, { timeoutMs }) => {
+      const t0 = Date.now();
+      const readPass = () => { try { return existsSync(handle.passFile) ? JSON.parse(readFileSync(handle.passFile, 'utf8')) : null; } catch { return null; } };
+      for (;;) {
+        const pass = readPass();
+        if (pass) return { spec: pass, waitedMs: Date.now() - t0 };
+        if (!specAlive(handle.pid)) return { spec: readPass(), waitedMs: Date.now() - t0 };
+        if (Date.now() - t0 >= timeoutMs) {
+          try { process.kill(-handle.pid, 'SIGTERM'); } catch { /* gone */ }
+          return { spec: null, waitedMs: Date.now() - t0, timedOut: true };
+        }
+        sleepSync(1000);
+      }
+    },
+    cancelSpeculativeSeats: (handle) => {
+      if (specAlive(handle.pid)) {
+        try { process.kill(-handle.pid, 'SIGTERM'); } catch { /* gone */ }
+        const t0 = Date.now();
+        while (specAlive(handle.pid) && Date.now() - t0 < 30_000) sleepSync(250);
+        if (specAlive(handle.pid)) { try { process.kill(-handle.pid, 'SIGKILL'); } catch { /* gone */ } }
+      }
+      const readJson = (f) => { try { return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null; } catch { return null; } };
+      return { spec: readJson(handle.passFile), reserved: readJson(handle.reservedFile) };
+    },
+    finishSpeculativeSeats: ({ pr, repo, loopPayload, slug, handle }) => {
+      const loopFile = join(dir, `${slug}.seats.loop.json`);
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(loopFile, JSON.stringify(loopPayload));
+        const r = node([
+          'scripts/operations/review-extra-seats.mjs', 'seats-finish', `--pr=${pr}`, `--repo=${repo}`, `--pass=${handle.passFile}`, `--loop-json=${loopFile}`,
+        ], { timeoutMs: 10 * 60 * 1000 });
+        for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
+          writeLineSync(2, `  ${line}`);
+        }
+        const last = String(r.stdout ?? '').trim().split('\n').pop() ?? '';
+        try { return JSON.parse(last); } catch { return { status: 'error', reason: `added-seats finish exit ${r.status}${r.signal ? ` (${r.signal})` : ''}, no result` }; }
+      } catch (e) {
+        return { status: 'error', reason: String(e?.message ?? e).slice(0, 300) };
+      } finally {
+        try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
+      }
+    },
+    speculativeSeatsReadSunk: (handle) => existsSync(handle.readSink),
+    recordDiscardedSeats: (o) => recordDiscardedSeats(o, createRedTeamIo({ env })),
+    cleanupSpeculativeSeats: (handle) => {
+      for (const f of [...(handle.ownsReadSink ? [handle.readSink] : []), handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
+    },
     recordSeatTimings: (runId, rows) => {
       if (!runId || !rows.length) return;
       let run = readRun(runId);
@@ -883,6 +950,39 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
   }
 }
 
+/** Added seats are evidence only: every refused or incomplete pass is terminal, never rerun. */
+export function settleSpeculativeSeats({ spec, out, input }, io) {
+  const discard = reason => {
+    let spend;
+    try {
+      const { spec: pass, reserved } = io.cancelSpeculativeSeats(spec);
+      if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
+      spend = io.recordDiscardedSeats?.({ pr: out.pr, repo: out.repo, pass, reserved, reason });
+    } catch (e) { spend = { status: 'error', reason: tail(e?.message ?? e, 200) }; }
+    return { status: 'discarded', reason, spend };
+  };
+  try {
+    if (['bounced', 'parked', BLOCKED_ON_INFRA].includes(out.outcome)) return discard(`review ${out.outcome}`);
+    if (!input) return discard('no final loop input');
+    if (io.speculativeSeatsReadSunk?.(spec) === false) return discard('the review loop wrote no read sink');
+    const waited = io.awaitSpeculativeSeats(spec, { timeoutMs: Math.max(0, (spec.wallMs ?? resolveSeatTimeoutMs() + 5 * 60_000) - (Date.now() - spec.startedAt)) });
+    const pass = waited?.spec;
+    if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
+    if (waited?.timedOut || pass?.status !== 'speculated') return discard(pass?.reason ?? 'added seats pass failed or incomplete');
+    const rev = input.loopPayload?.findings?.read?.netBasis?.rev;
+    if (!isRealHead(rev) || pass.rev !== rev) return discard('added seats head differs from final loop head');
+    const gate = finalHeadSeatsGate(input, io);
+    if (gate.skip) return discard(`final-head seats: ${gate.reason}`);
+    const result = io.finishSpeculativeSeats({ ...input, handle: spec });
+    if (result?.status !== 'ran') return discard(result?.reason ?? 'added seats finish failed');
+    return result;
+  } catch (e) {
+    return discard(`added seats settlement failed: ${tail(e?.message ?? e, 200)}`);
+  } finally {
+    try { io.cleanupSpeculativeSeats?.(spec); } catch { /* best effort */ }
+  }
+}
+
 /** x00g3tt — the compact form of the red team's result the job prints (the full rows live in the store). */
 export function summarizeRedTeam(r) {
   if (!r || typeof r !== 'object') return null;
@@ -952,7 +1052,15 @@ export function commentReasonSuffix(value, text = (v, fb) => { try { return Stri
 }
 
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
+  const jobStartedAt = io.now();
   const seatsBox = {};
+  if (!opts.redTeamOnly && typeof io.concurrentSeatsSetting === 'function') {
+    try {
+      const setting = io.concurrentSeatsSetting();
+      seatsBox.concurrentEnabled = setting?.enabled === true;
+      io.log(`review-job: review.extraSeats.concurrent=${setting?.value ?? '?'} (${setting?.source ?? '?'})${setting?.invalid?.length ? ` · ignored invalid: ${setting.invalid.join('; ')}` : ''}`);
+    } catch { seatsBox.concurrentEnabled = false; }
+  }
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
   // without the hook, is the sequential order: the red team starts only after the review accepts.
   if (!opts.redTeamOnly && typeof io.speculativeRedTeamSetting === 'function') {
@@ -971,16 +1079,20 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
-  // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
-  // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
-  // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
-  // outcome above. A missing hook, a crash, a timeout, a thrown kill switch: each is only a status in `extraSeats`.
-  if (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function') {
+  // Settle added evidence after the arc. Concurrent passes never alter the verdict or rerun on discard;
+  // disabled concurrency or a missing start hook retains the single-shot path.
+  const concurrentSeats = seatsBox.concurrent ?? null;
+  const seatsStartedAt = io.now();
+  if (concurrentSeats || (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function')) {
     let extraSeats;
     try {
-      let gate;
-      try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
-      extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
+      if (concurrentSeats) {
+        extraSeats = settleSpeculativeSeats({ spec: concurrentSeats, out, input: seatsBox.input }, io);
+      } else {
+        let gate;
+        try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
+        extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
+      }
     } catch (e) {
       extraSeats = { status: 'error', reason: tail(e?.message ?? e, 300) };
     }
@@ -988,7 +1100,11 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       + `${Array.isArray(extraSeats?.seats) ? `: ${extraSeats.seats.map((x) => `${x.lens}@${x.provider}=${x.status}/${x.findingsCount ?? 0}f/${x.confirmedCount ?? 0}c`).join(', ')}` : ''}`);
     recordSeats(extraSeats?.seats ?? []);
     out.extraSeats = summarizeExtraSeats(extraSeats);
+    if (extraSeats?.spend) out.extraSeats.spend = extraSeats.spend;
   }
+  out.timings.seatsMs = concurrentSeats ? concurrentSeats.seatsMs ?? Math.max(0, Date.now() - concurrentSeats.startedAt) : io.now() - seatsStartedAt;
+  out.timings.seatsConcurrent = Boolean(concurrentSeats);
+  if (!opts.redTeamOnly) io.log(`review-job ${out.sessionSlug}: seatsConcurrent counters: started=${Number(Boolean(concurrentSeats))} used=${Number(Boolean(concurrentSeats) && out.extraSeats?.status === 'ran')} discarded=${Number(Boolean(concurrentSeats) && out.extraSeats?.status === 'discarded')}`);
   // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when the review ACCEPTED (`redTeamOwedFor`), and only after
   // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
   // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
@@ -1128,6 +1244,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     const discarded = decision === 'discard';
     io.log(`review-job ${out.sessionSlug}: speculative-red-team counters: started=${Number(Boolean(spec))} used=${Number(decision === 'finish')} discarded-infra=${Number(discarded && out.outcome === BLOCKED_ON_INFRA)} discarded-parked=${Number(discarded && out.outcome === 'parked')} discarded-bounced=${Number(discarded && out.outcome === 'bounced')} stale=${Number(decision === 'stale')} skipped-infra=${Number(Boolean(seatsBox.skippedInfra))}`);
   }
+  out.timings.totalMs = io.now() - jobStartedAt;
   return out;
 }
 
@@ -1416,10 +1533,19 @@ function runReviewArc({
         seatsBox.speculative = null;
       }
     }
+    if (seatsBox.concurrentEnabled && typeof io.startSpeculativeSeats === 'function') {
+      try {
+        const [prior] = markSelfReportedDone([{ name: slug, state: 'working', startedAt: 0, sessionId: seatsBox.prevCompletion?.sessionId }],
+          () => seatsBox.prevCompletion, io.now());
+        const blocked = prior.awaitingInfraCooloff || io.reviewInfraBlock?.({ pr: planned.pr, repo: planned.repo, slug });
+        if (!blocked) seatsBox.concurrent = io.startSpeculativeSeats({ pr: planned.pr, repo: planned.repo, lanePath, slug,
+          waitMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink });
+      } catch (e) { io.log(`review-job ${slug}: concurrent added seats did not start (${tail(e?.message ?? e, 200)}) — sequential order`); }
+    }
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? null });
+    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);

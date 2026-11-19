@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnKeepAlive } from '../../lib/test-keepalive.mjs';
 
-import { createReviewJobIo, runReviewJob, settleSpeculativeRedTeam } from '../review-job.mjs';
+import { createReviewJobIo, runReviewJob, settleSpeculativeRedTeam, settleSpeculativeSeats } from '../review-job.mjs';
 import {
   speculateRedTeam, finishSpeculativeRedTeam, runRedTeam, buildRedTeamDiscardRow, reserveSeatCalls,
   RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam, ACTIVE_SEAT_PIDS, killActiveSeats,
@@ -626,4 +626,95 @@ describe('durable run seat timing handoff', () => {
     expect(rows).toContainEqual({ seat: 'advisory', lens: 'simplicity', provider: 'codex', model: 'test', startedAt, finishedAt, verdict: 'changes', findingsCount: 2 });
     expect(rows).toContainEqual({ seat: 'red-team', lens: 'red-team', provider: 'codex', model: null, startedAt, finishedAt, verdict: 'accept', findingsCount: 0 });
   });
+});
+
+
+describe('added seats concurrent evidence', () => {
+  function seatsIo({ moved = false, enabled = true, verdict = 'accept', stopped = 'complete', extra = {} } = {}) {
+    const { io, calls } = jobIo({ verdict, over: {
+      speculativeRedTeamSetting: () => ({ enabled: false }),
+      runRedTeam: undefined,
+      concurrentSeatsSetting: () => ({ enabled, value: enabled, source: 'tool' }),
+      startSpeculativeSeats: () => { calls.push(['seats-start']); return { readSink: '/jobs/seats-read', startedAt: Date.now() }; },
+      runLoop: o => { calls.push(['loop']); expect(o.readSink).toBe(enabled ? '/jobs/seats-read' : null);
+        return { status: 0, stdout: JSON.stringify({ ...payload(verdict, read(moved ? 'b'.repeat(40) : REV)), stopped }) }; },
+      awaitSpeculativeSeats: () => { calls.push(['seats-await']); return { spec: PASS }; },
+      finishSpeculativeSeats: o => { calls.push(['seats-finish']); expect(o.loopPayload.findings.read.netBasis.rev).toBe(REV); return { status: 'ran', seats: [] }; },
+      cancelSpeculativeSeats: () => { calls.push(['seats-cancel']); return { spec: PASS }; },
+      recordDiscardedSeats: () => { calls.push(['seats-discard']); return { status: 'recorded' }; },
+      cleanupSpeculativeSeats: () => calls.push(['seats-cleanup']),
+      runExtraSeats: () => { calls.push(['seats-sequential']); return { status: 'ran', seats: [] }; },
+      ...extra,
+    } });
+    return { io, calls };
+  }
+  it('starts before the loop and uses matching evidence, logging counters and job timings', () => {
+    const { io, calls } = seatsIo();
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).toEqual(['seats-start', 'loop', 'seats-await', 'seats-finish', 'seats-cleanup']);
+    expect(out.extraSeats.status).toBe('ran');
+    expect(out.timings).toMatchObject({ loopMs: expect.any(Number), seatsMs: expect.any(Number), seatsConcurrent: true });
+    expect(calls).toContainEqual(['log', expect.stringContaining('seatsConcurrent counters: started=1 used=1 discarded=0')]);
+  });
+  it.each([
+    ['bounce', { verdict: 'changes' }], ['park', { verdict: 'needs-human', stopped: 'confirm' }],
+    ['head move', { moved: true }], ['missing read sink', { extra: { speculativeSeatsReadSunk: () => false } }],
+    ['failed pass', { extra: { awaitSpeculativeSeats: () => ({ spec: null }) } }],
+    ['timed out pass', { extra: { awaitSpeculativeSeats: () => ({ spec: PASS, timedOut: true }) } }],
+    ['missing final input', { stopped: 'step-refused' }],
+    ['infra block', { extra: { runLoop: () => ({ status: 1, stdout: JSON.stringify({ stopped: 'step-refused', error: 'weekly limit' }) }) } }],
+    ['final-head gate', { extra: { finalHeadSeatsSetting: () => ({ mode: 'on' }), liveHead: () => 'b'.repeat(40) } }],
+  ])('discards on %s, records spend, and never applies or reruns evidence', (_label, options) => {
+    const { io, calls } = seatsIo(options);
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(out.extraSeats.status).toBe('discarded');
+    expect(kinds(calls)).toContain('seats-cancel');
+    expect(kinds(calls)).toContain('seats-discard');
+    expect(kinds(calls)).not.toContain('seats-finish');
+    expect(kinds(calls)).not.toContain('seats-sequential');
+    expect(kinds(calls)).toContain('seats-cleanup');
+  });
+  it('preserves the final-head gate fail-open policy on an unreadable live-head lookup', () => {
+    const { io, calls } = seatsIo({ extra: { finalHeadSeatsSetting: () => ({ mode: 'on' }), liveHead: () => { throw Error('unreadable'); } } });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(out.extraSeats.status).toBe('ran');
+    expect(kinds(calls)).toContain('seats-finish');
+    expect(kinds(calls)).not.toContain('seats-sequential');
+  });
+  it('off retains sequential order', () => {
+    const { io, calls } = seatsIo({ enabled: false });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).toEqual(['loop', 'seats-sequential']);
+    expect(out.timings.seatsConcurrent).toBe(false);
+  });
+  it('a missing start hook retains sequential order', () => {
+    const { io, calls } = seatsIo({ enabled: false, extra: { concurrentSeatsSetting: () => ({ enabled: true }), startSpeculativeSeats: undefined } });
+    runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).toEqual(['loop', 'seats-sequential']);
+  });
+  it('shares the red-team read sink while both workers run', () => {
+    const { io } = seatsIo({ extra: {
+      speculativeRedTeamSetting: () => ({ enabled: true }),
+      startSpeculativeSeats: o => { expect(o.readSink).toBe('/jobs/sink.json'); return { readSink: o.readSink, startedAt: Date.now() }; },
+      runLoop: o => { expect(o.readSink).toBe('/jobs/sink.json'); return { status: 0, stdout: JSON.stringify(payload('accept')) }; },
+    } });
+    expect(runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io).extraSeats.status).toBe('ran');
+  });
+});
+
+
+it('the extra-seats kill switch prevents a real concurrent worker start', () => {
+  expect(createReviewJobIo({ env: { WE_REVIEW_EXTRA_SEATS: '0' } }).startSpeculativeSeats({})).toBeNull();
+});
+
+
+it('discard remains terminal when spend accounting fails', () => {
+  let finished = false;
+  const out = settleSpeculativeSeats({ spec: {}, out: { outcome: 'bounced' } }, {
+    cancelSpeculativeSeats: () => ({ reserved: {} }),
+    recordDiscardedSeats: () => { throw Error('store unavailable'); },
+    finishSpeculativeSeats: () => { finished = true; },
+  });
+  expect(out).toMatchObject({ status: 'discarded', reason: 'review bounced', spend: { status: 'error' } });
+  expect(finished).toBe(false);
 });

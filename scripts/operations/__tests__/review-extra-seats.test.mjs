@@ -16,7 +16,7 @@ import {
   reviewSeatRoutes, ROUTED_ADVISORY_LENSES, EXTRA_JUROR_MANDATE, REVIEW_SEAT_MODELS,
 } from '../review-dispatch.mjs';
 import {
-  runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
+  runExtraSeatsCli, speculateExtraSeats, finishExtraSeats, recordDiscardedSeats, runExtraSeats, extraSeatsEnabled, resolveDailyCap, callsUsedToday, callsUsedTodayForProvider, quotaHold,
   PROBE_INTERVAL_ENV, DEFAULT_PROBE_INTERVAL_MS, resolveProbeIntervalMs, probeDue, quotaHoldOrProbe,
   claudeFindingsFromLoop, buildSeatTask, SEAT_ANSWER_CONTRACT, parseSeatAnswer, classifySeatCall, buildSeatRows, seatCallArgv, capDay,
   renderSeatSummary, EXTRA_SEATS_ENV, DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAULT,
@@ -1833,4 +1833,87 @@ else process.exitCode = 1;
     if (refuses) expect(call).toThrow(/outage/);
     else expect(call()).toEqual({ published: false, reason: 'outage' });
   });
+});
+
+
+describe('split added seats pass', () => {
+  it('reserves before calls, writes no seat rows speculatively, and finishes with actual Claude comparisons', async () => {
+    const { io, calls, rows } = fakeSeatIo();
+    const reserved = [];
+    const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {},
+      onReserved: r => { expect(calls.filter(c => c[0] === 'seat')).toHaveLength(0); reserved.push(structuredClone(r)); } }, io);
+    expect(pass.status).toBe('speculated');
+    expect(pass.rev).toBe(LOOP_PAYLOAD.findings.read.netBasis.rev);
+    expect(rows).toEqual([]);
+    expect(reserved.at(-1).reservations.length).toBeGreaterThan(0);
+    const expected = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: {} }, fakeSeatIo().io);
+    const result = await finishExtraSeats({ pass, loopPayload: LOOP_PAYLOAD, env: {} }, io);
+    expect(result).toEqual(expected);
+    expect(rows).toEqual(result.seats);
+  });
+  it.each([null, 'b'.repeat(40)])('refuses missing or moved final head %s without applying evidence', async rev => {
+    const { io, rows } = fakeSeatIo();
+    const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {} }, io);
+    const loopPayload = structuredClone(LOOP_PAYLOAD);
+    loopPayload.findings.read.netBasis.rev = rev;
+    expect((await finishExtraSeats({ pass, loopPayload, env: {} }, io)).status).toBe('discarded');
+    expect(rows).toEqual([]);
+  });
+  it('records every reserved call once as unscored discarded spend, never as seat results', () => {
+    const { io, rows } = fakeSeatIo();
+    const reservations = [{ callId: 'one', provider: 'codex', model: 'm', rev: 'a'.repeat(40) }, { callId: 'two', provider: 'agy-gemini', model: 'm', rev: 'a'.repeat(40) }];
+    expect(recordDiscardedSeats({ pr: 5, repo: REPO, pass: { reservations }, reserved: { reservations }, reason: 'head moved' }, io).rowsWritten).toBe(2);
+    for (const row of rows) {
+      expect(row).toMatchObject({ dispatchKind: 'review-seat-speculative-discard', criteriaEvaluated: 0, score: null, seat: 'added-seats', reason: 'head moved' });
+      expect(validateScorecard({ v: 1, ...row }).ok).toBe(true);
+    }
+  });
+});
+
+
+it('seats-speculate CLI writes pass and reservation files before seats-finish applies comparisons', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'added-seats-cli-'));
+  const sink = join(dir, 'read.json');
+  const out = join(dir, 'pass.json');
+  const loop = join(dir, 'loop.json');
+  const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  try {
+    writeFileSync(sink, JSON.stringify({ read: LOOP_PAYLOAD.findings.read }));
+    writeFileSync(loop, JSON.stringify(LOOP_PAYLOAD));
+    const { io, rows } = fakeSeatIo();
+    const seat = io.runSeat;
+    io.runSeat = o => {
+      expect(JSON.parse(readFileSync(`${out}.reserved`, 'utf8')).reservations.length).toBeGreaterThan(0);
+      return seat(o);
+    };
+    await runExtraSeatsCli(['seats-speculate', '--pr=5', `--repo=${REPO}`, '--lane=unused', `--read-sink=${sink}`, `--out=${out}`], { seatsIo: io });
+    expect(JSON.parse(readFileSync(out, 'utf8'))).toMatchObject({ status: 'speculated', rev: LOOP_PAYLOAD.findings.read.netBasis.rev });
+    expect(rows).toEqual([]);
+    await runExtraSeatsCli(['seats-finish', '--pr=5', `--repo=${REPO}`, `--pass=${out}`, `--loop-json=${loop}`], { seatsIo: io });
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0].claudeVerdict).toBe('changes');
+  } finally {
+    stdout.mockRestore(); stderr.mockRestore(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('incomplete added-seat passes write no comparison rows', async () => {
+  const { io, rows } = fakeSeatIo();
+  for (const calls of [[], [{}]]) {
+    const result = await finishExtraSeats({ pass: { status: 'speculated', rev: LOOP_PAYLOAD.findings.read.netBasis.rev, calls }, loopPayload: LOOP_PAYLOAD, env: {} }, io);
+    expect(result.status).toBe('discarded');
+  }
+  expect(rows).toEqual([]);
+});
+
+
+it('a corrupt later call discards the whole pass before any comparison row is applied', async () => {
+  const { io, rows } = fakeSeatIo();
+  const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {} }, io);
+  const corrupt = structuredClone(pass.calls[0]);
+  corrupt.parsed = Object.fromEntries(corrupt.seats.map(s => [s.key, { ok: true, findings: null }]));
+  pass.calls.push(corrupt);
+  expect((await finishExtraSeats({ pass, loopPayload: LOOP_PAYLOAD, env: {} }, io)).status).toBe('discarded');
+  expect(rows).toEqual([]);
 });

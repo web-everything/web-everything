@@ -32,6 +32,8 @@ import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { resolveCascade } from './policy-cascade.mjs';
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 export const SPECULATIVE_RED_TEAM_ENV = 'WE_REVIEW_SPECULATIVE_RED_TEAM';
@@ -135,4 +137,19 @@ export function speculativeSeatTimings(pass, reserved = null) {
     startedAt: source.startedAt, finishedAt: source.finishedAt ?? null,
     verdict: pass?.parsed?.['red-team']?.verdict ?? source.verdict ?? null,
     findingsCount: Array.isArray(pass?.findings) ? pass.findings.length : source.findingsCount ?? null }];
+}
+
+/** Added evidence seats share the red team's cascade; false restores the single-shot order. */
+export function resolveConcurrentSeats({ env = {}, tool, platform } = {}) {
+  const r = resolveCascade({ standard: true, platform, tool,
+    envValues: env.WE_REVIEW_EXTRA_SEATS_CONCURRENT === undefined ? {} : { '': env.WE_REVIEW_EXTRA_SEATS_CONCURRENT },
+    valid: value => normOnOff(value) !== null });
+  const enabled = normOnOff(r.value) === 'on';
+  return { value: enabled, enabled, source: r.sources[''], invalid: r.invalid };
+}
+
+export function loadConcurrentSeats({ env = process.env, toolFile = TOOL_SETTINGS_FILE, platformFile = PLATFORM_PREFERENCES_FILE,
+  readFile = p => readFileSync(p, 'utf8') } = {}) {
+  const read = p => { try { return JSON.parse(readFile(p)); } catch { return null; } };
+  return resolveConcurrentSeats({ env, tool: read(toolFile)?.extraSeats?.concurrent, platform: read(platformFile)?.review?.extraSeats?.concurrent });
 }
