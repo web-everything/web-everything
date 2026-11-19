@@ -13,6 +13,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { collectImportClosure } from '../../lib/import-closure.mjs';
+import * as retryPolicy from '../infra-retry-policy.mjs';
 import {
   classifyPrOpenFailure,
   correlateCause,
@@ -565,6 +567,18 @@ describe('infra recovery requires an injected runtime admission adapter', () => 
 });
 
 describe('infra-blocked retry CLI supplies runtime admission', () => {
+  it('keeps both CLI admission dependencies in a complete static closure', () => {
+    const closure = collectImportClosure({ root: process.cwd(), entries: ['scripts/conveyor/infra-blocked.mjs'] });
+    expect(closure?.complete).toBe(true);
+    for (const file of ['scripts/lib/runtime-admission.mjs', 'scripts/operations/build-pr-authorship.mjs']) {
+      expect(closure.files.has(file), file).toBe(true);
+    }
+    // Preserve the public API while the watchdog uses the same implementation
+    // through the policy leaf, without reaching recovery or driver decisions.
+    expect(backoffMs).toBe(retryPolicy.backoffMs);
+    expect(retryDecision).toBe(retryPolicy.retryDecision);
+  });
+
   it('fails closed before recovery when the admission adapter cannot load', () => {
     const dir = mkdtempSync(join(tmpdir(), 'infra-cli-load-failure-'));
     try {

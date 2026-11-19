@@ -4878,18 +4878,18 @@ in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and 
 
 ## Infra recovery admission injection and watchdog isolation
 
-`infra-blocked.mjs` belongs to the watchdog's pinned small import closure. Keep runtime
-admission policy imports out of its library import path. The build daemon's `--infra-retry`
+The watchdog reaches only `infra-retry-policy.mjs` through `branch-sync.mjs`; that leaf
+shares timing and caps without recovery IO or driver admission decisions. Keep the
+watchdog's pinned import closure independent of `infra-blocked.mjs` and runtime admission.
+The build daemon's `--infra-retry`
 entry injects the historical context reader and both shared admission functions into `runInfraBlocked` and
 `resumeOpen`. The runner retains its historical `infra-blocked.mjs retry` command; that CLI's
-main guard loads the same adapter and context reader through template imports only when running `retry`.
-Keep non-literal template specifiers with an explicit `.mjs` suffix and `@vite-ignore`: Vitest's web
-transform otherwise prepends a query helper before the shebang, causing SSR parsing to fail.
-Literal dynamic imports are followed by the watchdog graph scanner even inside the CLI guard.
+main guard loads the same adapter and context reader through literal dynamic imports only when running `retry`.
+Keep the targets literal so import-closure consumers can prove the graph complete. Computed
+targets make review staleness, promotion and live-smoke checks fall back to treating all code as relevant.
 The CLI adapter-load failure regression must exit nonzero without changing recovery state;
 never fall back to recovery without admission.
-These CLI-only imports do not execute on watchdog import; closure tools unable to resolve template
-imports must continue treating that closure as incomplete. Direct library recovery without a
+The watchdog never imports the recovery module. Direct library recovery without a
 complete adapter refuses before subprocess IO; retry through either CLI entry to restore the policy boundary.
 `infra-blocked.test.mjs` exercises the actual CLI with absent/lift runtime settings (including exact
 producer argv), an empty allowlist, and malformed settings, with subprocess and network effects stubbed.

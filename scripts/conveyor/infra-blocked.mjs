@@ -45,33 +45,24 @@ import { join, dirname, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { normNum } from './queue-store.mjs';
+import { backoffMs, retryDecision, toMs, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_REFUSALS } from './infra-retry-policy.mjs';
+export { backoffMs, retryDecision, DEFAULT_BASE_MS, DEFAULT_FACTOR, DEFAULT_CAP_MS,
+  DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_REFUSALS } from './infra-retry-policy.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // #4348-open-pr-retry addendum — the SAME reason→bucket table `open-pr.mjs`'s own operation already declares
 // (`unverified`/`check-red`/`bad-ref`/… → `refused`; `blocked-on-infra`/`gh-error`/… → `unrun`), reused here
 // rather than re-derived: `resumeOpen` needs the identical "did a guard answer, or did the environment simply
 // fail to run" split, for the identical reason (never let a fixable refusal masquerade as an unresolved outage).
-// Imported from the table's LEAF, never `open-pr.mjs` itself: this module is in the driver-watchdog's pinned
-// import graph, which must not pull in the operation registry (`driver-watchdog.test.mjs`).
+// Import the reason table's leaf rather than the whole open-pr operation.
 import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 
 // ── TUNING (exported so a caller/test can override; the conveyor tick uses the defaults) ──────────────────────
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 
-/** Backoff base: the wait after the FIRST failure before the first retry (30s). */
-export const DEFAULT_BASE_MS = 30_000;
-/** Backoff multiplier per attempt (doubling). */
-export const DEFAULT_FACTOR = 2;
-/** Backoff ceiling: no single wait exceeds 30 min however many attempts have failed. */
-export const DEFAULT_CAP_MS = 30 * 60_000;
-/** Attempt cap: after this many FAILED open attempts, stop auto-retrying and SURFACE to the operator. */
-export const DEFAULT_MAX_ATTEMPTS = 6;
 /** Refusal wait: a FIXED interval between resumes that a guard REFUSED (no doubling — waiting does not fix a
  *  refusal, this only stops a zero-delay loop against git/GitHub). */
 export const DEFAULT_REFUSAL_INTERVAL_MS = 5 * 60_000;
-/** Refusal cap: after this many consecutive refusals (~1h at the interval above), SURFACE to the operator. Its
- *  own budget, separate from {@link DEFAULT_MAX_ATTEMPTS} — see {@link markRefusedAttempt}. */
-export const DEFAULT_MAX_REFUSALS = 12;
 /** Auto re-arm knob: how many times the product may itself lift an entry off the attempt cap once the outage that
  *  burned it has passed (0 disables). Override per pass with `--max-auto-rearms=` or env INFRA_MAX_AUTO_REARMS. */
 export const DEFAULT_MAX_AUTO_REARMS = 2;
@@ -80,13 +71,6 @@ export const DEFAULT_REARM_COOLOFF_MS = 60 * 60_000;
 
 // ── PURE CORE (no fs / clock / gh / network — every input is injected) ────────────────────────────────────────
 
-/** ms since epoch for an ISO string (or a number passed through), NaN-safe → 0. */
-function toMs(iso) {
-  if (iso == null) return 0;
-  if (typeof iso === 'number') return Number.isFinite(iso) ? iso : 0;
-  const t = Date.parse(String(iso));
-  return Number.isNaN(t) ? 0 : t;
-}
 const iso = (ms) => new Date(ms).toISOString();
 
 /**
@@ -165,19 +149,6 @@ export function clusterByCause(members) {
   for (const [cause, list] of groups) out.push({ cause, count: list.length, members: list });
   out.sort((a, b) => b.count - a.count || a.cause.localeCompare(b.cause));
   return out;
-}
-
-/**
- * The backoff wait (ms) BEFORE the retry that follows a given failed attempt. `attempt` is 1-based (1 = the
- * initial failed open): wait = min(cap, base · factor^(attempt-1)). Deterministic (no jitter) so the retry
- * schedule is unit-testable; the conveyor tick's own cadence supplies the real-world spread.
- * @param {number} attempt  the 1-based number of the attempt that just failed
- * @returns {number} ms to wait before the next retry
- */
-export function backoffMs(attempt, { baseMs = DEFAULT_BASE_MS, factor = DEFAULT_FACTOR, capMs = DEFAULT_CAP_MS } = {}) {
-  const n = Math.max(1, Math.floor(Number(attempt) || 1));
-  const raw = baseMs * Math.pow(factor, n - 1);
-  return Math.min(capMs, Math.max(0, raw));
 }
 
 /** `{ autoRearms }` to spread onto a parsed entry — absent/null/0 = unspent; a corrupt counter fails CLOSED as spent. */
@@ -425,27 +396,6 @@ export function autoRearmUnderLock(num, cause, { now = Date.now(), maxAttempts =
 /** Serialize the store back to `.conveyor/infra-blocked.json` text (a bare JSON array, newline-terminated). */
 export function serializeInfraStore(store) {
   return JSON.stringify(Array.isArray(store) ? store : [], null, 2) + '\n';
-}
-
-/**
- * The retry decision for ONE entry, given the clock. Pure state machine:
- *   • `attempt >= maxAttempts` → **surface** — the attempt cap is hit; STOP auto-retrying and hand to the
- *     operator (never loop a doomed resume forever).
- *   • `refusals >= maxRefusals` → **surface** — a guard kept refusing the resume; same hand-off, own budget.
- *   • `now >= nextRetryAt`     → **retry** — the backoff has elapsed; attempt a resume-open this pass.
- *   • otherwise                → **wait**  — still backing off; `waitMs` is how long remains.
- * @param {{attempt?:number, refusals?:number, nextRetryAt?:string}} entry
- * @param {{now?:number, maxAttempts?:number, maxRefusals?:number}} o
- * @returns {{action:'surface'|'retry'|'wait', reason?:string, waitMs?:number}}
- */
-export function retryDecision(entry, { now = Date.now(), maxAttempts = DEFAULT_MAX_ATTEMPTS, maxRefusals = DEFAULT_MAX_REFUSALS } = {}) {
-  const attempt = Math.max(1, Math.floor(Number(entry?.attempt) || 1));
-  if (attempt >= maxAttempts) return { action: 'surface', reason: 'attempt-cap' };
-  if (Math.floor(Number(entry?.refusals) || 0) >= maxRefusals) return { action: 'surface', reason: 'refusal-cap' };
-  const nowMs = toMs(now) || Number(now) || Date.now();
-  const dueMs = toMs(entry?.nextRetryAt);
-  if (nowMs >= dueMs) return { action: 'retry' };
-  return { action: 'wait', waitMs: dueMs - nowMs };
 }
 
 /**
@@ -943,18 +893,14 @@ export async function runInfraBlocked(argv, { admission, readContext } = {}) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  // Load driver policy only for the CLI, never when the watchdog imports the
-  // state/backoff helpers. Non-literal templates keep this CLI-only boundary out
-  // of the watchdog's static graph. Keep the explicit .mjs suffix: Vite otherwise
-  // prepends a query helper before this file's shebang during its web transform.
+  // Load driver policy only for retry CLI execution. Literal targets keep the
+  // static closure complete; the watchdog imports only infra-retry-policy.mjs.
   const runCli = async () => {
     const argv = process.argv.slice(2);
     if (parseArgv(argv).pos[0] !== 'retry') return runInfraBlocked(argv);
-    const admissionModule = 'runtime-admission';
-    const authorshipModule = 'build-pr-authorship';
     const [admission, authorship] = await Promise.all([
-      import(/* @vite-ignore */ `../lib/${admissionModule}.mjs`),
-      import(/* @vite-ignore */ `../operations/${authorshipModule}.mjs`),
+      import('../lib/runtime-admission.mjs'),
+      import('../operations/build-pr-authorship.mjs'),
     ]);
     return runInfraBlocked(argv, { admission, readContext: authorship.producerBuildContext });
   };

@@ -52,7 +52,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, appendF
 import { basename, dirname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { backoffMs, retryDecision } from './infra-blocked.mjs';
+import { backoffMs, retryDecision } from './infra-retry-policy.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { ensureFullHistory } from '../lib/git-run.mjs';
 import { gateAlert } from '../lib/quiet-hours-io.mjs';
