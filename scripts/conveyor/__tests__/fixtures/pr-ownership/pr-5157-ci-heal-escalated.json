@@ -8,6 +8,8 @@
   "headRefName": "lane/5945-test-gaming-detector-strings",
   "baseRefName": "main",
   "headRefOid": "63e519fead8b89c56bb43990e703716d02e41e1c",
+  "rowsComplete": true,
+  "rowsHead": "63e519fead8b89c56bb43990e703716d02e41e1c",
   "mergeStateStatus": "BLOCKED",
   "labels": [
    {

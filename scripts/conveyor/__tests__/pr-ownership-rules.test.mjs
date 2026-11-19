@@ -82,7 +82,7 @@ describe('cards 273 and 278 incident replays', () => {
     const empty = planReconcile({ ...options, prs: [{ ...fx.pr, comments: [] }] });
     expect(empty.dispatch).toEqual([]);
     expect(empty.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings' }));
-    const moved = { ...fx.pr, headRefOid: 'b'.repeat(40) };
+    const moved = { ...fx.pr, headRefOid: 'b'.repeat(40), rowsHead: 'b'.repeat(40) };
     for (const addressed of [false, true]) {
       const pr = { ...moved, comments: [...moved.comments,
         ...(addressed ? [{ author: { login: 'web-everything' }, body: buildAdvisoryFixComment({}) }] : [])] };
