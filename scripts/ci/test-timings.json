@@ -1111,6 +1111,7 @@
   "scripts/lib/__tests__/host-overload-settings.test.mjs": 0.02,
   "scripts/lib/__tests__/host-path-scan.test.mjs": 0.93,
   "scripts/lib/__tests__/host-sample.test.mjs": 0.01,
+  "scripts/lib/__tests__/hot-patch.test.mjs": 1,
   "scripts/lib/__tests__/human-clearance-carry.test.mjs": 11.87,
   "scripts/lib/__tests__/human-clearance-mechanical-carry-setting.test.mjs": 0.02,
   "scripts/lib/__tests__/human-only-enqueue-license.test.mjs": 57.54,

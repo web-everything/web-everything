@@ -5293,3 +5293,30 @@ an abandoned lease's candidate worktree. The actionable-swap
 fixture asserts registry, event and swap bytes survive launch plus child prepare,
 with only the child's build lease changing in rebuild state, and proves the same
 swap removes the original registration when ordinary cleanup is called.
+
+
+## Hot-patch tier (R1100)
+
+`hot-patch.test.mjs` covers the settings cascade, never-patch touch classes, owed deadlines,
+late red verify rollback, and targeted/rate-limited wakes. The existing force-adopt rebuild
+suite covers passing smoke, deferred adoption, missing lastGood, unreadable watch, rollback
+and merged-PR closure. Settings live in `scripts/lib/hot-patch-settings.json` (`hotPatch` cascade;
+`WE_HOT_PATCH` JSON override). Use `scripts/hot-patch.mjs status` for ET deadlines and watch state.
+`urgent-verify` records completed green/red results automatically; `verify-result` is the explicit
+retry/integration point. Unknown state requires ledger/watch repair or ordinary verified delivery.
+Run affected suites and standards only through the host heavy-admission queue.
+CLI eligibility always reads the complete diff between pinned `origin/main` and the registered
+commit, with rename detection disabled to retain both endpoints. `--files` is checked against
+that evidence; it cannot omit protected changes. The CLI regressions use local Git commits
+and refuse falsified lists, protected renames, missing objects and incomplete diff output.
+
+
+## Hot-patch S2 checklist regressions
+
+`hot-patch.test.mjs` names closed paths with `checklist-N:` and uses local origin/clone
+commits plus the real rebuild state directory. Registration and wake failures must leave
+no open ledger or pending reservation. Keep the post-write race probes wrapping real
+filesystem writes, and exercise rollback retry in a fresh Node process so in-memory
+markers cannot substitute for persisted evidence. Hot-patch watches keep their exact
+build binding when HEAD moves; ordinary force-adopt watches retain their successor behavior.
+Owed reconciliation runs inside the existing force-watch tick, without another scheduler.

@@ -5,6 +5,8 @@ import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, ur
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
+import * as urgentIo from '../urgent-verify.mjs';
+import * as hotPatchIo from '../../lib/hot-patch.mjs';
 
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
@@ -14,6 +16,27 @@ const marker = sign( { sha, fuiSha: sha, fuiRepo: urgentFuiRepo, suite: 'full', 
 const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, expectedSteps, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
 
 describe('urgent marker', () => {
+  it.each(['green', 'red'])('completed urgent-verify %s reaches only matching open hot-patches', async result => {
+    const verify = vi.spyOn(urgentIo, 'urgentVerify').mockResolvedValue({ ok: result === 'green', marker: { sha, result } });
+    const list = vi.spyOn(hotPatchIo, 'listHotPatches').mockReturnValue([
+      { root: 'clone-a', sha }, { root: 'clone-b', sha: 'b'.repeat(40) }, { root: 'clone-c', sha },
+    ]);
+    const record = vi.spyOn(hotPatchIo, 'recordVerifyResult').mockResolvedValue({ ok: true });
+    try {
+      await resolveOperation('urgent-verify').sinks['urgent-verify.run']({ sha });
+      expect(record.mock.calls.map(([input]) => input)).toEqual([
+        { root: 'clone-a', sha, result }, { root: 'clone-c', sha, result },
+      ]);
+    } finally { verify.mockRestore(); list.mockRestore(); record.mockRestore(); }
+  });
+  it('an incomplete urgent-verify result never declares a hot-patch green', async () => {
+    const verify = vi.spyOn(urgentIo, 'urgentVerify').mockResolvedValue({ ok: false, detail: 'unavailable' });
+    const list = vi.spyOn(hotPatchIo, 'listHotPatches');
+    try {
+      await resolveOperation('urgent-verify').sinks['urgent-verify.run']({ sha });
+      expect(list).not.toHaveBeenCalled();
+    } finally { verify.mockRestore(); list.mockRestore(); }
+  });
   it('accepts an exact full green marker', () => expect(check()).toMatchObject({ ok: true, evidence: { source: 'urgent-local-full', marker } }));
   it.each([
     ['wrong sha', { sha: 'b'.repeat(40) }], ['short sha record', { sha: sha.slice(0, 8) }],

@@ -28,6 +28,7 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { openHotPatchWatch } from '../hot-patch.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -611,6 +612,13 @@ export async function smokeAndAdopt({
    *  FIRST, so a lock refusal here never throws it away — the next write-lock holder (this process's next tick, or
    *  a sibling at its own tick start) adopts it without re-smoking (see prepareRebuild). */
   const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null, { overFailedSmoke = false } = {}) => {
+    const hot = openHotPatchWatch({ root, env: stEnv, plan: p, lastGood: readRebuildState(root, stEnv).adopted,
+      smokePassed: smokeResult?.verdict === 'pass', now });
+    if (!hot.ok) {
+      await locked(null, { release: true });
+      alert('hot-patch-adoption-refused', { reason: hot.reason, target: p.finalSha });
+      return { moved: false, reason: 'hot-patch-adoption-refused', detail: hot.reason, plan: p };
+    }
     // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
     const busySkipped = busyPoolSkippedChecks(smokeResult);
     if (busySkipped.length) {

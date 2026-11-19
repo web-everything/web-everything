@@ -15,6 +15,8 @@ import {
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
+import { requestHotPatch, recordHotPatchPr, readHotPatch, recordVerifyResult } from '../hot-patch.mjs';
+import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason } from '../daemon-force-adopt.mjs';
@@ -136,6 +138,78 @@ const QUOTE = 'adopt the build even though smoke failed for infra';
 const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false }] } }));
 const headOf = (dir) => gitOk(dir, ['rev-parse', 'HEAD']).trim();
 const forceEnv = (env, base) => ({ ...env, WE_FORCE_ADOPT_HANDOFF: join(base, 'handoff.md'), WE_FORCE_ADOPT_CORONER: join(base, 'coroner.jsonl'), WE_DAEMON_EVENTS: join(base, 'events.jsonl') });
+
+describe('R1100 hot-patch smoke adoption', () => {
+  it.each(['verify-red', 'health-failed'])('rollback withdraws and clears hot-patch through the normal rebuild tick: %s', async (reason) => {
+    const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
+    const env = forceEnv(initialEnv, base), lastGood = headOf(cloneDir);
+    writeRebuildState(cloneDir, { adopted: { head: lastGood, mainSha: lastGood, inputsKey: 'initial', applied: [] } }, env);
+    const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
+      kind: 'incident', files: ['scripts/lib/daemon-tool.mjs'] });
+    const tick = { root: cloneDir, env, prState: async () => null, lockOpts: LOCK_OPTS,
+      runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) };
+    await rebuildClone({ ...tick, forceWatchProbe: async () => ({ healthy: true }) });
+    if (reason === 'verify-red') await recordVerifyResult({ root: cloneDir, env, sha: target, result: 'red' });
+    await rebuildClone({ ...tick, forceWatchProbe: async () => ({ healthy: reason === 'verify-red' }) });
+    expect(headOf(cloneDir)).toBe(lastGood); expect(readHotPatch(cloneDir, env)).toBeNull();
+  });
+
+  it('planner merged-PR evidence closes the owed ledger without a new PR-state reader', async () => {
+    const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
+    const env = forceEnv(initialEnv, base);
+    const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    addOverlay(cloneDir, { ref: 'lane/hot', pinned: true }, { env });
+    await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
+      kind: 'incident', files: ['scripts/lib/daemon-tool.mjs'] });
+    expect(recordHotPatchPr({ root: cloneDir, env, sha: target, pr: 42 }).ok).toBe(true);
+    await rebuildClone({ root: cloneDir, env, prState: async () => 'MERGED', lockOpts: LOCK_OPTS,
+      runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) });
+    expect(readHotPatch(cloneDir, env)).toBeNull();
+  });
+
+  it.each([false, true])('passing smoke opens 10 ticks plus 15 minutes, including ready adoption=%s', async (deferred) => {
+    const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
+    const env = forceEnv(initialEnv, base), lastGood = headOf(cloneDir);
+    writeRebuildState(cloneDir, { adopted: { head: lastGood, mainSha: lastGood, inputsKey: 'initial', applied: [] } }, env);
+    const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
+      kind: 'daemon-tooling', files: ['scripts/lib/daemon-tool.mjs'] });
+    const runSmoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    const tick = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      skipCheck: () => ({ skip: true }), forceWatchProbe: async () => ({ healthy: true }) };
+    const started = Date.now();
+    const result = await rebuildClone({ ...tick, readyOnly: deferred });
+    if (deferred) {
+      expect(result.readyRecorded).toBe(true);
+      expect(headOf(cloneDir)).toBe(lastGood);
+      await rebuildClone(tick);
+    }
+    expect(runSmoke).toHaveBeenCalled();
+    const adopted = headOf(cloneDir);
+    // Overlay composition may create a build commit distinct from the patch tip.
+    gitOk(cloneDir, ['merge-base', '--is-ancestor', target, adopted]);
+    expect(gitOk(cloneDir, ['show', `${adopted}:fix.mjs`])).toBe('export const fixed = true;\n');
+    expect(readHotPatch(cloneDir, env).adoptedSha).toBe(adopted);
+    const watch = readForceWatch(cloneDir, env);
+    expect(watch).toMatchObject({ sha: adopted, hotPatchSha: target, ticksLeft: 10, lastGood: { head: lastGood } });
+    expect(Date.parse(watch.minUntil)).toBeGreaterThanOrEqual(started + 15 * 60000);
+  });
+
+  it.each(['unknown-last-good', 'unreadable-watch', 'smoke-failed'])('hot-patch refuses adoption: %s', async (failure) => {
+    const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
+    const env = { ...forceEnv(initialEnv, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
+    const lastGood = headOf(cloneDir);
+    if (failure !== 'unknown-last-good') writeRebuildState(cloneDir, { adopted: { head: lastGood, mainSha: lastGood, inputsKey: 'initial', applied: [] } }, env);
+    const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
+      kind: 'daemon-tooling', files: ['scripts/lib/daemon-tool.mjs'] });
+    if (failure === 'unreadable-watch') writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`), '{bad');
+    const runSmoke = failure === 'smoke-failed' ? failing() : vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, forceWatchProbe: async () => ({ healthy: true }) });
+    expect(runSmoke).toHaveBeenCalled(); expect(headOf(cloneDir)).toBe(lastGood);
+  });
+});
 
 describe('R508 force-adopt through rebuildClone', () => {
   it('without a force request a failed smoke still holds on last-good (unchanged)', async () => {

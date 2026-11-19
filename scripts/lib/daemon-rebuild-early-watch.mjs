@@ -8,6 +8,7 @@ import { daemonEventsPath } from './daemon-events.mjs';
 import { repoKeyForSlug } from './constellation-repos.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { decideEarlyLaunch } from './daemon-rebuild-early-launch.mjs';
+import { resolve } from 'node:path';
 
 export function resolveEarlyLaunch({ entries = [], env = process.env, log = () => {}, tool } = {}) {
   if (tool === undefined) {
@@ -26,7 +27,7 @@ export function resolveEarlyLaunch({ entries = [], env = process.env, log = () =
   return { enabled, debounceMs: r.value.debounceMs };
 }
 
-export function createMainMoveReader({ env = process.env, path = daemonEventsPath({ env }), now = Date.now } = {}) {
+export function createMainMoveReader({ env = process.env, path = daemonEventsPath({ env }), root, now = Date.now } = {}) {
   let offset = 0, identity = null;
   try { const s = statSync(path); offset = s.size; identity = `${s.dev}:${s.ino}`; } catch { /* start when created */ }
   return () => {
@@ -42,13 +43,16 @@ export function createMainMoveReader({ env = process.env, path = daemonEventsPat
       const end = text.lastIndexOf('\n');
       if (end < 0) return null;
       offset += Buffer.byteLength(text.slice(0, end + 1));
-      let moved = false;
+      let moved = false, hotPatch = null;
       for (const line of text.slice(0, end).split('\n')) {
         if (!line) continue;
         const e = JSON.parse(line);
+        if (root && e.kind === 'hot-patch-loaded' && e.repo === 'web-everything'
+          && typeof e.detail?.root === 'string' && resolve(e.detail.root) === resolve(root)
+          && /^[a-f0-9]{40}$/.test(e.detail.sha)) hotPatch = { kind: 'hot-patch-loaded', at: now(), sha: e.detail.sha };
         if (e.kind === 'pr-merged' && (e.repo === 'web-everything' || repoKeyForSlug(e.repo) === 'we')) moved = true;
       }
-      return moved ? now() : null;
+      return hotPatch ?? (moved ? now() : null);
     } finally { if (fd !== undefined) closeSync(fd); }
   };
 }
@@ -58,33 +62,38 @@ export function createEarlyLaunchWatcher({ settings, readSignal, inFlight, launc
   schedule = setInterval, cancel = clearInterval, log = () => {} }) {
   let polling = false;
   let active = 0, pending = null, movedAt = null, lastLaunch = null, waitingAt = null, tickWaitMs = 0;
+  let hotPatch = null, lastHotLaunch = null;
   const poll = async () => {
-    if (!settings.enabled || pending || polling) return;
+    if ((!settings.enabled && !settings.hotPatch?.wake) || pending || polling) return;
     polling = true;
     try {
       const signal = await readSignal();
       if (Number.isFinite(signal)) movedAt = signal;
-      if (movedAt === null) return;
-      const d = decideEarlyLaunch({ ...settings, mainMovedAtMs: movedAt, lastLaunchAtMs: lastLaunch,
-        jobInFlightForTarget: await inFlight(), nowMs: now() });
+      if (settings.hotPatch?.wake && signal?.kind === 'hot-patch-loaded') hotPatch = signal;
+      if (movedAt === null && !hotPatch) return;
+      const hotDue = hotPatch && (lastHotLaunch === null || now() - lastHotLaunch >= settings.hotPatch.wakeMinIntervalMs);
+      const busy = await inFlight();
+      const d = hotDue ? { launch: busy === false } : decideEarlyLaunch({ ...settings,
+        mainMovedAtMs: movedAt, lastLaunchAtMs: lastLaunch, jobInFlightForTarget: busy, nowMs: now() });
       if (!d.launch) return;
       if (active) { waitingAt ??= now(); return; }
       lastLaunch = now();
+      if (hotDue) { lastHotLaunch = now(); hotPatch = null; }
       // Set pending synchronously before yielding, so tick entry can always join it.
       const waitInFlightTickMs = tickWaitMs;
       tickWaitMs = 0;
-      pending = Promise.resolve().then(() => launch({ launchOnly: true, launchedBy: 'early',
+      pending = Promise.resolve().then(() => launch({ launchOnly: true, launchedBy: hotDue ? 'hot-patch' : 'early',
         waitInFlightTickMs }));
       waitingAt = null;
       await pending;
     } catch (e) {
       waitingAt = null; tickWaitMs = 0;
-      movedAt = null; // incomplete evidence cannot authorize a later launch
+      movedAt = null; hotPatch = null; // incomplete evidence cannot authorize a later launch
       try { log(`daemon-self-sync: early rebuild deferred to tick-start (${String(e?.message ?? e).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 160)})`); } catch { /* logging is best effort */ }
     }
     finally { pending = null; polling = false; }
   };
-  const timer = settings.enabled ? schedule(poll, 1000) : null;
+  const timer = settings.enabled || settings.hotPatch?.wake ? schedule(poll, 1000) : null;
   timer?.unref?.();
   return { poll, stop: () => { if (timer) cancel(timer); },
     async tick(fn) {

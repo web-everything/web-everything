@@ -1,0 +1,20 @@
+{
+  "ticks": 10,
+  "minMinutes": 15,
+  "owedPrMinutes": 120,
+  "owedMergeHours": 24,
+  "wake": true,
+  "wakeMinIntervalMs": 120000,
+  "maxFiles": 1024,
+  "maxPathChars": 4096,
+  "ioTimeoutMs": 30000,
+  "registrationTimeoutMs": 180000,
+  "maxOutputBytes": 8388608,
+  "eligibleKinds": ["daemon-tooling", "delivery-blocker", "incident", "red-main"],
+  "neverPatchPaths": [
+    "**/*security*", "**/*credential*", "**/*secret*", "**/*auth*", "**/*password*", ".env*", "**/.env*",
+    ".claude/**", ".githooks/**", "scripts/hooks/**", "scripts/guard-*",
+    "scripts/**/*merge-gate*", "scripts/**/*verify*", "scripts/ci/**",
+    "**/*migration*", "**/*migrate*"
+  ]
+}

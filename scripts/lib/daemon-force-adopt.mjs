@@ -24,6 +24,7 @@
 import { rebuildReaders } from './daemon-rebuild/evidence-context.mjs';
 
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { stateDir, readReadyCandidate, clearReadyCandidate } from './daemon-rebuild/state.mjs';
@@ -167,6 +168,8 @@ export function transitionWatch(root, env, decide, { expectVersion } = {}) {
     }
     const next = { ...out.next, version: (cur?.version ?? 0) + 1 };
     writeJson(p, next);
+    const written = readWatchRecord(root, env);
+    if (written.state !== 'ok' || !isDeepStrictEqual(written.watch, JSON.parse(JSON.stringify(next)))) throw new Error('watch changed after write');
     return { out, changed: true, watch: next };
   });
   if (!locked.ok) return { ok: false, changed: false, reason: locked.reason, out: {} };
@@ -283,13 +286,15 @@ export async function dropReadyCandidate({ root, env = process.env, keepSha = nu
 }
 
 /** PURE. One watch tick: fail closed on a failed health check or a crash loop, else count down. */
-export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS }) {
+export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts = FORCE_ADOPT_MAX_RESTARTS, now = Date.now() }) {
   // A rollback that already failed stays mandatory: a later healthy probe must not forget it and count the watch down.
   if (watch.rollbackPending) return { action: 'rollback', reason: watch.rollbackPending, watch };
   if (healthy !== true) return { action: 'rollback', reason: 'health-failed', watch };
   if (restarts >= maxRestarts) return { action: 'rollback', reason: 'crash-loop', watch };
-  const ticksLeft = (watch.ticksLeft ?? 0) - 1;
-  if (ticksLeft <= 0) return { action: 'done', watch: { ...watch, ticksLeft: 0 } };
+  const ticksLeft = Math.max(0, (watch.ticksLeft ?? 0) - 1);
+  // Old force records have no time floor. An unreadable new floor never retires a watch.
+  const timePassed = watch.minUntil === undefined || (Number.isFinite(Date.parse(watch.minUntil)) && now >= Date.parse(watch.minUntil));
+  if (ticksLeft <= 0 && timePassed) return { action: 'done', watch: { ...watch, ticksLeft: 0 } };
   return { action: 'continue', watch: { ...watch, ticksLeft } };
 }
 
@@ -313,6 +318,8 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   };
   const first = readHead(); // lazy: no git call unless a watch exists
   const head = first.head;
+  if (watch.hotPatchSha && (first.unreadable || !/^[a-f0-9]{40}$/.test(head ?? '') || (head !== watch.sha && head !== watch.lastGood?.head)))
+    return { action: 'superseded' };
   const readySha = () => readReadyCandidate(root, env)?.adopt?.finalSha;
   const expired = () => now() - Date.parse(watch.startedAt) > FORCE_ADOPT_TTL_MS;
   const expire = async () => {
@@ -332,6 +339,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   let recordSha = watch.sha;
   let unsaved = false;
   const follow = async (toHead) => {
+    if (watch.hotPatchSha && toHead !== watch.lastGood?.head) return { failed: true }; // A patch never inherits authority over a successor build.
     const t = transitionWatch(root, env, (cur) => {
       if (!cur || cur.sha !== recordSha) return { gone: true };
       if (cur.sha === toHead) return { same: true }; // already there (a rollback that found HEAD on the watched build's own record)
@@ -341,7 +349,8 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
     if (!t.ok) return { failed: true };
     if (t.out.same) return { watch: t.watch };
     if (t.out.reverted) {
-      await emit?.({ kind: 'force-adopt-watch-reverted', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: recordSha, head: toHead } });
+      await emit?.({ kind: 'force-adopt-watch-reverted', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: recordSha, head: toHead,
+        ...(watch.hotPatchSha ? { hotPatchSha: watch.hotPatchSha } : {}) } });
       return { reverted: true };
     }
     const pend = pendingRollbacks.get(p);
@@ -363,6 +372,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const followResult = (f) => (f.failed ? { action: 'follow-failed' } : f.reverted ? { action: 'reverted' } : f.gone ? { action: 'none' } : null);
   /** Follow HEAD; when the write is refused, hold the move in memory for this tick. Returns a terminal tick result, or null to go on. */
   const moveTo = async (toHead) => {
+    if (watch.hotPatchSha && toHead !== watch.lastGood?.head) return { action: 'superseded' };
     const f = await follow(toHead);
     if (f.failed) { watch = { ...watch, sha: toHead, adoptedSeen: true }; unsaved = true; return null; }
     const stop = followResult(f);
@@ -408,6 +418,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // says nothing about it (no countdown, no false "passed") and an unhealthy one owes no revert: the watch follows the new HEAD.
   const second = first.unreadable ? first : readHead();
   const headNow = second.head;
+  if (watch.hotPatchSha && second.unreadable) return { action: 'head-unreadable' };
   // The probe is async: a concurrent tick may have recorded an owed rollback, moved, or closed the watch since our first read. Decide
   // from the CURRENT record, never the stale snapshot, so a healthy result can neither erase a mandatory rollback nor
   // count down / re-create a watch another tick already closed.
@@ -421,7 +432,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   const headUnreadable = first.unreadable || second.unreadable;
   if (headUnreadable) health = { healthy: false }; // unreadable after the probe: the probe's verdict cannot be tied to this build
   const pendingReason = watch.rollbackPending || pendingFor(root, env, watch.sha); // disk marker, else the in-process one
-  let verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0 });
+  let verdict = evaluateForceWatch({ watch: pendingReason ? { ...watch, rollbackPending: pendingReason } : watch, healthy: health?.healthy, restarts: health?.restarts ?? 0, now: now() });
   if (headUnreadable && !pendingReason && verdict.action === 'rollback') verdict = { ...verdict, reason: 'head-unreadable' };
   if (openedThisTick && (verdict.action === 'continue' || verdict.action === 'done')) return { action: 'none' }; // healthy on arrival: counting starts next tick
   const expectVersion = fresh.version ?? 0;
@@ -472,7 +483,8 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // The rollback completed. If the disk refuses to remove the record, the next tick finds HEAD on the rollback target and retires it then.
   retireWatch(root, env, { sha: recordSha });
   pendingRollbacks.delete(p); // the obligation is paid (also when it only ever lived in memory)
-  await emit?.({ kind: 'force-adopt-rolled-back', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, lastGood: watch.lastGood?.head ?? null, reason: verdict.reason } });
+  await emit?.({ kind: 'force-adopt-rolled-back', daemon: watch.daemon, detail: { ruling: watch.ruling, sha: watch.sha, lastGood: watch.lastGood?.head ?? null, reason: verdict.reason,
+    ...(watch.hotPatchSha ? { hotPatchSha: watch.hotPatchSha } : {}) } });
   appendLine(handoffFile(env), `- FORCE-ADOPT ${at} ${watch.daemon} ${watch.ruling}: ROLLED BACK ${watch.sha} -> ${watch.lastGood?.head ?? '?'} (${verdict.reason})\n`);
   appendLine(coronerFile(env), `${JSON.stringify({ kind: 'force-adopt-rolled-back', at, daemon: watch.daemon, ruling: watch.ruling, sha: watch.sha, reason: verdict.reason })}\n`);
   return { action: 'rollback', reason: verdict.reason };

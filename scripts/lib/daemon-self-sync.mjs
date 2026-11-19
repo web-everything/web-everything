@@ -129,6 +129,7 @@ import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
 import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
 import { readReadyCandidate } from './daemon-rebuild/state.mjs';
 import { createEarlyLaunchWatcher, createMainMoveReader, resolveEarlyLaunch } from './daemon-rebuild-early-watch.mjs';
+import { resolveHotPatchSettings } from './hot-patch-settings.mjs';
 import { createAdoptYieldProbe } from './daemon-rebuild/adopt-yield.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
 import { pin as pinVersion, unpin as unpinVersion } from './daemon-version-switch.mjs';
@@ -1122,10 +1123,14 @@ export function withSelfSync(effects, {
   };
 
   const earlySettings = earlyLaunch ?? resolveEarlyLaunch({ entries, env, log: (m) => log.error?.(m) });
+  const hotSettings = resolveHotPatchSettings({ env, log: m => log.error?.(m) });
+  const canWake = rebuildAsJob && !resolvedPocBranch && !vctx;
   const earlyWatcher = createEarlyLaunchWatcher({
-    settings: { ...earlySettings, enabled: earlySettings.enabled && rebuildAsJob && !resolvedPocBranch && !vctx },
+    settings: { ...earlySettings, enabled: earlySettings.enabled && canWake,
+      hotPatch: { ...hotSettings, wake: hotSettings.wake && canWake } },
     now, log: (m) => log.error?.(m),
-    readSignal: earlyLaunchIo.readSignal ?? (realIo && earlySettings.enabled ? createMainMoveReader({ env, now }) : () => null),
+    readSignal: earlyLaunchIo.readSignal ?? (realIo && canWake && (earlySettings.enabled || hotSettings.wake)
+      ? createMainMoveReader({ env, root, now }) : () => null),
     inFlight: earlyLaunchIo.inFlight ?? (() => {
       const store = createJobStore(rebuildJobsDir(root, env));
       const { records, corrupt } = store.list();

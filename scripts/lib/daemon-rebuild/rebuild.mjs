@@ -17,6 +17,7 @@ import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
+import { runOwedTick, closeHotPatch, readHotPatch } from '../hot-patch.mjs';
 import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
@@ -94,7 +95,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
 
 function isBetweenTickLaunch(options) {
   return options.launchOnly === true && options.asJob === true
-    && (options.launchedBy === 'early' || options.launchedBy === 'recovery');
+    && ['early', 'recovery', 'hot-patch'].includes(options.launchedBy);
 }
 
 /**
@@ -112,7 +113,7 @@ function isBetweenTickLaunch(options) {
  * @returns {Promise<object>} Legacy result shape, with phase waits in a non-enumerable `timing` record.
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
-  const strict = options.launchedBy === 'early' || options.launchedBy === 'recovery';
+  const strict = ['early', 'recovery', 'hot-patch'].includes(options.launchedBy);
   if (!strict) return rebuildCloneWithReaders(emitEvent, options, false);
   // Tick-start owns force-watch health checks and rollback; strict preparation is read-only.
   const readers = createRebuildReaders({ strict, read: options.evidenceRead });
@@ -179,8 +180,18 @@ async function forceWatch(options, emitEvent, startedAtMs) {
   if (!root || readyOnly || betweenTicks) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
+    try { await runOwedTick({ root, env: stEnv, now, emit: e => emitEvent(e, { env }) }); }
+    catch (e) { log.error?.(`hot-patch: owed tick failed; repair ledger/overlay state (${String(e.message).replace(/[\x00-\x1f\x7f]/g, '')})`); }
     await runForceWatchTick({
-      root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: (e) => emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
+      root, env: stEnv, notBefore: startedAtMs, currentHead: () => verifyRev(makeGit({ run, cwd: root, env }), 'HEAD'), emit: async (e) => {
+        await emitEvent(e, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } });
+        if (['force-adopt-rolled-back', 'force-adopt-watch-reverted'].includes(e.kind)) {
+          const record = readHotPatch(root, stEnv);
+          if (record && e.detail?.hotPatchSha === record.sha) {
+            await closeHotPatch({ root, env: stEnv, sha: record.sha, reason: 'rolled-back', emit: event => emitEvent(event, { env }) });
+          }
+        }
+      },
       probe: options.forceWatchProbe ?? defaultForceWatchProbe(run, env),
       rollback: async (lastGood, { sha } = {}) => {
         if (!lastGood?.head || !sha) return { ok: false }; // no watched build named: nothing proves it is still the one running, so never revert
@@ -232,7 +243,7 @@ async function rebuildCloneInternal({
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
   stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
-  if (readyOnly && adoptOnly && !admissionEvidence && launchedBy !== 'early' && launchedBy !== 'recovery') {
+  if (readyOnly && adoptOnly && !admissionEvidence && !['early', 'recovery', 'hot-patch'].includes(launchedBy)) {
     return { moved: false, reason: 'state-unreadable' };
   }
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or

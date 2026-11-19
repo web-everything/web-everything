@@ -22,6 +22,7 @@ import {
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { hasHotPatch, openHotPatchWatch, readHotPatch, closeHotPatch } from '../hot-patch.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
   pruneLandedBacklogSidecars,
@@ -100,7 +101,7 @@ export function contentContainedInBuild(git, sha, build) {
 export async function prepareRebuild({
   root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false, admissionEvidence, launchedBy,
 }) {
-  const strictState = !!admissionEvidence || launchedBy === 'early' || launchedBy === 'recovery';
+  const strictState = !!admissionEvidence || ['early', 'recovery', 'hot-patch'].includes(launchedBy);
   if (readyOnly && adoptOnly && !strictState) {
     return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: [] };
   }
@@ -413,6 +414,13 @@ export async function prepareRebuild({
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
+  // The planner already paid for PR state evidence. Reuse its positive merge verdict.
+  if (!strictState && plan.ok) {
+    const hot = readHotPatch(root, stEnv);
+    if (hot?.owed.pr && plan.decisions?.some(d => d.ref === hot.branch && d.pr === hot.owed.pr && d.reason === 'pr-merged')) {
+      await closeHotPatch({ root, env: stEnv, sha: hot.sha, reason: 'merged' });
+    }
+  }
   if (plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   if (!readyOnly) {
     try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git, feed: await import('../../operations/needs-you-feed.mjs') }); }
@@ -713,6 +721,12 @@ export async function prepareRebuild({
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
         });
         writeState();
+        const hot = openHotPatchWatch({ root, env: stEnv, plan: m.adopt, lastGood: state.adopted,
+          smokePassed: ready.forced !== true && ready.kind === 'candidate' && !!ready.passedAt, now });
+        if (!hot.ok) {
+          alert('hot-patch-adoption-refused', { reason: hot.reason });
+          return terminal({ moved: false, reason: 'hot-patch-adoption-refused', plan });
+        }
         const fin = await finalizeRebuild({
           readyPassedAt: ready.passedAt,
           root,
@@ -801,7 +815,7 @@ export async function prepareRebuild({
   const busyTrees = Array.isArray(state.busySkippedTrees) ? state.busySkippedTrees : [];
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
-  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
+  if (!hasHotPatch(root, stEnv) && typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
     // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.

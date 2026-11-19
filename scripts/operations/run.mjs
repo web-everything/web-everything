@@ -49,6 +49,7 @@ import { compute, effect } from './step-kinds.mjs';
 import { main as codexAuditMain } from './codex-audit.mjs';
 import { urgentSweep } from './urgent-sweep.mjs';
 import { urgentVerify } from './urgent-verify.mjs';
+import { listHotPatches, recordVerifyResult } from '../lib/hot-patch.mjs';
 import { manualDaemonPassOperation, MANUAL_DAEMON_PASS_OP } from './manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks } from './manual-daemon-pass-io.mjs';
 import { createFileRunStore, createMemoryRunStore, newRunId } from './run-store.mjs';
@@ -634,7 +635,16 @@ export const OPERATIONS = Object.freeze({
         return entry.result;
       } }),
     }),
-    sinks: { 'urgent-verify.run': input => urgentVerify(input) },
+    sinks: { 'urgent-verify.run': async input => {
+      const result = await urgentVerify(input);
+      if (result.marker?.sha === input.sha && ['green', 'red'].includes(result.marker.result)) {
+        for (const record of listHotPatches().filter(r => r.sha === input.sha)) {
+          const linked = await recordVerifyResult({ root: record.root, sha: input.sha, result: result.marker.result });
+          if (!linked.ok) throw new Error(`hot-patch verify integration refused: ${linked.reason}`);
+        }
+      }
+      return result;
+    } },
     finish: ({ run, code, lines }) => run?.verdict ? { code: run.verdict.ok ? 0 : 1, lines: [JSON.stringify(run.verdict)] } : { code, lines },
   }),
   'urgent-sweep': () => ({

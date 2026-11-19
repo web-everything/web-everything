@@ -31,6 +31,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
+import { claimHotPatchWake } from '../hot-patch.mjs';
 import {
   createJobStore, createTickClock, enqueueJob, reattachTick, runJob,
 } from '../daemon-jobs-runtime.mjs';
@@ -192,7 +193,7 @@ export async function rebuildCloneAsJob({
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
   readState = readRebuildStateStrict, readPending = readPendingAdoptionsStrict,
   readReady = (root, env) => readReadyCandidateStrict(root, env, readFileSync,
-    { strictPins: launchOnly || launchedBy === 'early' || launchedBy === 'recovery' }),
+    { strictPins: launchOnly || ['early', 'recovery', 'hot-patch'].includes(launchedBy) }),
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
@@ -316,7 +317,8 @@ export async function rebuildCloneAsJob({
   } catch { return { ...unreadable(), finishedJobs }; }
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
+  const hotWake = claimHotPatchWake({ root, env, plan: r.plan, now: now() });
+  if (!hotWake && last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
@@ -347,7 +349,7 @@ export async function rebuildCloneAsJob({
 export function rebuildChildArgs(input, cliPath) {
   return [
     cliPath, `--clone=${input.root}`, '--ready-only', '--json',
-    ...(['early', 'recovery'].includes(input.launchedBy) ? [`--launched-by=${input.launchedBy}`] : []),
+    ...(['early', 'recovery', 'hot-patch'].includes(input.launchedBy) ? [`--launched-by=${input.launchedBy}`] : []),
     ...(input.entries || []).map((e) => `--entry=${e}`),
     ...(input.mainOnly ? ['--main-only'] : []),
   ];
