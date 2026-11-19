@@ -52,6 +52,16 @@ describe('behavioral fix detection', () => {
         }
       `);
       expect(b.fixPresent(root)).toBe(false); // dropping the misnamed completed review still loses evidence
+      writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), projection + `
+        import { reviewRunEvidence } from ${JSON.stringify(new URL('../../review-referral-hold.mjs', import.meta.url).href)};
+        import { readFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        export function readReviewRunEvidence({ dir }) {
+          return ['review-pr-valid.json', 'review-pr-bad name.json', 'review-pr-invalid structure.json']
+            .map(name => reviewRunEvidence(JSON.parse(readFileSync(join(dir, name), 'utf8'))));
+        }
+      `);
+      expect(b.fixPresent(root)).toBe(false); // JSON parsing alone accepts structurally invalid evidence
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { isValidRunId, resolveRunsDir, reportInvalidRunEntry, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
+import { validateRunRecord } from '../operations/run-record.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -209,6 +210,9 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
       }
       if (length > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
       const run = JSON.parse(buffer.toString('utf8', 0, length));
+      // Recovery tolerates the bad id only; malformed run state must never clear a hold.
+      const errors = validateRunRecord(run).errors.filter(error => !error.startsWith('invalid run id '));
+      if (errors.length) throw new Error(errors.join('; '));
       if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
       const evidence = reviewRunEvidence(run);
       reportInvalidRunEntry(path);

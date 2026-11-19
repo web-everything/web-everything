@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import * as daemonEvents from '../../lib/daemon-events.mjs';
@@ -239,7 +239,8 @@ describe('attempted mandatory referrals', () => {
   it('enumerates valid evidence beside tombstones and stray JSON, alerting once before any record reads', () => {
     const dir = temp();
     writeRun(run(), dir);
-    for (const name of ['x y.json', 'review-pr-abc.abandoned.json', 'review-pr-bad name.json']) writeFileSync(join(dir, name), '{}');
+    for (const name of ['x y.json', 'review-pr-abc.abandoned.json']) writeFileSync(join(dir, name), '{}');
+    writeFileSync(join(dir, 'review-pr-bad name.json'), JSON.stringify({ ...run(), id: 'review-pr-bad name', input: { repo } }));
     const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
     const read = vi.fn(tryReadRun);
     try {
@@ -276,6 +277,41 @@ describe('attempted mandatory referrals', () => {
       expect(() => tryReadRun(invalid.id, dir)).toThrow(/invalid run id/);
       expect(() => runPath(invalid.id, dir)).toThrow(/invalid run id/);
       expect(alert).toHaveBeenCalledTimes(1);
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each([
+    ['missing version', r => { delete r.v; }],
+    ['invalid cursor', r => { r.cursor = -1; }],
+    ['invalid effects', r => { r.effects = {}; }],
+    ['invalid pending', r => { r.pending = {}; }],
+    ['invalid telemetry', r => { r.telemetry = {}; }],
+    ['invalid step timing', r => { delete r.stepTimings[0].stepIndex; }],
+  ])('a newer misnamed record with %s cannot clear a persistence-failure hold', (_, corrupt) => {
+    const dir = temp();
+    const failed = run({ failure: true });
+    const newer = run({ time: at + 60_000 });
+    newer.id = 'review-pr-bad name';
+    newer.findings.referralVerdict = newer.verdict = { verdict: 'accept', pendingReferrals: [] };
+    corrupt(newer);
+    writeRun(failed, dir);
+    const path = join(dir, 'review-pr-bad name.json');
+    writeFileSync(path, JSON.stringify(newer));
+    utimesSync(runPath(failed.id, dir), at / 1000, at / 1000);
+    utimesSync(path, (at + 60_000) / 1000, (at + 60_000) / 1000);
+    expect(statSync(path).mtimeMs).toBeGreaterThan(statSync(runPath(failed.id, dir)).mtimeMs);
+    // Without structural validation this projection would supersede the parked failure.
+    expect(hold(pr(), [reviewRunEvidence(failed), reviewRunEvidence(newer)])).toBeNull();
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      for (const persist of [false, true]) {
+        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
+        expect(rows).toEqual([reviewRunEvidence(failed)]);
+        expect(hold(pr(), rows)).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
+      }
+      expect(alert).toHaveBeenCalledWith({ kind: 'run-store-invalid-entry', detail: {
+        path, severity: 'high', reason: expect.any(String),
+      } });
     } finally { alert.mockRestore(); }
   });
 

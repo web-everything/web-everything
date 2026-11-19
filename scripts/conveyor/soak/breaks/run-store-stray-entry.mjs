@@ -34,6 +34,8 @@ export function probe(checkout) {
         findings: { ...valid.findings, referralVerdict: completed, read: { ...valid.findings.read, pr: 102 } } };
       writeFileSync(join(dir, 'review-pr-valid.json'), JSON.stringify(valid));
       writeFileSync(join(dir, 'review-pr-bad name.json'), JSON.stringify(misnamed));
+      const malformed = { ...misnamed, id: 'review-pr-invalid structure', cursor: -1, effects: {} };
+      writeFileSync(join(dir, 'review-pr-invalid structure.json'), JSON.stringify(malformed));
       writeFileSync(join(dir, 'review-pr-unparseable name.json'), '{');
       const expected = [valid, misnamed].map(reviewRunEvidence);
       ok(expected.every(row => row?.pr));
@@ -42,6 +44,7 @@ export function probe(checkout) {
       for (let pass = 0; pass < 2; pass++) {
         const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
         ok(Array.isArray(rows) && rows.length === 2, 'both records must retain evidence');
+        ok(!rows.some(row => row.id === malformed.id), 'structurally invalid misnamed records must not project evidence');
         for (const row of expected) deepStrictEqual(rows.find(r => r.id === row.id), row);
       }
     `, checkout, dir], {
