@@ -198,6 +198,12 @@ describe('S1 static edges', () => {
       .toEqual(['@frontierui/plugs/x', '@local/x', 'plugs/x.ts', 'src/x.ts']);
     expect(resolvedImportsOf('test.mjs', "import '@frontierui/plugs/external'", files)).toContain('@frontierui/plugs/external');
   });
+  it('substitutes every wildcard in an alias target, not only the first', () => {
+    const files = new Set(['pkg/x/x.ts']);
+    expect(resolvedImportsOf('test.mjs', "import '@dup/x'", files, { aliases: { '@dup/*': ['pkg/*/*.ts'] } }))
+      .toContain('pkg/x/x.ts');
+  });
+
   it('allows each static edge kind to be disabled for the import-only replay', () => {
     expect(reach("spawn('node', ['scripts/child.mjs']); readFileSync('scripts/child.mjs'); import 'we:scripts/child.mjs'",
       undefined, {}, { staticEdges: { spawnPath: false, literalRead: false, alias: false } }).size).toBe(0);

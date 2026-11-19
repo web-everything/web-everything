@@ -111,7 +111,7 @@ export function resolvedImportsOf(fromFile, text, fileSet, options = {}) {
         const [prefix, tail = ''] = pattern.split('*');
         if (pattern.includes('*') ? !spec.startsWith(prefix) || !spec.endsWith(tail) : spec !== pattern) continue;
         const part = spec.slice(prefix.length, tail ? -tail.length : undefined);
-        for (const path of paths) target ||= resolveSpecifier('_root.mjs', './' + path.replace('*', part), fileSet);
+        for (const path of paths) target ||= resolveSpecifier('_root.mjs', './' + path.split('*').join(part), fileSet);
         // External sibling aliases retain their textual key. Also match the vendored in-repo counterpart.
         out.add(spec);
         if (spec.startsWith('@frontierui/')) target ||= resolveSpecifier('_root.mjs', './' + spec.slice(12), fileSet);
