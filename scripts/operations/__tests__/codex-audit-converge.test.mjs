@@ -35,7 +35,7 @@ describe('R1081 converge rounds', () => {
     expect(CONVERGE_QUESTION_HASH).toBe(createHash('sha256').update(CONVERGE_QUESTION).digest('hex'));
     expect(CONVERGE_QUESTION_HASH).not.toBe(QUESTION_HASH);
     const prompt = f.deps.runCodex.mock.calls[0][0];
-    expect(prompt).toContain(`\ngit diff --no-renames ${PRIOR} ${HEAD}\n`);
+    expect(prompt).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${PRIOR} ${HEAD}\n`);
     expect(prompt).not.toContain(`git diff ${BASE}...${HEAD}`);
     expect(prompt).not.toContain('Judge the WHOLE diff');
     expect(prompt).toContain(`full audit ${original.at} on ${PRIOR}`);
@@ -188,7 +188,7 @@ describe('R1081 converge rounds', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.converge[0].priorHead).toBe(anchorHead);
     const prompt = f.deps.runCodex.mock.calls[1][0];
-    expect(prompt).toContain(`git diff --no-renames ${anchorHead} ${HEAD}`);
+    expect(prompt).toContain(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${anchorHead} ${HEAD}`);
     const fenced = prompt.split('<findings>\n')[1].split('\n</findings>')[0];
     for (const record of [original, latest]) {
       expect(fenced).toContain(`full audit ${record.at} on ${record.head}:`);
@@ -197,7 +197,7 @@ describe('R1081 converge rounds', () => {
     expect(f.deps.isAncestor).toHaveBeenCalledWith(BASE, PRIOR);
     expect(f.deps.isAncestor).toHaveBeenCalledWith(narrowBase, anchorHead);
     expect(f.deps.isAncestor).toHaveBeenCalledWith(narrowBase, narrowBase);
-    expect(f.deps.isAncestor).toHaveBeenCalledWith(narrowBase, HEAD);
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(anchorHead, HEAD);
     f.deps.runCodex.mockReturnValue(`WEAKENED\nOPEN: ${finding}\nFIXED: latest:1 gap\nOPEN: latest:1 gap`);
     expect(await main(ARGS, f.deps)).toBe(3);
   });
@@ -232,16 +232,50 @@ describe('R1081 converge rounds', () => {
   });
 
   it.each(['0'.repeat(40), NEXT])('refuses backward or outside-head base %s with full-audit fallback', async base => {
-    const f = fixture(); f.deps.resolveSha.mockImplementation(ref => ref === 'origin/main' ? base : ref);
-    expect(await main(ARGS, f.deps)).toBe(2);
+    const f = fixture();
+    expect(await main([`--base=${base}`, ...ARGS.slice(1)], f.deps)).toBe(2);
     expect(f.deps.runCodex).not.toHaveBeenCalled();
     expect(f.err.join('')).toContain('run a full audit');
+  });
+
+  it.each([false, true])('refuses an empty full audit in an older union member=%s', async older => {
+    const f = fixture();
+    const empty = { ...original, base: PRIOR, head: PRIOR };
+    if (older) f.full.unshift(empty);
+    else f.full.push(empty);
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('Empty full audit');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it.each(['anchor base off main base', 'requested base off main'])('refuses discontinuous B→A, C→D coverage: %s', async scenario => {
+    const f = fixture();
+    const c = 'ab'.repeat(20), d = 'bc'.repeat(20);
+    f.full.push({ ...original, base: c, head: d });
+    const base = scenario === 'requested base off main' ? d : BASE;
+    expect(await main([`--base=${base}`, ...ARGS.slice(1)], f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('converge needs a main-line base covered by the last full audit; run a full audit');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'bad', new Error('missing main')])('refuses unreadable or unresolved origin/main %s', async mainSha => {
+    const f = fixture();
+    f.deps.resolveSha.mockImplementation(ref => {
+      if (ref !== 'origin/main') return ref;
+      if (mainSha instanceof Error) throw mainSha;
+      return mainSha;
+    });
+    expect(await main([`--base=${BASE}`, ...ARGS.slice(1)], f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('run a full audit');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
   });
 
   it('allows the base to advance to head without narrowing the unrestricted delta', async () => {
     const f = fixture(); f.deps.resolveSha.mockReturnValue(HEAD);
     expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit diff --no-renames ${PRIOR} ${HEAD}\n`);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${PRIOR} ${HEAD}\n`);
   });
 
   it('declares converge and optional ref as operation inputs for the generic CLI', () => {

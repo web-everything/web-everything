@@ -4820,12 +4820,18 @@ absent mode), current canonical question hash, verdict, non-conflicting string f
 commit SHAs and timestamp (at most five minutes ahead). A WEAKENED record without findings
 fails closed with exit 3; malformed evidence requires retry or human review of the full diff.
 An unreadable candidate head also fails closed rather than silently excluding its findings.
-Missing anchors, exact-head anchors, no ancestral heads, backward requested bases or a
-requested base outside head ancestry require a full audit (exit 2). Independently require
-`isAncestor(record.base, record.head)` for every used record (exit 2 on false), plus the
-anchor's head-to-head and anchor.base-to-requested-base-to-head ancestry checks.
+Missing anchors, exact-head anchors, no ancestral heads and empty full audits (`base === head`,
+including older union members) require a full audit (exit 2). Independently require
+`isAncestor(record.base, record.head)` for every used record (exit 2 on false). Resolve
+`origin/main` and require `isAncestor(anchor.base, base)`, `isAncestor(base, originMain)`
+and `isAncestor(anchor.head, head)`. Unresolved main or failed coverage checks exit 2 with
+"converge needs a main-line base covered by the last full audit; run a full audit".
+The anchor's full `anchor.base...anchor.head` review and the `anchor.head..head` delta
+cover all branch-only changes of `base...head` when the requested base is on main and
+covered by the anchor base. Stacked branches whose base is off main use full audits;
+selecting a later anchor alone cannot bridge a gap between B→A and C→D audits.
 
-Every round reviews the unrestricted `git diff --no-renames <anchor.head> <head>` and the
+Every round reviews the unrestricted `git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames <anchor.head> <head>` and the
 exact-text deduplicated union of every used record's findings, including previously FIXED
 findings. An older broad audit's findings survive a later audit with a narrower base and
 fewer findings. Cite each source record's timestamp and head inside the untrusted findings
@@ -4836,7 +4842,10 @@ the narrowed-base union, cross-record deduplication, malformed older members and
 base/head lineage for both anchors and older members, asserting the ancestry calls.
 Keep these paths covered in `codex-audit-converge.test.mjs`; real Git regressions in
 `codex-audit-io-real.test.mjs` cover forward/backward bases, reverted guards, renames and
-`<material>.mjs` remaining in scope even when the requested base advances to head.
+`<material>.mjs` remaining in scope even when the requested base advances to head on main.
+Named regressions refuse discontinuous B→A then C→D coverage, off-main requested bases,
+empty anchors and older union records, and unresolved main; delta assertions pin all four flags.
+External diff drivers, text conversion and submodule-ignore settings cannot narrow the delta.
 The canonical question hash stays stable: exhaustive full-pass instructions live outside its text.
 
 Canonical audit lookup rejects non-full positive records even with the current question hash,

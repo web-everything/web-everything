@@ -34,19 +34,20 @@ describe('codex-audit real IO', () => {
       git(['commit', '--quiet', '-m', 'relocate guard test']);
       const current = head();
       git(['update-ref', 'refs/remotes/origin/lane/audit', current]);
+      git(['update-ref', 'refs/remotes/origin/main', current]);
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
       expect(deps.refsPointingAt(current)).toContain('lane/audit');
       expect(deps.isAncestor(prior, current)).toBe(true);
       expect(deps.isAncestor(current, prior)).toBe(false);
       let reviewed = false;
-      const code = await main([`--base=${current}`, `--head=${current}`, '--converge'], {
+      const code = await main([`--base=${current}`, `--head=${current}`, '--ref=lane/audit', '--converge'], {
         ...deps,
         readRecords: () => [{ at: '2026-11-17T00:00:00Z', base, head: prior, ref: 'lane/audit',
           questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: ['guard.mjs:1 gap'] }],
         now: () => '2026-11-18T00:00:00Z', appendRecord: () => {}, stdout: () => {}, stderr: () => {},
         runCodex: prompt => {
           const command = prompt.split('\n').find(line => line.startsWith('git diff '));
-          expect(command).toBe(`git diff --no-renames ${prior} ${current}`);
+          expect(command).toBe(`git diff --no-ext-diff --no-textconv --ignore-submodules=none --no-renames ${prior} ${current}`);
           const delta = String(git(command.split(' ').slice(1)));
           expect(delta).toContain('<material>.mjs');
           expect(delta).toContain('-improved guard');
@@ -73,6 +74,7 @@ describe('codex-audit real IO', () => {
       git(['checkout', '--quiet', '--detach', oldBase]);
       commit({ 'other.txt': 'other\n' });
       const unrelated = head();
+      git(['update-ref', 'refs/remotes/origin/main', base]);
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
       const errors = [];
       const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
@@ -85,6 +87,36 @@ describe('codex-audit real IO', () => {
       expect(await main([`--base=${unrelated}`, `--head=${current}`, '--ref=lane/audit', '--converge'], overrides)).toBe(2);
       expect(errors).toHaveLength(2);
       expect(errors.every(text => text.includes('run a full audit'))).toBe(true);
+    });
+  });
+
+  it('refuses real Git B→A then C→D audits that leave A→C uncovered', async () => {
+    await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
+      const b = head();
+      git(['update-ref', 'refs/remotes/origin/main', b]);
+      commit({ 'a.txt': 'audited change\n' });
+      const a = head();
+      commit({ 'gap.txt': 'unreviewed guard removal\n' });
+      const c = head();
+      commit({ 'd.txt': 'later audited change\n' });
+      const d = head();
+      commit({ 'h.txt': 'delta\n' });
+      const h = head();
+      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      const errors = [];
+      let reviews = 0;
+      const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
+        readRecords: () => [[b, a], [c, d]].map(([base, head]) => ({
+          at: '2026-11-17T00:00:00Z', base, head, ref: 'lane/audit',
+          questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [],
+        })),
+        runCodex: () => { reviews++; return 'NOT WEAKENED'; },
+        stderr: text => errors.push(text), stdout: () => {},
+      };
+      expect(await main([`--base=${b}`, `--head=${h}`, '--ref=lane/audit', '--converge'], overrides)).toBe(2);
+      expect(await main([`--base=${d}`, `--head=${h}`, '--ref=lane/audit', '--converge'], overrides)).toBe(2);
+      expect(reviews).toBe(0);
+      expect(errors).toEqual(Array(2).fill('converge needs a main-line base covered by the last full audit; run a full audit\n'));
     });
   });
 
