@@ -162,7 +162,9 @@ async function proveFindings(findings, base, head, deps, observe = () => {}) {
 // Shadow evidence has no authority: suppress proof output and replace every persistence effect.
 async function shadowFindings(findings, base, head, deps) {
   try {
-    if (deps.preExistingMode?.() !== 'block' || deps.preExistingShadow?.() !== true || typeof deps.shadowProof !== 'function') return;
+    const mode = deps.preExistingMode?.();
+    const proveDisabled = mode === 'prove' && deps.proveClearEnabled?.() !== true;
+    if (!(proveDisabled || (mode === 'block' && deps.preExistingShadow?.() === true)) || typeof deps.shadowProof !== 'function') return;
     let classified;
     await proveFindings([...findings], base, head, { ...deps, stderr: () => {},
       fileCard: ({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true,
@@ -170,7 +172,7 @@ async function shadowFindings(findings, base, head, deps) {
     await deps.shadowProof({ at: deps.now(), base, head, modelFindings: [...findings],
       wouldExempt: classified.flatMap(c => c.blocking ? [] : [{ line: c.preExisting.line,
         key: c.preExisting.key, class: c.preExisting.key.split('|').at(-1) }]),
-      wouldBlock: classified.flatMap((c, i) => c.blocking ? [{ line: findings[i], reason: c.reason }] : []), mode: 'block' });
+      wouldBlock: classified.flatMap((c, i) => c.blocking ? [{ line: findings[i], reason: c.reason }] : []), mode: proveDisabled ? 'prove-disabled' : 'block' });
   } catch { /* Observational only, including settings/proof/log failures. */ }
 }
 
@@ -202,7 +204,7 @@ export async function main(argv, deps) {
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     let findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
-    if (deps.preExistingMode?.() === 'prove' && verdict === 'WEAKENED') {
+    if (deps.preExistingMode?.() === 'prove' && deps.proveClearEnabled?.() === true && verdict === 'WEAKENED') {
       Object.assign(result, await proveFindings(findings, base, head, deps));
       ({ verdict, findings } = result);
     }

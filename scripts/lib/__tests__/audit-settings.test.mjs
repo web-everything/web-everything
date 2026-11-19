@@ -9,11 +9,11 @@ const HASH_A = Object.freeze({ hash: 'a'.repeat(64), acceptUntil: '2026-12-01T00
 const HASH_B = Object.freeze({ hash: 'b'.repeat(64), acceptUntil: '2026-12-02T00:00:00.000Z' });
 
 const file = audit => () => JSON.stringify({ audit });
-const full = (over = {}) => ({ verdict: { mode: 'model' }, preExisting: { mode: 'block', shadow: false, baseRecheckMax: 3 }, releaseStage: 'prerelease',
+const full = (over = {}) => ({ verdict: { mode: 'model' }, preExisting: { mode: 'block', shadow: false, baseRecheckMax: 3 }, proveMode: { clearEnabled: false }, releaseStage: 'prerelease',
   raceBlockPaths: [], guardFloorPaths: [], priorQuestionHashes: [], recheck: { max: 1 }, cards: { requireOnMain: true, requirePayBy: true }, ...over });
 const resolve = (audit, env = {}) => resolveAuditSettings({ fileRead: file(audit), platform: null, env, log: () => {} });
 const STRICT_PATHS = [...GUARD_FLOOR, '**'];
-const STRICT = { verdictMode: 'shadow', preExistingMode: 'block', preExistingShadow: false, releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
+const STRICT = { verdictMode: 'shadow', preExistingMode: 'block', preExistingShadow: false, proveClearEnabled: false, releaseStage: 'prod', recheckMax: 0, baseRecheckMax: 0, requireOnMain: true, requirePayBy: true };
 
 describe('audit settings (R528)', () => {
   it.each(['raceBlockPaths', 'guardFloorPaths'])('strict path grammar rejects malformed %s at settings load', key => {
@@ -536,5 +536,40 @@ describe('pre-existing shadow settings', () => {
     const r = resolve({ preExisting: { shadow: true } }, { WE_AUDIT_PREEXISTING_SHADOW: 'false' });
     expect(r.value.preExistingShadow).toBe(false);
     expect(r.sources.preExistingShadow).toBe('env');
+  });
+});
+
+
+describe('prove clear setting (R1085)', () => {
+  it('defaults to false and accepts explicit file true with provenance', () => {
+    expect(resolve({}).value.proveClearEnabled).toBe(false);
+    const r = resolve({ proveMode: { clearEnabled: true } });
+    expect(r.value.proveClearEnabled).toBe(true);
+    expect(r.sources.proveClearEnabled).toBe('file');
+  });
+  it('environment cannot enable clearing and may disable it', () => {
+    for (const audit of [{}, { proveMode: { clearEnabled: false } }]) {
+      expect(resolve(audit, { WE_AUDIT_PROVE_CLEAR_ENABLED: 'true' }).value.proveClearEnabled).toBe(false);
+    }
+    const r = resolve({ proveMode: { clearEnabled: true } }, { WE_AUDIT_PROVE_CLEAR_ENABLED: 'false' });
+    expect(r.value.proveClearEnabled).toBe(false);
+    expect(r.sources.proveClearEnabled).toBe('env');
+  });
+  it.each(['true', null, 1, {}])('invalid file value %j resolves to strictest false', clearEnabled => {
+    const r = resolve({ proveMode: { clearEnabled } });
+    expect(r.value.proveClearEnabled).toBe(false);
+    expect(r.sources.proveClearEnabled).toBe('strictest');
+  });
+  it.each(['TRUE', '', '1'])('invalid env value %j resolves to strictest false', raw => {
+    const r = resolve({ proveMode: { clearEnabled: true } }, { WE_AUDIT_PROVE_CLEAR_ENABLED: raw });
+    expect(r.value.proveClearEnabled).toBe(false);
+    expect(r.sources.proveClearEnabled).toBe('strictest');
+  });
+  it('inherits platform policy and lets the tool disable it', () => {
+    const platform = { proveMode: { clearEnabled: true } };
+    const r = resolveAuditSettings({ platform, env: {}, fileRead: file({}) });
+    expect(r.value.proveClearEnabled).toBe(true);
+    expect(r.sources.proveClearEnabled).toBe('platform');
+    expect(resolveAuditSettings({ platform, env: {}, fileRead: file({ proveMode: { clearEnabled: false } }) }).value.proveClearEnabled).toBe(false);
   });
 });

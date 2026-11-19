@@ -603,7 +603,7 @@ describe('R1053 prove mode', () => {
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
     Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }),
-      preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
+      preExistingMode: () => 'prove', proveClearEnabled: () => true, baseRecheckMax: () => 6, protectedPaths: () => [],
       reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
@@ -628,6 +628,26 @@ describe('R1053 prove mode', () => {
     const cards = parseCards(cardLine);
     expect(cards).toHaveLength(1);
     expect(cards[0]).toMatchObject({ raw: cardLine, tag: 'R1053', date: date.slice(0, 10), text });
+  });
+  it('prove mode with clearEnabled off leaves WEAKENED unchanged and files no card', async () => {
+    const normal = proof(); normal.deps.preExistingMode = () => 'block';
+    expect(await main(ARGS, normal.deps)).toBe(1);
+    for (const clearEnabled of [false, undefined]) {
+      const f = proof(); f.deps.proveClearEnabled = () => clearEnabled;
+      f.deps.shadowProof = vi.fn();
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.output).toEqual(normal.output);
+      expect(f.errors).toEqual(normal.errors);
+      expect(f.records).toEqual(normal.records);
+      expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [finding] });
+      expect(f.records[0].preExisting ?? []).toEqual([]);
+      expect(f.deps.fileCard).not.toHaveBeenCalled();
+      expect(f.deps.shadowProof).toHaveBeenCalledOnce();
+      expect(f.deps.shadowProof).toHaveBeenCalledWith({
+        at: AT, base: BASE, head: HEAD, modelFindings: [finding], mode: 'prove-disabled',
+        wouldExempt: [{ line: finding, key: 'x.mjs|X|E1', class: 'E1' }], wouldBlock: [],
+      });
+    }
   });
   it.each(['success', 'proof error', 'append error', 'setting error'])('shadow keeps block output and record unchanged: %s', async kind => {
     const normal = proof(); normal.deps.preExistingMode = () => 'block';

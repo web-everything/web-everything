@@ -52,8 +52,8 @@ export function revalidateExemptions(record, { settingsOptions = {}, readFile = 
   try {
     const settings = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, ...settingsOptions });
     const policy = settings.value;
-    for (const name of ['preExistingMode', 'releaseStage', 'requirePayBy']) warn(`audit.${name}=${policy[name]} source=${settings.sources[name]}`);
-    if (policy.preExistingMode !== 'prove' || Object.values(settings.sources).includes('strictest')) return false;
+    for (const name of ['preExistingMode', 'proveClearEnabled', 'releaseStage', 'requirePayBy']) warn(`audit.${name}=${policy[name]} source=${settings.sources[name]}`);
+    if (policy.preExistingMode !== 'prove' || policy.proveClearEnabled !== true || Object.values(settings.sources).includes('strictest')) return false;
     const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
     const persisted = readCards ? readCards() : {
       cards: readFile(join(home, 'workspace/.operations/handoff/cards-to-file.md'), 'utf8'),

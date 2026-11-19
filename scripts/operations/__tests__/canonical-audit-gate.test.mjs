@@ -220,10 +220,14 @@ describe('R1053 additive audit records', () => {
   const security = f => `- [R1053][needs-you] today ET: security pre-existing (${f.key.split('|').at(-1)}) ${f.key}`;
   const current = (audit = {}, cards = {}) => ({
     settingsOptions: { platform: null, env: {}, fileRead: () => JSON.stringify({ audit: {
-      preExisting: { mode: 'prove' }, releaseStage: 'prerelease', cards: { requirePayBy: false }, ...audit } }) },
+      preExisting: { mode: 'prove' }, proveMode: { clearEnabled: true }, releaseStage: 'prerelease', cards: { requirePayBy: false }, ...audit } }) },
     readCards: () => ({ cards: held(entry),
       index: JSON.stringify({ key: entry.key, cardHash: entry.cardHash }), ...cards }),
     readCard: () => 'mustPayBefore: 2099-01-01',
+  });
+  it.each([false, undefined])('rejects persisted exemptions when current prove clearing is %j', clearEnabled => {
+    const result = fixture({ records: [scoped], exemptionIO: current({ proveMode: { clearEnabled } }) }).result;
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
   });
   it.each(['block', 'allow'])('revokes proof passes when current mode is %s', mode => {
     const result = fixture({ records: [scoped], exemptionIO: current({ preExisting: { mode } }) }).result;

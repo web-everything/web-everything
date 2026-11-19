@@ -67,7 +67,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (!settings) {
       settings = resolveAuditSettings({ fileRead: fs.readFileSync, ...settingsOptions,
         log: message => process.stderr.write(`${message}\n`) });
-      for (const name of ['preExistingMode', 'preExistingShadow', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
+      for (const name of ['preExistingMode', 'preExistingShadow', 'proveClearEnabled', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
     }
     return settings;
   };
@@ -79,6 +79,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     readCard: path => readCardFromMain(path, { run: spawnSync }),
     preExistingMode: () => auditSettings().value.preExistingMode,
     preExistingShadow: () => auditSettings().value.preExistingShadow,
+    proveClearEnabled: () => auditSettings().value.proveClearEnabled,
     shadowProof(row) {
       fs.mkdirSync(dirname(shadowPath), { recursive: true });
       fs.appendFileSync(shadowPath, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o600 });

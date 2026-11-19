@@ -642,7 +642,7 @@ describe('prototype-load canonical audit admission', () => {
     const escalation = cls.startsWith('B') ? `- [R1053][needs-you] today ET: security pre-existing (${cls}) ${key}` : '';
     const exemptionFiles = {
       [resolve(dirname(fileURLToPath(import.meta.url)), '../../settings/codex-audit.json')]: kind === 'unreadable settings' ? '{bad' : JSON.stringify({ audit: {
-        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, releaseStage: 'prerelease', cards: { requirePayBy: false },
+        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, proveMode: { clearEnabled: true }, releaseStage: 'prerelease', cards: { requirePayBy: false },
         ...(kind === 'new protected path' ? { raceBlockPaths: ['x.mjs'] } : {}),
       } }),
       '/home/test/workspace/.operations/handoff/cards-to-file.md': [kind === 'card removed' ? '' : card, escalation].join('\n'),
