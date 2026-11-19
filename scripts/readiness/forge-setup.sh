@@ -68,10 +68,13 @@ if [[ ! "$FORGE_EXEC_SLOTS" =~ ^[1-9][0-9]*$ ]] || (( FORGE_EXEC_SLOTS > 128 ));
 fi
 # Preflight egress before publishing any new account or directory. Stop refreshes so
 # an old service count cannot replace coverage for the planned, not-yet-existing UIDs.
-if ! command -v python3 >/dev/null 2>&1; then apt-get install -y python3; fi
 installed_passwd=$(getent passwd)
 for user in $(printf '%s\n' "$installed_passwd" | cut -d: -f1); do
   if [[ "$user" =~ ^forge-exec-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > FORGE_EXEC_SLOTS )); then
+    if [[ "$slots_explicit" == x ]]; then
+      echo 'forge-setup: cannot shrink an installed pool; retain its slot count and inspect reservations' >&2
+      exit 1
+    fi
     FORGE_EXEC_SLOTS=${BASH_REMATCH[1]}
   fi
 done
@@ -80,6 +83,7 @@ if (( FORGE_EXEC_SLOTS > 128 )); then
 fi
 # Pick unused system UIDs without creating users. useradd -u below fails closed
 # if another account takes one meanwhile. Exhaustion requires operator cleanup.
+if ! command -v python3 >/dev/null 2>&1; then apt-get install -y python3; fi
 slot_uid_plan=$(printf '%s\n' "$installed_passwd" | python3 -c '
 import sys
 rows = [line.split(":") for line in sys.stdin.read().splitlines()]

@@ -94,6 +94,32 @@ describe('Forge slot settings', () => {
     expect(result.stderr).toContain('forge-slots.json host/default setting');
     expect(result.stderr).toContain('keeping 14 installed slots');
   });
+  it.each([true, false])('14 installed accounts with 8 directories: explicit limit=%s refuses before publication; settings retain installed count', explicit => {
+    const dir = fixture(), pool = join(dir, 'pool'), sudoers = join(dir, 'sudoers'), log = join(dir, 'log');
+    mkdirSync(pool);
+    const slots = Array.from({length: 8}, (_, i) => `slot-${i + 1}`);
+    for (const slot of slots) mkdirSync(join(pool, slot));
+    const fake = (name, body) => writeFileSync(join(dir, name), '#!/bin/bash\n' + body + '\n', {mode: 0o755});
+    fake('getent', 'for k in {1..14}; do echo "forge-exec-$k:x:$((2000+k)):2000::/:/bin/bash"; done');
+    // Stop safely and record any attempt to proceed beyond the count guards.
+    for (const name of ['python3', 'apt-get', 'systemctl', 'useradd']) fake(name, 'echo "$0 $*" >> "$LOG"; exit 99');
+    const script = explicit ? setup : setup.slice(0, setup.indexOf('# Pick unused system UIDs'))
+      + `\nbash -c 'printf "%s" "$FORGE_EXEC_SLOTS"'\n`;
+    writeFileSync(join(dir, 'forge-setup.sh'), script.replaceAll('/srv/forge-exec', pool)
+      .replaceAll('/etc/sudoers.d/forge-exec', sudoers));
+    const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+      env: {PATH: dir + ':' + process.env.PATH, FORGE_HOST: 'forge-b', LOG: log,
+        ...(explicit ? {FORGE_EXEC_SLOTS: '8'} : {})},
+    });
+    expect(result.status, result.stderr).toBe(explicit ? 1 : 0);
+    expect(result.stdout).toBe(explicit ? '' : '14');
+    if (explicit) expect(result.stderr).toContain('cannot shrink an installed pool; retain its slot count and inspect reservations');
+    else expect(result.stderr).toContain('forge-slots.json host/default setting');
+    expect(readdirSync(pool).sort()).toEqual(slots.sort());
+    expect(existsSync(sudoers)).toBe(false);
+    expect(existsSync(log)).toBe(false);
+  });
   it.each(['success', 'egress-failure', 'after-egress-failure'])('grow 8 to 14 covers planned UIDs before publishing slots: %s', failure => {
     const dir = fixture(), pool = join(dir, 'pool'), log = join(dir, 'log');
     mkdirSync(pool);
