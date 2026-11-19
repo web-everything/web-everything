@@ -1,3 +1,4 @@
+import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 /** Local verify / host-load counterpart to #4999 (CI per-test flake scoring and quarantine).
  * Pure planning plus injectable IO. A quiet host retries one saved fix, never force-pushing.
  */
@@ -96,7 +97,7 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
 export const REVERIFY_DEFAULT_REPO = 'we';
 export const REVERIFY_SWEEP_REPOS = Object.keys(CONSTELLATION_REPOS);
 
-export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo(config)) {
+export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, resolveProfile = repoProfile, config = reverifyConfig() } = {}, io = defaultReverifyIo(config)) {
   const now = io.now();
   const load = io.loadavg();
   const cores = io.cpuCount();
@@ -132,14 +133,14 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   // Cheap redispatches all run first; then the saved-fix path still stops after one progress outcome.
   for (const candidate of plan.candidates.filter((c) => c.hold.redispatch)) {
     try {
-      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores, admission }, io) });
+      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores, admission, resolveProfile }, io) });
     } catch (e) {
       redispatched.push({ pr: candidate.pr.number, error: String(e?.message ?? e) });
     }
   }
   for (const candidate of plan.candidates.filter((c) => !c.hold.redispatch)) {
     try {
-      const out = await reverifyCandidate({ candidate, key, slug, config }, io);
+      const out = await reverifyCandidate({ candidate, key, slug, config, resolveProfile }, io);
       if (!NON_PROGRESS.has(out.deferred)) return finish(out);
       lastDeferral = out;
     } catch (e) {
@@ -179,7 +180,7 @@ export async function rearmPushedFixes({ prs = [], slug }, io) {
   return out;
 }
 
-async function reverifyCandidate({ candidate, key, slug, config, load, cores, admission }, io) {
+async function reverifyCandidate({ candidate, key, slug, config, load, cores, admission, resolveProfile }, io) {
   const { pr, hold, attempts } = candidate;
   let mergeMain = null;
   const post = (result, text = '') => {
@@ -203,6 +204,10 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
   };
   let refusal = await check();
   if (refusal) return refusal;
+  if (hold.redispatch && attempts < config.maxAttempts) {
+    const refusal = assertCapability(key, 'fix', { resolveProfile });
+    if (refusal) return { deferred: 'unsupported-repo', ...refusal };
+  }
   // #xg0rkxn (live plateau #220): a re-dispatch on the old head re-runs without whatever main fixed meanwhile (#221, the
   // very timing tests that flaked). Merge main into the head first; a conflict is left to the conflict-fix path.
   if (hold.redispatch && attempts < config.maxAttempts && config.mergeMainBeforeRetry && typeof io.mergeMain === 'function') {
@@ -259,6 +264,8 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
     }
     refusal = await check();
     if (refusal) return refusal;
+    const refused = assertCapability(key, 'fix', { resolveProfile });
+    if (refused) return { deferred: 'unsupported-repo', ...refused };
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
     await post('pushed', config.mode === 'ci'
       ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');
