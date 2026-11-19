@@ -12,6 +12,15 @@ const setup = () => {
 const t0 = Date.parse('2026-11-01T10:00:00.000Z');
 
 describe('overlay adoption events', () => {
+  it('preserves degraded evidence across an overdue notice until adoption', async () => {
+    const { root, env } = setup();
+    const degradedFastPath = { sha: SHA, branch: 'lane/x', marker: { sig: 'receipt' } };
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString(), degradedFastPath }, { env });
+    await checkPendingAdoptions({ root, env, now: () => t0 + 16 * 60000, isAncestor: () => false, emit: () => true });
+    expect(readPendingAdoptions(root, { env })[0]).toMatchObject({ overdueSent: true, degradedFastPath });
+    await checkPendingAdoptions({ root, env, now: () => t0 + 17 * 60000, isAncestor: () => true, emit: () => true });
+    expect(readPendingAdoptions(root, { env })).toEqual([]);
+  });
   it('retains pending adoption when emit throws and retries successfully', async () => {
     const { root, env } = setup();
     recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString() }, { env });

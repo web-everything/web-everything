@@ -41,7 +41,7 @@ const settings = {
 function fixture(options = {}) {
   const candidateSha = options.sha || SHA;
   const calls = [], records = [], readyWrites = [], sleeps = [], reads = [], cloneRoots = [];
-  let clock = 0;
+  let clock = options.now ?? 0;
   let remoteTip = candidateSha;
   let tipReads = 0;
   let establishedAdvanced = false;
@@ -53,9 +53,15 @@ function fixture(options = {}) {
   const admitted = [];
   const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
+  const pendingFiles = new Map();
   const fs = {
+    writeFileSync(p, value) { if (options.pendingWriteFails) throw new Error('unwritable pending'); pendingFiles.set(p, value); },
+    renameSync(from, to) { pendingFiles.set(to, pendingFiles.get(from)); pendingFiles.delete(from); },
+    rmSync(p) { pendingFiles.delete(p); }, rmdirSync() {},
     readFileSync(p) {
       reads.push(p);
+      if (pendingFiles.has(p)) return pendingFiles.get(p);
+      if (p.endsWith('/daemon-events.jsonl')) return options.daemonEvents ?? '';
       if (p.endsWith('/urgent-full-green.jsonl')) {
         if (options.urgentLedger === undefined) throw new Error('unreadable urgent ledger');
         return options.urgentLedger;
@@ -158,6 +164,7 @@ function fixture(options = {}) {
         if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
         return options.missingCandidate ? fail(1, '', '') : SHA;
       }
+      if (options.probeThrows) throw new Error('probe exploded after registration');
       expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
       if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
       if (options.adoptionError) return fail(options.adoptionError);
@@ -266,13 +273,14 @@ function fixture(options = {}) {
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner, readUrgentKey: () => { if (options.missingUrgentKey) throw new Error('missing'); return urgentKey; },
+    emitDaemonEvent: async event => { records.push(event); return !options.eventWriteFails; }, needsYou: options.needsYou ?? (() => {}),
     readState: options.readState ?? (() => ({ corrupt: false, overlays: [...registrations.values(), ...admitted] })),
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { pendingFiles, calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
@@ -1873,7 +1881,7 @@ describe('prototype-load', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('warns when the pending-adoption tracking write fails', async () => {
-    const r = await fixture({ timeout: true }).run({ waitAdoptionMs: undefined });
+    const r = await fixture({ timeout: true, pendingWriteFails: true }).run({ waitAdoptionMs: undefined });
     expect(r.adoptionEventTracked).toBe(false);
     expect(r.message).toContain('pending-adoption record could not be written');
     expect(r.message).toContain('no overlay-adopted event will follow');
@@ -3384,4 +3392,177 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
     audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
     settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
   expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
+});
+
+describe('R1075 degraded daemon admission', () => {
+  const signal = { daemon: 'wev-control', kind: 'overlay-adoption-overdue', at: new Date(-7200000).toISOString() };
+  const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'studio', repo: 'https://example.com/org/repo', steps: ['install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
+  marker.sig = urgentSignature(marker, urgentKey);
+  const degraded = options => fixture({ daemonEvents: JSON.stringify(signal), testCheck: async () => null, urgentLedger: JSON.stringify(marker), ...options });
+  it('loads without a CI test check using the existing signed receipt and logs daemon evidence', async () => {
+    const f = degraded();
+    const out = await f.run({ reason: 'caller reason is ignored', evidence: { ageMinutes: 999 } });
+    expect(out).toMatchObject({ ok: true, registered: true, degradedFastPath: { signals: [{ kind: signal.kind, at: signal.at }], ageMinutes: 120, marker } });
+    expect(f.readyWrites.at(-1).testCheck.reason).toContain('overlay-adoption-overdue@');
+    expect(f.readyWrites.at(-1).testCheck.reason).not.toContain('caller');
+    expect(f.records).toContainEqual(expect.objectContaining({ kind: 'prototype-load.degraded-fast-path', daemon: 'control', detail: expect.objectContaining({ branch: BASE.branch, sha: SHA, marker }) }));
+  });
+  it('preserves ordinary green-CI admission without a receipt', async () => {
+    const f = degraded({ urgentLedger: undefined, testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+  });
+  it.each(['missing readiness', 'carried audit'])('preserves normal green-CI admission with %s', async kind => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ urgentLedger: undefined,
+      ...(kind === 'missing readiness' ? { ready: '' } : {
+        audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint,
+      }),
+      testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records.some(r => r.kind.startsWith('prototype-load.degraded-fast-path'))).toBe(false);
+  });
+  it.each(['green', 'absent', 'red'])('degradation never makes %s CI admission stricter', async state => {
+    const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',
+      conclusion: state === 'green' ? 'success' : 'failure', appId: prototypeLoad.TEST_CHECK_APP_ID });
+    const healthy = await degraded({ daemonEvents: '', testCheck, urgentLedger: undefined }).run();
+    const stuck = await degraded({ testCheck, urgentLedger: undefined }).run();
+    if (healthy.ok) expect(stuck.ok).toBe(true);
+    else expect(stuck.ok).toBe(false);
+    if (state === 'green') expect(stuck.degradedFastPath).toBeUndefined();
+  });
+  it.each(['green', 'absent', 'red'])('receipt-backed degraded admission supplements the healthy path with %s CI', async state => {
+    const testCheck = async () => state === 'absent' ? null : ({ sha: SHA, name: 'test', status: 'completed',
+      conclusion: state === 'green' ? 'success' : 'failure', appId: prototypeLoad.TEST_CHECK_APP_ID });
+    const healthy = await degraded({ daemonEvents: '', testCheck }).run();
+    const stuck = await degraded({ testCheck }).run();
+    expect(healthy.ok).toBe(state === 'green');
+    expect(stuck.ok).toBe(state !== 'red');
+  });
+  it('preserves ordinary merging onto main when degraded CI is green', async () => {
+    const f = degraded({ behind: true, urgentLedger: undefined,
+      testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) });
+    expect(await f.run()).toMatchObject({ ok: true, effectiveSha: MERGE });
+  });
+  it('clears pending tracking when registration fails', async () => {
+    const f = degraded({ addFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect([...f.pendingFiles.values()]).toHaveLength(0);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it('retains tracking when the failed add actually persisted the registration', async () => {
+    const f = degraded({ addFails: true, persistBeforeAddFailure: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'register-failed' });
+    expect([...f.pendingFiles.values()]).toHaveLength(1);
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(true);
+  });
+  it('records no admitted fast-path event on early refusal', async () => {
+    const f = degraded({ ready: '' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it('requires an existing green scoped fix-ready record', async () => {
+    expect(await degraded({ ready: '' }).run()).toMatchObject({ ok: false, detail: 'no-fix-ready-record' });
+  });
+  it.each(['failure', 'cancelled', 'timed_out'])('CI %s still vetoes', async conclusion => {
+    expect(await degraded({ testCheck: async () => ({ sha: SHA, name: 'test', status: 'completed', conclusion }) }).run()).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+  });
+  it('healthy daemon cannot be forced by extra caller input', async () => {
+    const f = degraded({ daemonEvents: '' });
+    expect(await f.run({ degradedFastPath: { enabled: true }, degraded: true, evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path')).toBe(false);
+  });
+  it.each([false, 'yes', null, [], { enabled: 'true' }, { degradedAfterMinutes: 0 }, { degradedAfterMinutes: '60' }, { degradedAfterMinutes: -1 }, { extra: true }])('disabled or malformed setting %j cannot enable it', async setting => {
+    const degradedFastPath = setting === false ? { enabled: false, degradedAfterMinutes: 60 } : setting;
+    const out = await degraded({ settings: { degradedFastPath } }).run();
+    expect(out).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+    expect(out.degradedFastPath).toBeUndefined();
+  });
+  it('takes the standard default and records platform/tool provenance', async () => {
+    const standard = await degraded().run();
+    expect(standard.settings.sources['degradedFastPath.enabled']).toBe('standard');
+    const platform = await degraded({ platformSettings: { degradedFastPath: { enabled: false } }, env: { WE_PLATFORM_PREFERENCES_FILE: '/home/test/platform-preferences.json' } }).run();
+    expect(platform.settings.sources['degradedFastPath.enabled']).toBe('platform');
+    expect(platform.degradedFastPath).toBeUndefined();
+  });
+  it('preserves ruled WEAKENED on green CI but refuses unclassified findings on the fast path', async () => {
+    const findings = ['scripts/tool.mjs:1 intentional scope relaxation'];
+    const ready = JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings });
+    const audits = auditLines([auditRecord({ base: 'e'.repeat(40), verdict: 'WEAKENED', findings })]);
+    expect(await degraded({ ready, audits }).run()).toMatchObject({ ok: false, stopReason: 'no-ready' });
+    const options = { ready, audits, settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] } };
+    expect(await degraded(options).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'security-finding' });
+    expect(await degraded({ ...options, testCheck: async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: prototypeLoad.TEST_CHECK_APP_ID }) }).run()).toMatchObject({ ok: true });
+  });
+  it('keeps fingerprint matching: a newer WEAKENED on the same fingerprint still blocks', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint }),
+      auditRecord({ head: 'd'.repeat(40), base: 'e'.repeat(40), fingerprint, verdict: 'WEAKENED', findings: ['scripts/x.mjs:1 newer negative evidence'] })]), fingerprint: () => fingerprint });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('unreadable daemon log cannot be replaced by caller evidence', async () => {
+    const f = degraded({ daemonEvents: 'truncated jsonl' });
+    expect(await f.run({ evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+  });
+  it.each(['security', 'B-class', 'B class', 'R37', '[B]', 'insecure temp file', 'arbitrary code execution', 'unclassified relaxation'])('findings cannot be waived on this path: %s', async text => {
+    const findings = [`scripts/tool.mjs:1 ${text}`];
+    const f = degraded({ ready: JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings }),
+      settings: { ruledWeakened: [{ ref: BASE.branch, sha: SHA, ruling: 'R1075', findings }] },
+      audits: auditLines([auditRecord({ base: 'e'.repeat(40), verdict: 'WEAKENED', findings })]) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', detail: 'security-finding' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('refused smoke withdraws the candidate through retirement and raises NEEDS-YOU', async () => {
+    const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'retire', reason: 'pr-merged', tip: SHA })) });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'adoption-refused', registered: false, rollback: { retired: true }, needsYou: true });
+    expect(retire).toHaveBeenCalledWith(expect.objectContaining({ ref: BASE.branch, expectedTip: SHA, expectedEntry: { ref: BASE.branch } }));
+    expect(needsYou).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringContaining('NEEDS-YOU') }));
+    expect(f.records.some(r => r.kind === 'prototype-load.degraded-fast-path-failed')).toBe(true);
+  });
+  it('unproven retirement keeps the overlay, refuses and raises NEEDS-YOU without withdrawing', async () => {
+    const retire = vi.fn(async () => ({ retired: true })), needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: retire, needsYou,
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'keep', reason: 'pr-open' })) });
+    expect(await f.run()).toMatchObject({ ok: false, registered: true, rollback: { retired: false, refused: 'retirement-unproved' }, needsYou: true });
+    expect(retire).not.toHaveBeenCalled();
+    expect(needsYou.mock.calls[0][0].error).toContain('NEEDS-YOU');
+  });
+  it('refused rollback stays visible and escalates manual recovery', async () => {
+    const needsYou = vi.fn();
+    const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: async () => ({ retired: false, refused: 'registration-changed' }), needsYou });
+    expect(await f.run()).toMatchObject({ registered: true, rollback: { retired: false }, needsYou: true });
+    expect(needsYou.mock.calls[0][0].error).toContain('unload manually');
+  });
+  it('never carries an older head audit across a matching fingerprint on degraded admission', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('keeps pending-adoption tracking when a degraded load fails after registration without a rollback', async () => {
+    const f = degraded({ probeThrows: true });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, adoptionEventTracked: true });
+    expect(out.rollback).toBeUndefined();
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect([...f.pendingFiles.values()].length).toBeGreaterThan(0);
+  });
+  it('unwritable pending-adoption storage refuses before registration', async () => {
+    const f = degraded({ pendingWriteFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, error: expect.stringContaining('adoption tracking unwritable') });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('does not create an unaudited merged SHA on the fast path', async () => {
+    const f = degraded({ behind: true });
+    expect(await f.run()).toMatchObject({ ok: false, detail: 'exact-sha-required' });
+    expect(f.calls.some(c => c.cmd === 'git' && c.args[0] === 'push')).toBe(false);
+  });
+  it('unwritable daemon event log refuses before registration', async () => {
+    const f = degraded({ eventWriteFails: true });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, error: expect.stringContaining('event log unwritable') });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
 });

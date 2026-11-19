@@ -5009,7 +5009,9 @@ load eligible for later failure detection. Legacy green settlements without `che
 are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
 Malformed, incomplete, oversized or duplicate-ID evidence never authorizes CI-failure unloading, even with a possible bound failure. Escalate that possible failure once per tracking ID and keep monitoring; the 24h verdict expiry still unloads.
 
-Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
+Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the local user's private HMAC key and the loading checkout’s normalized origin. The key detects tampering by writers without that key; it is readable by candidate code running as the same OS user and does not establish isolation from that code. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
+
+R1075 hardening debt — isolate receipt signing: move signing to an OS principal or host service whose secret is outside the suite child's filesystem view. Acceptance requires a candidate-suite probe that cannot read the key or request an arbitrary green signature, while the trusted signer binds the exact SHA, suite steps and observed result. Removing a key path from environment variables alone does not meet this requirement. This deployment boundary remains open; the current same-user runner does not provide it.
 
 The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,
 `integration`, `test`, `standards` and `changes`, with job-specific setup commands and exact occurrence counts.

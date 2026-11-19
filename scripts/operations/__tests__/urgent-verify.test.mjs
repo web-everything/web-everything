@@ -24,7 +24,7 @@ describe('urgent marker', () => {
     ['wrong shard count', { shards: 9 }], ['missing host', { host: '' }],
     ['non-string host', { host: 42 }], ['invalid finish', { finishedAt: 'invalid' }],
     ['invalid start', { startedAt: null }], ['reversed times', { startedAt: marker.finishedAt }],
-  ])('rejects %s', (_, change) => expect(check({ ...marker, ...change })).toMatchObject({ ok: false, fallback: expect.stringContaining('urgent-verify') }));
+  ])('rejects correctly signed %s', (_, change) => expect(check(sign({ ...marker, ...change }))).toMatchObject({ ok: false, fallback: expect.stringContaining('urgent-verify') }));
   it.each([
     ['missing reason', { reason: undefined }], ['short reason', { reason: 'short' }],
     ['missing urgent flag', { urgent: false }], ['short input sha', { sha: sha.slice(0, 8) }],

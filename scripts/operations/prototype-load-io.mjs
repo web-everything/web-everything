@@ -26,8 +26,11 @@ import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selecti
 import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
-import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
+import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository, defaultRetirePlanner } from './prototype-retire.mjs';
 import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
+import { assessDegraded } from './degraded-daemon.mjs';
+import { rollbackDegradedLoad } from './degraded-load-rollback.mjs';
+import { appendDaemonEvent, daemonEventsPath } from '../lib/daemon-events.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -175,24 +178,6 @@ async function defaultCombinedTest({ clone, candidateSha, refs }, { exec, fs, en
   }
 }
 
-/** Real retirement proof: refresh each registered ref's tracking ref, then decide with git and GitHub evidence. */
-function defaultRetirePlanner({ rows, proofRows = [], git, gh }) {
-  const refresh = (row) => git(['fetch', 'origin', `+refs/heads/${row.ref}:refs/remotes/origin/${row.ref}`]).code === 0;
-  const fetched = rows.filter(refresh);
-  // Registrations withheld from `rows` (the candidate being loaded) can still be the base a sibling is redundant with.
-  // Each is cited only after its own tracking ref was refreshed: a stale tip is no proof, and a base gone from origin is not cited.
-  const listed = new Set(rows.map((row) => row.ref));
-  const wantedBases = new Set(fetched.map((row) => mergeRefBase(row.ref)).filter(Boolean));
-  const proof = proofRows.filter((row) => wantedBases.has(row.ref) && !listed.has(row.ref) && refresh(row));
-  const unfetchedRows = rows.filter((row) => !fetched.includes(row));
-  if (!unfetchedRows.length && !fetched.length) return [];
-  // GitHub evidence is bound to origin's repository and host, for fetched and unfetched registrations alike.
-  const { repo, gh: originGh } = resolveOriginRepository({ git, gh });
-  // A deleted branch retires only on proof of its last tip (planFetchFailed); everything else is kept.
-  const unfetched = unfetchedRows.map((row) => planFetchFailed({ row, git, gh: originGh, repo }));
-  if (!fetched.length) return unfetched;
-  return [...planRetirements({ rows: fetched, proofRows: proof, git, gh: originGh, repo }), ...unfetched];
-}
 
 
 const clip80 = (v) => String(v ?? '').slice(0, 80);
@@ -237,15 +222,30 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
   readState = readOverlayState,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
-  resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
+  emitDaemonEvent = appendDaemonEvent, needsYou, resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
   // Mode settings have no authority: refuse is the only admission policy.
-  const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}) => layer;
-  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
-    platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
+  const settingErrors = [];
+  const withoutMode = ({ canonicalAuditMode: ignored, ...layer } = {}, source) => {
+    const v = layer.degradedFastPath;
+    if (v !== undefined && (!v || typeof v !== 'object' || Array.isArray(v)
+      || Object.keys(v).some(k => !['enabled', 'degradedAfterMinutes'].includes(k))
+      || (v.enabled !== undefined && typeof v.enabled !== 'boolean')
+      || (v.degradedAfterMinutes !== undefined && (!Number.isFinite(v.degradedAfterMinutes) || v.degradedAfterMinutes <= 0)))) {
+      settingErrors.push(`${source}.degradedFastPath malformed; disabled. Fix the setting and retry.`);
+      layer.degradedFastPath = { enabled: false, degradedAfterMinutes: 60 };
+    }
+    return layer;
+  };
+  const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS, degradedFastPath: { enabled: true, degradedAfterMinutes: 60 } },
+    platform: withoutMode(platform.prefs.prototypeLoad, 'platform'), tool: withoutMode(tool, 'tool') });
+  if (settingErrors.length || platform.errors.length) {
+    policy.value.degradedFastPath.enabled = false;
+    policy.leafValues['degradedFastPath.enabled'] = false;
+  }
   const config = { ...policy.value, ruledWeakened: loadRuledWeakened({
     platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env }) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
@@ -347,9 +347,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stopReason: null, branch: input.branch, sha: input.sha, effectiveRef: input.branch, effectiveSha: input.sha,
       dryRun: !!input.dryRun, stale: [], staleTolerated: [], removed: [], removedTips: {}, why: input.why || '',
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
-      settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
+      settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: [...platform.errors, ...settingErrors] } };
     let stage = 'bad-input';
     let pendingAdoption = null;
+    let degradedEventWritten = false;
+    let degradedRegistrationPresent = false;
     const stop = (reason, details = {}) => { Object.assign(out, details, { stopReason: reason }); return out; };
     // Once the replacement is registered, failures name the retained contained registrations.
     const keptNote = () => {
@@ -487,6 +489,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
       if (input.waitAdoptionMs !== undefined && input.waitAdoptionMs !== '' && (!Number.isFinite(Number(input.waitAdoptionMs)) || Number(input.waitAdoptionMs) < 0)) return stop('bad-input', { detail: 'bad-wait-adoption-ms', fallback: 'Pass --wait-adoption-ms as a number of milliseconds (0 returns right after registration; the cap is 160000).' });
+      // Assess eligibility here; select the fallback only after ordinary CI admission is known.
+      // Only this log read can enable R1075; extra caller fields have no authority.
+      let degradedEvidence;
+      if (!input.urgent && config.degradedFastPath.enabled && !settingErrors.length && !platform.errors.length) {
+        let events;
+        try { events = fs.readFileSync(daemonEventsPath({ env, home: env.HOME }), 'utf8'); } catch { /* no evidence */ }
+        const assessment = assessDegraded({ events, daemon: input.daemon, clone: out.clone,
+          now: now(), afterMinutes: config.degradedFastPath.degradedAfterMinutes });
+        if (assessment.degraded) {
+          degradedEvidence = { ...assessment.evidence, branch: input.branch, sha: input.sha, daemon: input.daemon, marker: null };
+        }
+      }
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
       let readyFp = null;
@@ -538,10 +552,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (result.code !== 0) return null;
         const data = JSON.parse(result.stdout);
         // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
-        urgentCiFailed = input.urgent && Array.isArray(data?.check_runs) && data.check_runs.some(r =>
+        urgentCiFailed = Array.isArray(data?.check_runs) && data.check_runs.some(r =>
           r?.head_sha === sha && r.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(r.conclusion));
-        if (urgentCiFailed) return null;
+        if (input.urgent && urgentCiFailed) return null;
         // Oversized/incomplete evidence refuses; operator completes or repairs the reader.
         if (!Number.isInteger(data?.total_count) || data.total_count < 0 || data.total_count > 100
           || !Array.isArray(data.check_runs) || data.check_runs.length !== data.total_count
@@ -561,7 +575,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           || runsData.workflow_runs.some(r => !r || !Number.isSafeInteger(r.check_suite_id) || !validSha(r.head_sha) || typeof r.path !== 'string'))
           throw new Error('malformed, incomplete or oversized CI workflows');
         const bound = testWorkflowBound(evidence, runsData, sha, config.testWorkflowPath);
-        if (input.urgent && !bound) throw new Error('unbound CI workflow');
+        if ((input.urgent || degradedEvidence) && !bound) throw new Error('unbound CI workflow');
         return bound ? evidence : null;
       });
       if (input.urgent && !urgentReason(input.reason)) return stop('no-ready', { detail: 'no-urgent-marker', fallback: 'Supply --reason with at least 10 characters after trimming, or wait for passing CI.' });
@@ -569,13 +583,28 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       try { checkRun = await readTestCheck({ sha: input.sha, branch: input.branch }); }
       catch (e) { return stop('no-ready', { detail: 'ci-evidence-unreadable', error: String(e.message || e),
         fallback: 'Repair the CI evidence reader or wait for complete, readable CI evidence (at most 100 checks and workflow runs), then retry.' }); }
-      if (urgentCiFailed || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
+      const passingTest = checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.appId === TEST_CHECK_APP_ID
+        && checkRun.status === 'completed' && checkRun.conclusion === 'success';
+      if (!passingTest && degradedEvidence) {
+        out.degradedFastPath = degradedEvidence;
+        input = { ...input, urgent: true, reason: `Daemon degraded for ${degradedEvidence.ageMinutes} minutes: ${degradedEvidence.signals.map(s => `${s.kind}@${s.at}`).join(', ')}` };
+        if (!out.gate) return stop('no-ready', { detail: 'no-fix-ready-record', fallback: 'Record green scoped fix-ready evidence before using degraded admission.' });
+        // No carried audit or textual waiver classification may substitute for exact-SHA proof.
+        out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, null, { ruledWeakened: out.gate }) };
+        // Audit findings currently have no structured security class. Unknown classification
+        // cannot establish that a waived finding is safe for the CI fallback.
+        if (out.gate.ruledWeakened) return stop('no-canonical-audit', { detail: 'security-finding',
+          fallback: 'Obtain a NOT WEAKENED exact-SHA audit or wait for passing CI; unclassified findings cannot waive the degraded gate.' });
+        if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
+          fallback: 'Obtain a NOT WEAKENED canonical audit on this exact SHA before retrying degraded admission.' });
+      }
+      if ((input.urgent && urgentCiFailed) || (checkRun?.sha === input.sha && checkRun.name === 'test' && checkRun.status === 'completed' && checkRun.conclusion !== 'success'))
         return stop('no-ready', { detail: 'ci-test-failed', fallback: 'Repair the failed CI test gate on this SHA and wait for passing CI.' });
       if (input.urgent && checkRun != null && !(checkRun.sha === input.sha && checkRun.name === 'test'
         && (['queued', 'in_progress'].includes(checkRun.status)
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
-      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
+      if (!passingTest) {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.' });
         let ledger, shards, expectedSteps, origin;
         try {
@@ -588,6 +617,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);
         checkRun = urgent.evidence;
+        if (out.degradedFastPath) out.degradedFastPath.marker = checkRun.marker;
       }
       const canonical = out.canonicalAudit.record;
       // R503: with only same-sha evidence no live fingerprint is computed (liveFp is null), yet the record we append
@@ -641,6 +671,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
       let comparison = input.sha;
+      if (!contains && out.degradedFastPath) return stop('no-ready', { detail: 'exact-sha-required',
+        fallback: 'Rebase onto main, run scoped tests, the canonical audit and urgent-verify on that exact SHA, then retry.' });
       if (!contains) {
         const merge = git('merge-tree', '--write-tree', 'origin/main', input.sha);
         if (merge.code === 1) {
@@ -802,6 +834,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
         // Persist intent before any registration mutation; failure refuses admission.
         appendUrgent(urgentIntent);
+        if (out.degradedFastPath) {
+          const intentRecorded = await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path-attempted', daemon: input.daemon,
+            detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
+          if (!intentRecorded) throw new Error('degraded event log unwritable; repair logging and retry');
+        }
+      }
+      if (out.degradedFastPath) {
+        pendingAdoption = { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(),
+          loadedBy: env.USER || null, nonce: randomUUID(), degradedFastPath: out.degradedFastPath };
+        out.adoptionEventTracked = recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
+        if (!out.adoptionEventTracked) throw new Error('degraded adoption tracking unwritable; repair storage and retry');
       }
       try {
         if (input.replace) {
@@ -838,10 +881,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             const state = await readState(out.clone, { env: childEnv });
             absent = state?.corrupt === false && Array.isArray(state.overlays)
               && state.overlays.every(e => safeRegistrationRef(e?.ref) && e.ref !== out.effectiveRef);
+            degradedRegistrationPresent = Boolean(out.degradedFastPath) && state?.corrupt === false
+              && Array.isArray(state.overlays) && state.overlays.every(e => safeRegistrationRef(e?.ref))
+              && state.overlays.some(e => e.ref === out.effectiveRef);
           } catch { /* Unknown state keeps the persisted urgent intent monitored. */ }
           if (absent) appendUrgent({ ...urgentIntent,
             type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
         }
+      }
+      if (out.degradedFastPath && out.registered) {
+        degradedEventWritten = await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: input.daemon,
+          detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
+        if (!degradedEventWritten) throw new Error('degraded admission event unwritable; inspect tracking and retry');
       }
       const readyPath = expand(config.readyRecordPath);
       fs.mkdirSync(dirname(readyPath), { recursive: true });
@@ -879,8 +930,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // about 180 s. By default return right after registration; the rebuild path emits overlay-adopted later.
       const waitMs = Math.min(WAIT_ADOPTION_CAP_MS, Math.max(0, Number(input.waitAdoptionMs) || 0), config.adoption.timeoutMs);
       const deadline = registeredAt + waitMs;
-      pendingAdoption = { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null, nonce: randomUUID() };
-      out.adoptionEventTracked = recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
+      pendingAdoption ||= { ref: out.effectiveRef, sha: out.effectiveSha, at: new Date(registeredAt).toISOString(), loadedBy: env.USER || null, nonce: randomUUID(), ...(out.degradedFastPath ? { degradedFastPath: out.degradedFastPath } : {}) };
+      out.adoptionEventTracked ||= recordPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       // Rebuilds currently emit to the self-sync state directory. Also read the requested overlay
       // sibling trail, so both the loader events and rebuild refusals are observed.
       const rebuildAlerts = join(env.WE_DAEMON_STATE_DIR || join(env.HOME, '.claude/daemon-self-sync-state'), `${basename(state)}.alerts.jsonl`);
@@ -888,7 +939,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const alerts = refusal(jsonLines(read(`${state}.alerts.jsonl`)), out.effectiveRef, registeredAt, true)
           || refusal(jsonLines(read(rebuildAlerts)), out.effectiveRef, registeredAt, true)
           || refusal(jsonLines(read(`${state}.events.jsonl`)), out.effectiveRef, registeredAt);
-        if (alerts) return stop('adoption-refused', { adoption: { refusal: alerts }, fallback: `Fix the refused replacement and rerun.${keptNote()}` });
+        if (alerts) {
+          if (out.degradedFastPath) {
+            out.rollback = await rollbackDegradedLoad({ root: out.clone, ref: out.effectiveRef, sha: out.effectiveSha,
+              fastPath: out.degradedFastPath, reason: 'adoption-refused', env: { ...childEnv, WE_DAEMON_STATE_DIR: env.WE_DAEMON_STATE_DIR, WE_DAEMON_EVENTS: env.WE_DAEMON_EVENTS },
+              readState, retire: removeRegistration || undefined, needsYou, io: fs, emit: emitDaemonEvent, now,
+              planner: retirePlanner, gitArgs: (args) => git(...args), ghArgs: (args) => execute('gh', args),
+              tip: ref => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0] });
+            out.needsYou = true;
+            if (out.rollback?.retired) out.registered = false;
+          }
+          return stop('adoption-refused', { adoption: { refusal: alerts }, fallback: out.degradedFastPath ? `NEEDS-YOU: inspect the refused replacement and registry, then rerun.${keptNote()}` : `Fix the refused replacement and rerun.${keptNote()}` });
+        }
         let probe = git('-C', out.clone, 'merge-base', '--is-ancestor', out.effectiveSha, 'HEAD');
         let missing = false;
         if (probe.code === 128) {
@@ -936,12 +998,23 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out;
     } catch (e) { return stop(stage, { error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
+      if (out.degradedFastPath && (out.registered || degradedRegistrationPresent) && !input.dryRun && !degradedEventWritten) {
+        await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path', daemon: out.daemon,
+          detail: out.degradedFastPath }, { env, now: () => new Date(now()) });
+      }
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }
       catch (e) { out.ok = false; out.stopReason ||= 'check-unverifiable'; out.recordError = String(e.message || e); }
+      if (out.degradedFastPath && !out.ok && !input.dryRun && !out.rollback) {
+        await emitDaemonEvent({ kind: 'prototype-load.degraded-fast-path-failed', daemon: out.daemon,
+          detail: { ...out.degradedFastPath, stopReason: out.stopReason } }, { env, now: () => new Date(now()) });
+      }
       // Pending is the only outcome that delegates its adoption notice to the rebuild path. Do not leave
       // refused/unverifiable loads or a load already adopted during its wait to emit misleading notices.
-      if (out.adoptionEventTracked && (out.result !== 'registered-pending' || !out.ok)) {
+      // A degraded load that failed after registration and ran no rollback keeps its pending-adoption tracking, so the
+      // asynchronous smoke-failure rollback can still find it; only a finished rollback or an adopted load clears it.
+      const keepDegradedTracking = Boolean(out.degradedFastPath) && Boolean(out.registered || degradedRegistrationPresent) && !out.ok && !out.rollback;
+      if (out.adoptionEventTracked && !keepDegradedTracking && (!out.rollback || (out.rollback.retired === true && out.rollback.eventRecorded)) && (out.result !== 'registered-pending' || !out.ok)) {
         clearPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       }
     }

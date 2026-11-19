@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,12 +9,21 @@ import ts from 'typescript';
 // remote PR reads and live smoke are deliberately outside this event contract.
 vi.mock('../daemon-rebuild/prepare.mjs', () => ({ prepareRebuild: vi.fn() }));
 vi.mock('../daemon-rebuild/smoke.mjs', () => ({ smokeAndAdopt: vi.fn() }));
+vi.mock('node:child_process', async importOriginal => {
+  const real = await importOriginal();
+  return { ...real, spawnSync: (cmd, args, opts) => cmd !== 'gh' ? real.spawnSync(cmd, args, opts)
+    : args[0] === 'repo' ? { status: 0, stdout: JSON.stringify({ nameWithOwner: 'web-everything/web-everything', url: 'https://github.com/web-everything/web-everything' }) }
+      : args[0] === 'pr' && args[1] === 'list' ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' } };
+});
 
 import * as rebuild from '../daemon-rebuild/rebuild.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
-import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { writeRebuildState, alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { recordPendingAdoption, readPendingAdoptions } from '../overlay-adoption.mjs';
+import { overlayFilePath, readOverlayState } from '../daemon-overlays.mjs';
+import { withBareOrigin } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 const sha = 'b'.repeat(40);
 const { FAILURE_REASONS, rebuildClone } = rebuild;
@@ -63,6 +72,53 @@ function expectEvent(kind, detail) {
 }
 
 describe('rebuildClone coordination events', () => {
+  it('rebuildClone withdraws a pending unmerged degraded load after smoke refusal with the real planner', async () => {
+    await withBareOrigin(async repo => {
+      options.root = repo.clone;
+      const ref = 'lane/refused';
+      repo.seedOriginBranch(ref, { 'repair.mjs': 'export const repair = true;\n' });
+      repo.git(['fetch', 'origin']);
+      const tip = repo.git(['rev-parse', `origin/${ref}`]).trim();
+      mkdirSync(options.env.WE_DAEMON_OVERLAY_DIR);
+      writeFileSync(overlayFilePath(options.root, options.env), JSON.stringify({ clone: options.root, overlays: [{ ref }] }));
+      recordPendingAdoption(options.root, { ref, sha: tip, degradedFastPath: { sha: tip, branch: ref, daemon: 'review' } }, { env: options.env });
+      terminal({ moved: false, reason: 'smoke-rejected', plan: { applied: [{ ref, sha: tip }] } });
+      options.emitEvent.mockReturnValue(true);
+      await rebuildClone(options);
+      expect(readOverlayState(options.root, { env: options.env }).overlays).toEqual([]);
+      expect(readPendingAdoptions(options.root, { env: options.env })).toEqual([]);
+      expect(readFileSync(alertsFilePath(options.root, options.env), 'utf8')).toContain('NEEDS-YOU');
+      expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'prototype-load.degraded-fast-path-failed', detail: expect.objectContaining({ rollback: expect.objectContaining({ retired: true }) }) }), expect.anything());
+    });
+  });
+  it('runs deferred degraded rollback and emits discard evidence from the rebuild call site', async () => {
+    const ref = 'lane/refused';
+    recordPendingAdoption(options.root, { ref, sha, degradedFastPath: { sha, branch: ref, daemon: 'review' } }, { env: options.env });
+    const discard = { kind: 'ready-candidate-discarded', detail: { ref, reason: 'smoke-rejected' } };
+    prepareRebuild.mockReturnValue({ terminal: true, result: { moved: false, reason: 'smoke-rejected' }, alerts: [discard] });
+    options.emitEvent.mockReturnValue(true);
+    await rebuildClone(options);
+    expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ ...discard, daemon: 'review-daemon' }), expect.anything());
+    expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'prototype-load.degraded-fast-path-failed', detail: expect.objectContaining({ rollback: { retired: true, absent: true } }) }), expect.anything());
+    expect(readPendingAdoptions(options.root, { env: options.env })).toEqual([]);
+    expect(readFileSync(alertsFilePath(options.root, options.env), 'utf8')).toContain('NEEDS-YOU');
+  });
+
+  it('still checks pending adoption when degraded rollback emission throws', async () => {
+    const ref = 'lane/refused';
+    recordPendingAdoption(options.root, { ref, sha, degradedFastPath: { sha, branch: ref, daemon: 'review' } }, { env: options.env });
+    terminal({ moved: false, reason: 'smoke-rejected', plan: { applied: [{ ref, sha }] } });
+    options.emitEvent.mockImplementation(event => {
+      if (event.kind === 'prototype-load.degraded-fast-path-failed') throw new Error('rollback event unavailable');
+      return true;
+    });
+    // An old pending entry must still get its overdue notice after the rollback hook throws.
+    const { pendingAdoptionPath } = await import('../overlay-adoption.mjs');
+    const [pending] = readPendingAdoptions(options.root, { env: options.env });
+    writeFileSync(pendingAdoptionPath(options.root, options.env), JSON.stringify([{ ...pending, at: new Date(Date.now() - 3600000).toISOString() }]));
+    await rebuildClone(options);
+    expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'overlay-adoption-overdue' }), expect.anything());
+  });
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
     const result = { moved: true, adopted: true, head: sha, prevHead, plan: { finalSha: sha }, alerts: [] };
     smokeAndAdopt.mockResolvedValue(result);
