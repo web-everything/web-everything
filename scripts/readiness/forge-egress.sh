@@ -20,8 +20,8 @@ set -euo pipefail
 
 SLOTS=$(bash "$(dirname -- "$0")/forge-slots.sh")
 # Standalone refreshes must also contain a pool retained after settings were lowered.
-# Explicit counts and UID fixtures keep their existing override semantics.
-if [[ -z "${FORGE_EXEC_SLOTS+x}" && -z "${FORGE_EGRESS_UIDS+x}" ]]; then
+# Explicit counts are a floor; UID fixtures keep their existing override semantics.
+if [[ -z "${FORGE_EGRESS_UIDS+x}" ]]; then
   if command -v getent >/dev/null 2>&1; then
     installed_users=$(getent passwd)
   else

@@ -115,10 +115,14 @@ describe('Forge slot settings', () => {
     ['installed users', 14, 11, {}, 14],
     ['installed paths', 11, 14, {}, 14],
     ['larger resolved count', 4, 6, {FORGE_HOST: 'forge'}, 14],
-    ['explicit count', 14, 14, {FORGE_EXEC_SLOTS: '8'}, 8],
+    ['explicit count covers installed users', 14, 11, {FORGE_EXEC_SLOTS: '8'}, 14],
+    ['explicit count covers installed paths', 11, 14, {FORGE_EXEC_SLOTS: '8'}, 14],
+    ['larger explicit count', 4, 6, {FORGE_EXEC_SLOTS: '16'}, 16],
     ['UID override', 14, 14, {FORGE_EGRESS_UIDS: '999'}, 0],
     ['unreadable user database', 14, 14, {PASSWD_FAIL: '1'}, -1],
     ['missing retained user', 14, 14, {MISSING_SLOT: '14'}, -1],
+    ['explicit count with unreadable user database', 14, 14, {FORGE_EXEC_SLOTS: '8', PASSWD_FAIL: '1'}, -1],
+    ['explicit count with missing retained user', 14, 14, {FORGE_EXEC_SLOTS: '8', MISSING_SLOT: '14'}, -1],
   ])('standalone egress respects %s', (_, users, paths, overrides, count) => {
     const dir = fixture();
     const pool = join(dir, 'pool'); mkdirSync(pool); mkdirSync(join(pool, `slot-${paths}`));
