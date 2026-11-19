@@ -1,4 +1,5 @@
-import { createRedTeamGateIo } from '../../../scripts/operations/red-team-gate-apply.mjs';
+import { applyRedTeamGate, createRedTeamGateIo } from '../../../scripts/operations/red-team-gate-apply.mjs';
+import { repoProfile } from '../../../scripts/lib/repo-profile.mjs';
 import * as preventionLanding from '../../../scripts/lib/prevention-landing-job.mjs';
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
 // The host operator store (~/.claude/operator-overrides.json) outranks env, so a developer's live
@@ -535,8 +536,8 @@ it.each(['on', 'off'])('capability-disabled tick still enforces overdue send-bac
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 
-it.each(['on', 'off'])('capability-off blocks mixed send-back/card catch-up before gate work (queue %s)', queue => {
-  const repo = 'web-everything/web-everything';
+it.each(['on', 'off'].flatMap(queue => [repoProfile('longshore').slug, 'unknown/repo'].map(repo => [queue, repo])))(
+  'mixed catch-up sends back before refusing card work (queue %s, repo %s)', async (queue, repo) => {
   const { plan, rawPrs } = owedPrs(repo, [9701]);
   const head = rawPrs[0].headRefOid;
   rawPrs[0].comments = [{
@@ -544,8 +545,21 @@ it.each(['on', 'off'])('capability-off blocks mixed send-back/card catch-up befo
     createdAt: '2026-11-14T16:00:00Z', author: { login: 'web-everything' },
   }];
   const realCatchUp = gateCatchUp.runGateCatchUp;
-  const fileCard = vi.fn(), history = new Map();
-  const runGate = vi.fn(() => { fileCard(); return { status: 'applied' }; });
+  const comments = rawPrs[0].comments, history = new Map();
+  const sendBack = vi.fn(() => ({ ok: true }));
+  const start = vi.spyOn(preventionLanding, 'spawnPreventionLandingJob');
+  const fileCard = vi.fn(createRedTeamGateIo().fileCard);
+  let applied;
+  const runGate = vi.fn(input => {
+    applied = applyRedTeamGate(input, {
+      readPr: () => ({ headRefOid: head, comments, labels: [] }),
+      readSetting: () => ({ value: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' } }),
+      readRound: () => 1, readHead: () => head, sendBack, fileCard,
+      appendSendBackEvent: () => {}, dequeueSentBack: () => {},
+      postComment: ({ body }) => comments.push({ body, author: { login: 'web-everything' } }), log: () => {},
+    });
+    return { status: 'applied' };
+  });
   vi.spyOn(gateCatchUp, 'runGateCatchUp').mockImplementation(options => realCatchUp({
     ...options, now: Date.parse('2026-11-14T16:20:00Z'), history,
     setting: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' },
@@ -557,13 +571,15 @@ it.each(['on', 'off'])('capability-off blocks mixed send-back/card catch-up befo
     const production = cliReviewTickOpts({ log: { error: log }, listCommands: () => '' });
     const input = { repo, plan, rawPrs, resolveProfile: () => ({ capabilities: { review: false } }), paused: true };
     production.redTeamOnSkip(input);
-    expect(runGate).not.toHaveBeenCalled();
-    expect(fileCard).not.toHaveBeenCalled();
-    expect(history.size).toBe(0);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('capability unavailable'));
-    production.redTeamOnSkip({ ...input, resolveProfile: () => ({ capabilities: { review: true } }) });
     expect(runGate).toHaveBeenCalledOnce();
+    expect(await applied).toMatchObject({ status: 'card-failed', outcome: 'sent-back', error: expect.stringContaining('capability unavailable') });
+    expect(sendBack).toHaveBeenCalledOnce();
     expect(fileCard).toHaveBeenCalledOnce();
+    expect(start).not.toHaveBeenCalled();
+    expect(comments.at(-1).body).toContain('outcome=sent-back');
+    production.redTeamOnSkip(input);
+    expect(runGate).toHaveBeenCalledOnce();
+    expect(sendBack).toHaveBeenCalledOnce();
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 

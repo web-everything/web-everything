@@ -103,6 +103,7 @@ export function buildRedTeamCardInput({ repo, pr, head, findings }) {
     + 'found these, Claude\'s re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up '
     + 'card instead of blocking the PR:\n\n' + findings.map(findingLine).join('\n');
   return {
+    repo,
     title: `Red-team follow-ups${classes.length ? ` [${classes.join(', ')}]` : ''} from ${repo}#${pr} (head ${String(head).slice(0, 9)})`,
     kind: 'story', size: '2',
     digest: qualifyLocusRefs(digest, files),

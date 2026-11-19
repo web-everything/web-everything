@@ -44,7 +44,7 @@ function rosterFilters(source) {
 describe('capabilities admit dispatch only', () => {
   const files = scopedScanFiles([...new Set([
     ...sources('scripts/conveyor'), ...sources('skills-src/conveyor'), ...sources('scripts/operations'),
-    'scripts/merge-ai-prs.mjs',
+    'scripts/merge-ai-prs.mjs', 'scripts/lib/red-team-gate-catchup.mjs',
   ])]);
   it.each(files)('%s has no capability-filtered roster or unapproved admission', path => {
     const source = readFileSync(resolve(root, path), 'utf8');
