@@ -1699,10 +1699,16 @@ describe('invalid probe cap', () => {
 });
 
 describe('list read partial', () => {
-  it('retains persisted known entries and probes blocked heads using stored head-bound refusal rows', () => {
+  it('never fabricates recovery refusals when the planner supplied none', () => {
+    const f = savedProbeQueue({ count: 3 });
+    expect(probeTick(f, undefined, { listPartial: true, plan: { refusals: [] } })).toEqual([]);
+    expect(numbers(f.open().entries())).toEqual([1, 2, 3]);
+  });
+
+  it('retains persisted known entries and probes only planner-provided head-bound refusal rows', () => {
     const f = savedProbeQueue({ count: 3, runnable: [4] });
     const stored = f.queue.entries();
-    const rows = probeTick(f, undefined, { listPartial: true, rawPrs: [], plan: { refusals: [] } });
+    const rows = probeTick(f, undefined, { listPartial: true });
     expect(rows).toEqual([1, 2, 3].map(prNumber => ({
       prNumber, kind: 'already-reviewed-head', headSha: stored.find(entry => entry.pr === prNumber).head,
     })));
@@ -1723,7 +1729,7 @@ describe('list read partial', () => {
       headRefOid: pr === 3 && state === 'head-moved' ? head(300) : head(pr),
     }));
     const f = savedProbeQueue({ count: 3, readLivePr });
-    const rows = probeTick(f, undefined, { listPartial: true, rawPrs: [], plan: { refusals: [] } });
+    const rows = probeTick(f, undefined, { listPartial: true });
     expect(rows.map(row => row.prNumber)).toEqual([1, 2]);
     expect(readLivePr).toHaveBeenCalledWith({ repo, pr: 3 });
   });
@@ -1752,7 +1758,7 @@ describe('partial inventory recovery safety', () => {
   it('partial inventory runner receives only raw PRs from matching live reads', () => {
     const f = savedProbeQueue({ count: 3, runnable: [4] });
     const readPartialPr = vi.fn(({ pr }) => ({ number: pr, labels: [], comments: [], state: pr === 3 ? 'CLOSED' : 'OPEN', headRefOid: head(pr), title: `live ${pr}` }));
-    runWithRedTeamQueue({ queue: f.queue, ...inputs([99]), listPartial: true, readPartialPr,
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 99]), listPartial: true, readPartialPr,
       capacity: capacity(1), run: options => {
         expect(options.rawPrs).toEqual([1, 2].map(pr => ({ number: pr, labels: [], comments: [], state: 'OPEN', headRefOid: head(pr), title: `live ${pr}` })));
         return { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'review-unfinished' })) };

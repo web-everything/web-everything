@@ -510,6 +510,10 @@ export function runReviewTick({
       startsCeiling: Math.max(0, hostLimit - occupied - reserve),
       take: () => { onTake(); if (typeof host.take === 'function') host.take(1); } };
   };
+  const recoveryPlan = plan => ({ ...plan, refusals: (plan.refusals ?? []).map(row =>
+    row.kind === 'nothing-owed' && row.phase === 'queued'
+      ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
+      : row) });
   let plan;
   let rawAgents = null;
   try {
@@ -533,7 +537,13 @@ export function runReviewTick({
         try { host = hostAdmission() ?? host; } catch { host = { admitted: false }; }
         const hostLimit = !host.admitted ? 0 : Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : Infinity;
         const capacity = recoveryCapacity({ host, hostLimit, recoveryStarts: hostLimit });
-        redTeamOnSkip({ repo, plan: { refusals: [] }, rawPrs: [], listPartial: true, capacity, paused });
+        redTeamOnSkip({ repo, plan: { refusals: [] }, rawPrs: [], listPartial: true, capacity, paused,
+          planPartialRecovery: prs => {
+            const agents = readAgents({});
+            const partialPlan = reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => agents });
+            if (partialPlan?.deferred) throw new Error('partial recovery reconcile deferred');
+            return recoveryPlan(partialPlan);
+          } });
       } catch { log(`review-daemon: ${repo} partial-inventory red-team recovery failed`); }
     }
     return {
@@ -791,11 +801,7 @@ export function runReviewTick({
       // guard. For red-team recovery they are also already reviewed; the recovery planner still
       // requires an accepting, head-bound payload and checks comments, status and cooldown.
       // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
-      const recoveryRefusals = (plan.refusals ?? []).map(row =>
-        row.kind === 'nothing-owed' && row.phase === 'queued'
-          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
-          : row);
-      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
+      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: recoveryPlan(plan), rawPrs,
         capacity, paused });
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
     finally {

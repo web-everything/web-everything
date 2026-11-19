@@ -244,14 +244,15 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    admit(repo, count, { allowProbes = true, maxProbes } = {}) {
+    admit(repo, count, { allowProbes = true, maxProbes, probePrs } = {}) {
       const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Least-recently-probed heads get the next bounded turn without using a runnable slot.
       // Missing turns get one-time legacy catch-up; newly blocked entries always carry a turn.
       const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key));
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
-      const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
+      const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount
+        && (probePrs === undefined || probePrs.has(entry.pr)))
         .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, probeCap(maxProbes));
       const probes = new Set(selected.map(entry => entry.key));
       if (selected.length) {
@@ -377,7 +378,7 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, listPartial = false, readPartialPr = readPartialRedTeamPr, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  floor, listPartial = false, planPartialRecovery, readPartialPr = readPartialRedTeamPr, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const transaction = transactions.get(queue)?.();
   try {
     const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
@@ -392,8 +393,11 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     if (listPartial) {
       const known = queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)
         && liveEvidence.get(entry.key)?.state === 'OPEN' && liveEvidence.get(entry.key)?.headRefOid === entry.head);
-      plan = { refusals: known.map(entry => ({ prNumber: entry.pr, kind: 'already-reviewed-head', headSha: entry.head })) };
       rawPrs = known.map(entry => ({ ...liveEvidence.get(entry.key), number: entry.pr }));
+      // Reuse the tick's normal planner and agent discovery; this branch never invents eligibility.
+      if (typeof planPartialRecovery === 'function') plan = planPartialRecovery(rawPrs);
+      plan = { ...plan, refusals: (plan?.refusals ?? []).filter(row => known.some(entry =>
+        entry.pr === Number(row.prNumber) && entry.head === (row.headSha ?? row.headRefOid))) };
     }
     const candidates = [], cardOnlyCandidates = [];
     for (const row of listPartial ? [] : plan?.refusals ?? []) {
@@ -443,7 +447,9 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, listPartial ? 0 : exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity), maxProbes: floor?.maxProbesPerTick });
+    const admitted = queue.admit(repo, listPartial ? 0 : exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity), maxProbes: floor?.maxProbesPerTick,
+      ...(listPartial ? { probePrs: new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head')
+        .map(row => Number(row.prNumber))) } : {}) });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))

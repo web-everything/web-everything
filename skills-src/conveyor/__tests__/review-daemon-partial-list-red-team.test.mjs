@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../../../scripts/lib/review-facts.mjs', async original => ({
   ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
 }));
+import { runReconcilePass } from '../../../scripts/conveyor/reconcile-pass.mjs';
 import { runReviewTick } from '../review-daemon.mjs';
 import { assertInventoryComplete, PrListUnreadableError } from '../../../scripts/lib/pr-list-paged.mjs';
 import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../../../scripts/lib/red-team-dispatch-queue.mjs';
@@ -36,6 +37,16 @@ function failedListTick(error, overrides = {}) {
 }
 
 describe('partial PR inventory red-team recovery', () => {
+  it('a known blocked draft passes through real reconcile and never reaches dispatch', () => {
+    const f = recoveryTick(inventoryError([], 10), 'draft');
+    expect(f.reconcile).toHaveBeenCalledOnce();
+    expect(f.readAgents).toHaveBeenCalledOnce();
+    expect(f.reconcile.mock.results[0].value.refusals).toContainEqual(expect.objectContaining({ kind: 'draft', prNumber: 1 }));
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.readEvidence).not.toHaveBeenCalled();
+    expect(f.queue.entries()).toEqual([expect.objectContaining(f.before[0])]);
+  });
+
   it('list read partial', () => {
     const error = inventoryError([{ number: 1 }], 10);
     expect(error.message).toContain('pages carried 1 unique of 10 open PRs');
@@ -78,7 +89,13 @@ function recoveryTick(error, mode) {
   const queue = createRedTeamDispatchQueue({ file: 'fixture-queue.json', readFile: () => stored,
     writeFile: (_path, data) => { stored = data; }, rename: () => {} });
   const before = queue.entries();
-  const readEvidence = vi.fn(() => ({ inFlight: true }));
+  const dispatch = vi.fn();
+  const readAgents = vi.fn(() => []);
+  const reconcile = vi.fn(options => runReconcilePass({ ...hermeticReconcile, ...options, repo: 'we' }));
+  const readEvidence = vi.fn(() => mode === 'draft'
+    ? { recorded: false, loopPayload: { verdict: { verdict: 'accept' },
+      findings: { read: { netBasis: { rev: head } } } } }
+    : { inFlight: true });
   const readReviews = vi.fn(() => []);
   let result;
   const redTeamOnSkip = vi.fn(options => {
@@ -87,19 +104,21 @@ function recoveryTick(error, mode) {
         if (mode === 'throw') throw Error('offline');
         if (mode === 'unreadable') return null;
         return { number: mode === 'wrong number' ? 99 : pr,
+          isDraft: mode === 'draft', mergeStateStatus: 'UNKNOWN',
           state: mode === 'closed' ? 'CLOSED' : 'OPEN',
           headRefOid: mode === 'head moved' ? 'b'.repeat(40) : head,
-          labels: mode === 'labels missing' ? undefined : [{ name: 'review:accepted' }],
+          labels: mode === 'labels missing' ? undefined : [{ name: mode === 'draft' ? 'review:pending' : 'review:accepted' }],
           comments: mode === 'comments missing' ? undefined : [] };
       },
       setting: { enabled: true, retryCooldownMin: 30 }, readEvidence, readReviews,
       readCarry: () => null, readWitness: null, readStatus: () => null, lastDispatch: new Map(),
-      syncLabels: vi.fn(), dispatch: vi.fn(),
+      headNeverReviewed: () => false,
+      syncLabels: vi.fn(), dispatch,
     });
     return result;
   });
-  failedListTick(error, { redTeamOnSkip });
-  return { redTeamOnSkip, result, readEvidence, readReviews, queue, before, head };
+  failedListTick(error, { redTeamOnSkip, reconcile, readAgents });
+  return { redTeamOnSkip, result, readEvidence, readReviews, queue, before, head, dispatch, reconcile, readAgents };
 }
 
 describe('partial inventory recovery safety', () => {
@@ -140,3 +159,17 @@ describe('partial inventory recovery safety', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('partial-inventory red-team recovery failed'));
   });
 });
+
+// Keep the actual IO shell and planner; replace external evidence readers only.
+const identity = prs => prs;
+const hermeticReconcile = {
+  readOnly: true, env: {}, stepLog: () => {}, enrich: identity,
+  readRequiredChecks: () => ({ checks: [] }), readChecks: () => [],
+  excuseMergeGateHolds: identity, enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
+  enrichAlreadyLanded: identity, enrichBaseRef: identity, enrichConflictDisposition: identity,
+  enrichSystemFix: identity, enrichEscalationBase: identity, enrichFixClaims: identity,
+  enrichTimeouts: identity, enrichReferralHolds: identity, enrichReferralAutoResolve: identity,
+  enrichLedgerHolds: identity, enrichRulings: identity, enrichScopeBloat: identity,
+  enrichCodeQL: identity, enrichStandingRulingGrants: identity, enrichOwedMainRule: () => {},
+  enrichMechanicalRound: identity, resolveMainSha: () => null, readPriority: () => null,
+};

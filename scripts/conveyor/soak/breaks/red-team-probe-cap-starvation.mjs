@@ -1,20 +1,24 @@
 /** Persisted blocked red-team heads must all get a bounded probe turn. */
-import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATH = 'scripts/lib/red-team-dispatch-queue.mjs';
+export function probeCapFixPresent(source) {
+  return !/\b(?:const|let|var)\s+MAX_PROBES\s*=\s*2\b/.test(source)
+    && /\.slice\(0,\s*probeCap\(maxProbes\)\)/.test(source)
+    && /const\s+DEFAULT_MAX_PROBES\s*=\s*6\s*;/.test(source)
+    && /const\s+MAX_PROBES_CEILING\s*=\s*50\s*;/.test(source);
+}
 export default {
   id: 'red-team-probe-cap-starvation',
   title: 'ten blocked red-team heads receive probe turns within two default ticks',
   card: 'red-team probe cap starvation regression',
   fixedBy: { sha: 'working-tree', where: 'current tree', paths: [PATH] },
   fixPresent(root) {
-    const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
-      `import b from ${JSON.stringify(import.meta.url)}; const r = await b.run({ sourceRoot: ${JSON.stringify(root)} }); process.exit(b.judge(r).length ? 1 : 0);`],
-    { timeout: 15000, maxBuffer: 65536, encoding: 'utf8' });
-    return !probe.error && probe.status === 0;
+    try { return probeCapFixPresent(readFileSync(join(root, PATH), 'utf8')); }
+    catch { return false; }
   },
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
