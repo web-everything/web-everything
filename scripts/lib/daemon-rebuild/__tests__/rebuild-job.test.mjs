@@ -2,7 +2,9 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { loadRebuildAsJobSettings, rebuildJobInterval, rebuildCloneAsJob, REBUILD_JOB_KIND } from '../rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../../daemon-jobs-runtime.mjs';
 import { writeReadyCandidate, readReadyCandidate, writeRebuildState, readRebuildState, readRebuildStateStrict, rebuildStatePath, readyCandidatePath, readReadyCandidateStrict } from '../state.mjs';
@@ -618,3 +620,62 @@ it('lost launch-only snapshot handoff refuses before any legacy read or Git IO',
   expect(prepared.result.reason).toBe('state-unreadable');
   expect(legacy).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled();
 });
+
+it.each(['early', 'recovery', 'tick-start', 'unknown', undefined].flatMap(source =>
+  ['corrupt', 'EACCES'].map(failure => [source, failure])))(
+  'detached %s child re-reads %s evidence under its own lock after admission without changing bytes', (launchedBy, failure) => {
+    const env = { ...process.env, WE_DAEMON_STATE_DIR: join(root, 'state'),
+      WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
+      WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_DAEMON_AUTO_REBASE: '0', WE_OVERLAY_STALE: '0' };
+    execFileSync('git', ['init', '-q', '-b', 'child-fixture', root], { timeout: 5000, maxBuffer: 65536 });
+    writeRebuildState(root, {}, env);
+    expect(readRebuildStateStrict(root, env)).toMatchObject({ rejected: null }); // queue admission succeeded
+    const file = rebuildStatePath(root, env);
+    if (failure === 'corrupt') writeFileSync(file, '{corrupted-after-admission');
+    const bytes = readFileSync(file);
+    const observed = join(root, 'locked-reads.jsonl');
+    // Inject EACCES rather than chmod (privileged runners can read mode-000 files).
+    // Observe the actual child read, including the lock it acquired independently.
+    const preload = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { inspectCloneLock } from ${JSON.stringify(pathToFileURL(resolve('scripts/lib/daemon-clone-lock.mjs')).href)};
+      const read = fs.readFileSync;
+      fs.readFileSync = (path, ...args) => {
+        if (path === ${JSON.stringify(file)}) {
+          fs.appendFileSync(${JSON.stringify(observed)}, JSON.stringify(inspectCloneLock(${JSON.stringify(root)},
+            { lockRoot: process.env.WE_DAEMON_CLONE_LOCK_ROOT }).writerLive) + '\\n');
+          if (${JSON.stringify(failure)} === 'EACCES') throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        }
+        return read(path, ...args);
+      };
+      syncBuiltinESMExports();
+    `;
+    const strict = launchedBy === 'early' || launchedBy === 'recovery';
+    const argv = rebuildJob.rebuildChildArgs({ root, launchedBy, admissionEvidence: { state: 'must-not-travel' } },
+      resolve('scripts/lib/daemon-rebuild.mjs'));
+    expect(argv).toEqual([resolve('scripts/lib/daemon-rebuild.mjs'), `--clone=${root}`, '--ready-only', '--json',
+      ...(strict ? [`--launched-by=${launchedBy}`] : [])]);
+    const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, ...argv], {
+      env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    expect(rebuildJob.parseRebuildChildOutput(stdout)).toMatchObject(strict
+      ? { moved: false, reason: 'state-unreadable' }
+      : { moved: false, reason: 'readonly-job-mutation-due', mutation: 'wrong-branch-heal' });
+    expect(readFileSync(observed, 'utf8')).toBe('true\n');
+    expect(readFileSync(file)).toEqual(bytes);
+  });
+
+it.each(['early', 'recovery'].flatMap(source => [false, true].map(readyOnly => [source, readyOnly])))(
+  '%s adopt-only readyOnly=%s also refuses corrupt state under the lock', async (launchedBy, readyOnly) => {
+    const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+    writeRebuildState(root, {}, env);
+    const file = rebuildStatePath(root, env);
+    writeFileSync(file, '{broken');
+    const run = vi.fn();
+    const result = await rebuildClone({ root, env, launchedBy, readyOnly, adoptOnly: true, asJob: false,
+      versions: null, run, emitEvent: vi.fn(), log: { error() {} } });
+    expect(result.reason).toBe('state-unreadable');
+    expect(run).not.toHaveBeenCalled();
+    expect(readFileSync(file, 'utf8')).toBe('{broken');
+  });

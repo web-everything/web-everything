@@ -159,6 +159,7 @@ async function runCli(argv) {
   const entries = argv.filter((a) => a.startsWith('--entry=')).map((a) => a.slice('--entry='.length)).filter(Boolean);
   const result = await rebuildClone({
     root, asJob: false, readyOnly: !!flags['ready-only'], mainOnly: !!flags['main-only'],
+    launchedBy: flags['launched-by'],
     ...(entries.length ? { entries } : {}),
   });
   if (flags.json) {

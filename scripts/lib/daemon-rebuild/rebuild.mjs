@@ -212,7 +212,9 @@ async function rebuildCloneInternal({
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
   stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
-  if (readyOnly && adoptOnly && !admissionEvidence) return { moved: false, reason: 'state-unreadable' };
+  if (readyOnly && adoptOnly && !admissionEvidence && launchedBy !== 'early' && launchedBy !== 'recovery') {
+    return { moved: false, reason: 'state-unreadable' };
+  }
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
@@ -221,7 +223,7 @@ async function rebuildCloneInternal({
       root, env: stEnv, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
       adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
-        dispatchSmoke, admissionWaitMs, ...o, stEnv, adoptOnly: true, asJob: false,
+        dispatchSmoke, admissionWaitMs, launchedBy, ...o, stEnv, adoptOnly: true, asJob: false,
       }),
     });
   }
@@ -294,7 +296,7 @@ async function rebuildCloneInternal({
   const prep = await withWriteLock(root, () => {
     prepareEnteredMs = now();
     return prepareRebuild({
-      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, admissionEvidence,
+      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, admissionEvidence, launchedBy,
     });
   }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
   const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);

@@ -345,6 +345,7 @@ export async function rebuildCloneAsJob({
 export function rebuildChildArgs(input, cliPath) {
   return [
     cliPath, `--clone=${input.root}`, '--ready-only', '--json',
+    ...(['early', 'recovery'].includes(input.launchedBy) ? [`--launched-by=${input.launchedBy}`] : []),
     ...(input.entries || []).map((e) => `--entry=${e}`),
     ...(input.mainOnly ? ['--main-only'] : []),
   ];

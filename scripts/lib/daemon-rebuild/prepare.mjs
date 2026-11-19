@@ -94,9 +94,10 @@ export function contentContainedInBuild(git, sha, build) {
  * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false, admissionEvidence,
+  root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false, admissionEvidence, launchedBy,
 }) {
-  if (readyOnly && adoptOnly && !admissionEvidence) {
+  const strictState = !!admissionEvidence || launchedBy === 'early' || launchedBy === 'recovery';
+  if (readyOnly && adoptOnly && !strictState) {
     return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: [] };
   }
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
@@ -140,7 +141,8 @@ export async function prepareRebuild({
   // use fresh evidence read under the clone write lock held by this phase.
   let state;
   try {
-    state = admissionEvidence ? readRebuildStateStrict(root, stEnv) : readRebuildState(root, stEnv);
+    // Detached/re-attached jobs carry provenance, never the admission snapshot.
+    state = strictState ? readRebuildStateStrict(root, stEnv) : readRebuildState(root, stEnv);
   } catch {
     return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: alertsList };
   }
