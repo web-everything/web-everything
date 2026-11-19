@@ -45,6 +45,7 @@ export const HOME_REASONS = Object.freeze({
   // …and the #2833 verify refusals, which come from `lib/lane-verify.mjs`'s own `verifyGateDecision`
   // rather than from pr-land's argv parsing. THESE ARE THE ONES THAT MATTER: they are the guard the
   // bypass skipped, and every one of them must reach the caller as an answer, never as a shrug.
+  'bad-verify': 'refused', 'ci-only-not-saturated': 'refused',
   'verify-unfinished': 'refused', 'verify-red': 'refused', 'verify-corrupt': 'refused',
   unverified: 'refused', untracked: 'refused', 'red-ci-gated': 'refused',
   // the environment could not complete — the request is not what is wrong
