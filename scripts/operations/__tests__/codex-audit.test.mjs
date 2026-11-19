@@ -9,6 +9,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 import { parseCards } from '../file-held-cards.mjs';
+import { cardLine as renderCardLine } from '../audit-base-repro.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
 const settingsOverride = vi.hoisted(() => ({ text: null }));
@@ -629,6 +630,41 @@ describe('R1053 prove mode', () => {
     expect(cards).toHaveLength(1);
     expect(cards[0]).toMatchObject({ raw: cardLine, tag: 'R1053', date: date.slice(0, 10), text });
   });
+  it.each(['\u2028', '\u2029', '\r', '\r\n', '\n'])('round-trips serialized card separators %j', separator => {
+    const card = renderCardLine({ date: '2026-11-18 12:00', cls: 'E2', path: 'x.mjs', symbol: 'X',
+      sha10: BASE.slice(0, 10), text: `${finding}${separator}see the probe` });
+    expect(card).not.toMatch(/[\r\n\u2028\u2029]/);
+    const cards = parseCards(card);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].text).toContain(`${finding} see the probe`);
+  });
+  it.each(['\u2028', '\u2029'])('serializes a fileable card with separator %j', async separator => {
+    const f = proof(reply('E2'));
+    const text = `${finding}${separator}see the probe`;
+    f.deps.runCodex = () => `WEAKENED\n${text}`;
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+    const { cardLine } = f.deps.fileCard.mock.calls[0][0];
+    expect(cardLine).not.toMatch(/[\r\n\u2028\u2029]/);
+    const cards = parseCards(cardLine);
+    expect(cards).toHaveLength(1);
+    expect(cards[0].text).toContain(`${finding} see the probe`);
+    expect(f.records[0]).toMatchObject({ verdict: 'NOT WEAKENED', preExisting: [{ line: text }] });
+  });
+  it.each(['function serve(req = defaultRequest()) {', 'function serve(req): Response {'])
+    ('retains SAME evidence when an unrecognized function has a changed guard: %s', async declaration => {
+      const f = proof('#1 REPRODUCES SAME CLASS=B2 BASE=x.mjs:9\nQUOTE: return unsafeResponse(req);');
+      const base = [declaration, '  requireAuth(req);', ...Array.from({ length: 6 }, (_, i) => `  const v${i} = ${i};`),
+        '  return unsafeResponse(req);', '}'].join('\n');
+      const text = 'x.mjs:9 unsafe response';
+      f.deps.runCodex = () => `WEAKENED\n${text}`;
+      f.deps.readBaseFile = () => base;
+      f.deps.readHeadFile = () => base.replace('requireAuth', 'skipAuth');
+      f.deps.diffText = () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -2 +2 @@\n-  requireAuth(req);\n+  skipAuth(req);\n';
+      expect(await main(ARGS, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [text], preExisting: [] });
+      expect(f.deps.fileCard).not.toHaveBeenCalled();
+    });
   it.each(['E1', 'E2'])('production policy blocks %s before filing', async cls => {
     const f = proof(reply(cls));
     f.deps.auditPolicy = () => ({ releaseStage: 'prod', requirePayBy: false, requireOnMain: true });

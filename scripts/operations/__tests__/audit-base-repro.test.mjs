@@ -116,6 +116,9 @@ describe('pre-existing classification', () => {
     const a = { ...parseReproAnswer(answer(), 1)[0], base: { path: 'lib/x.mjs', line: 1 }, quote: sourceText };
     expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText, answers: [a] })[0].blocking).toBe(true);
     expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      answers: [{ ...a, quote: 'const value = unsafe();' }] })[0].blocking).toBe(true);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
+      changedLines: parseDiffChangedLines(diff.replaceAll('lib/x.mjs', 'lib/y.mjs'), stat.replace('lib/x.mjs', 'lib/y.mjs')),
       answers: [{ ...a, quote: 'const value = unsafe();' }] })[0].blocking).toBe(false);
     expect(classify({ findings: [{ text: 'lib/x.mjs:1 unsafe', sourceText }], readBaseFile: () => sourceText,
       answers: [{ ...a, base: { path: 'lib/x.mjs', line: 5 }, quote: 'const other = unsafe();' }] })[0].blocking).toBe(true);
@@ -185,6 +188,29 @@ describe('pre-existing classification', () => {
     expect(classify({ changedLines: baseLine })[0].blocking).toBe(true);
     const otherFn = parseDiffChangedLines(`${hdr}@@ -5 +4,0 @@\n-  return old();\n`, '0\t1\tlib/x.mjs\n');
     expect(classify({ changedLines: otherFn })[0].blocking).toBe(false);
+  });
+  it.each([
+    'function serve(req = defaultRequest()) {',
+    'function serve(req): Response {',
+    'function serve(req): { body: string } {',
+    'const serve = (req = defaultRequest()) => {',
+    'const serve = (req): Response => {',
+    'serve(req = defaultRequest()): Response {',
+  ])('unknown symbol syntax retains distant guard changes: %s', declaration => {
+    const base = [declaration, '  requireAuth(req);', ...Array.from({ length: 6 }, (_, i) => `  const v${i} = ${i};`),
+      '  return unsafeResponse(req);', '}'].join('\n');
+    const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:9\nQUOTE: return unsafeResponse(req);', 1);
+    for (const removed of [false, true]) {
+      const sourceText = removed ? base.replace('  requireAuth(req);\n', '') : base.replace('requireAuth', 'skipAuth');
+      const changedLines = parseDiffChangedLines(removed ? `${hdr}@@ -2 +1,0 @@\n-  requireAuth(req);\n`
+        : `${hdr}@@ -2 +2 @@\n-  requireAuth(req);\n+  skipAuth(req);\n`, `${removed ? 0 : 1}\t1\tlib/x.mjs\n`);
+      const cardWritten = vi.fn(receipt);
+      expect(changedLines.complete).toBe(true);
+      expect(classify({ findings: [{ text: `lib/x.mjs:${removed ? 8 : 9} unsafe`, sourceText }], answers,
+        readBaseFile: () => base, changedLines, cardWritten })[0].blocking).toBe(true);
+      expect(cardWritten).not.toHaveBeenCalled();
+    }
   });
   it('a2 flagged changed head line blocks before carding', () => {
     const cardWritten = vi.fn();

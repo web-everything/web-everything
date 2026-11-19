@@ -4812,3 +4812,12 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Audit proof fallbacks and held-card separators (R1053)
+
+A null result from the approximate symbol scanner is not proof of top-level scope.
+Keep distant guard replacement and deletion cases for default-call parameters and typed
+functions in `audit-base-repro.test.mjs`; an unknown extent requires an unchanged file.
+In `codex-audit.test.mjs`, pass generated cards through the real held-card parser,
+including U+2028/U+2029 finding text. Normalize line separators at serialization while
+preserving the original finding in the audit record and keeping block-mode bytes pinned.

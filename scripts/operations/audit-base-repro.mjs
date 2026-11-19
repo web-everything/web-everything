@@ -96,11 +96,15 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
         : !range || range.symbol !== symbol || base.line < range.start || quoteEnd > range.end) return block('base quote outside the finding symbol');
       // Removed lines leave no head line: any hunk touching the finding's symbol (either side) or its base line is a change.
       const headRange = symbolRangeAt(finding?.sourceText, location.line);
-      const [hs, he] = headRange ? [headRange.start - 1, headRange.end] : [location.line - 3, location.line + 3];
-      const [bs, be] = range ? [range.start, range.end] : [base.line - 3, quoteEnd + 3];
+      // This approximate scanner also returns null for unsupported function syntax. Without a
+      // known extent, only an unchanged file can prove that a distant guard was not edited.
+      const [hs, he] = headRange ? [headRange.start - 1, headRange.end] : [0, Infinity];
+      const [bs, be] = range ? [range.start, range.end] : [1, Infinity];
       const inside = (set, lo, hi) => [...(set ?? [])].some(n => n >= lo && n <= hi);
       if (changedLines.removed?.get(base.path)?.has(base.line) || inside(changedLines.removed?.get(base.path), bs, be)
-        || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) return block('head or base symbol touched by the diff');
+        || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) {
+        return block(headRange && range ? 'head or base symbol touched by the diff' : 'unknown symbol extent in a changed file');
+      }
       const key = findingKey({ file: location.file, symbol, class: a.class });
       const security = a.class.startsWith('B'), receipt = cardWritten(key);
       if (security ? receipt?.written !== true || receipt.expedite !== true || receipt.needsYou !== true
@@ -149,4 +153,5 @@ export function parseDiffChangedLines(diffU0Text, numstatText) {
 
 export const cardHash = key => createHash('sha256').update(key).digest('hex');
 export const cardLine = ({ date, cls, path, symbol, sha10, text }) =>
-  `- [R1053] ${date} ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${sha10}: ${text}`;
+  `- [R1053] ${date} ET: pre-existing audit finding (${cls}) in we:${path}#${symbol}, reproduces on main ${sha10}: ${text}`
+    .replace(/\r\n|[\r\n\u2028\u2029]/g, ' ');
