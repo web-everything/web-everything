@@ -3,6 +3,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// Load the cyclic drain/dispatch graph during collection, before timed setup.
+import { defaultFetchDiff, defaultFetchLandGuardSignals } from '../merge-ai-prs.mjs';
+import { readManifestFromPrBody } from '../lane-drain.mjs';
+import { defaultListLaneChangedFiles } from '../conveyor/build-dispatch-orphan-adopt.mjs';
 
 const BIG = 2 * 1024 * 1024;
 let dir; let savedPath; let savedThrottle;
@@ -30,7 +34,6 @@ afterAll(() => {
 
 describe('merge-ai-prs migrated reads', () => {
   it('defaultFetchDiff reads a >1 MiB diff in full; a failed read is null, never an empty string', async () => {
-    const { defaultFetchDiff } = await import('../merge-ai-prs.mjs');
     delete process.env.FAKE_FAIL;
     expect(defaultFetchDiff({ num: 1 })).toHaveLength(BIG);
     process.env.FAKE_FAIL = '1';
@@ -38,7 +41,6 @@ describe('merge-ai-prs migrated reads', () => {
   });
 
   it('defaultFetchLandGuardSignals parses a >1 MiB body; a failed read reports unknown files (null)', async () => {
-    const { defaultFetchLandGuardSignals } = await import('../merge-ai-prs.mjs');
     delete process.env.FAKE_FAIL;
     const ok = defaultFetchLandGuardSignals({ num: 1 });
     expect(ok.body).toHaveLength(BIG);
@@ -50,7 +52,6 @@ describe('merge-ai-prs migrated reads', () => {
 
 describe('lane-drain migrated reads', () => {
   it('readManifestFromPrBody reads a >1 MiB PR body in full; a failed read is null (unknown), not a manifest', async () => {
-    const { readManifestFromPrBody } = await import('../lane-drain.mjs');
     delete process.env.FAKE_FAIL;
     expect(readManifestFromPrBody(process.cwd(), 'lane/x')?.item).toBe(74);
     process.env.FAKE_FAIL = '1';
@@ -60,7 +61,6 @@ describe('lane-drain migrated reads', () => {
 
 describe('build-dispatch-orphan-adopt migrated reads', () => {
   it('defaultListLaneChangedFiles lists >1 MiB of paths in full; a failed read is null, never []', async () => {
-    const { defaultListLaneChangedFiles } = await import('../conveyor/build-dispatch-orphan-adopt.mjs');
     delete process.env.FAKE_FAIL;
     expect(defaultListLaneChangedFiles({ lane: process.cwd() }).length).toBeGreaterThan(20000);
     process.env.FAKE_FAIL = '1';

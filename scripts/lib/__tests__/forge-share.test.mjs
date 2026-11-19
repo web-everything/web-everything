@@ -1,9 +1,9 @@
 /** R497 — forgeShare: remote heavy runs ÷ countable heavy runs, fail-closed on missing data. */
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { computeForgeShare, normalizeFallbackReason, loadForgeShareSettings, readForgeShareInputs, probeForgeShare } from '../forge-share.mjs';
+import { computeForgeShare, normalizeFallbackReason, loadForgeShareSettings, readForgeShareInputs, probeForgeShare, recordRemoteUsage } from '../forge-share.mjs';
 
 const NOW = Date.parse('2026-11-03T16:00:00Z');
 const MIN = 60_000;
@@ -159,5 +159,41 @@ describe('settings + IO', () => {
     const p = probeForgeShare({ lockRoot: join(dir, 'nope'), settingsFile: join(dir, 'missing.json'), now: NOW });
     expect(p.current.status).toBe('unknown');
     expect(p.earlier.status).toBe('unknown');
+  });
+});
+
+describe('remote usage measurement ledger',()=>{
+  it('appends normalized command rows with the actual CPU grant without changing remote-runs',()=>{
+    const root=mkdtempSync(join(process.env.TMPDIR,'remote-usage-'));
+    try {
+      writeFileSync(join(root,'remote-runs.jsonl'),'existing bytes\n');
+      const resources={cpuUsec:100,memoryPeakBytes:200,throttledUsec:30,nrThrottled:4,oomKills:0};
+      const options={lockRoot:root,resources:{...resources,slotCpus:5},argv:['npm','run','test:unit','--','scripts/a.test.mjs','b.spec.ts','--reporter=dot'],
+        kind:'files',slotUnits:3,runMs:50,code:1,at:'2026-11-18T00:00:00.000Z'};
+      recordRemoteUsage(options);
+      recordRemoteUsage({...options,slotUnits:undefined,resources:{slotCpus:2,cpuUsec:null,memoryPeakBytes:null,oomKills:null}});
+      const rows=readFileSync(join(root,'remote-usage.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+      expect(rows[0]).toEqual({ts:options.at,kind:'files',key:'npm run test:unit -- --reporter=dot',threadsGranted:5,memGranted:null,
+        ...resources,runMs:50,code:1,backend:'systemd-scope'});
+      expect(rows[1]).toMatchObject({threadsGranted:2,memGranted:null,cpuUsec:null,memoryPeakBytes:null,throttledUsec:null,nrThrottled:null,oomKills:null});
+      expect(readFileSync(join(root,'remote-runs.jsonl'),'utf8')).toBe('existing bytes\n');
+    } finally {rmSync(root,{recursive:true,force:true});}
+  });
+  it.each([undefined,0,-1,1.5,Number.MAX_SAFE_INTEGER+1,'5',null])('writes nothing for missing or invalid slotCpus=%j',slotCpus=>{
+    const root=mkdtempSync(join(process.env.TMPDIR,'remote-usage-'));
+    try {
+      recordRemoteUsage({lockRoot:root,resources:slotCpus===undefined?{}:{slotCpus}});
+      expect(existsSync(join(root,'remote-usage.jsonl'))).toBe(false);
+    } finally {rmSync(root,{recursive:true,force:true});}
+  });
+  it('skips absent resources and never throws on unwritable logging',()=>{
+    const root=mkdtempSync(join(process.env.TMPDIR,'remote-usage-'));
+    try {
+      recordRemoteUsage({lockRoot:root});
+      expect(existsSync(join(root,'remote-usage.jsonl'))).toBe(false);
+      const file=join(root,'not-a-directory');writeFileSync(file,'blocked');
+      expect(()=>recordRemoteUsage({lockRoot:file,resources:{slotCpus:1}})).not.toThrow();
+      expect(()=>recordRemoteUsage()).not.toThrow();
+    } finally {rmSync(root,{recursive:true,force:true});}
   });
 });
