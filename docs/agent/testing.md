@@ -5172,3 +5172,14 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+## Review-run journal discovery
+
+`scripts/lib/__tests__/review-run-journal.fs.test.mjs` exercises the append-before-rename
+journal on real files, including 6,000 runs, seed/probe CLI calls, torn/conflicting lines,
+archive claims, oversized journals and payload identity mismatches. Run it alongside
+`review-run-index.test.mjs`, `drain-red-team-evidence.test.mjs` and
+`red-team-skip-settle-r622.test.mjs` through heavy admission. Journal discovery must not
+consume the injected listing seam when the journal is missing: existing index fallback
+fixtures use that seam to replace a payload atomically between verification and scanning.
+Journal candidates and fallback reads share the same parse budget and file-identity cache.

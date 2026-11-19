@@ -12,7 +12,7 @@ import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
 import { createNewestRunFinder, resolveRunScanSettings, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
-import { readReviewRunIndex } from './review-run-index.mjs';
+import { readJournalCandidates, readReviewRunIndex } from './review-run-index.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidNamespace, pidStartTime } from './pid-alive.mjs';
 
@@ -440,7 +440,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const maxParses = setting.value.scan.maxParses;
   let parsed = 0;
   const budgetExhausted = Symbol('shared review parse budget exhausted');
-  const runScan = (indexedIds) => {
+  const runScan = (indexedIds, journalSet) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     const mtimes = new Map();
@@ -473,7 +473,11 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           indexReads.set(id, run);
           indexIdentities.set(id, identity);
         }
-        if (indexedIds && (run?.id !== id || run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))) {
+        if (indexedIds && (run?.id !== id || ((!journalSet || journalSet.has(id))
+          && (run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))))) {
+          // A payload with a different identity must never reappear as a verdict
+          // when the fallback reuses this verified file's cached read.
+          if (journalSet && run?.id !== id) indexReads.set(id, null);
           throw Error('unverified review index entry');
         }
         return run;
@@ -542,33 +546,42 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
     if (!scan) {
-      const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),
-        read: id => {
-          const identity = currentIdentity(id);
-          discardChangedRead(id, identity);
-          if (!indexReads.has(id)) {
-            if (parsed >= maxParses) throw budgetExhausted;
-            parsed++;
-            indexIdentities.set(id, identity);
-            // Failed reads consume budget and retain the scan's unreadable-record refusal.
-            try { indexReads.set(id, read(id, runsDir)); }
-            catch (error) { indexReads.set(id, null); indexReadErrors.set(id, error); throw error; }
-          }
-          return indexReads.get(id);
-        },
-      });
-      if (ids.length) {
+      const journal = readJournalCandidates(runsDir, repo, pr, { list });
+      if (journal !== null) {
         try {
-          runScan(ids);
-          // A locator alone cannot prove a head has no review. Wrong-head/stale hints
-          // and capped index reads must take the original bounded fallback.
-          if (!scan.slots[order].exact || scan.end?.ok === false) scan = null;
+          runScan(journal.ids, journal.journalSet);
+          if (scan.end?.ok === false) scan = null;
         } catch { scan = null; }
       }
       if (!scan) {
-        // Reuse verification reads only while their file identity still matches.
-        // Replacements require fresh IO charged to the same budget (including failures).
-        runScan();
+        const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),
+          read: id => {
+            const identity = currentIdentity(id);
+            discardChangedRead(id, identity);
+            if (!indexReads.has(id)) {
+              if (parsed >= maxParses) throw budgetExhausted;
+              parsed++;
+              indexIdentities.set(id, identity);
+              // Failed reads consume budget and retain the scan's unreadable-record refusal.
+              try { indexReads.set(id, read(id, runsDir)); }
+              catch (error) { indexReads.set(id, null); indexReadErrors.set(id, error); throw error; }
+            }
+            return indexReads.get(id);
+          },
+        });
+        if (ids.length) {
+          try {
+            runScan(ids);
+            // A locator alone cannot prove a head has no review. Wrong-head/stale hints
+            // and capped index reads must take the original bounded fallback.
+            if (!scan.slots[order].exact || scan.end?.ok === false) scan = null;
+          } catch { scan = null; }
+        }
+        if (!scan) {
+          // Reuse verification reads only while their file identity still matches.
+          // Replacements require fresh IO charged to the same budget (including failures).
+          runScan();
+        }
       }
       indexReads.clear();
       indexReadErrors.clear();

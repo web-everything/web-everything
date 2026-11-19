@@ -2,7 +2,7 @@
  * Overflow/corruption/missing records fall back to the ordinary scan and its HOLD.
  * Backfill stages a complete pass over review ids, at most 50 payloads per drain tick.
  */
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, writeSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { isValidRunId, parseRunRecord } from '../operations/run-record.mjs';
@@ -33,6 +33,91 @@ const reviewId = id => isValidRunId(id) && id.startsWith('review-pr-');
 const keyOf = (repo, pr) => typeof repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(repo)
   && Number.isSafeInteger(Number(pr)) && Number(pr) > 0 ? `${repo}#${Number(pr)}` : null;
 export const reviewRunIndexPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.json`);
+/** Append-only discovery journal; payloads remain the authority. */
+export const reviewRunJournalPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.jsonl`);
+const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
+
+/** One O_APPEND write before payload publication; the writer owns best-effort error handling. */
+export function appendReviewRunJournal(record, runsDir) {
+  const key = keyOf(record?.input?.repo, record?.input?.pr);
+  if (record?.op !== 'review-pr' || !reviewId(record.id) || !key) return false;
+  const bytes = Buffer.from(`${JSON.stringify({ id: record.id, key })}\n`);
+  const fd = openSync(reviewRunJournalPath(runsDir), 'a');
+  try {
+    if (writeSync(fd, bytes) !== bytes.length) throw Error('short review journal write');
+  } finally { closeSync(fd); }
+  return true;
+}
+
+function journalKeys(runsDir) {
+  const path = reviewRunJournalPath(runsDir);
+  if (statSync(path).size > JOURNAL_MAX_BYTES) throw Error('review journal oversized');
+  const bytes = readFileSync(path);
+  if (bytes.length > JOURNAL_MAX_BYTES) throw Error('review journal oversized');
+  const rows = bytes.toString('utf8').split('\n');
+  rows.pop(); // Never trust a final line without its publication newline.
+  const keys = new Map();
+  for (const text of rows) {
+    let row;
+    try { row = JSON.parse(text); } catch { continue; } // Invalid lines supply no evidence.
+    if (!reviewId(row?.id) || typeof row.key !== 'string') continue;
+    const match = /^([\w.-]+\/[\w.-]+)#([1-9][0-9]*)$/.exec(row.key);
+    if (!match || keyOf(match[1], match[2]) !== row.key) continue;
+    if (!keys.has(row.id)) keys.set(row.id, row.key);
+    else if (keys.get(row.id) !== row.key) keys.set(row.id, null); // Conflicts remain unknown.
+  }
+  return keys;
+}
+
+/** Complete candidate set, or null to request the bounded fallback. The non-enumerable
+ * journalSet identifies candidates requiring full key verification by the payload reader. */
+export function readJournalCandidates(runsDir, repo, pr, { list = listReviewIds } = {}) {
+  try {
+    const key = keyOf(repo, pr);
+    if (!key) return null;
+    if (statSync(reviewRunJournalPath(runsDir)).size > JOURNAL_MAX_BYTES) return null;
+    const snapshot = () => {
+      const names = readdirSync(runsDir);
+      if (names.some(name => /^\.review-pr-.*\.archiving-/.test(name))) throw Error('review archive in progress');
+      return { names: names.sort(), ids: list(runsDir).filter(reviewId).sort() };
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const before = snapshot(), keys = journalKeys(runsDir), after = snapshot();
+      if (JSON.stringify(before) !== JSON.stringify(after)) continue;
+      const ids = [], journalSet = new Set();
+      let unjournaled = 0;
+      for (const id of after.ids) {
+        const target = keys.get(id);
+        if (target == null) { ids.push(id); unjournaled++; }
+        else if (target === key) { ids.push(id); journalSet.add(id); }
+      }
+      return Object.defineProperty({ ids, source: 'journal', unjournaled }, 'journalSet', { value: journalSet });
+    }
+    return null;
+  } catch { return null; }
+}
+
+/** Seed readable, previously unjournaled records without rewriting concurrent appends. */
+export function seedReviewRunJournal({ runsDir, list = listReviewIds, read = id => readRecord(runsDir, id) } = {}) {
+  let keys;
+  try { keys = journalKeys(runsDir); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; keys = new Map(); }
+  const counts = { seeded: 0, already: 0, skipped: 0 };
+  for (const id of list(runsDir).filter(reviewId)) {
+    if (keys.get(id)) { counts.already++; continue; }
+    try {
+      const run = read(id, runsDir);
+      recordKey(run, id);
+      if (appendReviewRunJournal(run, runsDir)) counts.seeded++;
+      else counts.skipped++;
+    } catch { counts.skipped++; }
+  }
+  // An empty seed still makes an empty journal available for subsequent writes.
+  const fd = openSync(reviewRunJournalPath(runsDir), 'a');
+  closeSync(fd);
+  return counts;
+}
+
 function readJson(path, maxBytes = MAX_BYTES) {
   if (statSync(path).size > maxBytes) throw Error('review index oversized');
   return JSON.parse(readFileSync(path, 'utf8'));
