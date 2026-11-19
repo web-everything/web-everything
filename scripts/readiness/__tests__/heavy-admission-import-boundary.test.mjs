@@ -40,8 +40,9 @@ function cliFixture(source) {
       remoteExec: createRemoteExec({
         policy, lockRoot: ${JSON.stringify(join(pool, '.admission', 'heavy'))},
         readSha: () => 'unknown',
-        // Provenance is best-effort inside a 100 ms budget; a loaded CI shard can miss it and skip the
-        // state write this fixture asserts. Widen the budget (still under the 1500 ms drain cap).
+        // This fixture asserts persistence + exit code, not the deadline: the 100 ms production budget stays
+        // pinned in heavy-admission-remote-client.test.mjs (provenanceBudgetMs: 100 stall cases). A loaded CI
+        // shard can miss 100 ms and skip the write (ENOENT on client-override.json), so widen it here.
         provenanceBudgetMs: 1000,
       }),
     });
