@@ -20,7 +20,7 @@ function fixture(extra = {}) {
   const gh = vi.fn((_bin, args) => args[0] === 'pr' ? JSON.stringify({ ...pr(), number: Number(args[2]) })
     : args[1] === '-X' ? '{}' : JSON.stringify({ total_count: 1, check_runs: [gate] }));
   return { candidates: [{ repo, num: 1, head }], defaultBranchOf: () => 'main', requiredChecksOf: () => ['test', 'merge-gate'],
-    isRequiredCheckGreen, fixClaimHeld: () => false, stateRoot, gh, log: vi.fn(), ...extra };
+    isRequiredCheckGreen, fixClaimHeld: () => false, humanSurfaceGuardAllows: () => true, stateRoot, gh, log: vi.fn(), ...extra };
 }
 
 describe('stale gate planner — fail closed', () => {
@@ -115,6 +115,22 @@ describe('stale gate IO', () => {
   it('unknown live claim store prevents writes', () => {
     const x = fixture({ fixClaimHeld: () => { throw new Error('unreadable'); } });
     run(x); expect(x.gh.mock.calls.some(c => c[1][1] === '-X')).toBe(false);
+  });
+  it.each([
+    ['denied', () => false],
+    ['unknown', () => undefined],
+    ['missing', undefined],
+    ['unreadable', () => { throw new Error('approval proof unreadable'); }],
+  ])('human-surface guard %s prevents PUT and leaves the head unattempted', (_name, guard) => {
+    const humanSurfaceGuardAllows = guard && vi.fn(guard);
+    const x = fixture({ humanSurfaceGuardAllows });
+    expect(run(x)).toMatchObject([{ ok: false, attempted: false }]);
+    if (guard) expect(humanSurfaceGuardAllows).toHaveBeenCalledWith(repo, 1, head);
+    expect(x.gh.mock.calls.some(c => c[1][1] === '-X')).toBe(false);
+    expect(readdirSync(x.stateRoot)).toEqual([]);
+    expect(x.log.mock.calls.at(-1)[0]).toMatch(/approval proof (unknown|unreadable)/);
+    expect(x.log.mock.calls.at(-1)[0]).toContain('skipped; inspect and update branch manually');
+    expect(run({ ...x, humanSurfaceGuardAllows: () => true })).toMatchObject([{ ok: true }]);
   });
   it('claim acquired just before reservation prevents writes', () => {
     const x = fixture({ fixClaimHeld: vi.fn().mockReturnValueOnce(false).mockReturnValue(true) });

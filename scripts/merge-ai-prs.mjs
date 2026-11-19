@@ -7349,6 +7349,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       },
       isRequiredCheckGreen,
       fixClaimHeld: (repo, num) => !repoKeyForSlug(repo) || prestageFixClaimHeld(num, { claimKey: repoKeyForSlug(repo) }),
+      humanSurfaceGuardAllows: (repo, num, head) => !approvedHeadHold({ repo: staleGateRepoKey(repo), num }, head, { strict: true }),
     });
   }
   let deferred = [];

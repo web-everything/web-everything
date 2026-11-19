@@ -32,7 +32,7 @@ export default {
       let conflict = false;
       const args = { candidates: [7106, 7117, 7118].map(num => ({ repo: 'example/widgets', num, head })),
         max: 2, stateRoot, defaultBranchOf: () => 'main', requiredChecksOf: () => ['test', 'merge-gate'],
-        isRequiredCheckGreen, fixClaimHeld: () => false, log: line => logs.push(line),
+        isRequiredCheckGreen, fixClaimHeld: () => false, humanSurfaceGuardAllows: () => true, log: line => logs.push(line),
         gh: (_bin, argv) => {
           if (argv[0] === 'pr') return JSON.stringify({ number: Number(argv[2]), headRefOid: head,
             baseRefName: 'main', isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
@@ -46,6 +46,14 @@ export default {
           return JSON.stringify({ total_count: 1, check_runs: [{ id: 1, name: 'merge-gate', head_sha: head,
             status: 'completed', conclusion: 'failure' }] });
         } };
+      for (const humanSurfaceGuardAllows of [() => false, () => undefined,
+        () => { throw new Error('approval proof unreadable'); }]) {
+        const logStart = logs.length;
+        update({ ...args, humanSurfaceGuardAllows });
+        if (writes.length || !logs.slice(logStart).some(line => line.includes('skipped; inspect and update branch manually'))) {
+          violations.push('held or unreadable human-surface approval did not block branch updates with a skip reason');
+        }
+      }
       update(args);
       if (writes.length !== 2 || writes.some(a => a[2] !== 'PUT' || a.at(-1) !== `expected_head_sha=${head}`)) {
         violations.push('stale-failed gate was not repaired with two pinned branch updates');

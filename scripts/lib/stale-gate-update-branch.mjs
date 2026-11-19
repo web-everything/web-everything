@@ -73,7 +73,7 @@ function attempted(path, head) {
  * The caller supplies only BLOCKED skip verdicts and memoizes the live required-check roster per repo.
  */
 export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranchOf, requiredChecksOf,
-  isRequiredCheckGreen, fixClaimHeld, gh = execFileSyncThrottled, log = message => process.stderr.write(`${message}\n`),
+  isRequiredCheckGreen, fixClaimHeld, humanSurfaceGuardAllows, gh = execFileSyncThrottled, log = message => process.stderr.write(`${message}\n`),
   stateRoot = join(resolveCoordinationRoot(), 'stale-gate-update-branch') } = {}) {
   const results = [];
   if (!Number.isSafeInteger(max) || max < 1 || max > 100 || !Array.isArray(candidates)) return results;
@@ -108,6 +108,9 @@ export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranc
       mkdirSync(stateRoot, { recursive: true });
       withFileLock(`${path}.lock`, () => {
         if (attempted(path, c.head) || fixClaimHeld(c.repo, c.num) !== false) return;
+        if (humanSurfaceGuardAllows?.(c.repo, c.num, c.head) !== true) {
+          throw new Error('approved human-surface head held or approval proof unknown');
+        }
         writeJsonAtomic(path, { head: c.head, attempted: true });
         attempts++; didAttempt = true;
         gh('gh', ['api', '-X', 'PUT', `repos/${c.repo}/pulls/${c.num}/update-branch`, '-f', `expected_head_sha=${c.head}`], options);
