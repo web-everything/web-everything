@@ -84,6 +84,32 @@ describe('independent red-team queue drain', () => {
     await drainRedTeamQueue({ ...f.options, queue: f.open(), now: () => at + 60_000 });
     expect(f.options.runRecovery).toHaveBeenCalledTimes(2);
   });
+  it.each(['throw', 'reject', 'false'])('retries an alert after delivery %s across restart, then persists successful delivery', async failure => {
+    const f = fixture();
+    f.options.capacity.minConcurrent = 0;
+    f.options.alert.mockImplementationOnce(() => {
+      if (failure === 'throw') throw new Error('delivery failed');
+      if (failure === 'false') return Promise.resolve(false);
+      return Promise.reject(new Error('delivery failed'));
+    });
+    await drainRedTeamQueue(f.options);
+    expect(f.open().entries()[0].alertedHead).toBeUndefined();
+    await drainRedTeamQueue({ ...f.options, queue: f.open() });
+    expect(f.open().entries()[0].alertedHead).toBe(head);
+    await drainRedTeamQueue({ ...f.options, queue: f.open() });
+    expect(f.options.alert).toHaveBeenCalledTimes(2);
+  });
+  it('does not persist the dedupe mark until asynchronous delivery succeeds', async () => {
+    const f = fixture();
+    f.options.capacity.minConcurrent = 0;
+    let deliver;
+    f.options.alert.mockImplementation(() => new Promise(resolve => { deliver = resolve; }));
+    const draining = drainRedTeamQueue(f.options);
+    expect(f.open().entries()[0].alertedHead).toBeUndefined();
+    deliver();
+    await draining;
+    expect(f.open().entries()[0].alertedHead).toBe(head);
+  });
   it('alerts once per key/head only after 60 minutes, survives restart, and reports/logs oldest age', async () => {
     const f = fixture([{ pr: 1, enqueuedAt: at - 60 * 60_000 }]);
     f.options.capacity.minConcurrent = 0;

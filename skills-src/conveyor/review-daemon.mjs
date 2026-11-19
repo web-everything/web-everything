@@ -2171,7 +2171,9 @@ async function main() {
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   let drainBusy = false;
-  const drainEffects = withGithubAppAuth({ tickOnce: () => cliRedTeamQueueDrain() }, REVIEW_DAEMON_APP_AUTH_OPTS);
+  const drainEffects = withSelfSync(withGithubAppAuth({ tickOnce: () => cliRedTeamQueueDrain() }, REVIEW_DAEMON_APP_AUTH_OPTS), {
+    root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+  });
   const drainTimer = setInterval(async () => {
     if (drainBusy || stopping
       || ['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;

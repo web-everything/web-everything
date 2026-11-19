@@ -37,12 +37,12 @@ export async function drainRedTeamQueue({ queue, readLivePr, runRecovery, capaci
   for (const entry of entries) {
     const ageMin = Math.max(0, (at - entry.enqueuedAt) / 60_000);
     if (ageMin > alertAfterMin && entry.alertedHead !== entry.head) {
-      // Persist before emitting so a planner tick or daemon restart cannot duplicate this head's alert.
-      queue.noteDrain(entry, { alertedHead: entry.head });
+      // Only delivered alerts suppress this head on later drains or daemon restarts.
       try {
         alerts.push(Promise.resolve(alert({ kind: 'red-team-queue-aged', repo: entry.repo, pr: entry.pr,
-          daemon: 'review-daemon', detail: { key: entry.key, head: entry.head, ageMin, needsYou: true } })).catch(() => {}));
-      } catch { /* Event storage is best effort, like other daemon events. */ }
+          daemon: 'review-daemon', detail: { key: entry.key, head: entry.head, ageMin, needsYou: true } }))
+          .then(delivered => { if (delivered !== false) queue.noteDrain(entry, { alertedHead: entry.head }); }).catch(() => {}));
+      } catch { /* Leave unmarked so the next drain retries delivery. */ }
     }
     const livePr = liveEvidence.get(entry.key);
     // Retention is not admission evidence: unknown heads must not spend a recovery slot.
