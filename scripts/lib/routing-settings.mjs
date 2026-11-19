@@ -1,7 +1,7 @@
 /** Who writes code: routing.builder (claude | codex | auto). Audits and review seats stay on routing.auditProvider. */
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readCodexQuota } from './codex-usage-ledger.mjs';
-import { CAPACITY_DEFAULTS, PROVIDER_DEFAULTS, chooseBuilder } from './provider-capacity.mjs';
+import { CAPACITY_DEFAULTS, PROVIDER_DEFAULTS, chooseBuilder, launcherCapacity } from './provider-capacity.mjs';
 import { observeCapacity, recordCapacityDecision } from './provider-capacity-io.mjs';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
@@ -59,8 +59,8 @@ export function effectiveBuilder({ env = process.env, repo, declared, quota = re
   const fallback = used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude';
   if (!s.capacity.enabled) return { builder: fallback, source: 'auto', usedPercent: used, settings: s };
   const planning = { ...s.capacity, routeKey, queuedDemand, demandRatePerHour };
-  const capacities = capacity ?? observeCapacity({ env, now, settings: s.capacity, quota: () => q, records });
+  const capacities = launcherCapacity(capacity ?? observeCapacity({ env, now, settings: s.capacity, quota: () => q, records }), s.capacity);
   const decision = chooseBuilder({ kind, capacities, settings: { ...planning, now }, fallback });
   try { record(decision, { env, now, kind, capacities, settings: planning }); } catch { /* best effort */ }
-  return { builder: decision.provider, account: decision.account, source: 'auto', usedPercent: used, settings: s, capacities, decision };
+  return { builder: decision.provider, source: 'auto', usedPercent: used, settings: s, capacities, decision };
 }

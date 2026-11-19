@@ -1,19 +1,35 @@
 import { describe, expect, it, vi } from 'vitest';
+// Legacy launch assertions use shipped policy with capacity scoring switched off.
+vi.mock('../../lib/settings-files.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readDeclaredSettings: options => {
+    const declared = actual.readDeclaredSettings(options);
+    return { ...declared, settings: { ...declared.settings, routing: { ...declared.settings.routing,
+      capacity: { ...declared.settings.routing?.capacity, enabled: false } } } };
+  } };
+});
 import { dispatchFix, launchTableFor } from '../reconcile-fix-dispatch.mjs';
 import { resolveFixSettings } from '../fix-takeover.mjs';
 import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, resolvePolicyModel, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
 import * as routingPolicyIO from '../../lib/dispatch-routing-policy-io.mjs';
 
-import { fixPolicy, fixCapacity } from './fix-routing-fixture.mjs';
+import { PROVIDER_DEFAULTS } from '../../lib/provider-capacity.mjs';
+const fixCapacity = { ...PROVIDER_DEFAULTS, enabled: true, claudeUsageAccount: 'claude-a' };
+const capacityNow = Date.parse('2026-11-19T12:00:00Z');
+const capacity = [{ ...PROVIDER_DEFAULTS.providers.find(p => p.id === 'claude'), provider: 'claude', account: 'claude-a',
+  health: 1, known: true, windows: [{ usedPercent: 10, resetsAt: capacityNow + 3600000 }] }];
 const ruling = { rung: { id: 'stronger-model', at: 2 }, route: { provider: 'claude', model: 'opus', effort: 'high' } };
 const ordinary = { pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] };
 
 describe('daemon Claude fix models', () => {
-  it('the stronger route and its Claude fallback default to Sonnet at high effort', () => {
-    for (const taskType of ['ruling-escalation-stronger', 'ruling-escalation-cross-provider']) {
-      expect(resolveOperationRoute({ operation: 'fix', taskType, available: ['claude'], policy: fixPolicy, providerCapacity: fixCapacity }))
-        .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.sonnet, effort: 'high' });
-    }
+  it('shipped inherited stronger routing uses live Claude capacity while cross-provider fallback stays Sonnet', () => {
+    expect(routingPolicyIO.resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-stronger',
+      available: ['claude'], policy: DEFAULT_ROUTING_POLICY, providerCapacity: fixCapacity, capacity, now: capacityNow }))
+      .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.opus, effort: 'high' });
+    expect(resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-cross-provider', available: ['claude'], policy: DEFAULT_ROUTING_POLICY }))
+      .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.sonnet, effort: 'high' });
+    expect(routingPolicyIO.resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-stronger',
+      policy: DEFAULT_ROUTING_POLICY, providerCapacity: { ...PROVIDER_DEFAULTS, enabled: false } })).toBeNull();
   });
 
   it('resolves the escalation model through standard, platform, tool and env and logs its source', () => {

@@ -12,10 +12,10 @@ import { capacityCalendar, renderCalendar } from '../operations/capacity-calenda
 
 const now = Date.parse('2026-11-19T12:00:00Z'), hour = 3600000;
 const cap = (provider, used, hours, extra = {}) => ({ provider, windows: used === null ? [] : [{ name: 'seven_day', usedPercent: used,
-  resetsAt: now + hours * hour, source: 'live', lengthHours: 168 }], known: used !== null, held: false, health: 1, now, ...extra });
+  resetsAt: now + hours * hour, source: 'live', lengthHours: 168 }], known: used !== null, held: false, health: 1, now, ...(provider === 'claude' ? { account: 'claude-a' } : {}), ...extra });
 const providers = PROVIDER_DEFAULTS.providers.map(p => ({ ...p, accounts: undefined, operatorReading: undefined }));
 const choose = (capacities, settings = {}, kind = 'fix') => chooseBuilder({ kind, capacities, settings: { ...settings, now }, fallback: 'claude' });
-const repo = { routing: { builder: 'auto' } };
+const repo = { routing: { builder: 'auto', capacity: { claudeUsageAccount: 'claude-a' } } };
 const chain = capacities => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: capacities, now, quota: () => null, record: () => {} }).value;
 
 test('expiring Codex 27% beats Claude 10% with five days remaining', () => {
@@ -84,7 +84,7 @@ test('agy requires allowlisting; unknown emergency requires explicit opt-in and 
 });
 test('plan line, calendar scores, burn detection, durable dedupe and never-throw ledger', () => {
   const capacities = [cap('codex', 27, 2), cap('claude', 40, 120)];
-  assert.match(planLine(capacities, {}, now), /^codex: 27% used, resets in 2h -> burn; claude: 40% used, resets .*EST ->/);
+  assert.match(planLine(capacities, {}, now), /^codex: 27% used, resets in 2h -> burn; claude-a: 40% used, resets .*EST ->/);
   assert.equal(burnWindows(capacities).length, 1);
   const report = capacityCalendar({ capacities, settings: {}, now });
   assert.ok(report.providers[0].scores.fix.score > 0); assert.match(renderCalendar(report), /burn windows:/);
@@ -145,8 +145,9 @@ test('escalation removes reserve-only, inactive, disallowed and below-minimum ca
     assert.deepEqual(chain([bad, cap('claude', 10, 2)]), ['claude']);
   }
 });
-test('mixed unknown capacity is last after known eligible rungs in their existing order', () => {
-  assert.deepEqual(chain([cap('codex', null), cap('claude', 10, 2)]), ['claude', 'codex', 'codex-alt']);
+test('mixed unknown capacity retains main escalation order and never escalates from Claude to Codex', () => {
+  assert.deepEqual(chain([cap('codex', null), cap('claude', 10, 2)]), ['codex', 'codex-alt', 'claude']);
+  assert.equal(pickChainRung({ chain: chain([cap('codex', null), cap('claude', 10, 2)]), trigger: 'stronger-model' }).rung, 'codex-alt');
   assert.deepEqual(chain([cap('codex', 70, 120), cap('claude', 10, 2)]), ['codex', 'codex-alt', 'claude']);
 });
 test('critical takeover and send-back refuse when exhausted Claude has been removed', () => {
@@ -181,4 +182,30 @@ test('escalation enforces the configured fix minimum tier on known and unknown r
       capacity: [cap('codex', used, 120, { tier: 2 }), cap('claude', 10, 2)] });
     assert.deepEqual(result.value, ['claude']);
   }
+});
+
+
+test('filtered Claude refuses critical threshold and unproductive escalation after twenty runs', () => {
+  const value = chain([cap('codex', 27, 2), cap('claude', 98, 120)]);
+  assert.deepEqual(value, ['codex', 'codex-alt']);
+  for (const critical of [false, true]) {
+    const picked = pickChainRung({ chain: value, critical, criticalClaudeFromRung: 1, codexUnproductive: 20 });
+    assert.equal(picked.executor, null);
+    assert.match(picked.reason, /escalation requires Claude.*filtered out/);
+  }
+  assert.equal(pickChainRung({ chain: value, critical: true, criticalClaudeFromRung: 1, trigger: 'stronger-model' }).executor, null);
+});
+
+test('multi-account routing scores only the live reader account and logs attribution without an account route', () => {
+  const capacity = [cap('claude', 99, 2, { account: 'claude-a' }), cap('claude', 1, 2, { account: 'claude-b' }), cap('codex', 30, 120)];
+  const decisions = [];
+  const run = claudeUsageAccount => effectiveBuilder({ repo: { routing: { builder: 'auto', capacity: { claudeUsageAccount } } },
+    env: {}, capacity, now, quota: () => null, record: decision => decisions.push(decision) });
+  assert.equal(run('claude-a').builder, 'codex');
+  assert.equal(run(null).builder, 'codex');
+  const selected = run('claude-b');
+  assert.equal(selected.builder, 'claude');
+  assert.equal(Object.hasOwn(selected, 'account'), false);
+  assert.equal(decisions.at(-1).account, 'claude-b');
+  assert.deepEqual(decisions.at(-1).inputs.filter(i => i.provider === 'claude').map(i => i.account), ['claude-b']);
 });

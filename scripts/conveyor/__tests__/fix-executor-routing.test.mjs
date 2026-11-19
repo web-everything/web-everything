@@ -1,4 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
+// Legacy launch assertions use shipped policy with capacity scoring switched off.
+vi.mock('../../lib/settings-files.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readDeclaredSettings: options => {
+    const declared = actual.readDeclaredSettings(options);
+    return { ...declared, settings: { ...declared.settings, routing: { ...declared.settings.routing,
+      capacity: { ...declared.settings.routing?.capacity, enabled: false } } } };
+  } };
+});
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
 import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';

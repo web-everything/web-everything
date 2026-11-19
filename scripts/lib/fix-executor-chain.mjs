@@ -40,8 +40,8 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
   const chosen = effectiveBuilder({ env, ...(declared ? { declared } : { repo }), kind: 'fix', capacity, now, quota, records, record });
   if (chosen.decision && chosen.decision.reason !== 'all-readers-unknown') {
-    // Preserve escalation order. Mixed unknown readers are a last fallback, never scored as plenty.
-    const known = [], unknown = [];
+    // Filtering only removes rungs; unknown capacity never changes escalation order.
+    const kept = [];
     for (const id of result.value) {
       const provider = id === 'argon' ? 'agy-gemini' : id;
       const definition = chosen.settings.capacity.providers.find(p => p.id === provider);
@@ -52,10 +52,10 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
         allowedKinds: c.allowedKinds ?? definition?.allowedKinds }));
       const fits = c => c.active !== false && c.allowedKinds?.includes('fix')
         && Number.isFinite(c.tier) && c.tier >= (chosen.settings.capacity.minimumTiers?.fix ?? 0);
-      if (eligible.some(c => fits(c) && scoreProvider(c, 'fix', { ...chosen.settings.capacity, now }).score !== null)) known.push(id);
-      else if (eligible.some(c => fits(c) && scoreProvider(c, 'fix', { ...chosen.settings.capacity, now }).label === 'unknown')) unknown.push(id);
+      if (eligible.some(c => fits(c) && scoreProvider(c, 'fix', { ...chosen.settings.capacity, now }).score !== null)) kept.push(id);
+      else if (eligible.some(c => fits(c) && scoreProvider(c, 'fix', { ...chosen.settings.capacity, now }).label === 'unknown')) kept.push(id);
     }
-    result.value = [...known, ...unknown];
+    result.value = kept;
     result.source += '+capacity';
   } else if (chosen.builder === 'claude') {
     const kept = result.value.filter(id => FIX_EXECUTOR_RUNGS[id].executor !== 'codex');
@@ -82,7 +82,14 @@ export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, trigger = nu
   if (!chain.length) return { executor: null, rung: null, reason: 'no eligible capacity; wait for quota reset or clear provider hold', source: 'capacity' };
   const unproductive = codexUnproductive >= ROUTED_CODEX_MAX_UNPRODUCTIVE;
   // Triggers and failure history describe the same progress: take their floor, never add them.
-  let index = Math.min(Math.max(trigger ? 1 : 0, unproductive ? codexUnproductive - 1 : 0), chain.length - 1);
+  const progress = Math.max(trigger ? 1 : 0, unproductive ? codexUnproductive - 1 : 0);
+  if (critical && progress >= criticalClaudeFromRung && !chain.includes('claude')) {
+    return { executor: null, rung: null, reason: 'critical escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
+  }
+  if (unproductive && progress >= chain.length && !chain.includes('claude')) {
+    return { executor: null, rung: null, reason: 'unproductive escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
+  }
+  let index = Math.min(progress, chain.length - 1);
   const prefix = trigger === 'takeover' ? 'takeover round' : trigger === 'ruling-not-addressed' ? 'ruling-not-addressed send-back'
     : unproductive ? `codex unproductive on this head (${codexUnproductive} unproductive runs)`
       : trigger === 'stronger-model' ? 'stronger-model rung' : 'codex-first ordinary repair';
@@ -95,7 +102,9 @@ export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, trigger = nu
   if (critical && (trigger === 'takeover' || trigger === 'ruling-not-addressed')) {
     return { executor: 'claude', rung: 'claude', reason: 'critical work never leaves Claude', source: 'default' };
   }
-  if (critical && chain.includes('claude') && index >= criticalClaudeFromRung) return { executor: 'claude', rung: 'claude',
+  if (critical && index >= criticalClaudeFromRung && !chain.includes('claude')) return { executor: null, rung: null,
+    reason: 'critical escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
+  if (critical && index >= criticalClaudeFromRung) return { executor: 'claude', rung: 'claude',
     reason: `critical work reaches Claude from rung ${criticalClaudeFromRung} (criticalClaudeFromRung=${criticalClaudeFromRung}, source=${criticalSource})`, source: 'default' };
   const selected = FIX_EXECUTOR_RUNGS[chain[index]];
   const reason = `${prefix} → ${selected.id === 'claude' ? 'falls back to Claude (chain exhausted)' : `chain rung ${index + 1}/${chain.length} ${selected.id}`}${skips.length ? `; ${skips.join('; ')}` : ''}${critical && selected.id !== 'claude' ? `; critical work stays on ${selected.id} below criticalClaudeFromRung=${criticalClaudeFromRung} (source=${criticalSource})` : ''}`;

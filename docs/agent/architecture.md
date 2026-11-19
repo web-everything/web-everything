@@ -113,8 +113,9 @@ Inactive accounts never route or contribute capacity; sustained shortfall on thr
 (`activateAfterShortfallDays`) recommends activation. Banked inventory alone does not guarantee
 demand coverage: working-hour deferrals can cause a shortfall before the next reset. Inventory-only
 fixtures must supply continuous working hours. The shared Claude usage file maps only to
-`routing.capacity.claudeUsageAccount`; null leaves both accounts unknown. Route results carry
-`account` for a future account-selecting launcher; current callers may ignore it.
+`routing.capacity.claudeUsageAccount`; null leaves both accounts unknown. Until launchers select accounts, routing scores only the account attributed to the live reader.
+An unattributed multi-account provider is unknown. Account IDs appear only in the capacity decision
+log, never in executable route results (follow-up: account-aware provider launchers).
 
 `fix:critical-work` and `fix:ruling-escalation-stronger` inherit capacity selection with minimum tiers
 3 and 2 respectively. Explicit takeover and ruling-not-addressed routes remain Claude policy data.
@@ -125,14 +126,24 @@ Unknown eligible capacity refuses with an operator-visible wait/reset/readings f
 ### Capacity routing safety
 
 Capacity ranks provider/model candidates; the normal routing gate, holds, vetoes, disabled-provider
-and model validation still apply, trying the next candidate before the historical policy fallback.
+and model validation still apply. Projection preserves configured effort, disabled providers and
+other policy fields, and never changes non-build operations such as prepare-decision. Candidates
+are tried in order; only all-unknown readers may use the historical policy fallback. Known rejected
+capacity holds with named reasons and a wait/reset/clear-hold fallback. Apply capacity eligibility
+both to route selection and to every returned fallback rung: the pure router's `available` input
+constrains its selected route, but does not filter its returned fallback list.
 Critical fixes and ruling-escalation-stronger require their configured `providerCapacity.minimumTiers`
 with an exact provider/model tier from `providerCapacity.providers`; unknown tiers refuse.
 Critical takeover and ruling-not-addressed send-backs remain Claude-only and hold when Claude is unavailable.
 Escalation preserves rung order while removing held, exhausted, inactive, reserve-only, disallowed
-and below-minimum providers. With mixed observations, unknown rungs follow all known eligible rungs;
+and below-minimum providers. Unknown rungs retain their configured position;
 when every reader is unknown the historical effective-builder chain applies (Claude drops Codex).
 `routing.capacity.operatorReadingMaxAgeHours` defaults to 24 and follows the normal cascade with
 `capacitySources` provenance. Older operator readings never supply quota; the calendar reports
 “operator reading stale — refresh”. Refresh the reading, restore live quota, or wait for reset/clear
 holds when routing refuses. A chain decision with `executor:null` holds every launch and resume caller.
+
+When critical or unproductive escalation requires Claude but filtering removed Claude, the chain
+holds instead of continuing on Codex. An invalid AI overlay makes the fixer-ladder rung unavailable
+and surfaces its error. Routing tests consume shipped defaults; injected capacity observations or
+the capacity enable switch isolate quota-dependent and legacy paths without replacing route data.

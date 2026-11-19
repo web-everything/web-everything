@@ -25,7 +25,7 @@ vi.mock('../codex-usage-ledger.mjs', async (importOriginal) => {
 });
 vi.mock('../dispatch-contracts.mjs', async (importOriginal) => {
   const actual = await importOriginal();
-  return { ...actual, decideDispatchRoute: (d, o) => { state.seen.push({ kind: d?.kind, availability: { ...o?.availability } }); return actual.decideDispatchRoute(d, o); } };
+  return { ...actual, decideDispatchRoute: (d, o) => { state.seen.push({ kind: d?.kind, availability: { ...o?.availability }, routingPolicy: o.routingPolicy }); return actual.decideDispatchRoute(d, o); } };
 });
 beforeEach(() => { vi.stubEnv('WE_ROUTING_BUILDER', ''); });
 afterEach(() => { state.dir = null; state.quota = undefined; state.seen = []; vi.unstubAllEnvs(); });
@@ -234,4 +234,36 @@ it('operator reading age defaults to 24h and resolves platform, tool and environ
   const overridden = resolveRoutingSettings({ env: { ...env, WE_ROUTING_CAPACITY_OPERATOR_READING_MAX_AGE_HOURS: '6' } });
   expect(overridden.capacity.operatorReadingMaxAgeHours).toBe(6);
   expect(overridden.capacitySources.operatorReadingMaxAgeHours).toBe('env');
+});
+
+
+it('capacity projection preserves disabled providers, configured effort, model and fallback fields', () => {
+  settingsDir({ 'routing.json': { routing: { builder: 'auto' } } });
+  const policy = structuredClone(readRoutingPolicy());
+  policy.operations.build.disabledProviders = ['codex'];
+  policy.operations.build.effort = 'max';
+  const now = Date.parse('2026-11-19T12:00:00Z');
+  const result = resolveDispatchRoute({ kind: 'build', ...SCOPED, taskType: 'build-new-feature' }, { env: {}, now, routingPolicy: policy,
+    capacity: [{ provider: 'codex', model: 'gpt-6-astra', known: true, health: 1, windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }] });
+  const projected = state.seen.at(-1).routingPolicy;
+  expect(projected.operations.build).toEqual(policy.operations.build);
+  expect(projected.operations['build:build-new-feature']).toMatchObject({ provider: 'codex', model: 'sol', disabledProviders: ['codex'], effort: 'max' });
+  expect(result.executed).not.toBe('codex');
+});
+
+it('prepare capacity projection never overwrites prepare-decision or non-build policy', () => {
+  settingsDir({ 'routing.json': { routing: { builder: 'auto' } } });
+  const policy = readRoutingPolicy();
+  const now = Date.parse('2026-11-19T12:00:00Z');
+  const options = { env: {}, now, routingPolicy: policy, capacity: [{ provider: 'codex', known: true, health: 1,
+    windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }] };
+  for (const kind of ['prepare', 'prepare-item']) {
+    resolveDispatchRoute({ kind, ...SCOPED }, options);
+    const projected = state.seen.at(-1).routingPolicy;
+    expect(projected.operations['prepare-decision']).toBe(policy.operations['prepare-decision']);
+    expect(projected.smallPrepare).toBe(policy.smallPrepare);
+    expect(projected.operations[kind].effort).toEqual(policy.operations[kind].effort);
+  }
+  resolveDispatchRoute({ kind: 'prepare-decision', ...SCOPED }, options);
+  expect(state.seen.at(-1).routingPolicy).toBe(policy);
 });

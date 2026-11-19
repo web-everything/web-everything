@@ -37,6 +37,7 @@ const EFFORT_RANK = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export function loadFixerLadder({
   path, read, routingPolicy = readRoutingPolicy(), externalFixProviders = EXTERNAL_FIX_PROVIDERS,
   override, // injectable: skip the file
+  capacity, now, // injectable observations and clock; production reads live capacity
   providerCapacity, // injectable configured model tiers; production resolves through the settings cascade
   aiRouting, operatorKeys, // optional resolver input (fix coordinator slice); absent = unchanged
 } = {}) {
@@ -46,25 +47,27 @@ export function loadFixerLadder({
   const gateClosed = routingPolicy.criticalWorkGate.kinds.includes('fix');
   const providers = ['claude', ...externalFixProviders];
   const routes = {};
+  const routeErrors = [];
   for (const rung of policy.rungs) {
     if (rung.action !== 'dispatch') continue;
     if (!rung.taskType) { routes[rung.id] = null; continue; }
     try {
-      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, providerCapacity };
+      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, providerCapacity, capacity, now };
       routes[rung.id] = resolveOperationRoute(base);
       // aiRouting may only RAISE a rung's effort on the same provider and model: an escalation rung is never weakened.
       if (aiRouting !== undefined && routes[rung.id]) {
-        let routed;
-        try { routed = resolveOperationRoute({ ...base, aiRouting, operatorKeys }); }
-        catch { /* An invalid overlay cannot discard the already validated escalation route. */ }
+        const routed = resolveOperationRoute({ ...base, aiRouting, operatorKeys });
         const rank = effort => EFFORT_RANK.indexOf(effort);
         if (routed && routed.provider === routes[rung.id].provider && routed.model === routes[rung.id].model
           && rank(routed.effort) >= rank(routes[rung.id].effort)) routes[rung.id] = routed;
       }
     }
-    catch { routes[rung.id] = undefined; } // no route at all: unavailable
+    catch (error) {
+      if (aiRouting !== undefined && routes[rung.id]) routeErrors.push(`${rung.id}: ${error.message}`);
+      routes[rung.id] = undefined; // no route at all: unavailable
+    }
   }
   const available = (rung) => rung.action !== 'dispatch' || (!rung.taskType
     ? true : routes[rung.id] != null && routes[rung.id].provider === rung.provider);
-  return { policy, error: error ?? fromFile.error ?? null, routes, available, humanAt: humanAtMisses(policy, { available }) };
+  return { policy, error: [error, fromFile.error, ...routeErrors].filter(Boolean).join('; ') || null, routes, available, humanAt: humanAtMisses(policy, { available }) };
 }

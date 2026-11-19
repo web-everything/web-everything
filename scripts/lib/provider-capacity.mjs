@@ -82,6 +82,22 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
   });
 }
 
+/** Until launchers select accounts (follow-up: account-aware provider launchers),
+ * route only against the live reader's account; other account readings are informational. */
+export function launcherCapacity(capacities, settings = {}) {
+  const providers = settings.providers ?? PROVIDER_DEFAULTS.providers;
+  return [...new Set(capacities.map(c => c.provider))].flatMap(provider => {
+    const observations = capacities.filter(c => c.provider === provider);
+    const def = providers.find(p => p.id === provider);
+    const owner = providers.find(p => p.id === def?.quotaOf) ?? def;
+    if ((owner?.accounts?.length ?? new Set(observations.map(c => c.account)).size) <= 1) return observations;
+    const attributed = owner?.id === 'claude' || provider === 'claude' ? settings.claudeUsageAccount : null;
+    const live = attributed && observations.find(c => c.account === attributed);
+    return live ? [live] : [{ ...observations[0], account: null, windows: [], known: false,
+      held: observations.some(c => c.held) }];
+  });
+}
+
 export function scoreProvider(cap, kind, settings = {}) {
   const s = options(settings), now = settings.now ?? cap.now ?? Date.now();
   const w = bindingWindow(cap), hoursToReset = w ? Math.max(0, (w.resetsAt - now) / HOUR) : null;
