@@ -30,6 +30,7 @@ function evidence() {
   const platform = join(dir, 'platform.json');
   writeFileSync(platform, '{}');
   return { path, dir, env: {
+    HOME: dir, WE_SAME_DIFF_CARRY: 'off',
     WE_FIX_READY_PATH: path, WE_PLATFORM_PREFERENCES_FILE: platform,
     WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only',
   }, save: (...rows) => writeFileSync(path, rows.map(r => JSON.stringify(r)).join('\n')) };
@@ -793,7 +794,7 @@ describe('unaudited-tip wiring', () => {
     const calls = planCalls(sourceOf(`../daemon-rebuild/${file}`));
     expect(calls).toHaveLength(count);
     for (const call of calls) expect(call).toMatch(/\bauditedTip\b/);
-    if (file !== 'plan.mjs') for (const call of calls) expect(call).toContain('auditedTip: makeAuditedTipGate(env)');
+    if (file !== 'plan.mjs') for (const call of calls) expect(call).toContain(`auditedTip: makeAuditedTipGate(env, { repo: ${file === 'preview.mjs' ? 'scratchDir' : 'root'} })`);
   });
 
   it('prepare.mjs judges a pending ready record against the live plan (whose audit holds it re-derives from current evidence)', () => {
@@ -806,13 +807,13 @@ describe('unaudited-tip wiring', () => {
   it('smoke.mjs hands finalizeRebuild a fresh audit gate (evidence revoked during the smoke is re-judged at adoption)', () => {
     const src = sourceOf('../daemon-rebuild/smoke.mjs');
     const at = src.indexOf('finalizeRebuild({');
-    expect(src.slice(at, src.indexOf('finalizeLockOpts', at))).toContain('auditedTip: makeAuditedTipGate(env)');
+    expect(src.slice(at, src.indexOf('finalizeLockOpts', at))).toContain('auditedTip: makeAuditedTipGate(env, { repo: root })');
   });
 
   it('prepare.mjs hands the matcher a fresh audit gate, so a record\'s own tips are re-judged at adoption time', () => {
     const src = sourceOf('../daemon-rebuild/prepare.mjs');
     const at = src.indexOf('matchReadyCandidate({');
-    expect(src.slice(at, src.indexOf('forcedWatch:', at))).toContain('auditedTip: makeAuditedTipGate(env)');
+    expect(src.slice(at, src.indexOf('forcedWatch:', at))).toContain('auditedTip: makeAuditedTipGate(env, { repo: root })');
   });
 
   it('prepareRebuild with explicit audited-only env keeps the adopted head, logs overlay-unaudited-tip once, then advances on a record', async () => {

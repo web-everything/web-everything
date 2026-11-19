@@ -509,7 +509,7 @@ export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS, { r
   return { head: disposition.result?.rev ?? String(pr?.headRefOid ?? '').toLowerCase(), since: disposition.since, findings: held.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })) };
 }
 
-const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} patch-id=[0-9a-f]{40} -->$/;
+const CARRIED_LINE_RE = /^<!-- review-verdict-carried from=[0-9a-f]{40} to=[0-9a-f]{40} (?:patch-id=[0-9a-f]{40}|same-content=[0-9a-f]{40}:(?:clean-main-merge|jit-rename)(?:,[0-9a-f]{40}:(?:clean-main-merge|jit-rename))*) -->$/;
 /** The heading only `review-set-label --to=clear-human` renders, at the very start of its comment (CLEARED_HUMAN_PROSE_RE). */
 const CLEAR_HUMAN_RULING_RE = /^✅ review — `review:human` cleared via the sanctioned path\n\nCleared by .+? via `review-set-label\.mjs --to=clear-human`/;
 

@@ -384,7 +384,7 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
-    auditedTip: makeAuditedTipGate(env),
+    auditedTip: makeAuditedTipGate(env, { repo: root }),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -615,7 +615,7 @@ export async function prepareRebuild({
         maxAgeMs,
         // unaudited-tip: the record's own tips are re-judged against the evidence at adoption time (a red record appended since
         // the smoke revokes it even when the live alert names only a later tip), by a fresh gate so the snapshot is current.
-        auditedTip: makeAuditedTipGate(env),
+        auditedTip: makeAuditedTipGate(env, { repo: root }),
         tipInMain: (sha) => tipInMain(git, plan.mainSha, sha),
         // the overlays the RUNNING build applies: its own rebuild-committed merge records above main (hard data — an
         // empty list for a plain-main HEAD), plus the recorded adopted set when HEAD is that adopted build

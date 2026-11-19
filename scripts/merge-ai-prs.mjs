@@ -716,7 +716,7 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * `review:held-mechanical` (`decideTestGamingPark`), which the carry sweep retries; a decided refusal parks `review:human`.
  * @returns {{humanClearedSha: string|null, carried: boolean, reason: string, retryable: boolean}}
  */
-export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null, applyNumberingCarry = null } = {}) {
+export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null, applyNumberingCarry = null, repo = process.cwd(), exec, env = process.env } = {}) {
   const unchanged = (reason, retryable = false) => ({ humanClearedSha, carried: false, reason, retryable });
   if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
   if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
@@ -734,7 +734,7 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
   if (netDiffText.rev !== headSha) return unchanged('the net diff was not read at the live head; identity unproven', true);
   const carry = decideAcceptCarryForward({
     setting, record: latestAcceptRecord(comments, Array.isArray(reviews) ? reviews : null),
-    headSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
+    repo, exec, env, headSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
   });
   if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
     return { humanClearedSha: headSha, carried: true, reason: carry.reason, retryable: false };
@@ -6640,6 +6640,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             // PR #4631 round 7 (toctou-head-binding): the batch's `netDiffText` was read at the branch NAME, which may have
             // pointed at another commit than `tamperHeadSha`; the carry needs the live head's own diff, read at its SHA.
             const carried = carryHumanClearanceOnIdenticalDiff({
+              repo: escCwd || process.cwd(), exec: diffExec || undefined,
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
               humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),

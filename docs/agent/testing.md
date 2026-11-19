@@ -4931,3 +4931,13 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Same-content carry history proofs
+
+`scripts/lib/same-content-carry.mjs` owns the history classifier shared by waiver and verdict carries.
+Use real temporary Git histories to verify mechanical main merges, conflict resolutions and JIT backlog renames;
+only waivers may allow test-only edits. A history proof never substitutes for finding coverage or later-verdict guards.
+Keep readiness candidates separate from history-based negative-evidence vetoes: an old NOT WEAKENED ready record must not authorize a test-only successor through either readyEvidence or makeAuditedTipGate.
+Normalize colon-delimited line references only on recognized source paths; preserve endpoint ports and other numeric finding content, and test that changing a port refuses waiver admission.
+The node:test cases run through a small Vitest adapter so the host heavy-admission queue remains the test entry point.
+The soak break probes behavior in a temporary repository, including a real hunk-offset fingerprint change.

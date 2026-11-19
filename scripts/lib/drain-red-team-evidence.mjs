@@ -908,7 +908,7 @@ export function carriedStoredFindings(prior, result, status = 'finished') {
 const LEGACY_PENDING = 'unreadable-pending-pass';
 
 /** A status is written before settling speculation or starting the sequential pass; crashes leave a dead pid. */
-function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
+function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retryCount, refundRetry = false, admissionId, sameContentCarry }, { env = process.env, host = hostname(), namespace = pidNamespace(), readPidStart = pidStartTime, lockTimeoutMs = 60_000 } = {}) {
   const head = loopPayload?.findings?.read?.netBasis?.rev;
   if (!/^[a-f0-9]{40}$/i.test(head ?? '')) return;
   const path = statusPath({ repo, pr, head }, env);
@@ -916,11 +916,11 @@ function writeRedTeamStatus({ repo, pr, loopPayload, status, result = null, retr
   // The publisher's status lock (red-team-withheld-publish): its seal and this rewrite never interleave, so neither
   // drops the other's write (PR #6622). The publisher never takes the retry claim, so the order cannot deadlock.
   // The publisher holds it across its gh reads and post, so wait longer than the 5s default before reporting busy.
-  return withFileLock(`${path}.lock`, () => writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId },
+  return withFileLock(`${path}.lock`, () => writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId, sameContentCarry },
     { env, host, namespace, readPidStart }), { timeoutMs: lockTimeoutMs });
 }
 
-function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId }, { env, host, namespace, readPidStart }) {
+function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, result, retryCount, refundRetry, admissionId, sameContentCarry }, { env, host, namespace, readPidStart }) {
   // Retry admission survives running/finished rewrites, including lost seat-row appends.
   // A marker left by a failed status write must not wedge this writer: `claimed` below keeps its spend.
   let prior;
@@ -968,6 +968,7 @@ function writeRedTeamStatusLocked(path, { repo, pr, head, loopPayload, status, r
   // skipCardOnly is the writer's resolved setting, NOT evidence that this PR is card-only.
   // Consumers must classify the stored net read; the drain may resolve a different setting in its own process.
   writeJsonAtomic(path, { repo, pr, head, loopPayload, status, result,
+    ...(sameContentCarry ? { sameContentCarry } : {}),
     ...(admissionId ? { admissionId } : {}),
     // The sealed stored breaks and the legacy hold flag survive a rewrite that keeps the sealed result (a retry or recovery
     // that has no new result yet) (PR #6622): dropping them lifts the hold. A NEW result drops them, so the status reads

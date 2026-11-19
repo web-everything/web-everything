@@ -1,3 +1,4 @@
+import { classifyHeadMove } from './same-content-carry.mjs';
 /**
  * @file scripts/lib/accept-carry-forward.mjs
  * @description Card xu7kxtt (#5472, ruling P4, operator 2026-10-08): "an equivalent merge-main keeps the accept; a heal
@@ -410,7 +411,7 @@ export function latestAcceptRecord(comments, reviews = undefined, { sha: sourceS
 }
 
 /**
- * THE RULE. Facts in, verdict out. Pure.
+ * Guarded verdict: fingerprint comparison first, then an injectable local history proof.
  * @param {{setting?:'on'|'off', record?:ReturnType<typeof latestAcceptRecord>, headSha?:string|null,
  *   headDiff?:string|null, headContribution?:string|null, equivalence?:'contribution'|'strict', laterVerdict?:boolean}} facts — `headDiff` is the strict `normalizeDiffFingerprint` of the
  *   live head's net diff (null when it could not be read).
@@ -419,7 +420,7 @@ export function latestAcceptRecord(comments, reviews = undefined, { sha: sourceS
  *   `carry` = the accept holds on the new head (record both SHAs). `review-owed` = the net diff changed or could not
  *   be proven identical: today's path (a review of the change; a `review:human` PR goes back to the operator).
  */
-export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAULT, record = null, headSha = null, headDiff = null, headContribution = null, equivalence = resolveCarryEquivalenceSetting().value, laterVerdict = false } = {}) {
+export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAULT, record = null, headSha = null, headDiff = null, headContribution = null, equivalence = resolveCarryEquivalenceSetting().value, laterVerdict = false, repo = process.cwd(), exec, env = process.env, classify = classifyHeadMove } = {}) {
   if (setting !== 'on') return { action: 'off', reason: 'acceptCarryForward is off (today: a moved head loses a SHA-bound accept)' };
   const head = typeof headSha === 'string' ? headSha.toLowerCase() : '';
   if (!record || !SHA_RE.test(record.sha ?? '')) return { action: 'none', reason: 'no trusted accept record on the PR' };
@@ -442,6 +443,9 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   const match = compareCarryFingerprints({ mode: equivalence,
     cleared: { diff: record.diff, contribution: record.contribution }, live: { diff: headDiff, contribution: headContribution } });
   if (!match.same) {
+    const move = classify({ repo, from: record.sha, to: head, allowTestOnly: false, exec, env });
+    if (move.carries) return { ...base, action: 'carry', commits: move.commits,
+      reason: `same content from ${record.sha} to ${head}; commits ${JSON.stringify(move.commits)}` };
     return { ...base, action: 'review-owed', reason: `net diff changed since the accept at ${record.sha.slice(0, 9)} — a review of the change is owed${record.humanCleared ? '; it goes back to the operator' : ''}` };
   }
   if (match.tier === 'contribution') return { ...base, action: 'carry',

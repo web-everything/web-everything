@@ -49,7 +49,8 @@ function fixture(options = {}) {
     .map((ref, i) => [ref, 'd'.repeat(39) + i.toString(16)]));
   const establishedFetches = new Map();
   const admitted = [];
-  const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
+  // Historical fixtures model the fingerprint-only policy; real-history cases exercise the new on setting.
+  const env = { WE_SAME_DIFF_CARRY: 'off', HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
   const fs = {
     readFileSync(p) {

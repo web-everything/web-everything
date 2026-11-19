@@ -1,3 +1,4 @@
+import { createSameContentProof, recordWaiverCarry } from '../lib/same-content-waiver-io.mjs';
 /**
  * @file Injected prototype admission transaction.
  * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and retain mutable
@@ -235,6 +236,7 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
 }
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
+  carryLogPath, recordCarry = recordWaiverCarry,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
@@ -502,8 +504,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
       let readyFp = null;
+      const sameContent = createSameContentProof({ repo: gitRepo, exec, env });
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
-        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])));
+        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])), { sameContent });
       // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
       // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
       const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
@@ -522,9 +525,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate }) };
+        { ruledWeakened: out.gate, sameContent }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
+      if (out.gate?.sameContentCarry) try { recordCarry({ ref: input.branch, ...out.gate.sameContentCarry, matched: out.canonicalAudit.record.findings }, { env, ...(carryLogPath ? { path: carryLogPath } : {}) }); } catch { /* best effort */ }
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.

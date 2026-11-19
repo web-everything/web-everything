@@ -102,7 +102,7 @@ export async function dryRunRebuild({
               const overlayStarted = now();
               try {
                 plan = await planRebuild({
-                  auditedTip: makeAuditedTipGate(env),
+                  auditedTip: makeAuditedTipGate(env, { repo: scratchDir }),
                   git: scratchGit,
                   headSha: head,
                   mainRef: 'origin/main',
@@ -264,7 +264,7 @@ export async function previewOverlayConflict({
     let planExisting;
     for (;;) {
       planExisting = await planRebuild({
-        auditedTip: makeAuditedTipGate(env),
+        auditedTip: makeAuditedTipGate(env, { repo: scratchDir }),
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding,
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
@@ -297,7 +297,7 @@ export async function previewOverlayConflict({
     // A carried ref re-registered at a conflicting tip can be pinned, which still requires an operator override.
     if (mt.status === 1) {
       const planCandidate = await planRebuild({
-        auditedTip: makeAuditedTipGate(env),
+        auditedTip: makeAuditedTipGate(env, { repo: scratchDir }),
         git: scratchGit, headSha: head, mainRef: 'origin/main', overlays: folding.concat([{ ref, pr }]),
         prState: (p) => defaultPrState({ pr: p, root }),
         edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
