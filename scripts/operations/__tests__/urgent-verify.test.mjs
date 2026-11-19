@@ -563,6 +563,11 @@ describe('urgent-verify worktree tampered', () => {
     expect(r).toMatchObject({ ok: false, marker: { result: 'red' }, failure: { message: expect.stringContaining('checkout changed') } });
     expect(leftovers(t.parent)).toEqual([]);
   });
+  it.each(['--assume-unchanged', '--skip-worktree'])('hiding a tracked-file edit with update-index %s still gives red', async flag => {
+    const t = tempRepo();
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => { git(dir, 'update-index', flag, 'a.txt'); writeFileSync(pjoin(dir, 'a.txt'), 'forged'); }));
+    expect(r).toMatchObject({ ok: false, failure: { message: expect.stringContaining('checkout changed') } });
+  });
   it('a moved HEAD in the worktree gives red "checkout changed"', async () => {
     const t = tempRepo();
     const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => git(dir, 'commit', '--allow-empty', '-qm', 'moved')));

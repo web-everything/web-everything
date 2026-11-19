@@ -77,7 +77,10 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       catch (e) { if (e.code !== 'EEXIST') throw e; }
       return fs.readFileSync(path);
     }, host: hostname(), now: () => new Date().toISOString(),
-    clean: () => run('git', ['status', '--porcelain']) === '',
+    // Also refuse hidden changes: assume-unchanged (lowercase tag) and skip-worktree (S) entries make
+    // `git status` lie, so a checkout could edit tracked files and still look clean.
+    clean: () => run('git', ['status', '--porcelain']) === ''
+      && !String(run('git', ['ls-files', '-v'])).split(/\r?\n/).some(l => /^[a-zS] /.test(l)),
     head: () => run('git', ['rev-parse', 'HEAD']).trim(),
     plan: () => {
       const workflow = fs.readFileSync(join(cwd, '.github/workflows/ci.yml'), 'utf8');
