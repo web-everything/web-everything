@@ -381,6 +381,7 @@
   "scripts/ci/__tests__/ci-unit-shard-step.test.mjs": 0.09,
   "scripts/ci/__tests__/coverage-reach.test.mjs": 0.21,
   "scripts/ci/__tests__/fetch-main-history.test.mjs": 0.11,
+  "scripts/ci/__tests__/dep-trace.test.mjs": 0.05,
   "scripts/ci/__tests__/quarantine-job-wiring.test.mjs": 0.12,
   "scripts/ci/__tests__/quarantine-skip.test.mjs": 0.71,
   "scripts/ci/__tests__/refresh-timings.test.mjs": 2.19,

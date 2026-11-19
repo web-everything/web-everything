@@ -4,11 +4,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BUILT_IN_VERIFY_SETTINGS, defaultVerifySettingsPath, validateVerifySettings,
-  loadVerifySettingsFile, resolveVerifySettings } from '../verify-settings.mjs';
+  loadVerifySettingsFile as loadWithHostLayers, resolveVerifySettings } from '../verify-settings.mjs';
 import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, verifyPhaseAdmissionEnabled,
   verifyFastTargets, resolveDefaultGate, phaseAdmissionKind, buildVerifyPhases, formatVerifyPhases } from '../verify-lane-gate.mjs';
 
-const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
+// Hermetic: an explicit empty platform + operator layer, so a host `verify` preference (for example
+// shardMinTests: 0 in ~/.claude/platform-preferences.json) cannot leak into these expectations.
+const loadVerifySettingsFile = (path, options = {}) => loadWithHostLayers(path, { platform: {}, operatorOverride: {}, ...options });
+const allSources =source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
   matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
   revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr', phaseTimeoutMs: 600_000, slotHeartbeatMs: 120_000 };
