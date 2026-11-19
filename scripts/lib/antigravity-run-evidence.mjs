@@ -26,6 +26,20 @@ export function agyRunEvidence({ stdout = '', stderr = '', requestedModel, now =
     fallbackDecision: exhausted ? 'skip-quota-exhausted' : mismatch ? 'skip-backend-mismatch' : modelMismatch ? 'skip-model-mismatch' : 'none' };
 }
 export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } = {}) {
+  try {
+    const health = JSON.parse(readFileSync(join(dir, 'binary', 'health.json'), 'utf8'));
+    const at = typeof health?.at === 'string' ? Date.parse(health.at) : NaN;
+    if (!['ok', 'dead'].includes(health?.state) || typeof health.version !== 'string'
+      || typeof health.reason !== 'string' || !Number.isFinite(at) || at > now) throw Error('invalid health');
+    // An interrupted upgrade or an unconfirmed kill never ages out: only a healthy smoke (or the operator) clears it.
+    const unresolved = health.reason === 'upgrading' || health.reason === 'cleanup incomplete';
+    if (health.state === 'dead' && (unresolved || now - at < 86400000))
+      return { ...health, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
+        modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead' };
+  } catch (error) {
+    if (error.code !== 'ENOENT') return { requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
+      modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead', reason: 'binary health record is unreadable; inspect binary/health.json' };
+  }
   const readRows = (folder) => {
     try {
       return readdirSync(folder).filter((name) => name.endsWith('.json'))
