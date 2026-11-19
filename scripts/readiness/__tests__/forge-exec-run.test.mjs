@@ -1786,20 +1786,20 @@ describe('slot resource environment and receipts',()=>{
   });
 });
 
-it.each([false,true])('reads supervisor cgroup counters with missing counters=%s',async missing=>{
+it.each([false,true].flatMap(throttle=>['none','all','throttle'].map(missing=>[throttle,missing])))('reads supervisor cgroup counters throttle=%s missing=%s',async(throttle,missing)=>{
   const usage=join(root,'usage.json');
   const source=supervisorSource.slice(supervisorSource.indexOf("if 'usage' in cfg:"),supervisorSource.indexOf("fd = os.open(cfg['status']"));
   const probe=String.raw`import os, sys, json, io, builtins
 from unittest.mock import patch
-source, usage, missing = sys.argv[1:]
-cfg = {'usage': usage}
+source, usage, missing, throttle = sys.argv[1:]
+cfg = {'usage': usage, 'receiptCapabilities': {'throttle': 1} if throttle == 'true' else {}}
 process_count = None
 files = {'/proc/self/cgroup': '0::/forge-exec.slice/forge-exec-3.slice/scope\n',
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.peak': '12345',
-         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n',
+         '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/cpu.stat': 'usage_usec 678\nuser_usec 600\n' + ('throttled_usec 45\nnr_throttled 3\n' if missing != 'throttle' else ''),
          '/sys/fs/cgroup/forge-exec.slice/forge-exec-3.slice/scope/memory.events': 'oom 2\noom_kill 1\n'}
 def counter_open(path, *args, **kwargs):
-    if missing == 'true' and path != '/proc/self/cgroup': raise FileNotFoundError(path)
+    if missing == 'all' and path != '/proc/self/cgroup': raise FileNotFoundError(path)
     return io.StringIO(files[path])
 with patch.object(builtins, 'open', side_effect=counter_open):
     exec(source)
@@ -1812,11 +1812,12 @@ except FileExistsError:
 else:
     raise AssertionError('usage write was not exclusive')
 `;
-  const result=spawnSync('python3',['-I','-c',probe,source,usage,String(missing)],{encoding:'utf8',timeout:10000});
+  const result=spawnSync('python3',['-I','-c',probe,source,usage,missing,String(throttle)],{encoding:'utf8',timeout:10000});
   expect(result.status,result.stderr).toBe(0);
-  expect(JSON.parse(await readFile(usage,'utf8'))).toEqual(missing
+  expect(JSON.parse(await readFile(usage,'utf8'))).toEqual({...(missing==='all'
     ? {memoryPeakBytes:null,cpuUsec:null,oomKills:null,processCount:null}
-    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1,processCount:null});
+    : {memoryPeakBytes:12345,cpuUsec:678,oomKills:1,processCount:null}),
+    ...(throttle ? {throttledUsec:missing==='none'?45:null,nrThrottled:missing==='none'?3:null} : {})});
   expect(supervisorSource.indexOf("if 'usage' in cfg:")).toBeGreaterThan(supervisorSource.indexOf('if not uid_processes(): break'));
 });
 
@@ -1874,4 +1875,35 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(subprocess, 'Popen') as 
     expect(JSON.parse(await readFile(usage,'utf8')).processCount).toBe(expected);
     if(expected===null)expect(result.stderr).toContain('task-pressure sample unavailable');
   });
+});
+
+it.each([undefined, '1', 1])('negotiates throttle strictly and sums measurements: %s', async throttle => {
+  let count=0;
+  runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+    count++;
+    return {code:0,stdout:'',stderr:'',usage:{cpuUsec:10,memoryPeakBytes:200,oomKills:0,throttledUsec:7,nrThrottled:2}};
+  }});
+  const prepared=await runner.prepare({nonce:request.nonce,capabilities:{taskPressure:1,throttle}});
+  if(throttle===1)expect(prepared.receiptCapabilities).toEqual({taskPressure:1,throttle:1});
+  else expect(prepared).not.toHaveProperty('receiptCapabilities');
+  work=join(root,'runs',prepared.run,'work');
+  await writeFile(join(work,'package-lock.json'),'lock');
+  request={...request,run:prepared.run};
+  await runner.run(request);
+  const receipt=await runner.finish(request);
+  expect(count).toBeGreaterThanOrEqual(2);
+  expect(receipt.resources).toEqual({memoryPeakBytes:200,cpuUsec:10*count,oomKills:0,slotCpus:8,
+    ...(throttle===1 ? {throttledUsec:7*count,nrThrottled:2*count} : {})});
+});
+it.each([1,2])('keeps throttle counters unknown after an unmeasured command %s',async missingCommand=>{
+  let count=0;
+  runner=createRunner({testRoot:root,testWorkerExec:async()=>({code:0,stdout:'',stderr:'',
+    usage:++count===missingCommand ? {} : {throttledUsec:7,nrThrottled:2}})});
+  const prepared=await runner.prepare({nonce:request.nonce,capabilities:{throttle:1}});
+  expect(prepared.receiptCapabilities).toEqual({throttle:1});
+  work=join(root,'runs',prepared.run,'work');
+  await writeFile(join(work,'package-lock.json'),'lock');
+  request={...request,run:prepared.run};
+  await runner.run(request);
+  expect((await runner.finish(request)).resources).toMatchObject({throttledUsec:null,nrThrottled:null});
 });

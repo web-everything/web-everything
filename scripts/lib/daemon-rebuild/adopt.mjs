@@ -13,6 +13,7 @@ import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
+import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -132,15 +133,16 @@ export function matchReadyCandidate({
   // Carried means by CONTENT: the live applied sha is inside the record's build (the same ref at an OLDER head does
   // not count — Codex audit).
   // Graduation (`leftForMain`) proves both registry history and content in this candidate's own build.
-  // Separately, an overlay this tick's plan removed as `pr-merged`/`in-main` (`removedForMain`) is safe only
+  // Separately, an overlay removed for main in this tick or its recorded history (`removedForMain`) is safe only
   // with independent content proof. Current main containing an overlay alone never satisfies either path.
   // An explicit operator retirement instead proves intentional removal of this exact live tip.
   const retired = [];
-  const omitted = liveApplied.filter((a) => {
+  const uniqueLiveApplied = [...new Map(liveApplied.map((a) => [JSON.stringify([a?.ref, a?.sha]), a])).values()];
+  const omitted = uniqueLiveApplied.filter((a) => {
     if (!a?.ref) return false;
     if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
     if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
-    if (a.sha && removedForMain(a.ref) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
+    if (a.sha && removedForMain(a.ref, a.sha) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
     if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
     return true;
   });
@@ -362,7 +364,15 @@ export function staleAlertDetail(result, state) {
  * this module ever does, and writes `state.adopted`. On a FAILING smoke this is never called at all — `root`
  * was never touched, so {@link rebuildClone} handles that case itself, with no lock and nothing to roll back.
  */
-export async function finalizeRebuild({
+/** I2: the pending-drop check and the HEAD reset must be atomic with retire/replace, which take the add-guard lock
+ *  (and never the clone write lock, so holding both here cannot deadlock). A retirement during finalize waits. */
+export async function finalizeRebuild(options) {
+  // Lazy: daemon-overlay.mjs pulls a heavy import graph that the backlog CLI (which reaches this module) must not load.
+  const { withAddGuardLock } = await import('../../daemon-overlay.mjs');
+  return withAddGuardLock(options.root, options.env ?? process.env, () => finalizeRebuildLocked(options));
+}
+
+async function finalizeRebuildLocked({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
@@ -391,11 +401,27 @@ export async function finalizeRebuild({
     // fix-rebuild-finalize — an adopted build leaves nothing passed-but-unadopted behind.
     if (result.adopted) clearReadyCandidate(root, stEnv);
     // x5wbsbc — runs INSIDE this write-lock hold, only on an adoption (e.g. drop the overlay a fallback proved bad).
-    if (result.adopted && typeof onAdopted === 'function') {
+    // onAdopted can drop registrations (e.g. a fallback's bad overlay): never while a drop intent is unsettled.
+    let pendingDrops = false;
+    try { pendingDrops = readPendingDrops(root, env).length > 0; } catch { pendingDrops = true; }
+    if (result.adopted && typeof onAdopted === 'function' && pendingDrops) alert('on-adopted-skipped-drop-pending', {});
+    if (result.adopted && typeof onAdopted === 'function' && !pendingDrops) {
       try { onAdopted({ alert }); } catch (e) { alert('on-adopted-failed', { error: String(e?.message || e) }); }
     }
     return { ...result, alerts: alertsList };
   };
+
+  // I2: an unsettled drop intent (or an unreadable record) blocks a finalize that changes the applied registration set.
+  // A recovery/rollback that keeps the set unchanged still finalizes.
+  let dropsPending = false;
+  try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
+  const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
+  // The health-watch rollback to last-good only reverts HEAD; it never touches registrations, so it is never blocked.
+  const isRollback = lease?.token === 'force-adopt-rollback';
+  if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
+    alert('drop-pending-unsettled', { target: plan.finalSha });
+    return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either
   // a SIBLING process's own rebuild already landed this EXACT build (align state and stop, no error), or

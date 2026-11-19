@@ -99,12 +99,13 @@ export function quarantineSkip({
   const changedFiles = changed !== undefined ? changed
     : flags.changed !== undefined ? String(flags.changed).split(',').filter(Boolean)
       : (ctx.known && !ctx.onMain ? changedOf({ board, base }) : null);
-  const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now, job: firstSet(flags.job) });
+  const job = firstSet(flags.job);
+  const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now, job });
   const why = `${d.why}${d.unsupported?.length ? `; ${d.unsupported.length} name-qualified entr${d.unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file)` : ''}`;
   if (flags.nonblocking) return { line: d.skip.join(' '), why, skip: d.skip };
   const { line, refused } = renderExclude(d.skip);
   return {
-    line,
+    line: /^soak-shard \(\d+\)$/.test(job) ? d.skip.filter((f) => !refused.includes(f)).map((f) => `--exclude=${f} --quarantined=${f}`).join(' ') : line,
     why: `${why}${refused.length ? `; ${refused.length} file(s) not skipped (unsafe exclude paths; running): ${JSON.stringify(refused)}` : ''}`,
     skip: d.skip.filter((file) => !refused.includes(file)),
   };

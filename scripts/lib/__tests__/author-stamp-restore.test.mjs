@@ -193,6 +193,7 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
   ])('refuses %s with the HTML refusal', (_name, text) => {
     expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toEqual({
       action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by plateau-worker', offender: expect.any(String),
     });
   });
 
@@ -200,6 +201,7 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     expect(plan({ edits: [edit(`\`\n${buildAuthorActorMarker(ID)}\n\``)] })).toEqual({
       action: 'refuse',
       reason: 'malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by plateau-worker', offender: buildAuthorActorMarker(ID),
     });
   });
 
@@ -208,6 +210,7 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     const edits = [edit(diff)];
     const expected = {
       action: 'refuse', reason: 'unsupported HTML edit snapshot; inspect complete GitHub history manually',
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by plateau-worker', offender: expect.any(String),
     };
     expect(plan({ edits })).toEqual(expected);
     const seams = io({ readEdits: vi.fn(() => edits) });
@@ -859,4 +862,80 @@ process.stdout.write(out);
     }
     expect(process.env.WE_GH_READ_MEMO_DIR).toBe('memo-dir');
   });
+});
+
+
+describe('content refusal evidence', () => {
+  it.each([
+    ['HTML token', '<details>\nbody', '<details>'],
+    ['brackets and backticks', '[`<path>`](target)', '[`<path>`](target)'],
+    ['hunk header', '@@ -1 +2 @@\n+new', '@@ -1 +2 @@'],
+    ['inline delta', '{+new+}', '{+new+}'],
+    ['malformed marker', '<!-- authored-by-actor: -->', '<!-- authored-by-actor: -->'],
+    ['non-standalone marker', `prefix ${buildAuthorActorMarker(ID)}`, `prefix ${buildAuthorActorMarker(ID)}`],
+  ])('identifies the offending snapshot and first %s', (_name, diff, offender) => {
+    expect(plan({ edits: [edit(diff, 'operator', '2026-10-02T10:00:00Z')] })).toMatchObject({
+      action: 'refuse', contentRefusal: true, snapshotId: '2026-10-02T10:00:00Z by operator', offender,
+    });
+  });
+
+  it('identifies the first conflicting stamp with its uuid intact', () => {
+    const marker = buildAuthorActorMarker(OTHER);
+    expect(plan({ edits: [...history(), edit(marker, 'operator')] })).toMatchObject({
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by operator', offender: marker,
+    });
+  });
+
+  it('identifies the oldest non-author stamp', () => {
+    const marker = buildAuthorActorMarker(ID);
+    expect(plan({ edits: [edit(marker, 'operator')] })).toMatchObject({
+      contentRefusal: true, snapshotId: '2026-10-01T10:00:00Z by operator', offender: marker,
+    });
+  });
+
+  it('bounds oversized evidence and strips controls without allowing the HTML', () => {
+    const result = plan({ edits: [edit(`<div title="${'x'.repeat(200)}\x1b">`)] });
+    expect(result.action).toBe('refuse');
+    expect(result.offender).toBe(`<div title="${'x'.repeat(108)}`);
+    expect(result.offender).toHaveLength(120);
+    expect(plan({ edits: [edit('<div\x1b>')] }).offender).toBe('<div>');
+  });
+
+  it('reports a malformed live marker without inventing a historical snapshot', () => {
+    expect(plan({ body: '<!-- authored-by-actor: -->' })).toMatchObject({
+      contentRefusal: true, snapshotId: 'live body (no edit snapshot)', offender: '<!-- authored-by-actor: -->',
+    });
+  });
+
+  it('does not classify unreadable history as a deterministic content refusal', () => {
+    expect(plan({ edits: undefined }).contentRefusal).toBeUndefined();
+    expect(plan({ edits: [{ diff: '<div>' }] }).contentRefusal).toBeUndefined();
+  });
+});
+
+
+it('identifies a malformed second marker rather than the preceding valid marker', () => {
+  const malformed = '<!-- authored-by-actor: -->';
+  expect(plan({ edits: [edit(`${buildAuthorActorMarker(ID)}\n${malformed}`)] })).toMatchObject({
+    action: 'refuse', reason: 'malformed historical stamp', offender: malformed,
+  });
+});
+
+it('identifies the stamped edit when the oldest author snapshot has no stamp', () => {
+  const marker = buildAuthorActorMarker(ID);
+  expect(plan({ edits: [edit('Original'), edit(marker, 'operator', '2026-10-02T10:00:00Z')] })).toMatchObject({
+    action: 'refuse', contentRefusal: true, snapshotId: '2026-10-02T10:00:00Z by operator', offender: marker,
+  });
+});
+
+it('a new listed head bypasses the refusal memo and carries the new head identity', () => {
+  let headRefOid = 'a'.repeat(40);
+  const seams = io({ repo: 'o/stamp-head-change', listPrs: () => [{ number: 1, body: BODY,
+    author: { login: `app/${AUTHOR}` }, headRefOid }], readEdits: vi.fn(() => [edit('<div>')]) });
+  expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
+  sweepAuthorStamps(seams);
+  expect(seams.readEdits).toHaveBeenCalledTimes(1);
+  headRefOid = 'b'.repeat(40);
+  expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
+  expect(seams.readEdits).toHaveBeenCalledTimes(2);
 });

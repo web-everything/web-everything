@@ -13,7 +13,7 @@
  * transformed before it gets there — is real code, not a docstring's claim about it.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // `importOriginal` keeps `requireAllProperties`/`stripNulls` REAL — `resolveJudgeProvider`'s 'codex' branch
 // imports both from this same module (see `cli-adapter.mjs`'s own import comment on why: NOT from
@@ -487,3 +487,17 @@ describe('createDefaultJudge - the REAL review-pr requests route correctly throu
 });
 
 
+
+// These historical provider-port fixtures explicitly exercise a manually promoted Carbon seat.
+beforeEach(() => vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
+it('the default Carbon pin and explicit Carbon overrides refuse non-shadow use before promotion', () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+  const provider = resolveJudgeProvider('antigravity');
+  antigravityJudgeSpawnCalls.length = 0;
+  for (const model of [undefined, 'gemini-4-carbon-high']) {
+    expect(() => provider({ mandate: 'm', input: 'i', shape: { type: 'object' }, ...(model ? { model } : {}) }))
+      .toThrow('Carbon not promoted');
+  }
+  expect(antigravityJudgeSpawnCalls).toEqual([]);
+});

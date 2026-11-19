@@ -23,6 +23,7 @@ export const REBUILD_MECHANISM_PATHS = Object.freeze([
   // so an overlay changing that code is pinned exactly as one changing `daemon-rebuild.mjs` was before the split.
   'scripts/lib/daemon-rebuild/',
   'scripts/lib/daemon-overlays.mjs',
+  'scripts/lib/overlay-drop-pending.mjs', // the drop-intent reader the rebuild's I2 guards trust
   'scripts/lib/daemon-clone-lock.mjs',
   'scripts/lib/daemon-self-sync.mjs',
   'scripts/lib/daemon-self-sync*',
