@@ -19,6 +19,7 @@ import { resolveHotPatchSettings, hotPatchDefaults } from './hot-patch-settings.
 import { readMergeQueueMembership } from './enqueue-on-event.mjs';
 import { repoSlugFromRemote } from './lane-verify.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
+import { readHotPatchVerifyMarker } from './hot-patch-verify-marker.mjs';
 
 const validSha = s => typeof s === 'string' && /^[a-f0-9]{40}$/.test(s);
 export const hotPatchPath = (root, env = process.env) => join(stateDir(env), `${cloneKeyOf(root)}.hot-patch.json`);
@@ -269,9 +270,11 @@ function updateResult({ root, env, sha, result, reason }) {
   });
 }
 
-export async function recordVerifyResult({ root, env = process.env, sha, result,
+export async function recordVerifyResult({ root, env = process.env, sha,
   emit = e => appendDaemonEvent(e, { env }), removeOverlay = removeHotPatchOverlay }) {
-  if (!['red', 'green'].includes(result)) return { ok: false, reason: 'invalid-result' };
+  const evidence = readHotPatchVerifyMarker({ sha, env });
+  if (!evidence.ok) return evidence;
+  const result = evidence.marker.result;
   const out = updateResult({ root, env, sha, result });
   if (out.record) {
     await removeOverlay({ root, env, record: out.record });

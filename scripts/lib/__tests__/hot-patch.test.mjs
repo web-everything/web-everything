@@ -4,7 +4,8 @@ const test = process.env.VITEST ? (await import('vitest')).test : nodeTest;
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { classifyHotPatch, requestHotPatch, readHotPatch, hotPatchPath, evaluateOwed, openHotPatchWatch,
@@ -20,6 +21,15 @@ import { main, easternIso } from '../../hot-patch.mjs';
 
 let sha = 'b'.repeat(40), good = 'a'.repeat(40);
 const at = 1700000000000;
+const verifyMarker = (env, sha, result) => {
+  const key = Buffer.alloc(32, 7);
+  const record = { sha, suite: 'full', shards: 1, result, host: 'test-host',
+    startedAt: new Date(at).toISOString(), finishedAt: new Date(at + 60000).toISOString() };
+  mkdirSync(dirname(urgentKeyPath(env.HOME)), { recursive: true });
+  writeFileSync(urgentKeyPath(env.HOME), key);
+  mkdirSync(dirname(urgentLedger(env.HOME)), { recursive: true });
+  appendFileSync(urgentLedger(env.HOME), JSON.stringify({ ...record, sig: urgentSignature(record, key) }) + '\n');
+};
 const fixture = fn => async () => {
   const home = mkdtempSync(join(tmpdir(), 'hot-patch-'));
   const origin = join(home, 'origin'), root = join(home, 'clone');
@@ -133,14 +143,16 @@ test('checklist-2: missing lastGood, failed smoke, corrupt watch and red verify 
   writeFileSync(watchPath(root, env), '{bad'); assert.equal(arm().ok, false);
   writeFileSync(watchPath(root, env), JSON.stringify({ hotPatchSha: sha })); assert.equal(arm().ok, false);
   rmSync(watchPath(root, env));
-  await recordVerifyResult({ root, env, sha, result: 'red', removeOverlay: () => {} });
+  verifyMarker(env, sha, 'red');
+  await recordVerifyResult({ root, env, sha, removeOverlay: () => {} });
   assert.equal(arm().ok, false);
 }));
 
 test('red verify withdraws overlay, marks watch, rollback failure stays owed, healthy next tick still reverts', fixture(async ({ root, env, request, arm, emit }) => {
   addOverlay(root, { ref: request.branch, pinned: true }, { env });
   await requestHotPatch(request); arm();
-  assert.equal((await recordVerifyResult({ root, env, sha, result: 'red', emit })).ok, true);
+  verifyMarker(env, sha, 'red');
+  assert.equal((await recordVerifyResult({ root, env, sha, emit })).ok, true);
   assert.equal(readOverlays(root, { env }).length, 0);
   assert.equal(readForceWatch(root, env).rollbackPending, 'verify-red');
   const args = { root, env, currentHead: sha, probe: async () => ({ healthy: true }), emit, now: () => at + 1 };
@@ -154,8 +166,10 @@ test('late red recreates watch after health watch passes; later green cannot wai
   await requestHotPatch(request); arm();
   for (let i = 0; i < 10; i++) await runForceWatchTick({ root, env, currentHead: sha, probe: async () => ({ healthy: true }), now: () => at + 15 * 60000 });
   assert.equal(readForceWatch(root, env), null);
-  await recordVerifyResult({ root, env, sha, result: 'red' });
-  await recordVerifyResult({ root, env, sha, result: 'green' });
+  verifyMarker(env, sha, 'red');
+  await recordVerifyResult({ root, env, sha });
+  verifyMarker(env, sha, 'green');
+  await recordVerifyResult({ root, env, sha });
   assert.equal(readForceWatch(root, env).rollbackPending, 'verify-red');
   assert.equal(readHotPatch(root, env).owed.verify, 'red');
 }));
@@ -366,7 +380,8 @@ test('checklist-5: moved real clone HEAD cannot arm or retarget a hot-patch roll
   git(['commit', '--allow-empty', '-qm', 'successor']); const successor = git(['rev-parse', 'HEAD']);
   assert.equal(arm().ok, false); assert.equal(readForceWatch(root, env), null);
   git(['reset', '--hard', sha]); assert.equal(arm().ok, true);
-  await recordVerifyResult({ root, env, sha, result: 'red' });
+  verifyMarker(env, sha, 'red');
+  await recordVerifyResult({ root, env, sha });
   git(['reset', '--hard', successor]);
   const out = await runForceWatchTick({ root, env, currentHead: () => git(['rev-parse', 'HEAD']),
     probe: async () => ({ healthy: false }), rollback: async () => { assert.fail('rollback of successor'); } });
@@ -418,7 +433,8 @@ test('checklist-9: crash after registration retains the owed ledger and rolls ba
 
 test('checklist-9: rollbackPending survives a process restart and retries the real reset', fixture(async ({ root, env, request, arm }) => {
   await requestHotPatch(request); assert.equal(arm().ok, true);
-  await recordVerifyResult({ root, env, sha, result: 'red' });
+  verifyMarker(env, sha, 'red');
+  await recordVerifyResult({ root, env, sha });
   assert.equal((await runForceWatchTick({ root, env, currentHead: sha, rollback: async () => ({ ok: false }),
     probe: async () => ({ healthy: true }) })).action, 'rollback-failed');
   const script = `import { spawnSync } from 'node:child_process';
@@ -570,7 +586,8 @@ for (const membership of [{ ok: true, inQueue: false }, { ok: false }, null]) {
   test(`audit-3: caller queued claim cannot waive rollback on nonmembership or unreadable queue: ${JSON.stringify(membership)}`, fixture(async ({ root, env, request }) => {
     await requestHotPatch(request);
     recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
-    await recordVerifyResult({ root, env, sha, result: 'green' });
+    verifyMarker(env, sha, 'green');
+    await recordVerifyResult({ root, env, sha });
     let reads = 0;
     const readQueue = async ({ num }) => { assert.equal(num, 42); reads++; return membership; };
     assert.equal(await runOwedTick({ root, env, now: at + 24 * 3600000, readQueue }), 'rollback');
@@ -592,7 +609,8 @@ test('audit-3: every owed tick rechecks real queue membership, including after a
   await requestHotPatch(request);
   recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
   assert.equal(readHotPatch(root, env).inMergeQueueAt, new Date(at).toISOString());
-  await recordVerifyResult({ root, env, sha, result: 'green' });
+  verifyMarker(env, sha, 'green');
+  await recordVerifyResult({ root, env, sha });
   let reads = 0;
   const readQueue = async () => ({ ok: true, inQueue: ++reads === 1 });
   const args = { root, env, now: at + 24 * 3600000, readQueue };
@@ -604,7 +622,8 @@ test('audit-3: every owed tick rechecks real queue membership, including after a
 test('audit-3: default queue reader refuses unknown origin instead of trusting --queued', fixture(async ({ root, env, request }) => {
   await requestHotPatch(request);
   recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
-  await recordVerifyResult({ root, env, sha, result: 'green' });
+  verifyMarker(env, sha, 'green');
+  await recordVerifyResult({ root, env, sha });
   assert.equal(await runOwedTick({ root, env, now: at + 24 * 3600000 }), 'rollback');
 }));
 

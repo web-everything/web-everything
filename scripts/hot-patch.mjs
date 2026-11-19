@@ -97,7 +97,7 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), 
               `--clone=${root}`, `--ref=${f.branch}`, `--expected-sha=${f.sha}`, '--pinned', '--allow-no-pr', '--reason=R1100 hot-patch', '--json'], settings.registrationTimeoutMs);
         } });
       }
-    } else if (command === 'verify-result') result = await recordVerifyResult({ root, env, sha: f.sha, result: f.result });
+    } else if (command === 'verify-result') result = await recordVerifyResult({ root, env, sha: f.sha });
     else if (command === 'pr') result = recordHotPatchPr({ root, env, sha: f.sha, pr: Number(f.pr), inMergeQueue: f.queued });
     else throw new Error('usage: hot-patch.mjs request|verify-result|pr|status [--daemon clone]');
     stdout(JSON.stringify(result) + '\n');
