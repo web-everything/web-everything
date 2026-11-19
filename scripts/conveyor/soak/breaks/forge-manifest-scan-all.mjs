@@ -37,7 +37,7 @@ function refuses(root,probe) {
 // The fix commit. A tree that has it in its history is "fixed" even if both behaviours later regress, so a
 // regression turns this break red instead of silently downgrading to expected-fail. Shallow or exported trees
 // without the history fall back to the behaviour probe (a tree that really refuses a disguised key is fixed).
-const FIX_SHA='pending';
+const FIX_SHA='475ff53d1fd271cbcf786e5dadc5c9e8ed5fbd11';
 function containsFixCommit(root) {
   if(!/^[0-9a-f]{40}$/.test(FIX_SHA))return false;
   const result=spawnSync('git',['merge-base','--is-ancestor',FIX_SHA,'HEAD'],{cwd:root,timeout:10000});
