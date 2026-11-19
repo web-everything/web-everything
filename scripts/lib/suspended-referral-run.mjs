@@ -1,4 +1,5 @@
 /** Read-only discovery of mandatory-referral effects awaiting an operator ruling. */
+import { isRunAbandoned } from './run-abandoned.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { listRunIds, readRun, resolveRunsDir } from '../operations/run-store.mjs';
@@ -18,7 +19,7 @@ export function resolveReferralJudgeWindow({ env = process.env, log, readFile = 
 
 export function findSuspendedReferralRuns({ repo, pr, head, now, runsDir = resolveRunsDir(),
   list = dir => { statSync(dir); return listRunIds(dir); }, read = readRun, stat = statSync }) {
-  const ids = list(runsDir).filter(id => id.startsWith('review-pr-'));
+  const ids = list(runsDir).filter(id => id.startsWith('review-pr-') && !isRunAbandoned(id, runsDir));
   if (ids.length > 10000) throw Error('suspended referral scan capped; inspect run store');
   if (!Number.isFinite(now)) throw Error('suspended referral clock unreadable; inspect run store');
   return ids.flatMap(id => {

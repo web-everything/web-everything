@@ -2557,6 +2557,7 @@ export function runSessionReaperCli(argv, io = {}) {
   const stop = ({ handle }) => stopSessionWithRetry({ handle, exec, sleep });
   const result = runSessionReaperPass({ listAgents, stop, log, groundTruthFor, completionFor, allowedCwd, neverReapWorking, idleThresholdMs, dryRun, hungFor, backstopCompletion, noOutcomeFor, chatSpawnGuardFor, authExpiredFor, idleFinishedFor, awaitingVerifyFor, pidDeadFor, rateSession });
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;
+  // The shared sweep uses the minutes horizon for stuck effects, six hours for other dead cursors.
   const deadReviewRuns = runDeadReviewRuns
     ? (io.reapDeadReviewRuns ?? reapDeadReviewRuns)({ apply: flags.apply === true && !dryRun, log }) : null;
   if (deadReviewRuns) log(`session-reaper dead-review-runs: ${deadReviewRuns.scanned} scanned · ${deadReviewRuns.reaped.length} reaped · ${deadReviewRuns.wouldReap.length} would reap`);

@@ -42,7 +42,7 @@ it('apply creates exactly one sidecar and preserves run bytes, mtime, verdict an
   expect(readFileSync(path)).toEqual(before); expect(statSync(path).mtimeMs).toBe(mtime);
   const tombstone = JSON.parse(readFileSync(abandonedPath(original.id, dir), 'utf8'));
   expect(tombstone).toMatchObject({ by: 'reap-dead-review-runs', at: new Date(now).toISOString(),
-    reason: 'dead: no live pid/handle/lease/session; unchanged for >= 6h' });
+    reason: expect.stringContaining('abandoned, effect NOT claimed applied') });
   expect(isRunTerminalOrAbandoned(original, original.id, dir, isRunRecordTerminal)).toBe(true);
   const bytes = readFileSync(abandonedPath(original.id, dir));
   expect(sweep().kept.abandoned).toEqual([original.id]);
@@ -75,7 +75,7 @@ it('keeps mandatoryReferrals pending cursor', () => {
   record(undefined, { pending: { kind: 'effect', step: 'mandatoryReferrals', stepIndex: 0 } }); kept('suspended-mandatory-referrals');
 });
 it('keeps young work without running probes', () => {
-  record(undefined, {}, HOUR); kept('young'); expect(probes.leases).not.toHaveBeenCalled();
+  record(undefined, {}, 10 * 60000); kept('young'); expect(probes.leases).not.toHaveBeenCalled();
 });
 it('keeps corrupt JSON and leaves its bytes untouched', () => {
   writeFileSync(runPath('review-dead', dir), '{corrupt'); kept('unreadable');

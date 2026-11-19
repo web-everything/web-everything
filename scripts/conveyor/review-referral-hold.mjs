@@ -3,13 +3,14 @@
  * Persistence failures get three retries (15/30/60 minutes), each resuming the parked run at its referral step
  * (no new panel), then the same event-driven hold.
  */
+import { isRunAbandoned } from '../lib/run-abandoned.mjs';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { resolveRunsDir, tryReadRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -196,7 +197,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).map(name => {
+  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json') && !n.endsWith('.abandoned.json') && !isRunAbandoned(n.slice(0, -5), dir)).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
@@ -315,11 +316,11 @@ function latestReviewAttempt(history) {
  * parked on mandatory referrals at the PR's CURRENT head, it persisted them, and everything that woke it since it began
  * is a ruling. Any re-arm, send-back or operator reply since asks for a fresh look, so it answers `null`, as does a
  * head that moved (a new push owes a new review). A parked run whose referral persist FAILED is always resumable
- * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
+ * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Version-bound abandoned runs are excluded before selection.
  * @returns {{id: string, head: string}|null}
  */
-export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0, runsDir = process.env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir() } = {}) {
+  const history = runs.filter(r => !isRunAbandoned(r.id, runsDir) && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax

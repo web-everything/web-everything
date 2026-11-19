@@ -1,4 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
+import { isRunAbandoned } from './run-abandoned.mjs';
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -330,7 +331,7 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
     // Same id universe as the bounded scan and every other review-run reader: the `review-pr-` id minted for the op.
     // A review run given another id by `--run-id` is invisible to all of them before settlement is ever asked.
     let newest = null; // the newest completed review of this exact head: { at, rejects }
-    for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
+    for (const id of list(runsDir).filter(id => id.startsWith('review-pr-') && !isRunAbandoned(id, runsDir))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
       const key = `${runsDir}|${id}`; // one entry per record: a rewrite replaces it, so the cache never outgrows the store
@@ -428,12 +429,12 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
     // different records in the drain's and recovery's windows, and the two could disagree.
-    const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
+    const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-') && !isRunAbandoned(id, runsDir)), tieBreak: 'id-asc',
       stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
     const end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
-        if (!abandonedReview(hit, now)) {
+        if (!isRunAbandoned(id, runsDir) && !abandonedReview(hit, now)) {
           count++;
           if (!Number.isFinite(reviewStartedAt(hit))) startless.push({ id, at });
           for (const slot of Object.values(slots)) {

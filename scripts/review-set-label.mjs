@@ -60,6 +60,7 @@ import { readReviewRunEvidence } from './conveyor/review-referral-hold.mjs';
  * `we:scripts/lib/review-escalation.mjs` (`REVIEW_LABELS`, `hasReviewLabel`) — it never re-hardcodes the
  * label strings.
  */
+import { isRunAbandoned } from './lib/run-abandoned.mjs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -1108,7 +1109,8 @@ export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolv
   let names;
   try { names = readdirSync(dir); } catch { return out; }
   for (const name of names) {
-    if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
+    if (!name.startsWith('review-pr-') || !name.endsWith('.json') || name.endsWith('.abandoned.json')
+      || isRunAbandoned(name.slice(0, -5), dir)) continue;
     let text;
     try { text = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
     if (!text.includes('"confirm"') || !text.toLowerCase().includes(String(headSha).toLowerCase())) continue;

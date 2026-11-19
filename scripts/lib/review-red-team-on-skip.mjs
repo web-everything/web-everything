@@ -1,4 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { isRunAbandoned } from './run-abandoned.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -395,7 +396,7 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 const runsDirectory = env => env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
 const strictListRuns = dir => { statSync(dir); return listRunIds(dir); };
 function* reviewRuns({ runsDir, list, read, stat }) {
-  const ids = list(runsDir).filter(id => id.startsWith('review-pr-'));
+  const ids = list(runsDir).filter(id => id.startsWith('review-pr-') && !isRunAbandoned(id, runsDir));
   if (ids.length > 400) throw Error('run scan capped; inspect stored evidence');
   for (const id of ids) {
     const at = stat(join(runsDir, `${id}.json`)).mtimeMs;

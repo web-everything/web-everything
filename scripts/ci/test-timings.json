@@ -1,6 +1,8 @@
 {
  "_doc": "Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. Refresh with --update.",
  "unit": {
+  "scripts/conveyor/soak/breaks/review-abandon-redo.soak.test.mjs": 1,
+  "scripts/operations/__tests__/review-abandon.test.mjs": 1,
   "blocks/__tests__/integration/resource-loader.test.ts": 0.03,
   "blocks/__tests__/unit/adapters/dockviewRoundtrip.test.ts": 0.01,
   "blocks/__tests__/unit/adapters/report.test.ts": 0.02,
