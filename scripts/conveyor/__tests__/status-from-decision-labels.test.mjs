@@ -15,7 +15,7 @@ const OLD = 'a'.repeat(40);
 const bot = { login: 'web-everything' };
 const advisory = (head) => ({ author: bot, createdAt: '2026-11-18T20:00:00Z',
   body: `**Verdict:** accept\n**Advisory outcome:** accept\nNet basis: \`${OLD.slice(0, 12)}..${head}\`` });
-const gate = (head) => ({ author: bot, createdAt: '2026-11-18T20:01:00Z', body: `<!-- we:red-team-gate pr=1 rev=${head} outcome=card-queued -->` });
+const gate = (head) => ({ author: bot, createdAt: '2026-11-18T20:01:00Z', body: `<!-- we:red-team-gate pr=1 rev=${head} outcome=card-queued result=0123456789abcdef -->` });
 const checks = [{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
 const snapshot = (extra = {}) => ({ number: 1, headRefOid: HEAD, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   statusCheckRollup: checks, comments: [advisory(HEAD), gate(HEAD)], ...extra });
@@ -30,6 +30,7 @@ function run(labels, prState) {
   const provider = { readLabels: () => labels, ensureLabel() {}, setLabels: (_r, _p, d) => writes.push(d) };
   const result = tagReviewStatus({ pr: 1, repo: 'web-everything/web-everything', provider, agents: [], prState,
     signalFix: () => {}, readRequiredChecks: () => ({ source: 'live', checks: ['build', 'review-gate'] }),
+    readFreshRequiredChecks: () => ({ checks: ['build', 'review-gate'] }),
     loadStatusSettings: () => { throw new Error('unavailable'); } });
   return { writes, result };
 }
@@ -49,7 +50,7 @@ describe('status from decision labels', () => {
       const provider = { readLabels: () => labels, ensureLabel() {}, setLabels: (_r, _p, d) => writes.push(d) };
       tagReviewStatus({ pr: 1, repo: 'web-everything/web-everything', provider, agents: [], prState: snapshot(),
         planRows: [{ kind: 'cap-exhausted', prNumber: 1 }], signalFix: () => {},
-        readRequiredChecks: () => ({ source: 'live', checks: ['build'] }), loadStatusSettings: () => { throw new Error('x'); } });
+        readRequiredChecks: () => ({ source: 'live', checks: ['build'] }), readFreshRequiredChecks: () => ({ checks: ['build'] }), loadStatusSettings: () => { throw new Error('x'); } });
       expect(writes.map((w) => w.add).filter(Boolean)).toContain('ready-to-merge');
     });
   }
@@ -89,8 +90,25 @@ describe('status from decision labels', () => {
     const writes = [];
     tagReviewStatus({ pr: 1, repo: 'web-everything/web-everything', agents: [], prState: snapshot(), signalFix: () => {},
       provider: { readLabels: () => LIVE[7103], ensureLabel() {}, setLabels: (_r, _p, d) => writes.push(d) },
-      readRequiredChecks: () => { throw new Error('unavailable'); }, loadStatusSettings: () => { throw new Error('x'); } });
+      readRequiredChecks: () => { throw new Error('unavailable'); }, readFreshRequiredChecks: () => { throw new Error('unavailable'); }, loadStatusSettings: () => { throw new Error('x'); } });
     expect(writes).toEqual([]);
+  });
+
+  it('never trusts a cached requirement list: a failed fresh read means not ready', () => {
+    const writes = [];
+    tagReviewStatus({ pr: 1, repo: 'web-everything/web-everything', agents: [], prState: snapshot(), signalFix: () => {},
+      provider: { readLabels: () => LIVE[7103], ensureLabel() {}, setLabels: (_r, _p, d) => writes.push(d) },
+      readRequiredChecks: () => ({ source: 'stale-cache', checks: ['build'] }),
+      readFreshRequiredChecks: () => { throw new Error('rules API down'); }, loadStatusSettings: () => { throw new Error('x'); } });
+    expect(writes).toEqual([]);
+  });
+
+  it('a card-queued record without a result, or a bare unknown outcome, is not red-team clearance', () => {
+    const bare = { author: bot, body: `<!-- we:red-team-gate pr=1 rev=${HEAD} outcome=card-queued -->` };
+    const odd = { author: bot, body: `<!-- we:red-team-gate pr=1 rev=${HEAD} outcome=mystery result=0123456789abcdef -->` };
+    for (const rec of [bare, odd]) {
+      expect(readyFromDecisionLabels({ pr: snapshot({ comments: [advisory(HEAD), rec] }), labels: LIVE[7103] }).ready).toBe(false);
+    }
   });
 
   it('fails closed on a missing or still-running required check', () => {

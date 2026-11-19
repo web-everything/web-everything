@@ -27,7 +27,7 @@
  * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
-import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
+import { getRequiredStatusChecks, readRequiredStatusChecksDetailed } from '../lib/required-status-checks.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
@@ -262,7 +262,10 @@ export function tagReviewStatus({
   planRows = null,
   legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
   requiredChecks, prStatusSettings, signalFix = signalFixDispatch,
-  readRequiredChecks = readCachedRequiredChecks, loadStatusSettings = loadPrStatusSettings,
+  readRequiredChecks = readCachedRequiredChecks,
+  // A live branch-protection read (no cache) used only to prove readiness; throws when it cannot read.
+  readFreshRequiredChecks = ({ repo: r }) => readRequiredStatusChecksDetailed({ repo: r, readOnly: true }),
+  loadStatusSettings = loadPrStatusSettings,
   excuseMergeGate = (pr, { repo }) => excusePrMergeGateHolds([pr], {
     repo, readMergeGateVerdict: args => readMergeGateVerdict({ ...args }), readFreeze: readSharedFreeze,
   })[0],
@@ -317,7 +320,16 @@ export function tagReviewStatus({
       try { statusSubject = excuseMergeGate(statusSubject, { repo }); } catch { /* Keep the raw subject. */ }
     }
     // Decision labels on the live head outrank a stale `status:*` label (never the reverse).
-    const ready = readyFromDecisionLabels({ pr: statusSubject, labels: currentLabels, requiredChecks, settings: prStatusSettings });
+    // Readiness needs the required checks from a FRESH read (never a cache); a failed read means not ready.
+    const decided = currentLabels.map((l) => (typeof l === 'string' ? l : l?.name));
+    let freshChecks = null;
+    if (decided.includes('review:accepted') && decided.includes('red-team:clear')) {
+      try {
+        const fresh = readFreshRequiredChecks({ repo });
+        if (Array.isArray(fresh?.checks) && fresh.checks.length) freshChecks = fresh.checks;
+      } catch { freshChecks = null; }
+    }
+    const ready = readyFromDecisionLabels({ pr: statusSubject, labels: currentLabels, requiredChecks: freshChecks, settings: prStatusSettings });
     if (standalone && !ready.ready) return;
     let state = standalone ? null : derivePrStatusLabel({ pr: statusSubject, labels: currentLabels,
       reviewStatus: status, rows: planRows, defaultBranch, requiredChecks, settings: prStatusSettings });

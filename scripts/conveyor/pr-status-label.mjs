@@ -11,7 +11,7 @@ import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
 // Its import-time dependencies have no path back here (including its ruling-ledger load).
 const { evaluatePr, rulingNeededRow } = await import('../operations/operator-queue.mjs');
 import { FALLBACK_REQUIRED_STATUS_CHECKS, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
-import { redTeamQueueReason, gateOutcomesForHead } from '../lib/red-team-gate.mjs';
+import { redTeamQueueReason, parseRedTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { standDownComments } from './stand-down.mjs';
 import { latestUnresolvedStandDown } from './stand-down-answer-core.mjs';
@@ -102,9 +102,13 @@ export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = null
   const advisory = parseAdvisories(trusted).find((a) => advisoryCoversHead(a, head));
   if (!advisory || advisory.outcome !== ADVISORY_OUTCOMES.ACCEPT) return { ready: false, reason: 'no-head-accept' };
   // Red-team evidence recorded for THIS head: present, and not a send-back / round-cap outcome.
-  const outcomes = gateOutcomesForHead(trusted, pr?.number, head);
-  if (!outcomes.size) return { ready: false, reason: 'no-head-red-team-evidence' };
-  if (outcomes.has('sent-back') || outcomes.has('round-cap')) return { ready: false, reason: 'red-team-not-cleared-at-head' };
+  // Clearance needs the red-team RESULT record (a gate marker carrying `result=`) with a clearing outcome; a bare
+  // marker never counts, and any holding outcome recorded for this head blocks.
+  const records = trusted.map((c) => parseRedTeamGateMarker(c?.body))
+    .filter((m) => m && m.pr === Number(pr?.number) && m.rev === head);
+  if (!records.length) return { ready: false, reason: 'no-head-red-team-evidence' };
+  if (records.some((m) => ['sent-back', 'round-cap', 'operator-block'].includes(m.outcome))) return { ready: false, reason: 'red-team-not-cleared-at-head' };
+  if (!records.some((m) => ['no-send-back', 'card-queued'].includes(m.outcome) && m.result)) return { ready: false, reason: 'no-red-team-result-record' };
   const merged = { ...PR_STATUS_SETTING_DEFAULTS, ...settings };
   // Every required check must be present and finished green. The review-gate follows this decision (as in
   // derivePrStatusLabel); a failing merge-gate counts unless the caller already excused it on the head-bound evidence.
