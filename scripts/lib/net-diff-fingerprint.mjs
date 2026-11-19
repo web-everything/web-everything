@@ -9,7 +9,7 @@
  *   never carries.
  */
 import { execFileSync } from 'node:child_process';
-import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
+import { laneHistoryProofEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { normalizeDiffFingerprint } from './review-escalation.mjs';
 
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/@^~-]*$/;
@@ -22,7 +22,7 @@ const FP = /^[0-9a-f]{64}$/i;
 export function netDiffFingerprint(repo, base, head, { exec = execFileSync } = {}) {
   try {
     if (typeof repo !== 'string' || !repo || !REF.test(String(base ?? '')) || !REF.test(String(head ?? ''))) return null;
-    const env = laneHistoryProofEnv();
+    const env = laneHistoryProofEnv(scrubGitRepoEnv(process.env));
     const raw = (args) => exec('git', ['-C', repo, '--no-replace-objects', ...args], {
       env, encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024,
     });

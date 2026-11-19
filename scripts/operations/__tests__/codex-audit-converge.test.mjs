@@ -40,6 +40,54 @@ describe('remote-main SHA normalization', () => {
 });
 
 describe('R1081 converge rounds', () => {
+  it('requires disposition of ref-less legacy branch findings before a newer hardened anchor', async () => {
+    const f = fixture('NOT WEAKENED\nFIXED: latest:1 gap');
+    const legacy = { ...original };
+    delete legacy.ref;
+    delete legacy.mode;
+    delete legacy.reviewCommand;
+    f.full[0] = legacy;
+    f.full.push({ ...original, head: 'bc'.repeat(20), findings: ['latest:1 gap'] });
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.converge).toEqual([]);
+    expect(f.err.join('')).toContain('human review of the full diff');
+    f.deps.runCodex.mockReturnValue(`NOT WEAKENED\nFIXED: ${finding}\nFIXED: latest:1 gap`);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.converge[0].priorHead).toBe('bc'.repeat(20));
+    expect(f.deps.runCodex.mock.calls[1][0]).toContain(`on ${legacy.head}:\n${finding}`);
+  });
+
+  it('never anchors on a ref-less record even with hardened markers', async () => {
+    const f = fixture();
+    delete (f.full[0] = { ...original }).ref;
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('excludes main-line findings from the union with absent ref=%s', async legacy => {
+    const f = fixture();
+    const onMain = { ...original, head: BASE, base: '0'.repeat(40), findings: ['main:1 unrelated'] };
+    if (legacy) delete onMain.ref;
+    f.full.unshift(onMain);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex.mock.calls[0][0]).not.toContain('main:1 unrelated');
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(BASE, BASE);
+  });
+
+  it.each([' ', '\x1b[31m \x1b[0m', '\t'])('rejects prior whitespace-only findings after cleaning: %j', async text => {
+    const f = fixture(`NOT WEAKENED\nFIXED: ${text}`);
+    f.full[0] = { ...original, findings: [text] };
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.converge).toEqual([]);
+  });
+
+  it.each(['FIXED', 'OPEN', 'NEW'])('rejects cleaned whitespace-only %s text', async prefix => {
+    const f = fixture(`WEAKENED\nOPEN: ${finding}\n${prefix}: \x1b[31m \x1b[0m`);
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.converge).toEqual([]);
+  });
+
   it.each(['legacy', 'missing command', 'unknown command', 'missing mode'])('refuses a latest %s full audit without falling back to hardened evidence', async kind => {
     const f = fixture();
     const latest = { ...original };
@@ -378,9 +426,11 @@ describe('R1081 converge rounds', () => {
   });
 
   it('allows the base to advance to head without narrowing the unrestricted delta', async () => {
-    const f = fixture(); f.deps.resolveSha.mockReturnValue(HEAD); f.deps.remoteMainSha.mockReturnValue(HEAD);
+    const f = fixture('NOT WEAKENED'); f.deps.resolveSha.mockReturnValue(HEAD); f.deps.remoteMainSha.mockReturnValue(HEAD);
     expect(await main(ARGS, f.deps)).toBe(0);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`\ngit --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames ${PRIOR} ${HEAD}\n`);
+    expect(f.deps.runCodex.mock.calls[0][0]).not.toContain(finding);
+    expect(f.deps.isAncestor).toHaveBeenCalledWith(PRIOR, HEAD);
   });
 
   it('declares converge and optional ref as operation inputs for the generic CLI', () => {

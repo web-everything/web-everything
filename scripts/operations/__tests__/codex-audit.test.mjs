@@ -34,6 +34,19 @@ function fixture(answer = 'NOT WEAKENED') {
 }
 
 describe('canonical audit', () => {
+  it.each(['', ' ', '\t', '\x1b[31m \x1b[0m'])('refuses WEAKENED without substantive cleaned findings: %j', async text => {
+    const f = fixture(`WEAKENED\n${text}`);
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.records).toEqual([]);
+    expect(f.errors.join('')).toContain('human review of the full diff');
+  });
+
+  it('drops ANSI-wrapped blank lines before persisting substantive full findings', async () => {
+    const f = fixture('WEAKENED\n\x1b[31m \x1b[0m\nscripts/gate.mjs:1 gap');
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0].findings).toEqual(['scripts/gate.mjs:1 gap']);
+  });
+
   it('pins the question text and its sha256 hash', () => {
     expect(REVIEW_COMMAND).toBe('hardened-v1');
     expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
@@ -144,7 +157,7 @@ describe('canonical audit', () => {
 
   it.each(conflictingAnswers)('findAudit ignores historical contradictory records: %j', async answer => {
     const verdict = answer.startsWith('WEAKENED') ? 'WEAKENED' : 'NOT WEAKENED';
-    const f = fixture(verdict);
+    const f = fixture(`${verdict}\nscripts/gate.mjs:12 historical finding`);
     await main(ARGS, f.deps);
     const valid = { ...f.records[0], at: '2026-01-01T00:00:00.000Z' };
     const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
@@ -313,6 +326,36 @@ describe('audit IO with injected filesystem and subprocesses', () => {
       const config = Object.fromEntries(Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
         [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]));
       expect(config).toMatchObject({ 'core.commitGraph': 'false', 'core.fsmonitor': 'false', 'core.hooksPath': '/dev/null' });
+    }
+  });
+
+  it('scrubs inherited repository overrides on every Git spawn and auditor launch', () => {
+    const keys = ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_SHALLOW_FILE', 'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_REPLACE_REF_BASE', 'GIT_CEILING_DIRECTORIES',
+      'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_INDEX_FILE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_KEY_999', 'GIT_CONFIG_VALUE_999'];
+    const saved = keys.map(key => process.env[key]);
+    try {
+      for (const key of keys) process.env[key] = 'untrusted-override';
+      const f = adapter();
+      f.spawnSync.mockReturnValue({ status: 0, stdout: BASE + '\n' });
+      f.deps.resolveSha('main'); f.deps.refsPointingAt(HEAD); f.deps.hasCommit(BASE); f.deps.isAncestor(BASE, HEAD);
+      f.spawnSync.mockReturnValueOnce({ status: 0, stdout: 'true\n' });
+      expect(f.deps.isShallow()).toBe(true);
+      f.spawnSync.mockReturnValueOnce({ status: 0, stdout: `${BASE}\trefs/heads/main\n` });
+      expect(f.deps.remoteMainSha()).toBe(BASE);
+      f.spawnSync.mockReturnValueOnce({ status: 0, stdout: '.git/index\n' });
+      f.spawnSync.mockReturnValueOnce({ status: 0, stdout: JSON.stringify({ exitCode: 0, timedOut: false, lastMessage: 'NOT WEAKENED' }) });
+      f.deps.runCodex('prompt');
+      expect(f.spawnSync).toHaveBeenCalledTimes(8);
+      for (const [command, , { env, cwd }] of f.spawnSync.mock.calls) {
+        expect(cwd).toBe('/repo');
+        for (const key of keys) {
+          if (key === 'GIT_INDEX_FILE' && command !== 'git') expect(env[key]).toBe('/scratch/audit-1/index');
+          else expect(env).not.toHaveProperty(key);
+        }
+      }
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
     }
   });
 

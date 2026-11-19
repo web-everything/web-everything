@@ -4934,16 +4934,22 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Audit convergence evidence (R1081)
 
-Convergence uses every full-ledger record for the ref whose head is an ancestor of the
-requested head; the latest appended qualifying record anchors the delta only with explicit
+Convergence uses every full-ledger record for the ref (or with no `ref`, for legacy writers)
+whose head is an ancestor of the requested head and not an ancestor of the current base.
+The latest appended ancestral full record anchors the delta only with a matching ref and explicit
 `mode: full` and `reviewCommand: hardened-v1` (exported as `REVIEW_COMMAND`).
 A legacy or unknown review command on that latest record exits 2: "latest full audit
 predates hardened review; run a full audit"; never fall back to an older hardened anchor.
-Valid legacy full records still contribute all findings to the re-check union. Converge records
+Valid legacy full records still contribute all findings to the re-check union but never
+anchor without an explicit matching ref. An eligible full audit on main can still anchor the
+unrestricted delta; its findings are outside the branch-only union. Converge records
 are write-only and never influence selection. Validate every used record's full mode (or
 absent mode), current canonical question hash, verdict, non-conflicting string findings,
-commit SHAs and timestamp (at most five minutes ahead). A WEAKENED record without findings
-fails closed with exit 3; malformed evidence requires retry or human review of the full diff.
+commit SHAs and timestamp (at most five minutes ahead). A WEAKENED response without
+substantive findings, a prior record with any finding that
+is whitespace-only after control cleaning, or a disposition/NEW line with no substantive
+text after its prefix fails closed with exit 3; malformed evidence requires retry or human
+review of the full diff.
 An unreadable candidate head also fails closed rather than silently excluding its findings.
 Missing anchors, exact-head anchors, no ancestral heads and empty full audits (`base === head`,
 including older union members) require a full audit (exit 2). Independently require
@@ -4951,7 +4957,8 @@ including older union members) require a full audit (exit 2). Independently requ
 ancestry check, reject shallow repositories (exit 2; fetch origin first to unshallow).
 Normalize resolved, recorded and remote-main SHAs to lowercase before convergence comparisons
 and Git calls, including union membership, empty-audit and exact-head refusals and anchor lineage.
-All history proofs and the auditor use `laneHistoryProofEnv`: replace objects off,
+All Git spawns and the auditor first use `scrubGitRepoEnv` to remove inherited repository,
+index, object-store, shallow-file and config overrides, then `laneHistoryProofEnv`: replace objects off,
 `GIT_GRAFT_FILE=/dev/null`, `core.commitGraph=false` and shared lane pins. The auditor
 retains its isolated `GIT_INDEX_FILE`. Remote-main probes use the shared restricted
 transport pins and drop SSH, askpass and proxy command environment overrides; injected

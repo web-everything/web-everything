@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { URL as NodeURL } from 'node:url';
+import { URL as NodeURL, pathToFileURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 import { main, QUESTION_HASH, REVIEW_COMMAND } from '../codex-audit.mjs';
@@ -16,6 +16,28 @@ function createLocalTransportDeps(options) {
 }
 
 describe('codex-audit real IO', () => {
+  it('detects a real shallow clone despite inherited shallow-file and repository redirects', async () => {
+    await withRealRepo(async ({ root: repo, tmp, head, commit }) => {
+      commit({ 'next.txt': 'second commit\n' });
+      const sha = head();
+      const clone = join(tmp, 'shallow-clone');
+      execFileSync('git', ['-c', 'protocol.file.allow=always', 'clone', '--quiet', '--depth=1',
+        pathToFileURL(repo).href, clone], { cwd: tmp });
+      commit({ 'source-only.txt': 'source moves after clone\n' });
+      const keys = ['GIT_DIR', 'GIT_SHALLOW_FILE'];
+      const saved = keys.map(key => process.env[key]);
+      try {
+        process.env.GIT_DIR = join(repo, '.git');
+        process.env.GIT_SHALLOW_FILE = join(tmp, 'nonexistent-shallow');
+        const deps = createAuditDeps({ cwd: clone });
+        expect(deps.isShallow()).toBe(true);
+        expect(deps.resolveSha('HEAD')).toBe(sha);
+      } finally {
+        keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+      }
+    });
+  });
+
   it('refuses a local-file remote under the production remote proof policy', async () => {
     await withRealRepo(async ({ root: repo, git }) => {
       git(['remote', 'add', 'origin', repo]);
@@ -71,7 +93,8 @@ describe('codex-audit real IO', () => {
           expect(delta).toContain('deleted file mode');
           expect(delta).toContain('+++ b/relocated.mjs');
           reviewed = true;
-          return 'NOT WEAKENED\nFIXED: guard.mjs:1 gap';
+          expect(prompt).not.toContain('guard.mjs:1 gap');
+          return 'NOT WEAKENED';
         },
       });
       expect(code).toBe(0);

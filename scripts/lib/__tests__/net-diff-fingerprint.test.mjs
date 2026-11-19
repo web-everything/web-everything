@@ -33,6 +33,29 @@ beforeAll(() => {
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 describe('netDiffFingerprint / carriesAcross', () => {
+  it('scrubs repository overrides on every spawn and fingerprints the requested repository', () => {
+    const expected = netDiffFingerprint(dir, S.base, S.A);
+    const keys = ['GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_SHALLOW_FILE', 'GIT_OBJECT_DIRECTORY',
+      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_REPLACE_REF_BASE', 'GIT_CEILING_DIRECTORIES',
+      'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_INDEX_FILE'];
+    const saved = keys.map(key => process.env[key]);
+    let calls = 0;
+    try {
+      for (const key of keys) process.env[key] = 'untrusted-override';
+      const actual = netDiffFingerprint(dir, S.base, S.A, { exec: (command, args, options) => {
+        calls++;
+        for (const key of keys) expect(options.env).not.toHaveProperty(key);
+        expect(args.slice(0, 2)).toEqual(['-C', dir]);
+        return execFileSync(command, args, options);
+      } });
+      expect(expected).toMatch(/^[0-9a-f]{64}$/);
+      expect(actual).toBe(expected);
+      expect(calls).toBe(4);
+    } finally {
+      keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+    }
+  });
+
   it('rebase-only carries', () => {
     const a = netDiffFingerprint(dir, 'main', S.A), b = netDiffFingerprint(dir, 'main', S.rebased);
     expect(a).toMatch(/^[0-9a-f]{64}$/); expect(carriesAcross(a, b)).toBe(true);

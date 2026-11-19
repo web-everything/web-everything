@@ -130,21 +130,22 @@ export async function main(argv, deps) {
         deps.stderr('Converge requires complete history; fetch origin first to unshallow the repository.\n'); return 2;
       }
       const records = await deps.readRecords(deps.recordPath());
-      const matching = records.filter(record => record?.ref === ref);
+      const matching = records.filter(record => record && (record.ref === ref || !Object.hasOwn(record, 'ref')));
       if (!matching.length) { deps.stderr(`no full audit on ${clean(ref)}; run one first\n`); return 2; }
       const now = Date.parse(deps.now());
-      const used = [];
+      const fullAncestors = [];
       for (const stored of matching) {
         const record = { ...stored };
         // An unreadable head cannot safely be excluded from the ancestor checklist.
         if (!SHA.test(record.head ?? '')) throw new Error('invalid full audit head');
         record.head = record.head.toLowerCase();
         if (!await deps.isAncestor(record.head, head)) continue;
+        if (!Object.hasOwn(record, 'ref') && await deps.isAncestor(record.head, base)) continue;
         if (!Number.isFinite(now) || !Number.isFinite(Date.parse(record.at)) || Date.parse(record.at) > now + FUTURE_SKEW_MS
           || !SHA.test(record.base ?? '')
           || (Object.hasOwn(record, 'mode') && record.mode !== 'full') || record.questionHash !== QUESTION_HASH
           || !['NOT WEAKENED', 'WEAKENED'].includes(record.verdict)
-          || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string')
+          || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string' && clean(f).trim())
           || hasConflictingVerdict(record.verdict, record.findings)
           || (record.verdict === 'WEAKENED' && !record.findings.length)) throw new Error('invalid full audit record');
         record.base = record.base.toLowerCase();
@@ -154,11 +155,11 @@ export async function main(argv, deps) {
         if (!await deps.isAncestor(record.base, record.head)) {
           deps.stderr('Full audit base is not an ancestor of its head; run a full audit.\n'); return 2;
         }
-        used.push(record);
+        fullAncestors.push(record);
       }
-      prior = used.at(-1);
+      prior = fullAncestors.at(-1);
       if (!prior) { deps.stderr('Full audit head is not an ancestor (rebased); run a full audit.\n'); return 2; }
-      if (prior.mode !== 'full' || prior.reviewCommand !== REVIEW_COMMAND) {
+      if (prior.ref !== ref || prior.mode !== 'full' || prior.reviewCommand !== REVIEW_COMMAND) {
         deps.stderr('latest full audit predates hardened review; run a full audit\n'); return 2;
       }
       if (prior.head === head) { deps.stderr('already fully audited at this head; run a full audit for a fresh verdict\n'); return 2; }
@@ -176,6 +177,11 @@ export async function main(argv, deps) {
         || !await deps.isAncestor(base, mainLine) || !await deps.isAncestor(prior.head, head)) {
         deps.stderr('converge needs a main-line base covered by the last full audit; run a full audit\n'); return 2;
       }
+      // Main-line records may still anchor the delta, but only branch commits contribute findings.
+      const used = [];
+      for (const record of fullAncestors) {
+        if (!await deps.isAncestor(record.head, base)) used.push(record);
+      }
       priorOpen = [...new Set(used.flatMap(record => record.findings))];
       const sources = used.map(record => `Findings from full audit ${record.at} on ${record.head}:\n${record.findings.join('\n')}`).join('\n\n');
       const delta = `git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames ${prior.head} ${head}`;
@@ -191,9 +197,10 @@ export async function main(argv, deps) {
     const verdict = lines.shift();
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
-    const findings = lines.filter(line => line.trim()).map(line => flags.converge ? line : clean(line));
+    const findings = lines.map(clean).filter(line => line.trim());
+    if (verdict === 'WEAKENED' && !findings.length) throw new Error('missing substantive findings');
     if (flags.converge) {
-      if (findings.some(f => !/^(FIXED|OPEN|NEW): .+/.test(f))
+      if (findings.some(f => !/^(FIXED|OPEN|NEW): .+/.test(f) || !f.replace(/^(FIXED|OPEN|NEW): /, '').trim())
         || (verdict === 'NOT WEAKENED' && findings.some(f => /^(OPEN|NEW): /.test(f)))
         || (verdict === 'WEAKENED' && !findings.some(f => /^(OPEN|NEW): /.test(f)))) throw new Error('invalid converge findings');
       const remaining = [...priorOpen];
