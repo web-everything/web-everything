@@ -35,16 +35,18 @@ const keyOf = (repo, pr) => typeof repo === 'string' && /^[\w.-]+\/[\w.-]+$/.tes
 export const reviewRunIndexPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.json`);
 /** Append-only discovery journal; payloads remain the authority. */
 export const reviewRunJournalPath = runsDir => join(dirname(runsDir), `${basename(runsDir)}-review-index.jsonl`);
-const journalIdentity = metadata => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs];
-const validJournalIdentity = identity => Array.isArray(identity) && identity.length === 4
+const journalIdentity = metadata => [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs, metadata.ctimeMs, metadata.birthtimeMs];
+const validJournalIdentity = identity => Array.isArray(identity) && identity.length === 6
   && identity.every(Number.isFinite);
 const JOURNAL_MAX_BYTES = 8 * 1024 * 1024;
 
-/** One O_APPEND write before payload publication; the writer owns best-effort error handling. */
+/** One O_APPEND write: an intent before publication, or a seal of the final path afterward.
+ * The writer owns best-effort error handling. Never seal temporary-file metadata. */
 export function appendReviewRunJournal(record, runsDir, at = Date.now(), metadata) {
   const key = keyOf(record?.input?.repo, record?.input?.pr);
   if (record?.op !== 'review-pr' || !reviewId(record.id) || !key) return false;
-  const bytes = Buffer.from(`${JSON.stringify({ id: record.id, key, at, identity: metadata && journalIdentity(metadata) })}\n`);
+  const row = metadata ? { id: record.id, key, seal: journalIdentity(metadata) } : { id: record.id, key, at };
+  const bytes = Buffer.from(`${JSON.stringify(row)}\n`);
   const fd = openSync(reviewRunJournalPath(runsDir), 'a');
   try {
     if (writeSync(fd, bytes) !== bytes.length) throw Error('short review journal write');
@@ -63,12 +65,12 @@ function journalKeys(runsDir) {
   for (const text of rows) {
     let row;
     try { row = JSON.parse(text); } catch { continue; } // Invalid lines supply no evidence.
-    if (!reviewId(row?.id) || typeof row.key !== 'string') continue;
-    const match = /^([\w.-]+\/[\w.-]+)#([1-9][0-9]*)$/.exec(row.key);
-    if (!match || keyOf(match[1], match[2]) !== row.key) continue;
+    if (!reviewId(row?.id)) continue;
+    const match = typeof row.key === 'string' && /^([\w.-]+\/[\w.-]+)#([1-9][0-9]*)$/.exec(row.key);
+    const rowKey = match && keyOf(match[1], match[2]) === row.key ? row.key : null;
     const prior = keys.get(row.id);
-    const key = prior && prior.key !== row.key ? null : row.key;
-    keys.set(row.id, { key, at: row.at, identity: row.identity }); // Conflicts remain unknown; timestamp is always the last line's.
+    const key = prior && prior.key !== rowKey ? null : rowKey;
+    keys.set(row.id, { key, seal: row.seal }); // Conflicts remain unknown; only the last line can seal.
   }
   return keys;
 }
@@ -96,14 +98,12 @@ export function readJournalCandidates(runsDir, repo, pr, {
         const entry = keys.get(id);
         let target = entry?.key;
         try {
+          if (target === key) { ids.push(id); journalSet.add(id); continue; }
           const metadata = stat(id);
-          if (!validJournalIdentity(entry?.identity)
-            || JSON.stringify(entry.identity) !== JSON.stringify(journalIdentity(metadata))
-            || !Number.isFinite(entry?.at) || !Number.isFinite(metadata.mtimeMs)
-            || metadata.mtimeMs > entry.at + 10_000) target = null;
+          if (!validJournalIdentity(entry?.seal)
+            || JSON.stringify(entry.seal) !== JSON.stringify(journalIdentity(metadata))) target = null;
         } catch { target = null; }
         if (target == null) { ids.push(id); unjournaled++; }
-        else if (target === key) { ids.push(id); journalSet.add(id); }
       }
       return Object.defineProperty({ ids, source: 'journal', unjournaled }, 'journalSet', { value: journalSet });
     }
@@ -120,9 +120,11 @@ export function seedReviewRunJournal({ runsDir, list = listReviewIds, read = id 
   catch (error) { if (error.code !== 'ENOENT') throw error; keys = new Map(); }
   const counts = { seeded: 0, already: 0, skipped: 0 };
   for (const id of list(runsDir).filter(reviewId)) {
-    if (keys.get(id)?.key && validJournalIdentity(keys.get(id).identity)) { counts.already++; continue; }
     try {
       const before = stat(id);
+      const entry = keys.get(id);
+      if (entry?.key && validJournalIdentity(entry.seal)
+        && JSON.stringify(entry.seal) === JSON.stringify(journalIdentity(before))) { counts.already++; continue; }
       const run = read(id, runsDir);
       recordKey(run, id);
       const after = stat(id);

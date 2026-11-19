@@ -774,10 +774,10 @@ const journalReaders = [
   { name: 'drain', reader: readDrainRedTeamEvidence },
   { name: 'recovery', reader: readRecoveryWitness },
 ];
-// Fresh hints use timestamped rows; legacy missing-at refusal is covered by the filesystem suite.
+// Other-PR exclusions require final-path seals; legacy rows are covered by the filesystem suite.
 const journalLine = (f, id, key) => {
   const metadata = statSync(join(f.runsDir, `${id}.json`));
-  return `${JSON.stringify({ id, key, at: Date.now(), identity: [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs] })}\n`;
+  return `${JSON.stringify({ id, key, seal: [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs, metadata.ctimeMs, metadata.birthtimeMs] })}\n`;
 };
 function journalPayload(f, run, at) {
   writeFileSync(join(f.runsDir, `${run.id}.json`), JSON.stringify(run));

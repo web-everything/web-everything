@@ -1,5 +1,7 @@
 // @vitest-environment node
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -27,12 +29,12 @@ function fixture() {
 const key = f => `${f.repo}#${f.pr}`;
 const identity = path => {
   const metadata = statSync(path);
-  return [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs];
+  return [metadata.dev, metadata.ino, metadata.size, metadata.mtimeMs, metadata.ctimeMs, metadata.birthtimeMs];
 };
-const line = (f, id, target, at = Date.now()) => {
+const line = (f, id, target) => {
   let fileIdentity;
   try { fileIdentity = identity(join(f.runsDir, `${id}.json`)); } catch { /* Journal-only id. */ }
-  return `${JSON.stringify({ id, key: target, at, identity: fileIdentity })}\n`;
+  return `${JSON.stringify({ id, key: target, seal: fileIdentity })}\n`;
 };
 const lines = f => readFileSync(f.journalPath, 'utf8').trimEnd().split('\n').map(text => JSON.parse(text));
 function candidates(f) {
@@ -69,7 +71,8 @@ it('places the JSONL journal beside runs and writeRun journals its real record',
   const f = fixture();
   expect(journal.reviewRunJournalPath(f.runsDir)).toBe(f.journalPath);
   writeRun(f.run, f.runsDir);
-  expect(lines(f)).toEqual([{ id: f.run.id, key: key(f), at: expect.any(Number), identity: expect.any(Array) }]);
+  expect(lines(f)).toEqual([{ id: f.run.id, key: key(f), at: expect.any(Number) },
+    { id: f.run.id, key: key(f), seal: identity(join(f.runsDir, `${f.run.id}.json`)) }]);
   expect(Math.abs(lines(f)[0].at - Date.now())).toBeLessThan(10_000);
   expect(readRun(f.run.id, f.runsDir)).toEqual(f.run);
 });
@@ -78,7 +81,8 @@ it('appends the journal BEFORE atomic rename: a refused rename leaves a harmless
   const f = fixture();
   mkdirSync(join(f.runsDir, `${f.run.id}.json`));
   expect(() => writeRun(f.run, f.runsDir)).toThrow();
-  expect(lines(f)).toContainEqual({ id: f.run.id, key: key(f), at: expect.any(Number), identity: expect.any(Array) });
+  expect(lines(f)).toContainEqual({ id: f.run.id, key: key(f), at: expect.any(Number) });
+  expect(lines(f)).toHaveLength(1);
   rmSync(join(f.runsDir, `${f.run.id}.json`), { recursive: true });
   expect(candidates(f)).toEqual({ ids: [], source: 'journal', unjournaled: 0 });
 });
@@ -92,12 +96,12 @@ it('finds an exact-head verdict older than 3000 of 6000 real runs across 400 PRs
     const run = { ...f.run, id, input: { repo: f.repo, pr },
       findings: { read: { netBasis: { rev: i === 6 ? f.head : 'b'.repeat(40) } } } };
     writeRun(run, f.runsDir);
-    utimesSync(join(f.runsDir, `${id}.json`), 1000 + i, 1000 + i);
     if (pr === f.pr) targetIds.push(id);
     if (i === 6) f.run = run;
   }
   expect(targetIds).toHaveLength(15);
   expect(listRunIds(f.runsDir)).toHaveLength(6000);
+  expect(candidates(f)).toMatchObject({ ids: targetIds.slice().sort(), unjournaled: 0 });
   // Simulate migration of existing records, then exercise writeRun's ongoing maintenance.
   rmSync(f.journalPath, { force: true });
   const seeded = journal.seedReviewRunJournal({ runsDir: f.runsDir });
@@ -110,12 +114,10 @@ it('finds an exact-head verdict older than 3000 of 6000 real runs across 400 PRs
   for (let i = 0; i < 40; i++) {
     const run = { ...f.run, id: `review-pr-after-seed-${i}`, input: { repo: f.repo, pr: i === 0 ? f.pr : 100 + i },
       findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } };
-    writeJsonAtomic(join(f.runsDir, `${run.id}.json`), run);
-    utimesSync(join(f.runsDir, `${run.id}.json`), 8000 + i, 8000 + i);
-    journal.appendReviewRunJournal(run, f.runsDir, Date.now(), statSync(join(f.runsDir, `${run.id}.json`)));
+    writeRun(run, f.runsDir);
     if (i === 0) targetIds.push(run.id);
   }
-  expect(lines(f)).toHaveLength(6048);
+  expect(lines(f)).toHaveLength(6088);
   const found = candidates(f);
   expect(found).toMatchObject({ source: 'journal', unjournaled: 0 });
   expect(found.ids.sort()).toEqual(targetIds.sort());
@@ -149,13 +151,13 @@ it('parses an id with conflicting key lines, even when the last line names anoth
   expectFound(f, counter(f));
 });
 
-it.each([0, 5, 20])('parses an atomic replacement %s seconds after its other-PR journal row, including within the tolerance window', gap => {
+it.each([0, 5, 20])('parses an atomic replacement %s seconds after its other-PR journal row, with unchanged or advanced mtime', gap => {
   const f = fixture(); oldTargetAndNewerUnrelated(f, 40);
   const id = 'review-pr-new-0', path = join(f.runsDir, `${id}.json`);
   // Every other-PR row matches its file mtime, including the last line for this id.
   writeFileSync(f.journalPath, listRunIds(f.runsDir).map(id => {
     const run = readRun(id, f.runsDir);
-    return line(f, id, `${run.input.repo}#${run.input.pr}`, statSync(join(f.runsDir, `${id}.json`)).mtimeMs);
+    return line(f, id, `${run.input.repo}#${run.input.pr}`);
   }).join(''));
   const unchanged = counter(f); expectFound(f, unchanged, 2);
   expect(unchanged.ids).toEqual([f.run.id]);
@@ -170,19 +172,92 @@ it.each([0, 5, 20])('parses an atomic replacement %s seconds after its other-PR 
   expect(io.ids.length).toBeLessThanOrEqual(2);
 });
 
-it('uses the last timestamp for repeated same-key lines when checking replacement freshness', () => {
+it('finds a newer rejection after a same-inode same-size rewrite with restored mtime', () => {
+  const f = fixture(); writeRun(f.run, f.runsDir);
+  const id = 'review-pr-rewritten', path = join(f.runsDir, `${id}.json`);
+  const other = { ...f.run, id, input: { repo: f.repo, pr: 8 }, verdict: { verdict: 'reject' },
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(120_000).toISOString() }] };
+  writeRun(other, f.runsDir);
+  utimesSync(path, 100, 100); // Use an exactly restorable timestamp on every filesystem.
+  // Seal the current file after normalizing its timestamps, then bypass the writer.
+  journal.appendReviewRunJournal(other, f.runsDir, Date.now(), statSync(path));
+  const before = statSync(path);
+  const replacement = { ...other, input: { repo: f.repo, pr: f.pr } };
+  const bytes = JSON.stringify(replacement);
+  expect(Buffer.byteLength(bytes)).toBeLessThanOrEqual(before.size);
+  writeFileSync(path, bytes.padEnd(before.size, ' '));
+  utimesSync(path, before.atimeMs / 1000, before.mtimeMs / 1000);
+  const after = statSync(path);
+  expect(after.ino).toBe(before.ino);
+  expect(after.size).toBe(before.size);
+  expect(after.mtimeMs).toBe(before.mtimeMs);
+  expect(after.ctimeMs).not.toBe(before.ctimeMs);
+  expect(evidence(f, counter(f), 1)).toMatchObject({ ok: false, reason: 'scan-capped' });
+  const io = counter(f), result = evidence(f, io);
+  expect(result.loopPayload).not.toEqual(f.run);
+  if (result.ok !== false) {
+    expect(result.loopPayload).toEqual(replacement);
+    expect(io.ids).toContain(id);
+  }
+});
+
+it('does not seal a replacement rejection published between rename and final-path stat', () => {
+  const f = fixture(); writeRun(f.run, f.runsDir);
+  const id = 'review-pr-replaced-before-seal', path = join(f.runsDir, `${id}.json`);
+  const other = { ...f.run, id, input: { repo: f.repo, pr: 8 } };
+  const rejection = { ...f.run, id, verdict: { verdict: 'reject' },
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(120_000).toISOString() }] };
+  const rename = fs.renameSync;
+  let replaced = false;
+  const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+    rename(from, to);
+    if (to === path && !replaced) {
+      replaced = true;
+      writeJsonAtomic(path, rejection);
+    }
+  });
+  syncBuiltinESMExports();
+  try { writeRun(other, f.runsDir); }
+  finally { spy.mockRestore(); syncBuiltinESMExports(); }
+  expect(replaced).toBe(true);
+  expect(readRun(id, f.runsDir)).toEqual(rejection);
+  expect(lines(f).filter(row => row.id === id)).toEqual([{ id, key: 'o/r#8', at: expect.any(Number) }]);
+  expect(candidates(f)).toEqual({ ids: [f.run.id, id].sort(), source: 'journal', unjournaled: 1 });
+  const io = counter(f);
+  expect(evidence(f, io).loopPayload).toEqual(rejection);
+  expect(io.ids).toContain(id);
+});
+
+it('parses a previously sealed other-PR id when its last line is an unsealed intent', () => {
   const f = fixture(); writeRun(f.run, f.runsDir);
   utimesSync(join(f.runsDir, `${f.run.id}.json`), 120, 120);
-  writeFileSync(f.journalPath, line(f, f.run.id, 'o/r#999', 120_000) + line(f, f.run.id, 'o/r#999', 100_000));
+  writeFileSync(f.journalPath, line(f, f.run.id, 'o/r#999') + `${JSON.stringify({ id: f.run.id, key: 'o/r#999', at: Date.now() })}\n`);
   expect(candidates(f)).toEqual({ ids: [f.run.id], source: 'journal', unjournaled: 1 });
   expectFound(f, counter(f));
 });
 
-it.each(['missing', 'non-finite', 'stat failure', 'missing identity'])('parses an other-PR hint with an unverifiable timestamp (%s)', kind => {
+it('keeps conflicting keys unknown after a later matching seal', () => {
+  const f = fixture(); writeRun(f.run, f.runsDir);
+  writeFileSync(f.journalPath, line(f, f.run.id, 'o/r#8') + line(f, f.run.id, key(f)) + line(f, f.run.id, 'o/r#8'));
+  expect(candidates(f)).toEqual({ ids: [f.run.id], source: 'journal', unjournaled: 1 });
+  expectFound(f, counter(f));
+});
+
+it('keeps a target-key intent as a candidate without a seal or readable stat', () => {
+  const f = fixture(); writeRun(f.run, f.runsDir);
+  writeFileSync(f.journalPath, `${JSON.stringify({ id: f.run.id, key: key(f), at: Date.now() })}\n`);
+  expect(journal.readJournalCandidates(f.runsDir, f.repo, f.pr, { stat: () => { throw Error('stat failed'); } }))
+    .toEqual({ ids: [f.run.id], source: 'journal', unjournaled: 0 });
+  expectFound(f, counter(f));
+});
+
+it.each(['missing seal', 'legacy identity', 'short seal', 'non-finite seal', 'stat failure'])('parses an other-PR hint with an unverifiable seal (%s)', kind => {
   const f = fixture(); writeRun(f.run, f.runsDir);
   const row = { id: f.run.id, key: 'o/r#999' };
-  if (kind === 'non-finite') row.at = 'Infinity';
-  if (kind === 'stat failure' || kind === 'missing identity') row.at = Date.now();
+  if (kind === 'legacy identity') { row.at = Date.now(); row.identity = identity(join(f.runsDir, `${f.run.id}.json`)).slice(0, 4); }
+  if (kind === 'short seal') row.seal = [1];
+  if (kind === 'non-finite seal') row.seal = ['Infinity', 1, 1, 1, 1, 1];
+  if (kind === 'stat failure') row.seal = identity(join(f.runsDir, `${f.run.id}.json`));
   writeFileSync(f.journalPath, `${JSON.stringify(row)}\n`);
   const options = kind === 'stat failure' ? { stat: () => { throw Error('stat failed'); } } : {};
   expect(journal.readJournalCandidates(f.runsDir, f.repo, f.pr, options))
@@ -213,7 +288,7 @@ it.each(['journal', 'index'])('refuses a filename/payload ID mismatch through %s
 
 it.each(['archive claim', 'missing journal', 'oversized journal'])('%s refuses journal discovery and HOLDs at the fallback parse cap', kind => {
   const f = fixture(); oldTargetAndNewerUnrelated(f);
-  // Use a real journal independently of writeRun's not-yet-implemented maintenance.
+  // Exercise each discovery refusal with an otherwise fully sealed journal.
   writeFileSync(f.journalPath, listRunIds(f.runsDir).map(id => {
     const run = readRun(id, f.runsDir); return line(f, id, `${run.input.repo}#${run.input.pr}`);
   }).join(''));
@@ -269,8 +344,7 @@ it('seeds only missing readable records, reports the count, and is idempotent', 
   expect(io.ids).toContain(f.run.id);
   expect(io.ids).toContain('review-pr-unreadable');
   expect(lines(f)).toEqual([{ id: f.run.id, key: key(f),
-    at: statSync(join(f.runsDir, `${f.run.id}.json`)).mtimeMs,
-    identity: identity(join(f.runsDir, `${f.run.id}.json`)) }]);
+    seal: identity(join(f.runsDir, `${f.run.id}.json`)) }]);
   const before = readFileSync(f.journalPath, 'utf8');
   expect(journal.seedReviewRunJournal({ runsDir: f.runsDir })).toMatchObject({ seeded: 0 });
   expect(readFileSync(f.journalPath, 'utf8')).toBe(before);
@@ -291,8 +365,18 @@ it('seed migrates identity-less journal rows instead of preserving unverifiable 
   const f = fixture(); writeRun(f.run, f.runsDir);
   writeFileSync(f.journalPath, `${JSON.stringify({ id: f.run.id, key: key(f), at: Date.now() })}\n`);
   expect(journal.seedReviewRunJournal({ runsDir: f.runsDir })).toMatchObject({ seeded: 1 });
-  expect(lines(f).at(-1).identity).toEqual(identity(join(f.runsDir, `${f.run.id}.json`)));
+  expect(lines(f).at(-1).seal).toEqual(identity(join(f.runsDir, `${f.run.id}.json`)));
   expect(candidates(f)).toEqual({ ids: [f.run.id], source: 'journal', unjournaled: 0 });
+});
+
+it('seed reparses a stale seal instead of counting a changed file as already seeded', () => {
+  const f = fixture(); writeRun(f.run, f.runsDir);
+  utimesSync(join(f.runsDir, `${f.run.id}.json`), 100, 100);
+  const io = counter(f);
+  expect(journal.seedReviewRunJournal({ runsDir: f.runsDir, read: io.read }))
+    .toEqual({ seeded: 1, already: 0, skipped: 0 });
+  expect(io.ids).toEqual([f.run.id]);
+  expect(lines(f).at(-1).seal).toEqual(identity(join(f.runsDir, `${f.run.id}.json`)));
 });
 
 it('real CLI seeds idempotently and probes the journal within 40 parses', () => {

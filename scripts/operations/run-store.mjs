@@ -22,7 +22,7 @@
  * nothing above the seam changes.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -191,11 +191,30 @@ export function writeRun(record, dir = resolveRunsDir()) {
   assertRunRecord(record, 'run record being written');
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
-  writeJsonAtomic(path, record, { renameSyncFn: (tmp, destination) => {
-    // Bind the hint to the validated file BEFORE publication, including concurrent writers.
-    try { appendReviewRunJournal(record, dir, Date.now(), statSync(tmp)); } catch { /* discovery is best-effort */ }
-    renameSync(tmp, destination);
-  } });
+  let publishedFd;
+  try {
+    writeJsonAtomic(path, record, { renameSyncFn: (tmp, destination) => {
+      // Keep the writer's inode alive across rename, including an intervening replacement.
+      if (record.op === 'review-pr') {
+        try { publishedFd = openSync(tmp, 'r'); } catch { /* no binding means no seal */ }
+      }
+      try { appendReviewRunJournal(record, dir); } catch { /* discovery is best-effort */ }
+      renameSync(tmp, destination);
+    } });
+    if (publishedFd !== undefined) {
+      try {
+        const metadata = statSync(path), published = fstatSync(publishedFd);
+        const fields = ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'birthtimeMs'];
+        if (fields.every(field => Number.isFinite(metadata[field]) && metadata[field] === published[field])) {
+          appendReviewRunJournal(record, dir, Date.now(), metadata);
+        }
+      } catch { /* discovery is best-effort; an unbound publication remains unknown */ }
+    }
+  } finally {
+    if (publishedFd !== undefined) {
+      try { closeSync(publishedFd); } catch { /* best-effort cleanup, including refused rename */ }
+    }
+  }
   if (record.op === 'review-pr') {
     try { appendReviewRunIndex(record, dir); } catch { /* discovery is best-effort; never fail a persisted run */ }
   }
