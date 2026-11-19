@@ -1,5 +1,3 @@
-import { laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
-import { createSameContentProof, recordWaiverCarry } from '../lib/same-content-waiver-io.mjs';
 /** Canonical codex-audit admission shared by every PR producer. No docs-only exemption. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -9,6 +7,7 @@ import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
@@ -28,12 +27,11 @@ function wellFormedAudit(record) {
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
-  liveFingerprint: liveFingerprintOpt, sameContent: sameContentOpt, recordCarry = recordWaiverCarry, carryLogPath, warn = message => console.warn(message),
+  liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
     env: laneHistoryProofEnv(env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
   })).trim();
-  const sameContent = sameContentOpt || createSameContentProof({ repo, exec, env });
   let fullSha;
   try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).toLowerCase(); } catch { /* refuse below */ }
   if (!validSha(fullSha)) return { ok: false, reason: 'canonical-audit-missing', record: null,
@@ -91,22 +89,16 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   let evidence;
   try {
     const fp = liveFingerprint(records);
-    evidence = canonicalAuditEvidence(records, fullSha, covers, fp, { sameContent });
+    evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
-        if (entry.ref !== ref || !validSha(entry.sha) || (entry.sha.toLowerCase() !== fullSha && !sameContent(entry.sha.toLowerCase(), fullSha).carries)
+        if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const carry = entry.sha.toLowerCase() !== fullSha ? sameContent(entry.sha.toLowerCase(), fullSha) : null;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { sameContent, ruledWeakened: {
-          ...(carry ? { sameContentCarry: carry } : {}),
-          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null, auditDisclosed: entry.findings },
+        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
+          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
         } });
-        if (waived.ok && waived.record?.head === fullSha) {
-          evidence = waived;
-          if (carry && waived.record?.head === fullSha) try { recordCarry({ ref, from: entry.sha, to: fullSha, ruling: entry.ruling, matched: waived.record.findings, commits: carry.commits }, { env, ...(carryLogPath ? { path: carryLogPath } : {}) }); } catch { /* best effort */ }
-          break;
-        }
+        if (waived.ok) { evidence = waived; break; }
       }
     }
   } catch (e) {

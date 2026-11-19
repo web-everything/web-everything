@@ -4955,19 +4955,6 @@ Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispa
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
 
-## Same-content carry history proofs
-
-`scripts/lib/same-content-carry.mjs` proves WAIVER carry across clean automatic merges of main only:
-two parents, one in the base, and a tree identical to `git merge-tree --write-tree`.
-Use real temporary histories to pin refusal of test-only commits, card renames and hand-resolved merges.
-The live SHA needs its own green tests and canonical audit; history never supplies either.
-The live audit findings, ready record's `auditDisclosed`, and ruling's findings must be exactly equal,
-including order, duplicates, source locations and whitespace. Subsets refuse.
-Keep the setting provenance and `WE_SAME_DIFF_CARRY=off` kill-switch tests.
-Git proof wrappers merge caller environments before applying `laneHistoryProofEnv`, whose pins win.
-Keep ordinary loader and daemon IO on its ordinary environment. The Vitest adapter runs the real
-Git node:test cases through the host heavy-admission queue. The soak break independently probes
-clean merge admission and conflicting merge refusal, and exercises a real hunk-offset fingerprint change.
 
 ## Verify failed-file recovery
 
@@ -5149,17 +5136,3 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
-
-
-## Carry disclosure and proof wrapper regressions
-
-Merge caller environments before applying `laneHistoryProofEnv`; never spread caller values after its pins.
-The carry cases plant grafts and hostile commit-graph settings and inspect the actual subprocess options.
-A carried waiver's ready disclosure, ruling and live canonical findings must match exactly in order
-and multiplicity. Keep ready `[A]`, ruling `[A,B]`, audit `[B]` as a refusal at readiness admission.
-Soak fix presence uses separate clean/conflicting repositories and classifier-only checks; its regression
-stubs broken classifiers to verify both admission and refusal independently of the break itself.
-Mark shipped fixes `requiresFix: true`: a failed presence probe must register an ordinary failing test,
-never `it.fails`. Keep the named regression **broken classifier presence makes the shipped break fail,
-never pass as an expected failure**, including a green behavioral stub so the presence guard itself is exercised.
-Proof wrappers in IO factories must use the injected runner; a direct global reader defeats fixture isolation and may attempt live fallback fetches.

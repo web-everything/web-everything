@@ -1,5 +1,3 @@
-import { laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
-import { createSameContentProof, recordWaiverCarry } from '../lib/same-content-waiver-io.mjs';
 /**
  * @file Injected prototype admission transaction.
  * WHY (incident 2026-10-22): preserve main, reject incomplete evidence, and retain mutable
@@ -239,12 +237,7 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
 export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
   readState = readOverlayState,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
-  carryLogPath, recordCarry = recordWaiverCarry,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
-  // Carry proofs keep their history protections without changing ordinary loader IO.
-  const proofExec = (file, args, options) => exec(file, args, { ...options,
-    env: laneHistoryProofEnv({ ...env, ...options?.env }),
-  });
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -346,7 +339,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // tracking refspec also works in single-branch clones. This is read-only
         // remote access, never registration, retirement or publication.
         requireGit('fetch', 'origin', `+refs/heads/${input.branch}:refs/remotes/origin/${input.branch}`);
-        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(gitRepo, b, h, { exec: proofExec, env })))('origin/main', input.sha) || null;
+        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(gitRepo, b, h, { exec })))('origin/main', input.sha) || null;
       } catch { liveFpMemo = null; }
       return liveFpMemo;
     };
@@ -497,9 +490,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
       let readyFp = null;
-      const sameContent = createSameContentProof({ repo: gitRepo, exec: proofExec, env });
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
-        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])), { sameContent });
+        () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])));
       // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an
       // earlier load of different code must not strand the branch: the check-run path below writes fresh readiness.
       const hasReady = readyRecordSpeaksFor(readyRecords, input, readyFp);
@@ -518,10 +510,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate, sameContent }) };
+        { ruledWeakened: out.gate }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
-      if (out.gate?.sameContentCarry) try { recordCarry({ ref: input.branch, ...out.gate.sameContentCarry, matched: out.canonicalAudit.record.findings }, { env, ...(carryLogPath ? { path: carryLogPath } : {}) }); } catch { /* best effort */ }
       if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.

@@ -582,7 +582,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
       return { headSha: view.headRefOid, comments };
     },
-    contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
+    contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha, env,
       exec: (f, a, o) => exec(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env: laneHistoryProofEnv({ ...env, ...o.env }) }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
       const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,

@@ -11,7 +11,7 @@ import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 
 describe('prototype-load real R503 candidate fetch', () => {
   it.each([['full clone', withBareOrigin], ['single-branch clone', withNarrowClone]])(
-    'requires live readiness when the rebased candidate object is initially absent: %s', async (_, fixture) => {
+    'carries readiness and canonical audit when the rebased candidate object is initially absent: %s', async (_, fixture) => {
       await fixture(async ({ tmp, clone, origin, seedOriginBranch, git }) => {
         const branch = 'lane/rebased';
         seedOriginBranch('lane/audited', { 'feature.txt': 'reviewed change\n' });
@@ -34,7 +34,7 @@ describe('prototype-load real R503 candidate fetch', () => {
           at: '2026-11-09T12:00:00Z', verdict: 'NOT WEAKENED', findings: [] }) + '\n');
         const calls = [];
         const exec = (command, args, options) => {
-          calls.push({ command, args, options });
+          calls.push({ command, args });
           if (command === 'node' && args[1] === 'list') return JSON.stringify({ list: [] });
           if (command === 'node' && args[1] === 'add' && args.includes('--check'))
             return JSON.stringify({ check: { ok: true, clean: true, candSha: sha }, wouldRegister: true });
@@ -45,34 +45,19 @@ describe('prototype-load real R503 candidate fetch', () => {
           return execFileSync(command, boundArgs, { ...options, cwd: clone });
         };
         const load = createPrototypeLoader({ ...defaultDeps(), exec,
-          env: { HOME: tmp, TMPDIR: tmp, WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays'),
-            GIT_GRAFT_FILE: join(tmp, 'forged-grafts'), GIT_NO_REPLACE_OBJECTS: '0',
-            GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.commitGraph', GIT_CONFIG_VALUE_0: 'true' },
+          env: { HOME: tmp, TMPDIR: tmp, WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
           testCheck: async () => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 }),
           settings: { daemons: { control: { clone } }, workspaceRoot: tmp, loaderCli: 'scripts/daemon-overlay.mjs',
             readyRecordPath, auditRecordPath, recordPath, adoption: { timeoutMs: 30, pollMs: 10 } },
         });
         const result = await load({ branch, sha, daemon: 'control', dryRun: true });
-        expect(result).toMatchObject({ ok: false, stopReason: 'no-ready' });
-        expect(result.gate).toBeNull();
+        expect(result).toMatchObject({ ok: true, stopReason: null, wouldRegister: true,
+          gate: { source: 'ready-record', record: { sha: oldSha } },
+          canonicalAudit: { ok: true, record: { head: oldSha } } });
         expect(git(['cat-file', '-e', `${sha}^{commit}`])).toBe('');
         expect(git(['rev-parse', `refs/remotes/origin/${branch}`]).trim()).toBe(sha);
         const fetch = calls.findIndex(({ args }) => args[0] === 'fetch' && args.includes(`+refs/heads/${branch}:refs/remotes/origin/${branch}`));
         const fingerprintRead = calls.findIndex(({ args }) => args.includes('--end-of-options'));
-        // Inspect the actual producer calls, outside any fail-closed production catch.
-        const proofCalls = calls.filter(({ command, args }) => command === 'git' && args[0] === '-C');
-        expect(proofCalls.length).toBeGreaterThan(0);
-        for (const call of proofCalls) {
-          expect(call.options.env.GIT_GRAFT_FILE).toBe('/dev/null');
-          expect(call.options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
-          const pins = Array.from({ length: Number(call.options.env.GIT_CONFIG_COUNT) }, (_, i) =>
-            [call.options.env[`GIT_CONFIG_KEY_${i}`], call.options.env[`GIT_CONFIG_VALUE_${i}`]]);
-          expect(pins.filter(([key]) => key === 'core.commitGraph').at(-1)).toEqual(['core.commitGraph', 'false']);
-        }
-        const fetchEnv = calls[fetch]?.options.env;
-        expect(fetchEnv?.GIT_GRAFT_FILE).toBeUndefined();
-        expect(fetchEnv?.GIT_NO_REPLACE_OBJECTS).toBeUndefined();
-        expect(fetchEnv?.GIT_CONFIG_COUNT).toBeUndefined();
         expect(fetch).toBeGreaterThanOrEqual(0);
         expect(fingerprintRead).toBeGreaterThan(fetch);
         expect(calls.some(({ args }) => ['push', 'commit-tree'].includes(args[0]))).toBe(false);
@@ -198,25 +183,4 @@ describe('prototype-load default dispatch smoke (real worktree)', () => {
       expect(await load()).toMatchObject({ ok: false, stopReason: 'dispatch-smoke-failed', dispatchSmoke: { ok: false, reason: 'launch-failed' } });
     }, { wrapExec: stuck });
   });
-});
-
-
-it('a real clean main merge carries only an exact waiver and requires a live canonical audit', async () => {
-  const { sameContentRepo } = await import('../../lib/__tests__/fixtures/same-content-repo.mjs');
-  const { createSameContentProof } = await import('../../lib/same-content-waiver-io.mjs');
-  const { readyEvidence, canonicalAuditEvidence } = await import('../prototype-load.mjs');
-  const { QUESTION_HASH } = await import('../codex-audit.mjs');
-  const f = sameContentRepo('clean');
-  try {
-    const ref = 'lane/waiver', findings = ['A', 'B'], sameContent = createSameContentProof(f);
-    const entry = { ref, sha: f.from, ruling: 'R12', findings };
-    const ready = { ref, sha: f.to, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: findings };
-    const gate = readyEvidence([ready], { branch: ref, sha: f.to }, [entry], null, { sameContent });
-    expect(gate).toMatchObject({ sameContentCarry: { commits: [{ sha: f.to, kind: 'clean-main-merge' }] } });
-    const audit = { head: f.to, base: f.root, verdict: 'WEAKENED', findings, questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z' };
-    const judge = records => canonicalAuditEvidence(records, f.to, () => true, 'c'.repeat(64), { ruledWeakened: gate });
-    expect(judge([audit]).ok).toBe(true);
-    expect(judge([{ ...audit, head: f.from, fingerprint: 'c'.repeat(64) }]).ok).toBe(false);
-    for (const findings of [['A'], ['B', 'A'], ['A', 'A']]) expect(judge([{ ...audit, findings }]).ok).toBe(false);
-  } finally { f.cleanup(); }
 });

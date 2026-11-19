@@ -4288,6 +4288,9 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
 }
 
 export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+  const run = exec;
+  if (typeof run === 'function') exec = (file, args, options) => run(file, args, { ...options,
+    env: laneHistoryProofEnv({ ...process.env, ...options?.env }) });
   const empty = { changedFiles: [], diffLines: 0, scored: false, humanBasisFiles: [] };
   if (typeof exec !== 'function' || !rev) return empty;
   const baseRevOk = typeof baseRev === 'string' && /^[0-9a-f]{7,64}$/i.test(baseRev);
