@@ -5136,3 +5136,11 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## Runtime infra recovery identity
+
+Context-less infra records need explicit `groupMembers` evidence (`[]` proves an ungrouped
+dispatch); historical absence is unknown and requires operator repair of the original dispatch
+context or stored membership. Recovery unions context and stored members so neither source can
+shrink admission. Keep the runtime-admission unit cases and infra-retention soak replay covering
+unknown identity without budget changes, and successful subprocess output without a PR as a
+retained infra retry with an attempt bump.
