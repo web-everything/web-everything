@@ -133,9 +133,9 @@ describe('codex-audit runner output', () => {
     { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
       stderr: 'Audit record write failed; repair the record path and retry.\n' },
     { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
-      stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+      stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--ref=<branch>] [--converge] [--json]\n' },
     { name: 'invalid audit arguments', head: 'invalid', code: 2, stdout: '',
-      stderr: 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+      stderr: 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--ref=<branch>] [--converge] [--json]\n' },
   ];
   for (const json of [true, false]) {
     it.each(cases)(`captures $name in ${json ? 'JSON' : 'text'} mode without leaking to process streams`, async (testCase) => {
