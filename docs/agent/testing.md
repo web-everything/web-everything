@@ -1107,6 +1107,8 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
+`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
+
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
 `scope` / `WE_REVIEW_SHADOW_AGY_SCOPE` defaults to `high-care`: use the read's
@@ -2423,6 +2425,15 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
+Memory-warn regression cases must distinguish missing free-memory evidence (hold, even with flat swap)
+from missing swap growth (admit when free memory is readable and clean). Only pressure level 2 may relax;
+level 3 and unknown levels above 1 still hold. Exercise the sampler's unrounded bytes ratio at 19.96% and
+20%, and verify checkout-local/per-call warn overrides only tighten the resolved settings. Environment
+variables remain the operator settings layer. Scoped coverage lives in `memory-available`,
+`resource-sampler`, `resource-admission`, `resource-gate`, and `heavy-admission` tests.
+Keep the shared pressure/floor decisions in the import-free `memory-warn-corroboration.mjs`:
+read-only operations reach them via `resource-policy` and must never inherit the measurement module's IO imports.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
@@ -2930,6 +2941,8 @@ also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites 
 `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <files>`.
 
 ## Referral re-checks on the live head
+
+Unpromoted Carbon must retain prior unresolved referrals through both the mandatory-referral sink and the acceptance gate, like an unset Gemini cap. Keep default-path fixtures alongside promoted variants and assert that no settlement or audited retirement was written.
 
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
 `scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
@@ -4917,9 +4930,182 @@ an existing report that cannot be read, parsed or structurally validated, or exc
 the first attempt with the report failure in the diagnostic and an operator-review escalation.
 Keep ordinary flake rerun identity/count coverage checks unchanged. Run `overlay-main-sync-rerun.test.mjs`,
 `daemon-rebuild-overlay-main-sync.test.mjs`, and the killed-run soak through heavy admission.
+## Carbon review admission and complete escape evidence (Slice A)
+
+Carbon shadows require both `WE_REVIEW_SEAT_CAP_AGY_GEMINI > 0` and
+`WE_REVIEW_SEAT_CAP_CARBON_SHADOW > 0` (default 1; malformed values refuse).
+The daemon plist currently sets the Gemini cap to 0: operators must explicitly raise
+it to enable Carbon shadows. A refusal records `agy-gemini seat cap 0` or
+`carbon shadow seat off`; it never retries or reserves budget. Other Gemini models
+retain their provider cap.
+
+Non-shadow Carbon seats require `shadowSeats.antigravity.promoted === true`
+(default false; environment `WE_REVIEW_SHADOW_AGY_PROMOTED=true`). Only the
+orchestrator flips promotion after the manual ruling on ten agreeing PRs. The setting
+resolves standard → platform review → tool review.json → environment and logs provenance.
+The Carbon probation entry tracks shadow trials only; pinning Carbon never auto-seats
+an advisory reviewer. Unpromoted non-shadow Carbon is refused, leaving Gemini unseated
+by default. Historical counted-seat fixtures must explicitly supply promotion.
+
+`review-shadow-model.test.mjs` covers both launch switches, malformed overrides,
+manual promotion and the unchanged shadow path. `agy-review-juror.test.mjs` requires
+`read_file` to name a nonempty direct string path under a path-like key, contained
+by realpath in the juror lane (including symlink checks). Missing, scalar, array,
+nested-only and escaped parameters void the run. Other read tools retain their rules.
+Every nonempty transcript line must be an event object; an answered juror must end
+with a `result` object whose status is `SUCCESS`. Empty, whitespace-only, unrelated,
+non-object and incomplete transcripts void the run for incomplete escape evidence.
+Successful fixtures supply realistic tool events and a successful terminal result;
+never relax the evidence rule to accommodate an empty fixture. Refused evidence
+requires a fresh run with a complete transcript before its answer can count.
 ## Owed CI rerun execution
 
 The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+## Urgent prototype verification
+
+`node scripts/operations/run.mjs urgent-verify --sha=<full sha>` requires a clean checkout at
+that SHA. It reads CI's unit shard matrix, uses the current time-balanced covered/nocov assignments
+and npm-script Vitest arguments, and runs each group sequentially through heavy admission before
+`check:standards`. Unknown workflow/command layouts refuse; repair the runner or wait for CI.
+Admission exhaustion stops the run without an outer retry loop. Only this runner appends full-suite
+green/red receipts to `~/workspace/.operations/coordination/urgent-full-green.jsonl`.
+
+`prototype-load --urgent --reason=<at least 10 characters>` prefers passing CI, otherwise requires
+the latest exact-SHA receipt to be full, green, current-shard-count and at most two hours old.
+Its signed steps must start with `fetch-main-history`, `install-fui`, `install`, then match the current CI unit plan in order, followed by coverage,
+hostPaths, integration and standards. Before selecting or binding a test suite, any completed
+exact-SHA check-run with failure, cancelled, timed_out, action_required or startup_failure vetoes
+urgent loading. An unreadable raw check-runs response still requires the signed receipt.
+Other admission gates remain in force; merging still requires real CI. Urgent admissions append
+`prototype-load.urgent` events to `~/workspace/.operations/coordination/urgent-loads.jsonl`.
+`urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
+later-red supersession, event logging and the unchanged non-urgent CI gate. Run via heavy admission.
+
+The first local step runs the workflow-pinned `sh scripts/ci/fetch-main-history.sh` in the checkout; a failure signs a red receipt before any suites. Historical green never disables verdict timeouts: after green, persist `nonGreenSince` on the first current non-green read and apply the 6h escalation / 24h unload deadlines from that observation. Loads that never passed retain their load-time deadline. A recovered green clears that episode clock and its six-hour escalation deduplication; a later non-green episode can escalate again.
+
+## Urgent local verification receipts
+
+FUI sibling verification requires its origin to normalize to `https://github.com/frontier-ui/frontierui`
+(HTTPS and Git SSH forms are accepted) before fetching or installing. Signed receipts bind `fuiRepo`
+as well as `fuiSha`; old receipts without the origin require fresh verification or passing CI.
+The urgent sweep reads all check-runs (maximum 100, exact count and unique IDs required) and settles
+green only after every run completes and all required runs succeed. Pending unrelated runs keep the
+load eligible for later failure detection. Legacy green settlements without `checksComplete: true`
+are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
+Malformed, incomplete, oversized or duplicate-ID evidence never authorizes CI-failure unloading, even with a possible bound failure. Escalate that possible failure once per tracking ID and keep monitoring; the 24h verdict expiry still unloads.
+
+Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
+
+The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,
+`integration`, `test`, `standards` and `changes`, with job-specific setup commands and exact occurrence counts.
+Extra validations require a local runner update, including otherwise familiar setup commands.
+Checkout sources and paths are pinned: WE uses the event checkout without a ref/repository override; FUI uses `frontier-ui/frontierui` without a ref override. When CI adds
+validation, update the mirror before issuing local receipts; unknown run steps refuse with
+`unreadable-ci-gates`. Keep the real-workflow acceptance and per-job unknown-step regressions
+in `urgent-verify.test.mjs`.
+
+
+Urgent verification derives the required CI job closure from `test.needs`, including transitive
+dependencies; unknown jobs or changed install commands require a mirror update or passing CI.
+It verifies the clean FUI sibling against its fetched default branch, then admits FUI install/build
+and checkout install before suites. Signed receipts include `fuiSha` and both install steps; older
+receipts require fresh verification. Child environments are allowlisted with CI markers explicitly removed so host admission cannot be bypassed, and the signing key is read
+only after the suite pipeline stops. `urgent-sweep` is one bounded pass (32 loads, 100 checks per SHA);
+the orchestrator schedules it. Its durable settlement ledger prevents repeat handling and stores a
+`sweep-cursor` before each batch so pending or unreadable loads cannot starve later entries.
+Cursor records never settle a load; older ledgers without a cursor start at the beginning. Completed
+failures in any check-run on the SHA, regardless of job or app, open a once-per-tracking-ID NEEDS-YOU escalation through
+`land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
+require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
+starts fresh. Check failures authorize removal only for the GitHub Actions app and jobs in the configured
+`test` needs closure, with each suite bound to that workflow run on the exact SHA. Validate complete,
+bounded check pages before acting. Select only the latest check ID per app, check name and suite (including workflow rerun attempts), as in `testCheckEvidence`; a newer success supersedes its own older failure, while another suite or shard cannot.
+Unrelated app/workflow/job failures never authorize removal or green monitoring; they remain tracked
+with a durable failure-escalation receipt. The 24h verdict expiry still permits unloading.
+Unknown workflow or required-job
+evidence stays tracked and requires operator inspection; the existing verdict expiry still applies. Green loads are checked every pass while their clone/ref remains in the shared overlay
+store, including historical time-complete receipts. Only confirmed absence ends monitoring; corrupt
+overlay state escalates and stays tracked. A failed registration command can leave a persisted overlay:
+the loader writes a registration-failed note only after the shared overlay reader proves clone/ref
+absence, and the sweep honors that note only after confirming absence again. Present or unreadable
+registrations retain monitoring. Keep these paths in `prototype-load.test.mjs` and `urgent-sweep.test.mjs`.
+
+Action signatures also pin exact `if`, `env` and `continue-on-error` values, including their absence.
+A changed checkout condition or action environment refuses with `unreadable-ci-gates`; update the
+mirror or wait for passing CI. The real workflow and every action's context mutations are covered
+in `urgent-verify.test.mjs`.
+
+Urgent retirement requires both the matching load and a persisted `unload-decision` from
+`urgent-sweep-state`, read under the overlay lock. The sweep writes this decision before removal;
+write failure leaves the registration intact. Decisions bind tracking ID, clone, source ref/SHA
+and registration ref/SHA, with either an exact-source-SHA completed failure or a `ci-expired`
+decision at least 24 hours after loading. A load record alone never authorizes withdrawal.
+Urgent withdrawal reuses explicit `--remove`'s `proveOverlayWithdrawal` guard under the add lock:
+cached stacked dependents or live ancestry to another registration refuse removal. Unreadable
+dependent evidence also refuses; inspect the stack before unloading manually. Fetch the target
+as well as each potential dependent before comparing ancestry: urgent clones may lack the target's objects.
+Missing, unreadable, mismatched, future or incomplete decisions refuse; inspect CI and repair the
+ledger or unload manually. The production decision reader shares the 4 MiB ledger bound and
+archive fallback. Decisions are authorization records, not unload settlements: refused removals
+retain the decision without emitting an unload event. Historical settlements retain their existing
+adoption handling. Keep these guarantees in `urgent-sweep.test.mjs` and
+`daemon-overlay-replace-retire.test.mjs`.
+
+The CI mirror also pins each run step's directory, environment, shell, condition and error policy,
+and refuses job run defaults, environments and containers. A context change requires updating the
+mirror or waiting for passing CI; command equality alone cannot authorize an urgent receipt.
+Health-watch schedules `urgent-sweep-tick.mjs` every five minutes, persisting `urgentSweep.lastAttemptAt`
+even on failure. `scripts/settings/urgent-sweep.json` controls the interval through the policy cascade
+(`WE_URGENT_SWEEP_INTERVAL_MINUTES` is the environment override). Fixture, redirected and dry-run ticks
+skip host urgent loads. Errors are logged and recorded as probe errors without interrupting the tick.
+Keep cadence, persisted-stamp and fail-soft wiring regressions in `urgent-sweep-tick.test.mjs`.
+The lane-scan boundary guard also pins `runUrgentSweepTick` by module/export identity and exactly one
+health-watch invocation. Keep sweep IO in the tick module and register new reviewed tick entry points
+in both helper inventories without exempting them from the call-site guard.
+
+Absent registrations removed by another actor also require ancestry proof: settle only when HEAD
+excludes the urgent SHA or a freshly fetched `origin/main` contains it. Historical
+`settled-unregistered` receipts without `ancestryVerified` resume monitoring. Persist the first
+observed absence in `monitoring-unregistered`; while unmerged code remains in HEAD, keep reading
+CI and raise one NEEDS-YOU per tracking identity on failure or after 15 minutes. Unloading an
+already absent registration cannot repair that running build. Unknown ancestry/fetch evidence
+escalates and stays tracked. The urgent sweep suite pins both settlement proofs, grace/deduplication,
+later CI failure, legacy receipt migration, and bounded injectable Git IO.
+
+## Urgent unload adoption
+
+An urgent CI removal persists `unloaded-pending-adoption` before emitting its unload event and
+escalation. It remains tracked until the registration is absent and Git in the daemon clone proves
+`git merge-base --is-ancestor <failed-sha> HEAD` exits 1. Only then write `unloaded-adopted`.
+Historical `settled-unloaded` receipts resume adoption checks using their removal timestamp.
+Unknown ancestry or timestamps escalate and stay tracked. After 15 minutes from removal, a HEAD
+still containing the SHA with no registration raises a separate last-good-build NEEDS-YOU packet,
+deduplicated through a persisted flag per load identity (including tracking ID). Later passes still
+check adoption. Keep grace, adoption, legacy receipt, closed-path and dedupe regressions in
+`scripts/operations/__tests__/urgent-sweep.test.mjs`; run it and the conveyor tick suite via heavy admission.
+
+Unload receipts checkpoint `unloadEventSent` and `unloadEscalationSent` separately after each
+successful sink write. Failed notifications retry on later sweeps even after `unloaded-adopted`,
+and do not prevent adoption checks or the other notification. A failed progress write allows
+redelivery (event delivery is at least once); escalation IDs stay stable. Legacy `settled-unloaded`
+receipts already followed both notifications; pending/adopted receipts missing progress retry them.
+Named fault-injection tests cover each sink failure and each progress-write interruption.
+
+
+## Urgent sweep guarded withdrawals
+
+Urgent CI failure and expired-verdict unloads use `retireRegistration` with the library-only
+`urgent-failed` mode after `recoverDrops` for the clone. Pass the loaded registration SHA
+(`registration.sha`, which may differ from the source SHA) and the observed full entry snapshot.
+The normal retirement proof still runs; only `unique-commits-not-on-main` and `pr-open` keep
+verdicts may authorize urgent withdrawal, with a matching tracking record, SHA and exact live tip.
+Pinned, edge-resolution and unreadable keep verdicts still refuse. Check the registration
+`edgeResolution` explicitly before overriding a keep verdict: the planner can return `pr-open`
+before inspecting its approved edge. Keep regression cases for changed
+entries, moved/unreadable tips, the lock and
+persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
+never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
+same locked library helper; recovery failure must prevent retirement and unload receipts.

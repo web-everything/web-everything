@@ -78,6 +78,15 @@ export const PROVIDER_CAP_ENV = Object.freeze({
   'agy-claude': 'WE_REVIEW_SEAT_CAP_AGY_CLAUDE',
   'agy-gemini': 'WE_REVIEW_SEAT_CAP_AGY_GEMINI',
 });
+/** Independent Carbon shadow seat switch; zero disables only Carbon in shadow mode. */
+export const CARBON_SHADOW_CAP_ENV = 'WE_REVIEW_SEAT_CAP_CARBON_SHADOW';
+export function resolveCarbonShadowCap(env = process.env) {
+  const value = env?.[CARBON_SHADOW_CAP_ENV];
+  // Unset or blank = the default (1, on). Anything else that is not a non-negative integer fails CLOSED (0, off).
+  if (value == null || (typeof value === 'string' && value.trim() === '')) return 1;
+  const n = typeof value === 'boolean' ? NaN : Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+}
 /** Standard daily caps: Codex 600, Gemini 0 (operator ruling 2026-10-02; opt-in only), agy-claude 10 (red-team emergency only). */
 export const PROVIDER_CAP_DEFAULT = Object.freeze({ codex: 600, 'agy-claude': 10, 'agy-gemini': 0 });
 /** The daily call cap for ONE provider: its own env var, else (codex only) the legacy shared env var, else its

@@ -25,12 +25,10 @@
     {
       "provider": "antigravity",
       "model": "gemini-4-carbon-high",
-      "roles": {
-        "advisory-review": "probation"
-      },
+      "roles": {},
       "since": "2026-11-18",
       "owner": "3383",
-      "note": "Gemini 4 Carbon (agy 1.5.11 roster) replaces Argon as the pinned advisory-review model. Same probation rules as the Argon entry: advisory only, collects run-quality data, never gates a merge until promoted."
+      "note": "Carbon shadow probation bookkeeping only; never auto-seats advisory-review. R1062 requires ten agreeing PRs and manual promotion by the orchestrator."
     }
   ]
 }

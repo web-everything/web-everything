@@ -27,6 +27,7 @@
       "terra-5.6": "gpt-5.6-terra"
     },
     "antigravity": {
+      "carbon": "gemini-4-carbon-high",
       "sonnet": "claude-sonnet-5-5-high",
       "opus": "claude-opus-4-6-thinking",
       "flash": "gemini-3.8-flash",
@@ -38,6 +39,7 @@
       "opus-5-5": "claude-opus-5-5-high"
     },
     "agy-gemini": {
+      "carbon": "gemini-4-carbon-high",
       "flash": "gemini-3.8-flash",
       "pro": "gemini-4-argon-high"
     }
