@@ -3,15 +3,17 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// Load the cyclic drain/dispatch graph during collection, before timed setup.
+import { defaultFetchDiff, defaultFetchLandGuardSignals } from '../merge-ai-prs.mjs';
+import { readManifestFromPrBody } from '../lane-drain.mjs';
+import { defaultListLaneChangedFiles } from '../conveyor/build-dispatch-orphan-adopt.mjs';
 
 const BIG = 2 * 1024 * 1024;
 let dir; let savedPath; let savedThrottle;
-let defaultFetchDiff; let defaultFetchLandGuardSignals;
-let readManifestFromPrBody; let defaultListLaneChangedFiles;
 // Fake `gh`/`git` that print a >1 MiB payload, or fail when FAKE_FAIL=1.
 const fake = (body) => `#!/usr/bin/env node\nif (process.env.FAKE_FAIL === '1') { process.stderr.write('boom'); process.exit(1); }\n${body}\n`;
 
-beforeAll(async () => {
+beforeAll(() => {
   dir = mkdtempSync(join(tmpdir(), 'proc-read-74b-'));
   const gh = fake(`const a = process.argv.slice(2);
 if (a[1] === 'diff') process.stdout.write('d'.repeat(${BIG}));
@@ -22,18 +24,7 @@ else process.stdout.write(JSON.stringify({ body: 'b'.repeat(${BIG}), files: [{ p
   chmodSync(join(dir, 'gh'), 0o755); chmodSync(join(dir, 'git'), 0o755);
   savedPath = process.env.PATH; savedThrottle = process.env.WE_GH_THROTTLE_CAP;
   process.env.PATH = `${dir}:${savedPath}`;
-  // Cold drain imports can exceed a test's 5s budget on a busy coverage shard.
-  // Load after installing the fixture PATH, with a separate bounded setup budget;
-  // keep every read/failure assertion inside its original test deadline.
-  const [merge, lane, adopt] = await Promise.all([
-    import('../merge-ai-prs.mjs'),
-    import('../lane-drain.mjs'),
-    import('../conveyor/build-dispatch-orphan-adopt.mjs'),
-  ]);
-  ({ defaultFetchDiff, defaultFetchLandGuardSignals } = merge);
-  ({ readManifestFromPrBody } = lane);
-  ({ defaultListLaneChangedFiles } = adopt);
-}, 30_000);
+});
 afterAll(() => {
   process.env.PATH = savedPath;
   if (savedThrottle === undefined) delete process.env.WE_GH_THROTTLE_CAP; else process.env.WE_GH_THROTTLE_CAP = savedThrottle;
