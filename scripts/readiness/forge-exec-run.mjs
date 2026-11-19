@@ -322,6 +322,17 @@ async function directory(path, trusted = false, operator = {uid:process.getuid()
   await fd.close();
   if (!info.isDirectory() || (trusted && ((info.uid !== operator.uid && info.uid !== 0) || (info.mode & 0o002) || ((info.mode & 0o020) && info.gid !== operator.gid)))) throw new Error('Untrusted directory');
 }
+// The exit code a failed supervisor may still report: only when it wrote .unsafe AND a verdict record bound to this
+// run id and nonce before its uid sweep. Anything else (no record, wrong run, unreadable) is null: fail as before.
+export async function keptVerdict(status,reservation) {
+  try {
+    await readPinned(status+'.unsafe');
+    const record=JSON.parse((await readPinned(status+'.verdict')).toString());
+    if(typeof reservation?.run!=='string'||typeof reservation?.nonce!=='string')return null;
+    if(record?.run!==reservation.run||record?.nonce!==reservation.nonce)return null;
+    return Number.isInteger(record.code)&&record.code>=0&&record.code<=255?record.code:null;
+  } catch {return null;}
+}
 async function readPinned(path) {
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
@@ -740,7 +751,7 @@ if cfg.get('usage') is not None:
 # result. The wrapper still fences the slot when the sweep is unconfirmed (the .unsafe marker below).
 verdict_path = cfg['status'] + '.verdict'
 verdict_fd = os.open(verdict_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-with os.fdopen(verdict_fd, 'w') as verdict: verdict.write(str(code if 0 <= code <= 255 else 255))
+with os.fdopen(verdict_fd, 'w') as verdict: json.dump({'run': writer.get('run'), 'nonce': writer.get('nonce'), 'code': code if 0 <= code <= 255 else 255}, verdict)
 cleanup_wait_ms = cfg.get('cleanupWaitMs', 120000)
 if not isinstance(cleanup_wait_ms, int) or isinstance(cleanup_wait_ms, bool) or cleanup_wait_ms < 1 or cleanup_wait_ms > 600000: cleanup_wait_ms = 120000
 deadline = time.monotonic() + cleanup_wait_ms / 1000
@@ -1256,13 +1267,15 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       // A supervisor that persisted the verdict but could not confirm the uid sweep leaves .unsafe: keep the
       // verdict, report the uid as unconfirmed, and let the caller fence the slot. Anything else fails as before.
-      let uidUnconfirmed=false;
+      let uidUnconfirmed=false,keptCode;
       if(result.code!==0) {
         if(cleanup) throw new Error('Supervisor failed');
-        try {await readPinned(status+'.unsafe');} catch {throw new Error('Supervisor failed');}
+        // .unsafe alone never implies success: a status record for THIS run, written before the sweep, must exist.
+        keptCode=await keptVerdict(status,worker.reservation);
+        if(keptCode===null) throw new Error('Supervisor failed');
         uidUnconfirmed=true;
       }
-      const code=Number((await readPinned(uidUnconfirmed?status+'.verdict':status)).toString());
+      const code=uidUnconfirmed?keptCode:Number((await readPinned(status)).toString());
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
       let measured;
       if(!uidUnconfirmed) try {measured=JSON.parse((await readPinned(usage)).toString());} catch(error) {if(error.code!=='ENOENT')throw error;}

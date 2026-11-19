@@ -1960,7 +1960,7 @@ def waitpid(*a):
 ns=types.SimpleNamespace(**{n:getattr(real,n) for n in dir(real)})
 ns.kill=lambda *a:None
 ns.waitpid=waitpid
-exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9),'cfg':cfg,'code':code,'children':lambda:set(),'uid_processes':uid_processes})
+exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9),'cfg':cfg,'code':code,'json':json,'writer':{'run':'r-run','nonce':'n-once'},'children':lambda:set(),'uid_processes':uid_processes})
 `;
   const run=(mode,ms)=>{
     const status=join(root,'sup-status');
@@ -1970,14 +1970,14 @@ exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9)
   it('sleep-polls a slow uid to a clean sweep without marking it unsafe',async()=>{
     const {result,status}=run('slow',2000);
     expect(result.status,result.stderr).toBe(0);
-    expect(await readFile(status+'.verdict','utf8')).toBe('3');
+    expect(JSON.parse(await readFile(status+'.verdict','utf8'))).toEqual({run:'r-run',nonce:'n-once',code:3});
     await expect(stat(status+'.unsafe')).rejects.toMatchObject({code:'ENOENT'});
   });
   it('persists the verdict, marks the uid unsafe and fails when the sweep never confirms',async()=>{
     const {result,status}=run('stuck',300);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('uid cleanup unconfirmed');
-    expect(await readFile(status+'.verdict','utf8')).toBe('3');
+    expect(JSON.parse(await readFile(status+'.verdict','utf8'))).toEqual({run:'r-run',nonce:'n-once',code:3});
     await stat(status+'.unsafe');
     await expect(stat(status)).rejects.toMatchObject({code:'ENOENT'});
   });
@@ -2004,6 +2004,25 @@ exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9)
     // Only the empty key/profile directories and the lock may exist; no published archive.
     const entries=await readdir(join(root,'cache'),{recursive:true}).catch(()=>[]);
     expect(entries.filter(entry=>entry.split('/').length>2&&!entry.endsWith('/.lock'))).toEqual([]);
+  });
+  it('keptVerdict: .unsafe alone, a crash without status, or a mismatched run never imply success',async()=>{
+    const {keptVerdict}=manifestAPI;
+    const reservation={run:'r-run',nonce:'n-once'};
+    const base=join(root,'kept-status');
+    // Supervisor crash: .unsafe present, no verdict record.
+    await writeFile(base+'.unsafe','');
+    expect(await keptVerdict(base,reservation)).toBeNull();
+    // Verdict for another run id or nonce.
+    await writeFile(base+'.verdict',JSON.stringify({run:'r-other',nonce:'n-once',code:0}));
+    expect(await keptVerdict(base,reservation)).toBeNull();
+    await rm(base+'.verdict');await writeFile(base+'.verdict',JSON.stringify({run:'r-run',nonce:'x',code:0}));
+    expect(await keptVerdict(base,reservation)).toBeNull();
+    // Verdict without .unsafe (a plain supervisor failure).
+    await rm(base+'.verdict');await rm(base+'.unsafe');await writeFile(base+'.verdict',JSON.stringify({run:'r-run',nonce:'n-once',code:0}));
+    expect(await keptVerdict(base,reservation)).toBeNull();
+    // Both present and bound to this run.
+    await writeFile(base+'.unsafe','');
+    expect(await keptVerdict(base,reservation)).toBe(0);
   });
   it('honours the configured wait: a stuck uid fails only after it elapses, and a bad value falls back to the default',()=>{
     const started=Date.now();

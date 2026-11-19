@@ -16,7 +16,7 @@ def waitpid(*a): raise ChildProcessError()
 ns=types.SimpleNamespace(**{n:getattr(real,n) for n in dir(real)})
 ns.kill=lambda *a:None
 ns.waitpid=waitpid
-exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9),'cfg':cfg,'code':code,'children':lambda:set(),'uid_processes':uid_processes})
+exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9),'cfg':cfg,'code':code,'json':json,'writer':{'run':'r-run','nonce':'n-once'},'children':lambda:set(),'uid_processes':uid_processes})
 `;
 
 export function probeUidCleanup(root = REPO_ROOT) {
@@ -36,7 +36,9 @@ export function probeUidCleanup(root = REPO_ROOT) {
       const status = join(scratch, mode + '-status');
       const result = spawnSync('python3', ['-I', '-c', PROBE, block, JSON.stringify({ mode, status, cleanupWaitMs: mode === 'stuck' ? 300 : 5000 })], { encoding: 'utf8', timeout: 8000 });
       const verdict = existsSync(status + '.verdict') ? readFileSync(status + '.verdict', 'utf8') : null;
-      if (verdict !== '3') violations.push(`${mode}: verdict not persisted before the uid sweep`);
+      let kept = null;
+      try { kept = JSON.parse(verdict).code; } catch { /* absent or legacy bare status */ }
+      if (kept !== 3 && verdict !== '3') violations.push(`${mode}: verdict not persisted before the uid sweep`);
       if (mode === 'slow' && (result.status !== 0 || existsSync(status + '.unsafe'))) violations.push('slow: a late-reaping uid was treated as unsafe');
       if (mode === 'stuck' && (result.status === 0 || !existsSync(status + '.unsafe'))) violations.push('stuck: an unconfirmed uid was not fenced');
     }
