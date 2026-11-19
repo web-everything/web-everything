@@ -697,9 +697,12 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     ['no workflow flag', ({ workflowEditProtection, ...hold }) => hold],
     ['another head', hold => ({ ...hold, headSha: 'b'.repeat(40) })],
     ['another job', hold => ({ ...hold, jobId: 999 })],
-    ['two review-acceptance ids', hold => ({ ...hold, holdIds: ['review-acceptance', 'review-acceptance'] })],
+    ['two review-acceptance ids', hold => ({ ...hold, holdIds: ['review-acceptance', 'review-acceptance', 'red-team'] })],
   ])('a workflow hold with %s stays red for the strict resolver', (_name, alter) => {
-    const [row] = probe().out.statusCheckRollup;
+    // With the red-team hold, only the workflow-protection rule can hold it (a lone review-acceptance hold
+    // is already human-review-only work for every producer).
+    const [row] = probe(e => { e.log = e.log.replace('pass  red-team  ok', 'hold  red-team  no red-team check run on head'); }).out.statusCheckRollup;
+    expect([...row.mergeGateReviewHold.holdIds].sort()).toEqual(['red-team', 'review-acceptance']);
     const rows = [{ ...row, mergeGateReviewHold: alter(row.mergeGateReviewHold) }];
     expect(resolveRequiredChecks({ rows, rowsHead: HEAD, rowsComplete: true, head: HEAD,
       requiredNames: ['merge-gate'], rosterSource: 'live' }).state).toBe('fail');

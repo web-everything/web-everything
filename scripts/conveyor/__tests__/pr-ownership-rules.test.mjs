@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { readFileSync } from 'node:fs';
+import { collapseRollupToLatestPerName } from '../../lib/rollup-collapse.mjs';
 import { describe, it, expect } from 'vitest';
 import { planReconcile as planReconcileCore } from '../reconcile-core.mjs';
 // These replays select the serial policy; the default fast gate is covered below.
@@ -9,7 +10,14 @@ import { ownerFor, assessPrOwnership, assessOwnership } from '../../operations/p
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 const checks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'];
-const fixture = name => JSON.parse(readFileSync(new URL(`./fixtures/pr-ownership/${name}.json`, import.meta.url), 'utf8'));
+// The incident snapshots predate evidence provenance; replay them as the complete exact-head read the
+// reconcile pass hands the planner (a review-hold advisory never waives CI on unknown evidence). Production
+// re-reads duplicate check names through the REST latest-run read, so the replay keeps the latest run per name.
+const fixture = name => {
+  const fx = JSON.parse(readFileSync(new URL(`./fixtures/pr-ownership/${name}.json`, import.meta.url), 'utf8'));
+  return { ...fx, pr: { rowsComplete: true, rowsHead: fx.pr.headRefOid, ...fx.pr,
+    statusCheckRollup: collapseRollupToLatestPerName(fx.pr.statusCheckRollup) } };
+};
 const before = 'pr-5157-before-ci-heal';
 const escalated = 'pr-5157-ci-heal-escalated';
 const unlabeled = 'pr-5172-unlabeled-red';
@@ -82,7 +90,8 @@ describe('cards 273 and 278 incident replays', () => {
     const empty = planReconcile({ ...options, prs: [{ ...fx.pr, comments: [] }] });
     expect(empty.dispatch).toEqual([]);
     expect(empty.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings' }));
-    const moved = { ...fx.pr, headRefOid: 'b'.repeat(40) };
+    // The moved head's checks are re-read for that head (a stale snapshot never waives CI).
+    const moved = { ...fx.pr, headRefOid: 'b'.repeat(40), rowsHead: 'b'.repeat(40) };
     for (const addressed of [false, true]) {
       const pr = { ...moved, comments: [...moved.comments,
         ...(addressed ? [{ author: { login: 'web-everything' }, body: buildAdvisoryFixComment({}) }] : [])] };

@@ -3789,7 +3789,7 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
 
   it.each([
     ['incomplete rows', { rowsComplete: false, rowsHead: pr1563().headRefOid }],
-    ['missing provenance', {}],
+    ['missing provenance', { rowsComplete: undefined, rowsHead: undefined }],
     ['a stale snapshot head', { rowsComplete: true, rowsHead: 'f'.repeat(40) }],
   ])('never waives CI for a review-hold advisory on %s', (_, evidence) => {
     const source = pr1563({ isDraft: false, labels: lbl('review:pending'), comments: [], statusCheckRollup: heldRollup(), ...evidence });
