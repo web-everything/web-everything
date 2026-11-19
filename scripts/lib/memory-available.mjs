@@ -40,32 +40,22 @@ export function memoryAvailableBytes({ metric = DEFAULT_MEMORY_METRIC, exec = ex
 /** Memory-free percent (0-100) under `metric`. Throws on unreadable evidence. */
 export function memoryFreePct({ metric = DEFAULT_MEMORY_METRIC, exec = execFileSync, platform = process.platform,
   freemem = os.freemem, totalmem = os.totalmem } = {}) {
+  return Math.round(memoryFreePctUnrounded({ metric, exec, platform, freemem, totalmem }) * 10) / 10;
+}
+
+/** Unrounded bytes ratio for admission comparisons; display rounding must not admit below a threshold. */
+export function memoryFreePctUnrounded({ totalmem = os.totalmem, ...options } = {}) {
   const total = totalmem();
   if (!Number.isFinite(total) || total <= 0) throw Error('invalid memory totals');
-  const bytes = memoryAvailableBytes({ metric, exec, platform, freemem });
-  return Math.round(Math.min(100, bytes / total * 100) * 10) / 10;
+  const bytes = memoryAvailableBytes(options);
+  return Math.min(100, bytes / total * 100);
 }
 
 /** Available memory in whole MB (rounded down). Throws on unreadable evidence. */
 export function memoryAvailableMb(opts = {}) { return Math.floor(memoryAvailableBytes({ strict: true, ...opts }) / (1024 * 1024)); }
 
 export const DEFAULT_MEM_AVAILABLE_FLOOR_MB = 2048;
-/** macOS kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical. */
-const PRESSURE_NAME = { 1: 'normal', 2: 'warn', 4: 'critical' };
 
-/**
- * PURE hard memory floor for admitting a new fixer. Fail closed: any unreadable input refuses.
- * Refuses below the floor, under pressure warn/critical, or when the available reading, the pressure level or the
- * floor itself is missing, non-numeric or an unknown level. `snapshotFresh:false` is an unreadable reading too.
- * @returns {{admit:boolean, reason:string}}
- */
-export function decideMemoryFloor({ availableMb, floorMb, pressureLevel, snapshotFresh = true } = {}) {
-  const n = (v) => typeof v === 'number' && Number.isFinite(v);
-  if (!snapshotFresh) return { admit: false, reason: 'memory reading unavailable (no fresh snapshot)' };
-  if (!n(floorMb) || floorMb <= 0) return { admit: false, reason: 'memory floor unreadable' };
-  if (!n(availableMb) || availableMb < 0) return { admit: false, reason: 'available memory unreadable' };
-  if (!n(pressureLevel) || !PRESSURE_NAME[pressureLevel]) return { admit: false, reason: 'memory pressure unreadable' };
-  if (pressureLevel !== 1) return { admit: false, reason: `memory pressure ${PRESSURE_NAME[pressureLevel]}` };
-  if (availableMb < floorMb) return { admit: false, reason: `available ${availableMb} MB < floor ${floorMb} MB` };
-  return { admit: true, reason: `available ${availableMb} MB >= floor ${floorMb} MB, pressure normal` };
-}
+// Preserve the measurement module's existing exports for callers.
+export { decideMemoryPressure, decideMemoryFloor, DEFAULT_WARN_MIN_FREE_PCT, DEFAULT_WARN_SWAP_GROWTH_MB }
+  from './memory-warn-corroboration.mjs';
