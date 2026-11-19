@@ -36,7 +36,8 @@ if (a[0] === 'api') {
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
-  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
+  if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:pr.statusCheckRollup.filter(c => c.name)}]);
+  if (path.includes('/status?')) out([{statuses:pr.statusCheckRollup.filter(c => c.context)}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
@@ -342,7 +343,7 @@ describe('real drain pre-stage path', () => {
     const enqueue = vi.fn(() => ({ enqueued: true }));
     const result = await enqueuePrestage({ cache: createPrestageCache({ root: join(coord, 'drain-prestage') }), repo: 'web-everything/web-everything', num: 42,
       settings: resolvePrestageSettings({ env: {}, tool: {}, platform: {} }), recordLanded: vi.fn(), enqueue,
-      readPr: async () => ({ ...pr, statusCheckRollup: [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}] }),
+      readPr: async () => ({ ...pr, rowsComplete: true, rowsHead: sha, statusCheckRollup: [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}] }),
       fixClaimHeld: () => prestageFixClaimHeld(42, { claimKey: 'we', readClaim: q => readLiveFixClaim({ ...q, lockRoot }) }), beforeEnqueue: vi.fn(),
       // The initial read saw no claim; the fixer takes it while the drain waits for the merge-write lock.
       withLock: fn => {

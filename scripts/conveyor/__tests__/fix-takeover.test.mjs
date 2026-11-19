@@ -34,6 +34,7 @@ const rearm = (i) => ({ author: BOT, createdAt: `2026-10-0${i}T00:00:00Z`, body:
 function cappedPr(extraComments = []) {
   return {
     number: 7, headRefName: 'lane/x-thing', headRefOid: HEAD, isDraft: false, createdAt: '2026-10-01T00:00:00Z',
+    rowsComplete: true, rowsHead: HEAD,
     labels: [{ name: 'review:changes' }], statusCheckRollup: [], files: [{ path: 'src/a.mjs' }],
     comments: [{ author: BOT, createdAt: '2026-10-01T00:00:00Z', body: '🔁 review — changes requested\n\n### Findings\n\n**correctness/logic** (1)\n- `src/a.mjs:1` — bad' }, ...extraComments],
   };

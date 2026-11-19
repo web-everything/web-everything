@@ -370,7 +370,8 @@ export function needsHumanGateOnlyRefusal({ headSha, pr, requiredChecks }) {
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
   // A cancelled, stale, running, or missing required check may need human help.
   // Gate-only red describes failures, not whether the rest of CI finished green.
-  if (!ciGreenForEscalation({ rollup: pr?.statusCheckRollup, requiredChecks })) return null;
+  if (!ciGreenForEscalation({ rollup: pr?.statusCheckRollup, requiredChecks, headSha: pr?.headRefOid,
+    rowsComplete: pr?.rowsComplete, rowsHead: pr?.rowsHead })) return null;
   const { gateOnlyRed, red } = gateOnlyRedStates({ rollup: pr?.statusCheckRollup, requiredChecks });
   if (!gateOnlyRed) return null;
   return `Refusing needs-human: only ${red.join(', ')} is red on this head. This is not a CI break; ordinary review is owed.`;

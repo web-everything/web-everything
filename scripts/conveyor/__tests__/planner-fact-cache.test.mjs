@@ -17,6 +17,7 @@ const REPO = 'org/repo';
 const START = Date.parse('2026-10-01T00:00:00Z');
 const HOUR = 60 * 60 * 1000;
 const fact = (overrides = {}) => ({
+  rowsComplete: true, rowsHead: overrides.headRefOid ?? 'a'.repeat(40),
   repo: REPO, number: 5, state: 'OPEN',
   headRefName: 'lane/fact-cache', headRefOid: 'a'.repeat(40),
   baseRefName: 'main', baseSha: 'b'.repeat(40),

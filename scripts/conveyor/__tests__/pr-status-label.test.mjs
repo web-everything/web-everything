@@ -36,7 +36,7 @@ const HEAD = 'a'.repeat(40);
 const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 const marker = (h) => ({ author: BOT, createdAt: at(h), body: takeoverMarkerBody({ pr: 7, head: HEAD, attempts: 5, cap: 5, rung: { id: 'x' } }) });
 const advisory = (h) => ({ author: BOT, createdAt: at(h), body: `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** x\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`` });
-const pr = (labels = [], comments = [], over = {}) => ({ number: 7, headRefOid: HEAD, baseRefName: 'main', labels: labels.map((name) => ({ name })), comments, ...over });
+const pr = (labels = [], comments = [], over = {}) => ({ rowsComplete: true, rowsHead: over.headRefOid ?? HEAD, number: 7, headRefOid: HEAD, baseRefName: 'main', labels: labels.map((name) => ({ name })), comments, ...over });
 const derive = (o) => derivePrStatusLabel({ humanAt: 99, ...o });
 
 describe('derivePrStatusLabel', () => {
@@ -304,7 +304,7 @@ describe('required CI determines status (#5241, #5267, #5270, #5254)', () => {
     ['required-review-gate-conflict', { requiredChecks: ['review-gate'], checks: [] }, 'awaiting-review'],
     ['required-checks-successful', {}, 'awaiting-ci'],
   ])('classifies the gate reason %s conservatively', (reason, overrides, expected) => {
-    const ci = reviewCiGate({ headSha: HEAD, requiredChecks: ['merge-gate'],
+    const ci = reviewCiGate({ headSha: HEAD, rowsComplete: true, rowsHead: HEAD, requiredChecks: ['merge-gate'],
       checks: [{ name: 'merge-gate', status: 'completed', conclusion: 'success' }], ...overrides });
     expect(ci.reason).toBe(reason);
     expect(derive({ pr: subject({ baseRefName: 'lane/base', statusCheckRollup: green() }),

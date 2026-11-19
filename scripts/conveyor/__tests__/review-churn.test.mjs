@@ -17,6 +17,7 @@ const mkPr = (comments, head, churn) => ({
   number: 7, headRefName: 'lane/x-thing', headRefOid: head, baseRefName: 'main', isDraft: false, createdAt: at(0),
   labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
+  rowsComplete: true, rowsHead: head,
   comments, ...(churn ? { reviewChurn: churn } : {}),
 });
 const plan = (p) => planReconcile({ reviewTiming: { startAfter: 'ci-green' }, prs: [p], agents: [], durableCounts: {},

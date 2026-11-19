@@ -168,8 +168,10 @@ describe('resolvePidAlive — the two-signal liveness probe (#3383)', () => {
 });
 
 describe('defaultIsPidAlive — process.kill(pid, 0)', () => {
-  it('the current process\'s own pid is alive', () => {
-    expect(defaultIsPidAlive(process.pid)).toBe(true);
+  it('the current process\'s own pid is alive with matching injected identity', () => {
+    const identity = vi.fn(() => ({ alive: true }));
+    expect(defaultIsPidAlive(process.pid, identity)).toBe(true);
+    expect(identity).toHaveBeenCalledWith(process.pid);
   });
 
   it('a pid nothing holds answers false', () => {

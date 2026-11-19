@@ -8,10 +8,19 @@ import * as strategy from '../lib/drain-merge-strategy.mjs';
 
 const required = ['test', 'smoke'];
 const green = name => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
-const pr = (extra = {}) => ({ number: 42, title: 'Fix queue admission', body: 'Allow checked PRs into the required queue.', headRefOid: 'abc', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], reviewDecision: '', statusCheckRollup: required.map(green), ...extra });
+const pr = (extra = {}) => ({ number: 42, title: 'Fix queue admission', body: 'Allow checked PRs into the required queue.', headRefOid: 'abc', rowsComplete: true, rowsHead: 'abc', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], reviewDecision: '', statusCheckRollup: required.map(green), ...extra });
 const opts = { queueRequiredChecks: required };
 
 describe('required merge queue BLOCKED relief', () => {
+  it.each([
+    { rowsComplete: undefined }, { rowsComplete: false },
+    { rowsHead: undefined }, { rowsHead: 'old' }, { headRefOid: undefined },
+  ])('retains BLOCKED with incomplete or unpinned rows %j', evidence => {
+    const verdict = classifyPr(pr(evidence), opts);
+    expect(verdict.decision).toBe('skip');
+    expect(verdict).not.toHaveProperty('queueBlockedRelief');
+  });
+
   it.each(['', null, 'APPROVED'])('admits green uppercase CheckRuns with reviewDecision %s', reviewDecision => {
     expect(classifyPr(pr({ reviewDecision }), opts)).toMatchObject({ decision: 'merge', queueBlockedRelief: true, reason: expect.stringMatching(/BLOCKED only by the required merge queue.*all 2 required checks green.*enqueue/) });
   });

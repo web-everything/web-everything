@@ -11,7 +11,7 @@ import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { tmpdir } from 'node:os';
 
 import {
-  classifyGateOutcome, markerStillOurs, runGateStep, createVerifyGateJobs, resolveGateAsJob, killGateGroup,
+  classifyGateOutcome, markerStillOurs, runGateStep as realRunGateStep, createVerifyGateJobs as realCreateVerifyGateJobs, resolveGateAsJob, killGateGroup,
   gatePath, resultPath, VERIFY_GATE_JOB_KIND, gateState, gateStopHandler,
 } from '../verify-gate-job.mjs';
 import * as gateJob from '../verify-gate-job.mjs';
@@ -19,6 +19,12 @@ import { createJobStore, enqueueJob, hostName, readProcStart } from '../../lib/d
 import { formatJobHandle } from '../../operations/job-record.mjs';
 import { spawn, execFileSync } from 'node:child_process';
 import { markClaimed, markFailed, markLaunching, markSucceeded } from '../../lib/daemon-jobs.mjs';
+
+// Step fixtures provide their supervisor identity explicitly; gate/process probes stay injectable per case.
+const runGateStep = options => realRunGateStep({
+  supervisorHandle: () => 'fixture-host:77:fixture-start', scanLane: () => [], ...options,
+});
+const createVerifyGateJobs = options => realCreateVerifyGateJobs({ scanLane: () => [], ...options });
 
 let dir;
 let store;
@@ -449,24 +455,36 @@ describe('a gate is its whole process group, not just its leader (PR 4764 round 
 
   it('real processes: the leader dies while its test-runner child runs on — not dead until the whole group is gone', async () => {
     const childJs = keepAliveScript({ maxLifetimeMs: 60_000 });
-    const leader = spawn(process.execPath, ['-e',
-      `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childJs)}], { stdio: 'ignore' }); ${childJs}`],
-    { detached: true, stdio: 'ignore' });
-    const exited = new Promise((r) => leader.once('exit', r));
-    const pid = leader.pid;
+    // Keep both group members as children of a live reaper, so this proof does not
+    // depend on the host's init reaping an orphan after the group leader dies.
+    const quote = value => `'${value.replaceAll("'", "'\"'\"'")}'`;
+    const command = `${quote(process.execPath)} -e ${quote(childJs)}`;
+    const reaper = spawn('bash', ['-c', `set -m
+${command} | ${command} &
+jobs -p
+wait`],
+      { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    const reaped = new Promise(resolve => reaper.once('exit', resolve));
+    const pid = await new Promise((resolve, reject) => {
+      reaper.once('error', reject);
+      reaper.stdout.once('data', data => resolve(Number(String(data).trim())));
+    });
     try {
+      expect(Number.isSafeInteger(pid) && pid > 1).toBe(true);
       await waitFor(() => groupMembers(pid) >= 2);
       const gate = { pid, handle: formatJobHandle({ host: hostName(), pid, procStart: readProcStart(pid) }) };
       expect(gateState(gate)).toBe('alive');
       process.kill(pid, 'SIGKILL'); // the leader alone (OOM, crash): its child keeps running in the group
-      await exited;
+      await waitFor(() => groupMembers(pid) === 1);
       expect(groupMembers(pid)).toBeGreaterThanOrEqual(1);
       expect(gateState(gate)).toBe('unknown'); // a retry must not start a second gate beside the surviving child
       process.kill(-pid, 'SIGKILL');
+      await reaped;
       await waitFor(() => groupMembers(pid) === 0);
       expect(gateState(gate)).toBe('dead');
     } finally {
-      try { process.kill(-pid, 'SIGKILL'); } catch {}
+      try { if (Number.isSafeInteger(pid) && pid > 1) process.kill(-pid, 'SIGKILL'); } catch {}
+      try { process.kill(-reaper.pid, 'SIGKILL'); } catch {}
     }
   }, 20_000);
 

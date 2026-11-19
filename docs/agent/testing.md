@@ -4770,3 +4770,20 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Review CI fixture provenance
+
+Gate fixtures that inject a complete head-scoped check/status read use
+`scripts/lib/__tests__/helpers/complete-check-rows.mjs` to retain the array API
+while attesting `rowsComplete` and `rowsHead`. Direct planner PR fixtures carry
+these fields on the PR. Keep deliberately incomplete/wrong-head cases raw so
+they continue exercising refusal. The review facts store contains completed check
+runs only, without legacy statuses or pending runs; it cannot attest a complete
+check read. Its gate tests inject the live fallback and assert its decision and
+call cost rather than manufacturing completeness for the store.
+
+The shared CLI GraphQL page fixture must include the commit `oid` and contexts
+`totalCount`/`pageInfo`; a flattened `gh pr view` response alone never attests
+completeness. Pre-stage's targeted reread and operator landing use the complete
+check/status reader before forwarding provenance. Preserve the pre-stage
+incomplete/wrong-head matrix and operator unreadable-status refusal.
