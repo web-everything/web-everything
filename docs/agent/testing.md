@@ -4835,6 +4835,21 @@ directory resolution, must return the drain context unchanged on exceptions.
 For every bounded-read risk, the test plan must name a regression counting actual read attempts
 or asserting the read range, including the default shared budget across repositories. Inject a
 failure after a successful staged read to prove no partial completeness can be published.
+Index verification payloads may serve the bounded fallback only after rechecking the file
+identity captured before the read (mtime, device, inode, size, ctime and birthtime). Changed
+identities discard cached payloads and read errors; fresh attempts still consume the shared
+parse budget. The unchanged one-read fallback and unchanged-mtime atomic-replacement cases
+in `review-run-index.test.mjs` pin both reuse and stale-cache refusal for drain and recovery.
+Both backfills must count payload attempts before calling the reader and retain that count
+outside staging, so aborts, listing churn and failed persistence cannot refund the shared
+50-read drain budget. The `%s backfill preserves payload spend after %s` cases and the
+`an aborted open-PR backfill leaves only the actual remainder after %s` drain cases pin this
+accounting. The open pass receives at most 25 of the shared 50 reads; unused reads go
+to the full pass, which always has at least 25 reads when the open pass obeys its cap.
+Unknown spend exhausts the open allocation, preserving the full pass's reservation.
+The repeated saturated-tick regression in `merge-ai-prs-review-backfill.test.mjs`
+pins full-pass completion without exceeding the shared budget. The bounded evidence scan and scan-capped HOLD
+remain the fallback until a later tick can complete discovery.
 Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
 through heavy admission.
 ## Fast-drain round listing and live target refresh
@@ -5122,6 +5137,27 @@ persisted drop intent at interruption, and recovery confirming or restoring the 
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
 
+
+## Negative review-run proofs
+
+`headNeverReviewedFromRuns` may bypass its 400-run scan only through
+`readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
+markers, stat-only listing verification, and no overflow or eviction for that PR.
+The full-backfill verified staging state lives in the index and uses the same identity
+reconciliation and bad-record cooldown as the open-PR backfill, parsing at most 50
+records per call by default. Concurrent writes requeue only changed identities; a bad
+or unreadable record blocks the global watermark while other candidates advance.
+Open-PR hint refreshes must preserve that staging state and proof.
+Full completeness includes a SHA-256 digest of the rebuilt entries and eviction
+markers. Readers and the backfill reuse path reject a missing or mismatched digest:
+deleting a PR key, dropping one row, or losing an eviction marker cannot preserve
+the proof. Old snapshots without the digest require a new bounded full pass.
+Appends never reseal a proof; only a completed rebuild writes the digest. This
+checks persisted consistency, not authenticity against a writer forging the whole index.
+Unverifiable indexed identities return to the original capped scan; they never
+establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
+races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the
+existing `redteam-pending-settle` and `review-red-team-on-skip` suites.
 ## Forge sweep partial work
 
 `forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between
