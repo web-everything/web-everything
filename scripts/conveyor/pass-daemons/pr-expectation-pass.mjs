@@ -106,8 +106,8 @@ export function collectExpectationEvidence({ repo, pr, read, now }) {
     if (check?.head_sha !== sha || typeof check.name !== 'string'
       || !['queued', 'in_progress', 'completed'].includes(check.status)) throw Error('unknown check');
     const gate = /merge[- ]gate/i.test(check.name);
-    const redTeam = /red[- ]team/i.test(check.name);
-    const review = /review/i.test(check.name);
+    const redTeam = /(^|[^a-z0-9])red[- ]team([^a-z0-9]|$)/i.test(check.name);
+    const review = !redTeam && /(^|[^a-z0-9])review([^a-z0-9]|$)/i.test(check.name);
     if (check.started_at) add(gate ? 'merge-gate-started' : redTeam ? 'red-team-started'
       : review ? 'review-started' : 'ci-started', check.started_at, check.html_url ?? `check:${check.id}`);
     if (check.status === 'completed' && !['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'stale'].includes(check.conclusion)) throw Error('unknown check conclusion');
@@ -209,14 +209,18 @@ export async function runExpectationPass({ repo = 'web-everything/web-everything
       const tracked = state.prs[row.pr];
       const key = missKey(row);
       if (tracked.emitted[key]) continue;
-      tracked.emitted[key] = true;
-      save(stateFile, state);
       const { status, ...facts } = row;
       const event = { kind: 'expectation-missed', repo, pr: row.pr,
         daemon: 'expectation-babysitter', detail: { ...facts, mode: 'observe' } };
       const send = emitEvent ?? (e => appendDaemonEvent(e, {
         env: { ...env, WE_DAEMON_EVENTS: eventsFile }, now: () => new Date(now) }));
-      if (await send(event) === false) fail(); else result.delivered++;
+      // Mark emitted only after a successful append, so a failed delivery is retried next pass.
+      let sent = false;
+      try { sent = (await send(event)) !== false; } catch { sent = false; }
+      if (!sent) { fail(); continue; }
+      tracked.emitted[key] = true;
+      save(stateFile, state);
+      result.delivered++;
     }
     save(stateFile, state);
   } catch { fail(); }

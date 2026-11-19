@@ -56,6 +56,8 @@ export function deriveActions(events, timeline = []) {
   for (const [rows, prefix] of [[events, 'daemon-events'], [timeline, 'timeline']]) {
     for (const [i, row] of rows.entries()) {
       if (!object(row)) return null;
+      if (row.kind === 'expectation-missed') continue; // our own output is never a trigger
+
       const action = row.detail?.action ?? row.action ?? row.kind;
       if (!ACTIONS.has(action)) continue;
       const item = { pr: row.pr, sha: row.sha ?? row.detail?.sha ?? row.detail?.head,

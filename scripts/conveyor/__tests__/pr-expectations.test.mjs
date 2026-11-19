@@ -118,13 +118,18 @@ test('off performs no IO; replay paths are mandatory, distinct and cannot alias 
   await assert.rejects(runExpectationPass({ ...options(paths), env: { WE_DAEMON_EVENTS: link } }), /scratch paths/);
   await assert.rejects(runExpectationCli({ 'as-of': at(1) }), /scratch replay/);
 }));
-test('delivery failure reserves the miss before append and restart does not retry', () => scratch(async paths => {
-  let attempts = 0;
-  const opts = { ...options(paths), emitEvent() { attempts++; return false; } };
+test('failed delivery is not marked emitted: the next pass retries, then dedupes', () => scratch(async paths => {
+  let attempts = 0; let ok = false;
+  const opts = { ...options(paths), emitEvent() { attempts++; return ok; } };
   assert.equal((await runExpectationPass(opts)).incomplete, true);
+  ok = true;
+  assert.equal((await runExpectationPass(opts)).delivered, 1);
   assert.equal((await runExpectationPass(opts)).delivered, 0);
-  assert.equal(attempts, 1);
+  assert.equal(attempts, 2);
 }));
+test('own expectation-missed events are never triggers; unrelated checks are not review', () => {
+  assert.deepEqual(deriveActions([{ kind: 'expectation-missed', pr: 1, detail: { action: 'worker-push', sha, at: at(0) }, at: at(0) }]), []);
+});
 
 function githubRead() {
   const calls = [];
