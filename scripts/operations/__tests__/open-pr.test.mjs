@@ -429,7 +429,7 @@ describe('classifySubmit — refused and could-not-run are different facts', () 
       expect(r.outcome).toBe('unrun');
       expect(r.outcome).not.toBe('refused');
     }
-    expect(SUBMIT_OUTCOMES).toEqual(['opened', 'refused', 'unrun']);
+    expect(SUBMIT_OUTCOMES).toEqual(['opened', 'refused', 'unrun', 'checked', 'queued']);
   });
 
   // The no-credential case specifically: it must never read as an open, and never as a refusal to fix.

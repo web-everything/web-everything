@@ -1,6 +1,8 @@
 import { vi, it, expect, describe } from 'vitest';
 
 
+vi.mock('../../lib/pr-limit-queue.mjs', () => ({ drainPrLimitQueue: vi.fn() }));
+
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execFileSync: vi.fn(),
 }));
@@ -2270,4 +2272,17 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+
+it('pr-limit queue drains once per writable tick, never during read-only planning; failures are best-effort', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const drainQueue = vi.fn(() => { throw new Error('queue unavailable'); });
+  const input = { readPrs: () => [], readAgents: () => [], drainQueue, readFreeze: () => null,
+    readPriority: () => null, stepLog: () => {} };
+  expect(() => runReconcilePass(input)).not.toThrow();
+  expect(drainQueue).toHaveBeenCalledOnce();
+  expect(drainQueue.mock.calls[0][0]).toMatchObject({ repoKey: 'we' });
+  runReconcilePass({ ...input, readOnly: true });
+  expect(drainQueue).toHaveBeenCalledOnce();
 });

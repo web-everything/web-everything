@@ -4803,3 +4803,16 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Open-pr preflight and capacity queue
+
+`open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards,
+writing bypass receipts or modifying the PR-limit queue. `pr-land-preflight.test.mjs` runs the actual CLI with
+read-only gate/forge ports replaced and records push/create/card effects. A real refusal uses the same checkpoint.
+Park opens ready for review; draft-promotion still handles older drafts.
+
+The PR-limit queue is capped at 1000 entries and 16 MiB, with atomic writes under a shared file lock.
+Corrupt or oversized state is retained for operator inspection: drain or dequeue old entries, then retry open-pr.
+Drains check the exact remote SHA and existing PRs before create, retain unknown evidence, and process at most ten
+entries per invocation. `pr-limit-queue.test.mjs` covers corruption, capacity, stale heads and persistence;
+`open-pr-audit-gate.test.mjs` covers aggregation and an unconfirmed check child.

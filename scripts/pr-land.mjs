@@ -49,8 +49,8 @@
  *   node scripts/pr-land.mjs --ref=lane/2153-… --base=main --method=merge # method ∈ merge|squash|rebase (default merge; the drain wants --no-ff history)
  *   node scripts/pr-land.mjs --ref=lane/… --label-on-green                 # PRODUCER mode (#2199): open, WAIT for required checks, label ready-to-merge ONLY when green, hand merge to the drain
  *   node scripts/pr-land.mjs --ref=lane/… --no-wait                       # open the PR UNLABELLED, don't wait/merge (CI unconfirmed — the drain won't collect it until labelled)
- *   node scripts/pr-land.mjs --ref=lane/… --park=review:human            # PARK mode (#2622): open the PR WITH the review label already on it and STOP (no wait, no ready-to-merge, no drain) — the first-class held-for-review open, replacing the hash-stranding `gh pr create` bypass. DRAFT BY DEFAULT (draft-first PRs, operator-approved 2026-09-27): the review label sits on it, but nothing dispatches a review until the daemon un-drafts it on green CI (`gh pr ready`, `scripts/conveyor/reconcile-core.mjs`'s `promote-draft`)
- *   node scripts/pr-land.mjs --ref=lane/… --park=review:human --no-draft # same, but opened READY FOR REVIEW immediately (opt-out for a human-opened or otherwise special-cased park — #2622's original behavior)
+ *   node scripts/pr-land.mjs --ref=lane/… --park=review:human            # PARK mode (#2622): open the PR WITH the review label already on it and STOP (no wait, no ready-to-merge, no drain) — the first-class held-for-review open, replacing the hash-stranding `gh pr create` bypass. READY for review with the park label.
+ *   node scripts/pr-land.mjs --ref=lane/… --park=review:human --no-draft # same; --no-draft is accepted as a harmless no-op
  *   node scripts/pr-land.mjs --ref=lane/… --dry-run                       # print the exact gh command sequence, execute nothing
  *   node scripts/pr-land.mjs --ref=lane/… --fallback-git                  # on gh failure / unmergeable, local git-merge + push instead
  *   node scripts/pr-land.mjs --ref=lane/… --no-heal                       # skip the post-land id-collision self-heal (#2071)
@@ -89,6 +89,8 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
+import { blocker, formatBlockers, mergeBlockers } from './lib/open-pr-preflight.mjs';
+import { enqueue, drainPrLimitQueue } from './lib/pr-limit-queue.mjs';
 import { createSizeAdmissionRunner } from './lib/pr-size-admission.mjs';
 
 /** Shared, injected admission for direct and operation-based producers. */
@@ -179,7 +181,8 @@ const BASE = typeof flags.base === 'string' ? flags.base : 'main';
 const REMOTE = typeof flags.remote === 'string' ? flags.remote : 'origin';
 const METHOD = typeof flags.method === 'string' ? flags.method : 'merge';
 const WAIT = !flags['no-wait'];
-const DRY_RUN = !!flags['dry-run'];
+const CHECK = !!flags.check;
+const DRY_RUN = !!flags['dry-run'] && !CHECK;
 const FALLBACK_GIT = !!flags['fallback-git'];
 const AS_JSON = !!flags.json;
 // #2833 — the lane-verification finish-guard. #3321 INVERTED WHO HAS TO SPEAK UP. This comment used to read
@@ -309,20 +312,7 @@ const LABEL_ON_GREEN = !!flags['label-on-green'];
 // honours is logged with actor + reason, and an unstated one would be the sole silently-unaccountable override.
 const FORCE_OPEN = !!flags['force-open'];
 const FORCE_OPEN_REASON = typeof flags.reason === 'string' ? flags.reason : null;
-// draft-first PRs (operator-approved, 2026-09-27) — a `--park`-ed PR (the agent-opened default, #2622) is
-// what applies a review label AT OPEN with no CI confirmed yet — measured live: 6 of 26 PRs opened overnight
-// failed their OWN FIRST CI run, and every one of them still got a full independent review (~12 min each,
-// several re-reviewed after their fix), because the review daemon dispatches off the `review:*` label alone
-// and never asked whether CI had even run yet. `--no-draft` is the explicit opt-out (mirrors `--no-label`/
-// `--no-heal`'s naming) for a human-opened or otherwise special-cased `--park` call that WANTS review to start
-// immediately. Scoped to `park` ONLY (applied where `PLAN.mode === 'park'` below): `land`/`label-on-green`
-// already never apply a review label until AFTER their own green-wait poll loop breaks (see `pollVerdict`'s
-// docblock) — those two modes never had this bug, and `pollVerdict` has no `'DRAFT'` branch, so opening a
-// `land`/`label-on-green` PR as a draft would spin its poll loop to timeout on GitHub's own `mergeStateStatus:
-// 'DRAFT'` (neither `CLEAN`/`UNSTABLE` nor `BEHIND`) instead of ever landing. The daemon (never pr-land) is
-// what un-drafts it: `scripts/conveyor/reconcile-core.mjs`'s new `promote-draft` dispatch calls `gh pr ready`
-// once the PR's required checks are ALL green, which is what lets the review daemon dispatch a review at all
-// (its own new `isDraft` gate in `dispatchReviewRow` refuses one on any draft PR, whatever label it carries).
+// Park opens ready for review with its park label. --no-draft remains a harmless compatibility flag.
 const DRAFT_OPT_OUT = !!flags['no-draft'];
 
 // ── PURE helpers (unit-tested in scripts/__tests__/pr-land.test.mjs) ──────────────────────────────────
@@ -357,28 +347,9 @@ export function planPrLand({ wait, labelOnGreen, park } = {}) {
  *  review is owed). Sourced from `REVIEW_LABELS` so the names never drift from the escalation module. */
 export const PARK_LABELS = Object.freeze([REVIEW_LABELS.human, REVIEW_LABELS.pending]);
 
-/**
- * #draft-first-prs (operator-approved 2026-09-27) — whether THIS create should carry `--draft`. Pure.
- *
- * SCOPED TO `park` ONLY, DELIBERATELY. `park` is the ONE mode that applies a `review:*` label at OPEN, before
- * any CI has run at all (`planPrLand`'s own docblock: "no green-wait, no ready-to-merge") — measured live:
- * 6 of 26 PRs opened overnight failed their OWN first CI run, and every one still got a full independent
- * review, because the review daemon dispatches off the label alone. `land`/`label-on-green` never had this
- * bug: both apply their review-escalation label only AFTER their own green-wait poll loop already broke
- * (see `pollVerdict`'s own docblock) — CI has always finished by then. Opening either of THOSE as a draft
- * would additionally break: `pollVerdict` has no `'DRAFT'` branch, so GitHub's own `mergeStateStatus: 'DRAFT'`
- * would fall to `'wait'` and spin the poll loop to its timeout instead of ever landing.
- * @param {{mode:string, optOut:boolean}} o
- * @returns {boolean}
- */
-export function resolveDraft({ mode, optOut, ref = '', title = '', readyOnOpen = false }) {
-  // R502 item 2 (#6323, #6330, #6341, #6339/#6343): an operator-pre-approved or guard-config-only PR opened as a
-  // draft and the review daemon never picked it up, so it needed a hand `gh pr ready`. See decideReadyOnOpen.
-  if (readyOnOpen) return false;
-  // Card xu1nixv (incident 2026-10-08: #4522, the fix for red main, opened as a draft and sat refused "still a
-  // draft" while main stayed red) — a PR that fixes red main opens READY: it is the one PR that cannot wait.
-  if (isMainFixPr({ ref, title })) return false;
-  return mode === 'park' && !optOut;
+/** Park opens READY for review with the park label; optOut/--no-draft is a compatibility no-op. */
+export function resolveDraft(_options = {}) {
+  return false;
 }
 
 /** R502 item 2 — does this PR skip the draft step? Fail closed; BOTH conditions are required: an
@@ -810,6 +781,11 @@ async function runCli() {
   // any OTHER (rogue/buggy) push to main stays blocked. The initial lane/* push does NOT use this (not main).
   const gitPushMain = (args) => execFileSync('git', ['push', ...args], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, MAIN_PUSH_OK: '1' } }).toString().trim();
   const tryGit = (args) => { try { return gitC(args); } catch { return null; } };
+  if (!DRY_RUN && !CHECK) {
+    try { drainPrLimitQueue(); } catch { /* best-effort: queue failure never fails this run */ }
+  }
+  const blockers = [];
+  const collect = (gate, reason, detail, sha) => blockers.push(blocker(gate, reason, detail, sha));
   const forge = createGhLandProvider({ cwd: REPO }); // #3585 — every bare `gh` call below goes through this port
 
   // #2290 — the single-couple FAST DRAIN pr-land shells after labelling green so /pr still feels instant. The
@@ -929,7 +905,9 @@ async function runCli() {
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
 
-  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha }, { refuse: emit });
+  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, ...(CHECK ? { fetchMain: () => {} } : {}) }, {
+    refuse: DRY_RUN ? emit : result => collect('canonical-audit', result.reason, result.detail, refSha),
+  });
 
   // Derive a title when none was passed: `--fill` can't autofill for a lane/* head (it's remote-only, so
   // gh can't diff it locally). Use the source commit's subject — a meaningful, always-available title —
@@ -940,16 +918,15 @@ async function runCli() {
   // ONE source of truth for the create params — the dry-run render below still needs the built ARGV (via
   // buildCreateArgs directly, nothing is executed there), while the real create goes through the port with
   // these same semantic params so the two never drift apart.
-  // draft-first PRs — scoped to `park` only; see `DRAFT_OPT_OUT`'s own comment for why `land`/`label-on-green`
-  // are excluded (their poll loop has no `'DRAFT'` branch and would spin to timeout).
+  // All modes open ready for review; parked PRs carry their review hold label.
   let readyOnOpen = false;
   try {
     // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
     const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
     let changedFiles = [];
-    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* fail closed: stays a draft */ }
+    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* classification unavailable */ }
     readyOnOpen = decideReadyOnOpen({ body: CREATE_BODY, changedFiles, guardConfigPaths }).ready;
-  } catch { /* fail closed: stays a draft */ }
+  } catch { /* classification unavailable */ }
   const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
   // Existing PRs keep their title even when their latest commit is a merge/repair. Only CREATE (or its
   // dry-run preview) reads this getter, so absent title metadata cannot block landing an existing PR.
@@ -1059,7 +1036,7 @@ async function runCli() {
       CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);
       if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · ${deferredOpen.disclosure} - opening only; ready-to-merge needs a green CI test check on ${refSha.slice(0, 8)}\n`);
     } else if (!verdict.ok) {
-      emit({ repo: REPO, merged: false, reason: verdict.reason, ref: REF, sha: refSha, verifyStatus: verdict.status, detail: `refusing to land ${REF} — ${verdict.detail} (${BASE} left untouched; this is #2833's stall guard)` }, 3);
+      collect('verify', verdict.reason, verdict.detail);
     }
   }
 
@@ -1084,7 +1061,7 @@ async function runCli() {
     if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · locus-prefix range sweep ran and is clean (${LOCUS_RANGE})\n`);
   }
   catch (e) {
-    if (e && e.status === 2) emit({ repo: REPO, merged: false, reason: 'locus-prefix', detail: `bare code-path ref(s) without a <repo>: prefix in this lane's corpus changes (#883/#2331 — the #2170 review-append leak) — prefix them (e.g. "foo.ts" → "we:foo.ts"), \`git commit --amend\`, and re-run; refusing to open a PR CI would fail` }, 3);
+    if (e && e.status === 2) collect('locus-prefix', 'locus-prefix', `bare code-path ref(s) without a <repo>: prefix in this lane's corpus changes (#883/#2331 — the #2170 review-append leak) — prefix them (e.g. "foo.ts" → "we:foo.ts"), \`git commit --amend\`, and re-run; refusing to open a PR CI would fail`);
     if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · locus-prefix range sweep DID NOT RUN over ${LOCUS_RANGE} in ${REPO} — this lane's corpus changes were NOT checked here (${String(e.message || e).split('\n')[0]}); CI still backstops it\n`);
   }
 
@@ -1094,19 +1071,45 @@ async function runCli() {
   {
     // `REPO` is the resolved checkout PATH (never a slug); read the URL of the remote this run actually pushes to.
     const refusal = pushRefusal({ repo: repoKeyForCheckout(REPO, { remote: REMOTE }), branch: REF, ...callerIdentity() });
-    if (refusal) emit({ repo: REPO, merged: false, reason: 'fix-claimed', ref: REF, pr: refusal.pr, holder: refusal.holder, detail: refusal.message }, 3);
+    if (refusal) collect('fix-claimed', 'fix-claimed', refusal.message);
   }
 
   // Create only: existing PRs use their live body; lookup failure falls toward checking.
   let existingSoakPr = null;
   try { existingSoakPr = forge.listOpenByHead(REF)?.[0] ?? null; } catch { /* check locally */ }
   if (!existingSoakPr) {
+    const bodyGuard = prCreateBodyGuard(BODY);
+    if (!bodyGuard.ok) collect('body', bodyGuard.code, bodyGuard.reason);
     const soak = soakCreatePrecheck();
-    if (!soak.ok) emit({ repo: REPO, merged: false, reason: 'soak-declaration', ref: REF, detail: soak.message }, 3);
+    if (!soak.ok) collect('soak-declaration', 'soak-declaration', soak.message);
     if (!AS_JSON && !soak.skipped?.startsWith('diff unavailable')) {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: ${soak.skipped || soak.reason}\n`);
     }
   }
+
+  function prLimitDecision() {
+    const repoKeyForLimit = repoKeyForSlug(originSlugOf(REPO)) || 'we';
+    let changedFilesForLimit = [];
+    try { changedFilesForLimit = gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
+    const { count: openCount, limit, excludeCardOnly, cardOnly: cardOnlyExcluded, accepted: acceptedExcluded, stacked: stackedExcluded } = countOpenPrsForRepo(repoKeyForLimit);
+    const limitDecision = decideOpenPr({
+      repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, stackedExcluded, excludeCardOnly, changedFiles: changedFilesForLimit, branch: REF,
+      branchAllowed: isBranchAllowedLive(REF), globalOff: isGlobalOffLive(), forceOpen: FORCE_OPEN, forceReason: FORCE_OPEN_REASON,
+    });
+    return { ...limitDecision, count: openCount, limit };
+  }
+
+  const info = [];
+  if (CHECK && !existingSoakPr) {
+    const decision = prLimitDecision();
+    info.push(`pr-limit: ${decision.allowed ? 'would open' : 'would queue'} (${decision.count ?? '?'}/${decision.limit})`);
+  }
+  const allBlockers = mergeBlockers(blockers);
+  if (allBlockers.length) emit({ repo: REPO, merged: false, ref: REF, sha: refSha,
+    reason: allBlockers[0].reason, blockers: allBlockers, info,
+    detail: [formatBlockers(allBlockers), ...info].join('\n') }, 3);
+  if (CHECK) emit({ repo: REPO, merged: false, reason: 'check-ok', info,
+    detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
   try { gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
@@ -1150,28 +1153,20 @@ async function runCli() {
   }
 
   if (prNum == null) {
-    // #2332 — fail fast BEFORE creating: never open a bodyless PR (the #2324 drain gate would refuse to land
-    // it, stalling the queue for a human to hand-fill the body). Create-path only — an existing PR is exempt.
-    const bodyGuard = prCreateBodyGuard(BODY);
-    if (!bodyGuard.ok) emit({ repo: REPO, merged: false, reason: bodyGuard.code, detail: `${bodyGuard.reason} (head ${REF})` }, 3);
-
     // we:xniq7xs — the open-PR backpressure limit. Too many open PRs is usually a REVIEW-SYSTEM problem
     // (the drain/review pipeline can't keep up), not a build problem, so a NEW PR over the per-repo cap is
     // refused HERE, AFTER the ref is already pushed (step 2 above) — the branch stays pushed; only the
     // `gh pr create` is skipped, exactly like the empty-body guard just above. Never runs for an EXISTING
     // PR (the `else` branch below) — fixing/re-pushing to an already-open PR is never blocked by this.
     {
-      const repoKeyForLimit = repoKeyForSlug(originSlugOf(REPO)) || 'we';
-      let changedFilesForLimit = [];
-      try { changedFilesForLimit = gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
-      const { count: openCount, limit, excludeCardOnly, cardOnly: cardOnlyExcluded, accepted: acceptedExcluded, stacked: stackedExcluded } = countOpenPrsForRepo(repoKeyForLimit);
-      const limitDecision = decideOpenPr({
-        repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, stackedExcluded, excludeCardOnly, changedFiles: changedFilesForLimit, branch: REF,
-        branchAllowed: isBranchAllowedLive(REF), globalOff: isGlobalOffLive(), forceOpen: FORCE_OPEN, forceReason: FORCE_OPEN_REASON,
-      });
-      if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · pr-limit(${repoKeyForLimit}): ${limitDecision.reason}\n`);
+      const limitDecision = prLimitDecision();
+      if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · pr-limit: ${limitDecision.reason}\n`);
       if (!limitDecision.allowed) {
-        emit({ repo: REPO, merged: false, reason: 'pr-limit', detail: `${limitDecision.reason} (ref ${REF} left pushed on ${REMOTE} — re-run pr-land once the count drops, or use one of the overrides named above)` }, 3);
+        enqueue({ repoSlug: originSlugOf(REPO), ref: REF, sha: refSha, base: BASE,
+          title: createParams.title, body: createParams.body, draft: false,
+          parkLabel: PLAN.parkLabel || 'review:pending' });
+        emit({ repo: REPO, merged: false, reason: 'pr-limit-queued', ref: REF, sha: refSha,
+          detail: 'queued: opens automatically when a slot frees' }, 0);
       }
     }
 
