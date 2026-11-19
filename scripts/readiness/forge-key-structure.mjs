@@ -1,4 +1,4 @@
-// One bounded decoding pipeline feeds byte-only DER and parsed-JSON detectors.
+// One bounded decoding pipeline feeds byte-only DER, armor/magic and JWK member detectors.
 // Exhaustion refuses remote admission; the operator can inspect the file and run locally.
 //
 // ROLE: this is a TRIPWIRE, not the containment boundary. It catches common and nested encodings of private keys
@@ -6,6 +6,7 @@
 // RESIDUAL: Keys hidden by junk padding over 50%, custom encodings, or other obfuscation are NOT detected;
 // containment is the allowlist manifest (S1/S2) plus read-deny on credential stores.
 // See designs/forge-allowlist-manifest.md (S1: only tracked files at HEAD; S2: only pushed commits).
+// Ordinary binary and JSON fixtures are pinned at 1 MiB; larger blobs may exhaust the shared work budget.
 const LIMITS={bytes:32*1024*1024,candidates:16384,depth:8,steps:4*1024*1024,derDepth:64,jsonDepth:64};
 // Reserve the initial candidate and conservatively allow one counted unit per
 // input byte. This bounds bytes, candidates and ticks by their smallest budget.
@@ -127,12 +128,28 @@ function afterTrivia(text,index) {
   return text.length;
 }
 
+// Decode literals without evaluating JavaScript. The single-quote form covers JSON5 and util.inspect output.
+function stringValue(token) {
+  if(token[0]!=='"'&&token[0]!=="'")return null;
+  return token.slice(1,-1).replace(/\\(?:u([\da-f]{4})|x([\da-f]{2})|\r\n|([\s\S]))/gi,(_,unicode,hex,char)=>{
+    if(unicode||hex)return String.fromCharCode(parseInt(unicode||hex,16));
+    return ({n:'\n',r:'\r',t:'\t',b:'\b',f:'\f',v:'\v','0':'\0','\n':'','\r':'','\u2028':'','\u2029':''})[char]??char;
+  });
+}
+
+function startsObjectMember(text,index) {
+  const start=afterTrivia(text,index);
+  if(start<0)return false;
+  const member=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|(?:[A-Za-z_$]|\\u[\da-f]{4})(?:[\w$]|\\u[\da-f]{4})*/iy;
+  member.lastIndex=start;
+  return member.test(text)&&text[afterTrivia(text,member.lastIndex)]===':';
+}
+
 function jwkFinding(bytes) {
   const text=bytes.toString('utf8');
   if(!text.trimStart().startsWith('{'))return false;
   let depth=0,key=null,pending=null,anyKty=false,octKty=false,oct=false,priv=false;
-  const decoded=token=>{try {return JSON.parse(token);} catch {return '';}};
-  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]:,]/g)) {
+  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|(?:[A-Za-z_$]|\\u[\da-f]{4})(?:[\w$]|\\u[\da-f]{4})*|[{}\[\]:,]/gi)) {
     const token=match[0];
     if(token[0]==='/')continue;
     if(token==='{'||token==='[') {
@@ -144,16 +161,17 @@ function jwkFinding(bytes) {
       }
       depth++;
     }
-    else if(token==='}'||token===']')depth--;
+    // Only this object's members belong together. Canonicalization visits later and nested objects separately.
+    else if(token==='}'||token===']') {if(--depth===0)break;}
     else if(depth!==1)continue;
     else if(token===':') {key=pending;pending=null;}
     else if(token===',') {key=pending=null;}
-    else if(key===null)pending=decoded(token);
+    else if(key===null)pending=stringValue(token)??token.replace(/\\u([\da-f]{4})/gi,(_,hex)=>String.fromCharCode(parseInt(hex,16)));
     else {
-      const value=decoded(token);
+      const value=stringValue(token);
       if(key==='kty'&&typeof value==='string') {anyKty=true;octKty||=value==='oct';}
-      else if(value.length>0&&key==='k')oct=true;
-      else if(value.length>0&&['d','p','q','dp','dq','qi'].includes(key))priv=true;
+      else if(value?.length>0&&key==='k')oct=true;
+      else if(value?.length>0&&['d','p','q','dp','dq','qi'].includes(key))priv=true;
       key=null;
     }
   }
@@ -162,10 +180,12 @@ function jwkFinding(bytes) {
 
 // Syntax that can yield another supported representation; byte detection precedes this filter.
 function encodedText(text) {
-  return (text.includes('{')&&text.includes('}')&&text.includes('"'))
-    ||(text.includes('[')&&text.includes(']'))
-    ||(text.includes('"')&&text.includes('\\'))
-    ||(text.match(/[\[{]/g)?.length??0)>=64
+  // Require a plausible representation prefix, rather than unrelated punctuation
+  // anywhere in a binary/UTF-16 view. Detectors have already visited its bytes.
+  return /\{\s*(?:["'/]|[A-Za-z_$]|\\u[\da-f]{4})/.test(text)
+    ||/\[\s*(?:[\[\]{"'/\d-]|true\b|false\b|null\b)/.test(text)
+    ||/\\(?:["'\\/bfnrtv0]|u[\da-f]{4}|x[\da-f]{2})/i.test(text)
+    ||/[\[{](?:\s*[\[{]){63}/.test(text)
     ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
     ||/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)
     // Lenient base64 ignores every non-alphabet character (whitespace and punctuation alike), so the gate does too.
@@ -183,16 +203,16 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
   const stack=[],visited=new Set();
-  const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g
-    :/"(?:\\[\s\S]|[^"\\])*"|[{}\[\]\ufffd]/g;
+  const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g
+    :/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|[{}\[\]\ufffd]/g;
   for(const match of text.matchAll(tokens)) {
     tick();
     const token=match[0];
     // A comment body is already unwrapped. URLs inside it are not more comment layers.
     if(token[0]==='/')emit(Buffer.from(token.replace(/^\/\/|^\/\*|\*\/$/g,'')),{comments:false,utf16,layer:false});
-    else if(token[0]==='"') {
+    else if(token[0]==='"'||token[0]==="'") {
       if(token.includes('\\')) {
-        try {emit(Buffer.from(JSON.parse(token)));} catch(error) {if(error===EXHAUSTED||error===FINDING)throw error;}
+        emit(Buffer.from(stringValue(token)));
       }
     // Broken UTF-8 outside strings cannot extend a JSON container's scope.
     } else if(token==='\ufffd')stack.length=0;
@@ -201,7 +221,8 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       // Incomplete JSON-shaped nesting still reaches the fail-closed bound.
       let next=match.index+1;
       while(next<text.length&&/\s/.test(text[next]))next++;
-      if(!(token==='{'?/^["}/]/:/^[\[\]{"/\d-]|^(?:true|false|null)\b/).test(text.slice(next,next+5))) {
+      if(!(token==='{'?(text[next]==='}'||startsObjectMember(text,next))
+        :/^[\[\]{"'/\d-]|^(?:true|false|null)\b/.test(text.slice(next,next+5)))) {
         stack.length=0;continue;
       }
       if(stack.length>=64)throw EXHAUSTED;
@@ -217,14 +238,14 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
   if(/kty|\\u/i.test(text)) {
-    const pieces=/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
+    const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
       if(visited.has(at))continue;
-      // A JWK object opens with a quoted member name (after optional whitespace or comments).
+      // A JWK object opens with a quoted or identifier member name after optional whitespace or comments.
       // No lookahead bound: whitespace or comments of any length between the brace and the name must not hide it.
-      if(text[afterTrivia(text,at+1)]!=='"')continue;
+      if(!startsObjectMember(text,at+1))continue;
       tick();
       const limit=Math.min(text.length,at+65536);
       let depth=0,closed=false;
@@ -368,11 +389,16 @@ export function keyStructureFinding(buffer,{precheck=true}={}) {
   const add=(bytes,depth,options={})=>{
     tick();
     if(bytes.length>LIMITS.bytes)throw EXHAUSTED;
-    const identity=bytes.toString('base64')+':'+(options.comments!==false)+':'+(options.utf16!==false);
+    const identity=bytes.toString('base64')+':'+(options.comments!==false)+':'+(options.utf16!==false)+':'+(options.expand!==false);
     if(!bytes.length||seen.has(identity))return;
+    // Repeated terminal/container views consume work only once too. Keep the
+    // expansion mode distinct so detection-only visits cannot suppress decoding.
+    seen.add(identity);
     if((total+=bytes.length)>LIMITS.bytes)throw EXHAUSTED;
     // Every decoded view reaches the byte detectors, including views with no more encodings.
-    if(derFinding(bytes,tick)||jwkFinding(bytes))throw FINDING;
+    if(bytes.includes(Buffer.from(['openssh','key','v1'].join('-')+'\0'))
+      ||/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/.test(bytes.toString('utf8'))
+      ||derFinding(bytes,tick)||jwkFinding(bytes))throw FINDING;
     if(options.expand===false)return;
     // The shortest DER structure is eight bytes (already detected above); its
     // shortest supported text encoding is eleven base64 characters. This bounds
@@ -383,7 +409,7 @@ export function keyStructureFinding(buffer,{precheck=true}={}) {
     // retain/redecode them as candidates, but still scan them above for embedded DER/JWKs.
     if(!encodedText(text)&&!(options.utf16!==false&&bytes.includes(0)))return;
     if(depth>LIMITS.depth||queue.length>=LIMITS.candidates)throw EXHAUSTED;
-    seen.add(identity);queue.push({bytes,depth,options});
+    queue.push({bytes,depth,options});
   };
   try {
     add(buffer,0);

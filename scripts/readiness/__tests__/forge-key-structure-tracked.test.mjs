@@ -1,5 +1,6 @@
 // @vitest-environment node
 import {readFileSync} from 'node:fs';
+import {createHash} from 'node:crypto';
 import {describe,expect,it} from 'vitest';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
 import {credentialBufferFinding} from '../forge-exec-manifest.mjs';
@@ -26,6 +27,29 @@ const fixtures=[
   'design-refs/items/253b45a916c9cfe2/screenshot.webp',
 ];
 describe('Forge key structure tracked fixture sources',()=>{
+  it('admits ordinary binary and JSON fixtures at the documented 1 MiB ceiling',()=>{
+    const ceiling=1024*1024;
+    const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
+    const row=JSON.stringify({title:'ordinary documentation',count:123});
+    const rows='['+Array.from({length:Math.floor((ceiling-2)/(row.length+1))},()=>row).join(',')+']';
+    const json=Buffer.from(rows.padEnd(ceiling,' '));
+    for(const content of [binary,json]) {
+      expect(content.length).toBe(ceiling);
+      expect(keyStructureFinding(content)).toBeNull();
+      expect(credentialBufferFinding(content)).toBeNull();
+    }
+  });
+  it.each(['DER','JWK','UTF-16LE','UTF-16BE'])('still detects embedded %s in 1 MiB binary views',format=>{
+    const ceiling=1024*1024;
+    const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
+    const jwk=JSON.stringify({['k'+'ty']:'oct',k:'a'});
+    const payload={DER:Buffer.from([48,6,2,1,1,4,1,7]),JWK:Buffer.from(jwk),
+      'UTF-16LE':Buffer.from(jwk,'utf16le'),'UTF-16BE':Buffer.from(jwk,'utf16le').swap16()}[format];
+    const content=Buffer.from(binary);
+    payload.copy(content,ceiling/2);
+    expect(keyStructureFinding(content)).toBe('private-key-structure');
+    expect(credentialBufferFinding(content)).toBe('private-key-structure');
+  });
   it.each(fixtures)('adds no finding over ordinary tracked fixture source %s',file=>{
     const content=readFileSync(file);
     expect(keyStructureFinding(content)).toBeNull();
