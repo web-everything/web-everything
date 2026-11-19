@@ -592,11 +592,15 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
       if (accepted) {
         expect(match).toMatchObject({ match: 'superseded', retired: [ref], adopt: { finalSha: candidate } });
         expect(result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'superseded' });
+      } else if (options.registered) {
+        // Adopt the build that passed, then add: the overlay is registered again, so the next rebuild carries it.
+        expect(match).toMatchObject({ match: 'superseded', adopt: { finalSha: candidate }, rebuildAfter: [ref] });
+        expect(result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'superseded' });
       } else {
         expect(match).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${ref}`, omitted: [ref] });
         expect(result.reason).not.toBe('ready-adopted');
       }
-      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(accepted ? candidate : liveHead);
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(accepted || options.registered ? candidate : liveHead);
       expect(noSmoke).not.toHaveBeenCalled();
     } finally { matching.mockRestore(); }
   });
