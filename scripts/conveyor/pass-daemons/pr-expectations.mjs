@@ -62,6 +62,9 @@ export function deriveActions(events, timeline = []) {
       if (!ACTIONS.has(action)) continue;
       const item = { pr: row.pr, sha: row.sha ?? row.detail?.sha ?? row.detail?.head,
         action, at: row.at, source: row.source ?? `${prefix}:${i + 1}` };
+      // An event with no head sha at all (e.g. the merger's pr-merged) cannot bind to a head: ignore it,
+      // never let one ordinary event blind the whole log. A present-but-malformed sha still reads unknown.
+      if (item.sha === undefined && Object.values(REACTIONS).flat(2).includes(action)) continue;
       if (!validObservation(item)) return null;
       out.push(item);
     }

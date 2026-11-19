@@ -129,6 +129,10 @@ test('failed delivery is not marked emitted: the next pass retries, then dedupes
   assert.equal((await runExpectationPass(opts)).delivered, 0);
   assert.equal(attempts, 2);
 }));
+test('an event with no sha (pr-merged) is ignored; a malformed sha still reads unknown', () => {
+  assert.deepEqual(deriveActions([{ kind: 'pr-merged', pr: 5, at: at(0) }]), []);
+  assert.equal(deriveActions([{ kind: 'pr-merged', pr: 5, sha: 'zz', at: at(0) }]), null);
+});
 test('own expectation-missed events are never triggers; unrelated checks are not review', () => {
   assert.deepEqual(deriveActions([{ kind: 'expectation-missed', pr: 1, detail: { action: 'worker-push', sha, at: at(0) }, at: at(0) }]), []);
 });
