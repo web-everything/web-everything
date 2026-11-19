@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { netDiffFingerprint, carriesAcross } from '../net-diff-fingerprint.mjs';
 
 let dir; const git = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -53,11 +53,73 @@ describe('netDiffFingerprint / carriesAcross', () => {
     const fe = netDiffFingerprint(dir, 'main', S.fe), ff = netDiffFingerprint(dir, 'main', S.ff);
     expect(fe).toMatch(/^[0-9a-f]{64}$/); expect(carriesAcross(fe, ff)).toBe(false);
   });
-  it('asks git for a diff no text converter or submodule setting can hide', () => {
-    const calls = []; const exec = (c, a, o) => { calls.push(a); return execFileSync(c, a, o); };
-    netDiffFingerprint(dir, 'main', S.A, { exec });
+  it('isolates every Git call from replacement objects and grafts and preserves all diff protections', () => {
+    const calls = []; let graft;
+    const exec = (c, a, o) => {
+      calls.push(a);
+      expect(a.slice(0, 3)).toEqual(['-C', dir, '--no-replace-objects']);
+      expect(o.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+      graft = o.env.GIT_GRAFT_FILE;
+      expect(existsSync(dirname(graft))).toBe(true);
+      expect(existsSync(graft)).toBe(false);
+      return execFileSync(c, a, o);
+    };
+    expect(netDiffFingerprint(dir, 'main', S.A, { exec })).toMatch(/^[0-9a-f]{64}$/);
+    expect(calls.map(a => a[3])).toEqual(['rev-parse', 'rev-parse', 'merge-base', 'diff']);
     const diff = calls.find((a) => a.includes('diff'));
-    expect(diff).toEqual(expect.arrayContaining(['--no-ext-diff', '--no-textconv', '--ignore-submodules=none']));
+    expect(diff).toEqual(expect.arrayContaining(['--no-relative', '--text', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options']));
+    expect(existsSync(dirname(graft))).toBe(false);
+  });
+  it('diff.relative=true from a subdirectory cannot omit changes outside that directory', () => {
+    const expected = netDiffFingerprint(dir, S.base, S.A);
+    expect(expected).toMatch(/^[0-9a-f]{64}$/);
+    git('config', 'diff.relative', 'true');
+    try {
+      expect(netDiffFingerprint(join(dir, 'scripts'), S.base, S.A)).toBe(expected);
+    } finally { git('config', '--unset', 'diff.relative'); }
+  });
+  it('binary attributes and an external diff driver cannot hide changed text', () => {
+    const expected = netDiffFingerprint(dir, S.base, S.A);
+    expect(expected).toMatch(/^[0-9a-f]{64}$/);
+    writeFileSync(join(dir, '.git/info/attributes'), '*.mjs binary\n');
+    try {
+      expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected);
+      writeFileSync(join(dir, '.git/info/attributes'), '*.mjs diff=hidden\n');
+      git('config', 'diff.hidden.command', 'false');
+      expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected);
+    } finally {
+      rmSync(join(dir, '.git/info/attributes'), { force: true });
+      git('config', '--unset', 'diff.hidden.command');
+    }
+  });
+  it('replace refs and repository or inherited grafts cannot change the fingerprint', () => {
+    const expected = netDiffFingerprint(dir, S.base, S.A);
+    expect(expected).toMatch(/^[0-9a-f]{64}$/);
+    git('replace', S.A, S.base);
+    try { expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected); }
+    finally { git('replace', '-d', S.A); }
+    const graft = join(dir, '.git/info/grafts');
+    const inherited = process.env.GIT_GRAFT_FILE;
+    writeFileSync(graft, `${S.A}\n`);
+    try {
+      expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected);
+      process.env.GIT_GRAFT_FILE = graft;
+      expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected);
+    } finally {
+      if (inherited === undefined) delete process.env.GIT_GRAFT_FILE;
+      else process.env.GIT_GRAFT_FILE = inherited;
+      rmSync(graft, { force: true });
+    }
+  });
+  it('Git failure returns no carry evidence and removes the graft scratch directory', () => {
+    let scratch;
+    const fingerprint = netDiffFingerprint(dir, S.base, S.A, { exec: (_c, _a, options) => {
+      scratch = dirname(options.env.GIT_GRAFT_FILE);
+      throw new Error('unreadable git');
+    } });
+    expect(fingerprint).toBeNull();
+    expect(existsSync(scratch)).toBe(false);
+    expect(carriesAcross(fingerprint, 'a'.repeat(64))).toBe(false);
   });
   it('unreadable fingerprints never carry', () => {
     const ok = netDiffFingerprint(dir, 'main', S.A);

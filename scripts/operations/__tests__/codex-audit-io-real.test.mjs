@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
-import { main, QUESTION_HASH } from '../codex-audit.mjs';
+import { main, QUESTION_HASH, REVIEW_COMMAND } from '../codex-audit.mjs';
 
 describe('codex-audit real IO', () => {
   it('resolves a branch and commit SHA to the full 40-hex commit in a real repo', async () => {
@@ -46,7 +46,7 @@ describe('codex-audit real IO', () => {
       const code = await main([`--base=${current}`, `--head=${current}`, '--ref=lane/audit', '--converge'], {
         ...deps,
         readRecords: () => [{ at: '2026-11-17T00:00:00Z', base, head: prior, ref: 'lane/audit',
-          questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: ['guard.mjs:1 gap'] }],
+          mode: 'full', reviewCommand: REVIEW_COMMAND, questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: ['guard.mjs:1 gap'] }],
         now: () => '2026-11-18T00:00:00Z', appendRecord: () => {}, stdout: () => {}, stderr: () => {},
         runCodex: prompt => {
           const command = prompt.split('\n').find(line => line.startsWith('git --no-replace-objects diff '));
@@ -118,7 +118,7 @@ describe('codex-audit real IO', () => {
       const errors = [];
       const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
         readRecords: () => [{ at: '2026-11-17T00:00:00Z', base, head: prior, ref: 'lane/audit',
-          questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [] }],
+          mode: 'full', reviewCommand: REVIEW_COMMAND, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [] }],
         runCodex: () => { throw new Error('must refuse before review'); },
         stderr: text => errors.push(text), stdout: () => {},
       };
@@ -151,7 +151,7 @@ describe('codex-audit real IO', () => {
       const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
         readRecords: () => [[b, a], [c, d]].map(([base, head]) => ({
           at: '2026-11-17T00:00:00Z', base, head, ref: 'lane/audit',
-          questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [],
+          mode: 'full', reviewCommand: REVIEW_COMMAND, questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [],
         })),
         runCodex: () => { reviews++; return 'NOT WEAKENED'; },
         stderr: text => errors.push(text), stdout: () => {},

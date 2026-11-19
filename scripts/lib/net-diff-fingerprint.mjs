@@ -9,6 +9,9 @@
  *   never carries.
  */
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { normalizeDiffFingerprint } from './review-escalation.mjs';
 
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/@^~-]*$/;
@@ -19,9 +22,15 @@ const FP = /^[0-9a-f]{64}$/i;
  * @returns {string|null}
  */
 export function netDiffFingerprint(repo, base, head, { exec = execFileSync } = {}) {
+  let scratch;
   try {
     if (typeof repo !== 'string' || !repo || !REF.test(String(base ?? '')) || !REF.test(String(head ?? ''))) return null;
-    const raw = (args) => exec('git', ['-C', repo, ...args], { encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 });
+    // A fresh directory guarantees the graft file is absent, including with hostile inherited Git settings.
+    scratch = mkdtempSync(join(tmpdir(), 'net-diff-fingerprint-'));
+    const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: join(scratch, 'no-grafts') };
+    const raw = (args) => exec('git', ['-C', repo, '--no-replace-objects', ...args], {
+      env, encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024,
+    });
     const run = (args) => Buffer.from(raw(args) ?? '').toString('utf8');
     const sha = (rev) => { const s = run(['rev-parse', '--verify', '--end-of-options', `${rev}^{commit}`]).trim(); return /^[0-9a-f]{40,64}$/i.test(s) ? s : null; };
     const headSha = sha(head), baseSha = sha(base);
@@ -29,12 +38,13 @@ export function netDiffFingerprint(repo, base, head, { exec = execFileSync } = {
     const fork = run(['merge-base', '--end-of-options', baseSha, headSha]).split('\n')[0].trim();
     if (!/^[0-9a-f]{40,64}$/i.test(fork)) return null;
     // No external driver, no text conversion, and submodule changes stay visible: nothing may hide a change.
-    const bytes = Buffer.from(raw(['diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options', fork, headSha]) ?? '');
+    const bytes = Buffer.from(raw(['diff', '--no-relative', '--text', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options', fork, headSha]) ?? '');
     let text;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } // valid UTF-8 matches R200's value exactly
     catch { text = `\0latin1\n${bytes.toString('latin1')}`; } // invalid bytes stay distinct (a lossy decode would merge 0xFE and 0xFF)
     return normalizeDiffFingerprint(text);
   } catch { return null; }
+  finally { if (scratch) rmSync(scratch, { recursive: true, force: true }); }
 }
 
 /** PURE: a recorded fingerprint covers the live head only when both are real fingerprints and equal. */

@@ -9,6 +9,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
 export const EXHAUSTIVE_INSTRUCTION = 'List EVERY finding you can find in this one exhaustive pass; do not stop at the first finding. Later fix rounds only check the delta since this audit.';
 export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).digest('hex');
+export const REVIEW_COMMAND = 'hardened-v1';
 export const CONVERGE_QUESTION = 'You are a read-only auditor. Judge ONLY the delta since the last full audit for weakening of guards, gates, tests, assertions, validation or fail-closed paths, and check whether every distinct finding from all supplied full audits is fixed at the specified head. Do not seek unrelated findings outside this scope. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then only lines prefixed `FIXED: `, `OPEN: ` or `NEW: `. For every distinct finding from all supplied full audits emit exactly one FIXED: or OPEN: line repeating its exact text. Report delta weakening as NEW: with file:line and why. NOT WEAKENED is allowed only when no OPEN or NEW remains. Do not edit files.';
 export const CONVERGE_QUESTION_HASH = createHash('sha256').update(CONVERGE_QUESTION).digest('hex');
 const CONVERGE_NOTICE = 'converge round: does NOT satisfy open-pr/prototype-load; finish with one full audit on the final sha.\n';
@@ -157,6 +158,9 @@ export async function main(argv, deps) {
       }
       prior = used.at(-1);
       if (!prior) { deps.stderr('Full audit head is not an ancestor (rebased); run a full audit.\n'); return 2; }
+      if (prior.mode !== 'full' || prior.reviewCommand !== REVIEW_COMMAND) {
+        deps.stderr('latest full audit predates hardened review; run a full audit\n'); return 2;
+      }
       if (prior.head === head) { deps.stderr('already fully audited at this head; run a full audit for a fresh verdict\n'); return 2; }
       let mainLine = await deps.remoteMainSha();
       if (!SHA.test(mainLine ?? '')) throw new Error('invalid remote main');
@@ -206,7 +210,7 @@ export async function main(argv, deps) {
     try { if (!flags.converge) fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     try {
       const record = { at: deps.now(), base, head, baseRef: flags.base, ref, mode: flags.converge ? 'converge' : 'full',
-        ...(flags.converge ? { priorHead: prior.head, priorAt: prior.at } : {}),
+        ...(flags.converge ? { priorHead: prior.head, priorAt: prior.at } : { reviewCommand: REVIEW_COMMAND }),
         questionHash, verdict, findings, ...(fingerprint ? { fingerprint } : {}) };
       await deps.appendRecord(record, ...(flags.converge ? [deps.convergeRecordPath()] : []));
     } catch {

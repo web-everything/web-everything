@@ -4814,7 +4814,11 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 ## Audit convergence evidence (R1081)
 
 Convergence uses every full-ledger record for the ref whose head is an ancestor of the
-requested head; the latest appended qualifying record anchors the delta. Converge records
+requested head; the latest appended qualifying record anchors the delta only with explicit
+`mode: full` and `reviewCommand: hardened-v1` (exported as `REVIEW_COMMAND`).
+A legacy or unknown review command on that latest record exits 2: "latest full audit
+predates hardened review; run a full audit"; never fall back to an older hardened anchor.
+Valid legacy full records still contribute all findings to the re-check union. Converge records
 are write-only and never influence selection. Validate every used record's full mode (or
 absent mode), current canonical question hash, verdict, non-conflicting string findings,
 commit SHAs and timestamp (at most five minutes ahead). A WEAKENED record without findings
@@ -4858,6 +4862,11 @@ Subdirectory execution with `diff.relative=true`, external diff drivers, text co
 submodule-ignore settings cannot narrow the delta; auditor Git commands ignore replace refs and grafts.
 Full prompts name `git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text <base>...<head>`.
 The canonical question hash stays stable: hardened full-pass instructions live outside its text.
+Full records store the hardened review marker. The shared net-diff fingerprint helper uses
+`--no-relative --text` plus its existing diff flags and `--end-of-options`; every Git call
+uses `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1` and a fresh nonexistent graft path.
+Real Git tests pin subdirectory/relative-config invariance. Old fingerprints may fail to
+carry and require a fresh audit; gate consumer selection rules remain unchanged.
 
 Canonical audit lookup rejects non-full positive records even with the current question hash,
 while current-question negative records still block prior-hash fallback regardless of mode.

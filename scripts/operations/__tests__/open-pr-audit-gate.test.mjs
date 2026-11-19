@@ -43,7 +43,8 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
     cp.execFileSync = (cmd, args) => {
       fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify([cmd, args]) + '\\n');
       if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
-      const a = args[0] === '-C' ? args.slice(2) : args;
+      const c = args[0] === '-C' ? args.slice(2) : args;
+      const a = c[0] === '--no-replace-objects' ? c.slice(1) : c;
       if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
       if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') return '';
       if (a[0] === 'fetch') throw new Error("couldn't find remote ref");

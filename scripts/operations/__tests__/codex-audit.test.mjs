@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, REVIEW_COMMAND, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
@@ -35,6 +35,7 @@ function fixture(answer = 'NOT WEAKENED') {
 
 describe('canonical audit', () => {
   it('pins the question text and its sha256 hash', () => {
+    expect(REVIEW_COMMAND).toBe('hardened-v1');
     expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
     expect(QUESTION_HASH).toBe('c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284');
     expect(QUESTION_HASH).toBe(createHash('sha256').update(CANONICAL_QUESTION).digest('hex'));
@@ -73,7 +74,7 @@ describe('canonical audit', () => {
     const f = fixture(`\n\r\n${verdict}\r\nscripts/example.mjs:12 why\n`);
     expect(await main(ARGS, f.deps)).toBe(code);
     expect(f.output.join('')).toBe(`${verdict}\nscripts/example.mjs:12 why\n`);
-    expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main', ref: null, mode: 'full',
+    expect(f.records).toEqual([{ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main', ref: null, mode: 'full', reviewCommand: REVIEW_COMMAND,
       questionHash: QUESTION_HASH, verdict, findings: ['scripts/example.mjs:12 why'] }]);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`${CANONICAL_QUESTION}\n\n${EXHAUSTIVE_INSTRUCTION}`);
     expect(f.deps.runCodex.mock.calls[0][0]).toContain(`Review this exact resolved range: git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text ${BASE}...${HEAD}`);

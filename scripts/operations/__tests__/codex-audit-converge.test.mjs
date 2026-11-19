@@ -1,7 +1,7 @@
 /** R1081 convergence is advisory evidence, never canonical gate evidence. */
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { main, findAudit, QUESTION_HASH, CONVERGE_QUESTION, CONVERGE_QUESTION_HASH } from '../codex-audit.mjs';
+import { main, findAudit, QUESTION_HASH, REVIEW_COMMAND, CONVERGE_QUESTION, CONVERGE_QUESTION_HASH } from '../codex-audit.mjs';
 import { createAuditDeps, resolveConvergeRecordPath } from '../codex-audit-io.mjs';
 import { canonicalAuditEvidence } from '../prototype-load.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
@@ -11,7 +11,7 @@ const BASE = 'a'.repeat(40), PRIOR = 'b'.repeat(40), HEAD = 'c'.repeat(40), NEXT
 const AT = '2026-11-18T00:00:00.000Z', REF = 'lane/converge';
 const ARGS = ['--base=origin/main', `--head=${HEAD}`, '--converge'];
 const finding = 'scripts/gate.mjs:12 missing guard';
-const original = { at: '2026-11-17T00:00:00.000Z', base: BASE, head: PRIOR, ref: REF,
+const original = { at: '2026-11-17T00:00:00.000Z', base: BASE, head: PRIOR, ref: REF, mode: 'full', reviewCommand: REVIEW_COMMAND,
   questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: [finding] };
 function fixture(answer = `NOT WEAKENED\nFIXED: ${finding}`) {
   const full = [original], converge = [], out = [], err = [];
@@ -40,6 +40,34 @@ describe('remote-main SHA normalization', () => {
 });
 
 describe('R1081 converge rounds', () => {
+  it.each(['legacy', 'missing command', 'unknown command', 'missing mode'])('refuses a latest %s full audit without falling back to hardened evidence', async kind => {
+    const f = fixture();
+    const latest = { ...original };
+    if (kind === 'legacy' || kind === 'missing mode') delete latest.mode;
+    if (kind === 'legacy' || kind === 'missing command') delete latest.reviewCommand;
+    if (kind === 'unknown command') latest.reviewCommand = 'hardened-v2';
+    f.full.push(latest);
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toBe('latest full audit predates hardened review; run a full audit\n');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('retains legacy findings in the union with explicit full mode=%s but anchors only to the hardened record', async explicitMode => {
+    const f = fixture('NOT WEAKENED\nFIXED: latest:1 gap');
+    const legacy = { ...original };
+    delete legacy.reviewCommand;
+    if (!explicitMode) delete legacy.mode;
+    f.full[0] = legacy;
+    f.full.push({ ...original, head: 'bc'.repeat(20), findings: ['latest:1 gap'] });
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.converge).toEqual([]);
+    f.deps.runCodex.mockReturnValue(`NOT WEAKENED\nFIXED: ${finding}\nFIXED: latest:1 gap`);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.converge[0].priorHead).toBe('bc'.repeat(20));
+    expect(f.deps.runCodex.mock.calls[1][0]).toContain(`on ${legacy.head}:\n${finding}`);
+  });
+
   it('uses its own hashed question and the unrestricted delta plus verbatim full-audit findings', async () => {
     const f = fixture();
     expect(await main(ARGS, f.deps)).toBe(0);
@@ -107,7 +135,7 @@ describe('R1081 converge rounds', () => {
   it('explicit --ref overrides derivation and full records gain mode and ref', async () => {
     const f = fixture('NOT WEAKENED');
     expect(await main(['--base=origin/main', `--head=${HEAD}`, '--ref=lane/explicit'], f.deps)).toBe(0);
-    expect(f.full.at(-1)).toMatchObject({ mode: 'full', ref: 'lane/explicit', questionHash: QUESTION_HASH });
+    expect(f.full.at(-1)).toMatchObject({ mode: 'full', reviewCommand: REVIEW_COMMAND, ref: 'lane/explicit', questionHash: QUESTION_HASH });
     expect(f.deps.refsPointingAt).not.toHaveBeenCalled();
   });
 
@@ -385,6 +413,15 @@ function gate(records) {
 }
 
 describe('convergence never satisfies gate consumers', () => {
+  it.each([false, true])('legacy full records keep existing gate eligibility with explicit mode=%s', explicitMode => {
+    const legacy = { ...original, head: HEAD, verdict: 'NOT WEAKENED', findings: [] };
+    delete legacy.reviewCommand;
+    if (!explicitMode) delete legacy.mode;
+    expect(findAudit([legacy], query)).toBe(legacy);
+    expect(canonicalAuditEvidence([legacy], HEAD).ok).toBe(true);
+    expect(gate([legacy])).toMatchObject({ ok: true, record: legacy });
+  });
+
   it('rejects a converge record planted in the full ledger by its distinct question hash', () => {
     const converge = { ...original, head: HEAD, mode: 'converge', questionHash: CONVERGE_QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [] };
     expect(findAudit([converge], query)).toBeNull();
