@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
-import { readFinishedPublicationHold, settleFinishedPublicationHold, readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
+import { readRoundPublicationHold, readFinishedPublicationHold, settleFinishedPublicationHold, readRedTeamPublicationHold } from '../drain-red-team-evidence.mjs';
 import { historicalCardOnlySkipCandidate, readDrainRedTeamEvidence, recordRedTeamStatus, readRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { redTeamOwedFor } from '../review-red-team-policy.mjs';
@@ -1856,6 +1856,54 @@ describe('finished publication hold recovery', () => {
       state: 'failure', description: 'held: finished round publication in progress', creator: { login: 'web-everything' } }] }));
     return { ...f, path, readCheck, readComments, readStatus, postHold, lock };
   }
+  it('accepts a stale queued marker like a finished marker', () => {
+    const f = setup({ status: 'queued', remoteHold: true });
+    expect(readFinishedPublicationHold(f)).toBe(true);
+    expect(readRoundPublicationHold(f)).toBe(true);
+    expect(f.readStatus).not.toHaveBeenCalled();
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(existsSync(f.path)).toBe(false);
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each(['finished', 'queued', 'running'])('clears an owned remote %s hold without a marker, idempotently', status => {
+    const f = setup();
+    rmSync(f.path);
+    f.readCheck.mockReturnValue({ ok: true }); // No marker means no mtime comparison.
+    f.readStatus.mockReturnValue({ total_count: 1, statuses: [{ context: `red-team/publication #${f.pr}`,
+      state: status === 'queued' ? 'pending' : 'failure', description: `held: ${status} round not confirmed published`,
+      creator: { login: 'web-everything' } }] });
+    expect(readRoundPublicationHold(f)).toBe(true);
+    expect(f.readStatus).toHaveBeenCalledTimes(1);
+    f.postHold.mockImplementation(() => {
+      f.readStatus.mockReturnValue({ total_count: 0, statuses: [] });
+      return { ok: true };
+    });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(f.postHold).toHaveBeenCalledTimes(1);
+    expect(existsSync(f.path)).toBe(false);
+    expect(readRoundPublicationHold(f)).toBe(false);
+  });
+  it.each(['live', 'foreign', 'in progress', 'untrusted', 'unknown state', 'incomplete', 'unreadable', 'absent', 'success'])
+    ('does not clear a no-marker %s remote status', kind => {
+      const f = setup();
+      rmSync(f.path);
+      const combined = f.readStatus();
+      const status = combined.statuses[0];
+      status.description = 'held: queued round not confirmed published';
+      if (kind === 'live') status.description = 'held: live red-team check not clear: awaiting validation';
+      if (kind === 'foreign') status.description = 'held: unknown';
+      if (kind === 'in progress') status.description = 'held: finished round publication in progress';
+      if (kind === 'untrusted') status.creator.login = 'mallory';
+      if (kind === 'unknown state') status.state = 'unknown';
+      if (kind === 'success') status.state = 'success';
+      if (kind === 'absent') { combined.statuses = []; combined.total_count = 0; }
+      if (kind === 'incomplete') combined.total_count = 2;
+      f.readStatus.mockImplementation(() => { if (kind === 'unreadable') throw Error('offline'); return combined; });
+      expect(readRoundPublicationHold(f)).toBe(false);
+      expect(settleFinishedPublicationHold(f).ok).toBe(['absent', 'success'].includes(kind));
+      expect(f.postHold).not.toHaveBeenCalled();
+    });
   it('clears only the trusted round writer hold; foreign or unreadable status keeps the marker', () => {
     for (const kind of ['live', 'foreign', 'untrusted', 'unknown state', 'unreadable', 'incomplete', 'round', 'success', 'absent']) {
       const f = setup();
@@ -1907,13 +1955,17 @@ describe('finished publication hold recovery', () => {
   it('clears the hold and marker under the lock, then a second call posts nothing', () => {
     const f = setup();
     expect(readFinishedPublicationHold(f)).toBe(true);
-    f.postHold.mockImplementation(() => { expect(existsSync(f.path)).toBe(true); return { ok: true }; });
+    f.postHold.mockImplementation(() => {
+      expect(existsSync(f.path)).toBe(true);
+      f.readStatus.mockReturnValue({ total_count: 0, statuses: [] });
+      return { ok: true };
+    });
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
     expect(f.lock).toHaveBeenCalledTimes(1);
     expect(f.postHold).toHaveBeenCalledWith(expect.objectContaining({ headSha: f.head, held: false }));
     expect(existsSync(f.path)).toBe(false);
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
-    expect(f.readCheck).toHaveBeenCalledTimes(1);
+    expect(f.readCheck).toHaveBeenCalledTimes(2);
     expect(f.postHold).toHaveBeenCalledTimes(1);
   });
   it.each([

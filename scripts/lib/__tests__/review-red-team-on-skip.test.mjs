@@ -3206,9 +3206,11 @@ describe('finished publication hold recovery on an already-reviewed head', () =>
     expect(o.escalate).toHaveBeenCalledTimes(1);
   });
   it('routes a finished hold with no posted check to publish-result, not a clear', () => {
-    const o = options({ readCheckFact: vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' })), publishCheck: vi.fn(() => ({ ok: true })) });
+    const o = options({ readFinishedHold: vi.fn(() => true),
+      readCheckFact: vi.fn(() => ({ ok: false, reason: 'no red-team check run on head' })), publishCheck: vi.fn(() => ({ ok: true })) });
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('publish-result');
     expect(o.clearFinishedHold).not.toHaveBeenCalled();
+    expect(o.readFinishedHold).not.toHaveBeenCalled();
   });
   it.each(['missing', 'unreadable', 'untrusted', 'other head'])('does not plan settlement with %s evidence', kind => {
     const o = options({ readFinishedHold: () => { if (kind === 'unreadable') throw Error('unreadable'); return kind !== 'missing'; } });

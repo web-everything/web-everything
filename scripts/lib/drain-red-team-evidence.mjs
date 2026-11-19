@@ -62,14 +62,34 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
   }
 }
 
-/** Only a readable finished marker for this exact head authorizes ordinary-round settlement.
+/** Only a readable finished/queued marker for this exact head authorizes ordinary-round settlement.
  * Old markers have no identity fields: their head-bound filename is the binding. */
 export function readFinishedPublicationHold({ repo, pr, head, env = process.env }) {
   try {
     const marker = JSON.parse(readFileSync(`${statusPath({ repo, pr, head }, env)}.unpublished`, 'utf8'));
-    return marker?.status === 'finished' && (marker.head === undefined || marker.head === head)
+    return ['finished', 'queued'].includes(marker?.status) && (marker.head === undefined || marker.head === head)
       && (marker.repo === undefined || marker.repo === repo) && (marker.pr === undefined || Number(marker.pr) === Number(pr));
   } catch { return false; }
+}
+
+const ownedRoundHold = status => ['failure', 'pending'].includes(status?.state)
+  && /^held: (finished|queued|running) round not confirmed published$/.test(status.description)
+  && isTrustedMarkerAuthor({ user: { login: String(status.creator?.login ?? '') } });
+
+function latestPublicationStatus(combined, pr) {
+  if (!Array.isArray(combined?.statuses) || !Number.isSafeInteger(combined.total_count)
+    || combined.total_count !== combined.statuses.length)
+    throw Error('publication hold status unreadable or incomplete; operator must inspect');
+  return combined.statuses.find(status => status?.context === redTeamPublicationContext(pr));
+}
+
+/** Nominate local finished/queued outboxes or the round writer's remote hold, even after local release.
+ * Unreadable remote evidence never authorizes a clear; settlement re-reads all evidence under the locks. */
+export function readRoundPublicationHold({ repo, pr, head, env = process.env,
+  gh = (args, options) => runGhSync(args, { ...options, env }), readStatus = readCombinedStatus }) {
+  if (readFinishedPublicationHold({ repo, pr, head, env })) return true;
+  try { return ownedRoundHold(latestPublicationStatus(readStatus({ repo, headSha: head, gh }), pr)); }
+  catch { return false; }
 }
 
 /** Settle a finished writer's outbox, never republish its sealed check. The status claim prevents a round writer
@@ -95,33 +115,29 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       let markerStat;
       try { markerStat = statSync(`${path}.unpublished`); }
       catch (error) {
-        return error.code === 'ENOENT' ? { ok: true } : { ok: false, reason: 'finished publication marker unreadable' };
+        if (error.code !== 'ENOENT') return { ok: false, reason: 'finished publication marker unreadable' };
       }
-      if (!readFinishedPublicationHold({ repo, pr, head, env }))
+      if (markerStat && !readFinishedPublicationHold({ repo, pr, head, env }))
         return { ok: false, reason: 'publication marker is not a finished round for this head' };
       const fact = readCheck({ repo, pr, headSha: head });
       if (fact?.ok !== true) return { ok: false, reason: fact?.reason ?? 'red-team check not confirmed ok' };
       const completedAt = Date.parse(fact.completedAt);
-      if (!Number.isFinite(completedAt) || !Number.isFinite(markerStat.mtimeMs) || completedAt < markerStat.mtimeMs)
+      if (markerStat && (!Number.isFinite(completedAt) || !Number.isFinite(markerStat.mtimeMs) || completedAt < markerStat.mtimeMs))
         return { ok: false, reason: 'red-team check not proven newer than finished marker; operator must inspect publication' };
       const result = redTeamResultCommentForHead(readComments(), pr, head);
       if (!result || result.carriedFrom) return { ok: false, reason: 'no ordinary red-team result on head' };
-      const combined = readStatus({ repo, headSha: head, gh: liveGh });
-      if (!Array.isArray(combined?.statuses) || !Number.isSafeInteger(combined.total_count)
-        || combined.total_count !== combined.statuses.length)
-        return { ok: false, reason: 'publication hold status unreadable or incomplete; operator must inspect' };
-      const current = combined.statuses.find(status => status?.context === redTeamPublicationContext(pr));
+      const current = latestPublicationStatus(readStatus({ repo, headSha: head, gh: liveGh }), pr);
       if (!current || current.state === 'success') {
-        rmSync(`${path}.unpublished`, { force: true });
+        if (markerStat) rmSync(`${path}.unpublished`, { force: true });
         return { ok: true };
       }
-      if (current.state !== 'failure'
-        || !/^held: (pending|running|finished) round (publication in progress|not confirmed published)$/.test(current.description)
-        || !isTrustedMarkerAuthor({ user: { login: String(current.creator?.login ?? '') } }))
+      if (!ownedRoundHold(current) && !(markerStat && current.state === 'failure'
+        && /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(current.description)
+        && isTrustedMarkerAuthor({ user: { login: String(current.creator?.login ?? '') } })))
         return { ok: false, reason: 'publication hold not owned by the finished round writer; left to its owner' };
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });
       if (cleared?.ok !== true) return { ok: false, reason: cleared?.reason ?? 'finished publication hold clear unconfirmed' };
-      rmSync(`${path}.unpublished`, { force: true });
+      if (markerStat) rmSync(`${path}.unpublished`, { force: true });
       return { ok: true };
     }));
   } catch (error) { return { ok: false, reason: safeText(error) }; }

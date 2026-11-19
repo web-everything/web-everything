@@ -13,7 +13,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pidExistence, readDrainRedTeamEvidence, readRedTeamStatus, readRecoveryWitness, redTeamStatusDir, withRedTeamStatusClaim,
-  readCarriedCheckUnpublished, createCarriedCheckPublisher, readFinishedPublicationHold, settleFinishedPublicationHold } from './drain-red-team-evidence.mjs';
+  readCarriedCheckUnpublished, createCarriedCheckPublisher, readRoundPublicationHold, settleFinishedPublicationHold } from './drain-red-team-evidence.mjs';
 import { latestRedTeamResultPosition, redTeamForHead, redTeamMarker, parseRedTeamComment, redTeamResultCommentForHead, redTeamHoldDecision } from './red-team-gate.mjs';
 import { redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
 import { foreignStaleOwnerDead, localPidLive } from './red-team-foreign-host-stale.mjs';
@@ -515,14 +515,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       }
       const result = redTeamResultCommentForHead(rawPr?.comments, pr, head);
       let finishedHold = false;
+      // A round with no posted check must publish-result first. Avoid a remote status read for that path.
       if (result && !result.carriedFrom) {
-        try { finishedHold = readFinishedHold({ repo, pr, head }) === true; } catch { /* unreadable is not authority to clear */ }
-      }
-      // A finished round whose check was never posted is the existing publish-result path's: it posts the check from
-      // live evidence, and the next tick (check now ok) clears the hold here.
-      if (finishedHold && readCheckFact) {
-        try { if (readCheckFact({ repo, pr, headSha: head })?.reason === 'no red-team check run on head') finishedHold = false; }
-        catch { finishedHold = false; }
+        try {
+          if (!readCheckFact || readCheckFact({ repo, pr, headSha: head })?.reason !== 'no red-team check run on head')
+            finishedHold = readFinishedHold({ repo, pr, head }) === true;
+        } catch { /* unreadable is not authority to clear */ }
       }
       if (finishedHold) {
         const escalation = pendingEscalation();
@@ -900,7 +898,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   readCarriedCheck = isUnderTest() || isUnderTest(env) ? () => false : key => readCarriedCheckUnpublished({ ...key, env }),
   // The shared writer resolves the App id from the setting (the daemon never sets WE_APP_ID) and lets the writer env win.
   publishCarriedCheck = isUnderTest() || isUnderTest(env) ? null : carriedCheckPublisher({ repo, env }),
-  readFinishedHold = isUnderTest() || isUnderTest(env) ? () => false : key => readFinishedPublicationHold({ ...key, env }),
+  readFinishedHold = isUnderTest() || isUnderTest(env) ? () => false : key => readRoundPublicationHold({ ...key, env }),
   clearFinishedHold = isUnderTest() || isUnderTest(env) ? null : key => settleFinishedPublicationHold({ ...key, env }),
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   sealStored = isUnderTest() || isUnderTest(env) ? null : publishStoredRedTeamResult,

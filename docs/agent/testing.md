@@ -5088,11 +5088,13 @@ same locked library helper; recovery failure must prevent retirement and unload 
 
 
 Finished red-team publication recovery keeps the ordinary writer's `.unpublished` outbox separate from the
-carried-check outbox. A posted ordinary result plus a readable finished marker schedules a cooldown-bound
+carried-check outbox. A posted ordinary result plus a readable finished/queued marker or a trusted remote
+`held: (finished|queued|running) round not confirmed published` failure/pending status schedules a cooldown-bound
 clear; the executor re-reads under both the status claim and check lock and requires a live successful check
 whose completion time is at or after the marker's mtime, and the latest trusted same-head result must be ordinary
 before clearing the remote hold and deleting the marker. Missing/invalid completion times and stale successes
-retain the marker for operator inspection. Unknown
+retain the marker for operator inspection. Without a marker, skip only the mtime comparison: require the exact
+trusted remote round-writer description and leave live-check or foreign holds to their owner. Unknown
 checks, unreadable markers, missing comments and rejected posts retain the marker for operator inspection.
 `finished-red-team-publication-hold.soak.test.mjs` replays the stranded PR #6945 state and probes planner
 behaviour to decide fix presence. An unconditional assertion also requires the fix and a green scenario, so a
