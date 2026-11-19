@@ -1079,10 +1079,19 @@ describe('prototype-load', () => {
       ...Array.from({ length: MAX_RELATED_TARGETS }, (_, i) => [`passing-${i}.test.mjs`, "import './x';"]),
     ]);
     const reverse = buildReverseImportGraph({ files: [...sources.keys()], readFile: (file) => sources.get(file) });
-    const selection = selectRelatedTests({ changedFiles: ['x'], reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
+    // Model a bounded local run independently of the test runner's CI environment.
+    const selectionOptions = { changedFiles: ['x'], reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 };
+    const selection = selectRelatedTests({ ...selectionOptions, env: {} });
     expect(selection.status).toBe('selection-truncated');
     expect(selection.tests).toHaveLength(MAX_RELATED_TARGETS);
     expect(selection.tests).not.toContain('omitted.test.mjs');
+    // The same graph in CI must keep the omitted regression under either CI indicator.
+    for (const flag of ['CI', 'GITHUB_ACTIONS']) {
+      const ciSelection = selectRelatedTests({ ...selectionOptions, env: { [flag]: 'true' } });
+      expect(ciSelection).toMatchObject({ status: 'complete', partial: false, maxTests: 0,
+        selectedTestCount: MAX_RELATED_TARGETS + 1, droppedCount: 0 });
+      expect(ciSelection.reachableTests).toContain('omitted.test.mjs');
+    }
     // Model the regression: the bounded subset passes, but complete evidence would fail.
     const testRunner = (tests) => {
       if (tests.includes('omitted.test.mjs')) throw Object.assign(new Error('omitted related regression'), { status: 1, stderr: 'omitted related regression' });

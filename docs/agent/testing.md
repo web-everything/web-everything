@@ -4812,6 +4812,10 @@ ambiguous literal expressions can add tests. Sibling aliases retain their textua
 key and match a tracked vendored counterpart when available; they do not read sibling
 repositories. CI uses the unlimited `ci.selection.maxTestsInCi` setting; local
 `relatedMaxTests` stays caller-owned. Truncation carries `partial: true`.
+Fixtures exercising local truncation must pass an explicit environment to selection helpers.
+Subprocess fixtures that need local sharding must clear both `CI` and `GITHUB_ACTIONS`
+in their child environment; either inherited flag makes selection unlimited. Keep CI
+controls asserting complete selection under each flag.
 Before graph-reachable tests replace changed-file targets, require every changed target
 in the tracked inventory; an absent target (including a committed deletion) forces the full suite.
 
