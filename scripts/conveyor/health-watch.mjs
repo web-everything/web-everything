@@ -431,19 +431,31 @@ export function daemonNameForLabel(label) {
  * (every resident daemon that is not a `pass-daemon.mjs` watcher), which the smell already treats as "use the
  * generic default".
  */
-export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000 } = {}) {
+export function probeLeasePid(pid, { signal = process.kill } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  try { signal(pid, 0); return true; } // signal 0 only checks existence; it never terminates anything
+  catch (e) { return e?.code === 'ESRCH' ? false : e?.code === 'EPERM' ? true : null; }
+}
+
+export function probeDaemonStatus({ collect = collectDaemonStatus, assess = assessDaemonStatus, timeoutMs = 15_000,
+  leasePidAlive = pid => probeLeasePid(pid),
+} = {}) {
   const exec = (cmd, args, opts = {}) => execFileSync(cmd, args, { ...opts, timeout: timeoutMs });
   const read = assess(collect({ exec }));
   return read.daemons.filter((d) => d.readable !== false).map((d) => {
     const ms = (v) => (v == null ? null : typeof v === 'number' ? v : Date.parse(v) || null);
     const entry = d.lease?.entry ?? null;
+    const outsideLaunchd = !d.running && Number.isSafeInteger(entry?.pid) && entry.pid > 1
+      ? leasePidAlive(entry.pid) : false;
     const activity = [ms(d.tick?.lastActivityAt), ms(d.tick?.at), ms(d.tick?.logMtimeMs)].filter(Number.isFinite);
     const log = daemonNameForLabel(d.name);
     return {
       log,
       role: d.kind ?? null,
       pid: entry?.pid ?? null,
-      pidAlive: !!d.running,
+      pidAlive: !!d.running, // unchanged: a bare signal-0 probe never feeds the silent-daemon investigation
+      // Launchd absence does not prove that the process holding the daemon lease is dead; the alert smell reads this.
+      outsideLaunchd,
       heartbeatAt: ms(entry?.heartbeatAt),
       lastActivityAt: activity.length ? Math.max(...activity) : null,
       daemonState: d.state,

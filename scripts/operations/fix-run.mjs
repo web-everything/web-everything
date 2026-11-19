@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
+import { readCiJobLog } from '../lib/gh-ci-log.mjs';
+import { stripVTControlCharacters } from 'node:util';
+import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -406,13 +409,13 @@ export function renderPrContext(json) {
 }
 
 // Job log lines have GitHub timestamps and terminal colours; keep only their readable text.
-const cleanCiLog = text => String(text ?? '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+const cleanCiLog = text => stripVTControlCharacters(String(text ?? ''))
   .split('\n').map(line => line.replace(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+/, '').replace(/\r$/, '')).join('\n');
 const CI_FAIL_FILE_RE = /\bFAIL\s+(\S+\.(?:test|spec|soak\.test)\.[cm]?[jt]sx?)\b/;
 
 /** Read current failing checks and up to four job logs for card 5947 (live #5045, 2026-10-13).
  * A job API failure leaves an empty log; check links still give the agent useful context. */
-export async function readCiHealInputs({ repo, pr, run = sh }) {
+export async function readCiHealInputs({ repo, pr, run = sh, readLog = readCiJobLog }) {
   const data = JSON.parse(await run('gh', ['pr', 'view', String(pr), '--json', 'title,body,statusCheckRollup',
     ...(repo ? ['--repo', repo] : [])]) || '{}');
   const checks = collapseRollupToLatestPerName(data.statusCheckRollup)
@@ -422,11 +425,18 @@ export async function readCiHealInputs({ repo, pr, run = sh }) {
   for (const check of checks.filter(check => /\/job\/(\d+)/.test(check.detailsUrl ?? '')).slice(0, 4)) {
     const id = /\/job\/(\d+)/.exec(check.detailsUrl)[1];
     let log = '';
+    let filtered = false;
     try {
       if (!slug) slug = String(await run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'])).trim();
-      log = cleanCiLog(await run('gh', ['api', `repos/${slug}/actions/jobs/${id}/logs`], { maxBuffer: BLOB_MAX_BYTES }));
+      const result = await readLog({ repo: slug, jobId: id, exec: run, opts: { maxBuffer: BLOB_MAX_BYTES } });
+      if (result.ok) {
+        // Extract diagnostics from the whole log before staging drops older cleanup context.
+        // The renderer reapplies the same helper at its smaller prompt budget.
+        log = boundedCiLogTail(cleanCiLog(result.text));
+        filtered = result.filtered === true;
+      }
     } catch { /* one inaccessible job must not refuse the repair */ }
-    jobs.push({ name: check.name, detailsUrl: check.detailsUrl, log });
+    jobs.push({ name: check.name, detailsUrl: check.detailsUrl, log, filtered });
   }
   return { title: data.title, body: data.body, checks, jobs };
 }
@@ -437,20 +447,20 @@ export function renderCiHealContext(inputs) {
   const jobs = (inputs.jobs ?? []).map(job => {
     const lines = cleanCiLog(job.log).split('\n');
     let sawTest = false;
-    for (const line of lines) {
+    for (const line of job.filtered === true ? lines : []) {
       const match = CI_FAIL_FILE_RE.exec(line);
       if (match) { files.add(match[1]); sawTest = true; }
       if (sawTest && /AssertionError|Error:/.test(line)) errors.add(line);
     }
-    return { ...job, lines, hasTests: lines.some(line => CI_FAIL_FILE_RE.test(line)) };
+    return { ...job, lines, hasTests: sawTest };
   }).sort((a, b) => Number(b.hasTests) - Number(a.hasTests));
   return cap([
     '## CI FAILURE CONTEXT (fetched by the launcher)',
-    'Fix the code so these tests pass. The sandbox has no network: do not run gh; the launcher pushes after you exit.',
+    'Diagnose the failing checks using attributable evidence. Unfiltered logs may contain passing-step fixtures; their rows are context only. The sandbox has no network: do not run gh; the launcher pushes after you exit.',
     `Title: ${String(inputs.title ?? '')}`, '', 'PR body:', cap(inputs.body, 4000),
     '', '### Failing checks', ...(inputs.checks ?? []).map(check => `- ${check.name}: ${check.detailsUrl ?? ''}`),
-    '', '### Failing tests', ...[...files].map(file => `- ${file}`), ...errors,
-    '', '### Failed log', ...jobs.map(job => `${job.name}\n${job.lines.slice(-120).join('\n')}`), '', '---', '',
+    '', '### Failing tests', ...(jobs.some(job => job.filtered !== true) ? ['unknown (unfiltered log)'] : []), ...[...files].map(file => `- ${file}`), ...errors,
+    '', '### Failed log', FENCED_DATA_RULE, ...jobs.map(job => `${job.name} (${job.filtered === true ? 'failed-step evidence' : 'unfiltered context only'})\n${fenceUntrusted('material', boundedCiLogTail(job.lines.join('\n'), { maxLines: 120, maxBytes: 2000 }))}`), '', '---', '',
   ].join('\n'), 16000);
 }
 
