@@ -4,12 +4,84 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acceptedRedTeamRepair, failingRedTeamRepair, ordinaryAcceptedRedTeamRepair, roundCommitGitOutput } from '../../__tests__/fixtures/accepted-red-team-repair.mjs';
 import { planReconcile } from '../../reconcile-core.mjs';
-import { planFixesFromReconcile, publishRedTeamFixDispatch } from '../../reconcile-fix-dispatch.mjs';
+import { dispatchFix, planFixesFromReconcile, publishRedTeamFixDispatch } from '../../reconcile-fix-dispatch.mjs';
 import { countRedTeamFixComments, RED_TEAM_FIX_COMMENT_MARKER } from '../../red-team-fix-round-count.mjs';
-import { runFixCli } from '../../../operations/fix-run.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER } from '../../conflict-fix-round-count.mjs';
+import { parseFixRunArgv, runFixCli } from '../../../operations/fix-run.mjs';
+import { fixDetachedProvider } from '../../../operations/dispatch-providers/fix.mjs';
 
 const plan = pr => planReconcile({ prs: [pr], agents: [], now: Date.parse('2026-11-18T12:00:00Z'),
   roundCap: 3, requiredChecks: ['test'] });
+
+/** The same head/result and charged count recur after a failed launch and a mechanical refund. */
+async function borrowedRefundReplay() {
+  const pr = acceptedRedTeamRepair(7);
+  pr.comments.splice(1, 2); // One refundable mechanical round.
+  pr.comments.push({ author: { login: 'web-everything' }, body: CONFLICT_FIX_COMMENT_MARKER });
+  let setting = true, launched = 0;
+  const errors = [], launches = [];
+  const freshPlan = () => planFixesFromReconcile(planReconcile({ prs: [pr], agents: [],
+    now: Date.parse('2026-11-18T12:00:00Z'), roundCap: 3,
+    mechanicalRoundsCountTowardCap: setting }).dispatch,
+  () => ({ num: '7', scope: ['we:scripts/example.mjs'] }), () => []).planned[0];
+  const io = {
+    run: (cmd, args) => {
+      if (cmd === 'gh' && args.includes('view')) return JSON.stringify(pr);
+      if (cmd === 'gh' && args.includes('comment')) {
+        pr.comments.push({ author: { login: 'web-everything' }, body: readFileSync(args.at(-1), 'utf8') });
+        return '';
+      }
+      if (cmd !== 'node' && cmd !== 'git') throw Error(`unexpected IO: ${cmd}`);
+      if (args.includes('acquire')) return JSON.stringify({ path: '/fixture/lane', holder: 'test-holder' });
+      if (args.includes('--absolute-git-dir')) return tmpdir();
+      if (args.includes('--verify') && args.includes('HEAD')) return pr.headRefOid;
+      if (args[0] === 'rev-parse') return pr.headRefOid;
+      return '';
+    },
+    readComments: async () => pr.comments, readCommits: () => pr.roundCommits,
+    loadMechanicalRoundsSetting: () => ({ value: setting }),
+    timingPolicy: { pushAfterCi: false },
+    readPrompt: () => 'Repair the fixture', removePrompt: () => {},
+    resolveProvider: () => ({ spawn: async () => {
+      launched++;
+      throw Error('executor failed after receipt');
+    } }),
+    readLease: () => ({ holder: 'test-holder' }), persistEvidence: () => {},
+    pendingRearm: { read: () => null, clear: () => {}, write: () => {} },
+    releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {},
+    weRoot: '/fixture', write: () => {}, writeErr: text => errors.push(text.trim()),
+  };
+  const dispatch = async planned => {
+    let execution;
+    dispatchFix({ ...planned, lane: 2 }, {
+      root: '/fixture', repo: 'we', borrowed: { executor: 'codex', reason: 'borrowed-build-slot' },
+      readFixClaim: () => null, acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, stampRunner: () => {},
+      readHistoryInputs: () => null,
+      postNotice: () => {}, readBrief: () => 'brief {{PR_NUM}} {{LANE_REF}}',
+      writeBorrowedPrompt: () => '/fixture/brief', checkoutExists: () => true, readPackageJson: () => ({ scripts: {} }),
+      spawnBorrowed: request => fixDetachedProvider(request, {
+        readDeliveryAgentMarker: () => null, logPathFor: () => '/fixture/log',
+        spawnDetached: args => {
+          launches.push(parseFixRunArgv(args.slice(1)).launchId);
+          execution = runFixCli(args.slice(1), io);
+          return { pid: 99 };
+        },
+      }),
+    });
+    const result = await execution;
+    return { code: result.code, launched, receipts: countRedTeamFixComments(pr.comments) };
+  };
+  const before = freshPlan();
+  const failed = await dispatch(before);
+  setting = false;
+  const after = freshPlan();
+  const retried = await dispatch(after);
+  const replayed = await dispatch(after);
+  return { attempts: [before.attempts, after.attempts],
+    plannedIds: [before.redTeamSentBack.attemptId, after.redTeamSentBack.attemptId],
+    sameHeadAndResult: before.headRefOid === after.headRefOid && before.redTeamSentBack.resultId === after.redTeamSentBack.resultId,
+    launches, failed, retried, replayed, errors };
+}
 
 function claudeReplay() {
   const pr = acceptedRedTeamRepair();
@@ -93,6 +165,7 @@ export default {
   card: 'PR #7080, live #7031',
   fixedBy: { sha: 'HEAD', where: 'lane/redteam-sent-back-accepted-owed', paths: [
     'scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs', 'scripts/operations/fix-run.mjs',
+    'scripts/operations/dispatch-providers/fix.mjs',
   ] },
   // This break ships in the same tree as its fix, so the fix is present wherever the break exists.
   // fixPresent must NOT replay the behaviour under test: a regression would then read as "fix absent",
@@ -104,14 +177,20 @@ export default {
     const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
     Object.assign(process.env, env);
     try { return { results: [claudeReplay(), await borrowedReplay(false), await borrowedReplay(true), await borrowedReplay(false, false)],
-      ordinary: await Promise.all(['conflict', 'ci-heal', 'ordinary'].map(kind => borrowedReplay(kind === 'ci-heal', true, kind, ordinaryLauncher))) }; }
+      ordinary: await Promise.all(['conflict', 'ci-heal', 'ordinary'].map(kind => borrowedReplay(kind === 'ci-heal', true, kind, ordinaryLauncher))),
+      refund: await borrowedRefundReplay() }; }
     finally {
       Object.entries(saved).forEach(([key, value]) => { if (value === undefined) delete process.env[key]; else process.env[key] = value; });
       rmSync(root, { recursive: true, force: true });
     }
   },
-  judge({ results: [claude, borrowed, ci, unreadable], ordinary }) {
+  judge({ results: [claude, borrowed, ci, unreadable], ordinary, refund }) {
     return [
+      ...(refund.sameHeadAndResult && refund.attempts.every(n => n === 1)
+        && refund.launches[0] !== refund.launches[1] && refund.launches[1] === refund.launches[2]
+        && refund.failed.launched === 1 && refund.retried.launched === 2 && refund.replayed.launched === 2
+        && refund.failed.receipts === 1 && refund.retried.receipts === 2 && refund.replayed.receipts === 2
+        ? [] : [JSON.stringify(refund)]),
       ...(claude.plannerAttempts === 0 && claude.receipt === 'published' && claude.receipts === 1 ? [] : [JSON.stringify(claude)]),
       ...(borrowed.code === 0 && borrowed.launched === 1 && borrowed.receipts === 1 && borrowed.commitReads === 1 ? [] : [JSON.stringify(borrowed)]),
       ...(ci.plannerKind === 'ci-heal' && ci.code === 0 && ci.launched === 1 && ci.ciReads === 1 && ci.receipts === 0 ? [] : [JSON.stringify(ci)]),

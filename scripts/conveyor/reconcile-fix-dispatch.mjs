@@ -1682,6 +1682,7 @@ export function dispatchFix(planned, {
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
           mode: planned.mode, head: planned.headRefOid, attempts: planned.attempts,
+          redTeamSentBack: planned.redTeamSentBack,
           resultId: planned.redTeamSentBack?.resultId, roundCap: planned.roundCap,
           mergeOnto: mergeOntoFor(planned),
           policyRoute: decision.policyRoute ?? { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },

@@ -124,8 +124,10 @@ export function fixDetachedProvider(request, {
   argv.push(`--planned-repair-mode=${validatePlannedRepairMode(request.mode === 'red-team-sent-back' ? request.mode : 'ordinary')}`);
   // Session slugs repeat across dispatches. Preserve this ID on a retry of the same launch;
   // a fresh dispatch gets its own counted repair, even if no executor makes a commit.
+  // Preserve the planner's unused receipt ID verbatim so its spent-ID scan survives refunds.
+  // Older requests without a frozen ID retain their deterministic replay identity.
   const launchId = request.mode === 'red-team-sent-back'
-    ? redTeamFixLaunchId({ repo: request.repo, pr, head: request.head, resultId: request.resultId, attempts: request.attempts })
+    ? request.redTeamSentBack?.attemptId ?? redTeamFixLaunchId({ repo: request.repo, pr, head: request.head, resultId: request.resultId, attempts: request.attempts })
     : request.launchId ?? randomUUID();
   argv.push(`--launch-id=${launchId}`);
   if (request.roundCap !== undefined) argv.push(`--red-team-round-cap=${request.roundCap}`);

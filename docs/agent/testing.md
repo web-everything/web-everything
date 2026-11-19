@@ -4787,8 +4787,9 @@ receipts survive a restart alongside ordinary re-arms.
 
 Start tick tests with production `gh pr list` rows through `shapePrs`, without `mode`;
 that field exists only on planned dispatches, never on production PR discovery rows.
-Borrowed launch IDs hash the
-planned repository, PR, head, gate result and charged attempt count. Test replay through
+Borrowed launches carry the planner's frozen `redTeamSentBack.attemptId` verbatim, so
+the planner can recognize spent receipts even when mechanical rounds are refunded.
+Legacy requests without a frozen ID retain their deterministic hash. Test replay through
 `fixDetachedProvider` into `runFixCli`, with a mutable trusted thread and executor spy.
 Carry the planned red-team accounting mode on validated `--planned-repair-mode` argv.
 Receipt publication and hand-back selection follow that plan even if labels changed to
@@ -4811,8 +4812,13 @@ and `runFixCli`: its ordinary CI-heal must read CI evidence and reach the execut
 When red-team receipts contribute to the combined cap, enrich ordinary re-arms with commit
 evidence even below the ordinary cap. Freeze Claude's unused receipt ID in the plan so a
 mechanical-round refund cannot reuse a spent ID, while replaying that same plan still refuses.
-Keep borrowed launch identities unchanged; cover the setting transition from counting
-mechanical rounds to refunding them through a fresh plan and real Claude dispatch.
+Cover the setting transition from counting mechanical rounds to refunding them through
+a fresh plan and both dispatch paths. `a failed borrowed launch gets a fresh identity after
+mechanical refunds and its replay stays spent` in `fix-planned-mode.test.mjs` exercises
+`dispatchFix` → `fixDetachedProvider` → `runFixCli` on the same head/result with attempts
+remaining at one. The `accepted-red-team-repair-accounting` soak break shares that
+scenario: a failed executor spends one receipt, the fresh refunded plan invokes the
+executor with a different ID, and replaying that frozen plan adds no receipt or execution.
 
 The reconcile-to-fix planning projection must preserve `roundCap` on both item-backed and
 PR-diff rows. Cap-1 tests exercise both receipt writers after a competing writer consumes

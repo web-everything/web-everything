@@ -5,8 +5,24 @@ import { planReconcile } from '../../../conveyor/reconcile-core.mjs';
 import { planFixesFromReconcile } from '../../../conveyor/reconcile-fix-dispatch.mjs';
 import { renderRedTeamComment } from '../../review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../../lib/red-team-gate.mjs';
+import repairBreak from '../../../conveyor/soak/breaks/accepted-red-team-repair-accounting.mjs';
 
 describe('fix provider planned accounting mode', () => {
+  it('a failed borrowed launch gets a fresh identity after mechanical refunds and its replay stays spent', async () => {
+    const { refund } = await repairBreak.run();
+    expect(refund.sameHeadAndResult).toBe(true);
+    expect(refund.attempts).toEqual([1, 1]);
+    expect(refund.failed).toEqual({ code: 1, launched: 1, receipts: 1 });
+    expect(refund.errors[0]).toContain('executor failed after receipt');
+    expect(refund.launches[1]).not.toBe(refund.launches[0]);
+    expect(refund.plannedIds).toEqual([2, 3]);
+    expect(refund.launches).toEqual(['2', '3', '3']);
+    expect(refund.retried).toEqual({ code: 1, launched: 2, receipts: 2 });
+    expect(refund.errors[1]).toContain('executor failed after receipt');
+    expect(refund.replayed).toEqual(refund.retried);
+    expect(refund.errors[2]).toContain('launch already spent');
+  });
+
   it('projects a production PR with no mode through reconciliation into validated launcher argv despite label drift', () => {
     const head = 'a'.repeat(40), author = { login: 'web-everything' };
     const comments = [{ author, body: renderRedTeamComment({ pr: 7, rev: head, provider: 'codex', model: 'm',
