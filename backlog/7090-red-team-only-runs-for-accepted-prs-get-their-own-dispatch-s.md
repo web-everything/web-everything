@@ -1,9 +1,10 @@
 ---
 bornAs: xe3za5r
 kind: task
-status: open
+status: resolved
 scope: ["we:scripts/conveyor"]
 dateOpened: "2026-10-25"
+dateResolved: "2026-11-19"
 tags: []
 ---
 
