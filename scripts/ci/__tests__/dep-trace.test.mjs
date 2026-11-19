@@ -5,6 +5,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { activateTrace, createTracer, startTrace, mergeTraces, compareCoverage } from '../dep-trace.mjs';
 import { initialize, load } from '../dep-trace-loader.mjs';
 import { runTraceCoverage } from '../../readiness/trace-coverage.mjs';
@@ -74,6 +75,15 @@ describe('shadow dependency tracer', () => {
     expect(f.originals.execFile.mock.calls[0][2]).toBe(callback);
     f.child_process.fork('script.mjs', { cwd: root });
     expect(f.originals.fork.mock.calls[0][1].cwd).toBe(root);
+  });
+  it('preserves execFile util.promisify.custom contract and still injects the trace env', async () => {
+    const custom = vi.fn(async () => ({ stdout: 'ok', stderr: 'err' }));
+    const cp = Object.fromEntries(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].map(name => [name, vi.fn(() => 'child')]));
+    Object.defineProperty(cp.execFile, promisify.custom, { value: custom });
+    const tracer = createTracer({ test, root, record: vi.fn(), env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, fs: {}, child_process: cp });
+    tracer.install();
+    await expect(promisify(cp.execFile)('node', ['-e', '1'])).resolves.toEqual({ stdout: 'ok', stderr: 'err' });
+    expect(custom.mock.calls[0][2].env.WE_TRACE_TEST).toBe(test);
   });
   it('records all requested reads/lists and forwards arguments, receiver and return value', () => {
     const f = fixture();

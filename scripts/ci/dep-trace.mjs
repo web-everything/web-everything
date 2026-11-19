@@ -12,6 +12,7 @@ import { register, syncBuiltinESMExports } from 'node:module';
 import { MessageChannel, receiveMessageOnPort } from 'node:worker_threads';
 import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 const hook = import.meta.url;
 const ROOT = fileURLToPath(new URL('../../', hook));
@@ -55,7 +56,7 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
       const original = cp[name];
       if (!original) continue;
-      cp[name] = function (command, ...args) {
+      const prepare = (command, args) => {
         const index = Array.isArray(args[0]) ? 1 : 0;
         const hasOptions = args[index] && typeof args[index] === 'object';
         const options = hasOptions ? args[index] : {};
@@ -68,8 +69,14 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
         if (env.WE_CI_SELECTION !== undefined) childEnv.WE_CI_SELECTION = env.WE_CI_SELECTION;
         childEnv.NODE_OPTIONS = inheritOptions(childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS);
         args.splice(index, hasOptions ? 1 : 0, { ...options, env: childEnv });
-        return Reflect.apply(original, this, [command, ...args]);
+        return [command, ...args];
       };
+      cp[name] = function (command, ...args) { return Reflect.apply(original, this, prepare(command, args)); };
+      // Keep util.promisify's {stdout, stderr} contract: route the original custom promisifier through the same env injection.
+      const custom = original[promisify.custom];
+      if (typeof custom === 'function') {
+        Object.defineProperty(cp[name], promisify.custom, { configurable: true, value: function (command, ...args) { return Reflect.apply(custom, this, prepare(command, args)); } });
+      }
     }
   } };
   return tracer;
