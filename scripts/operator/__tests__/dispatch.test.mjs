@@ -83,6 +83,18 @@ describe('prompt builders (converge.py FIX/CI_HEAL/REVIEW templates, ported verb
     expect(p).toContain('Do NOT touch anything the accepted review did not ask you to touch');
   });
 
+  it('both operator prompts forbid promoting unfiltered rows and require ANSI-stripped bounded context', () => {
+    const prompts = [buildCiHealPrompt({ pr: 42, branch: 'lane/y', lanePath: '/lanes/lane-7' }),
+      readFileSync(join(process.cwd(), 'scripts/operator/converge.py'), 'utf8')];
+    for (const prompt of prompts) {
+      expect(prompt).toContain('Strip ANSI escapes before matching any log lines.');
+      expect(prompt).toContain('unknown (unfiltered log)');
+      expect(prompt).toContain('bounded raw tail as context');
+      expect(prompt).toContain('Never promote its FAIL/error rows to an authoritative failure list');
+      expect(prompt).toContain('Only filtered: true evidence attributable to failed steps');
+    }
+  });
+
   it('buildReviewPrompt interpolates pr/drvPath/jurorPath and requires --cwd', () => {
     const p = buildReviewPrompt({ pr: 9, drvPath: '/lanes/lane-1', jurorPath: '/lanes/lane-2' });
     expect(p).toContain('--pr=9');

@@ -149,6 +149,12 @@ identity; old persisted records without it start fresh. Keep enqueue result reco
 emission in one helper, test each outcome and delivery failures, and exercise exported helpers
 instead of evaluating extracted source with `new Function`.
 
+The post-plan detector regressions in `scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs`
+cover consecutive conflicts, moved tips, registration identity, open PR/pin exclusions, unknown evidence,
+read-only stale inspection, and event/attention publication. F1 refuses pending drop intents before planning;
+F3 proves supersession against the applied carrier SHA even when `pinnedFrom` names a newer fetched tip.
+The static case forbids registration mutation APIs in the detector; a local Git fixture exercises merge-tree.
+
 ## Established-overlay auto-rebase
 
 Operator withdrawal wins over a detached repair: the worker rechecks its source registration
@@ -4542,6 +4548,14 @@ when it stays blocked. Replay two new planner skips per tick alongside four bloc
 heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
 new arrivals must never overtake heads already waiting in the rotation.
 
+The queue regression and `red-team-queue-stale-eviction` soak break replay live-state
+maintenance across restarts. Terminal PRs are evicted even when stale planner candidates
+still list them. Changed live heads are re-keyed in place with attempts and blocks reset;
+unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
+runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
+Planner skips retain the existing bounded, fair probe rotation.
+Run the soak `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
+
 ## Timeout evidence synchronous worker pool
 
 `timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,
@@ -4676,6 +4690,13 @@ At `a19d094c84a838c161105da3296c3558467fc319`, interacting `records` and `owed` 
 remove `review` and return `pass`. Rejecting accessors returns the original state untouched,
 keeps both daemons owed, calls no getters, and returns `pending`.
 These pure-core probes do not establish live daemon integration or merge compatibility.
+## GitHub Actions job-log readers
+
+Use `ciJobLogApiArgs` or `readCiJobLog` from `scripts/lib/gh-ci-log.mjs` for fixer-evidence and CI-heal job-log reads, with the caller’s existing throttled exec wrapper and output limits. Every successful helper read returns the whole raw job log, including passing steps, with `filtered: false`; logs without escapes remain byte-identical. The shared transport permits ANSI bytes; display callers retain their own control-character cleanup. The transport never filters the log or requests step metadata. Builder-draft recovery separately uses job-step metadata to attribute `firstError`, including untimestamped continuations; it never promotes a passing-step error from the whole log into a repair target. Without a nonempty failure annotation or a diagnostic attributable to a failed step, recovery reports `unattributed` and does not reserve capacity, dispatch repair, write retry state or escalate. Published summaries and no-detail placeholders never substitute for attribution; unreadable log or metadata requests abort recovery. Its whole-log fixer context still comes from the shared CI-heal context pack. Finding-producing readers remain on their `origin/main` transport, deferred to the follow-up **finding-producing log readers on gh 2.104**. The timeout classifier's `reconcile-pass.mjs` plain raw reader and `fix-facts.mjs` plain/raw and `readLog` paths also retain plain `gh api <path>` without `--allow-escape-sequences`, deferred to **timeout classifier on unfiltered logs: treat as unknown and retry, never eligible**. Only the timeout classifier consumes `makeFixEvidenceReader.readLog`; it has no failed-step attribution, so permitting escape-coded whole-job logs could promote a passing-step timeout into rerun eligibility. The structural regression in `scripts/lib/__tests__/gh-ci-log.test.mjs` checks both `scripts/` and `skills-src/` and explicitly allowlists these deferred readers; new bypasses are forbidden. In the mixed `reconcile-pass.mjs`, the main-fixed signature reader and timeout classifier are separately pinned.
+
+Only explicit `filtered: true` provenance may supply a failing-test list. For whole-job logs (`filtered: false`) or missing provenance, both fixer renderers report `unknown (unfiltered log)` and fence an ANSI-stripped tail as context; passing-step `FAIL` fixtures and errors must never become repair targets. `ci-log-evidence.mjs` caps tails by UTF-8 bytes and lines, retaining the end of even an oversized final line and directing the fixer to inspect the full log when truncated. Strip ANSI before timestamp ownership matching too: a coloured passing-step timestamp must end failed-step ownership. Context-pack, fix-run, operator prompt and builder-draft recovery tests pin these guarantees.
+
+A failed log read is `log-unreadable`: it refuses evidence-based mechanical reruns while ordinary bounded repair remains available. Actual request timeouts stay unknown and retry. Escape errors remain `{ eligible: false, reason: 'log-unreadable' }`; the named follow-up does not change that mapping in this slice. `ci-log-unreadable.test.mjs` supplies an escape-coded passing-step timeout plus an unrelated deploy failure and asserts plain argv, one failed log read, no retry and no eligibility across the direct, facts-disabled, facts-enabled and facts raw-API paths. Unreadable logs retain the readable-failure repair route. In particular, bounced CI-heal entries must still reach `ci-heal-pr-dispatch` and its unsettled-worker, unconfirmed-accounting and per-head loop hold/park guards. `ci-heal-pr-dispatch.test.mjs` exercises each refusal with real planner output; `ci-log-unreadable.test.mjs` pins routing parity and preserves the existing joined fixer for trusted current-head review findings, including the log evidence reason in its brief. Helper, context-pack and builder-draft recovery regressions cover whole-log context and unreadable evidence.
 ## Review job exit evidence
 
 Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
@@ -4722,6 +4743,26 @@ The stuck-trace node:test fixtures inject both operations and the event sink. Ke
 fixtures import modules through data URLs, where eager file-path resolution fails.
 The digest and merge watcher share the watcher receipt directory; when overriding
 its state directory, pass that directory as the digest’s `traceStateDir` too.
+
+## Antigravity binary maintenance
+
+`scripts/operations/__tests__/agy-upgrade-check.test.mjs` injects command execution,
+child spawn/kill, time, filesystem and attention publication. No real agy or brew
+runs. Its timeout probes assert exact child PID SIGKILL and completion without a
+close event; output overflow also kills the child. The persisted dead-health
+probe checks both model families, malformed/future/expired records and normal
+quota fallback. Keep the two maintenance JSON files excluded from the legacy
+root quota scan: malformed optional health must not become a quota parse error.
+The run lock serializes scheduled ticks; a killed checker requires operator
+inspection and removal of its leftover lock before maintenance can resume.
+
+## Binary maintenance hold regressions
+
+Keep binary health/cache under the evidence directory's `binary/` subfolder; root JSON names remain legacy quota observations. Test unreadable health as a closed hold, recovery followed by an identical outage through the real attention publisher, and refused child kills at every maintenance step with reporting before lock release.
+
+Register binary maintenance's exclusive lock in `LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`.
+The source scan in `scripts/operations/__tests__/audit-verdict.test.mjs` requires every lock holder
+to stay on the protected audit floor, so concurrency findings block publication.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
@@ -4769,3 +4810,10 @@ Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a 
 retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+## Owed CI rerun execution
+
+The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
+Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
+daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
+refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
