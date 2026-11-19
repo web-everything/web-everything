@@ -20,10 +20,16 @@ export function probe(checkout) {
       for (const name of ['review-pr-abc.abandoned.json', 'x y.json', 'review-pr-bad name.json']) {
         writeFileSync(join(dir, name), '{}');
       }
+      // A valid run record must still be read: a reader that discards everything is not a fix.
+      const valid = { v: 1, id: 'review-pr-valid', op: 'review-pr', input: {}, cursor: 0, findings: {}, verdict: null, effects: [], telemetry: [], stepTimings: [], pending: null };
+      writeFileSync(join(dir, 'review-pr-valid.json'), JSON.stringify(valid));
+      let seen = 0;
+      const readRun = (id) => { seen++; return valid; };
       for (let pass = 0; pass < 2; pass++) {
-        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
-        if (!Array.isArray(rows) || rows.length) throw new Error('sidecars became run evidence');
+        const rows = readReviewRunEvidence({ dir, readRun, memo: new Map(), persist: false });
+        if (!Array.isArray(rows)) throw new Error('evidence enumeration returned no list');
       }
+      if (seen !== 2) throw new Error('valid run record was not read exactly once per pass');
     `, checkout, dir], {
       encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
       env: { ...process.env, WE_UNDER_TEST: '1', WE_DAEMON_EVENTS: join(dir, 'events.jsonl') },

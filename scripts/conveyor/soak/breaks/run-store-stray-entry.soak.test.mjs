@@ -35,6 +35,9 @@ describe('behavioral fix detection', () => {
       `);
       expect(b.fixPresent(root)).toBe(false);
       writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), 'export function readReviewRunEvidence() { return []; }');
+      expect(b.fixPresent(root)).toBe(false); // discarding all evidence is not a fix
+      writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'),
+        "export function readReviewRunEvidence({ dir, readRun }) { readRun('review-pr-valid', dir); return []; }");
       expect(b.fixPresent(root)).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
