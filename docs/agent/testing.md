@@ -8,6 +8,17 @@ one negotiation ref; a bounded binary pack/index-pack handoff imports the pinned
 `review-job-fetch-security.test.mjs` replants hostile local/worktree/includeIf config after
 the scrub to prove isolation, and checks failed handoffs and moved heads leave the commit absent.
 
+## Merge drain CLI fixtures (R1063a)
+
+`merge-ai-prs-prestage.test.mjs` and `merge-ai-prs-listing-dedupe.test.mjs` call the exported
+`main(argv, { env, stdout, exit })` through `scripts/__tests__/fixtures/merge-ai-prs-cli-harness.mjs`.
+Mock `node:child_process` before importing the CLI. The harness reloads module-scoped paths/settings
+per invocation, captures exit with a sentinel, restores ambient IO in `finally`, and refuses unported
+commands even if a best-effort CLI reader catches the error. It spies on `process.cwd()` because
+Vitest's thread pool cannot chdir. Run it sequentially within each test file.
+The gh/git function ports also generate the executable shims for the two `*.real.test.mjs` smokes.
+Those files are explicitly excluded from the PR unit config. There is currently no filename-based
+scheduled real-process config discovery; scheduled-runner enrollment remains separate.
 > Authors: APPEND new sections at the END of this file, never right after the title (`.gitattributes` union-merges it, but appending avoids overlapping insertions).
 
 ## Review PR transport isolation (R37)
@@ -148,6 +159,12 @@ the paginated thread and trusted leading markers. Scope queue failure/rebuild hi
 identity; old persisted records without it start fresh. Keep enqueue result recording and event
 emission in one helper, test each outcome and delivery failures, and exercise exported helpers
 instead of evaluating extracted source with `new Function`.
+
+The post-plan detector regressions in `scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs`
+cover consecutive conflicts, moved tips, registration identity, open PR/pin exclusions, unknown evidence,
+read-only stale inspection, and event/attention publication. F1 refuses pending drop intents before planning;
+F3 proves supersession against the applied carrier SHA even when `pinnedFrom` names a newer fetched tip.
+The static case forbids registration mutation APIs in the detector; a local Git fixture exercises merge-tree.
 
 ## Established-overlay auto-rebase
 
@@ -1089,6 +1106,8 @@ coverage lives in `antigravity-judge-spawn.test.mjs`; `parallel-judges.test.mjs`
 that both drive modes preserve provider effort while retaining the request fallback.
 
 ## Shadow reviewer agreement evidence
+
+`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
@@ -2215,6 +2234,8 @@ a delayed request starts later and remains active at 28 minutes.
 
 Missing IDs, receipts or parseable starts still fail closed; stuck-slot signals and
 operator-confirmed cleanup remain the fallback while capacity is retained.
+Cancel-finish waits for the supervisor, then proves the reserved UID empty before clearing a stale
+`executing` lock; unprovable cleanup holds the marker and raises one needs-you alert naming the slot (throttled per slot).
 Keep regressions for the exact seven-active-run live shape released at >=15 minutes, 14-minute retention, unknown evidence,
 finish retries and legacy state. Markers carry optional caller/session/parent PID/command-word,
 lane and PR tags; `.exit` records synchronous best-effort exit or signal evidence. Release logs
@@ -2320,8 +2341,8 @@ telemetry sample taken after the failure; a bounded probe that stalls or returns
 keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
 Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
 
-After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
-validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
+After a run timeout, allow 180 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
+validated as a nonnegative integer and capped at 300 seconds), probing fresh per-run telemetry
 about every two seconds while also waiting for the executor. R989 accepts a late receipt-verified
 `mode: 'remote'` answer with an integer code 0–254 only inside this cancel wait and only when
 its string `run` strictly matches the non-null execution run recorded by `onRun` for this dispatch;
@@ -2329,7 +2350,9 @@ return its exit code (including failures), record it, and release the slot and b
 Missing/mismatched run IDs, invalid codes, executor rejection and other ambiguous answers must
 not stop telemetry probes. A client signal still wins. Only confirmed cancellation
 or fresh `finished` telemetry permits local fallback; deadline expiry
-keeps exit 124 and both marker files.
+keeps exit 124 and both marker files. Busy unit-run rejections preserve `forge-busy`;
+only a matching finish from protected `prepared` state certifies `started: false`.
+A protected `running` state and plain non-sibling snapshot rejection remain unconfirmed.
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
@@ -2403,6 +2426,15 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 `WE_DAEMON_CLONE_MAINTENANCE_INTERVAL_MS` as the environment override. A corrupt or
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
+
+Memory-warn regression cases must distinguish missing free-memory evidence (hold, even with flat swap)
+from missing swap growth (admit when free memory is readable and clean). Only pressure level 2 may relax;
+level 3 and unknown levels above 1 still hold. Exercise the sampler's unrounded bytes ratio at 19.96% and
+20%, and verify checkout-local/per-call warn overrides only tighten the resolved settings. Environment
+variables remain the operator settings layer. Scoped coverage lives in `memory-available`,
+`resource-sampler`, `resource-admission`, `resource-gate`, and `heavy-admission` tests.
+Keep the shared pressure/floor decisions in the import-free `memory-warn-corroboration.mjs`:
+read-only operations reach them via `resource-policy` and must never inherit the measurement module's IO imports.
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
@@ -2912,6 +2944,8 @@ also has a real Node-child probe in `worker-wrapper.test.mjs`. Run these suites 
 
 ## Referral re-checks on the live head
 
+Unpromoted Carbon must retain prior unresolved referrals through both the mandatory-referral sink and the acceptance gate, like an unset Gemini cap. Keep default-path fixtures alongside promoted variants and assert that no settlement or audited retirement was written.
+
 `review.recheckCarriedReferrals` and `review.autoPolicyRespectsNotReal` default true in
 `scripts/review-settings.json`, with standard → platform → tool → environment resolution and source diagnostics.
 Historical referrals persist a `recheck` provenance marker and go through the existing mandatory review against the pinned live net diff;
@@ -3355,6 +3389,10 @@ reclamation: acquisition, prepare, execution, and finish hold shared leases on
 persistent per-slot `.worker-active-K.writer` inodes. Pruning holds exclusive
 leases through scanning and deletion and proves UID process absence before
 removing a reservation.
+Cancel-finish clears a stale `executing` lock only with both proven UID emptiness and
+an `lstat` mtime age at least the hard max runtime, measured with the injected clock.
+Before that bound, even successful UID cleanup retains the lock and requires an operator
+to stop the reserved UID; failed cleanup also retains it past the bound.
 The root supervisor requires reservation evidence and rechecks it under its own shared lease;
 a forked child retains that lease through UID drop and closes it before task exec.
 Only reservations declaring `writerGuard: 1` participate; historical or uncertain
@@ -4030,6 +4068,15 @@ review loop with in-memory runs, ledger IO and effect sinks. It replays an accep
 a later reviewed head, compares off/shadow/on live effects, distinguishes confirmed from plausible
 broken ratings, and injects writer and logger failures without contacting GitHub or changing Git.
 
+## Review label body-file checkout regression
+
+Keep staging `root` separate from the label child's `cwd`: `--cwd` reaches the sinks through
+`resolveOperation`. Test checkout A staging against checkout B's `bodyFileRoots`, with a separate
+temp root so a host-temp fixture cannot hide the mismatch. The `review-label-body-child-cwd`
+soak break probes the real sink to decide fix presence and checks private-copy cleanup. Its replay
+and the unit regression inject hermetic IO via `resolveOperation`'s `sinkFactory`; only the
+operation builder supplies `cwd`, so removing that forwarding must fail their existing assertions.
+
 ## Verdict-ledger contention regression (R365 fix 2)
 
 `verdict-ledger-io.test.mjs` uses local bare origins and real rejected pushes to
@@ -4278,8 +4325,18 @@ so a crashed re-review cannot hold a PR forever. A run waiting on a pending step
 abandoned, and neither is a rewound resume (`resumeOf`), which the review loop may still finish.
 Unreadable records still throw, never skip.
 
-The scoped regressions are `drain-red-team-evidence`, `stream-filter-runs`, and the settings layout
-test `settings-files`; use heavy admission.
+Review discovery first tries the bounded `<runs-dir-name>-review-index.json` sidecar beside the
+resolved runs directory. The run-store writer updates it fail-soft under a file lock; drain's complete
+open-PR context advances persisted per-id verification (50 review records total per tick). Partial
+backfills are staged, never published. Indexed payloads still pass the same PR/head, ordering and
+unfinished-review checks. Missing/corrupt/unverified/overflowed hints take the original bounded scan;
+`scan-capped` still holds. Indexed payload read attempts and the fallback share one
+`runs.scan.maxParses` budget, including failed reads; cached indexed payloads count once.
+Index bounds are 512 PR keys, 32 ids per key and 1 MiB per file. Per-PR
+overflow becomes an empty sentinel, forcing fallback instead of silently discarding a review.
+On a persistent backfill error or overflow, inspect omitted records manually; the index cannot clear
+unknown evidence. The scoped regressions are `review-run-index`, `drain-red-team-evidence`,
+`stream-filter-runs`, and the settings layout test `settings-files`; use heavy admission.
 
 
 ## Refused referral reviews re-read standing rulings
@@ -4536,6 +4593,14 @@ when it stays blocked. Replay two new planner skips per tick alongside four bloc
 heads across restarts, and bound repeat probes by `ceil(blockedCount / 2)` ticks;
 new arrivals must never overtake heads already waiting in the rotation.
 
+The queue regression and `red-team-queue-stale-eviction` soak break replay live-state
+maintenance across restarts. Terminal PRs are evicted even when stale planner candidates
+still list them. Changed live heads are re-keyed in place with attempts and blocks reset;
+unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
+runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
+Planner skips retain the existing bounded, fair probe rotation.
+Run the soak `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
+
 ## Timeout evidence synchronous worker pool
 
 `timeout-evidence-pool.mjs` runs the unchanged collector once per red PR per pass,
@@ -4617,6 +4682,66 @@ share the ref/full-SHA/ruling de-dup key; unreadable ops evidence warns and gran
 The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true` so each
 `--finding=<string>` appends one verbatim value in order; ordinary array flags still take JSON.
 
+
+## R986 I1 probation core (production wiring pending)
+
+`scripts/lib/daemon-rebuild/probation.mjs` is a pure transition core, not a running
+probation service. At adoption, `freezeProbation` takes the complete registered roster
+for one clone and `readClosure(daemon, sha)` snapshots at proven-good and adopted heads.
+A snapshot is `{ complete: true, files: { repoRelativePath: gitBlobId } }`; include
+all imported files. Unknown, incomplete, empty or unreadable snapshots owe proof.
+The core copies and validates each closure's files before the next `readClosure` call;
+readers may reuse their result object or files map without changing earlier evidence.
+An unknown or ambiguous roster refuses adoption: the operator must recover the roster.
+`owed` stays fixed for this adoption. `recordProof` stores independent daemon records;
+boot and completed tick evidence must name that daemon, agree on its PID and adopted
+head, and show process start at/after adoption with a later completed tick. Callers
+must obtain boot evidence from that daemon's process record, not from a sibling or
+from the wrapper's first tick time. `evaluateProbation` passes only with all owed
+records, or immediately for a known empty owed set. Non-owed evidence is a no-op.
+Each entry uses the same sanitizing boundary to recursively capture enumerable data
+properties and reject accessor descriptors without invoking getters or setters, including
+when `records` precedes `owed` in key order. Validation and decisions use only the frozen
+plain copy. State and evidence restored from JSON contain no accessors.
+The boundary catches read/copy errors, rejects cycles and functions (except the separately
+captured injected closure reader), memoizes aliases, and does not execute `toJSON`.
+Copying is limited to 100,000 properties/array slots per entry.
+Oversized input follows the same closed path; recover a bounded roster or state
+before retrying, and treat an identity return from adoption as a refused adoption.
+It preserves invalid values such as `undefined` and `NaN` for the validator rather than
+silently dropping unknown fields or coercing values through JSON serialization.
+Unreadable adoption options return the original options; readable but invalid rosters
+still throw the operator recovery error. Unreadable proof/state input is a no-op for
+`recordProof`; validation reports invalid state and evaluation stays pending.
+A recorded proof returns a fresh frozen copy, so
+mutating restored (for example JSON-parsed) state, a getter or a hidden key cannot
+discharge another daemon. A no-op still returns the caller's own input object.
+Legacy single-record state cannot promote; it requires operator recovery.
+
+The probation tests adapt the WIP adoption clock/heads and invalid-tick cases. The
+self-sync test uses the WIP injected rebuild/lock/closure fixture as a core consumer;
+it does not establish production probation integration. Remaining wiring: enumerate
+clone registrations, read both import closures by SHA, persist adoption and daemon
+boot/tick records under a shared mutation lock, and advance proven-good only on pass.
+No rollback, boot counting or probation deadline policy ships in this I1 core.
+
+`scripts/conveyor/soak/breaks/probation-accessor-snapshot.mjs` replays the operator's
+shared-files-map, records-getter-popping-owed, interacting-getters and throwing-boot probes against the real
+core. Its soak wrapper is automatically registered by the breaks directory discovery.
+The shared-map case pins an earlier repair; the records getter and top-level boot getter
+reproduce the failure at `41aaa588c39397fc7ad7eca7f63e9bf5fa041483`. All accessor cases now
+also require zero getter calls, including nested evidence.
+At `a19d094c84a838c161105da3296c3558467fc319`, interacting `records` and `owed` getters
+remove `review` and return `pass`. Rejecting accessors returns the original state untouched,
+keeps both daemons owed, calls no getters, and returns `pending`.
+These pure-core probes do not establish live daemon integration or merge compatibility.
+## GitHub Actions job-log readers
+
+Use `ciJobLogApiArgs` or `readCiJobLog` from `scripts/lib/gh-ci-log.mjs` for fixer-evidence and CI-heal job-log reads, with the caller’s existing throttled exec wrapper and output limits. Every successful helper read returns the whole raw job log, including passing steps, with `filtered: false`; logs without escapes remain byte-identical. The shared transport permits ANSI bytes; display callers retain their own control-character cleanup. The transport never filters the log or requests step metadata. Builder-draft recovery separately uses job-step metadata to attribute `firstError`, including untimestamped continuations; it never promotes a passing-step error from the whole log into a repair target. Without a nonempty failure annotation or a diagnostic attributable to a failed step, recovery reports `unattributed` and does not reserve capacity, dispatch repair, write retry state or escalate. Published summaries and no-detail placeholders never substitute for attribution; unreadable log or metadata requests abort recovery. Its whole-log fixer context still comes from the shared CI-heal context pack. Finding-producing readers remain on their `origin/main` transport, deferred to the follow-up **finding-producing log readers on gh 2.104**. The timeout classifier's `reconcile-pass.mjs` plain raw reader and `fix-facts.mjs` plain/raw and `readLog` paths also retain plain `gh api <path>` without `--allow-escape-sequences`, deferred to **timeout classifier on unfiltered logs: treat as unknown and retry, never eligible**. Only the timeout classifier consumes `makeFixEvidenceReader.readLog`; it has no failed-step attribution, so permitting escape-coded whole-job logs could promote a passing-step timeout into rerun eligibility. The structural regression in `scripts/lib/__tests__/gh-ci-log.test.mjs` checks both `scripts/` and `skills-src/` and explicitly allowlists these deferred readers; new bypasses are forbidden. In the mixed `reconcile-pass.mjs`, the main-fixed signature reader and timeout classifier are separately pinned.
+
+Only explicit `filtered: true` provenance may supply a failing-test list. For whole-job logs (`filtered: false`) or missing provenance, both fixer renderers report `unknown (unfiltered log)` and fence an ANSI-stripped tail as context; passing-step `FAIL` fixtures and errors must never become repair targets. `ci-log-evidence.mjs` caps tails by UTF-8 bytes and lines, retaining the end of even an oversized final line and directing the fixer to inspect the full log when truncated. Strip ANSI before timestamp ownership matching too: a coloured passing-step timestamp must end failed-step ownership. Context-pack, fix-run, operator prompt and builder-draft recovery tests pin these guarantees.
+
+A failed log read is `log-unreadable`: it refuses evidence-based mechanical reruns while ordinary bounded repair remains available. Actual request timeouts stay unknown and retry. Escape errors remain `{ eligible: false, reason: 'log-unreadable' }`; the named follow-up does not change that mapping in this slice. `ci-log-unreadable.test.mjs` supplies an escape-coded passing-step timeout plus an unrelated deploy failure and asserts plain argv, one failed log read, no retry and no eligibility across the direct, facts-disabled, facts-enabled and facts raw-API paths. Unreadable logs retain the readable-failure repair route. In particular, bounced CI-heal entries must still reach `ci-heal-pr-dispatch` and its unsettled-worker, unconfirmed-accounting and per-head loop hold/park guards. `ci-heal-pr-dispatch.test.mjs` exercises each refusal with real planner output; `ci-log-unreadable.test.mjs` pins routing parity and preserves the existing joined fixer for trusted current-head review findings, including the log evidence reason in its brief. Helper, context-pack and builder-draft recovery regressions cover whole-log context and unreadable evidence.
 ## Review job exit evidence
 
 Review-job diagnostics use `diagnostics/<slug>.exit.json` and `diagnostics/<slug>.ended.json`,
@@ -4625,6 +4750,108 @@ are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/s
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
 
+## Required-check evidence contract (PR1)
+
+`resolveRequiredChecks` ships without production callers. Its acceptance tests build
+job/head-bound hold annotations inline; no caller or hold-classifier change is required.
+Every required name needs its own evidence, a live/cache roster, an exact head and
+`rowsComplete: true`. Missing or false completeness returns `unknown`; neutral/skipped
+conclusions fail unless the exact name is in `optionalNames`.
+
+The fetch tests prove completeness only from matching connection counts, valid nodes
+and `hasNextPage: false`, and preserve the commit read head independently of the PR head.
+Legacy hydration reads at most ten batches of twenty heads. Unreadable, truncated or
+overflow evidence remains incomplete for retry on a later tick or operator inspection;
+an incomplete refresh preserves previously observed failures. Retry by exhausting
+pagination or explicitly reading every required name before attesting completeness.
+
+
+## PR1 audit: malformed rows, human holds and unavailable rosters
+
+`pr-list-paged.test.mjs` pins success beside null, empty and unknown-type nodes in both
+orders: mapping retains a nameless unknown row, marks the connection incomplete, and
+prevents a green legacy summary (which rejects the malformed identity). Strict resolution
+returns `unknown`. The open-PR fetch regression also proves that such an incomplete refresh
+preserves an already observed failure. Retry the read on a later tick or inspect the evidence
+before admission; never discard malformed nodes to obtain a green summary.
+
+`check-state-predicate.test.mjs` requires the shared `humanReviewOnlyHold` guard for each
+job/head-bound merge-gate hold source: IDs must be a nonempty subset of the human-review
+hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-label-only
+and other incidental holds retain failure. Empty or malformed required rosters always
+return `unknown` with `roster-unavailable`, including persisted options containing the
+removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+## Stuck trace isolation
+
+The stuck-trace node:test fixtures inject both operations and the event sink. Keep
+`fileURLToPath(import.meta.url)` resolution inside the default child runner: the digest
+fixtures import modules through data URLs, where eager file-path resolution fails.
+The digest and merge watcher share the watcher receipt directory; when overriding
+its state directory, pass that directory as the digest’s `traceStateDir` too.
+When exercising production branches with fully injected IO, stub `VITEST` and
+`WE_UNDER_TEST` to empty strings and assert `isUnderTest()` is false. Vitest 1.x
+stringifies `vi.stubEnv(name, undefined)` to the truthy string `"undefined"`, which
+keeps the isolation guards active and can make negative-path assertions vacuous.
+Restore the environment after each case; retain the production isolation guards.
+
+## Antigravity binary maintenance
+
+`scripts/operations/__tests__/agy-upgrade-check.test.mjs` injects command execution,
+child spawn/kill, time, filesystem and attention publication. No real agy or brew
+runs. Its timeout probes assert exact child PID SIGKILL and completion without a
+close event; output overflow also kills the child. The persisted dead-health
+probe checks both model families, malformed/future/expired records and normal
+quota fallback. Keep the two maintenance JSON files excluded from the legacy
+root quota scan: malformed optional health must not become a quota parse error.
+The run lock serializes scheduled ticks; a killed checker requires operator
+inspection and removal of its leftover lock before maintenance can resume.
+
+## Binary maintenance hold regressions
+
+Keep binary health/cache under the evidence directory's `binary/` subfolder; root JSON names remain legacy quota observations. Test unreadable health as a closed hold, recovery followed by an identical outage through the real attention publisher, and refused child kills at every maintenance step with reporting before lock release.
+
+Register binary maintenance's exclusive lock in `LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`.
+The source scan in `scripts/operations/__tests__/audit-verdict.test.mjs` requires every lock holder
+to stay on the protected audit floor, so concurrency findings block publication.
+
+## Review index completeness proof
+
+Appending a review id is only a discovery hint. Trust requires a completed backfill's
+`completeThroughMtimeMs`, stat-only id/mtime/file-identity snapshot, rebuilt PR keys, and acknowledged
+create-only poison markers. Listing or open-set changes retain verified id/mtime/file-identity
+and ownership rows; requeue changed/new ids and drop removed ids. An unreadable or mismatched
+candidate aborts the batch without publishing completeness, persists verified progress, and
+records a blocking id with a 60-second retry cooldown. Other ids advance during cooldown;
+completeness remains unpublished until every blocking record is verified or removed. Failed appends poison the whole sidecar independently of its write lock; only a
+complete rebuild acknowledges those markers. Readers stat the current listing before parsing
+indexed ids. Unknown or rewritten unindexed ids require strict record identity verification
+(at most 20 reads, sharing the evidence scan budget); unrelated PR ownership permits the hit.
+Same-PR, unreadable or over-bound unknown evidence, missing watermarks, unreadable listings
+or new poison markers force the unchanged bounded fallback. File identity also detects atomic replacements with
+unchanged mtimes when marker creation fails. Even an older/coarse mtime cannot hide an unknown id.
+Oversized snapshots retain the bounded scan and its scan-capped
+HOLD; inspect omitted runs manually. Optional backfill side effects, including argument and
+directory resolution, must return the drain context unchanged on exceptions.
+For every bounded-read risk, the test plan must name a regression counting actual read attempts
+or asserting the read range, including the default shared budget across repositories. Inject a
+failure after a successful staged read to prove no partial completeness can be published.
+Index verification payloads may serve the bounded fallback only after rechecking the file
+identity captured before the read (mtime, device, inode, size, ctime and birthtime). Changed
+identities discard cached payloads and read errors; fresh attempts still consume the shared
+parse budget. The unchanged one-read fallback and unchanged-mtime atomic-replacement cases
+in `review-run-index.test.mjs` pin both reuse and stale-cache refusal for drain and recovery.
+Both backfills must count payload attempts before calling the reader and retain that count
+outside staging, so aborts, listing churn and failed persistence cannot refund the shared
+50-read drain budget. The `%s backfill preserves payload spend after %s` cases and the
+`an aborted open-PR backfill leaves only the actual remainder after %s` drain cases pin this
+accounting. The open pass receives at most 25 of the shared 50 reads; unused reads go
+to the full pass, which always has at least 25 reads when the open pass obeys its cap.
+Unknown spend exhausts the open allocation, preserving the full pass's reservation.
+The repeated saturated-tick regression in `merge-ai-prs-review-backfill.test.mjs`
+pins full-pass completion without exceeding the shared budget. The bounded evidence scan and scan-capped HOLD
+remain the fallback until a later tick can complete discovery.
+Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
+through heavy admission.
 ## Fast-drain round listing and live target refresh
 
 Catch-up children share the `--listing-snapshot` round file. Its default TTL is 60 seconds;
@@ -4658,3 +4885,301 @@ oversized/incomplete/foreign evidence, target head invalidation, snapshot exclus
 a live target replacing a stale cached target with a different head and red check.
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
+
+## Drain read-migration fixture imports
+
+Load the drain/adoption graph with static imports during collection in
+`proc-read-migration-74b.test.mjs`, as the reaper fixture does in `proc-read-migration-74c.test.mjs`.
+Dynamic imports of that cyclic graph can remain unresolved in the Vite runner, even when awaited
+sequentially. Keep fake executable PATH setup in `beforeAll` and all large-output/failed-read
+assertions inside the original per-test deadlines; increasing the setup timeout does not resolve the import stall.
+## Ready-candidate adoption during overlay churn
+
+`daemon-rebuild-ready.test.mjs` exercises adoption with real Git ancestry: newly registered
+refs and descendant advances remain pending after adoption, and the next adopt-only tick
+must return `needs-build` with a different plan. `ready-candidate-adopted-partial` is an
+open-kind rebuild alert emitted after successful adoption only when pending refs exist.
+A candidate containing a removed ref is refused as `overlay-no-longer-wanted`, even when
+another overlay contains its tip; `pr-merged`/`in-main` removals retain their existing wanted
+handling. Each wanted tip must equal or descend from the candidate's tip. Preserve the independent
+live-applied omission, build-provenance, smoke, forced-record and canonical-audit gates.
+Preserve `overlaysBefore` as a veto for omitted live tips: the regression for a live overlay
+retired during planning must reject its omission and preserve HEAD.
+Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
+rule does not reset overlay main-sync parking or add retries for parked overlays.
+
+
+## Workflow-protection review admission
+
+The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged
+planner together using a rollup with `detailsUrl` and no check id. Workflow protection needs
+head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
+step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
+negative cases, rather than matching planner source text.
+## Overlay main-sync interrupted test evidence
+
+A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
+report. Retry the same chunk once with a distinct report path; a second interruption fails closed
+with the structured cause ahead of the cleaned diagnostic tail and asks for operator review.
+Remote termination unconfirmed remains a skip, including on the retry. Ordinary test failures
+retain the failed-file flake reruns and plain-main comparison. The killed-run soak proves the retry
+by executing an injected killed-once, then green runner; its presence probe uses behavior, not source markers.
+Stop text in stderr cannot classify an ordinary exit (0 or 1) as interrupted. Retry an interrupted
+attempt only when neither stdout nor stderr (ANSI stripped) nor partial JSON contains red evidence.
+TAP `not ok`, Vitest `FAIL`/`×`/`✗`, positive failed summary counts, and failed JSON rows (including
+extra files and unnamed assertions) block immediately with the interruption cause, `attempts: 1`,
+and failing names preserved in the diagnostic tail. A green retry cannot erase an observed failure.
+Vitest's `Unhandled Errors`/`Unhandled Rejection` headers and `Errors N error(s)` summaries also
+block retry in either output stream. Only ENOENT at the initial report stat is absent evidence:
+an existing report that cannot be read, parsed or structurally validated, or exceeds 8 MiB, blocks
+the first attempt with the report failure in the diagnostic and an operator-review escalation.
+Keep ordinary flake rerun identity/count coverage checks unchanged. Run `overlay-main-sync-rerun.test.mjs`,
+`daemon-rebuild-overlay-main-sync.test.mjs`, and the killed-run soak through heavy admission.
+## Carbon review admission and complete escape evidence (Slice A)
+
+Carbon shadows require both `WE_REVIEW_SEAT_CAP_AGY_GEMINI > 0` and
+`WE_REVIEW_SEAT_CAP_CARBON_SHADOW > 0` (default 1; malformed values refuse).
+The daemon plist currently sets the Gemini cap to 0: operators must explicitly raise
+it to enable Carbon shadows. A refusal records `agy-gemini seat cap 0` or
+`carbon shadow seat off`; it never retries or reserves budget. Other Gemini models
+retain their provider cap.
+
+Non-shadow Carbon seats require `shadowSeats.antigravity.promoted === true`
+(default false; environment `WE_REVIEW_SHADOW_AGY_PROMOTED=true`). Only the
+orchestrator flips promotion after the manual ruling on ten agreeing PRs. The setting
+resolves standard → platform review → tool review.json → environment and logs provenance.
+The Carbon probation entry tracks shadow trials only; pinning Carbon never auto-seats
+an advisory reviewer. Unpromoted non-shadow Carbon is refused, leaving Gemini unseated
+by default. Historical counted-seat fixtures must explicitly supply promotion.
+
+`review-shadow-model.test.mjs` covers both launch switches, malformed overrides,
+manual promotion and the unchanged shadow path. `agy-review-juror.test.mjs` requires
+`read_file` to name a nonempty direct string path under a path-like key, contained
+by realpath in the juror lane (including symlink checks). Missing, scalar, array,
+nested-only and escaped parameters void the run. Other read tools retain their rules.
+Every nonempty transcript line must be an event object; an answered juror must end
+with a `result` object whose status is `SUCCESS`. Empty, whitespace-only, unrelated,
+non-object and incomplete transcripts void the run for incomplete escape evidence.
+Successful fixtures supply realistic tool events and a successful terminal result;
+never relax the evidence rule to accommodate an empty fixture. Refused evidence
+requires a fresh run with a complete transcript before its answer can count.
+## Owed CI rerun execution
+
+The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
+Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
+daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
+refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+
+## Verify failed-file recovery
+
+`verify.retryFailed` (`scripts/verify-settings.json`, env `WE_VERIFY_RETRY_FAILED`) defaults to 1,
+accepts 0–10 attempts, and logs its effective value/source. Zero retains the historical
+`isolatedRetry` policy. Positive values retry up to three failed files per Vitest/scan/guard
+phase, including edited files, using serial workers and the phase's scaled timeouts. `isolatedRetry=off`
+disables all retries; `isolatedRetry=timeouts` permits only timeout-only failure inventories, including
+on later attempts. These restrictions also apply to scan and guard retries. A complete
+failure inventory and a JSON report proving the original failing assertions passed are required;
+missing, skipped, or incomplete execution never clears red. Every duplicate of an original full test
+name in that exact file's retry report must pass; a passing namesake cannot mask a skipped test.
+Oversized/incomplete inventories stay red: fix the failures or run a fresh verify. The recognized full-unit default separates tests
+from standards; opaque explicit combined commands retain their verdict. Recovered files appear in
+marker `flakes` and the advisory coordination-root `.operations/test-flakes.jsonl`; merge CI is unchanged.
+Full-unit recovery requires a runtime read proving the target checkout's `test:unit` is exactly the
+heavy-admission `vitest run` script with neither `pretest:unit` nor `posttest:unit`. Missing, unreadable,
+malformed or oversized package evidence leaves the full gate opaque. Scan retries retain the original
+command's environment assignments, including `VERIFY_SCAN_FILES`; an unrecognized assignment or shell
+shape refuses recovery. Both refusals retain red: fix the failures or run a fresh verify.
+`verify-retry-context.test.mjs` covers package evidence and an untracked deterministic scan violation.
+## Urgent prototype verification
+
+`node scripts/operations/run.mjs urgent-verify --sha=<full sha>` requires a clean checkout at
+that SHA. It reads CI's unit shard matrix, uses the current time-balanced covered/nocov assignments
+and npm-script Vitest arguments, and runs each group sequentially through heavy admission before
+`check:standards`. Unknown workflow/command layouts refuse; repair the runner or wait for CI.
+Admission exhaustion stops the run without an outer retry loop. Only this runner appends full-suite
+green/red receipts to `~/workspace/.operations/coordination/urgent-full-green.jsonl`.
+
+`prototype-load --urgent --reason=<at least 10 characters>` prefers passing CI, otherwise requires
+the latest exact-SHA receipt to be full, green, current-shard-count and at most two hours old.
+Its signed steps must start with `fetch-main-history`, `install-fui`, `install`, then match the current CI unit plan in order, followed by coverage,
+hostPaths, integration and standards. Before selecting or binding a test suite, any completed
+exact-SHA check-run with failure, cancelled, timed_out, action_required or startup_failure vetoes
+urgent loading. An unreadable raw check-runs response still requires the signed receipt.
+Other admission gates remain in force; merging still requires real CI. Urgent admissions append
+`prototype-load.urgent` events to `~/workspace/.operations/coordination/urgent-loads.jsonl`.
+`urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
+later-red supersession, event logging and the unchanged non-urgent CI gate. Run via heavy admission.
+
+The first local step runs the workflow-pinned `sh scripts/ci/fetch-main-history.sh` in the checkout; a failure signs a red receipt before any suites. Historical green never disables verdict timeouts: after green, persist `nonGreenSince` on the first current non-green read and apply the 6h escalation / 24h unload deadlines from that observation. Loads that never passed retain their load-time deadline. A recovered green clears that episode clock and its six-hour escalation deduplication; a later non-green episode can escalate again.
+
+## Urgent local verification receipts
+
+FUI sibling verification requires its origin to normalize to `https://github.com/frontier-ui/frontierui`
+(HTTPS and Git SSH forms are accepted) before fetching or installing. Signed receipts bind `fuiRepo`
+as well as `fuiSha`; old receipts without the origin require fresh verification or passing CI.
+The urgent sweep reads all check-runs (maximum 100, exact count and unique IDs required) and settles
+green only after every run completes and all required runs succeed. Pending unrelated runs keep the
+load eligible for later failure detection. Legacy green settlements without `checksComplete: true`
+are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
+Malformed, incomplete, oversized or duplicate-ID evidence never authorizes CI-failure unloading, even with a possible bound failure. Escalate that possible failure once per tracking ID and keep monitoring; the 24h verdict expiry still unloads.
+
+Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the runner-owned private HMAC key and the loading checkout’s normalized origin. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
+
+The urgent gate mirror pins every `run` text in `test-shard`, `coverage-merge`, `host-paths`,
+`integration`, `test`, `standards` and `changes`, with job-specific setup commands and exact occurrence counts.
+Extra validations require a local runner update, including otherwise familiar setup commands.
+Checkout sources and paths are pinned: WE uses the event checkout without a ref/repository override; FUI uses `frontier-ui/frontierui` without a ref override. When CI adds
+validation, update the mirror before issuing local receipts; unknown run steps refuse with
+`unreadable-ci-gates`. Keep the real-workflow acceptance and per-job unknown-step regressions
+in `urgent-verify.test.mjs`.
+
+
+Urgent verification derives the required CI job closure from `test.needs`, including transitive
+dependencies; unknown jobs or changed install commands require a mirror update or passing CI.
+It verifies the clean FUI sibling against its fetched default branch, then admits FUI install/build
+and checkout install before suites. Signed receipts include `fuiSha` and both install steps; older
+receipts require fresh verification. Child environments are allowlisted with CI markers explicitly removed so host admission cannot be bypassed, and the signing key is read
+only after the suite pipeline stops. `urgent-sweep` is one bounded pass (32 loads, 100 checks per SHA);
+the orchestrator schedules it. Its durable settlement ledger prevents repeat handling and stores a
+`sweep-cursor` before each batch so pending or unreadable loads cannot starve later entries.
+Cursor records never settle a load; older ledgers without a cursor start at the beginning. Completed
+failures in any check-run on the SHA, regardless of job or app, open a once-per-tracking-ID NEEDS-YOU escalation through
+`land-advance-escalations`; unreadable/oversized evidence and legacy records without registrations
+require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
+starts fresh. Check failures authorize removal only for the GitHub Actions app and jobs in the configured
+`test` needs closure, with each suite bound to that workflow run on the exact SHA. Validate complete,
+bounded check pages before acting. Select only the latest check ID per app, check name and suite (including workflow rerun attempts), as in `testCheckEvidence`; a newer success supersedes its own older failure, while another suite or shard cannot.
+Unrelated app/workflow/job failures never authorize removal or green monitoring; they remain tracked
+with a durable failure-escalation receipt. The 24h verdict expiry still permits unloading.
+Unknown workflow or required-job
+evidence stays tracked and requires operator inspection; the existing verdict expiry still applies. Green loads are checked every pass while their clone/ref remains in the shared overlay
+store, including historical time-complete receipts. Only confirmed absence ends monitoring; corrupt
+overlay state escalates and stays tracked. A failed registration command can leave a persisted overlay:
+the loader writes a registration-failed note only after the shared overlay reader proves clone/ref
+absence, and the sweep honors that note only after confirming absence again. Present or unreadable
+registrations retain monitoring. Keep these paths in `prototype-load.test.mjs` and `urgent-sweep.test.mjs`.
+
+Action signatures also pin exact `if`, `env` and `continue-on-error` values, including their absence.
+A changed checkout condition or action environment refuses with `unreadable-ci-gates`; update the
+mirror or wait for passing CI. The real workflow and every action's context mutations are covered
+in `urgent-verify.test.mjs`.
+
+Urgent retirement requires both the matching load and a persisted `unload-decision` from
+`urgent-sweep-state`, read under the overlay lock. The sweep writes this decision before removal;
+write failure leaves the registration intact. Decisions bind tracking ID, clone, source ref/SHA
+and registration ref/SHA, with either an exact-source-SHA completed failure or a `ci-expired`
+decision at least 24 hours after loading. A load record alone never authorizes withdrawal.
+Urgent withdrawal reuses explicit `--remove`'s `proveOverlayWithdrawal` guard under the add lock:
+cached stacked dependents or live ancestry to another registration refuse removal. Unreadable
+dependent evidence also refuses; inspect the stack before unloading manually. Fetch the target
+as well as each potential dependent before comparing ancestry: urgent clones may lack the target's objects.
+Missing, unreadable, mismatched, future or incomplete decisions refuse; inspect CI and repair the
+ledger or unload manually. The production decision reader shares the 4 MiB ledger bound and
+archive fallback. Decisions are authorization records, not unload settlements: refused removals
+retain the decision without emitting an unload event. Historical settlements retain their existing
+adoption handling. Keep these guarantees in `urgent-sweep.test.mjs` and
+`daemon-overlay-replace-retire.test.mjs`.
+
+The CI mirror also pins each run step's directory, environment, shell, condition and error policy,
+and refuses job run defaults, environments and containers. A context change requires updating the
+mirror or waiting for passing CI; command equality alone cannot authorize an urgent receipt.
+Health-watch schedules `urgent-sweep-tick.mjs` every five minutes, persisting `urgentSweep.lastAttemptAt`
+even on failure. `scripts/settings/urgent-sweep.json` controls the interval through the policy cascade
+(`WE_URGENT_SWEEP_INTERVAL_MINUTES` is the environment override). Fixture, redirected and dry-run ticks
+skip host urgent loads. Errors are logged and recorded as probe errors without interrupting the tick.
+Keep cadence, persisted-stamp and fail-soft wiring regressions in `urgent-sweep-tick.test.mjs`.
+The lane-scan boundary guard also pins `runUrgentSweepTick` by module/export identity and exactly one
+health-watch invocation. Keep sweep IO in the tick module and register new reviewed tick entry points
+in both helper inventories without exempting them from the call-site guard.
+
+Absent registrations removed by another actor also require ancestry proof: settle only when HEAD
+excludes the urgent SHA or a freshly fetched `origin/main` contains it. Historical
+`settled-unregistered` receipts without `ancestryVerified` resume monitoring. Persist the first
+observed absence in `monitoring-unregistered`; while unmerged code remains in HEAD, keep reading
+CI and raise one NEEDS-YOU per tracking identity on failure or after 15 minutes. Unloading an
+already absent registration cannot repair that running build. Unknown ancestry/fetch evidence
+escalates and stays tracked. The urgent sweep suite pins both settlement proofs, grace/deduplication,
+later CI failure, legacy receipt migration, and bounded injectable Git IO.
+
+## Urgent unload adoption
+
+An urgent CI removal persists `unloaded-pending-adoption` before emitting its unload event and
+escalation. It remains tracked until the registration is absent and Git in the daemon clone proves
+`git merge-base --is-ancestor <failed-sha> HEAD` exits 1. Only then write `unloaded-adopted`.
+Historical `settled-unloaded` receipts resume adoption checks using their removal timestamp.
+Unknown ancestry or timestamps escalate and stay tracked. After 15 minutes from removal, a HEAD
+still containing the SHA with no registration raises a separate last-good-build NEEDS-YOU packet,
+deduplicated through a persisted flag per load identity (including tracking ID). Later passes still
+check adoption. Keep grace, adoption, legacy receipt, closed-path and dedupe regressions in
+`scripts/operations/__tests__/urgent-sweep.test.mjs`; run it and the conveyor tick suite via heavy admission.
+
+Unload receipts checkpoint `unloadEventSent` and `unloadEscalationSent` separately after each
+successful sink write. Failed notifications retry on later sweeps even after `unloaded-adopted`,
+and do not prevent adoption checks or the other notification. A failed progress write allows
+redelivery (event delivery is at least once); escalation IDs stay stable. Legacy `settled-unloaded`
+receipts already followed both notifications; pending/adopted receipts missing progress retry them.
+Named fault-injection tests cover each sink failure and each progress-write interruption.
+
+
+## Urgent sweep guarded withdrawals
+
+Urgent CI failure and expired-verdict unloads use `retireRegistration` with the library-only
+`urgent-failed` mode after `recoverDrops` for the clone. Pass the loaded registration SHA
+(`registration.sha`, which may differ from the source SHA) and the observed full entry snapshot.
+The normal retirement proof still runs; only `unique-commits-not-on-main` and `pr-open` keep
+verdicts may authorize urgent withdrawal, with a matching tracking record, SHA and exact live tip.
+Pinned, edge-resolution and unreadable keep verdicts still refuse. Check the registration
+`edgeResolution` explicitly before overriding a keep verdict: the planner can return `pr-open`
+before inspecting its approved edge. Keep regression cases for changed
+entries, moved/unreadable tips, the lock and
+persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
+never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
+same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+
+## Negative review-run proofs
+
+`headNeverReviewedFromRuns` may bypass its 400-run scan only through
+`readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
+markers, stat-only listing verification, and no overflow or eviction for that PR.
+The full-backfill verified staging state lives in the index and uses the same identity
+reconciliation and bad-record cooldown as the open-PR backfill, parsing at most 50
+records per call by default. Concurrent writes requeue only changed identities; a bad
+or unreadable record blocks the global watermark while other candidates advance.
+Open-PR hint refreshes must preserve that staging state and proof.
+Full completeness includes a SHA-256 digest of the rebuilt entries and eviction
+markers. Readers and the backfill reuse path reject a missing or mismatched digest:
+deleting a PR key, dropping one row, or losing an eviction marker cannot preserve
+the proof. Old snapshots without the digest require a new bounded full pass.
+Appends never reseal a proof; only a completed rebuild writes the digest. This
+checks persisted consistency, not authenticity against a writer forging the whole index.
+Unverifiable indexed identities return to the original capped scan; they never
+establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
+races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the
+existing `redteam-pending-settle` and `review-red-team-on-skip` suites.
+## Forge sweep partial work
+
+`forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between
+slot and presync tree inspection and proven-tree removal. Entry-bound exhaustion
+preserves the tree and reports `partial` with an operator fallback to raise the
+bound or stop writers and inspect manually. Depth limits and filesystem errors
+remain refusals. `slots.maxRunDirsPerTick` (integer 1–10000, default 200) counts only
+reclaimed directories (would-reclaim in dry-run) across sorted slots and legacy
+directories. Fresh, reserved, live-record and oversized trees do not consume this
+budget. At the bound, inspection stops and unexamined candidates carry over with
+a reclaimed/remaining partial note. Invalid bounds use defaults and report
+`default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
+warning. Unreadable reservations refuse and preserve the entire affected slot.
+The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## Open-pr preflight
+
+`open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
+or writing bypass receipts. `pr-land-preflight.test.mjs` runs the actual CLI with gate/forge ports replaced and
+records push/create/card effects. A real refusal uses the same checkpoint. PR-limit refusal is a check-only
+blocker hint: a real open evaluates capacity after pushing and leaves the ref pushed when refusing.
+Park opens ready for review; draft-promotion still handles older drafts.
+
+Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
+`main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
+`open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.

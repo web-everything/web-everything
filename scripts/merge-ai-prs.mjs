@@ -6,6 +6,7 @@ import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, crea
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
+import { isDrainTransientPath } from './lib/transient-paths.mjs';
 import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, refreshHeldHead, refreshApprovedHeadChecked, retainApprovedHumanQueueHead } from './lib/approved-human-surface-hold.mjs';
 /**
  * merge-ai-prs.mjs — sweep OPEN pull requests and merge the AI-generated ones that are safe to land.
@@ -132,8 +133,7 @@ import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from 
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundSnapshot, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
-import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
-// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
+import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
 import {
@@ -186,6 +186,28 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
+/** Optional discovery hints must never reject the drain's open-PR context. */
+export function backfillDrainReviewRuns(context, {
+  backfill = backfillOpenReviewRuns, backfillAll = backfillAllReviewRuns, resolveDir = resolveRunsDir, localSlug,
+} = {}) {
+  // Reserve half the shared tick budget for full-store progress, even if the open
+  // pass repeatedly exhausts its allocation or cannot report its spend.
+  const TICK_PARSE_BUDGET = 50;
+  const OPEN_PARSE_BUDGET = 25;
+  let used = OPEN_PARSE_BUDGET; // Unknown spend consumes the entire assigned allocation.
+  try {
+    const spent = backfill(context, { runsDir: resolveDir(), localSlug, maxParses: OPEN_PARSE_BUDGET });
+    used = Number.isSafeInteger(spent?.parsed) && spent.parsed >= 0 ? spent.parsed : OPEN_PARSE_BUDGET;
+  } catch { /* The unchanged bounded evidence scan remains authoritative. */ }
+  const left = TICK_PARSE_BUDGET - used;
+  if (left > 0) {
+    try { backfillAll({ runsDir: resolveDir(), maxParsesPerCall: left }); }
+    catch { /* The full backfill is a hint too: the capped scan stays authoritative. */ }
+  }
+  return context;
+}
+import { resolveRunsDir } from './operations/run-store.mjs';
 import { resolveCardNumbering } from './lib/policy-cascade.mjs';
 import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
@@ -202,6 +224,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
+import { resolveRequiredChecks } from './lib/check-state-predicate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
@@ -1404,6 +1427,113 @@ export function isRebaseDropCandidate(v) {
   const state = String(v.state || '').toUpperCase();
   const mergeable = String(v.mergeable || '').toUpperCase();
   return mergeable === 'CONFLICTING' || state === 'BEHIND' || state === 'DIRTY';
+}
+
+/** Pure: only complete, clean evidence permits retaining a BEHIND head for the merge queue. */
+export function isBehindButClean(v) {
+  // BEHIND must be the SOLE blocker: the verdict reason is exactly the plain BEHIND reason (no queueBlocker suffix,
+  // no CodeQL / read-error / review-hold / fix-claim reason, which replace it) and no blocker flag is set.
+  return isRebaseDropCandidate(v) && v.state === 'BEHIND' && v.mergeable === 'MERGEABLE'
+    && v.reason === unlandableStateReason('BEHIND')
+    && !v.codeqlBlocked && !v.reviewHeld && !v.requiredCheckReadError && !v.prestagePendingCi && !v.offDefaultBase
+    && v.hasManifest === false && v.testGreen === true && (v.certifyLabel === true || v.aiGenerated === true);
+}
+
+/**
+ * Authoritative head-tree probe: true ONLY when git proves the head tree has no `.lane-manifest.json` path at all.
+ * `v.hasManifest === false` is not enough (malformed/item-less manifests parse to null), so any read problem or any
+ * listed path fails closed (false => the existing rebase/strip path runs). `git` is injected (args => stdout).
+ */
+export function headTreeLacksManifestFile({ headRef, headSha, prNumber, git }) {
+  try {
+    const read = readLegacyLocalManifestAt({ headRef, headSha, prNumber, git });
+    if (read.unreadable || !read.definitive || read.manifest != null) return false;
+    if (String(git(['ls-tree', '--end-of-options', headSha, '--', '.lane-manifest.json']) ?? '').trim() !== '') return false;
+    // rebaseDropManifest also strips root fix-evidence scratch files; keep that backstop by requiring none exist.
+    const root = String(git(['ls-tree', '--name-only', '--end-of-options', headSha]) ?? '').split('\n').filter(Boolean);
+    return !root.some(name => isDrainTransientPath(name));
+  } catch { return false; }
+}
+
+/** Return the rebase operation unless the queue can preserve this proven manifest-free head. */
+export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFree, reclassifiesMerge, rebase = rebaseDropManifest }) {
+  if (setting === 'conflict-only' && mergeStrategy.queueOwnsFreshness(v.repo) === true
+    && isBehindButClean(v) && manifestFree() === true && reclassifiesMerge() === true) {
+    v.decision = 'merge';
+    v.reason = 'behind main but clean; merge queue tests PR + main - enqueued on its existing head';
+    v.rebaseDrop = 'skipped-behind-clean';
+    return null;
+  }
+  return rebase;
+}
+
+/** Fresh bypass evidence: exhaust the head's rollup, bounded to 1,000 contexts.
+ * Any unreadable/oversized connection retains BEHIND for the ordinary skip/rebase path.
+ */
+export async function readFreshQueueRollup(pr, { repo, exec = execFileP } = {}) {
+  const unresolved = { ...pr, rowsComplete: false };
+  if (!/^[a-f0-9]{40}$/i.test(pr?.headRefOid ?? '') || !repo) return unresolved;
+  const [owner, name] = repo.split('/');
+  const rows = [], cursors = new Set();
+  let after = null, total = null;
+  try {
+    for (let page = 0; page < 10; page += 1) {
+      const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){object(oid:${JSON.stringify(pr.headRefOid)}){...on Commit{oid statusCheckRollup{contexts(first:100${after ? `,after:${JSON.stringify(after)}` : ''}){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ...on CheckRun{name status conclusion detailsUrl databaseId startedAt completedAt} ...on StatusContext{context state targetUrl}}}}}}}}`;
+      const { stdout } = await exec('gh', ['api', 'graphql', '-F', `owner=${owner}`, '-F', `name=${name}`, '-f', `query=${query}`],
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      const data = JSON.parse(stdout);
+      const commit = data?.data?.repository?.object;
+      const connection = commit?.statusCheckRollup?.contexts;
+      if (data.errors?.length || commit?.oid !== pr.headRefOid || !Array.isArray(connection?.nodes)
+        || !Number.isInteger(connection.totalCount) || connection.totalCount < 0
+        || typeof connection.pageInfo?.hasNextPage !== 'boolean') return unresolved;
+      if (total !== null && total !== connection.totalCount) return unresolved;
+      total = connection.totalCount;
+      // The latest-per-name reducer orders runs by `id`/`completedAt`; keep them so a stale success cannot mask a newer failure.
+      rows.push(...connection.nodes.map(n => (n?.__typename === 'CheckRun' && n.databaseId != null ? { ...n, id: n.databaseId } : n)));
+      if (!connection.pageInfo.hasNextPage) return rows.length === total
+        ? { ...pr, statusCheckRollup: rows, rowsComplete: true } : unresolved;
+      after = connection.pageInfo.endCursor;
+      if (typeof after !== 'string' || !after || cursors.has(after)) return unresolved;
+      cursors.add(after);
+    }
+  } catch { /* next tick may retry; never excuse BEHIND on an incomplete read */ }
+  return unresolved;
+}
+
+/**
+ * Excuse BEHIND only after every required context has its own passing row on this head.
+ * Unknown required sets or incomplete evidence preserve the original skip/rebase path.
+ */
+export function retainCheckedQueueHead(pr, { requiredCheck = 'test', queueRequiredChecks = null,
+  requiredNames = queueRequiredChecks, rosterSource, expectedHeadSha, holds = [], ...options } = {}) {
+  if (!pr || pr.requiredCheckReadError || !Array.isArray(queueRequiredChecks) || !Array.isArray(requiredNames)) return pr;
+  const required = [...new Set([...requiredNames, requiredCheck, ...queueRequiredChecks])];
+  if (resolveRequiredChecks({ rows: pr.statusCheckRollup, rowsHead: pr.headRefOid,
+    rowsComplete: pr.rowsComplete, requiredNames: required, rosterSource,
+    head: expectedHeadSha ?? pr.headRefOid, holds }).state !== 'pass') return pr;
+  return retainApprovedHumanQueueHead(pr, options);
+}
+
+/** Excuse only BEHIND for the exact manifest-free head retained by this pass's bypass. */
+export function retainBypassedQueueHead(pr, { verdict, setting, queueOwnsFreshness, expectedHeadSha, requiredCheck, queueRequiredChecks, requiredNames, rosterSource }) {
+  const retained = setting === 'conflict-only' && queueOwnsFreshness === true
+    && verdict?.rebaseDrop === 'skipped-behind-clean'
+    && !!expectedHeadSha && (verdict.listedHeadSha || verdict.headSha) === expectedHeadSha
+    && pr?.headRefOid === expectedHeadSha;
+  return retainCheckedQueueHead(pr, { hold: retained, queueOwnsFreshness, requiredCheck, queueRequiredChecks, requiredNames, rosterSource, expectedHeadSha });
+}
+
+/** Pure: injected settings layers keep IO outside the resolver; invalid values retain the legacy rebase path. */
+export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
+  const checked = value => value === undefined || ['conflict-only', 'always'].includes(value) ? value : 'invalid';
+  const r = resolveCascade({
+    standard: 'conflict-only', platform: checked(platform?.rebaseBeforeEnqueue), tool: checked(tool?.rebaseBeforeEnqueue),
+    envValues: { '': checked(env?.WE_DRAIN_REBASE_BEFORE_ENQUEUE) },
+  });
+  const value = r.value, source = r.sources[''];
+  return ['conflict-only', 'always'].includes(value) ? { value, source }
+    : { value: 'always', source: `${source} (invalid; fail closed to always)` };
 }
 
 /**
@@ -4734,23 +4864,26 @@ export function describeGhListError(e) {
 
 // ── CLI boundary ───────────────────────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (IS_CLI) runCli().catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
+if (IS_CLI) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
-async function runCli() {
+export async function main(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
+  const flags = parseArgvFlags(argv);
+  // Keep the real CLI's synchronous flush before exit; fixtures supply a memory sink.
+  const writeStdout = text => stdout === process.stdout ? writeAllSync(1, text) : stdout.write(text);
   // #3866 (ratified) — opt-in only: a no-op unless WE_GITHUB_APP_* is configured, in which case every `gh`
   // call this drain run makes draws from the App installation's own rate-limit bucket instead of the
   // operator's personal one. Awaited HERE, before any gh work, so a fresh env var is in place for even the
   // very first discovery call; a `--watch` run re-checks at the top of every pass (see the watch loop). See
   // github-app-auth-env.mjs's own header for why this lives outside gh-throttle.mjs.
   // PR #5729 — the drain is a daemon: install the gh refusal shim (or refuse) before any gh call.
-  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
+  await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(env, argv) });
   // #4308 — the drain CLI's one-off overlap-yield overrides (`--overlap-yield`/`--no-overlap-yield`/
   // `--overlap-yield-window=<n>`, env `WE_DRAIN_OVERLAP_YIELD`). A usage error (conflicting flags, a bad env
-  // value) throws here and is caught by this file's own top-level `runCli().catch(...)` — an ordinary CLI
+  // value) throws here and is caught by this file's own top-level `main(...).catch(...)` — an ordinary CLI
   // usage-error exit, not a drain failure.
-  const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
-  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }))}\n`);
-  process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }))}\n`);
+  const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env });
+  process.stderr.write(`${formatOverlapYieldOnlyToEnqueueableSetting(resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env }))}\n`);
+  process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
@@ -4798,7 +4931,7 @@ async function runCli() {
   // `--under-lease=<owner>` (or the DRAIN_UNDER_LEASE env) declares this run a CHILD of the resident drain
   // daemon that already holds the lease (#2449) — run without acquiring, the parent owns the heartbeat.
   const NO_DRAIN_LEASE = !!flags['no-drain-lease'];
-  const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (process.env.DRAIN_UNDER_LEASE || null);
+  const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (env.DRAIN_UNDER_LEASE || null);
   // #2395 — `--max-runtime-min=N`: a wall-clock lifetime cap on a `--watch` monitor. The bounded-max-lifetime
   // backstop push-at-close needs: when its detached drain has no batch feed, `--until-batches-idle` is INERT
   // and would poll forever, so this hard-stops the watch after N minutes regardless of idle/feed state. 0/unset
@@ -4870,7 +5003,7 @@ async function runCli() {
   // use the URL so a remote on another GitHub host keeps its identity too. Never guess on a failed read.
   let implicitLabelRepo;
   const memoRepo = (repo) => {
-    if (repo || process.env.GH_REPO) return repo || process.env.GH_REPO;
+    if (repo || env.GH_REPO) return repo || env.GH_REPO;
     if (!implicitLabelRepo) {
       implicitLabelRepo = execFileSync('gh', ['repo', 'view', '--json', 'url', '--jq', '.url'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 }).trim();
@@ -4908,7 +5041,7 @@ async function runCli() {
   // so a restarted or one-shot drain does not re-mint labels every pass. A not-found on a label write forgets the
   // entry and re-mints it (`healLabelNotFoundIn`), so a label deleted on GitHub is created again exactly when needed.
   const labelEnsurer = createLabelEnsurer({
-    path: process.env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
+    path: env.WE_DRAIN_LABEL_MEMO_PATH || join(homedir(), '.claude', 'conveyor', 'drain-label-memo.json'),
     run: (args, repo) => execFileSync('gh', [...args, ...(repo && !repo.startsWith('cwd:') ? ['--repo', repo] : [])], { stdio: ['ignore', 'ignore', 'pipe'] }),
   });
 
@@ -4990,7 +5123,7 @@ async function runCli() {
   const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
-    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
+    withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
@@ -5117,12 +5250,14 @@ async function runCli() {
       const pruned = pruneStuckUnknown(stuckUnknownMarks, { prs: [{ ...data, repo: repo || localSlug, num }] });
       updateStuckUnknown(pruned);
       attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
-      return await resolveChecks(repo, data);
+      const resolved = await resolveChecks(repo, data);
+      return data.mergeStateStatus === 'BEHIND' && mergeStrategy.queueOwnsFreshness(repo)
+        ? readFreshQueueRollup(resolved, { repo: repo || localSlug }) : resolved;
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
   // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
-  const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(env);
   const stuckUnknownPath = join(dirname(refreshedStatePath()), 'stuck-unknown-mergeability.json');
   let stuckUnknownMarks = loadStuckUnknown(stuckUnknownPath);
   const updateStuckUnknown = next => {
@@ -5142,7 +5277,7 @@ async function runCli() {
   let stuckUnknownTool;
   try { stuckUnknownTool = readDeclaredDrainSettings()?.drain?.stuckUnknownMergeability; } catch { /* standard */ }
   const stuckUnknownSetting = cascadePolicy('drain.stuckUnknownMergeability', stuckUnknownTool, {
-    standard: { afterMinutes: 30 }, env: process.env,
+    standard: { afterMinutes: 30 }, env,
     valid: { afterMinutes: v => Number.isFinite(v) && v > 0 },
   });
   process.stderr.write(`merge-ai-prs: stuckUnknownMergeability.afterMinutes=${stuckUnknownSetting.value.afterMinutes} (${stuckUnknownSetting.sources.afterMinutes})\n`);
@@ -5164,9 +5299,9 @@ async function runCli() {
       read: ({ repo, num, fields }) => fetchFreshPrForRevalidation(repo, num, fields) }),
   };
   const fail = (reason, detail, code) => {
-    if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify({ ok: false, reason, detail }) + '\n');
     else process.stderr.write(`merge-ai-prs ✗ ${reason}: ${detail}\n`);
-    process.exit(code);
+    exit(code);
   };
 
   // Read a PR's lane manifest (#2188). xnsk54v — the manifest now rides the PR BODY (drain-only orchestration
@@ -5353,7 +5488,7 @@ async function runCli() {
     },
     onListingFailed: (repo) => { process.stderr.write(`  ⚠️  FAILED open-PR listing for ${repoTag(repo) || 'cwd'}: gh pr list threw — the couple gate treats the open-PR context as INCOMPLETE this pass (fail closed; #xc7p3q9 B2).\n`); },
     onListingTruncated: (repo, n) => { if (!AS_JSON) process.stderr.write(`  ⚠️  DEGRADED open-PR listing for ${repoTag(repo) || 'cwd'}: ${n} PRs hit the --limit ${OPEN_PR_LIST_LIMIT} cap — the page MAY be truncated (oldest, longest-held blockers dropped first). The cross-item merge order derived from this listing is NOT trustworthy for the early-land decision this pass (#999/xq985wu F3).\n`); },
-  });
+  }).then(context => backfillDrainReviewRuns(context, { localSlug }));
 
   // #2421 — POST-CI TOTAL CI-LIFECYCLE LABEL RECONCILE, generalizing #2216's green-only `reconcileGreenLabels`
   // per the #2281 ruling. Every open, PRODUCER-OWNED (AI-generated) PR is brought to the state
@@ -5546,6 +5681,10 @@ async function runCli() {
   };
   const approvedHeadSetting = resolveSkipRebaseApprovedHumanSurface();
   if (!AS_JSON) process.stderr.write(`  merge-queue: skipRebaseApprovedHumanSurface=${approvedHeadSetting.value} (${approvedHeadSetting.source})\n`);
+  const rebaseBeforeEnqueue = resolveRebaseBeforeEnqueue(process.env, {
+    platform: platformPreference('drain'), tool: readDeclaredDrainSettings()?.drain,
+  });
+  if (!AS_JSON) process.stderr.write(`  rebase-before-enqueue: ${rebaseBeforeEnqueue.value} (${rebaseBeforeEnqueue.source})\n`);
   const approvedHeadHold = (v, headSha = v.listedHeadSha || v.headSha, { strict = false, onUnreadable = null } = {}) => {
     // Only the queue can retest an unchanged head against main. Direct merges (including sibling repos)
     // still need the drain's rebase/refresh path, regardless of the head's human approval.
@@ -5717,7 +5856,10 @@ async function runCli() {
           // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
           let seed = snapshotSeed || [];
           if (!snapshotSeed) {
-            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+            // Cache-only within the snapshot's normal TTL and dirty rules (same bounds as before, so heavy-field
+            // staleness is unchanged); a stale or dirty snapshot just gives no seed. The old fresh-or-refresh read ran a second full paged
+            // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
+            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
           listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
@@ -5888,6 +6030,11 @@ async function runCli() {
       if (checks && !AS_JSON) process.stderr.write(`  github-merge-queue: BLOCKED PRs with all required checks green (${checks.join(', ')}) are enqueue-eligible\n`);
     },
   });
+  // The existing queue reader accepts only the full live protection/ruleset union.
+  const queueCheckEvidenceOf = (repo) => {
+    const checks = queueRequiredChecksOf(repo);
+    return { queueRequiredChecks: checks, requiredNames: checks, rosterSource: checks ? 'live' : 'unavailable' };
+  };
   verdicts.push(...buildDrainVerdicts({
     preparePendingCi: prestageSetting.value.prestageWhileCiRuns && queueEnqueueMode && !!REVIEW_ESCALATION,
     queueRequiredChecksOf,
@@ -6012,7 +6159,14 @@ async function runCli() {
     ...unknownRecovery, repo: repo || localSlug, num,
     read: async () => {
       const pr = await fetchFreshPrForRevalidation(repo, num);
-      return retainApprovedHumanQueueHead(pr, { queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(repo),
+      const queueOwnsFreshness = mergeStrategy.queueOwnsFreshness(repo);
+      const retained = retainBypassedQueueHead(pr, {
+        verdict: verdicts.find(v => v.repo === repo && v.num === num),
+        setting: rebaseBeforeEnqueue.value, queueOwnsFreshness, expectedHeadSha: opts.expectedHeadSha,
+        requiredCheck: REQUIRED, ...queueCheckEvidenceOf(repo),
+      });
+      return retainCheckedQueueHead(retained, { queueOwnsFreshness,
+        requiredCheck: REQUIRED, ...queueCheckEvidenceOf(repo), expectedHeadSha: opts.expectedHeadSha,
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
@@ -6063,9 +6217,27 @@ async function runCli() {
       if (approvedHeadHold(v)) {
         const pr = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
         if (pr && mergeStrategy.queueOwnsFreshness(v.repo) && v.reason?.startsWith('merge state ')
-          && classifyPr(retainApprovedHumanQueueHead(pr, { hold: true, queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(v.repo) }), { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge') {
+          && classifyPr(retainCheckedQueueHead(pr, { hold: true, queueOwnsFreshness: mergeStrategy.queueOwnsFreshness(v.repo), requiredCheck: REQUIRED, ...queueCheckEvidenceOf(v.repo), expectedHeadSha: v.listedHeadSha || v.headSha }), { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge') {
           v.decision = 'merge'; v.reason = 'approved human head retained for merge queue';
         }
+        continue;
+      }
+      const behindCleanDir = isLocalRepo(v.repo) ? process.cwd() : siblingCloneDir(v.repo);
+      const rebase = routeRebaseBeforeEnqueue(v, { setting: rebaseBeforeEnqueue.value, mergeStrategy,
+        // Re-run every classifyPr guard (body, review hold, claims, checks) with BEHIND treated as queue-landable,
+        // exactly as the approved-head path does; BEHIND alone must be the only thing that was blocking.
+        reclassifiesMerge: () => {
+          const live = (prsByRepo.get(v.repo) || []).find(p => p.number === v.num);
+          return !!live && classifyPr(retainCheckedQueueHead(live, { hold: true, queueOwnsFreshness: true, requiredCheck: REQUIRED, ...queueCheckEvidenceOf(v.repo), expectedHeadSha: v.listedHeadSha || v.headSha }), { requiredCheck: REQUIRED,
+            defaultBranch: defaultBranchOf(v.repo), queueRequiredChecks: queueRequiredChecksOf(v.repo) }).decision === 'merge';
+        },
+        manifestFree: () => !!behindCleanDir && headTreeLacksManifestFile({
+          headRef: v.headRef, headSha: v.listedHeadSha || v.headSha, prNumber: v.num,
+          git: (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: behindCleanDir, maxBuffer: 16 * 1024 * 1024 }),
+        }),
+      });
+      if (!rebase) {
+        if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} ${v.reason}\n`);
         continue;
       }
 
@@ -6099,7 +6271,7 @@ async function runCli() {
         if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} would rebase-drop manifest (state ${v.state}/${v.mergeable})${cloneDir ? ` via ${cloneDir}` : ''} then merge\n`);
         continue;
       }
-      let r = rebaseDropManifest({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
+      let r = rebase({ laneRef, base: 'origin/main', healCollision: HEAL_COLLISION, run: gitRunner, cwd: cloneDir });
       // #2371 — a REAL (non-manifest) conflict is the manifest resolver's own skip boundary; retry it with the
       // wider content resolver, which ONLY auto-resolves if every conflicting hunk is non-overlapping. Its own
       // skip (a genuine overlapping/unsafe hunk) is left exactly as before — surfaced for `/finish`.
@@ -6861,7 +7033,7 @@ async function runCli() {
   const drainOrder = (() => {
     let tool; try { tool = readDeclaredDrainSettings()?.drain; } catch { tool = undefined; }
     let platform = null; try { platform = platformPreference('drain') ?? null; } catch { platform = null; }
-    return resolveDrainOrderSettings({ tool, platform, env: process.env });
+    return resolveDrainOrderSettings({ tool, platform, env });
   })();
   const drainPriority = { ...readDeliveryPrioritySettings(), mode: drainOrder.priorityMode };
   delete drainPriority.invalid;
@@ -7339,7 +7511,7 @@ async function runCli() {
         // dedupe) — not a no-op stub, which silently dropped the trace for a PR found already merged before
         // the land path below rebinds it (the out-of-band branch right after revalidation).
         const makeMergeTrace = (headSha, prereadComments) => () => {
-          const reason = buildMergeTraceReason({ headSha, caller: 'drain', sessionId: process.env.CLAUDE_CODE_SESSION_ID || null });
+          const reason = buildMergeTraceReason({ headSha, caller: 'drain', sessionId: env.CLAUDE_CODE_SESSION_ID || null });
           const posted = postDrainReasonComment(c.repo, c.num, MERGE_TRACE_KIND, reason, null, prereadComments);
           if (!AS_JSON) process.stderr.write(`  💬 ${repoTag(c.repo)}${c.num} merge trace stamped (head ${headSha || 'unknown'})${posted ? '' : ' (already stamped / post failed)'}\n`);
         };
@@ -7655,7 +7827,7 @@ async function runCli() {
   // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
   const followup = await handOffDrainFollowup({
     landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
-    buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
+    buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof env.WE_PRIMARY === 'string' && env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
   });
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
@@ -7700,8 +7872,8 @@ async function runCli() {
   // left UNTOUCHED and loudly logged; a hint-less unlocatable (cwd IS the primary, already synced) stays quiet.
   let primarySynced = null;
   if (landedLocal) {
-    const primary = resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY });
-    const hinted = (typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim());
+    const primary = resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY });
+    const hinted = (typeof flags.primary === 'string' && flags.primary.trim()) || (typeof env.WE_PRIMARY === 'string' && env.WE_PRIMARY.trim());
     const gitAt = (a) => readGit(a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const isCwd = (p) => { try { return realpathSync(p) === realpathSync(process.cwd()); } catch { return false; } };
     const r = syncPrimaryOnLand({ exec: gitAt, primary, hinted: !!hinted, isCwd });
@@ -7946,15 +8118,15 @@ async function runCli() {
       : leaseGate.reason === 'lease-held-uncovered'
       ? `another drain holds the whole-process lease (${heldBy || '?'}) but its scope does NOT cover ${uncovered.join(', ')} — those repos are NOT swept by the holder; wait for it to exit, or force an immediate scoped run with --no-drain-lease (#2458)`
       : `another drain already holds the whole-process lease (${heldBy || '?'}) — no-op; its next pass covers this work (#2449/#2391)`;
-    if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: true, ...(WATCH ? { watch: true } : {}), skipped: 'drain-in-progress', heldBy, detail, ...(uncovered.length ? { uncovered } : {}) }) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify({ ok: true, ...(WATCH ? { watch: true } : {}), skipped: 'drain-in-progress', heldBy, detail, ...(uncovered.length ? { uncovered } : {}) }) + '\n');
     else process.stderr.write(`merge-ai-prs · ${detail}\n`);
-    process.exit(0);
+    exit(0);
   }
   if (leaseHeld) {
     // Release on ANY exit path (the watch loop has several `break`s + signal kills). Idempotent + owner-fenced:
     // releaseDrainLease only frees a lease THIS owner still holds, so a reclaimer who seized it is never stomped.
     process.on('exit', () => { releaseDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { repoKey: localSlug }); });
-    for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0)); // → triggers the exit handler → frees the lease
+    for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => exit(0)); // → triggers the exit handler → frees the lease
   }
 
   // ── RED-MAIN dispatch-freeze (#2681) — while main is red, nothing but the main-fix PR writes to main ─────────
@@ -7971,7 +8143,7 @@ async function runCli() {
   //     and the stranded-card sweep does not push (`redMainHeld`). The real CLI is defended in
   //     merge-ai-prs-red-main-hold-wiring.test.mjs, which runs WITHOUT the bypass and asserts both the
   //     `gh pr merge` calls and every `git push` to main.
-  const redMainBypass = !!flags['no-red-main-freeze'] || process.env.WE_MERGE_BREAK_GLASS === '1';
+  const redMainBypass = !!flags['no-red-main-freeze'] || env.WE_MERGE_BREAK_GLASS === '1';
   let freezeBeforePass = null;
   const readDrainFreezePass = async () => {
     const cached = freezeBeforePass;
@@ -8007,12 +8179,12 @@ async function runCli() {
     };
   };
   const emitRedMainStop = (stop) => {
-    if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, ...(WATCH ? { watch: true } : {}), stopped: 'red-main-freeze', detail: stop.detail, marker: stop.marker }) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify({ ok: false, ...(WATCH ? { watch: true } : {}), stopped: 'red-main-freeze', detail: stop.detail, marker: stop.marker }) + '\n');
     else process.stderr.write(`merge-ai-prs · STOP-THE-LINE — ${stop.detail}\n`);
   };
   {
     const stop = await redMainFreezeStop();
-    if (stop) { emitRedMainStop(stop); process.exit(5); } // distinct from empty (0), merge-fail (2), dup-id (3): a red-main stop-the-line
+    if (stop) { emitRedMainStop(stop); exit(5); } // distinct from empty (0), merge-fail (2), dup-id (3): a red-main stop-the-line
   }
 
   // ── Driver — one sweep (the /drain one-shot + /merge bare), or the `--watch` monitor (`/drain watch`) ──────
@@ -8026,11 +8198,11 @@ async function runCli() {
       sleepSync(REPOLL_SEC * 1000);
       ({ result, failedMerges, duplicateIdsOnMain } = await sweepOnce());
     }
-    if (AS_JSON) writeAllSync(1, JSON.stringify(result) + '\n');
+    if (AS_JSON) writeStdout(JSON.stringify(result) + '\n');
     // #2318 — a duplicate id surviving on main is a LOUD failure (exit 3), distinct from a merge failure (exit 2):
     // main is in a globally-red state until it is resolved by hand, so the drain must never exit 0 over it.
     const exitCode = passExitCode({ dup: duplicateIdsOnMain, failed: failedMerges, mergedCount: result.merged.length });
-    process.exit(exitCode);
+    exit(exitCode);
   }
 
   // WATCH: re-sweep on a fixed interval, landing PRs as they become eligible, until `--max-idle` consecutive
@@ -8051,7 +8223,7 @@ async function runCli() {
     // #3881 — refresh the App token at the top of EVERY pass (a no-op unless configured, and a plain cache read
     // until the token nears expiry). Never on a timer: this loop sleeps with `sleepSync`, so the event loop is
     // never free for a background refresh to run — the top of a pass is the only point it can.
-    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(process.env, process.argv) });
+    if (pass > 1) await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(env, argv) });
     if (leaseHeld) heartbeatDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { scope: leaseScope, repoKey: localSlug }); // #2395 — keep the whole-process lease alive across a long watch (an `under-lease` child never heartbeats — its parent daemon owns that); #2458 re-supply the scope so it survives the heartbeat rewrite; #3440 repoKey selects the same per-repo lock dir
     // #2681 — RE-CHECK the red-main dispatch-freeze EVERY pass: a post-land red can be raised DURING a running
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a
@@ -8135,8 +8307,8 @@ async function runCli() {
   }
   if (!AS_JSON) process.stderr.write(`watch: stopped after ${passes.length} pass(es); merged ${allMerged.length} PR(s) total.\n`);
   // A red-main freeze already emitted its own stop payload (above) — don't double-emit; just exit 5.
-  if (redMainStopped) process.exit(5);
-  if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: lastDup.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
+  if (redMainStopped) exit(5);
+  if (AS_JSON) writeStdout(JSON.stringify({ ok: lastDup.length === 0, watch: true, label, interval: INTERVAL, maxIdle: MAX_IDLE, passes: passes.length, merged: allMerged, lastFailed, ...(lastDup.length ? { duplicateIdsOnMain: lastDup } : {}) }) + '\n');
   const exitCode = passExitCode({ dup: lastDup, failed: lastFailed, mergedCount: allMerged.length });
-  process.exit(exitCode);
+  exit(exitCode);
 }

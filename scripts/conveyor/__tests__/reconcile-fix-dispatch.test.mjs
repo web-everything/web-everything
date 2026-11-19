@@ -2318,6 +2318,7 @@ describe('runReconcileFixDispatch — PR deadline and cursor', () => {
     const tryResumeRound = vi.fn(() => ({ resumed: false, resumeAttempt: null }));
     const tryAdmit = vi.fn(() => ({ admit: true }));
     const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      fixSettings: { conflictFixesPerPass: 0, conflictFixExemptPerPass: 0 },
       reconcile: () => ({ dispatch: [
         { kind: 'fix', prNumber: 1764, headRefName: 'fix-branch-1764' },
         { kind: 'fix', prNumber: 1765, headRefName: 'fix-branch-1765', labels: [CONFLICT_LABEL] },
@@ -2525,5 +2526,105 @@ describe('fix pass PR metadata snapshot', () => {
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(1);
     expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
+  });
+});
+
+
+describe('conflict-fix deadline exemption', () => {
+  const row = (prNumber, extra = {}) => ({ kind: 'fix', prNumber, headRefName: `fix-${prNumber}`, ...extra });
+  const mechanical = pr => row(pr, { isConflict: true, conflictFixMechanical: true, baseRefName: 'main' });
+  const run = (rows, extra = {}) => {
+    let time = 10;
+    return runReconcileFixDispatch({
+      root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: rows, refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [1, 2, 3, 4, 5, 6], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null, tryResume: () => ({ resumed: false }),
+      fixSettings: { conflictFixExemptPerPass: 3 },
+      dispatch: entry => { time++; return { pr: entry.pr }; }, ...extra,
+    });
+  };
+  const conflicts = () => [1, 2, 3, 4, 5, 6].map(pr => row(pr, { isConflict: true, baseRefName: 'main' }));
+  const pass = (cap, extra = {}) => run(conflicts(), {
+    now: () => 11, fixSettings: { conflictFixesPerPass: cap, conflictFixExemptPerPass: 0 }, ...extra,
+  });
+  it('dispatches six conflicts past an already expired deadline when the allowance is six', () => {
+    expect(pass(6)).toMatchObject({ dispatched: [1, 2, 3, 4, 5, 6].map(pr => ({ pr })), deferred: [] });
+  });
+  it('allows six conflicts under the default allowance of sixteen', () => {
+    expect(pass(16).dispatched).toHaveLength(6);
+  });
+  it('still binds conflict launches to the fix cap', () => {
+    let admitted = 0;
+    const tryAdmit = vi.fn(() => ++admitted <= 3 ? { admit: true } : { admit: false, kind: 'fix-cap', why: 'full' });
+    const result = pass(6, { dispatchThrottle: { tryAdmit } });
+    expect(result.dispatched).toEqual([1, 2, 3].map(pr => ({ pr })));
+    expect(result.refusals.filter(r => r.kind === 'fix-cap')).toHaveLength(3);
+    expect(tryAdmit).toHaveBeenCalledTimes(6);
+  });
+  it('dispatches two conflicts and defers four with an allowance of two', () => {
+    expect(pass(2)).toMatchObject({ dispatched: [{ pr: 1 }, { pr: 2 }], deferred: [3, 4, 5, 6] });
+  });
+  it('zero restores the one-per-pass stop without mechanical exemptions', () => {
+    expect(pass(0)).toMatchObject({ dispatched: [{ pr: 1 }], deferred: [2, 3, 4, 5, 6] });
+  });
+  it.each([[6, 3, 6], [2, 3, 3], [0, 3, 3]])('overlapping budgets %i and %i dispatch at most %i conflicts', (cap, exempt, count) => {
+    expect(run([1, 2, 3, 4, 5, 6].map(mechanical), { now: () => 11,
+      fixSettings: { conflictFixesPerPass: cap, conflictFixExemptPerPass: exempt } }).dispatched).toHaveLength(count);
+  });
+  it('bounds mixed mechanical and other conflicts by the larger budget', () => {
+    expect(run([...conflicts().slice(0, 2), ...[3, 4, 5, 6].map(mechanical)], { now: () => 11,
+      fixSettings: { conflictFixesPerPass: 2, conflictFixExemptPerPass: 3 } }).dispatched).toHaveLength(3);
+  });
+  it('excludes restacks from the general conflict allowance', () => {
+    // Restack metadata is derived from stack evidence after planning, not copied from reconcile rows.
+    expect(run([row(1), row(2, { isConflict: true })], { now: () => 11,
+      prStack: () => ({ pairs: [{ top: 2, bottom: 1, bottomOpen: true,
+        bottomRef: 'lane/bottom', bottomHead: 'bottom-head', inSync: false }] }),
+      prStackSettings: { detect: true, bottomFirst: true, restack: true, restackMaxRounds: 3 },
+      fixSettings: { conflictFixesPerPass: 6, conflictFixExemptPerPass: 0 },
+    })).toMatchObject({ dispatched: [{ pr: 1 }], deferred: [2] });
+  });
+  it('routes conflicts to Codex by default when routing allows and bypasses Claude resume', () => {
+    const route = vi.fn(entry => routeFixExecutor(entry, { launcherAvailable: true, readRouted: () => ({}), criticalFor: () => false }));
+    const tryResume = vi.fn(() => { throw Error('Codex must not resume Claude'); });
+    const dispatch = vi.fn(entry => ({ pr: entry.pr }));
+    expect(pass(6, { fixExecutorRoute: route, tryResume, dispatch }).dispatched).toHaveLength(6);
+    expect(route.mock.results.every(r => r.value.executor === 'codex')).toBe(true);
+    expect(tryResume).not.toHaveBeenCalled();
+  });
+  it('dispatches two proven conflicts after the deadline, scanning past a non-exempt PR', () => {
+    expect(run([row(1), row(2), mechanical(3), mechanical(4)]))
+      .toMatchObject({ handled: 3, dispatched: [{ pr: 1 }, { pr: 3 }, { pr: 4 }], deferred: [2], nextCursor: 2 });
+  });
+  it('honours cap three even when more proven conflicts are planned', () => {
+    expect(run([row(1), ...[2, 3, 4, 5, 6].map(mechanical)]))
+      .toMatchObject({ dispatched: [{ pr: 1 }, { pr: 2 }, { pr: 3 }, { pr: 4 }], deferred: [5, 6] });
+  });
+  it.each([0, undefined, -1, '3', 1.5])('disables exemptions for zero or invalid runtime cap %j', cap => {
+    expect(run([row(1), mechanical(2)], { fixSettings: { conflictFixExemptPerPass: cap } }))
+      .toMatchObject({ dispatched: [{ pr: 1 }], deferred: [2] });
+  });
+  it('defers a non-mechanical conflict and refuses a label-only exemption', () => {
+    expect(run([row(1), row(2, { isConflict: true }), row(3, { labels: [CONFLICT_LABEL], conflictFixMechanical: true })]))
+      .toMatchObject({ dispatched: [{ pr: 1 }], deferred: [2, 3] });
+  });
+  it('keeps the launch throttle guard on exempt entries after the deadline', () => {
+    const tryAdmit = vi.fn().mockReturnValueOnce({ admit: true }).mockReturnValue({ admit: false, kind: 'host-load', why: 'busy' });
+    expect(run([row(1), mechanical(2)], { dispatchThrottle: { tryAdmit } }))
+      .toMatchObject({ dispatched: [{ pr: 1 }], deferred: [], refusals: [expect.objectContaining({ pr: 2, kind: 'host-load' })] });
+    expect(tryAdmit).toHaveBeenCalledTimes(2);
+  });
+  it('keeps the live dispatch claim refusal on an exempt entry', () => {
+    let time = 10;
+    const dispatch = vi.fn(entry => {
+      time++;
+      return entry.pr === 2 ? { held: true, reason: 'claimed', heldBy: 'live-session' } : { pr: entry.pr };
+    });
+    const result = run([row(1), mechanical(2)], { now: () => time, dispatch });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(result.dispatched).toEqual([{ pr: 1 }]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 2, kind: 'held' }));
   });
 });

@@ -749,6 +749,8 @@ while True:
 # Missing kernel counters are unknown, not a measured zero.
 if 'usage' in cfg:
     usage = {'memoryPeakBytes': None, 'cpuUsec': None, 'oomKills': None}
+    if cfg.get('receiptCapabilities', {}).get('throttle') == 1:
+        usage.update(throttledUsec=None, nrThrottled=None)
     try:
         with open('/proc/self/cgroup') as stream:
             path = next(line.strip().split(':', 2)[2] for line in stream if line.startswith('0::'))
@@ -760,6 +762,8 @@ if 'usage' in cfg:
                 return int(data) if key is None else int(dict(line.split() for line in data.splitlines())[key])
             except (OSError, ValueError, KeyError): return None
         usage = {'memoryPeakBytes': counter('memory.peak'), 'cpuUsec': counter('cpu.stat', 'usage_usec'), 'oomKills': counter('memory.events', 'oom_kill')}
+        if cfg.get('receiptCapabilities', {}).get('throttle') == 1:
+            usage.update(throttledUsec=counter('cpu.stat', 'throttled_usec'), nrThrottled=counter('cpu.stat', 'nr_throttled'))
     except (OSError, StopIteration): pass
     usage['processCount'] = process_count
     fd = os.open(cfg['usage'], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
@@ -1233,7 +1237,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       const launcher=elasticScopeArgv({limits,units,slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,...(worker.reservation?.receiptCapabilities?.throttle === 1 ? {receiptCapabilities:{throttle:1}} : {}),writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
       if(result.code!==0) throw new Error('Supervisor failed');
       const code=Number((await readPinned(status)).toString());
@@ -1451,7 +1455,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) throw new Error('Invalid slot units');
       const run='r-'+randomBytes(16).toString('hex');
       const worker=await reserveWorker(run,nonce,slot),record={v:1,nonce,run,...(slotUnits > 1 ? {slotUnits} : {}),
-        ...(capabilities?.taskPressure === 1 ? {receiptCapabilities:{taskPressure:1}} : {}),...(worker.active?{slot:worker.user}:{})};
+        ...(capabilities?.taskPressure === 1 || capabilities?.throttle === 1 ? {receiptCapabilities:{...(capabilities?.taskPressure === 1 ? {taskPressure:1} : {}),...(capabilities?.throttle === 1 ? {throttle:1} : {})}} : {}),...(worker.active?{slot:worker.user}:{})};
       const prepare=async()=>{
       const container=join(worker.root,run);
       try {
@@ -1496,7 +1500,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         await pinBase(run,baseSha);
         await writeFile(statePath(run,'base'),JSON.stringify({baseSha,baseManifestDigest}),{flag:'wx',mode:0o600});
       });
-      return {run,...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{}),...(mainStamp!==undefined&&mainStamp.sha===bundleBase?{gitBundleMainAgeMs:mainStamp.ageMs}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
+      return {run,...(record.receiptCapabilities?.throttle === 1 ? {receiptCapabilities:record.receiptCapabilities} : {}),...(worker.active?{slot:worker.user,worker:{user:worker.user,uid:worker.uid,gid:worker.gid}}:{}),capabilities:{siblings:1,commandClasses:1,gitWorktree:2,...(bundleReady?{gitBundle:1,...(bundleBase?{gitBundleBase:bundleBase}:{}),...(mainStamp!==undefined&&mainStamp.sha===bundleBase?{gitBundleMainAgeMs:mainStamp.ageMs}:{})}:{}),...(worker.active?{workers:(await workers()).map(w=>w.user)}:{}),...await this.bases()}};
       }catch(error){
         await rm(container,{recursive:true,force:true});
         await rm(statePath(run,'prepared'),{force:true});
@@ -1518,6 +1522,8 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       await requireEgressTable();
       return await exclusiveWorker(async (executeCommand,selected) => {
       const resources={memoryPeakBytes:null,cpuUsec:null,oomKills:null,slotCpus:8};
+      if(prepared.receiptCapabilities?.throttle === 1)Object.assign(resources,{throttledUsec:null,nrThrottled:null});
+      const counters=['memoryPeakBytes','cpuUsec','oomKills',...(prepared.receiptCapabilities?.throttle === 1 ? ['throttledUsec','nrThrottled'] : [])];
       let tasks = {};
       const unmeasured=new Set();
       const command=async(...args)=>{
@@ -1525,7 +1531,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         resources.slotCpus=value.slotCpus??resources.slotCpus;
         const note = taskPressureNote(value.usage?.processCount,value.tasksMax);
         if (note.tasksNear && (!tasks.tasksNear || note.processCount > tasks.processCount)) tasks = note;
-        for(const key of ['memoryPeakBytes','cpuUsec','oomKills']) {
+        for(const key of counters) {
           const n=value.usage?.[key];
           if(!Number.isSafeInteger(n)||n<0) {
             unmeasured.add(key);
@@ -1665,7 +1671,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
           const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
-            : error.code==='forge-draining' ? 'forge-draining' : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+            : error.code==='forge-draining' ? 'forge-draining' : error.code==='forge-busy' ? 'forge-busy' : 'snapshot-rejected';
           if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
           if(error.code==='egress-table-absent')process.stderr.write('forge-exec-run: egress-table-absent\n');
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
@@ -1685,7 +1691,23 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         await writeFile(statePath(request.run,'cancel'),'',{flag:'wx',mode:0o600}).catch(error=>{if(error.code!=='EEXIST')throw error;});
         const deadline=process.hrtime.bigint()+45000000000n;
         while(await lstat(join(worker.active,'executing')).catch(error=>{if(error.code!=='ENOENT')throw error;})) {
-          if(process.hrtime.bigint()>=deadline)throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+          if(process.hrtime.bigint()>=deadline) {
+            try {
+              const container=join(worker.root,request.run);
+              await directory(container,true,operator);
+              const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
+              if(reaped.code!==0)throw new Error('uid cleanup unconfirmed');
+              // The reap scan keys on /proc ownership; the credential-based probe also sees non-dumpable workers.
+              if(await reapProbe.uidBusy((await identity(record.slot)).uid))throw new Error('uid still busy');
+              // UID emptiness cannot see a root supervisor paused before dropping identity.
+              // Require the hard runtime bound too, when the old controller must be dead.
+              if(!(clock()-(await lstat(join(worker.active,'executing'))).mtimeMs>=PAST_MAX_RUNTIME_MS))throw new Error('execution age unconfirmed');
+              await rmdir(join(worker.active,'executing'));
+            } catch {
+              throw new Error('Worker cancellation unconfirmed; operator must stop the reserved UID');
+            }
+            break;
+          }
           await new Promise(resolve=>setTimeout(resolve,50));
         }
       }

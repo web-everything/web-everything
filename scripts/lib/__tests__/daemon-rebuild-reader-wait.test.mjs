@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { acquireRead, acquireWrite, withReadLock, cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { readLockEntry, heartbeat } from '../../readiness/file-locks.mjs';
 import * as jobs from '../daemon-rebuild/rebuild-job.mjs';
 import { spawnSync } from 'node:child_process';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
-import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import { rebuildClone, targetDaemonReader } from '../daemon-rebuild/rebuild.mjs';
 import * as planner from '../daemon-rebuild/plan.mjs';
 import * as edgeFetch from '../daemon-rebuild/edge-fetch.mjs';
 import * as adoption from '../daemon-rebuild/adopt.mjs';
@@ -427,4 +427,62 @@ describe('ready-only preparation defers clone mutations to the normal tick', () 
     expect(cloneBytes(f.root)).toEqual(before);
     expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, 'Mac:60796')).not.toBeNull();
   });
+});
+
+describe('target daemon reader session', () => {
+  const reader = { root: '/clone', owner: 'Mac:60796', pid: 60796, startedMs: 1000 };
+  it('carries the target session across detached job reparenting, stripping inherited transport', () => {
+    const env = jobs.rebuildChildEnv({ WE_DAEMON_REBUILD_READER: 'untrusted' },
+      { ppid: 1, host: 'Mac', daemonReader: reader });
+    expect(targetDaemonReader(env.WE_DAEMON_REBUILD_READER, '/clone', () => 1000, 'Mac')).toEqual(['Mac:60796']);
+    expect(jobs.rebuildChildEnv({ WE_DAEMON_REBUILD_READER: 'untrusted' }, { ppid: 1 })
+      .WE_DAEMON_REBUILD_READER).toBeUndefined();
+  });
+  it.each([
+    ['reused pid', reader, 2000, '/clone', 'Mac'],
+    ['unreadable session', reader, null, '/clone', 'Mac'],
+    ['other clone', reader, 1000, '/other', 'Mac'],
+    ['other host', reader, 1000, '/clone', 'Other'],
+    ['missing session', { ...reader, startedMs: undefined }, 1000, '/clone', 'Mac'],
+    ['mismatched owner', { ...reader, owner: 'Mac:333' }, 1000, '/clone', 'Mac'],
+  ])('fails closed for %s', (_name, record, start, root, host) => {
+    expect(targetDaemonReader(JSON.stringify(record), root, () => start, host)).toEqual([]);
+  });
+  it('ignores the target daemon priority claim before reservation and while draining a foreign reader', async () => {
+    const f = fixture();
+    f.read('Mac:60796', 60796); f.read('Mac:222', 222);
+    const { starvedRoot } = cloneLockDirs(f.root, f.lockRoot);
+    fs.mkdirSync(starvedRoot, { recursive: true });
+    // Generate real claims through the reader/writer handshake, including a stable readerKey.
+    let tried = false;
+    const result = await acquireWrite(f.root, { ...f.opts, owner: 'Mac:12154', readerPriorityAfter: 1,
+      ignoreOwners: ['Mac:60796'], sleep: async ms => {
+        if (!tried) {
+          tried = true;
+          expect(acquireRead(f.root, { ...f.opts, owner: 'Mac:60796', pid: 60796,
+            readerKey: 'review', nowMs: f.opts.now() }).reason).toBe('writer-active');
+        }
+        await f.opts.sleep(ms);
+      } });
+    expect(result).toMatchObject({ reason: 'tick-in-progress', heldBy: 'Mac:222' });
+    expect(await acquireWrite(f.root, { ...f.opts, owner: 'Mac:12154', readerPriorityAfter: 1,
+      ignoreOwners: ['Mac:60796'] })).toMatchObject({ reason: 'tick-in-progress', heldBy: 'Mac:222' });
+    expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, 'Mac:60796')).not.toBeNull();
+  });
+});
+
+it('ready-only writer excludes its recorded target session even after the launcher is gone', async () => {
+  const f = prepareFixture(); mutationCases[0][1](f);
+  const owner = `${hostname()}:${process.pid}`;
+  f.read(owner, process.pid);
+  const env = { ...f.env, WE_DAEMON_REBUILD_READER: JSON.stringify({
+    root: f.root, owner, pid: process.pid, startedMs: 1000,
+  }) };
+  const { ignoreOwners: _ignored, ...lockOpts } = f.opts;
+  const before = cloneBytes(f.root);
+  const result = await rebuildClone({ ...f.args, env, readyOnly: true, asJob: false, versions: null,
+    spawnerOwners: () => [], readerStartTimeOf: () => 1000, lockOpts: { ...lockOpts, owner: 'Mac:12154' } });
+  expect(result).toMatchObject({ reason: 'readonly-job-mutation-due', mutation: 'in-progress-rollback' });
+  expect(cloneBytes(f.root)).toEqual(before);
+  expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, owner)).not.toBeNull();
 });

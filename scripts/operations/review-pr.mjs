@@ -1,3 +1,4 @@
+import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { redTeamCardOnly, redTeamEnabled, redTeamOwedFor } from '../lib/review-red-team-policy.mjs';
 import { readRedTeamProbes } from '../lib/red-team-gate.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
@@ -772,6 +773,7 @@ export const ANTIGRAVITY_REVIEW_ENV_VAR = 'REVIEW_PR_ANTIGRAVITY_REVIEW';
  * @returns {boolean}
  */
 export function antigravityReviewFromEnv(env = process.env, { isOnProbation = defaultAntigravityReviewProbationCheck } = {}) {
+  if (!carbonNonShadowAllowed(ANTIGRAVITY_MODEL, { env })) return false;
   if (env && Object.hasOwn(env, ANTIGRAVITY_REVIEW_ENV_VAR)) return env[ANTIGRAVITY_REVIEW_ENV_VAR] === '1';
   return isOnProbation();
 }
