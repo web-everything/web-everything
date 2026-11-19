@@ -1,9 +1,9 @@
 /**
  * A single bounded retry distinguishes intermittent unit failures from reproducible breaks without
  * hiding either: every retried file is recorded, and only proven passing retries can recover a shard.
- * The original coverage is retained; retries run without coverage. Missing evidence, process errors,
+ * The original coverage is retained; retries use the same coverage mode in a separate directory. Missing evidence, process errors,
  * and widespread failures stay red for operator inspection. This is evidence collection, not quarantine.
- * Usage (only after a nonzero first run): node scripts/ci/rerun-failed-once.mjs --shard=N -- [quarantine args]
+ * Usage (only after a nonzero first run): node scripts/ci/rerun-failed-once.mjs --shard=N --mode=covered|nocov -- [quarantine args]
  */
 import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
@@ -45,10 +45,22 @@ export function parseReport(text, root = process.cwd()) {
     seen.add(file);
     const collectionError = !!result.testExecError || !!result.message || (Array.isArray(result.errors) && result.errors.length > 0);
     if (!['passed', 'failed', 'pending', 'skipped', 'todo'].includes(result.status) && !(result.status === undefined && collectionError)) throw new Error('unknown file status');
-    const failedTests = (result.assertionResults ?? []).filter(t => t.status === 'failed').map(t => t.fullName || t.title);
-    if (failedTests.some(name => typeof name !== 'string')) throw new Error('missing failed test name');
+    const assertions = result.assertionResults ?? [];
+    if (!Array.isArray(assertions)) throw new Error('invalid assertion evidence');
+    const assertionNames = new Set();
+    const tests = assertions.map(test => {
+      const name = test.fullName || (Array.isArray(test.ancestorTitles)
+        ? [...test.ancestorTitles, test.title].join(' ') : test.title);
+      if (typeof name !== 'string' || !name || (!test.fullName && typeof test.title !== 'string')
+        || assertionNames.has(name) || !['passed', 'failed', 'pending', 'skipped', 'todo'].includes(test.status)) {
+        throw new Error('invalid or duplicate assertion evidence');
+      }
+      assertionNames.add(name);
+      return { name, status: test.status };
+    });
+    const failedTests = tests.filter(t => t.status === 'failed').map(t => t.name);
     const failed = result.status === 'failed' || collectionError || failedTests.length > 0;
-    return { file, failed, passed: result.status === 'passed' && !failed, failedTests };
+    return { file, failed, passed: result.status === 'passed' && !failed, failedTests, tests };
   });
 }
 
@@ -63,26 +75,34 @@ export function planRetry(text, policy, root) {
 export function retryVerdict(first, rerunText, { shard, sha, runId, root, exitCode }) {
   let results = [];
   try { results = parseReport(rerunText, root); } catch { /* incomplete evidence records failures */ }
-  const files = first.map(({ file, failedTests }) => ({ file, firstRun: 'failed',
-    rerun: results.find(r => r.file === file)?.passed ? 'passed' : 'failed', failedTests }));
+  const files = first.map(({ file, failedTests, tests }) => {
+    const retry = results.find(r => r.file === file);
+    const required = failedTests.length ? failedTests : tests.filter(t => t.status === 'passed').map(t => t.name);
+    const recovered = retry?.passed
+      && required.every(name => retry.tests.some(t => t.name === name && t.status === 'passed'))
+      && (failedTests.length > 0 || retry.tests.some(t => t.status === 'passed'));
+    return { file, firstRun: 'failed', rerun: recovered ? 'passed' : 'failed', failedTests };
+  });
   return { passed: exitCode === 0 && files.every(f => f.rerun === 'passed'),
     record: { shard, sha, runId, files } };
 }
 
 /** IO boundary, injectable so orchestration and fail-closed reads can be exercised hermetically. */
-export async function rerunOnce({ shard, skipArgs = [], env = process.env, root = process.cwd(),
+export async function rerunOnce({ shard, mode, skipArgs = [], env = process.env, root = process.cwd(),
   policy, read = file => readFileSync(file, 'utf8'), write = (file, data) => writeFileSync(file, data),
   remove = file => rmSync(file, { force: true }), run = args => spawnSync('npm', args, { cwd: root, env, stdio: 'inherit' }),
   listFiles, warn = console.log, error = console.error } = {}) {
   try {
     if (!/^\d+$/.test(String(shard))) throw new Error('invalid shard');
+    if (!['covered', 'nocov'].includes(mode)) throw new Error('invalid or missing retry mode');
     const first = planRetry(read(`coverage/timing-unit-${shard}.json`), policy, root);
     // Vitest positional filters are substrings: refuse ambiguous filters rather than run extra files.
     const all = await listFiles();
     if (first.some(f => !all.includes(f.file) || all.some(other => other !== f.file && other.includes(f.file)))) throw new Error('ambiguous/unknown retry filter; inspect files and rerun manually');
     const output = `coverage/rerun-unit-${shard}.json`;
     remove(output); // A crashed retry must never reuse an earlier passing report.
-    const result = run(['run', 'test:unit', '--', '--reporter=default', '--reporter=./scripts/ci/unit-json-reporter.mjs', `--outputFile.json=${output}`, ...first.map(f => f.file), ...skipArgs]);
+    const coverageArgs = mode === 'covered' ? ['--coverage.reportOnFailure=true', `--coverage.reportsDirectory=coverage-rerun-${shard}`] : [];
+    const result = run(['run', mode === 'covered' ? 'test:coverage:shard' : 'test:unit', '--', ...coverageArgs, '--reporter=default', '--reporter=./scripts/ci/unit-json-reporter.mjs', `--outputFile.json=${output}`, ...first.map(f => f.file), ...skipArgs]);
     let text;
     try { text = read(output); } catch { /* record all files as failed */ }
     const verdict = retryVerdict(first, text, { shard, sha: env.GITHUB_SHA ?? '', runId: env.GITHUB_RUN_ID ?? '', root, exitCode: result.status });
@@ -97,9 +117,11 @@ export async function rerunOnce({ shard, skipArgs = [], env = process.env, root 
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  const shard = args[0]?.match(/^--shard=(\d+)$/)?.[1];
+  const options = args.includes('--') ? args.slice(0, args.indexOf('--')) : args;
+  const shard = options.find(arg => arg.startsWith('--shard='))?.slice('--shard='.length);
+  const mode = options.find(arg => arg.startsWith('--mode='))?.slice('--mode='.length);
   const { listUnitTestFiles } = await import('./shard-assign.mjs');
   mkdirSync('coverage', { recursive: true });
   const policy = resolvePolicy({ tool: readSettings().ciUnitRerun, env: process.env });
-  process.exitCode = await rerunOnce({ shard, policy, skipArgs: args.includes('--') ? args.slice(args.indexOf('--') + 1) : [], listFiles: listUnitTestFiles });
+  process.exitCode = await rerunOnce({ shard, mode, policy, skipArgs: args.includes('--') ? args.slice(args.indexOf('--') + 1) : [], listFiles: listUnitTestFiles });
 }

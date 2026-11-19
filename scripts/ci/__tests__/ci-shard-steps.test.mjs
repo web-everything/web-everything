@@ -19,8 +19,8 @@ const stepRun = (prefix) => {
 };
 
 const STEPS = [
-  ['coverage shard step', 'Unit suite shard'],
-  ['no-coverage group step', 'Unit suite no-coverage group'],
+  ['coverage shard step', 'Unit suite shard', 'covered'],
+  ['no-coverage group step', 'Unit suite no-coverage group', 'nocov'],
 ];
 
 function runStep(run, nodeStub, npmExit = 0) {
@@ -44,7 +44,7 @@ function runStep(run, nodeStub, npmExit = 0) {
   }
 }
 
-describe.each(STEPS)('ci.yml test-shard %s', (_label, prefix) => {
+describe.each(STEPS)('ci.yml test-shard %s', (_label, prefix, mode) => {
   it('uses the JSON producer that preserves global errors', () => {
     expect(stepRun(prefix)).toContain('--reporter=./scripts/ci/unit-json-reporter.mjs');
   });
@@ -57,7 +57,7 @@ describe.each(STEPS)('ci.yml test-shard %s', (_label, prefix) => {
         *rerun-failed-once*) echo "retry-invoked:$*"; exit ${retryExit} ;;
       esac`, 1);
     expect(r.status).toBe(retryExit);
-    expect(r.out).toContain('retry-invoked:scripts/ci/rerun-failed-once.mjs --shard=2 -- --exclude=quarantined.test.mjs');
+    expect(r.out).toContain(`retry-invoked:scripts/ci/rerun-failed-once.mjs --shard=2 --mode=${mode} -- --exclude=quarantined.test.mjs`);
     expect(r.npmArgs).toContain('--exclude=quarantined.test.mjs');
   });
 

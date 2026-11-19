@@ -7,6 +7,7 @@ const root = '/repo';
 const policy = { enabled: true, maxFiles: 10 };
 const report = (...testResults) => JSON.stringify({ numUnhandledErrors: 0, testResults });
 const entry = (name, status = 'failed', extra = {}) => ({ name, status, assertionResults: [], ...extra });
+const passingEntry = (name = 'a.test.mjs') => entry(name, 'passed', { assertionResults: [{ fullName: 'suite fails', status: 'passed' }] });
 const firstText = report(entry('/repo/a.test.mjs', 'failed', { assertionResults: [{ status: 'failed', fullName: 'suite fails' }] }));
 const first = planRetry(firstText, policy, root);
 const metadata = { shard: '2', sha: 'abc', runId: '123', root, exitCode: 0 };
@@ -37,10 +38,49 @@ describe('single failed-file retry core', () => {
   it.each([entry('../escape'), entry('-option'), entry('a\ncontrol'), entry('a', 'unknown')])('refuses invalid paths/statuses', result => {
     expect(() => parseReport(report(result), root)).toThrow();
   });
+  it.each([
+    {},
+    { assertionResults: [{ status: 'passed' }] },
+    { assertionResults: [{ fullName: 'suite fails', status: 'unknown' }] },
+    { assertionResults: [{ fullName: 'suite fails', status: 'passed' }, { fullName: 'suite fails', status: 'passed' }] },
+  ])('refuses incomplete or ambiguous retry assertion evidence %j', extra => {
+    expect(retryVerdict(first, report(entry('a.test.mjs', 'passed', extra)), metadata).passed).toBe(false);
+  });
   it('records a passing retry as flaky with portable paths and first-run failed test names', () => {
-    expect(retryVerdict(first, report(entry('a.test.mjs', 'passed')), metadata)).toEqual({ passed: true, record: {
+    expect(retryVerdict(first, report(passingEntry()), metadata)).toEqual({ passed: true, record: {
       shard: '2', sha: 'abc', runId: '123', files: [{ file: 'a.test.mjs', firstRun: 'failed', rerun: 'passed', failedTests: ['suite fails'] }],
     } });
+  });
+  it.each(['skipped', 'pending', 'todo', 'missing'])('failed assertion becomes %s and remains a real failure', status => {
+    const assertionResults = status === 'missing' ? [] : [{ fullName: 'suite fails', status }];
+    const verdict = retryVerdict(first, report(entry('a.test.mjs', 'passed', { assertionResults })), metadata);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.record.files[0].rerun).toBe('failed');
+  });
+  it('matches failed assertions by ancestorTitles and title when fullName is absent', () => {
+    const original = planRetry(report(entry('a.test.mjs', 'failed', { assertionResults: [
+      { ancestorTitles: ['suite'], title: 'fails', status: 'failed' },
+    ] })), policy, root);
+    expect(retryVerdict(original, report(passingEntry()), metadata).passed).toBe(true);
+    expect(retryVerdict(original, report(entry('a.test.mjs', 'passed', { assertionResults: [
+      { ancestorTitles: ['other'], title: 'fails', status: 'passed' },
+    ] })), metadata).passed).toBe(false);
+  });
+  it('collection-error file recovers with assertions passing and is flaky', () => {
+    const original = planRetry(report(entry('a.test.mjs', 'failed', { testExecError: { message: 'collection' } })), policy, root);
+    expect(retryVerdict(original, report(passingEntry()), metadata).record.files[0].rerun).toBe('passed');
+  });
+  it('collection-error recovery requires at least one passed assertion', () => {
+    const original = planRetry(report(entry('a.test.mjs')), policy, root);
+    expect(retryVerdict(original, report(entry('a.test.mjs', 'passed')), metadata).passed).toBe(false);
+  });
+  it.each(['skipped', 'pending', 'todo', 'missing'])('collection-error recovery refuses a previously passed assertion becoming %s', status => {
+    const original = planRetry(report(entry('a.test.mjs', 'failed', { assertionResults: [
+      { fullName: 'previously passed', status: 'passed' },
+    ] })), policy, root);
+    const retry = passingEntry();
+    if (status !== 'missing') retry.assertionResults.push({ fullName: 'previously passed', status });
+    expect(retryVerdict(original, report(retry), metadata).passed).toBe(false);
   });
   it.each([report(entry('a.test.mjs')), report(), undefined, report(entry('a.test.mjs', 'skipped')), report(entry('a.test.mjs', 'passed', { testExecError: {} }))])('a second failure or incomplete evidence fails the shard', text => {
     const verdict = retryVerdict(first, text, metadata);
@@ -48,11 +88,11 @@ describe('single failed-file retry core', () => {
     expect(verdict.record.files[0].rerun).toBe('failed');
   });
   it('a process failure remains red even with passing files', () => {
-    expect(retryVerdict(first, report(entry('a.test.mjs', 'passed')), { ...metadata, exitCode: 1 }).passed).toBe(false);
+    expect(retryVerdict(first, report(passingEntry()), { ...metadata, exitCode: 1 }).passed).toBe(false);
   });
   it('mixed flaky and reproducible failures retain both records and fail the shard', () => {
     const files = planRetry(report(entry('a'), entry('b')), policy, root);
-    const verdict = retryVerdict(files, report(entry('a', 'passed'), entry('b')), { ...metadata, exitCode: 1 });
+    const verdict = retryVerdict(files, report(passingEntry('a'), entry('b')), { ...metadata, exitCode: 1 });
     expect(verdict.passed).toBe(false);
     expect(verdict.record.files.map(f => f.rerun)).toEqual(['passed', 'failed']);
   });
@@ -66,9 +106,9 @@ describe('single failed-file retry core', () => {
 });
 
 function fixture(overrides = {}) {
-  return { shard: '2', root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
+  return { shard: '2', mode: 'nocov', root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
     skipArgs: ['--exclude=quarantined.test.mjs'],
-    read: vi.fn(file => file.includes('timing') ? firstText : report(entry('a.test.mjs', 'passed'))),
+    read: vi.fn(file => file.includes('timing') ? firstText : report(passingEntry())),
     write: vi.fn(), remove: vi.fn(), run: vi.fn(() => ({ status: 0 })),
     listFiles: vi.fn(async () => ['a.test.mjs', 'other.test.mjs']), warn: vi.fn(), error: vi.fn(), ...overrides };
 }
@@ -83,7 +123,22 @@ describe('retry IO boundary', () => {
     expect(io.remove.mock.invocationCallOrder[0]).toBeLessThan(io.run.mock.invocationCallOrder[0]);
     expect(io.warn).toHaveBeenCalledTimes(1);
     expect(io.warn).toHaveBeenCalledWith('::warning::flaky test file a.test.mjs');
-    expect(JSON.parse(io.write.mock.calls[0][1])).toEqual(retryVerdict(first, report(entry('a.test.mjs', 'passed')), metadata).record);
+    expect(JSON.parse(io.write.mock.calls[0][1])).toEqual(retryVerdict(first, report(passingEntry()), metadata).record);
+  });
+  it('covered retry keeps coverage enabled in a separate directory and runs exactly once', async () => {
+    const io = fixture({ mode: 'covered' });
+    expect(await rerunOnce(io)).toBe(0);
+    expect(io.run).toHaveBeenCalledTimes(1);
+    expect(io.run).toHaveBeenCalledWith(['run', 'test:coverage:shard', '--',
+      '--coverage.reportOnFailure=true', '--coverage.reportsDirectory=coverage-rerun-2',
+      '--reporter=default', '--reporter=./scripts/ci/unit-json-reporter.mjs',
+      '--outputFile.json=coverage/rerun-unit-2.json', 'a.test.mjs', '--exclude=quarantined.test.mjs']);
+  });
+  it.each([undefined, 'unknown'])('refuses missing or unknown coverage mode %s before launching a retry', async mode => {
+    const io = fixture({ mode });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).not.toHaveBeenCalled();
+    expect(io.error).toHaveBeenCalledWith(expect.stringMatching(/retry mode.*inspect original run/));
   });
   it('missing/unreadable first report never launches a retry', async () => {
     const io = fixture({ read: () => { throw new Error('ENOENT'); } });
@@ -92,7 +147,7 @@ describe('retry IO boundary', () => {
   });
   it('a failed file plus a first-run unhandled error cannot recover even if its file retry would pass', async () => {
     const text = JSON.stringify({ ...JSON.parse(firstText), numUnhandledErrors: 1 });
-    const io = fixture({ read: file => file.includes('timing') ? text : report(entry('a.test.mjs', 'passed')) });
+    const io = fixture({ read: file => file.includes('timing') ? text : report(passingEntry()) });
     expect(await rerunOnce(io)).toBe(1);
     expect(io.run).not.toHaveBeenCalled();
     expect(io.listFiles).not.toHaveBeenCalled();
@@ -136,7 +191,7 @@ describe('unit JSON evidence producer', () => {
     expect(log).not.toHaveBeenCalled();
   });
   it('a passing retry report with global errors cannot pass the verdict', () => {
-    const text = JSON.stringify({ ...JSON.parse(report(entry('a.test.mjs', 'passed'))), numUnhandledErrors: 1 });
+    const text = JSON.stringify({ ...JSON.parse(report(passingEntry())), numUnhandledErrors: 1 });
     expect(retryVerdict(first, text, metadata).passed).toBe(false);
   });
 });
