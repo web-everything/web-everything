@@ -161,6 +161,12 @@ export function localPhaseShape(command) {
   return shape.join(' && ').slice(0, 200);
 }
 
+// Explicitly identify local-only raw phases for the host routing report; omit command values.
+export function localPhaseBypassDetail(command, { lane, session } = {}) {
+  const safe = value => String(value ?? 'unknown').replace(/[^a-zA-Z0-9_.:-]/g, '_').slice(0, 100);
+  return `caller=verify-lane lane=${safe(lane)} session=${safe(session)}; ${localPhaseShape(command)}`;
+}
+
 export function phaseAdmissionPlan({ command, decision, cwd = process.cwd(), fileExists = existsSync, readPackageJson = readCheckoutPackageJson }) {
   if (!/[;&|<>`$()\r\n]/.test(command.replace(/'(?:[^']|'\\'')*'/g, "''")) && command.startsWith(`node ${shellQuote(SHARD_RUN_SCRIPT)} `)) {
     return { command, takeLocalSlot: false, setHeld: false, shardWrapper: true };
