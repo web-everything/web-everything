@@ -1663,11 +1663,11 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
     const env = { ...daemonEnv(), WE_GITHUB_APP_ROLE: 'merger', KEEP: '1' };
     api.postRedTeamCheckRun({ ...args, gh, env, payload: api.redTeamCheckRunPayload({ ...args, status: 'in_progress' }) });
     api.postRedTeamPublicationHold({ ...args, held: true, gh, env });
-    expect(seen).toEqual([{ ...env, WE_GITHUB_APP_ROLE: 'legacy' }, { ...env, WE_GITHUB_APP_ROLE: 'legacy' }]);
+    expect(seen).toEqual([{ ...env, WE_GITHUB_APP_ROLE: 'legacy', WE_GH_DAEMON_CALLER: 'red-team-writer', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' }, { ...env, WE_GITHUB_APP_ROLE: 'legacy', WE_GH_DAEMON_CALLER: 'red-team-writer', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' }]);
     expect(env.WE_GITHUB_APP_ROLE).toBe('merger'); // the caller's env is never mutated
     // An inherited role-App token never reaches the write (the shim's inherited-token path or a bare gh would use it).
     const inherited = { ...env, GH_TOKEN: 'fixture-role-token', GITHUB_TOKEN: 'x', WE_GH_AUTH_TOKEN_HASH: 'h', WE_GH_AUTH_SOURCE: 'cache', WE_GH_AUTH_INSTALLATION: '1' };
-    expect(api.redTeamWriterEnv(inherited)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+    expect(api.redTeamWriterEnv(inherited)).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy', WE_GH_DAEMON_CALLER: 'red-team-writer', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
     expect(inherited.GH_TOKEN).toBe('fixture-role-token');
   });
 
@@ -1714,7 +1714,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       const writes = fake.calls.filter(c => c.args.includes('POST'));
       expect(writes.map(c => String(c.args[1]).includes('/statuses/') ? 'status' : 'check')).toEqual(['status', 'check', 'status']);
       const { GH_TOKEN: _dropped, ...kept } = env;
-      for (const write of writes) expect(write.env).toEqual({ ...kept, WE_GITHUB_APP_ROLE: 'legacy' });
+      for (const write of writes) expect(write.env).toEqual({ ...kept, WE_GITHUB_APP_ROLE: 'legacy', WE_GH_DAEMON_CALLER: 'red-team-writer', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
       expect(fake.statuses.map(status => status.state)).toEqual(['success', 'failure']);
       expect(fake.runs).toEqual([expect.objectContaining({ app: { id: Number(WE_APP) }, external_id: 'o/r#7', conclusion: 'success',
         output: expect.objectContaining({ title: 'Live-check: Red team clear' }) })]);
@@ -1738,7 +1738,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       expect(result).toMatchObject({ ok: false, remoteHold: true });
       const holds = calls.filter(c => c.args.includes('POST') && String(c.args[1]).includes('/statuses/'));
       expect(holds).toHaveLength(1);
-      expect(holds[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(holds[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy', WE_GH_DAEMON_CALLER: 'red-team-writer', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
       expect(calls.filter(c => c.args.includes('POST')).every(c => c.env?.WE_GITHUB_APP_ROLE === 'legacy')).toBe(true);
     });
 
@@ -1756,7 +1756,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       expect(api.createLiveCheckPublisher({ env, run }).clearHold({ ...args, env: {} })).toMatchObject({ ok: true, cleared: true });
       const writes = calls.filter(c => c.args.includes('POST'));
       expect(writes).toHaveLength(1);
-      expect(writes[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy' });
+      expect(writes[0].env).toEqual({ ...env, WE_GITHUB_APP_ROLE: 'legacy', WE_GH_DAEMON_CALLER: 'red-team-writer', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' });
     });
 
     it('an unresolvable App id fails closed with the shared reason and touches no GitHub', () => {

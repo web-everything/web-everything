@@ -1,5 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, requireRedTeamAppWriter } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -672,7 +672,7 @@ export function withRedTeamStatusClaim(path, write, { readPidStart = pidStartTim
 /** CAS and atomic rename share a reclaimable recovery claim; a loser never rolls back the winner. */
 export function recordRedTeamStatus(input, options = {}) {
   const underTest = isUnderTest(options.env) || isUnderTest();
-  const publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
+  let publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
   const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
   mkdirSync(dirname(path), { recursive: true });
   return withRedTeamStatusClaim(path, () => {
@@ -695,6 +695,9 @@ export function recordRedTeamStatus(input, options = {}) {
         catch { remoteHold = true; }
       }
     }
+    // A not-owed transition (no red-team review owed) with no earlier unconfirmed hold has nothing to publish or clear.
+    if (publish && !heldBefore && (input.status === 'finished'
+      && (input.result === 'skipped' || input.result?.status === 'skipped'))) publish = false;
     const writeHold = () => writeJsonAtomic(`${path}.unpublished`, { status: input.status, remoteHold });
     if (publish) writeHold();
     let written;
@@ -759,6 +762,9 @@ export function recordRedTeamStatus(input, options = {}) {
           if (!result.ok && result.definite) { remoteHold = false; writeHold(); }
           return result;
         };
+        // Fail closed BEFORE any hold: no WE App token means no check run can be created, so a hold would be orphaned.
+        const appWriter = requireRedTeamAppWriter({ gh: options.gh, env: writerEnv, appWriterProbe: options.appWriterProbe });
+        if (appWriter.ok !== true) return report({ published: false, reason: safeReason(appWriter.reason) });
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;

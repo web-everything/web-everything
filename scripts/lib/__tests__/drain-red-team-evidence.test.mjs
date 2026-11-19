@@ -70,7 +70,7 @@ describe('status persistence and check publication share one claim', () => {
     const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('real gh forbidden'); });
     try {
       const result = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status }, {
-        env: f.env, postCheckRun: ({ payload: check }) => {
+        env: f.env, appWriterProbe: () => {}, postCheckRun: ({ payload: check }) => {
           expect(readRedTeamPublicationHold(f)).toMatch(/not confirmed published/);
           checks.push(check);
           return { ok: true };
@@ -349,6 +349,35 @@ describe('status persistence and check publication share one claim', () => {
       expect(out).toEqual({ published: true });
       expect(probes).toEqual([expect.objectContaining({ ok: false, reason: expect.stringMatching(/lock failed/) })]);
     } finally { rmSync(lockDir, { recursive: true, force: true }); }
+  });
+
+  it('refuses before any status POST when the WE App token does not resolve (no orphan hold)', () => {
+    const f = fixture(), posts = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    const out = recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {},
+      appWriterProbe: () => { throw Error('REFUSING personal-auth fallback'); },
+      postCheckRun: args => { posts.push(['check', args]); return { ok: true }; },
+      postPublicationHold: hold => { posts.push(['hold', hold]); return { ok: true }; } });
+    expect(out).toMatchObject({ published: false, reason: expect.stringContaining('WE App token unavailable') });
+    expect(posts).toEqual([]);
+  });
+
+  it('a not-owed (skipped) transition publishes nothing', () => {
+    const f = fixture(), posts = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' };
+    recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {}, appWriterProbe: () => {},
+      postCheckRun: args => { posts.push(args); return { ok: true }; },
+      postPublicationHold: hold => { posts.push(hold); return { ok: true }; } });
+    expect(posts).toEqual([]);
+  });
+
+  it('the normal App path still holds, posts the check, and clears', () => {
+    const f = fixture(), order = [];
+    const input = { ...f, loopPayload: payload(f.head), status: 'running' };
+    expect(recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {}, appWriterProbe: () => {},
+      postCheckRun: () => { order.push('check'); return { ok: true }; },
+      postPublicationHold: hold => { order.push(hold.held ? 'hold' : 'clear'); return { ok: true }; } })).toEqual({ published: true });
+    expect(order).toEqual(['hold', 'check', 'clear']);
   });
 
   it('sets a GitHub-visible hold before any check post, keeps it across later failures, and clears it only on confirmation', () => {
