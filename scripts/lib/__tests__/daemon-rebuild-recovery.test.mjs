@@ -202,9 +202,8 @@ describe('recovery setting retention bound', () => {
     const resolved = resolveRecovery({ tool: { overlayOverdueMs: value }, log,
       env: { WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'absent-recovery-preferences.json'),
         WE_DAEMON_RECOVERY_OVERLAY_OVERDUE_MS: String(value) } });
-    expect(MAX_OVERLAY_OVERDUE_MS).toBeLessThanOrEqual(OVERLAY_ADOPTION_TTL_MS / 2);
-    expect(MAX_OVERLAY_OVERDUE_MS).toBeLessThanOrEqual(6 * 60 * 60_000);
-    expect(resolved.overlayOverdueMs).toBe(MAX_OVERLAY_OVERDUE_MS);
+    expect(MAX_OVERLAY_OVERDUE_MS).toBe(15 * 60_000);
+    expect(resolved.overlayOverdueMs).toBe(15 * 60_000);
     expect(log.mock.calls.flat().join('\n')).toContain(`overlayOverdueMs=${MAX_OVERLAY_OVERDUE_MS} (source env; clamped to maximum`);
     expect(recoveryDue({ state: {}, pending: [{ at: at(0) }], nowMs: resolved.overlayOverdueMs, settings: resolved })).toBe(true);
   });
@@ -218,5 +217,14 @@ describe('recovery setting retention bound', () => {
   it('accepts the cap and preserves the standard overdue threshold', () => {
     expect(resolveRecovery({ tool: { overlayOverdueMs: MAX_OVERLAY_OVERDUE_MS }, env: {} }).overlayOverdueMs).toBe(MAX_OVERLAY_OVERDUE_MS);
     expect(resolveRecovery({ tool: {}, env: {} }).overlayOverdueMs).toBe(OVERLAY_ADOPTION_OVERDUE_MS);
+  });
+
+  it.each(['tool', 'env'])('honours a shorter overdue threshold from %s', source => {
+    const value = 5 * 60_000;
+    const resolved = resolveRecovery({ tool: { overlayOverdueMs: value },
+      env: source === 'env' ? { WE_DAEMON_RECOVERY_OVERLAY_OVERDUE_MS: String(value) } : {}, log: vi.fn() });
+    expect(resolved.overlayOverdueMs).toBe(value);
+    expect(recoveryDue({ state: {}, pending: [{ at: at(0) }], nowMs: value - 1, settings: resolved })).toBe(false);
+    expect(recoveryDue({ state: {}, pending: [{ at: at(0) }], nowMs: value, settings: resolved })).toBe(true);
   });
 });

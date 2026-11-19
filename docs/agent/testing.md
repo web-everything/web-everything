@@ -4953,6 +4953,6 @@ operator repair. Recovery settings use the shared policy cascade and the detache
 queue retains its in-flight guard before considering any recovery trigger.
 Recovery uses the existing rebuild minimum interval (including jitter), even after a ready-recorded
 job; a `still-rejected` adopt-only result never launches recovery. The overdue threshold must be
-at most half the retention TTL or six hours, whichever is smaller; oversized settings clamp
+at most 15 minutes (the default); settings may only shorten it, and oversized settings clamp
 to that maximum and log the originating policy layer. The unit fixture drives the real ready-only rebuild through a
 timeout and a later passing smoke on unchanged inputs; the soak fixture checks queueing only.

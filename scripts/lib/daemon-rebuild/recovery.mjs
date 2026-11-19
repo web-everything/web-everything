@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { OVERLAY_ADOPTION_OVERDUE_MS, OVERLAY_ADOPTION_TTL_MS } from '../overlay-adoption.mjs';
 
-export const MAX_OVERLAY_OVERDUE_MS = Math.min(OVERLAY_ADOPTION_TTL_MS / 2, 6 * 60 * 60_000);
+export const MAX_OVERLAY_OVERDUE_MS = OVERLAY_ADOPTION_OVERDUE_MS;
 
 export function resolveRecovery({ env = process.env, log = console.error, tool } = {}) {
   if (tool === undefined) {
