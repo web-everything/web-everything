@@ -40,6 +40,9 @@ function cliFixture(source) {
       remoteExec: createRemoteExec({
         policy, lockRoot: ${JSON.stringify(join(pool, '.admission', 'heavy'))},
         readSha: () => 'unknown',
+        // Provenance is best-effort inside a 100 ms budget; a loaded CI shard can miss it and skip the
+        // state write this fixture asserts. Widen the budget (still under the 1500 ms drain cap).
+        provenanceBudgetMs: 1000,
       }),
     });
   `;
