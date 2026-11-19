@@ -122,6 +122,9 @@ function auditTranscript(text, clone) {
     // Anything that names a tool is a tool step whatever its step_type says (matches the juror's check).
     if (s?.step_type !== 'tool' && s?.tool_name == null && s?.tool_info?.name == null) continue;
     const name = s.tool_name ?? s.tool_info?.name;
+    // Conflicting names are rewritten below, so reject them before the rewrite erases the evidence.
+    if (s.tool_name != null && s.tool_info?.name != null && s.tool_name !== s.tool_info.name)
+      throw new Error('conflicting tool names');
     if (/git/i.test(name ?? '') || /\bgit\b/i.test(JSON.stringify(s.tool_info?.parameters ?? {}))
       && /command|shell|exec/i.test(name ?? '')) throw new Error('agy git call');
     if (!WRITE_TOOLS.has(name) && !PATH_CHECKED_READS.has(name) && !READ_ONLY_AGY_TOOLS.includes(name))
