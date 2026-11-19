@@ -56,7 +56,7 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
     "fingerprint": "module-sha256-v2:79586a75fe2888a15a582764cbacb1788aaaecf76f699b62d7faf1e57016f15b",
     "function": "freshAgentStatus",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:50e2d5d175571c51b04350346a297cf036b6b1f49c9148a1bc9cb64684372d88",
+    "moduleFingerprint": "module-sha256-v2:d93daba086cebc9ac353fb82812a083f64ee61d1ea3120db4defc8df96690f13",
   },
   {
     "file": "scripts/conveyor/session-reaper.mjs",
