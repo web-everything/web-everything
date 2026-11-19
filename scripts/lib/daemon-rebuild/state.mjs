@@ -52,8 +52,8 @@ const EMPTY_STATE = Object.freeze({
 });
 
 /**
- * Read the per-clone rebuild state, never throwing — a missing or corrupt file reads as the empty state (fail
- * closed to "nothing adopted, nothing rejected, nothing in progress", never a crash).
+ * Read the per-clone rebuild state, never throwing — a missing or corrupt file reads as the empty state. Legacy, best-effort consumers only;
+ * admission must use the strict reader and retain its snapshot.
  * @param {string} root
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {{adopted:object|null, rejected:object|null, inProgress:object|null, quarantine:object|null,
@@ -73,27 +73,31 @@ const string = v => typeof v === 'string' && v.length > 0;
 const date = v => string(v) && Number.isFinite(Date.parse(v));
 const positive = v => Number.isSafeInteger(v) && v > 0;
 const strings = v => Array.isArray(v) && v.every(string);
-const applied = v => Array.isArray(v) && v.every(r => object(r) && string(r.ref) && string(r.sha));
+export const appliedShape = v => Array.isArray(v) && v.every(r => object(r) && string(r.ref) && string(r.sha)
+  && (!Object.hasOwn(r, 'pinnedFrom') || string(r.pinnedFrom)));
+const applied = appliedShape;
 const fields = (v, required, optional = {}) => object(v)
   && Object.entries(required).every(([k, valid]) => valid(v[k]))
   && Object.entries(optional).every(([k, valid]) => !(k in v) || valid(v[k]));
-const backoff = { retryAt: date, attempts: positive };
-const stateShapes = {
-  held: v => fields(v, { reason: string }, { ...backoff, since: date, updatedAt: date })
-    && date(v.updatedAt ?? v.since ?? v.retryAt)
-    // Historical timeout holds predate retryAt/attempts; their persisted date is the deadline origin.
-    && (v.reason !== 'smoke-env-timeout' || date(v.retryAt ?? v.updatedAt ?? v.since)),
-  rejected: v => fields(v, { inputsKey: string }, { ...backoff, reason: string, at: date,
-    harnessBroken: v => typeof v === 'boolean', externalOnly: v => typeof v === 'boolean',
-    envLoad: v => typeof v === 'boolean', dispatchSmoke: v => typeof v === 'boolean' })
+const boolean = v => typeof v === 'boolean';
+const nullable = valid => v => v === null || valid(v);
+const backoff = { retryAt: nullable(date), attempts: positive };
+// Admission schema: every persisted discriminator and every value defaulted/coerced by
+// readState/prepare is required. Null is an explicit absence, never an omitted field.
+// Old incomplete files require operator repair; only ENOENT creates EMPTY_STATE.
+export const rebuildStateSchema = {
+  held: v => fields(v, { reason: string, since: date, updatedAt: date, ...backoff })
+    && (v.reason !== 'smoke-env-timeout' || date(v.retryAt)),
+  rejected: v => fields(v, { inputsKey: string, reason: string, at: date, ...backoff,
+    harnessBroken: boolean, externalOnly: boolean, envLoad: boolean, dispatchSmoke: boolean })
     && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
-  adopted: v => fields(v, { head: string, inputsKey: string }, { applied, mainSha: string, at: date }),
-  inProgress: v => fields(v, { pid: positive, host: string, startedAt: date, prevHead: string, target: string },
-    { inputsKey: string, mainSha: string, applied, verified: v => typeof v === 'boolean' }),
+  adopted: v => fields(v, { head: string, inputsKey: string, applied, mainSha: string, at: date }),
+  inProgress: v => fields(v, { pid: positive, host: string, startedAt: date, prevHead: string, target: string,
+    inputsKey: string, mainSha: string, applied, verified: boolean }),
   quarantine: v => fields(v, { prevHead: string, reason: string }),
   unverified: v => fields(v, { head: string, prevHead: string }),
   building: v => fields(v, { token: string, pid: positive, host: string, startedAt: date,
-    target: string, inputsKey: string, path: string }, { adoptOnly: v => typeof v === 'boolean' }),
+    target: string, inputsKey: string, path: string, adoptOnly: boolean }),
   busySkippedTrees: strings,
   forceUnverifiedTrees: strings,
   smokePassed: v => Array.isArray(v) && v.every(r => fields(r, { key: string, tree: string, passedAt: date })),
@@ -106,11 +110,12 @@ function readState(root, env, strict, read = readFileSync) {
     if (strict && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) {
       throw new Error('Invalid rebuild state object');
     }
-    if (strict) for (const [key, valid] of Object.entries(stateShapes)) {
-      if (parsed[key] !== undefined && parsed[key] !== null && !valid(parsed[key])) {
+    if (strict) for (const [key, valid] of Object.entries(rebuildStateSchema)) {
+      if (!Object.hasOwn(parsed, key) || (parsed[key] !== null && !valid(parsed[key]))) {
         throw new Error(`Invalid rebuild state ${key}`);
       }
     }
+    if (strict) return parsed; // Preserve the one validated snapshot, without legacy coercion.
     return {
       adopted: parsed?.adopted ?? null,
       rejected: parsed?.rejected ?? null,
@@ -135,7 +140,14 @@ export function writeRebuildState(root, state, env = process.env) {
   const file = rebuildStatePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  // Producers materialize known policy defaults. Admission never repairs a persisted
+  // file or invents missing identities, applied tips, timestamps or timeout deadlines.
+  const persisted = { ...EMPTY_STATE, ...state };
+  if (persisted.rejected) persisted.rejected = {
+    retryAt: null, attempts: 1, harnessBroken: false, externalOnly: false, envLoad: false, dispatchSmoke: false,
+    ...persisted.rejected,
+  };
+  writeFileSync(tmp, JSON.stringify(persisted, null, 2), 'utf8');
   renameSync(tmp, file);
 }
 
@@ -175,13 +187,17 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   try { text = read(readyCandidatePath(root, env), 'utf8'); }
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   const r = JSON.parse(text);
-  if (!fields(r, { prevHead: string, adopt: v => fields(v, { finalSha: string },
-    { inputsKey: string, mainSha: string, applied }) }, {
-    tree: string, passedAt: date, at: date, kind: string, forced: v => typeof v === 'boolean',
+  if (!fields(r, { prevHead: string, tree: string, passedAt: date, kind: v => ['candidate', 'fallback'].includes(v),
+    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied }) }, {
+    at: date, token: string, pid: positive, host: string, forInputsKey: string,
+    dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
+      { ref: string, sha: string, pr: v => v === null || positive(v) })),
+    failed: v => typeof v === 'string',
+  }) || (r.kind === 'fallback' && !fields(r, {
     forInputsKey: string, dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
-      { ref: string }, { sha: string, pr: v => v === null || positive(v) })),
-    failed: v => typeof v === 'string', token: string, pid: positive, host: string,
-  })) {
+      { ref: string, sha: string, pr: v => v === null || positive(v) })),
+    failed: v => typeof v === 'string',
+  }))) {
     throw new Error('Invalid ready candidate');
   }
   return r;
@@ -192,7 +208,7 @@ export function writeReadyCandidate(root, record, env = process.env) {
     const file = readyCandidatePath(root, env);
     mkdirSync(dirname(file), { recursive: true });
     const tmp = `${file}.tmp-${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8');
+    writeFileSync(tmp, JSON.stringify({ forced: false, ...record }, null, 2), 'utf8');
     renameSync(tmp, file);
     return true;
   } catch {

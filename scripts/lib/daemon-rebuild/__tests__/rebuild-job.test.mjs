@@ -16,6 +16,8 @@ import * as rebuildJob from '../rebuild-job.mjs';
 import * as forceAdopt from '../../daemon-force-adopt.mjs';
 import * as overlayAdoption from '../../overlay-adoption.mjs';
 import * as preparation from '../prepare.mjs';
+import * as stateIO from '../state.mjs';
+import { matchReadyCandidate } from '../adopt.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-job-jitter-')); });
@@ -95,7 +97,7 @@ it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job 
   const store = createJobStore(join(root, 'jobs'));
   const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root } });
   const ready = { kind: 'candidate', prevHead: 'old', tree: 'tree', passedAt: new Date().toISOString(),
-    adopt: { finalSha: 'ready', applied: [] } };
+    adopt: { finalSha: 'ready', inputsKey: 'inputs', mainSha: 'main', applied: [] } };
   const publish = () => writeReadyCandidate(root, ready, env);
   if (phase === 'before-reattach') publish();
   const reattach = vi.fn(async () => {
@@ -148,10 +150,10 @@ it.each([true, false])('launchOnly=%s refuses unreadable state and permits only 
 });
 
 it.each([
-  ['sticky rejection', { rejected: { inputsKey: 'unchanged' } }, 'still-rejected'],
-  ['smoke backoff', { held: { reason: 'smoke-harness-broken', since: new Date(0).toISOString() },
-    rejected: { inputsKey: 'older', harnessBroken: true, retryAt: new Date(2000).toISOString() } }, 'smoke-harness-broken-backoff'],
-  ['retry not yet due', { rejected: { inputsKey: 'unchanged', retryAt: new Date(2000).toISOString() } }, 'still-rejected'],
+  ['sticky rejection', { rejected: { inputsKey: 'unchanged', reason: 'failed', at: new Date(0).toISOString() } }, 'still-rejected'],
+  ['smoke backoff', { held: { reason: 'smoke-harness-broken', since: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(), retryAt: null, attempts: 1 },
+    rejected: { inputsKey: 'older', reason: 'failed', at: new Date(0).toISOString(), harnessBroken: true, retryAt: new Date(2000).toISOString() } }, 'smoke-harness-broken-backoff'],
+  ['retry not yet due', { rejected: { inputsKey: 'unchanged', reason: 'failed', at: new Date(0).toISOString(), retryAt: new Date(2000).toISOString() } }, 'still-rejected'],
   ['clean state', {}, 'rebuild-job-started'],
   ...[true, false].flatMap(launchOnly => ['corrupt', 'EACCES'].map(failure =>
     [failure, { rejected: { inputsKey: 'unchanged' } }, 'state-unreadable', launchOnly, failure])),
@@ -193,7 +195,7 @@ it.each([
   expect(result.reason).toBe(reason);
   expect(adopt).toHaveBeenCalledTimes(failure ? 0 : 1);
   if (failure) expect(readFileSync(file, 'utf8')).toBe(original);
-  else expect(adopt).toHaveBeenCalledWith({ readyOnly: true });
+  else expect(adopt).toHaveBeenCalledWith({ readyOnly: true, admissionEvidence: { state: expect.any(Object), ready: null } });
   expect(store.list().records).toHaveLength(reason === 'rebuild-job-started' ? 1 : 0);
   expect(reattach).toHaveBeenCalledTimes(reason === 'rebuild-job-started' ? 1 : 0);
   expect(runSmoke).not.toHaveBeenCalled();
@@ -265,9 +267,11 @@ it.each([
   ['adopt inputsKey', { adopt: { finalSha: 'target', inputsKey: false } }],
   ['adopt mainSha', { adopt: { finalSha: 'target', mainSha: [] } }],
   ['adopt applied', { adopt: { finalSha: 'target', applied: [{ ref: 'lane/x', sha: false }] } }],
+  ['adopt pinnedFrom', { adopt: { applied: [{ ref: 'lane/x', sha: 'tip', pinnedFrom: true }] } }],
 ])('wrong ready %s type refuses before adoption or job mutation, preserving evidence', async (_name, patch) => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
-  writeReadyCandidate(root, { prevHead: 'head', adopt: { finalSha: 'target' }, ...patch }, env);
+  writeReadyCandidate(root, { ...completeReady(), kind: 'candidate', ...patch,
+    adopt: patch.adopt ? { ...completeReady().adopt, ...patch.adopt } : completeReady().adopt }, env);
   const file = readyCandidatePath(root, env);
   const original = readFileSync(file, 'utf8');
   const adopt = vi.fn(); const reattach = vi.fn(); const error = vi.fn();
@@ -281,12 +285,12 @@ it.each([
 });
 
 it.each([{}, { forced: false }, { forced: true }, {
-  kind: 'fallback', forInputsKey: 'inputs', dropRefs: [{ ref: 'lane/x', sha: 'tip', pr: 123 }, { ref: 'lane/y', pr: null }],
+  kind: 'fallback', forInputsKey: 'inputs', dropRefs: [{ ref: 'lane/x', sha: 'tip', pr: 123 }, { ref: 'lane/y', sha: 'tip', pr: null }],
   failed: '', at: new Date(0).toISOString(), tree: 'tree', token: 'lease', pid: 1, host: 'host',
   adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [{ ref: 'lane/z', sha: 'tip' }] },
 }])('strict ready reader preserves valid optional and historical fields %j', patch => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
-  const ready = { prevHead: 'head', adopt: { finalSha: 'target' }, passedAt: new Date(0).toISOString(), ...patch };
+  const ready = { kind: 'candidate', forced: false, tree: 'tree', prevHead: 'head', adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [] }, passedAt: new Date(0).toISOString(), ...patch };
   writeReadyCandidate(root, ready, env);
   expect(readReadyCandidateStrict(root, env)).toEqual(ready);
 });
@@ -420,10 +424,14 @@ it.each([
   { held: { reason: 'smoke-env-timeout', updatedAt: new Date(0).toISOString() } },
   { rejected: { inputsKey: 'historical-sticky-rejection' } },
   { held: null, rejected: null },
-])('strict admission preserves historical persisted state %j', state => {
+])('incomplete historical files require repair without migration at admission %j', state => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
-  writeRebuildState(root, state, env);
-  expect(readRebuildStateStrict(root, env)).toMatchObject(state);
+  mkdirSync(env.WE_DAEMON_STATE_DIR);
+  const file = rebuildStatePath(root, env);
+  const bytes = JSON.stringify(state);
+  writeFileSync(file, bytes);
+  expect(() => readRebuildStateStrict(root, env)).toThrow();
+  expect(readFileSync(file, 'utf8')).toBe(bytes);
 });
 
 
@@ -443,4 +451,154 @@ it.each(['consumed.json', 'result'])('corrupt persisted %s refuses before changi
   expect(readFileSync(file, 'utf8')).toBe('{broken');
   expect(store.read(old.id)).toEqual(before);
   expect(store.list().records).toHaveLength(1);
+});
+
+// Complete persisted fixtures: mutation cases below bypass writers deliberately.
+const stamp = new Date(0).toISOString();
+const completeState = () => ({
+  adopted: { head: 'head', inputsKey: 'inputs', mainSha: 'main', applied: [{ ref: 'lane/x', sha: 'tip' }], at: stamp },
+  rejected: { inputsKey: 'inputs', reason: 'failed', at: stamp, retryAt: stamp, attempts: 1,
+    harnessBroken: false, externalOnly: false, envLoad: false, dispatchSmoke: false },
+  held: { reason: 'smoke-env-timeout', since: stamp, updatedAt: stamp, retryAt: stamp, attempts: 1 },
+  inProgress: { pid: 1, host: 'host', startedAt: stamp, prevHead: 'head', target: 'target',
+    inputsKey: 'inputs', mainSha: 'main', applied: [{ ref: 'lane/x', sha: 'tip' }], verified: true },
+  quarantine: { prevHead: 'head', reason: 'failed' },
+  unverified: { head: 'head', prevHead: 'previous' },
+  building: { token: 'token', pid: 1, host: 'host', startedAt: stamp, target: 'target',
+    inputsKey: 'inputs', path: 'candidate', adoptOnly: false },
+  busySkippedTrees: ['tree'], forceUnverifiedTrees: ['tree'],
+  smokePassed: [{ key: 'key', tree: 'tree', passedAt: stamp }], pinnedNotified: { 'lane/x': 'tip' },
+});
+const completeReady = () => ({
+  kind: 'fallback', forced: false, prevHead: 'head', tree: 'tree', passedAt: stamp,
+  adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [{ ref: 'lane/x', sha: 'tip' }] },
+  forInputsKey: 'inputs', dropRefs: [{ ref: 'lane/y', sha: 'tip', pr: null }], failed: '',
+});
+function requiredPaths(value, prefix = []) {
+  return Object.entries(value).flatMap(([key, child]) => {
+    const path = [...prefix, key];
+    return [path, ...(child && typeof child === 'object' ? requiredPaths(child, path) : [])];
+  });
+}
+const requiredCases = [
+  ...requiredPaths(completeState()).map(path => ['state', path]),
+  ...requiredPaths(completeReady()).map(path => ['ready', path]),
+].flatMap(([kind, path]) => (path[0] === 'pinnedNotified' && path.length > 1 ? ['wrong-type'] : ['missing', 'wrong-type']).map(mode => [kind, path.join('.'), mode]));
+
+it.each(requiredCases)('%s required field %s %s refuses without changing evidence', async (kind, dotted, mode) => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  mkdirSync(env.WE_DAEMON_STATE_DIR);
+  const value = kind === 'state' ? completeState() : completeReady();
+  const path = dotted.split('.');
+  const parent = path.slice(0, -1).reduce((v, k) => v[k], value);
+  const key = path.at(-1);
+  // Removing an array member creates a malformed member, rather than shortening a valid list.
+  if (mode === 'missing') { if (Array.isArray(parent)) parent[key] = null; else delete parent[key]; }
+  else parent[key] = parent[key] === null ? true : typeof parent[key] === 'boolean' ? 'false' : typeof parent[key] === 'number' ? '1' : 42;
+  const file = (kind === 'state' ? rebuildStatePath : readyCandidatePath)(root, env);
+  const bytes = JSON.stringify(value, null, 2) + '\n';
+  writeFileSync(file, bytes);
+  const adopt = vi.fn(); const reattach = vi.fn();
+  const store = createJobStore(join(root, 'jobs'));
+  const result = await rebuildCloneAsJob({ root, env, store, launchOnly: true, adopt, reattach, log: { error() {} } });
+  expect(result.reason).toBe('state-unreadable');
+  expect(adopt).not.toHaveBeenCalled(); expect(reattach).not.toHaveBeenCalled();
+  expect(readFileSync(file, 'utf8')).toBe(bytes);
+  expect(nodeFs.existsSync(store.dir)).toBe(false);
+});
+
+it('complete declared state and ready schemas are admitted without coercion', () => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  mkdirSync(env.WE_DAEMON_STATE_DIR);
+  writeFileSync(rebuildStatePath(root, env), JSON.stringify(completeState()));
+  writeFileSync(readyCandidatePath(root, env), JSON.stringify(completeReady()));
+  expect(readRebuildStateStrict(root, env)).toEqual(completeState());
+  expect(readReadyCandidateStrict(root, env)).toEqual(completeReady());
+});
+
+it.each([undefined, null, {}, [null], [{ ref: 'lane/x' }], [{ ref: 'lane/x', sha: 'tip', pinnedFrom: true }]])(
+  'exact ready matching refuses incomplete applied evidence %j before an audit exemption', applied => {
+    const auditedTip = vi.fn();
+    const ready = completeReady(); ready.adopt.applied = applied; ready.kind = 'candidate';
+    expect(matchReadyCandidate({ ready, auditedTip, plan: { finalSha: 'target', mainSha: 'main', alerts: [] },
+      prevHead: 'head', nowMs: 1000, maxAgeMs: 2000 }).adopt).toBeNull();
+  });
+
+it('exact ready matching consults fresh audit evidence for each recorded tip', () => {
+  const auditedTip = vi.fn(() => ({ ok: false }));
+  const ready = completeReady(); ready.kind = 'candidate';
+  const result = matchReadyCandidate({ ready, auditedTip,
+    plan: { finalSha: 'target', mainSha: 'main', alerts: [] }, prevHead: 'head',
+    stillWanted: () => true, nowMs: 1000, maxAgeMs: 2000 });
+  expect(auditedTip).toHaveBeenCalled();
+  expect(result.adopt).toBeNull();
+});
+
+it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'clean', 'interrupted', 'up-to-date'].map(kind => [source, kind])))(
+  '%s %s admission uses one exact strict snapshot through real preparation and never rereads state', async (launchedBy, kind) => {
+    const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
+      WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_AUTO_REBASE: '0' };
+    writeRebuildState(root, ['clean', 'up-to-date'].includes(kind) ? {} : {
+      rejected: { inputsKey: kind !== 'backoff' ? 'inputs' : 'older', reason: 'failed', at: stamp,
+        ...(kind === 'backoff' ? { harnessBroken: true, retryAt: new Date(2000).toISOString() } : {}) },
+      ...(kind === 'interrupted' ? { inProgress: { pid: 1, host: 'other-host', startedAt: new Date(-3600000).toISOString(),
+        prevHead: 'head', target: 'head', inputsKey: 'inputs', mainSha: 'main', applied: [], verified: true } } : {}),
+      ...(kind === 'backoff' ? { held: { reason: 'smoke-harness-broken', since: stamp, updatedAt: stamp,
+        retryAt: null, attempts: 1 } } : {}),
+    }, env);
+    const file = rebuildStatePath(root, env), bytes = readFileSync(file, 'utf8');
+    const snapshot = readRebuildStateStrict(root, env);
+    const persistedRejection = structuredClone(snapshot.rejected);
+    const readState = vi.fn(() => {
+      if (readState.mock.calls.length > 1) throw new Error('second strict read forbidden');
+      return snapshot;
+    });
+    const legacyRead = vi.spyOn(stateIO, 'readRebuildState').mockImplementation(() => { throw new Error('legacy read forbidden'); });
+    const prepare = vi.spyOn(preparation, 'prepareRebuild');
+    vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
+      // Evidence arriving after strict admission is owned by the next tick.
+      if (kind === 'up-to-date') writeFileSync(readyCandidatePath(root, env), '{new-unreadable-evidence');
+      return { ok: true, upToDate: kind === 'up-to-date', finalSha: kind === 'up-to-date' ? 'head' : 'target',
+        mainSha: 'main', inputsKey: 'inputs', applied: [], decisions: [], alerts: [] };
+    });
+    vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
+    vi.spyOn(laneRepair, 'probeBrokenRefs').mockReturnValue({ probeFailed: false, broken: [] });
+    vi.spyOn(laneRepair, 'diagnoseLane').mockReturnValue({ ok: true, problems: [] });
+    const run = vi.fn(args => {
+      if (args[0] === 'symbolic-ref') return { status: 0, stdout: 'main' };
+      if (args[0] === 'rev-parse') return args.includes('MERGE_HEAD') ? { status: 1, stdout: '' } : { status: 0, stdout: 'head' };
+      if (['commit-graph', 'ls-files', 'status', 'rev-list'].includes(args[0])) return { status: 0, stdout: '' };
+      throw new Error('unexpected git: ' + args.join(' '));
+    });
+    const actualJob = rebuildJob.rebuildCloneAsJob;
+    const store = createJobStore(join(root, 'jobs'));
+    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockImplementation(options => actualJob({ ...options, store, readState,
+      codeSha: 'a'.repeat(40), reattach: async () => ({}), evict() {},
+      settings: { minIntervalMs: 0, minIntervalJitterPct: 0 } }));
+    const result = await rebuildClone({ root, env, run, asJob: true, launchOnly: true, launchedBy,
+      versions: null, now: () => 1000, lockOpts: { waitMs: 0 }, log: { error() {} }, emitEvent: vi.fn() });
+    expect(result.reason).toBe(['sticky', 'interrupted'].includes(kind) ? 'still-rejected' : kind === 'backoff'
+      ? 'smoke-harness-broken-backoff' : kind === 'up-to-date' ? 'up-to-date' : 'rebuild-job-started');
+    expect(readState).toHaveBeenCalledOnce(); expect(legacyRead).not.toHaveBeenCalled();
+    expect(prepare.mock.calls[0][0].admissionEvidence.state).toBe(snapshot);
+    if (kind === 'interrupted') {
+      const persisted = JSON.parse(readFileSync(file, 'utf8'));
+      expect(persisted.inProgress).toBeNull();
+      expect(persisted.rejected).toEqual(persistedRejection);
+    } else if (kind === 'up-to-date') {
+      expect(readFileSync(readyCandidatePath(root, env), 'utf8')).toBe('{new-unreadable-evidence');
+      expect(JSON.parse(readFileSync(file, 'utf8')).adopted.head).toBe('head');
+    } else expect(readFileSync(file, 'utf8')).toBe(bytes);
+    expect(store.list().records).toHaveLength(kind === 'clean' ? 1 : 0);
+  });
+
+it('lost launch-only snapshot handoff refuses before any legacy read or Git IO', async () => {
+  const legacy = vi.spyOn(stateIO, 'readRebuildState').mockImplementation(() => { throw new Error('legacy read forbidden'); });
+  const run = vi.fn();
+  const result = await rebuildClone({ root, env: {}, readyOnly: true, adoptOnly: true, asJob: false,
+    run, emitEvent: vi.fn(), log: { error() {} } });
+  expect(result.reason).toBe('state-unreadable');
+  const prepared = await preparation.prepareRebuild({ root, env: {}, readyOnly: true, adoptOnly: true, run });
+  expect(prepared.result.reason).toBe('state-unreadable');
+  expect(legacy).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled();
 });

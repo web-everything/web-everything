@@ -94,8 +94,11 @@ export function contentContainedInBuild(git, sha, build) {
  * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
+  root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false, admissionEvidence,
 }) {
+  if (readyOnly && adoptOnly && !admissionEvidence) {
+    return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: [] };
+  }
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
@@ -133,7 +136,7 @@ export async function prepareRebuild({
     detail: 'Deferred to the next daemon tick holding the normal clone write lock.',
   });
 
-  const state = readRebuildState(root, stEnv);
+  const state = admissionEvidence ? admissionEvidence.state : readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
   // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
   // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
@@ -451,6 +454,7 @@ export async function prepareRebuild({
     if (/^pinned-overlay-/.test(plan.reason) && state.adopted?.head && state.adopted.head === prevHead) {
       const d = plan.detail || {};
       state.held = {
+        retryAt: null, attempts: 1,
         since: state.held?.since ?? nowIso(),
         reason: plan.reason,
         failed: `${d.ref ?? '?'}${d.pr != null ? ` (PR #${d.pr})` : ''}: ${d.message ?? plan.reason}`,
@@ -490,6 +494,7 @@ export async function prepareRebuild({
     alert('established-overlay-hold', detail);
     if (state.adopted?.head && state.adopted.head === prevHead) {
       state.held = {
+        retryAt: null, attempts: 1,
         since: state.held?.since ?? nowIso(),
         reason: 'established-overlay-conflict',
         failed: `${lost.map((l) => l.ref).join(', ')}: conflict with main`,
@@ -559,7 +564,9 @@ export async function prepareRebuild({
       state.held = null; // x5wbsbc — current again: no longer held on a last-good build
       writeState();
     }
-    await dropReady('up-to-date', plan.finalSha); // current already — nothing a passed-but-unadopted build could add
+    // A between-tick probe must not re-read/delete ready evidence that arrived after
+    // its strict snapshot. The next normal tick owns ready cleanup and forced watches.
+    if (!readyOnly) await dropReady('up-to-date', plan.finalSha);
     return terminal({ moved: false, reason: 'up-to-date', plan });
   }
 
@@ -568,7 +575,7 @@ export async function prepareRebuild({
   // instead of being thrown away and re-smoked. Checked before the rejection/backoff short-circuits: a passed
   // plain-main fallback answers exactly the inputs the reject-cache would otherwise stop at.
   {
-    const ready = readReadyCandidate(root, stEnv);
+    const ready = admissionEvidence ? admissionEvidence.ready : readReadyCandidate(root, stEnv);
     if (ready) {
       if (readyOnly) return mutationDue('ready-candidate-adopt');
       // Still wanted = registered AFTER this tick's own list edits (a same-tick `pr-closed`/`ref-gone` removal is
@@ -826,6 +833,14 @@ export async function prepareRebuild({
   // PR #2731 review — single flight: phase 2 runs unlocked, so without this a sibling daemon sharing the clone
   // could build + smoke the same candidate at the same time. Claimed HERE, under the write lock, so exactly one
   // caller wins; the loser returns at once and its next tick finds the winner's result.
+  // Between-tick admission only decides whether work is due. It must not claim/release
+  // a transient lease (which used to require a second fail-open read-modify-write).
+  if (admissionEvidence && adoptOnly) {
+    return terminal({ moved: false,
+      reason: buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() }) ? 'rebuild-in-progress' : 'needs-build',
+      plan,
+    });
+  }
   const lease = claimBuildLease({
     state, plan, root, run, env: stEnv, nowMs: nowMs(), adoptOnly,
   });

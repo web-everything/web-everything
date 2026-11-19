@@ -108,7 +108,7 @@ test('early and tick-start use the same admission and job queue; early prepares 
     const store = createJobStore(join(dir, 'jobs')); let adopts = 0;
     const base = { root: dir, env: {}, store, codeSha: 'a'.repeat(40), snapshot: {}, now: () => 1000,
       reattach: async () => {}, evict: () => {}, log: { error() {} }, settings: { minIntervalMs: 0, minIntervalJitterPct: 0 },
-      adopt: async (options) => { adopts += 1; if (adopts === 1) assert.deepEqual(options, { readyOnly: true });
+      adopt: async (options) => { adopts += 1; if (adopts === 1) { assert.equal(options.readyOnly, true); assert.deepEqual(options.admissionEvidence, { state: readRebuildState(dir, {}), ready: null }); }
         return { reason: 'needs-build', plan: { finalSha: 'target' } }; } };
     const early = await rebuildCloneAsJob({ ...base, launchOnly: true, launchedBy: 'early', waitInFlightTickMs: 40 });
     assert.equal(early.reason, 'rebuild-job-started'); assert.equal(adopts, 1);

@@ -6,7 +6,7 @@ import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
-import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -51,6 +51,7 @@ export function matchReadyCandidate({
   tipInMain = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  if (!appliedShape(ready.adopt?.applied)) return { adopt: null, reason: 'invalid-ready-applied' };
   // The live plan could not persist its audit pin. No ready/fallback path may replace that history with a build
   // lacking the pin (even a same-tree candidate or a record claiming pinnedFrom for a different sha).
   if (plan.reason === 'pinned-overlay-hold-marker-failed') return { adopt: null, reason: plan.reason };
@@ -86,7 +87,7 @@ export function matchReadyCandidate({
     // Literal reasons (no template): the reason-classification test reads them statically.
     if (watch !== 'ok') return { adopt: null, reason: watch === 'unreadable' ? 'forced-watch-unreadable' : watch === 'owed' ? 'forced-watch-owed' : 'forced-watch-missing' };
   }
-  const applied = ready.adopt.applied || [];
+  const applied = ready.adopt.applied;
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
     if (!applied.every((a) => stillWanted(a.ref))) return { adopt: null, reason: 'overlay-no-longer-wanted' };

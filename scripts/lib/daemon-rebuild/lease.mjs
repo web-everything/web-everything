@@ -163,7 +163,7 @@ export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly 
   const lease = {
     token, pid: process.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(),
     target: plan.finalSha, inputsKey: plan.inputsKey, path: candidateWorktreePath(root, env, token),
-    ...(adoptOnly ? { adoptOnly: true } : {}),
+    adoptOnly,
   };
   state.building = lease;
   ACTIVE_BUILD_TOKENS.add(token);

@@ -142,24 +142,24 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
   };
 }
 
-function readConsumed(dir, strict = false) {
+function readConsumed(dir) {
   try {
     const ids = JSON.parse(readFileSync(join(dir, CONSUMED_FILE), 'utf8'));
     if (!Array.isArray(ids) || !ids.every(id => typeof id === 'string' && id)) throw new Error('Invalid consumed jobs');
     return new Set(ids);
-  } catch (error) { if (strict && error?.code !== 'ENOENT') throw error; return new Set(); }
+  } catch (error) { if (error?.code !== 'ENOENT') throw error; return new Set(); }
 }
 function writeConsumed(dir, set) {
   try { writeFileSync(join(dir, CONSUMED_FILE), `${JSON.stringify([...set])}\n`); } catch { /* best-effort */ }
 }
-function readResult(dir, id, strict = false) {
+function readResult(dir, id) {
   try {
     const result = JSON.parse(readFileSync(join(dir, `${id}${RESULT_SUFFIX}`), 'utf8'));
     if (!result || typeof result !== 'object' || Array.isArray(result)
       || typeof result.reason !== 'string'
       || ('readyRecorded' in result && typeof result.readyRecorded !== 'boolean')) throw new Error('Invalid rebuild result');
     return result;
-  } catch (error) { if (strict && error?.code !== 'ENOENT') throw error; return null; }
+  } catch (error) { if (error?.code !== 'ENOENT') throw error; return null; }
 }
 function removeJobFiles(dir, id) {
   try { deleteRun(id, dir); } catch { /* gone */ }
@@ -200,13 +200,18 @@ export async function rebuildCloneAsJob({
     return { moved: false, reason: 'state-unreadable' };
   };
   let initialReady;
+  let initialState;
+  let consumed;
+  const results = new Map();
+  let initialFinished;
   try {
-    readState(root, env);
+    initialState = readState(root, env);
     initialReady = readReady(root, env);
     readPending(root, { env });
-    readConsumed(store.dir, true);
-    for (const r of store.list().records.filter(r => r.job.kind === REBUILD_JOB_KIND.kind
-      && TERMINAL_JOB_STATUSES.includes(r.job.status))) readResult(store.dir, r.id, true);
+    consumed = readConsumed(store.dir);
+    initialFinished = store.list().records.filter(r => r.job.kind === REBUILD_JOB_KIND.kind
+      && TERMINAL_JOB_STATUSES.includes(r.job.status));
+    for (const r of initialFinished) results.set(r.id, readResult(store.dir, r.id));
   } catch { return unreadable(); }
   mkdirSync(store.dir, { recursive: true });
   if (store.list().corrupt?.length) return { moved: false, reason: 'rebuild-job-running', unknownJobState: true };
@@ -216,12 +221,11 @@ export async function rebuildCloneAsJob({
   const tickClock = clock ?? clockFor(store.dir);
 
   // 1. Consume finished jobs once (oldest first) and say what each did — the job's outcome reaches the daemon log.
-  const consumed = readConsumed(store.dir);
   const finishedJobs = [];
-  for (const r of mine().filter((x) => TERMINAL_JOB_STATUSES.includes(x.job.status) && !consumed.has(x.id))
+  for (const r of initialFinished.filter((x) => !consumed.has(x.id))
     .sort((a, b) => Date.parse(a.job.finishedAt || 0) - Date.parse(b.job.finishedAt || 0))) {
     consumed.add(r.id);
-    const res = readResult(store.dir, r.id);
+    const res = results.get(r.id);
     const outcome = r.job.status === 'failed'
       ? { id: r.id, status: 'failed', reason: r.job.error ?? 'unknown' }
       : { id: r.id, status: r.job.status, reason: res?.reason ?? 'no-result', readyRecorded: !!res?.readyRecorded, target: res?.target ?? null };
@@ -243,7 +247,7 @@ export async function rebuildCloneAsJob({
     const after = store.list().records;
     const referenced = after.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []);
     try { evict({ jobsDir: store.dir, referenced }); } catch (e) { say(`snapshot eviction failed: ${e.message}`); }
-    const cons = readConsumed(store.dir);
+    const cons = consumed;
     for (const r of after) {
       if (r.job.kind !== kind || !TERMINAL_JOB_STATUSES.includes(r.job.status) || !cons.has(r.id)) continue;
       if (now() - Date.parse(r.job.finishedAt || 0) < FINISHED_REBUILD_JOB_KEEP_MS) continue;
@@ -274,7 +278,7 @@ export async function rebuildCloneAsJob({
     inFlight = null; // finished during the pass — fall through, the next tick consumes it
   }
   // Between ticks, use the same admission checks without adopting or repairing the live tree.
-  r ??= await adopt(launchOnly ? { readyOnly: true } : undefined);
+  r ??= await adopt(launchOnly ? { readyOnly: true, admissionEvidence: { state: initialState, ready: initialReady } } : undefined);
   // Preparation refused: do not evict snapshots or rewrite consumed-job evidence.
   if (launchOnly && !r?.moved && !r?.adopted && r?.reason !== 'needs-build') return { ...r, finishedJobs };
   let recover = false;
@@ -292,7 +296,7 @@ export async function rebuildCloneAsJob({
 
   // Reattach can finish a job and publish a candidate during this call. Keep it for adoption.
   let ready;
-  try { readState(root, env); ready = readReady(root, env); }
+  try { if (!launchOnly) readState(root, env); ready = readReady(root, env); }
   catch { return { ...unreadable(), finishedJobs }; }
   if ((r?.reason !== 'needs-build' && !recover) || ready) {
     housekeeping();
@@ -305,8 +309,8 @@ export async function rebuildCloneAsJob({
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
   let lastRes;
   try {
-    readConsumed(store.dir, true);
-    lastRes = last ? readResult(store.dir, last.id, true) : null;
+    readConsumed(store.dir);
+    lastRes = last ? readResult(store.dir, last.id) : null;
   } catch { return { ...unreadable(), finishedJobs }; }
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);

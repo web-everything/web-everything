@@ -180,7 +180,7 @@ describe('the job records a passed build; the tick adopts it without re-smoking'
     const store = createJobStore(mktemp('versioned-jobs-'));
     enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root: cloneDir } });
     writeReadyCandidate(cloneDir, { kind: 'candidate', prevHead: 'x', tree: 't', passedAt: new Date().toISOString(),
-      adopt: { finalSha: 'ready', applied: [] } }, env);
+      adopt: { finalSha: 'ready', inputsKey: 'inputs', mainSha: 'main', applied: [] } }, env);
     const smoke = vi.fn(async () => PASS);
     const reattach = vi.fn(async () => ({}));
     const adopt = () => rebuildClone({ root: cloneDir, env, runSmoke: smoke, prState: async () => null, versions: { sentinel: true },

@@ -5157,15 +5157,46 @@ history defers to tick-start. The declared self-sync rebuild path must resolve t
 rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests__/rebuild-job.test.mjs`
 checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
 Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is empty state.
-The job fixture injects EACCES/EIO and corrupt JSON, asserting refusal without a queued job;
-the legacy fail-open reader remains unchanged for other consumers. Strict admission must precede
-preparation/adoption and reattachment: real preparation can overwrite corrupt state through that legacy
-reader. Assert the original state bytes survive refusal. Repair unreadable state before retrying.
+The declared schema requires every top-level slot, with explicit null for an unused slot.
+For present records the admission inventory is: adopted head/inputsKey/mainSha/applied/at;
+inProgress pid/host/startedAt/prevHead/target/inputsKey/mainSha/applied/verified; quarantine
+prevHead/reason; unverified head/prevHead; building token/pid/host/startedAt/target/inputsKey/path/adoptOnly;
+held reason/since/updatedAt/retryAt/attempts; rejected inputsKey/reason/at/retryAt/attempts and
+harnessBroken/externalOnly/envLoad/dispatchSmoke booleans. retryAt may be null for a sticky
+rejection or a non-timeout hold; timeout holds and transient rejection flags require a date.
+busySkippedTrees/forceUnverifiedTrees contain strings; smokePassed entries require key/tree/passedAt;
+pinnedNotified is a string-valued map. Applied entries require ref/sha, and any pinnedFrom must
+be a nonempty string because it changes audit exemptions.
+Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
+Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
+Optional diagnostic ready metadata remains typed when present.
+
+The job fixture injects EACCES/EIO and corrupt JSON, and a recursive table deletes and mistypes
+every required field, asserting refusal, untouched bytes and no job. Historical incomplete files
+are deliberately refused until operator repair; the legacy reader retains its compatibility behavior
+for ordinary tick consumers. Producers write explicit policy defaults rather than admission
+inventing them. The strict reader returns the exact parsed snapshot; launch-only preparation receives
+that object through `admissionEvidence`, including the ready snapshot. Missing handoff refuses.
+The early/recovery sticky/backoff/clean tests drive real preparation, assert object identity, and
+make every second strict or legacy rebuild-state read throw. Between-tick admission never takes
+a transient build lease, avoiding a second read-modify-write during lease release. An up-to-date
+ready-only probe also leaves ready cleanup to the next tick: the fixture plants corrupt ready evidence
+during planning and asserts that the indirect cleanup reader neither rereads nor deletes it.
+
+The launch-path fallback audit covers state, prepare, rebuild, rebuild-job, recovery and
+overlay-adoption. Rebuild-state coercions are confined to the legacy reader; strict validation
+covers prepare's recovery/array/map/backoff defaults. Ready adoption and its lazy overlay-event-log
+reader cannot run in launch-only admission: a ready snapshot defers immediately. Consumed-job and
+finished-result bookkeeping use the strict precheck snapshots (including the finished-job roster);
+later result/ready probes remain strict. Between-tick launches return before the wrapper's
+best-effort pending-adoption notifications and force-watch. Remaining settings defaults choose
+bounded standard policy; Git/process proof defaults retain holds or deny mutation; diagnostic
+and best-effort logging defaults do not authorize launch or erase persisted evidence.
 Job admission also strictly reads pending adoptions before job bookkeeping. Any `state-unreadable`
 refusal logs the repair requirement and skips pending-adoption notifications/rewrites, including at
 tick-start; the mixed overdue/malformed-record fixture asserts that the wrapper preserves file bytes.
-Only explicit `launchOnly: true`, `asJob: true` early/recovery launches outside adopt-only skip failure
-events and force-watch on refusal. Inline, adopt-only, tick-start and unknown launch sources retain
+Only explicit `launchOnly: true`, `asJob: true` early/recovery launches outside adopt-only skip
+best-effort wrapper notifications and force-watch, including after successful queueing. Inline, adopt-only, tick-start and unknown launch sources retain
 force-watch health checks and rollback even when carrying `launchOnly: true`.
 Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
 regression cannot turn the protected behaviour into an expected failure.

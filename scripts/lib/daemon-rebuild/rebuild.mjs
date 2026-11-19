@@ -124,9 +124,7 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
   if (result.reason === 'state-unreadable') {
     (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
   }
-  if (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted
-    && (result.unknownJobState
-      || !['needs-build', 'up-to-date', 'rebuild-job-started', 'rebuild-job-running'].includes(result.reason))) return result;
+  if (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted) return result;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -211,9 +209,10 @@ async function rebuildCloneInternal({
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
   asJob, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
-  spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
+  spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
   stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
+  if (readyOnly && adoptOnly && !admissionEvidence) return { moved: false, reason: 'state-unreadable' };
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
@@ -246,7 +245,7 @@ async function rebuildCloneInternal({
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
   const skipDecider = readyOnly ? null : (skipCheck === undefined ? makeSkipCheck({ root, entries, env }) : skipCheck);
-  if (readyOnly && readReadyCandidate(root, stEnv)) {
+  if (readyOnly && (admissionEvidence ? admissionEvidence.ready : readReadyCandidate(root, stEnv))) {
     return { moved: false, reason: 'ready-pending', alerts: [] };
   }
   const lockRootFromEnv = env && env.WE_DAEMON_CLONE_LOCK_ROOT;
@@ -287,7 +286,7 @@ async function rebuildCloneInternal({
   // ── Phase 1 (locked, fast) ───────────────────────────────────────────────────────────────────────────────
   // A passed candidate waiting on THIS head (an unlocked peek — prepareRebuild re-checks it under the lock) is
   // adopted by this phase, so it earns the finalize wait: this is the tick boundary the sibling yields at.
-  const pendingReady = readReadyCandidate(root, stEnv);
+  const pendingReady = admissionEvidence ? admissionEvidence.ready : readReadyCandidate(root, stEnv);
   const readyOnHead = !!pendingReady
     && pendingReady.prevHead === verifyRev(makeGit({ run, cwd: root, env }), 'HEAD');
   const startedMs = now();
@@ -295,7 +294,7 @@ async function rebuildCloneInternal({
   const prep = await withWriteLock(root, () => {
     prepareEnteredMs = now();
     return prepareRebuild({
-      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
+      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly, admissionEvidence,
     });
   }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
   const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);
