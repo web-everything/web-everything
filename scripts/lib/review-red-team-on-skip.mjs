@@ -518,6 +518,12 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (result && !result.carriedFrom) {
         try { finishedHold = readFinishedHold({ repo, pr, head }) === true; } catch { /* unreadable is not authority to clear */ }
       }
+      // A finished round whose check was never posted is the existing publish-result path's: it posts the check from
+      // live evidence, and the next tick (check now ok) clears the hold here.
+      if (finishedHold && readCheckFact) {
+        try { if (readCheckFact({ repo, pr, headSha: head })?.reason === 'no red-team check run on head') finishedHold = false; }
+        catch { finishedHold = false; }
+      }
       if (finishedHold) {
         const escalation = pendingEscalation();
         if (escalation) return { ...skip('red-team result already on head'), ...escalation };
