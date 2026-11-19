@@ -218,8 +218,9 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
       if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
       // The verdict payload must be well formed: the pipeline always writes pendingReferrals (an array) on a
       // needs-human verdict, so a missing or non-array list means the record is unreadable, never evidence.
-      const payload = run.verdict ?? run.findings?.referralVerdict;
-      if (payload && typeof payload === 'object') {
+      // Every payload the projection may read is validated, so a valid one can never mask a malformed one.
+      for (const payload of [run.verdict, run.findings?.referralVerdict, run.resumeOf?.verdict, run.findings?.record?.verdict]) {
+        if (!payload || typeof payload !== 'object') continue;
         for (const key of ['pendingReferrals', 'blockedReferrals']) {
           if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new Error(`verdict ${key} is not a list`);
         }
