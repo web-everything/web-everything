@@ -105,14 +105,16 @@ describe('review external juror setting cascade', () => {
   });
   it.each([true, false])('default probation mode preserves old seating when probation=%s', active => {
     const opts = { platform: {}, readFile: () => '{}', log: () => {}, isOnProbation: () => active };
-    expect(antigravityReviewFromEnv({}, opts)).toBe(active);
-    expect(antigravityReviewFromEnv({}, { ...opts, readFile: () => '{"advisorySeats":{"antigravityReview":"probation"}}' })).toBe(active);
+    const promoted = { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' }; // Carbon seats need R1062 promotion.
+    expect(antigravityReviewFromEnv(promoted, opts)).toBe(active);
+    expect(antigravityReviewFromEnv(promoted, { ...opts, readFile: () => '{"advisorySeats":{"antigravityReview":"probation"}}' })).toBe(active);
   });
   it.each(['on', 'off'])('forced %s bypasses probation and literal env overrides win', mode => {
     const opts = { platform: {}, readFile: () => JSON.stringify({ advisorySeats: { antigravityReview: mode } }),
       log: () => {}, isOnProbation: () => { throw Error('must not consult probation'); } };
-    expect(antigravityReviewFromEnv({}, opts)).toBe(mode === 'on');
-    for (const value of ['1', '0', '', 'true']) expect(antigravityReviewFromEnv({ REVIEW_PR_ANTIGRAVITY_REVIEW: value }, opts)).toBe(value === '1');
+    const promoted = { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' };
+    expect(antigravityReviewFromEnv(promoted, opts)).toBe(mode === 'on');
+    for (const value of ['1', '0', '', 'true']) expect(antigravityReviewFromEnv({ ...promoted, REVIEW_PR_ANTIGRAVITY_REVIEW: value }, opts)).toBe(value === '1');
   });
   it('invalid seat mode falls back to probation and logs tool provenance for valid probation', () => {
     expect(settings({ readFile: () => '{"advisorySeats":{"antigravityReview":"unknown"}}' }))
