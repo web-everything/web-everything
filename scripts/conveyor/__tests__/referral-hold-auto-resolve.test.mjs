@@ -261,6 +261,13 @@ describe('complete long threads with ruled referral-kind holds', () => {
     }
   });
 
+  it('an explicit commentsComplete:false keeps the hold even for a short thread', () => {
+    const comments = thread('not-real').slice(0, 1);
+    expect(comments.length).toBeLessThan(GH_LIST_COMMENT_CAP);
+    expect(decide({ ...asPr(fx, comments), commentsComplete: false }, hold))
+      .toMatchObject({ outcome: 'stay', why: expect.stringMatching(/may be truncated/) });
+  });
+
   it('a capped array read (or a reader reporting incomplete) stays incomplete, so the hold stays', () => {
     const snapshot = thread('not-real').slice(0, GH_LIST_COMMENT_CAP);
     for (const read of [() => snapshot, () => ({ comments: snapshot, complete: false }), () => ({ comments: snapshot })]) {
