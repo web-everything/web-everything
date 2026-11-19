@@ -95,6 +95,8 @@ import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { hostCapacityOperation, HOST_CAPACITY_OP, finishHostCapacity } from './host-capacity.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { resourcePoolOperation, RESOURCE_POOL_OP, finishResourcePool } from './resource-pool.mjs';
+import { collectResourcePool } from '../lib/resource-pool-io.mjs';
 import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
 import { readSnapshot, loadResourcePolicy, resourcePaths, appendResourceLog } from '../lib/resource-admission.mjs';
 import { workerCapacityOperation, finishWorkerCapacity, WORKER_CAPACITY_OP } from './worker-capacity.mjs';
@@ -522,6 +524,12 @@ export const OPERATIONS = Object.freeze({
   [HEAVY_QUEUE_OP]: () => ({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
+  }),
+  // R1094 S1 — inventory reads and best-effort shadow logging are bound here.
+  [RESOURCE_POOL_OP]: () => ({
+    declaration: resourcePoolOperation({ collect: collectResourcePool }),
+    sinks: {},
+    finish: finishResourcePool,
   }),
   // Card xkuflno — read-only resource snapshot and shadow admission verdicts; IO bound here.
   [RESOURCE_STATUS_OP]: () => ({

@@ -1,0 +1,13 @@
+{
+  "$comment": "R1094 S1 observations only. Enforce is accepted but behaves as shadow. Reserves and maxima are units; class 4 gets the remainder with a protected 4u floor.",
+  "resourcePool": {
+    "mode": "shadow",
+    "builderFloor": 4,
+    "classes": {
+      "1": { "reserve": 2, "max": 4, "class1Overdraw": 2 },
+      "2": { "reserve": 6, "max": 8 },
+      "3": { "reserve": 2, "max": 6 },
+      "4": { "reserve": 4, "max": 64 }
+    }
+  }
+}

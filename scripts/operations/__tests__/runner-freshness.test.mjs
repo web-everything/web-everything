@@ -121,6 +121,7 @@ describe('runner freshness policy', () => {
         "refresh",
         "reopen-items",
         "resolve",
+        "resource-pool",
         "resource-status",
         "restart-runner",
         "retry-prepare",

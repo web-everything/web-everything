@@ -5136,3 +5136,27 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+
+## Resource pool shadow inventory (R1094 S1)
+
+The pool adapter validates source directories and records before calling tolerant legacy readers.
+An empty directory is zero holders; a missing directory or malformed record is unknown. Never
+replace this with a bare legacy list call: several readers swallow these errors as `[]`. Review
+job listing must remain read-only (the default listing can prune dead records). Overlapping
+claim/job/run/verification observations are counted conservatively rather than deduplicated by
+guessed identity. The injected clock keeps snapshot freshness checks pure.
+
+Resource-pool live readers use `liveReviewRoundBudget` for host process liveness, rather
+than enumerating the shared run archive. Review jobs use `reviewJobsDir` with the
+registered review daemon clone (or its explicit environment override), not the observer's
+lane. Old sampler snapshots may omit `swapGrowthMb`; freshness follows resource-status,
+including its boundary and policy grace. Dotted filename-key taint is waived only after
+reading the offending layer and proving it cannot own the resourcePool namespace;
+read/parse errors and namespace collisions remain unknown. Lease classes derive from
+explicit purpose, then session/item kind, with C4 as the unclassified default.
+
+Red-team pool completeness compares only status files within the canonical
+`MAX_AGE_MS` mtime window. Apply that exclusion before JSON/size validation so
+aged-out attempt metadata cannot poison the live inventory; corrupt or oversized
+recent evidence remains unknown. Pin the inclusive age boundary in fixtures.
