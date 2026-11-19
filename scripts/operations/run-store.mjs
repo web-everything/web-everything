@@ -196,9 +196,11 @@ export function writeRun(record, dir = resolveRunsDir()) {
 }
 
 const reportedInvalidEntries = new Set();
+const reportingInvalidEntries = new Set();
 
-/** Run-record filenames only. Sidecars are silent; unexpected JSON names emit one best-effort event per path. */
-export function runFileEntries(dir = resolveRunsDir()) {
+/** Run-record filenames; includeInvalid also exposes stray JSON for fail-safe evidence readers.
+ * Tombstones are silent; unexpected JSON names emit one successfully delivered event per path. */
+export function runFileEntries(dir = resolveRunsDir(), { includeInvalid = false } = {}) {
   let names;
   try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   return names.filter(name => {
@@ -207,13 +209,16 @@ export function runFileEntries(dir = resolveRunsDir()) {
     if (isValidRunId(id)) return true;
     if (id.endsWith('.abandoned') && isValidRunId(id.slice(0, -10))) return false;
     const path = resolve(dir, name);
-    if (!reportedInvalidEntries.has(path)) {
-      reportedInvalidEntries.add(path);
+    if (!reportedInvalidEntries.has(path) && !reportingInvalidEntries.has(path)) {
+      reportingInvalidEntries.add(path);
       try {
-        void appendDaemonEvent({ kind: 'run-store-invalid-entry', detail: { path } }).catch(() => {});
-      } catch { /* reporting must never interrupt enumeration */ }
+        void Promise.resolve(appendDaemonEvent({ kind: 'run-store-invalid-entry', detail: { path } }))
+          .then(delivered => { if (delivered !== false) reportedInvalidEntries.add(path); })
+          .catch(() => {})
+          .finally(() => reportingInvalidEntries.delete(path));
+      } catch { reportingInvalidEntries.delete(path); /* retry on the next enumeration */ }
     }
-    return false;
+    return includeInvalid;
   });
 }
 

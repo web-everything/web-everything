@@ -286,16 +286,25 @@ describe('a corrupt record is REFUSED, never read as absent', () => {
     } finally { alert.mockRestore(); }
   });
 
-  it('keeps enumeration available when event publication throws or rejects', async () => {
+  it('retries throws, rejections and failed deliveries, suppressing concurrent and delivered alerts', async () => {
     const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockImplementationOnce(() => { throw new Error('unavailable'); })
-      .mockRejectedValue(new Error('unavailable'));
+      .mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce(false).mockResolvedValue(true);
     try {
       writeFileSync(join(dir, 'x y.json'), '{}');
       expect(listRunIds(dir)).toEqual([]);
-      writeFileSync(join(dir, 'other stray.json'), '{}');
       expect(listRunIds(dir)).toEqual([]);
-      await Promise.resolve();
+      expect(listRunIds(dir)).toEqual([]);
       expect(alert).toHaveBeenCalledTimes(2);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(3);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(listRunIds(dir)).toEqual([]);
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(4);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(listRunIds(dir)).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(4);
     } finally { alert.mockRestore(); }
   });
 

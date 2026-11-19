@@ -27,6 +27,7 @@ describe('behavioral fix detection', () => {
 
   it('refuses a reader that throws on invalid ids, regardless of source markers', () => {
     const root = mkdtempSync(join(tmpdir(), 'run-store-prefixed-'));
+    const projection = `export { reviewRunEvidence } from ${JSON.stringify(new URL('../../review-referral-hold.mjs', import.meta.url).href)};\n`;
     try {
       mkdirSync(join(root, 'scripts/conveyor'), { recursive: true });
       writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), `
@@ -34,11 +35,23 @@ describe('behavioral fix detection', () => {
         export function readReviewRunEvidence() { throw new Error('invalid run id'); }
       `);
       expect(b.fixPresent(root)).toBe(false);
-      writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), 'export function readReviewRunEvidence() { return []; }');
+      writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), projection + 'export function readReviewRunEvidence() { return []; }');
       expect(b.fixPresent(root)).toBe(false); // discarding all evidence is not a fix
       writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'),
-        "export function readReviewRunEvidence({ dir, readRun }) { readRun('review-pr-valid', dir); return []; }");
-      expect(b.fixPresent(root)).toBe(true);
+        projection + "export function readReviewRunEvidence({ dir, readRun }) { readRun('review-pr-valid', dir); return []; }");
+      expect(b.fixPresent(root)).toBe(false);
+      writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'),
+        projection + 'let calls = 0; export function readReviewRunEvidence() { calls++; return []; }');
+      expect(b.fixPresent(root)).toBe(false);
+      writeFileSync(join(root, 'scripts/conveyor/review-referral-hold.mjs'), projection + `
+        import { reviewRunEvidence } from ${JSON.stringify(new URL('../../review-referral-hold.mjs', import.meta.url).href)};
+        import { readFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        export function readReviewRunEvidence({ dir }) {
+          return [reviewRunEvidence(JSON.parse(readFileSync(join(dir, 'review-pr-valid.json'), 'utf8')))];
+        }
+      `);
+      expect(b.fixPresent(root)).toBe(false); // retaining only the well-named record still loses a hold
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
