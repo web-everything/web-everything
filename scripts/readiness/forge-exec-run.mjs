@@ -1568,6 +1568,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const unmeasured=new Set();
       const command=async(...args)=>{
         const value=await executeCommand(...args);
+        // Only the final test command may carry a kept verdict. An install with an unconfirmed uid sweep must not
+        // reach the reusable dependency cache: fail it (the slot is already fenced).
+        if(value.uidUnconfirmed===true&&phase!=='test')throw new Error('uid cleanup unconfirmed during install; slot fenced');
         resources.slotCpus=value.slotCpus??resources.slotCpus;
         const note = taskPressureNote(value.usage?.processCount,value.tasksMax);
         if (note.tasksNear && (!tasks.tasksNear || note.processCount > tasks.processCount)) tasks = note;

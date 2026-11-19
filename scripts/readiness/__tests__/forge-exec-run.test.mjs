@@ -1995,6 +1995,16 @@ exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9)
     const second=await runner.prepare({nonce:'c'.repeat(32),label:'abcdef-2'});
     await expect(runner.run({...request,nonce:'c'.repeat(32),run:second.run})).rejects.toThrow(/busy|interrupted|unconfirmed/);
   });
+  it('fails an install whose uid sweep is unconfirmed instead of publishing a dependency cache',async()=>{
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>({code:0,stdout:'',stderr:'',uidUnconfirmed:true})});
+    await runner.run(request);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(receipt.code).toBe(97);
+    await stat(join(root,'receipts','worker-active'));
+    // Only the empty key/profile directories and the lock may exist; no published archive.
+    const entries=await readdir(join(root,'cache'),{recursive:true}).catch(()=>[]);
+    expect(entries.filter(entry=>entry.split('/').length>2&&!entry.endsWith('/.lock'))).toEqual([]);
+  });
   it('honours the configured wait: a stuck uid fails only after it elapses, and a bad value falls back to the default',()=>{
     const started=Date.now();
     const {result}=run('stuck',1500);
