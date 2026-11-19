@@ -5165,8 +5165,11 @@ held reason/since/updatedAt/retryAt/attempts; rejected inputsKey/reason/at/retry
 harnessBroken/externalOnly/envLoad/dispatchSmoke booleans. retryAt may be null for a sticky
 rejection or a non-timeout hold; timeout holds and transient rejection flags require a date.
 busySkippedTrees/forceUnverifiedTrees contain strings; smokePassed entries require key/tree/passedAt;
-pinnedNotified is a string-valued map. Applied entries require ref/sha, and any pinnedFrom must
-be a nonempty string because it changes audit exemptions.
+pinnedNotified is a string-valued map. Applied entries require ref/sha and a nonempty string for any pinnedFrom.
+Strict ready pins require sha and pinnedFrom to be distinct full 40-hex SHAs. Strict ready pins also prove the registered ref/PR,
+exact held remote tip, and latest rebuild-authored second-parent adopted SHA on
+the running head. Malformed or unproven pins refuse as `state-unreadable`;
+operator repair is required. Tick-start keeps the legacy pin exemption.
 Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
 Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
 Optional diagnostic ready metadata remains typed when present.
@@ -5177,11 +5180,11 @@ are deliberately refused until operator repair; the legacy reader retains its co
 for ordinary tick consumers. Producers write explicit policy defaults rather than admission
 inventing them. The pre-lock strict state read is an early refusal filter only. Launch-only
 preparation re-reads and validates state under the clone write lock, using that locked snapshot
-for every check and read-modify-write; an unreadable locked read refuses as `state-unreadable`.
+for every check; an unreadable locked read refuses as `state-unreadable`.
 The ready snapshot still passes through `admissionEvidence`; missing handoff refuses.
 The early/recovery race tests publish rejection, hold, lease or corrupt state between admission
 and lock acquisition, assert the second strict read holds the lock, and verify newer evidence
-survives refusal and interrupted-rebuild bookkeeping. Clean admission remains covered.
+survives refusal. Interrupted-rebuild bookkeeping defers to tick-start. Clean admission remains covered.
 Between-tick admission never takes
 a transient build lease, avoiding a second read-modify-write during lease release. An up-to-date
 ready-only probe also leaves ready cleanup to the next tick: the fixture plants corrupt ready evidence
@@ -5200,8 +5203,9 @@ Job admission also strictly reads pending adoptions before job bookkeeping. Any 
 refusal logs the repair requirement and skips pending-adoption notifications/rewrites, including at
 tick-start; the mixed overdue/malformed-record fixture asserts that the wrapper preserves file bytes.
 Only explicit `launchOnly: true`, `asJob: true` early/recovery launches outside adopt-only skip
-best-effort wrapper notifications and force-watch, including after successful queueing. Inline, adopt-only, tick-start and unknown launch sources retain
-force-watch health checks and rollback even when carrying `launchOnly: true`.
+best-effort wrapper notifications and force-watch, including after successful queueing. Tick-start and unknown launch sources retain force-watch health checks and rollback
+even when carrying `launchOnly: true`; strict early/recovery provenance defers them
+also for inline and adopt-only callers.
 Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
 regression cannot turn the protected behaviour into an expected failure.
 
@@ -5236,3 +5240,20 @@ asserting unchanged bytes. It also pins indirect legacy-reader inheritance and l
 corruption before publication/cleanup. The recovery suite pins both recovery launch origins
 and successful strict-child smoke/ready publication. Existing real CLI child probes retain
 legacy tick-start behavior and prove early/recovery entry refusal before Git IO.
+
+
+Strict early/recovery preparation defers these mutators to tick-start: index-lock
+unlink; interrupted/unverified recovery state writes and rollback; quarantine reset;
+`finishPendingSwaps` (registration removal, events, swap deletion, needs-you reports);
+`healWrongBranch`; `ensureSafeToMove` (claim/store recovery); `repairCloneRefs`;
+sidecar pruning; `detectOverlayStale`; `persistStackBases`; conflict-wake mark/clear;
+pin-notice, hold and up-to-date state writes; `kickAutoRebase`; registration removal
+and overlay events; ready cleanup, forced-watch transitions and ready/skip-unrelated
+finalization. Alert-file appends, wrapper pending-adoption rewrites/notifications,
+force-watch checks/rollback, and starvation writes also defer. Fetch and deterministic
+plan object creation remain part of rebuilding; admission never claims a lease, while
+the detached child may claim its actual build lease before smoke, without deleting
+an abandoned lease's candidate worktree. The actionable-swap
+fixture asserts registry, event and swap bytes survive launch plus child prepare,
+with only the child's build lease changing in rebuild state, and proves the same
+swap removes the original registration when ordinary cleanup is called.

@@ -8,6 +8,8 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, unlinkS
 import { overlayFilePath, cloneKey } from '../daemon-overlays.mjs';
 import { daemonStateDir } from '../daemon-last-good.mjs';
 import { join, dirname } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { FULL_SHA_RE, REBUILD_IDENTITY_ENV, verifyRev } from './shared.mjs';
 
 /**
  * Is `root` a daemon-managed clone — one the rebuild moves with `reset --hard`? True once it has a rebuild
@@ -78,6 +80,8 @@ const strings = v => Array.isArray(v) && v.every(string);
 export const appliedShape = v => Array.isArray(v) && v.every(r => object(r) && string(r.ref) && string(r.sha)
   && (!Object.hasOwn(r, 'pinnedFrom') || string(r.pinnedFrom)));
 const applied = appliedShape;
+const pinnedApplied = v => appliedShape(v) && v.every(r => !Object.hasOwn(r, 'pinnedFrom')
+  || (FULL_SHA_RE.test(r.pinnedFrom) && FULL_SHA_RE.test(r.sha) && r.sha !== r.pinnedFrom));
 const fields = (v, required, optional = {}) => object(v)
   && Object.entries(required).every(([k, valid]) => valid(v[k]))
   && Object.entries(optional).every(([k, valid]) => !(k in v) || valid(v[k]));
@@ -186,13 +190,13 @@ export function readReadyCandidate(root, env = process.env) {
 }
 
 /** Admission must distinguish absent ready evidence from unreadable or incomplete evidence. */
-export function readReadyCandidateStrict(root, env = process.env, read = readFileSync) {
+export function readReadyCandidateStrict(root, env = process.env, read = readFileSync, { strictPins = true, run = (args, opts) => spawnSync('git', args, opts) } = {}) {
   let text;
   try { text = read(readyCandidatePath(root, env), 'utf8'); }
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   const r = JSON.parse(text);
   if (!fields(r, { prevHead: string, tree: string, passedAt: date, kind: v => ['candidate', 'fallback'].includes(v),
-    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied }) }, {
+    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: strictPins ? pinnedApplied : appliedShape }) }, {
     at: date, token: string, pid: positive, host: string, forInputsKey: string,
     dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
       { ref: string, sha: string, pr: v => v === null || positive(v) })),
@@ -203,6 +207,30 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
     failed: v => typeof v === 'string',
   }))) {
     throw new Error('Invalid ready candidate');
+  }
+  // pinnedFrom bypasses audit revocation. Prove the same registration and adopted
+  // second parent used by planRebuild, plus the exact branch tip being held back.
+  const pins = r.adopt.applied.filter(a => Object.hasOwn(a, 'pinnedFrom'));
+  if (strictPins && pins.length) {
+    if (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha)) throw new Error('Invalid ready pin history bounds');
+    const registry = JSON.parse(read(overlayFilePath(root, env), 'utf8'));
+    const git = args => run(args, { cwd: root, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' },
+      encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, killSignal: 'SIGKILL' });
+    if (verifyRev(git, 'HEAD') !== r.prevHead) throw new Error('Unproven ready pin head');
+    const history = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', r.prevHead, '--not', r.adopt.mainSha]);
+    if (history.status !== 0) throw new Error('Unreadable ready pin history');
+    for (const pin of pins) {
+      const registration = registry.overlays?.find(o => o.ref === pin.ref);
+      if (!registration || (registration.pr ?? null) !== (pin.pr ?? null)
+        || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new Error('Unproven ready pin registration');
+      const recorded = String(history.stdout).split('\n').find(line => {
+        const [parents, committer, subject] = line.split('\t');
+        const hit = subject?.match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
+        return hit && hit[1] === pin.ref && (hit[2] ? Number(hit[2]) : null) === (registration.pr ?? null)
+          && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL && [2, 3].includes(parents.split(' ').length);
+      });
+      if (!recorded || recorded.split('\t')[0].split(' ')[1] !== pin.sha) throw new Error('Unproven ready pin adopted head');
+    }
   }
   return r;
 }

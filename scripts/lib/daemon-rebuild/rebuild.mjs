@@ -3,7 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 import { createRebuildReaders, RebuildEvidenceError } from './evidence-readers.mjs';
-import { withRebuildReaders } from './evidence-context.mjs';
+import { rebuildReaders, withRebuildReaders } from './evidence-context.mjs';
 
 
 import { resolveRecovery } from './recovery.mjs';
@@ -114,9 +114,7 @@ function isBetweenTickLaunch(options) {
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const strict = options.launchedBy === 'early' || options.launchedBy === 'recovery';
   if (!strict) return rebuildCloneWithReaders(emitEvent, options, false);
-  // Health checks and owed rollbacks precede strict evidence refusal, outside its
-  // reader scope so unrelated corrupt evidence cannot suppress watch maintenance.
-  await forceWatch(options, emitEvent, Date.now());
+  // Tick-start owns force-watch health checks and rollback; strict preparation is read-only.
   const readers = createRebuildReaders({ strict, read: options.evidenceRead });
   return withRebuildReaders(readers, async () => {
     try {
@@ -146,7 +144,7 @@ async function rebuildCloneWithReaders(emitEvent, options, strict) {
   if (result.reason === 'state-unreadable') {
     (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
   }
-  if ((strict && options.readyOnly) || (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted)) return result;
+  if (strict || (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted)) return result;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -325,10 +323,10 @@ async function rebuildCloneInternal({
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
-    if (starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
+    if (!rebuildReaders() && starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
       writeRebuildStarvation(root, 0, stEnv);
     }
-  } else if (prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
+  } else if (!rebuildReaders() && prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);

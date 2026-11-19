@@ -3,7 +3,7 @@ import { withRebuildReaders } from '../evidence-context.mjs';
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
@@ -22,6 +22,8 @@ import * as overlayAdoption from '../../overlay-adoption.mjs';
 import * as preparation from '../prepare.mjs';
 import * as stateIO from '../state.mjs';
 import * as cloneLocks from '../../daemon-clone-lock.mjs';
+import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays } from '../../daemon-overlays.mjs';
+import { finishPendingSwaps } from '../auto-rebase.mjs';
 import { matchReadyCandidate } from '../adopt.mjs';
 
 let root;
@@ -596,17 +598,18 @@ it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'hold', 'l
       settings: { minIntervalMs: 0, minIntervalJitterPct: 0 } }));
     const result = await rebuildClone({ root, env, run, asJob: true, launchOnly: true, launchedBy,
       versions: null, now: () => 1000, lockOpts: { waitMs: 0 }, log: { error() {} }, emitEvent: vi.fn() });
-    expect(result.reason).toBe(['sticky', 'interrupted'].includes(kind) ? 'still-rejected' : kind === 'backoff'
+    expect(result.reason).toBe(kind === 'interrupted' ? 'readonly-job-mutation-due' : kind === 'sticky' ? 'still-rejected' : kind === 'backoff'
       ? 'smoke-harness-broken-backoff' : kind === 'hold' ? 'smoke-env-timeout-backoff'
         : kind === 'lease' ? 'rebuild-in-progress' : kind === 'unreadable' ? 'state-unreadable'
-          : kind === 'up-to-date' ? 'state-unreadable' : 'rebuild-job-started');
+          : kind === 'up-to-date' ? 'up-to-date' : 'rebuild-job-started');
     expect(readLocks[0]).toBe(false);
     expect(readLocks).toContain(true);
     expect(legacyRead).not.toHaveBeenCalled();
     if (kind === 'unreadable') expect(run).not.toHaveBeenCalled();
     if (kind === 'interrupted') {
       const persisted = JSON.parse(readFileSync(file, 'utf8'));
-      expect(persisted.inProgress).toBeNull();
+      expect(persisted.inProgress).toEqual(JSON.parse(bytes).inProgress);
+      expect(readFileSync(file, 'utf8')).toBe(bytes);
       expect(persisted.rejected).toEqual(persistedRejection);
     } else if (kind === 'up-to-date') {
       expect(readFileSync(readyCandidatePath(root, env), 'utf8')).toBe('{new-unreadable-evidence');
@@ -684,3 +687,64 @@ it.each(['early', 'recovery'].flatMap(source => [false, true].map(readyOnly => [
     expect(run).not.toHaveBeenCalled();
     expect(readFileSync(file, 'utf8')).toBe('{broken');
   });
+
+
+it.each(['early', 'recovery'])('%s launch and child prepare preserve actionable swaps and all bookkeeping', async launchedBy => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
+    WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_AUTO_REBASE: '1' };
+  const head = 'a'.repeat(40), next = 'b'.repeat(40);
+  addOverlay(root, { ref: 'lane/old', pr: 1 }, { env });
+  addOverlay(root, { ref: 'lane/new', pr: 2 }, { env });
+  const oldOverlay = readOverlays(root, { env }).find(o => o.ref === 'lane/old');
+  appendOverlayEvent(root, { kind: 'registered', ref: 'lane/old' }, { env });
+  const registry = overlayFilePath(root, env);
+  const swaps = `${registry}.auto-rebase`;
+  mkdirSync(swaps, { recursive: true });
+  const swap = join(swaps, `${encodeURIComponent('lane/old')}.json`);
+  writeFileSync(swap, JSON.stringify({ old: 'lane/old', oldOverlay, new: 'lane/new', newSha: next }));
+  const abandoned = join(root, 'abandoned-candidate');
+  mkdirSync(abandoned);
+  const abandonedEvidence = join(abandoned, 'evidence');
+  writeFileSync(abandonedEvidence, 'keep this abandoned build for tick-start cleanup');
+  writeRebuildState(root, { building: { token: 'abandoned', pid: process.pid, host: hostname(), startedAt: stamp,
+    target: head, inputsKey: 'old', path: abandoned, adoptOnly: false },
+    adopted: { head, inputsKey: 'old', mainSha: head, applied: [], at: stamp },
+    pinnedNotified: { 'lane/old': 'old-notice' } }, env);
+  const files = [registry, swap, registry.replace(/\.json$/, '.events.jsonl'), rebuildStatePath(root, env)];
+  const before = files.map(f => readFileSync(f, 'utf8'));
+  vi.spyOn(planner, 'planRebuild').mockResolvedValue({ ok: true, upToDate: false, finalSha: next,
+    mainSha: head, inputsKey: 'new', applied: [], decisions: [], alerts: [
+      { kind: 'overlay-pinned', detail: { ref: 'lane/new', pr: 2, newTip: next, files: [] } },
+    ] });
+  vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
+  vi.spyOn(laneRepair, 'probeBrokenRefs').mockReturnValue({ probeFailed: false, broken: [] });
+  vi.spyOn(laneRepair, 'diagnoseLane').mockReturnValue({ ok: true, problems: [] });
+  const run = vi.fn(args => {
+    if (args[0] === 'symbolic-ref') return { status: 0, stdout: 'main' };
+    if (args[0] === 'rev-parse') return args.includes('MERGE_HEAD') ? { status: 1, stdout: '' }
+      : { status: 0, stdout: args.some(a => a.includes('lane/new')) ? next : head };
+    if (['cat-file', 'merge-base', 'fetch', 'commit-graph', 'ls-files', 'status', 'rev-list', 'log'].includes(args[0])) return { status: 0, stdout: '' };
+    throw new Error('unexpected git: ' + args.join(' '));
+  });
+  const store = createJobStore(join(root, 'jobs'));
+  const launch = await rebuildCloneAsJob({ root, env, store, launchedBy, launchOnly: true,
+    adopt: options => rebuildClone({ root, env, run, versions: null, launchedBy, asJob: false, adoptOnly: true,
+      ...options, log: { error() {} }, now: () => 1000 }),
+    codeSha: head, reattach: async () => ({}), evict() {}, now: () => 1000,
+    settings: { minIntervalMs: 0, minIntervalJitterPct: 0 }, log: { error() {} } });
+  expect(launch.reason).toBe('rebuild-job-started');
+  expect(files.map(f => readFileSync(f, 'utf8'))).toEqual(before);
+  const child = await preparation.prepareRebuild({ root, env, stEnv: env, run, launchedBy,
+    readyOnly: true, now: () => 1000, log: { error() {} }, prBaseChain: Object.assign(() => null, { fresh: new Map([[2, []]]) }) });
+  expect(child.terminal).toBe(false);
+  expect(files.slice(0, 3).map(f => readFileSync(f, 'utf8'))).toEqual(before.slice(0, 3));
+  const state = JSON.parse(readFileSync(files[3], 'utf8'));
+  expect(state.building).toMatchObject({ target: next });
+  state.building = JSON.parse(before[3]).building;
+  expect(state).toEqual(JSON.parse(before[3]));
+  expect(readFileSync(abandonedEvidence, 'utf8')).toBe('keep this abandoned build for tick-start cleanup');
+  // Positive control: this exact swap is actionable on the normal tick path.
+  await finishPendingSwaps({ root, env, run });
+  expect(readOverlays(root, { env }).map(o => o.ref)).toEqual(['lane/new']);
+  expect(nodeFs.existsSync(swap)).toBe(false);
+});

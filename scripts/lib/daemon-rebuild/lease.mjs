@@ -160,9 +160,9 @@ export function buildLeaseIsLive(building, { env = process.env, nowMs = Date.now
  * `plan`, tearing down an abandoned lease's leftover candidate first. Returns the lease, or `null` when a live
  * sibling build already holds it. Mutates `state.building`; the caller writes the state.
  */
-export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly = false, startTimeOf = processStartMs }) {
+export function claimBuildLease({ state, plan, root, run, env, nowMs, adoptOnly = false, startTimeOf = processStartMs, cleanupAbandoned = true }) {
   if (buildLeaseIsLive(state.building, { env, nowMs, startTimeOf })) return null;
-  if (state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
+  if (cleanupAbandoned && state.building?.path && leaseOwnerIsGone(state.building, startTimeOf)) removeCandidate({ root, path: state.building.path, run, env });
   const token = `${process.pid}-${randomBytes(4).toString('hex')}`;
   const lease = {
     token, pid: process.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(),

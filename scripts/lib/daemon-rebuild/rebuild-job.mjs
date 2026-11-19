@@ -190,7 +190,9 @@ export async function rebuildCloneAsJob({
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
   launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
-  readState = readRebuildStateStrict, readPending = readPendingAdoptionsStrict, readReady = readReadyCandidateStrict,
+  readState = readRebuildStateStrict, readPending = readPendingAdoptionsStrict,
+  readReady = (root, env) => readReadyCandidateStrict(root, env, readFileSync,
+    { strictPins: launchOnly || launchedBy === 'early' || launchedBy === 'recovery' }),
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
