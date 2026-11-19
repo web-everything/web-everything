@@ -72,7 +72,7 @@ const prefix = 'review-daemon: red-team queue ';
 // Sync IO doubles match node:fs semantics without touching the operator's queue.
 // No persisted envelope is assumed: restart assertions exercise the public reader.
 // maxAttempts is deliberately NOT defaulted here: omitting it exercises the production default (3).
-function fixture({ maxAttempts, logger, readLivePr = ({ pr }) => ({ state: 'OPEN', comments: [], headRefOid: head(pr) }) } = {}) {
+function fixture({ maxAttempts, logger, readLivePr = ({ pr }) => ({ state: 'OPEN', comments: [], headRefOid: head(pr) }), ...recoveryReaders } = {}) {
   const file = join('queue-fixture', 'queue.json');
   const files = new Map();
   const operations = [];
@@ -96,7 +96,7 @@ function fixture({ maxAttempts, logger, readLivePr = ({ pr }) => ({ state: 'OPEN
   const unlink = vi.fn(path => { files.delete(path); });
   const log = logger ?? ((...parts) => logs.push(parts.join(' ')));
   const open = () => createRedTeamDispatchQueue({
-    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts, readLivePr,
+    file, readFile, writeFile, rename, unlink, now: () => clock, log, maxAttempts, readLivePr, ...recoveryReaders,
   });
   return {
     file, files, operations, logs, log, readFile, writeFile, rename, unlink, open,
@@ -1560,6 +1560,10 @@ describe('live red-team queue reconciliation', () => {
 
 
 describe('decided red-team queue heads', () => {
+  const published = {
+    readStatus: () => null, readCarry: () => null, readCarriedCheck: () => false,
+    readCheckFact: () => ({ ok: true }),
+  };
   const result = (pr, rev, blocked = false, login = 'web-everything') => ({
     author: { login },
     body: `<!-- we:red-team-advisory pr=${pr} rev=${rev} -->
@@ -1568,8 +1572,9 @@ ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix 
   });
   it.each([false, true])('evicts a decided head (blocked=%s) and prevents stale planner re-enqueue across restart', blocked => {
     const readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr),
-      comments: pr === 1 ? [result(pr, head(pr), blocked)] : [] });
-    const f = fixture({ readLivePr });
+      labels: [], comments: pr === 1 ? [result(pr, head(pr), blocked)] : [] });
+    const f = fixture({ readLivePr, ...published,
+      readCheckFact: () => blocked ? { ok: false, reason: 'red-team check run failed (failure)' } : { ok: true } });
     f.queue.sync(repo, candidates([1, 2]));
     f.queue.reconcile();
     expect(numbers(f.open().entries())).toEqual([2]);
@@ -1580,6 +1585,42 @@ ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix 
     } });
     expect(numbers(f.open().entries())).toEqual([2]);
   });
+  it.each(['marker-only', 'malformed result', 'missing check', 'unpublished carry', 'unfinished carry',
+    'unreadable check', 'unreadable carry', 'unreadable status', 'unreadable outbox', 'pending settlement',
+    'missing check reader', 'policy-clear hold', 'card-only settlement'])('keeps %s available to recovery across restart', mode => {
+    const comment = result(1, head(1));
+    if (mode === 'marker-only') comment.body = `<!-- we:red-team-advisory pr=1 rev=${head(1)} -->`;
+    if (mode === 'malformed result') comment.body += '\n1. [**confirmed**] malformed finding';
+    if (mode === 'unpublished carry') comment.body =
+      `<!-- review-verdict-carried from=${head(2)} to=${head(1)} patch-id=${head(3)} -->\n${comment.body}`;
+    const unreadable = () => { throw Error('unreadable'); };
+    const readers = { ...published };
+    if (mode === 'missing check') readers.readCheckFact = () => ({ ok: false, reason: 'no red-team check run on head' });
+    if (mode === 'unreadable check') readers.readCheckFact = () => ({ ok: false, reason: 'check runs unreadable' });
+    if (mode === 'missing check reader') readers.readCheckFact = null;
+    if (mode === 'policy-clear hold') readers.readCheckFact = () => ({ ok: false,
+      reason: 'policy-clear success still under its own publication hold on head' });
+    if (mode === 'card-only settlement') readers.readStatus = () => ({
+      status: 'finished', head: head(1), skipCardOnly: true, result: { status: 'skipped', policy: 'card-only' },
+      loopPayload: { findings: { read: { diffText: 'card diff', netChangedFiles: ['backlog/1.md'], netBasis: { rev: head(1) } } } },
+    });
+    if (mode === 'unpublished carry') readers.readCarriedCheck = () => true;
+    if (mode === 'unfinished carry') readers.readCarry = () => ({ step: 'comment' });
+    if (mode === 'unreadable carry') readers.readCarry = unreadable;
+    if (mode === 'unreadable status') readers.readStatus = unreadable;
+    if (mode === 'unreadable outbox') readers.readCarriedCheck = unreadable;
+    const readLivePr = () => ({ state: 'OPEN', headRefOid: head(1),
+      labels: mode === 'pending settlement' ? ['red-team:pending'] : [], comments: [comment] });
+    const f = fixture({ ...readers, readLivePr });
+    f.queue.sync(repo, candidates([1]));
+    f.queue.reconcile();
+    expect(numbers(f.open().entries())).toEqual([1]);
+    runWithRedTeamQueue({ queue: f.open(), ...inputs([1]), run: options => {
+      expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1]);
+      return refused(1, 'no review capacity left');
+    } });
+    expect(numbers(f.open().entries())).toEqual([1]);
+  });
   it('re-keys a changed head with only an older verdict, preserving FIFO', () => {
     const f = fixture(); f.queue.sync(repo, candidates([1, 2]));
     f.queue.reconcile({ readLivePr: ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr + 10),
@@ -1587,8 +1628,8 @@ ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix 
     expect(f.open().entries().map(({ pr, head: rev }) => [pr, rev])).toEqual([[1, head(11)], [2, head(12)]]);
   });
   it('evicts when the new current head is decided even if the persisted entry names an older head', () => {
-    const f = fixture(); f.queue.sync(repo, candidates([1]));
-    f.queue.reconcile({ readLivePr: () => ({ state: 'OPEN', headRefOid: head(11), comments: [result(1, head(11))] }) });
+    const f = fixture(published); f.queue.sync(repo, candidates([1]));
+    f.queue.reconcile({ readLivePr: () => ({ state: 'OPEN', labels: [], headRefOid: head(11), comments: [result(1, head(11))] }) });
     expect(f.open().entries()).toEqual([]);
   });
   it.each([null, undefined])('keeps and logs unreadable verdict evidence (%s) through sync', comments => {
@@ -1608,7 +1649,7 @@ ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix 
     expect(numbers(f.queue.admit(repo, 1))).toEqual([1]);
   });
   it('does not dispatch a decided card-only head through the bypass', () => {
-    const f = fixture({ readLivePr: () => ({ state: 'OPEN', headRefOid: head(1), comments: [result(1, head(1))] }) });
+    const f = fixture({ ...published, readLivePr: () => ({ state: 'OPEN', labels: [], headRefOid: head(1), comments: [result(1, head(1))] }) });
     runWithRedTeamQueue({ queue: f.queue, ...inputs([1]), readNetFiles: () => ({ ok: true, files: ['backlog/1.md'] }),
       readSkipCardOnly: () => true, run: options => {
         expect(options.plan.refusals).toEqual([]);
@@ -1620,15 +1661,21 @@ ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix 
 
 
 it('rolls back decided-head eviction and its sync filter when the runner throws', () => {
-  const f = fixture(); f.queue.sync(repo, candidates([1]));
+  const readCheckFact = vi.fn(() => ({ ok: true }));
+  const f = fixture({ readStatus: () => null, readCarry: () => null,
+    readCarriedCheck: () => false, readCheckFact });
+  f.queue.sync(repo, candidates([1]));
   const before = f.open().entries();
   expect(() => runWithRedTeamQueue({ queue: f.queue, ...inputs([1]),
-    readLivePr: () => ({ state: 'OPEN', headRefOid: head(1), comments: [{
+    readLivePr: () => ({ state: 'OPEN', labels: [], headRefOid: head(1), comments: [{
       author: { login: 'web-everything' },
-      body: `<!-- we:red-team-advisory pr=1 rev=${head(1)} -->\nRed team not required (card-only).`,
+      body: `<!-- we:red-team-advisory pr=1 rev=${head(1)} -->
+Advisory only: recorded result · recorded verdict \`accept\`.
+The red team tried to break this change and reported nothing.`,
     }] }),
     run: () => { throw new Error('runner failed'); },
   })).toThrow('runner failed');
+  expect(readCheckFact).toHaveBeenCalledOnce();
   expect(f.open().entries()).toEqual(before);
   expect(f.queue.entries()).toEqual(before);
   f.queue.sync(repo, candidates([1]));

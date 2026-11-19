@@ -10,12 +10,39 @@ import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-import { readRedTeamProbes, redTeamForHead } from './red-team-gate.mjs';
+import { readRedTeamProbes, redTeamForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
+import { redTeamSkipNeedsSettlement } from './review-red-team-on-skip.mjs';
+import { readRedTeamStatus, readCarriedCheckUnpublished } from './drain-red-team-evidence.mjs';
+import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+
+// Match recovery's result-on-head obligations. A failed check is published evidence for a blocked
+// result, but missing/incomplete checks and policy-clear holds must still reach recovery.
+function settledResult({ repo, pr, head, comments, labels, env = process.env,
+  readStatus = key => readRedTeamStatus({ ...key, env }),
+  readCarry = key => readRedTeamCarry({ ...key, env }),
+  readCarriedCheck = key => readCarriedCheckUnpublished({ ...key, env }),
+  readCheckFact = isUnderTest() ? null : key => {
+    const app = resolveWeAppId({ env });
+    return app.ok ? readRedTeamRecoveryFact({ ...key, appId: app.appId,
+      gh: (args, options) => runGhSync(args, { ...options, env }) }) : app;
+  } }) {
+  if (!isPublishableRedTeamResult(redTeamForHead(comments, pr, head))) return false;
+  try {
+    const key = { repo, pr, head };
+    if (!Array.isArray(labels) || labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:pending')) return false;
+    const carry = readCarry(key);
+    if ((carry && carry.step !== 'done') || redTeamSkipNeedsSettlement(readStatus(key))
+      || readCarriedCheck(key) !== false || !readCheckFact) return false;
+    const fact = readCheckFact({ repo, pr, headSha: head });
+    return fact?.ok === true || (fact?.ok === false && fact.reason === 'red-team check run failed (failure)');
+  } catch { return false; } // Unreadable evidence keeps the recovery opportunity.
+}
 
 export function readLiveRedTeamPr({ repo, pr }) {
   if (isUnderTest()) return null; // Hermetic callers inject evidence; never spawn gh under tests.
-  const live = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
+  const live = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid,labels'],
     { encoding: 'utf8', timeout: 15000, maxBuffer: 65536, throttle: { maxAttempts: 1 } }));
   if (live.state === 'OPEN') {
     try { live.comments = readCompletePrComments(pr, { repo,
@@ -115,7 +142,8 @@ export function defaultQueueFile(env = process.env, home = homedir()) {
 
 /** Synchronous IO matches the daemon's tick; admission never dequeues a PR. */
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
-  writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr } = {}) {
+  writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr,
+  ...recoveryReaders } = {}) {
   let entries = [];
   let live = new Map(), waiting = new Set(), decided = new Set();
   let pending = null;
@@ -170,7 +198,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     entries: () => copy(entries),
     // Validate incoming PRs too: maintenance may have removed a terminal PR still present in a stale plan.
     // Each PR is read once per reconciliation; the daemon reader shares evidence across the tick.
-    reconcile({ readLivePr: read = readLivePr, candidates = [] } = {}) {
+    reconcile({ readLivePr: read = readLivePr, candidates = [], ...recovery } = {}) {
       live = new Map(); waiting = new Set(); decided = new Set();
       const persisted = new Set(entries);
       const subjects = new Map(entries.map(entry => [entry.key, entry]));
@@ -202,7 +230,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           note(log, `keep ${entry.key}: red-team verdict evidence unreadable; admission deferred`);
           continue;
         }
-        if (redTeamForHead(pr.comments, entry.pr, pr.headRefOid)) {
+        if (settledResult({ ...recoveryReaders, ...recovery, repo: entry.repo, pr: entry.pr,
+          head: pr.headRefOid, comments: pr.comments, labels: pr.labels })) {
           decided.add(entry.key);
           if (persisted.has(entry)) remove(entry, `red-team result already on head ${pr.headRefOid}`);
         }
@@ -371,7 +400,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const incoming = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       .map(row => ({ repo, pr: Number(row.prNumber) }));
-    const liveEvidence = queue.reconcile({ readLivePr, candidates: incoming });
+    const liveEvidence = queue.reconcile({ ...rest, readLivePr, candidates: incoming });
     const candidates = [], cardOnlyCandidates = [];
     for (const row of plan?.refusals ?? []) {
       if (row.kind !== 'already-reviewed-head') continue;

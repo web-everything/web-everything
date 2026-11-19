@@ -28,9 +28,11 @@ export default {
         body: `<!-- we:red-team-advisory pr=${pr} rev=${head} -->
 Advisory only: recorded result · recorded verdict \`${blocked ? 'changes' : 'accept'}\`.
 ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix required.' : 'The red team tried to break this change and reported nothing.'}` });
-      const readLivePr = ({ pr }) => ({ state: 'OPEN', headRefOid: pr === 3 ? next : head,
+      const readLivePr = ({ pr }) => ({ state: 'OPEN', labels: [], headRefOid: pr === 3 ? next : head,
         comments: pr === 4 ? null : pr <= 3 ? [result(pr, pr === 2)] : [] });
-      const open = () => createRedTeamDispatchQueue({ file, now: () => 1_000_000, readLivePr,
+      const open = () => createRedTeamDispatchQueue({ file,
+        readStatus: () => null, readCarry: () => null, readCarriedCheck: () => false,
+        readCheckFact: () => ({ ok: true }), now: () => 1_000_000, readLivePr,
         log: line => logs.push(line),
         readFile: path => {
           if (!files.has(path)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
