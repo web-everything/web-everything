@@ -1,8 +1,7 @@
 /**
  * 2026-11-19 13:43-13:50 ET: operator-shell red-team round runs (no WE App token) fell back to personal credentials,
  * which can post statuses but cannot create check runs, so each run added an orphan `red-team/publication` hold
- * (#6945/#7149/#7156). The round writer must refuse BEFORE posting any hold when the App token does not resolve, and
- * a not-owed (skipped) transition must publish nothing.
+ * (#6945/#7149/#7156). The round writer must refuse BEFORE posting any hold when the App token does not resolve.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,7 +26,7 @@ export default {
     const violations = [];
     const dir = mkdtempSync(join(tmpdir(), 'rt-writer-soak-'));
     try {
-      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
       const loopPayload = { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: HEAD } } } };
       const posts = [];
       const options = { env, gh: () => '', log: () => {},
@@ -36,9 +35,6 @@ export default {
         postPublicationHold: () => { posts.push('hold'); return { ok: true }; } };
       recordRedTeamStatus({ repo: REPO, pr: 6945, head: HEAD, loopPayload, status: 'running' }, options);
       if (posts.length) violations.push(`a round with no App token posted ${posts.join(',')} before refusing`);
-      posts.length = 0;
-      recordRedTeamStatus({ repo: REPO, pr: 7149, head: HEAD, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, { ...options, appWriterProbe: () => {} });
-      if (posts.length) violations.push(`a not-owed transition posted ${posts.join(',')}`);
     } finally { rmSync(dir, { recursive: true, force: true }); }
     return { violations };
   },

@@ -362,17 +362,15 @@ describe('status persistence and check publication share one claim', () => {
     expect(posts).toEqual([]);
   });
 
-  it('a not-owed (skipped) transition publishes nothing', () => {
-    const f = fixture(), posts = [];
-    const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: { status: 'skipped', policy: 'card-only' } };
-    const options = { env: f.env, gh: () => '', log: () => {}, appWriterProbe: () => {},
-      postCheckRun: args => { posts.push(args); return { ok: true }; },
-      postPublicationHold: hold => { posts.push(hold); return { ok: true }; } };
-    recordRedTeamStatus(input, options);
-    expect(posts).toEqual([]);
-    // A send-back is never a no-op: it still publishes.
-    recordRedTeamStatus({ ...input, sendBack: true }, options);
-    expect(posts.length).toBeGreaterThan(0);
+  it('a refusal is loud: it emits red-team-writer-refused-no-app-token for the daemon', () => {
+    const f = fixture();
+    const events = join(f.runsDir, '..', 'events.jsonl');
+    const env = { ...f.env, WE_DAEMON_EVENTS: events };
+    const out = recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'running' }, { env, gh: () => '', log: () => {},
+      appWriterProbe: () => { throw Error('no token'); }, postCheckRun: () => ({ ok: true }), postPublicationHold: () => ({ ok: true }) });
+    expect(out).toMatchObject({ published: false, refused: true });
+    const line = JSON.parse(readFileSync(events, 'utf8').trim());
+    expect(line).toMatchObject({ kind: 'red-team-writer-refused-no-app-token', pr: f.pr, detail: { head: f.head } });
   });
 
   it('the normal App path still holds, posts the check, and clears', () => {

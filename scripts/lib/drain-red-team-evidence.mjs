@@ -5,7 +5,8 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { daemonEventsPath } from './daemon-events.mjs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
@@ -672,7 +673,7 @@ export function withRedTeamStatusClaim(path, write, { readPidStart = pidStartTim
 /** CAS and atomic rename share a reclaimable recovery claim; a loser never rolls back the winner. */
 export function recordRedTeamStatus(input, options = {}) {
   const underTest = isUnderTest(options.env) || isUnderTest();
-  let publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
+  const publish = typeof options.postCheckRun === 'function' || typeof options.gh === 'function' || !underTest;
   const path = statusPath({ ...input, head: input.loopPayload?.findings?.read?.netBasis?.rev }, options.env ?? process.env);
   mkdirSync(dirname(path), { recursive: true });
   return withRedTeamStatusClaim(path, () => {
@@ -695,10 +696,6 @@ export function recordRedTeamStatus(input, options = {}) {
         catch { remoteHold = true; }
       }
     }
-    // A not-owed transition (a proven card-only policy exemption, never a send-back) with no earlier unconfirmed hold
-    // has nothing to publish or clear.
-    if (publish && !heldBefore && input.status === 'finished' && input.sendBack !== true
-      && input.result?.status === 'skipped' && input.result.policy === 'card-only') publish = false;
     const writeHold = () => writeJsonAtomic(`${path}.unpublished`, { status: input.status, remoteHold });
     if (publish) writeHold();
     let written;
@@ -765,7 +762,17 @@ export function recordRedTeamStatus(input, options = {}) {
         };
         // Fail closed BEFORE any hold: no WE App token means no check run can be created, so a hold would be orphaned.
         const appWriter = requireRedTeamAppWriter({ gh, env: writerEnv, appWriterProbe: options.appWriterProbe });
-        if (appWriter.ok !== true) return report({ published: false, reason: safeReason(appWriter.reason) });
+        if (appWriter.ok !== true) {
+          // Loud refusal: an event the daemon (which holds the App token) reacts to by running the round, and a nonzero
+          // exit for an operator-shell CLI. An earlier success on the SAME head stays only until the daemon's round posts.
+          try {
+            appendFileSync(daemonEventsPath({ env: writerEnv }), `${JSON.stringify({ at: new Date().toISOString(),
+              kind: 'red-team-writer-refused-no-app-token', repo: input.repo, pr: input.pr, daemon: 'red-team-writer',
+              detail: { head, status: input.status, reason: safeReason(appWriter.reason) } })}\n`);
+          } catch { /* best effort: the refusal itself is still returned */ }
+          if (!underTest) process.exitCode = 1;
+          return report({ published: false, refused: true, reason: safeReason(appWriter.reason) });
+        }
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
