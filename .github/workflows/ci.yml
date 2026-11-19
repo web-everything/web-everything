@@ -12,7 +12,7 @@ name: CI
 #   job `test-shard` — the 2000+ vitest suite split across N runners (`vitest run --shard=i/N`, #2682),
 #                 each emitting a partial coverage report. A matrix job, so its own check names are
 #                 `test-shard (1..N)`, NOT a required check.
-#   job `coverage-merge` — combines nine coverage artifacts and applies the 80% bar (#2082).
+#   job `coverage-merge` — combines 24 coverage artifacts and applies the 80% bar (#2082).
 #   jobs `standards` / `host-paths` — independent repo health and host-local path checks.
 #   job `test` — THE required shell-only gate over shards, coverage, integration and health checks.
 #   job `smoke` — deploy smoke (build:docs, #2220) + the deterministic Playwright interaction lane (#2070,
@@ -196,11 +196,12 @@ jobs:
       # cancelling would hide which other shards also failed.
       fail-fast: false
       matrix:
-        # Nine time-balanced coverage shards plus one no-coverage group.
+        # 24 time-balanced coverage shards plus one no-coverage group.
         # Keep this SINGLE-DIMENSION matrix: strategy.job-total counts every combination.
-        # Shards 1-9 cover tests that reach coverage-counted files; shard 10 runs the rest.
-        # Keep --expect=9 in coverage-merge and the /9 unit-suite divisors in lockstep.
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        # Shards 1-24 cover tests that reach coverage-counted files; shard 25 runs the rest.
+        # Keep --expect=24 in coverage-merge and the /24 unit-suite divisors in lockstep.
+        # 2026-11-18 9 -> 24 covered shards: p50 13.4 min per shard at 9; target <=8 min PR CI (operator 21:17 ET).
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
     steps:
       # Keep the fast-check name green for an intentionally empty unit-test scope.
       - name: Card-only unit scope receipt
@@ -270,21 +271,21 @@ jobs:
       # scripts/ci/test-timings.json), not vitest's blind `--shard=i/N`. Every file is in exactly one shard.
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
       # only those run under --coverage, so the covered files' numbers are unchanged.
-      - name: Unit suite shard ${{ matrix.shard }}/9 (coverage, no per-shard bar)
-        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}
+      - name: Unit suite shard ${{ matrix.shard }}/24 (coverage, no per-shard bar)
+        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 25) }}
         working-directory: web-everything
         run: |
           # Capture first, then split: reading the list through a process substitution drops the producer's exit status, so a failing
           # assignment would leave `files` empty and run the WHOLE suite. (scripts/ci/__tests__/ci-shard-steps.test.mjs)
-          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/9) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
+          list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=${{ matrix.shard }}/24) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
           [ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
-          echo "unit shard ${{ matrix.shard }}/9: ${#files[@]} files"
+          echo "unit shard ${{ matrix.shard }}/24: ${#files[@]} files"
           npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 
       - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
-        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}
+        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard == 25) }}
         working-directory: web-everything
         run: |
           # Same capture-then-split shape as the coverage shard step above (see its comment).
@@ -297,9 +298,9 @@ jobs:
 
       # Upload this shard's partial coverage for the `coverage-merge` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
-      # is the second line of defence. The no-coverage group (shard 10) produces none.
+      # is the second line of defence. The no-coverage group (shard 25) produces none.
       - name: Upload shard coverage
-        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}
+        if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 25) }}
         uses: actions/upload-artifact@v4
         with:
           name: coverage-shard-${{ matrix.shard }}
@@ -346,10 +347,10 @@ jobs:
         with:
           path: web-everything/coverage-shards
           pattern: coverage-shard-*
-      # Expect exactly the nine coverage shards; the tenth group runs without coverage.
+      # Expect exactly the 24 coverage shards; the 25th group runs without coverage.
       - name: Merge coverage + enforce 80% bar (#2082)
         working-directory: web-everything
-        run: npm run coverage:merge -- coverage-shards --threshold=80 --expect=9
+        run: npm run coverage:merge -- coverage-shards --threshold=80 --expect=24
 
   host-paths:
     runs-on: ubuntu-latest
