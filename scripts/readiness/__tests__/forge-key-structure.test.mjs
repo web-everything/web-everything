@@ -56,6 +56,8 @@ describe('Forge key structure slice 1',()=>{
     for(const lead of [quote+' ',quote+' a '+quote+' b '+quote+' ','say '+quote+'hello '+quote+'x '+quote+'y\n','an unclosed '+quote+'string, '])
       blocked(Buffer.from(lead+jwk));
     expect(keyStructureFinding(Buffer.from('prose with a '+quote+' and {not json} only'))).toBeFalsy();
+    // long whitespace between the brace and the first member name (red-team #7076, 4,096-space lookahead)
+    for(const pad of [4095,4096,5000])blocked(Buffer.from('an unclosed '+quote+'string, {'+' '.repeat(pad)+quote+'kty'+quote+':'+quote+'oct'+quote+','+quote+'k'+quote+':'+quote+'YQ'+quote+'}'));
     // key name spelled with a JSON escape, and an object longer than the per-candidate bound (fails closed, never skipped)
     blocked(Buffer.from(quote+' '+jwk.replace('kty','k\\u0074y')));
     const long=JSON.stringify({kty:'oct',k:'abcdefghijklm'+'n',pad:'x'.repeat(66000)});

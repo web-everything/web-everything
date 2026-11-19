@@ -132,13 +132,16 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
   if(/kty|\\u/i.test(text)) {
+    const opens=/(?:\s|\/\/[^\r\n]*[\r\n]|\/\*[\s\S]*?\*\/)*"/y;
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
       if(visited.has(at))continue;
       // A JWK object opens with a quoted member name (after optional whitespace or comments).
-      if(!/^(?:\s|\/\/[^\r\n]*[\r\n]|\/\*[\s\S]*?\*\/)*"/.test(text.slice(at+1,at+4097)))continue;
+      // No lookahead bound: whitespace or comments of any length between the brace and the name must not hide it.
+      opens.lastIndex=at+1;
+      if(!opens.test(text))continue;
       tick();
       const limit=Math.min(text.length,at+65536);
       let depth=0,closed=false;
