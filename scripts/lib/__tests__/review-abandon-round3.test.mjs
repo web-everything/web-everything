@@ -224,15 +224,17 @@ it('a replacement that is later abandoned gets its own deadline instead of inher
 });
 
 
-it.each(['pending confirm', 'no verdict', 'open effect'])('%s replacement escalates when quiet past the stuck window, but not while active', kind => {
+it.each(['pending confirm', 'no verdict', 'needs-human', 'open effect', 'refused effect'])('%s replacement escalates when quiet past the stuck window, but not while active', kind => {
   record({}, 2 * 24 * 60 * minute);
   markRunAbandoned({ id, dir, now: now - 24 * 60 * minute, reason: 'stuck review', probes: {}, by: 'fixture' });
   const replacement = 'review-pr-quiet-replacement';
   record({ id: replacement,
     stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - 40 * minute).toISOString() }],
     pending: kind === 'pending confirm' ? { kind: 'confirm', step: 'confirm', stepIndex: 9 } : null,
-    verdict: kind === 'no verdict' ? null : { verdict: 'accept' },
-    effects: kind === 'open effect' ? [effect({ to: 'accepted', addLabel: 'review:accepted' })] : [],
+    verdict: kind === 'no verdict' ? null : { verdict: kind === 'needs-human' ? 'needs-human' : 'accept' },
+    effects: ['open effect', 'refused effect'].includes(kind)
+      ? [{ ...effect({ to: 'accepted', addLabel: 'review:accepted' }, kind === 'refused effect' ? 'refused' : 'pending'),
+        ...(kind === 'refused effect' ? { attempts: 1, error: 'SELF-CLEAR REFUSED — nothing was changed (#2844)' } : {}) }] : [],
   });
   utimesSync(runPath(replacement, dir), (now - 29 * minute) / 1000, (now - 29 * minute) / 1000);
   expect(signal()).toMatchObject({ awaitingFreshReview: true, escalate: false });
@@ -244,6 +246,20 @@ it.each(['pending confirm', 'no verdict', 'open effect'])('%s replacement escala
   const stalled = recovery();
   expect(stalled.row).toMatchObject({ action: 'skip', why: 'review-abandoned', escalate: true });
   expect(stalled.escalate).toHaveBeenCalledOnce();
+  expect(stalled.escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'review-abandoned' });
+});
+
+it('a day-old needs-human replacement without pending work remains incomplete and escalates', () => {
+  record({}, 3 * 24 * 60 * minute);
+  markRunAbandoned({ id, dir, now: now - 2 * 24 * 60 * minute, reason: 'stuck review', probes: {}, by: 'fixture' });
+  record({ id: 'review-pr-needs-human-replacement', pending: null, verdict: { verdict: 'needs-human' }, effects: [] }, 24 * 60 * minute);
+  for (const reader of [readDrainRedTeamEvidence, readRecoveryWitness]) {
+    expect(gate(reader)).toMatchObject({ ok: false, reason: 'review-abandoned' });
+  }
+  expect(signal()).toMatchObject({ awaitingFreshReview: true, escalate: true,
+    escalationContext: expect.stringContaining('replacement review is unfinished') });
+  const stalled = recovery();
+  expect(stalled.row).toMatchObject({ action: 'skip', why: 'review-abandoned', escalate: true });
   expect(stalled.escalate).toHaveBeenCalledWith({ repo, pr, head, why: 'review-abandoned' });
 });
 

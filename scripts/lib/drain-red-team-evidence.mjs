@@ -300,6 +300,8 @@ const settleKind = run => {
   // 'bogus') is a shape this reader does not recognise and fails closed like a non-string one.
   return verdict === 'changes' && run.pending == null ? 'reject' : 'hard';
 };
+/** A replacement completes only with a settled verdict, without pending or refused work. */
+export const isCompletedReview = run => ['accept', 'reject'].includes(settleKind(run));
 // What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
@@ -310,7 +312,7 @@ const summaryCache = new WeakMap();
 const strictPr = value => (Number.isSafeInteger(value) && value > 0 ? value : typeof value === 'string' && /^[1-9]\d*$/.test(value.trim()) ? Number(value.trim()) : NaN);
 const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null);
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
-  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run),
+  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run), completed: isCompletedReview(run),
   rejecting: hasRejectingReviewVerdict(run), startedAt: reviewStartedAt({ run }),
   // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
   orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run) });
@@ -319,7 +321,7 @@ const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run
 const reviewAbandoned = (abandoned, completed) => abandoned.some(s => s.rev === null || !Number.isFinite(s.startedAt)
   || !Number.isFinite(s.abandonedAt) || !(completed.get(s.rev) > s.abandonedAt));
 const rememberCompleted = (completed, s, now) => {
-  if (['accept', 'reject'].includes(s.kind) && s.rev !== null && Number.isFinite(s.startedAt)
+  if (s.completed && s.rev !== null && Number.isFinite(s.startedAt)
     && s.startedAt <= now + RUN_MTIME_SLACK_MS) {
     completed.set(s.rev, Math.max(completed.get(s.rev) ?? -Infinity, s.startedAt));
   }

@@ -4830,8 +4830,9 @@ or unrecognised verdicts, operator `findings.confirm` rejections, and declared/p
 send-back effect payloads retain their original holds through the shared `hasRejectingReviewVerdict` predicate. The queue treats `review-abandoned` as a
 non-runnable wait carrying `awaitingFreshReview: true`. It pages no human initially; after the
 same stuck deadline from the tombstone, absence of a newer same-head read start escalates through
-the existing unfinished-review path. A newer unfinished replacement (including pending confirmation,
-missing verdict or open effects) suppresses escalation only while its read start or last record write
+the existing unfinished-review path. Replacement completeness shares the gate's `isCompletedReview`
+predicate: a newer unfinished replacement (including `needs-human`, pending confirmation,
+missing verdict or open/refused effects) suppresses escalation only while its read start or last record write
 is within its stuck deadline. A completed replacement discharges it; a later tombstone owns a new
 deadline. Missing, unreadable or over-400-record replacement evidence
 escalates for operator inspection. Test cached readers and rewritten records as well as the operation; a record rewrite invalidates

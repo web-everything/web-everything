@@ -4,10 +4,9 @@ import { hasRejectingReviewVerdict, isRunAbandoned, readRunAbandonment } from '.
 import { statSync } from 'node:fs';
 import { boundedText } from './host-overload-settings.mjs';
 import { resolveReviewRunReaperSettings, stuckReviewThreshold } from './review-run-reaper-settings.mjs';
+import { isCompletedReview } from './drain-red-team-evidence.mjs';
 
 const stalledContext = 'review-abandoned: replacement review is unfinished and quiet past its stuck deadline; inspect the unfinished review';
-const unfinished = run => !run.verdict || run.pending != null || run.outcome === 'refused'
-  || run.effects?.some(effect => ['declared', 'pending', 'in-flight', 'refused'].includes(effect?.status));
 const context = 'review-abandoned: replacement review never started; inspect review dispatch and start a fresh same-head review';
 export function readAbandonedReviewSignal({ repo, pr, head, env = process.env, now = Date.now(), log = console.error,
   runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env), tool,
@@ -33,7 +32,7 @@ export function readAbandonedReviewSignal({ repo, pr, head, env = process.env, n
       const readAt = Date.parse(run.stepTimings?.find(t => t?.step === 'read')?.startedAt);
       const isAbandoned = abandoned(id) && !hasRejectingReviewVerdict(run);
       if (Number.isFinite(readAt) && readAt <= now && (!latest || readAt > latest.readAt)) {
-        latest = { id, readAt, isAbandoned, unfinished: unfinished(run), threshold: stuckReviewThreshold(run, settings).ms };
+        latest = { id, readAt, isAbandoned, unfinished: !isCompletedReview(run), threshold: stuckReviewThreshold(run, settings).ms };
       }
       if (isAbandoned) {
         const at = Date.parse(readTombstone(id)?.at);
