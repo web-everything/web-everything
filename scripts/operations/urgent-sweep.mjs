@@ -134,9 +134,21 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered' && r.ancestryVerified === true).map(r => r.id));
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
     for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
-    const ciEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.noVerdictEscalated === true).map(r => r.id));
+    const ciEscalated = new Set();
     const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
     const green = new Map(settlements.filter(r => r.status === 'monitoring-green').map(r => [r.id, r.greenAt]));
+    const nonGreen = new Map();
+    const everGreen = new Set();
+    for (const receipt of settlements) {
+      if (['monitoring-green', 'settled-green'].includes(receipt.status)) {
+        everGreen.add(receipt.id);
+        nonGreen.delete(receipt.id);
+        ciEscalated.delete(receipt.id);
+      } else if (receipt.status === 'monitoring-ci') {
+        if (Object.hasOwn(receipt, 'nonGreenSince')) nonGreen.set(receipt.id, receipt.nonGreenSince);
+        if (receipt.noVerdictEscalated === true) ciEscalated.add(receipt.id);
+      }
+    }
     const records = deps.loads();
     const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
       && typeof r.trackingId === 'string').map(r => r.trackingId));
@@ -225,30 +237,51 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
         if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
           throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
-        const age = now - loadedAt;
+        let age = now - loadedAt;
         let data, boundFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
         try {
           data = await deps.checks(r);
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
-          try { validateChecks(data, r.sha); } catch (e) { evidenceError = e; }
+          validateChecks(data, r.sha);
+          // Like testCheckEvidence, reruns supersede only their own suite. Check IDs
+          // increase across workflow run attempts; keep distinct job/shard names apart.
+          const latestByCheck = new Map();
+          for (const c of data.check_runs) {
+            const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
+            if (!latestByCheck.has(key) || c.id > latestByCheck.get(key).id) latestByCheck.set(key, c);
+          }
+          const latestChecks = [...latestByCheck.values()];
+          anyFailure = latestChecks.some(c => failedCheck(c, r.sha));
           const required = await deps.required(r, data?.testWorkflowPath);
           if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
             throw new Error('unreadable required CI jobs');
-          const checks = (Array.isArray(data?.check_runs) ? data.check_runs : []).filter(c =>
+          const checks = latestChecks.filter(c =>
             c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
             && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)
             && required.some(n => c.name === n || c.name.startsWith(`${n} (`))
             && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, r.sha, data.testWorkflowPath));
           boundFailure = checks.find(c => failedCheck(c, r.sha));
           unload = Boolean(boundFailure);
-          if (evidenceError) throw evidenceError;
           if (!unload) {
             requiredSucceeded = !anyFailure && testWorkflowBound(testCheckEvidence(data, r.sha), data.workflows, r.sha, data.testWorkflowPath)
               && required.every(n => checks.some(c => c.name === n || c.name.startsWith(`${n} (`)))
               && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
           }
         } catch (e) { evidenceError = e; }
-        if (!unload && !requiredSucceeded && (anyFailure || !green.has(id))) {
+        if (!requiredSucceeded && everGreen.has(id)) {
+          // A historical pass cannot authorize today's incomplete or failing evidence.
+          // Persist before notifications so restarts cannot extend this verdict deadline.
+          if (!nonGreen.has(id)) {
+            const nonGreenSince = new Date(now).toISOString();
+            await deps.settle({ id, ref: r.ref, sha: r.sha, at: nonGreenSince, status: 'monitoring-ci', nonGreenSince });
+            nonGreen.set(id, nonGreenSince);
+          }
+          const since = Date.parse(nonGreen.get(id));
+          if (!Number.isFinite(since) || since < loadedAt || since > now)
+            throw new Error('unreadable non-green timestamp; inspect CI or unload manually');
+          age = now - since;
+        }
+        if (!unload && !requiredSucceeded) {
           if (!anyFailure && age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
             await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
             await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
@@ -258,7 +291,9 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
         }
         if (anyFailure && !unload) {
-          const detail = `CI failed on ${r.sha} outside the bound test closure. Inspect CI or unload manually.`;
+          const detail = evidenceError
+            ? `Unreadable CI evidence with a possible failure on ${r.sha}. Inspect CI or unload manually.`
+            : `CI failed on ${r.sha} outside the bound test closure. Inspect CI or unload manually.`;
           if (!failureEscalated.has(id)) {
             await escalate(`${id}-ci-failed`, r.ref, detail);
             await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', failureEscalated: true });
@@ -291,7 +326,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             const at = deps.now(), greenAt = green.get(id) ?? at;
             if (!Number.isFinite(Date.parse(at)) || !Number.isFinite(Date.parse(greenAt))) throw new Error('unreadable green monitoring timestamp');
             const status = 'monitoring-green';
-            if (!green.has(id)) await deps.settle({ id, ref: r.ref, sha: r.sha, at, greenAt, status, checksComplete: true });
+            if (!green.has(id) || nonGreen.has(id)) await deps.settle({ id, ref: r.ref, sha: r.sha, at, greenAt, status, checksComplete: true });
             results.push({ id, status });
           } else results.push({ id, status: 'pending' });
         }

@@ -53,6 +53,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       if (!/^[a-f0-9]{40}$/i.test(head) || head !== tip) throw new Error('FUI sibling must match fetched origin default branch');
       return { sha: head, repo };
     },
+    'fetch-main-history': () => run(gates.fetchMain[0], gates.fetchMain.slice(1)),
     'install-fui': () => { for (const command of gates.installFui) heavy(command, fui); },
     install: () => heavy(gates.install),
     shard: ({ group, shard }) => {
@@ -100,6 +101,8 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
     let result = 'green', fuiSha, fuiRepo;
     // Stop on failure, including queue exhaustion: no admission polling or retry loop.
     try {
+      steps.push('fetch-main-history');
+      await deps['fetch-main-history']();
       const fui = await deps.verifyFui();
       fuiSha = fui.sha; fuiRepo = fui.repo;
       if (fuiRepo !== urgentFuiRepo) throw new Error('untrusted FUI origin');

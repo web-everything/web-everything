@@ -93,13 +93,68 @@ describe('urgent CI sweep', () => {
       expect(f.d.remove).not.toHaveBeenCalled();
     });
   });
-  it('preserves a recorded green completion beyond 24h when CI becomes unreadable', async () => {
+  it('starts a fresh verdict deadline when CI becomes unreadable after green', async () => {
     const f = fixture();
     await f.run();
     f.d.now = () => '2026-11-19T13:00:00Z';
     f.d.checks.mockImplementation(() => { throw new Error('API unavailable'); });
     expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
     expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each(['pending', 'missing', 'unreadable'])('expires %s required evidence after green using the persisted first observation', async kind => {
+    const f = fixture();
+    await f.run();
+    const firstObserved = new Date(Date.parse(load.at) + 49 * 60 * 60 * 1000).toISOString();
+    f.d.now = () => firstObserved;
+    const rows = kind === 'pending' ? [check('test', null, { status: 'queued' })] : [];
+    f.d.checks.mockImplementation(() => {
+      if (kind === 'unreadable') throw new Error('API unavailable');
+      return { total_count: rows.length, check_runs: rows, workflows };
+    });
+    expect(await f.run()).toMatchObject({ results: [{ status: kind === 'unreadable' ? 'needs-you' : 'pending' }] });
+    expect(f.settlements()[0]).toMatchObject({ status: 'monitoring-ci', nonGreenSince: firstObserved });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.now = () => new Date(Date.parse(firstObserved) + 6 * 60 * 60 * 1000).toISOString();
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+    f.d.now = () => new Date(Date.parse(firstObserved) + 24 * 60 * 60 * 1000).toISOString();
+    expect(await urgentSweep({}, { ...f.d })).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('resets the non-green clock after a recovered green verdict', async () => {
+    const f = fixture();
+    await f.run();
+    const greenChecks = f.d.checks.getMockImplementation();
+    f.d.checks.mockReturnValue({ total_count: 0, check_runs: [], workflows });
+    await f.run();
+    f.d.now = () => '2026-11-18T18:00:00Z';
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenLastCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+    f.d.checks.mockImplementation(greenChecks);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    f.d.now = () => '2026-11-20T13:00:00Z';
+    f.d.checks.mockReturnValue({ total_count: 0, check_runs: [], workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.settlements()[0]).toMatchObject({ nonGreenSince: new Date(f.d.now()).toISOString() });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    f.d.now = () => '2026-11-20T19:00:00Z';
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+    expect(f.d.escalate).toHaveBeenLastCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+    await urgentSweep({}, { ...f.d });
+    expect(f.d.escalate).toHaveBeenCalledTimes(2);
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('fails closed on a corrupt persisted non-green timestamp', async () => {
+    const f = fixture();
+    await f.run();
+    f.d.checks.mockReturnValue({ total_count: 0, check_runs: [], workflows });
+    await f.run();
+    f.settlements()[0].nonGreenSince = 'bad';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('non-green timestamp') }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
   });
   it.each(['pinned-closed-pr', 'edge-resolution-recorded', 'history-unreadable'])('raises NEEDS-YOU when guarded expiry retirement refuses a %s overlay', async reason => {
     const f = fixture();
@@ -159,6 +214,29 @@ describe('urgent CI sweep', () => {
     expect(f.d.escalate).not.toHaveBeenCalled();
   });
 
+  it.each(['test', 'test-shard (1)'])('supersedes an older failed %s with the latest successful workflow attempt regardless of response order', async name => {
+    const old = check(name, 'failure');
+    const latest = check(name);
+    const rows = [...required.filter(n => n !== name && !(n === 'test-shard' && name.startsWith('test-shard'))).map(n => check(n)), latest, old];
+    const f = fixture(rows);
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows,
+      workflows: { total_count: 1, workflow_runs: [{ ...workflows.workflow_runs[0], run_attempt: 2 }] } });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).not.toHaveBeenCalled();
+  });
+  it.each(['pending', 'failure'])('uses the latest %s rerun instead of an older success', async verdict => {
+    const f = fixture([check('test'), check('test', verdict === 'pending' ? null : 'failure',
+      verdict === 'pending' ? { status: 'in_progress' } : {})]);
+    expect(await f.run()).toMatchObject({ results: [{ status: verdict === 'pending' ? 'pending' : 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(verdict === 'pending' ? 0 : 1);
+  });
+  it.each(['different suite', 'different shard'])('does not let a success from a %s supersede a bound failure', async kind => {
+    const f = fixture([check('test-shard (1)', 'failure'), check(kind === 'different shard' ? 'test-shard (2)' : 'test-shard (1)', 'success',
+      kind === 'different suite' ? { check_suite: { id: 8 } } : {})]);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
   it.each(['failure', 'cancelled', 'timed_out'])('unloads required %s and escalates once across repeated passes', async conclusion => {
     const f = fixture([check('test-shard (1)', conclusion), check('test', null, { status: 'in_progress' })]);
     expect(await f.run()).toMatchObject({ ok: true, results: [{ status: 'unloaded-pending-adoption' }] });
@@ -640,15 +718,21 @@ describe('urgent CI sweep', () => {
     ['missing count', { check_runs: [check('test', 'failure')] }],
     ['malformed row', { total_count: 2, check_runs: [null, check('test-shard', 'failure')] }],
     ['duplicate IDs', { total_count: 2, check_runs: [check('test', 'success', { id: 1 }), check('test', 'failure', { id: 1 })] }],
-  ])('unloads before escalating %s evidence containing an explicit bound-workflow failure', async (_, data) => {
+  ])('keeps %s evidence containing a possible bound failure tracked, escalates once, and expires at 24h', async (_, data) => {
     const f = fixture(); f.d.checks.mockReturnValue({ ...data, workflows });
+    for (const at of ['2026-11-18T12:00:00Z', '2026-11-19T11:59:59Z']) {
+      f.d.now = () => at;
+      expect(await f.run()).toMatchObject({ ok: false, results: [{ status: 'needs-you', detail: expect.stringContaining('Unreadable CI evidence with a possible failure') }] });
+    }
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.events).toEqual([]);
+    expect(f.settlements()).toEqual([expect.objectContaining({ status: 'monitoring-ci', failureEscalated: true })]);
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', evidence: [expect.stringContaining('Unreadable CI evidence with a possible failure')] }));
+    f.d.now = () => '2026-11-19T12:00:00Z';
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
-    expect(f.d.remove).toHaveBeenCalledWith(load, { ref: load.registration.ref });
-    expect(f.events).toEqual([expect.objectContaining({ type: 'prototype-load.urgent-unloaded' })]);
-    expect(f.settlements()).toEqual([expect.objectContaining({ status: 'unloaded-pending-adoption' })]);
-    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you', question: expect.stringContaining('NEEDS-YOU') }));
-    expect(f.d.remove.mock.invocationCallOrder[0]).toBeLessThan(f.d.escalate.mock.invocationCallOrder[0]);
-    expect(f.d.required).toHaveBeenCalled();
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.state).toContainEqual(expect.objectContaining({ status: 'unload-decision', reason: 'ci-expired' }));
   });
   it.each([
     ['foreign SHA', check('test', 'failure', { head_sha: 'c'.repeat(40) })],

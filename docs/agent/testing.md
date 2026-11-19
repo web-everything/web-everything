@@ -2425,6 +2425,15 @@ limits, idle-hook order and real local packing that preserves recent unreachable
 oversized stamp skips GC (`stamp-unreadable` in the `clone-maintenance` event); inspect
 and repair `clone-maintenance-<cloneLockKey>.json` under the daemon state directory.
 
+Memory-warn regression cases must distinguish missing free-memory evidence (hold, even with flat swap)
+from missing swap growth (admit when free memory is readable and clean). Only pressure level 2 may relax;
+level 3 and unknown levels above 1 still hold. Exercise the sampler's unrounded bytes ratio at 19.96% and
+20%, and verify checkout-local/per-call warn overrides only tighten the resolved settings. Environment
+variables remain the operator settings layer. Scoped coverage lives in `memory-available`,
+`resource-sampler`, `resource-admission`, `resource-gate`, and `heavy-admission` tests.
+Keep the shared pressure/floor decisions in the import-free `memory-warn-corroboration.mjs`:
+read-only operations reach them via `resource-policy` and must never inherit the measurement module's IO imports.
+
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`
 or the admitted `npm run test:unit -- <file>` / `npm run check:standards` scripts.
@@ -4942,7 +4951,7 @@ green/red receipts to `~/workspace/.operations/coordination/urgent-full-green.js
 
 `prototype-load --urgent --reason=<at least 10 characters>` prefers passing CI, otherwise requires
 the latest exact-SHA receipt to be full, green, current-shard-count and at most two hours old.
-Its signed steps must start with `install-fui`, `install`, then match the current CI unit plan in order, followed by coverage,
+Its signed steps must start with `fetch-main-history`, `install-fui`, `install`, then match the current CI unit plan in order, followed by coverage,
 hostPaths, integration and standards. Before selecting or binding a test suite, any completed
 exact-SHA check-run with failure, cancelled, timed_out, action_required or startup_failure vetoes
 urgent loading. An unreadable raw check-runs response still requires the signed receipt.
@@ -4950,6 +4959,8 @@ Other admission gates remain in force; merging still requires real CI. Urgent ad
 `prototype-load.urgent` events to `~/workspace/.operations/coordination/urgent-loads.jsonl`.
 `urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
 later-red supersession, event logging and the unchanged non-urgent CI gate. Run via heavy admission.
+
+The first local step runs the workflow-pinned `sh scripts/ci/fetch-main-history.sh` in the checkout; a failure signs a red receipt before any suites. Historical green never disables verdict timeouts: after green, persist `nonGreenSince` on the first current non-green read and apply the 6h escalation / 24h unload deadlines from that observation. Loads that never passed retain their load-time deadline. A recovered green clears that episode clock and its six-hour escalation deduplication; a later non-green episode can escalate again.
 
 ## Urgent local verification receipts
 
@@ -4960,7 +4971,7 @@ The urgent sweep reads all check-runs (maximum 100, exact count and unique IDs r
 green only after every run completes and all required runs succeed. Pending unrelated runs keep the
 load eligible for later failure detection. Legacy green settlements without `checksComplete: true`
 are rechecked; incomplete or oversized evidence escalates to NEEDS-YOU for manual inspection.
-An explicit completed failure for the exact SHA unloads first even when the remaining evidence is malformed, incomplete or oversized.
+Malformed, incomplete, oversized or duplicate-ID evidence never authorizes CI-failure unloading, even with a possible bound failure. Escalate that possible failure once per tracking ID and keep monitoring; the 24h verdict expiry still unloads.
 
 Urgent verification mirrors CI coverage artifacts under ignored `coverage-shards/`; clear this directory before a run and copy each covered shard before the next overwrites its report. Receipts require the local user's private HMAC key and the loading checkout’s normalized origin. The key detects tampering by writers without that key; it is readable by candidate code running as the same OS user and does not establish isolation from that code. A completed failing CI gate always refuses urgent loading; old unsigned receipts require a fresh verification or passing CI.
 
@@ -4989,7 +5000,7 @@ failures in any check-run on the SHA, regardless of job or app, open a once-per-
 require operator repair or manual unloading. Settlement identity includes the load tracking ID, so a reload
 starts fresh. Check failures authorize removal only for the GitHub Actions app and jobs in the configured
 `test` needs closure, with each suite bound to that workflow run on the exact SHA. Validate complete,
-bounded check pages before acting; malformed pages may still unload on an explicit bound failure.
+bounded check pages before acting. Select only the latest check ID per app, check name and suite (including workflow rerun attempts), as in `testCheckEvidence`; a newer success supersedes its own older failure, while another suite or shard cannot.
 Unrelated app/workflow/job failures never authorize removal or green monitoring; they remain tracked
 with a durable failure-escalation receipt. The 24h verdict expiry still permits unloading.
 Unknown workflow or required-job

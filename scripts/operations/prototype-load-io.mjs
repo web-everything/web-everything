@@ -612,7 +612,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           ledger = fs.readFileSync(urgentLedger(env.HOME), 'utf8');
           const plan = ciUnitPlan(fs.readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8'));
           shards = plan.length;
-          expectedSteps = ['install-fui', 'install', ...plan.map(s => `unit:${s.group ?? 'unit'}:${s.shard}`), 'coverage', 'hostPaths', 'integration', 'standards'];
+          expectedSteps = ['fetch-main-history', 'install-fui', 'install', ...plan.map(s => `unit:${s.group ?? 'unit'}:${s.shard}`), 'coverage', 'hostPaths', 'integration', 'standards'];
         } catch { /* Missing or unreadable evidence fails closed below. */ }
         const urgent = urgentMarker({ ...input, ledger, shards, expectedSteps, repo: origin, readKey: readUrgentKey, now: now() });
         if (!urgent.ok) return stop('no-ready', urgent);

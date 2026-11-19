@@ -9,7 +9,7 @@ import { parseOperationArgv } from '../cli-adapter.mjs';
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
 const sign = m => ({ ...m, sig: urgentSignature(m, key) });
-const expectedSteps = ['install-fui', 'install', ...Array.from({ length: 10 }, (_, i) => `unit:unit:${i + 1}/10`), 'coverage', 'hostPaths', 'integration', 'standards'];
+const expectedSteps = ['fetch-main-history', 'install-fui', 'install', ...Array.from({ length: 10 }, (_, i) => `unit:unit:${i + 1}/10`), 'coverage', 'hostPaths', 'integration', 'standards'];
 const marker = sign( { sha, fuiSha: sha, fuiRepo: urgentFuiRepo, suite: 'full', shards: 10, result: 'green', startedAt: new Date(now - 2000).toISOString(), finishedAt: new Date(now - 1000).toISOString(), host: 'host', repo: 'https://example.com/org/repo', steps: expectedSteps });
 const check = (m = marker, input = {}) => urgentMarker({ urgent: true, reason: 'Urgent daemon repair', sha, shards: 10, expectedSteps, now, repo: marker.repo, readKey: () => key, ledger: JSON.stringify(m), ...input });
 
@@ -34,7 +34,7 @@ describe('urgent marker', () => {
     ['wrong repo', { repo: 'https://example.com/other/repo' }],
   ])('rejects %s', (_, input) => expect(check(marker, input).ok).toBe(false));
   it.each([
-    ['empty', []], ['partial', expectedSteps.slice(1)],
+    ['legacy without main history', expectedSteps.slice(1)], ['empty', []], ['partial', expectedSteps.slice(2)],
     ['reordered', [...expectedSteps].reverse()], ['extra', [...expectedSteps, 'extra']],
     ['wrong group', expectedSteps.map(s => s.replace('unit:unit:', 'unit:covered:'))],
   ])('refuses correctly signed %s steps', (_, steps) => {
@@ -60,20 +60,20 @@ describe('urgent marker', () => {
 
 function fixture() {
   let tick = now - 1000;
-  return { verifyFui: vi.fn(() => ({ sha, repo: urgentFuiRepo })), 'install-fui': vi.fn(), install: vi.fn(), repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
+  return { 'fetch-main-history': vi.fn(), verifyFui: vi.fn(() => ({ sha, repo: urgentFuiRepo })), 'install-fui': vi.fn(), install: vi.fn(), repo: () => marker.repo, readKey: () => key, host: 'host', now: () => new Date(tick += 1000).toISOString(), clean: vi.fn(() => true), head: vi.fn(() => sha),
     plan: () => [{ shard: '1/2' }, { shard: '2/2' }], shard: vi.fn(), standards: vi.fn(), coverage: vi.fn(), hostPaths: vi.fn(), integration: vi.fn(), append: vi.fn() };
 }
 describe('urgent verifier', () => {
   it('records green only after all shards sequentially and standards', async () => {
     const d = fixture(), order = [];
     d.shard = async s => { order.push(s.shard); await Promise.resolve(); order.push('done'); };
-    for (const step of ['install-fui', 'install', 'coverage', 'hostPaths', 'integration', 'standards']) d[step] = () => order.push(step);
+    for (const step of ['fetch-main-history', 'install-fui', 'install', 'coverage', 'hostPaths', 'integration', 'standards']) d[step] = () => order.push(step);
     expect(await urgentVerify({ sha, result: 'red' }, d)).toMatchObject({ ok: true });
-    expect(order).toEqual(['install-fui', 'install', '1/2', 'done', '2/2', 'done', 'coverage', 'hostPaths', 'integration', 'standards']);
+    expect(order).toEqual(['fetch-main-history', 'install-fui', 'install', '1/2', 'done', '2/2', 'done', 'coverage', 'hostPaths', 'integration', 'standards']);
     expect(d.append).toHaveBeenCalledTimes(1);
-    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, fuiSha: sha, fuiRepo: urgentFuiRepo, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['install-fui', 'install', 'unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
+    expect(d.append).toHaveBeenCalledWith(expect.objectContaining({ sha, fuiSha: sha, fuiRepo: urgentFuiRepo, suite: 'full', result: 'green', shards: 2, host: 'host', repo: marker.repo, steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/2', 'unit:unit:2/2', 'coverage', 'hostPaths', 'integration', 'standards'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) }));
   });
-  it.each(['install-fui', 'install', 'shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
+  it.each(['fetch-main-history', 'install-fui', 'install', 'shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
     const d = fixture(); d[stage] = vi.fn(() => { throw new Error('failed'); });
     expect(await urgentVerify({ sha, result: 'green' }, d)).toMatchObject({ ok: false, marker: { result: 'red' } });
     expect(d.append).toHaveBeenCalledTimes(1);
@@ -168,6 +168,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync,
       env: { PATH: '/bin', HOME: '/home/test', URGENT_KEY: urgentKeyPath('/home/test'), NODE_OPTIONS: urgentKeyPath('/home/test') } });
     expect((await urgentVerify({ sha }, d)).ok).toBe(true);
+    expect(spawnSync).toHaveBeenCalledWith('sh', ['scripts/ci/fetch-main-history.sh'], expect.objectContaining({ cwd: '/repo' }));
     const heavy = spawnSync.mock.calls.filter(([, args]) => args[0].endsWith('scripts/readiness/heavy-admission.mjs'));
     expect(heavy).toHaveLength(17);
     expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(4), o.cwd])).toEqual([
@@ -197,6 +198,16 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(() => d.shard({ group: 'nocov', shard: '1/1' })).toThrow('unreadable CI Vitest command');
     expect(spawnSync).toHaveBeenCalledTimes(1);
   });
+  it('signs red and stops before suites when the workflow main-history script fails', async () => {
+    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+    const fs = { readFileSync: p => p.endsWith('.key') ? key : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn() };
+    const spawnSync = vi.fn((cmd, args) => ({ status: cmd === 'sh' ? 1 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : marker.repo }));
+    const result = await urgentVerify({ sha }, createUrgentDeps({ cwd: '/repo', fs, spawnSync }));
+    expect(result).toMatchObject({ ok: false, marker: { result: 'red', steps: ['fetch-main-history'], sig: expect.stringMatching(/^[a-f0-9]{64}$/) } });
+    expect(spawnSync).toHaveBeenCalledWith('sh', ['scripts/ci/fetch-main-history.sh'], expect.objectContaining({ cwd: '/repo' }));
+    expect(spawnSync.mock.calls.some(([, args]) => args[0].includes('heavy-admission'))).toBe(false);
+    expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
+  });
   it('treats admission failure as red and appends once without retrying', async () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8'), packageText = readFileSync('package.json', 'utf8');
     const fs = { readFileSync: p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn() };
@@ -212,6 +223,7 @@ describe('CI gate mirroring fails closed', () => {
   const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
   it('accepts every run and uses step in the real CI workflow', () => {
     expect(ciGatePlan(workflow)).toMatchObject({
+      fetchMain: ['sh', 'scripts/ci/fetch-main-history.sh'],
       coverage: ['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9'],
       hostPaths: ['node', 'scripts/lint-host-paths.mjs'],
       integration: ['npm', 'run', 'test:integration:vitest'],
