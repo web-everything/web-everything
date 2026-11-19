@@ -54,10 +54,29 @@ function markdownRow(line) {
 function markdownContext(lines) {
   const unsafe = Array(lines.length + 1).fill(false);
   const delimiters = [];
+  // Includes CommonMark block tags, raw-text containers and standalone custom tags.
+  const blockTags = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param pre script search section source style summary table tbody td textarea tfoot th thead title tr track ul').split(' '));
+  const voidTags = new Set('area base basefont br col embed frame hr img input link menuitem meta param source track wbr'.split(' '));
+  const rawTags = new Set(['pre', 'script', 'style', 'textarea']);
+  const html = [];
   let fence = null, comment = false;
   for (const [i, line] of lines.entries()) {
-    let protectedLine = !!fence || comment || /^(?: {4}|\t)/.test(line);
-    if (fence) {
+    let protectedLine = !!fence || comment || html.length > 0 || /^(?: {4}|\t)/.test(line);
+    const tag = !fence && !comment && line.match(/^ {0,3}<\/?([a-z][\w-]*)\b/i);
+    if (html.length || (tag && (blockTags.has(tag[1].toLowerCase()) || /^ {0,3}<\/?[a-z][^>]*>\s*$/i.test(line)))) {
+      protectedLine = true;
+      if (/<!--|-->/.test(line)) return null; // Mixed HTML/comment nesting needs human resolution.
+      for (const token of line.matchAll(/<(\/?)([a-z][\w-]*)\b[^>]*>/gi)) {
+        const name = token[2].toLowerCase(), closing = !!token[1];
+        if (rawTags.has(html.at(-1)) && !(closing && name === html.at(-1))) continue;
+        delimiters.push(token[0]);
+        if (closing) {
+          if (html.pop() !== name) return null;
+        } else if (!voidTags.has(name)) html.push(name);
+      }
+      // Incomplete opening tags are ambiguous and must not authorize a union.
+      if (tag && !line.includes('>')) return null;
+    } else if (fence) {
       const close = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
       if (close && close[1][0] === fence[0] && close[1].length >= fence.length) {
         delimiters.push(close[1]);
@@ -76,10 +95,11 @@ function markdownContext(lines) {
         delimiters.push(token);
         protectedLine = true;
       }
+      if (!comment && [...line.matchAll(/<\/?([a-z][\w-]*)\b/gi)].some(token => blockTags.has(token[1].toLowerCase()))) return null;
     }
     if (protectedLine) unsafe[i] = unsafe[i + 1] = true;
   }
-  return fence || comment ? null : { unsafe, delimiters: delimiters.join('\n') };
+  return fence || comment || html.length ? null : { unsafe, delimiters: delimiters.join('\n') };
 }
 
 // Preserve every base line; match identical cross-side additions one-for-one at each base gap.

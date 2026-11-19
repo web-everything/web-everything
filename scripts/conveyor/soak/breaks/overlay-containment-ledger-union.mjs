@@ -1,6 +1,6 @@
 /** R1048: a strict superset and independent shared-ledger additions must admit automatically. */
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withBareOrigin } from '../../../operations/__tests__/helpers/real-repo.mjs';
@@ -40,6 +40,9 @@ export default {
       f.seedOriginBranch('lane/peer', ledgers('theirs'));
       f.seedOriginBranch('lane/new', { 'new.txt': 'superset\n' }, 'lane/old');
       const sha = ref => f.git(['rev-parse', ref], { cwd: f.origin }).trim();
+      // Supersession must not borrow the no-adopted-history audit exemption.
+      env.WE_FIX_READY_PATH = join(f.tmp, 'ready.jsonl');
+      writeFileSync(env.WE_FIX_READY_PATH, JSON.stringify({ ref: 'lane/old', sha: sha('lane/old'), tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
       addOverlay(f.clone, { ref: 'lane/old' }, { env });
       addOverlay(f.clone, { ref: 'lane/peer' }, { env });
       const result = spawnSync(process.execPath, [CLI, 'add', `--clone=${f.clone}`, '--ref=lane/new', '--pr=7118',

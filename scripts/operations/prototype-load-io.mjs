@@ -627,16 +627,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.effectiveRef = out.wouldMerge.ref; out.effectiveSha = commit;
       }
       out.check = check(out.clone, out.effectiveRef, out.effectiveSha);
-      // The guarded add re-proves these strict ancestors and swaps them atomically with
-      // the new registration. They need neither independent retirement nor stale checks.
-      const superseding = out.check.ok === true && out.check.clean === true && out.check.candSha === out.effectiveSha
+      // Containment is not permission to retire a mutable registration. Run the same
+      // retirement, stale and cleanup gates as every other contained registration.
+      let superseding = out.check.ok === true && out.check.clean === true && out.check.candSha === out.effectiveSha
         ? (out.check.superseded || []).map(s => s.entry.ref).filter(ref => ref !== input.replace) : [];
       if (!settleIntents()) return stop('drop-recovery-failed', { fallback: 'Drop intents are unsettled; run daemon-overlay.mjs recover-drops and inspect them.' });
       const listed = listRows();
       if (!listed.ok) return stop('check-unverifiable', { listing: listed.listing });
-      const retiredRefs = retireStep(listed.rows, [out.effectiveRef, input.replace, ...superseding].filter(Boolean));
+      const retiredRefs = retireStep(listed.rows, [out.effectiveRef, input.replace].filter(Boolean));
       if (out.retireRefused.length) return stop('retire-refused', { fallback: 'A proved retirement was refused by the loader (tip moved or entry changed); rerun to re-prove it.' });
       const rows = listed.rows.filter((r) => !retiredRefs.includes(r.ref));
+      superseding = superseding.filter(ref => rows.some(row => row.ref === ref));
       if (input.replace) {
         if (!rows.some((r) => r.ref === input.replace)) return stop('bad-input', { detail: `replaced ref ${input.replace} is not registered` });
         requireGit('fetch', 'origin', `+refs/heads/${input.replace}:refs/remotes/origin/${input.replace}`);
@@ -651,7 +652,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const overlapping = [], combinedChanged = new Set(effectivePaths);
       const blockingReasons = Object.create(null);
       out.staleChecks = {};
-      for (const ref of established.filter((ref) => ref !== out.effectiveRef && !superseding.includes(ref))) {
+      for (const ref of established.filter((ref) => ref !== out.effectiveRef)) {
         if (git('fetch', 'origin', ref).code !== 0) {
           if (git('ls-remote', '--exit-code', 'origin', `refs/heads/${ref}`).code === 2) {
             // Registrations do not pin an authoritative tip. A cached tracking ref may
@@ -742,56 +743,6 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       });
       if (!out.check.ok) return stop('check-unverifiable');
       if (!out.check.clean) return stop('check-conflict');
-      out.swap = { contained };
-      if (rows.some((row) => row.ref === out.effectiveRef)) out.registered = 'already';
-      if (input.dryRun) {
-        out.wouldRegister = out.registered !== 'already'; out.wouldRemove = []; out.wouldRetain = contained;
-        if (superseding.length) out.wouldSupersede = superseding;
-        if (input.replace) out.wouldReplace = input.replace;
-        if (contained.length) out.wouldStopReason = 'swap-remove-failed';
-        out.ok = true; return out;
-      }
-      stage = 'register-failed';
-      const registeredAt = now();
-      stage = 'no-ready';
-      requireGit('fetch', 'origin', out.effectiveRef);
-      const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
-      if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
-      stage = 'register-failed';
-      if (input.replace) {
-        const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`,
-          `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
-        out.registration = result;
-        const data = lastJson(result);
-        if (data?.registered === true) out.registered = true;
-        if (result.code !== 0 || data?.replaced !== true) {
-          return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
-            fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
-        }
-        const evidence = data.conflictCheck;
-        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
-          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
-        }
-        out.replaced = input.replace;
-        out.superseded = evidence.superseded || [];
-      } else if (out.registered !== 'already' || superseding.length) {
-        const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
-        out.registration = result;
-        if (result.code !== 0) return stop('register-failed');
-        out.registered = true;
-        const evidence = lastJson(result)?.conflictCheck;
-        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
-          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
-        }
-        out.superseded = evidence.superseded || [];
-      }
-      const supersededRefs = (out.superseded || []).map(s => s.entry.ref);
-      // A fresh guard may retain a tip that moved after preview. Re-enter the existing
-      // retained-registration refusal instead of claiming the preview completed a swap.
-      contained.push(...superseding.filter(ref => !supersededRefs.includes(ref)));
-      const readyPath = expand(config.readyRecordPath);
-      fs.mkdirSync(dirname(readyPath), { recursive: true });
-      fs.appendFileSync(readyPath, `${JSON.stringify(producedReady)}\n`, 'utf8');
       const finishSwap = (refs) => {
         for (const ref of refs) {
           // The preview predates the real add (which can fetch newer, cleanly merging tips).
@@ -813,10 +764,66 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // report an incomplete swap rather than claim that an old SHA was safely removed.
         if (refs.length) return stop('swap-remove-failed', {
           detail: 'mutable-registration', swap: { ...out.swap, retained: refs },
-          fallback: `The replacement was adopted, but automatic cleanup cannot safely retire mutable registrations. Keep them registered until their changes land on main and normal rebuild cleanup retires them.${keptNote()}`,
+          fallback: `Automatic cleanup cannot safely retire mutable registrations. Keep them registered until their changes land on main and normal rebuild cleanup retires them.${keptNote()}`,
         });
         return null;
       };
+      out.swap = { contained };
+      if (rows.some((row) => row.ref === out.effectiveRef)) out.registered = 'already';
+      if (input.dryRun) {
+        out.wouldRegister = out.registered !== 'already'; out.wouldRemove = []; out.wouldRetain = contained;
+        if (superseding.length) out.wouldRetain = [...new Set([...contained, ...superseding])];
+        if (input.replace) out.wouldReplace = input.replace;
+        if (contained.length || superseding.length) out.wouldStopReason = 'swap-remove-failed';
+        out.ok = true; return out;
+      }
+      // Guarded add can delete superseded refs during registration. Do not let that
+      // earlier mutation bypass the exact cleanup refusal used after adoption.
+      const supersedeCleanup = finishSwap(superseding);
+      if (supersedeCleanup) return supersedeCleanup;
+      stage = 'register-failed';
+      const registeredAt = now();
+      stage = 'no-ready';
+      requireGit('fetch', 'origin', out.effectiveRef);
+      const movedTip = requireGit('rev-parse', `origin/${out.effectiveRef}`);
+      if (movedTip !== out.effectiveSha) return stop('no-ready', { detail: 'sha-moved', tip: movedTip });
+      stage = 'register-failed';
+      if (input.replace) {
+        const result = loader('replace', out.clone, out.effectiveRef, [`--replaces=${input.replace}`, `--expected-sha=${out.effectiveSha}`, '--refuse-supersede',
+          `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef} replaces ${input.replace}`}`, `--by=${env.USER || 'unknown'}`]);
+        out.registration = result;
+        const data = lastJson(result);
+        if (data?.registered === true) out.registered = true;
+        if (result.code !== 0 || data?.replaced !== true) {
+          return stop(out.registered ? 'replace-incomplete' : 'register-failed', { detail: data?.refused || 'replace failed',
+            fallback: `The old registration ${input.replace} was kept. Fix the refusal and rerun.` });
+        }
+        const evidence = data.conflictCheck;
+        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying.' });
+        }
+        out.replaced = input.replace;
+        out.superseded = evidence.superseded || [];
+      } else if (out.registered !== 'already' || superseding.length) {
+        const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, '--refuse-supersede', `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
+        out.registration = result;
+        if (result.code !== 0) return stop('register-failed');
+        out.registered = true;
+        const evidence = lastJson(result)?.conflictCheck;
+        if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {
+          return stop('register-failed', { detail: 'admitted-sha-unverified', fallback: 'Inspect the candidate registration and loader evidence before retrying; prior registrations were retained.' });
+        }
+        out.superseded = evidence.superseded || [];
+      }
+      const supersededRefs = (out.superseded || []).map(s => s.entry.ref);
+      // A fresh guard may retain a tip that moved after preview. Re-enter the existing
+      // retained-registration refusal instead of claiming the preview completed a swap.
+      for (const ref of superseding.filter(ref => !supersededRefs.includes(ref))) {
+        if (!contained.includes(ref) && rows.some(row => row.ref === ref)) contained.push(ref);
+      }
+      const readyPath = expand(config.readyRecordPath);
+      fs.mkdirSync(dirname(readyPath), { recursive: true });
+      fs.appendFileSync(readyPath, `${JSON.stringify(producedReady)}\n`, 'utf8');
       // A stale preview is not proof that the replacement can pass live smoke. Keep every prior
       // registration until adoption; a blocked rebuild times out with recovery guidance below.
       stage = 'check-unverifiable';

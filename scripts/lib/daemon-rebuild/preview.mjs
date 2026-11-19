@@ -257,6 +257,18 @@ export async function previewOverlayConflict({
     // adopted head by planRebuild, which need not contain what it would supersede: never supersede for it.
     const superseded = candidateRegistered ? []
       : supersededOverlays(scratchGit, existingOverlays, mainSha, candSha, { historyGit: rootGit, headSha: head });
+    // Removing the old identity also removes planRebuild's adopted/graduated-tip
+    // hold. A fresh ref must never launder that unaudited tip via the no-history exemption.
+    // Following tips does not authorize erasing their registration identity.
+    const supersessionAudit = makeAuditedTipGate({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' });
+    for (const { entry, oldTip } of superseded) {
+      if (scratchGit(['merge-base', '--is-ancestor', oldTip, head]).status !== 0
+        && scratchGit(['merge-base', '--is-ancestor', oldTip, mainSha]).status !== 0
+        && supersessionAudit?.(entry.ref, oldTip) !== true) {
+        return { ok: false, reason: 'supersession-unaudited-tip', detail: { ref: entry.ref, tip: oldTip },
+          fallback: 'Retain the registration; audit its exact current tip and retry admission.' };
+      }
+    }
     existingOverlays = existingOverlays.filter(o => !superseded.some(s => s.entry.ref === o.ref));
 
     // 1. Fold every ALREADY-registered overlay using the running HEAD — the SAME `planRebuild` a real rebuild runs —

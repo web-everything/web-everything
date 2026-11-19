@@ -166,6 +166,8 @@ describe('testing ledger union', () => {
     ['after a comment', '# Tests\n<!-- hidden -->\n', ''],
     ['after an unclosed fence', '# Tests\n```md\n- example\n', ''],
     ['after an unclosed comment', '# Tests\n<!--\n- example\n', ''],
+    ['inside quoted HTML', '# Tests\n> <div>\n- example\n', '> </div>\n'],
+    ['after mixed comment and HTML', '# Tests\n<!-- note --> <div>\n- example\n', '</div>\n'],
     ['inside indented code', '# Tests\n\n    example\n', '    continuation\n'],
     ['outside a matching list block', '# Tests\n- existing\n\nprose\n', '\nmore prose\n'],
     ['before a list block', '# Tests\n', '- existing\n'],
@@ -177,6 +179,31 @@ describe('testing ledger union', () => {
     expect(resolveAdvisoryConflicts(f)).toBeNull();
   });
 
+  it.each(['pre', 'div', 'details', 'script', 'style', 'textarea', 'table', 'section', 'address', 'article'])(
+    'round 3: protects raw HTML %s blocks and their neighbouring gaps', async tag => {
+      const { resolveAdvisoryConflicts, resolveAdvisoryInWorktree } = await advisory();
+      const blocks = [
+        [`# Tests\n<${tag}>\n- existing\n`, `</${tag}>\n`],
+        ['# Tests\n- existing\n', `<${tag}>\n- example\n</${tag}>\n`],
+        [`# Tests\n<${tag}>\n- example\n</${tag}>\n`, ''],
+        [`# Tests\n<${tag}>\n- example\n`, ''],
+      ];
+      for (const [before, after] of blocks) {
+        const f = fixture({ testing: [before + after, before + '- ours\n' + after, before + '- theirs\n' + after] });
+        expect(resolveAdvisoryConflicts(f)).toBeNull();
+        expect(f.git(['merge', '--no-edit', f.ovSha]).status).toBe(1);
+        expect(resolveAdvisoryInWorktree({ git: f.git, cwd: f.root })).toBe(false);
+      }
+    },
+  );
+
+  it('round 3: refuses changes to raw HTML balance', async () => {
+    const { resolveAdvisoryConflicts } = await advisory();
+    const base = '# Tests\n<div>\n- example\n</div>\n\n';
+    const f = fixture({ testing: [base, base.replace('</div>', '</section>') + '- ours\n', base + '- theirs\n'] });
+    expect(resolveAdvisoryConflicts(f)).toBeNull();
+  });
+
   it.each([
     ['list append', '# Tests\n', '', '- '],
     ['star append', '# Tests\n', '', '* '],
@@ -185,6 +212,7 @@ describe('testing ledger union', () => {
     ['table header append', '# Tests\n| Header |\n| --- |\n', '', '| '],
     ['after a separated fence', '# Tests\n```md\nexample\n```\n\n', '', '- '],
     ['after a separated comment', '# Tests\n<!-- hidden -->\n\n', '', '- '],
+    ['after separated HTML', '# Tests\n<div>\n<pre>example</pre>\n</div>\n\n', '', '- '],
     ['list block end', '# Tests\n- existing\n', '\nprose\n', '- '],
     ['list block gap', '# Tests\n- existing\n', '- next\n\nprose\n', '- '],
     ['table block end', '# Tests\n| existing |\n', '\nprose\n', '| '],
