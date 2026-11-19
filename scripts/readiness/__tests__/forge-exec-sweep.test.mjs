@@ -72,6 +72,15 @@ describe('production CLI safety defaults', () => {
     expect(JSON.parse(result.stdout).refusals).toEqual([expect.objectContaining({consumer: 'presync'})]);
     expect(await exists(old)).toBe(false);
   });
+  it('CLI refuses unreadable reservations and preserves the affected slot', async () => {
+    const path = await runDir(1, 1, 500);
+    await mkdir(join(receipts, 'worker-active-1'));
+    await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), '{broken');
+    const result = invoke('--apply');
+    expect(result.status, result.stderr).toBe(1);
+    expect(JSON.parse(result.stdout).refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('unreadable reservation')})]);
+    expect(await exists(path)).toBe(true);
+  });
   it('CLI rejects unknown flags with status 2', () => {
     const result = invoke('--unexpected');
     expect(result.status).toBe(2);
@@ -80,6 +89,50 @@ describe('production CLI safety defaults', () => {
 });
 
 describe('slot run dirs are cleaned per run, not per slot', () => {
+  it('shares the tick bound across slots and legacy dirs and reclaims the next batch on the next sweep', async () => {
+    const paths = [];
+    for (const [slot, n] of [[1, 3], [1, 1], [1, 2], [2, 4]]) paths.push(await runDir(slot, n, 500));
+    const legacy = join(root, run(5)); await mkdir(legacy); await age(legacy, 500);
+    const budget = {slots: {maxRunDirsPerTick: 2}};
+    const first = await go({budget});
+    expect(first.candidates.runDirs).toEqual(['slot-1/' + run(1), 'slot-1/' + run(2)]);
+    expect(first.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', examined: 2, remaining: 3}]);
+    expect(first.refusals).toEqual([]);
+    expect(await Promise.all(paths.map(exists))).toEqual([true, false, false, true]);
+    expect(await exists(legacy)).toBe(true);
+    const second = await go({budget});
+    expect(second.candidates.runDirs).toEqual(['slot-1/' + run(3), 'slot-2/' + run(4)]);
+    expect(second.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', examined: 2, remaining: 1}]);
+    expect(await Promise.all(paths.map(exists))).toEqual([false, false, false, false]);
+    expect((await go({budget})).candidates.runDirs).toEqual([run(5)]);
+  });
+  it('counts recent and over-bound trees against the tick budget', async () => {
+    const recent = await runDir(1, 1, 1), huge = await runDir(1, 2, 500), deferred = await runDir(1, 3, 500);
+    await writeFile(join(huge, 'extra'), '');
+    const summary = await go({budget: {slots: {maxRunDirsPerTick: 2, scanEntryBound: 1}}});
+    expect(summary.counts.runDirs).toBe(0);
+    expect(summary.partial).toContainEqual({consumer: 'slots', reason: 'run-dir bound', examined: 2, remaining: 1});
+    expect(await Promise.all([recent, huge, deferred].map(exists))).toEqual([true, true, true]);
+  });
+  it('reports default and overridden scan and tick budget sources', async () => {
+    expect(DEFAULT_BUDGET.slots).toMatchObject({scanEntryBound: 200000, maxRunDirsPerTick: 200});
+    const defaults = await go();
+    expect(defaults.budgetSource).toMatchObject({'slots.scanEntryBound': 'default', 'slots.maxRunDirsPerTick': 'default'});
+    const overridden = await go({budget: {slots: {scanEntryBound: 12, maxRunDirsPerTick: 2}}});
+    expect(overridden.budgetSource).toMatchObject({'slots.scanEntryBound': 'budget', 'slots.maxRunDirsPerTick': 'budget'});
+  });
+  it.each([-1, 0.5, Infinity, '2', Number.MAX_SAFE_INTEGER + 1])('rejects invalid integer bounds %s', async value => {
+    const summary = await go({budget: {slots: {scanEntryBound: value, maxRunDirsPerTick: value}}});
+    expect(summary.budgetSource).toMatchObject({'slots.scanEntryBound': 'default (invalid budget value)',
+      'slots.maxRunDirsPerTick': 'default (invalid budget value)'});
+  });
+  it('a zero tick budget preserves all candidate dirs with an explicit carry-over note', async () => {
+    const path = await runDir(1, 1, 500);
+    const summary = await go({budget: {slots: {maxRunDirsPerTick: 0}}});
+    expect(summary.partial).toEqual([{consumer: 'slots', reason: 'run-dir bound', examined: 0, remaining: 1}]);
+    expect(await exists(path)).toBe(true);
+  });
+
   it('keeps the reserved run while other old runs in the same slot are deleted', async () => {
     const reserved = await runDir(1, 1, 50), old = await runDir(1, 2, 50), other = await runDir(2, 3, 50);
     await reserve(1, 1); await reserve(2, 9); // worker-active-K exists for every slot
@@ -136,7 +189,7 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
     await writeFile(join(receipts, 'worker-active-1', 'reservation.json'), '{not json');
     const summary = await go();
     expect(await exists(dir)).toBe(true);
-    expect(summary.skips.concat(summary.refusals).length).toBeGreaterThan(0);
+    expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('unreadable reservation')})]);
   });
   it('does not follow a symlinked run entry', async () => {
     const outside = join(tmp, 'outside'); await mkdir(outside); await writeFile(join(outside, 'keep'), 'k');
@@ -173,6 +226,14 @@ describe('slot run dirs are cleaned per run, not per slot', () => {
 });
 
 describe('presync keys', () => {
+  it('uses the shared scan bound and preserves oversized keys as partial while reclaiming proven keys', async () => {
+    const large = await presyncKey(1, 100), small = await presyncKey(2, 100);
+    await writeFile(join(large, 'extra'), '');
+    const summary = await go({budget: {slots: {scanEntryBound: 1}}});
+    expect(summary.refusals).toEqual([]);
+    expect(summary.partial).toEqual([expect.objectContaining({consumer: 'presync', reason: 'tree scan bound exceeded'})]);
+    expect(await exists(large)).toBe(true); expect(await exists(small)).toBe(false);
+  });
   it('deletes keys idle more than 72 h, keeps younger ones, never touches keys under 24 h', async () => {
     const stale = await presyncKey(1, 80), mid = await presyncKey(2, 30), young = await presyncKey(3, 5);
     const summary = await go();
@@ -327,15 +388,51 @@ builtins.open = unreadable_status
 });
 
 describe('descriptor-pinned tree deletion and recovery', () => {
-  it('reports oversized trees as refusals with an operator fallback', async () => {
-    const path = await runDir(1, 77, 50), names = Array.from({length: 20_001}, (_, i) => join(path, 'entry-' + i));
-    for (let i = 0; i < names.length; i += 100) {
-      await Promise.all(names.slice(i, i + 100).map(name => writeFile(name, '')));
-    }
-    const summary = await go();
-    expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('stop worker UID and inspect manually')})]);
-    expect(await exists(path)).toBe(true);
+  it('reclaims a tree above the historical 20,000-entry deletion bound with the default budget', async () => {
+    const path = await runDir(1, 77, 500);
+    for (let i = 0; i < 20_001; i++) await writeFile(join(path, 'entry-' + i), '');
+    const summary = await go({now: Date.now() + 500 * H});
+    expect(summary.refusals).toEqual([]);
+    expect(summary.partial).toEqual([]);
+    expect(summary.counts.runDirs).toBe(1);
+    expect(await exists(path)).toBe(false);
   }, 60_000);
+  it('depth-bound exhaustion remains a refusal with the entire tree preserved', async () => {
+    const path = await runDir(1, 1, 500);
+    let nested = path;
+    for (let i = 0; i < 66; i++) { nested = join(nested, 'd'); await mkdir(nested); }
+    const summary = await go();
+    expect(summary.refusals).toEqual([expect.objectContaining({consumer: 'slots', error: expect.stringContaining('depth bound exceeded')})]);
+    expect(summary.partial).toEqual([]);
+    expect(await exists(nested)).toBe(true);
+  });
+  it('lock helper errors refuse and preserve candidate trees', async () => {
+    const path = await runDir(1, 1, 500);
+    const summary = await go({lock: async () => { throw new Error('lock helper failed'); }});
+    expect(summary.refusals).toContainEqual({consumer: 'slots', error: 'lock helper failed'});
+    expect(await exists(path)).toBe(true);
+  });
+  it('preserves an over-bound tree and continues reclaiming the next proven tree', async () => {
+    const path = await runDir(1, 1, 500), next = await runDir(1, 2, 500);
+    await writeFile(join(path, 'extra'), '');
+    const summary = await go({budget: {slots: {scanEntryBound: 1}}});
+    expect(summary.refusals).toEqual([]);
+    expect(summary.partial).toEqual([expect.objectContaining({consumer: 'slots', reason: 'tree scan bound exceeded',
+      path: 'slot-1/' + run(1), fallback: expect.stringContaining('inspect manually')})]);
+    expect(await exists(path)).toBe(true);
+    expect(await exists(next)).toBe(false);
+  });
+  it('CLI emits a partial warning and exits zero for an incomplete entry scan', async () => {
+    const path = await runDir(1, 1, 500);
+    await writeFile(join(path, 'extra'), '');
+    const result = runSweepFixture(tmp, {runRoot: root, pythonMatch: 'result = dict(newest',
+      pythonBefore: "import sys\nsys.argv[3] = '1'"});
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.summary.refusals).toEqual([]);
+    expect(result.summary.partial).toEqual([expect.objectContaining({consumer: 'slots', reason: 'tree scan bound exceeded'})]);
+    expect(result.stderr.trim()).toBe('forge-exec-sweep: partial (slots: tree scan bound exceeded)');
+    expect(await exists(path)).toBe(true);
+  });
   it('holds the production flock during reservation reads and slot deletion while preserving receipt records', async () => {
     const old = await runDir(1, 76, 500), oldReceipt = await receipt(run(76) + '.telemetry', 500);
     await reserve(1, 9);

@@ -4805,3 +4805,17 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Forge sweep partial work
+
+`forge-exec-sweep.mjs` shares `slots.scanEntryBound` (default 200000) between
+slot and presync tree inspection and proven-tree removal. Entry-bound exhaustion
+preserves the tree and reports `partial` with an operator fallback to raise the
+bound or stop writers and inspect manually. Depth limits and filesystem errors
+remain refusals. `slots.maxRunDirsPerTick` (default 200) counts candidate names
+across sorted slots and legacy directories, including recent or oversized trees;
+remaining candidates carry over with an examined/remaining partial note. Persistent
+protected candidates can keep later names deferred; inspect the partial summary
+and adjust the budget when needed. Partial work alone exits zero with a stderr
+warning. Unreadable reservations refuse and preserve the entire affected slot.
+The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
