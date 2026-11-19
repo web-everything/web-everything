@@ -210,6 +210,7 @@ export function parseInfraStore(text) {
     seen.add(key);
     out.push({
       num: String(e.num),
+      ...(e.groupMembers !== undefined ? { groupMembers: e.groupMembers } : {}),
       ref: e.ref != null ? String(e.ref) : null,
       sha: e.sha != null ? String(e.sha) : null,
       base: e.base != null ? String(e.base) : 'main',
@@ -694,6 +695,16 @@ function parseArgv(argv) {
   return { flags, pos };
 }
 
+/** Historical infra records retain the dispatch context, which owns the full group. */
+export function infraRecoveryCard(entry, { readContext } = {}) {
+  if (!entry.builderContext) return entry;
+  if (typeof readContext !== 'function') throw new Error('unproven infra recovery identity');
+  const context = readContext({ WE_BUILD_PR_CONTEXT: entry.builderContext });
+  const card = context?.entry?.payload;
+  if (!card || normNum(card.num) !== normNum(entry.num)) throw new Error('unproven infra recovery identity');
+  return { ...entry, ...card };
+}
+
 /**
  * Resume-open the PR for one recorded entry — the ONLY "resume" mechanism, and it NEVER merges: it re-invokes
  * the producer `pr-land --label-on-green` against the ALREADY-PUSHED lane ref (fetched from origin so the tip
@@ -705,7 +716,25 @@ function parseArgv(argv) {
  * {@link markRefusedAttempt} vs {@link markRetryAttempt}. Best-effort — a failure just bumps the attempt (or,
  * for a refusal, does not — see that function's own docblock).
  */
-function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
+export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext, admission: adapter } = {}) {
+  // Keep this watchdog dependency free of driver policy. Launchers must supply the
+  // shared fresh-read gate; a missing or incomplete adapter requires operator repair.
+  if (typeof adapter?.assertRuntimeAdmitted !== 'function' || typeof adapter?.withRuntimeAdmission !== 'function') {
+    return { ok: false, refused: true, admission: true, reason: 'runtime admission adapter missing',
+      detail: 'Retry through the build daemon with its runtime admission adapter; entry retained.' };
+  }
+  const { assertRuntimeAdmitted, withRuntimeAdmission } = adapter;
+  try { entry = infraRecoveryCard(entry, { readContext }); }
+  catch { return { ok: false, refused: true, admission: true, reason: 'unproven infra recovery identity', detail: 'unproven infra recovery identity' }; }
+  // Recheck in the child: tick-local admission does not cross a process boundary.
+  const admission = assertRuntimeAdmitted(entry, 'infra-recovery', { readSettings });
+  if (!admission.admitted) return { ok: false, refused: true, admission: true, reason: admission.reason, detail: admission.reason };
+  const groupMembers = entry.groupMembers ?? [];
+  if (!Array.isArray(groupMembers)) return { ok: false, refused: true, admission: true, reason: 'invalid group', detail: 'invalid group' };
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readSettings }).admitted)) {
+    return { ok: false, refused: true, admission: true, reason: 'runtime admission refused group', detail: 'runtime admission refused group' };
+  }
+  const readResumeGit = (args, options) => exec('git', args, options);
   const ref = entry?.ref;
   const base = entry?.base || 'main';
   if (!ref) return { ok: false, detail: 'no resumable ref recorded' };
@@ -718,7 +747,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   // The ref is already on origin (it was pushed before the open failed). Fetch its objects so pr-land's push of
   // <sha>:<ref> is a local no-op and the create has a head to point at.
   // #x5n4zn3 — was bare (no timeout): a real network fetch.
-  try { execFileSync('git', ['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
+  try { readResumeGit(['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
   catch (e) {
     // An OUTAGE during the fetch is an infra failure (the attempt/backoff budget), never a refusal — otherwise
     // the tip check below would read "no ref" and burn the refusal budget under a misleading `bad-ref`. Any
@@ -728,7 +757,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   }
   // PR #2899 review — pin the resume to the RECORDED (verified) sha, and refuse if the ref moved since.
   let tipSha = null;
-  try { tipSha = execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
+  try { tipSha = readResumeGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
   catch { tipSha = null; }
   const pin = resumeShaDecision({ recordedSha: entry.sha, tipSha, ref });
   if (!pin.ok) return { ok: false, refused: true, reason: pin.reason, detail: pin.detail };
@@ -768,7 +797,9 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
     // #x5n4zn3 — was bare (no timeout). `pr-land.mjs --label-on-green` has its OWN internal wait-for-green
     // deadline (`--timeout-min`, default 15 min) — this outer bound must exceed that, with margin for gh/push
     // overhead, or it would kill a wait pr-land itself would have given up on cleanly moments later.
-    const res = parse(execFileSync('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }));
+    const launched = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }), { readSettings });
+    if (launched?.outcome === 'runtime-refused') return { ...launched, admission: true };
+    const res = parse(launched);
     return { ok: true, prNumber: res.pr ?? null, detail: res.detail || 'resume-opened' };
   } catch (e) {
     const res = parse(e.stdout);
@@ -784,7 +815,11 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   }
 }
 
-async function main(argv) {
+export async function runInfraBlocked(argv, {
+  admission, readContext, exec, readSettings,
+  fetchStatus = fetchGithubStatus, readLocalSlug = originSlugOf,
+  writeReport = text => writeAllSync(1, text),
+} = {}) {
   const { flags, pos } = parseArgv(argv);
   const sub = pos[0] || 'list';
   const path = resolveInfraStorePath();
@@ -826,7 +861,7 @@ async function main(argv) {
   }
 
   if (sub === 'github-status') {
-    const status = await fetchGithubStatus();
+    const status = await fetchStatus();
     process.stdout.write(JSON.stringify(status) + '\n');
     return 0;
   }
@@ -847,8 +882,8 @@ async function main(argv) {
       process.stdout.write(JSON.stringify({ retried: [], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] }) + '\n');
       return 0;
     }
-    const status = await fetchGithubStatus();
-    const localSlug = originSlugOf(INFRA_ROOT);
+    const status = await fetchStatus();
+    const localSlug = readLocalSlug(INFRA_ROOT);
     const only = flags.num ? normNum(flags.num) : null;
     // #4348-open-pr-retry addendum — `failed` (`{num, detail, refused?}`) is NEW: before this, a resume failure's
     // own `detail` reached only `log()` on stderr, never the JSON a caller (the build-dispatch daemon's own
@@ -858,9 +893,11 @@ async function main(argv) {
     for (const entry of snapshot) {
       const key = normNum(entry.num);
       if (only && key !== only) continue;
-      // Refine the cause (real outage vs one-off) — persist it under the lock so the board/operator sees it.
+      // Refine the cause, but defer persistence until admission answers: a held entry stays untouched.
       const refined = correlateCause(entry.cause, status);
-      if (refined !== entry.cause) mutateInfraStore((s) => updateCause(s, entry.num, refined), { path });
+      const persistCause = () => {
+        if (refined !== entry.cause) mutateInfraStore((s) => updateCause(s, entry.num, refined), { path });
+      };
       let decision = retryDecision({ ...entry, cause: refined }, { now: Date.now(), maxAttempts });
       // Capped by an outage that has since passed: re-arm through the same pure transform + lock as the `rearm`
       // verb (never a hand-edit), bounded by the maxAutoRearms knob. It is retried on the NEXT pass.
@@ -883,12 +920,18 @@ async function main(argv) {
           }
         }
       }
-      if (decision.action === 'surface') { surfaced.push({ num: entry.num, cause: refined, attempt: entry.attempt, reason: decision.reason }); continue; }
-      if (decision.action === 'wait') { waiting.push({ num: entry.num, waitSec: Math.round((decision.waitMs || 0) / 1000) }); continue; }
+      if (decision.action === 'surface') { persistCause(); surfaced.push({ num: entry.num, cause: refined, attempt: entry.attempt, reason: decision.reason }); continue; }
+      if (decision.action === 'wait') { persistCause(); waiting.push({ num: entry.num, waitSec: Math.round((decision.waitMs || 0) / 1000) }); continue; }
       // action === 'retry' → attempt a resume-open (never a local merge). The resume itself is UNLOCKED (it can
       // block for minutes on pr-land's green-wait); only the short store mutation after it takes the lock.
+      const r = resumeOpen(entry, { localSlug, admission, readContext, exec, readSettings });
+      if (r.admission) {
+        failed.push({ num: entry.num, detail: r.detail, refused: true, admission: true, reason: r.reason });
+        log('  admission held for #' + entry.num + ': ' + r.detail + '; entry retained for next tick or operator repair');
+        continue;
+      }
       retried.push(entry.num);
-      const r = resumeOpen(entry, { localSlug });
+      persistCause();
       if (r.skip) { surfaced.push({ num: entry.num, cause: refined, attempt: entry.attempt, reason: 'cross-repo' }); log(`  ⊘ #${entry.num} ${r.detail}`); continue; }
       if (r.ok) { mutateInfraStore((s) => removeInfraBlock(s, entry.num), { path }); resumed.push({ num: entry.num, pr: r.prNumber ?? null }); continue; }
       if (r.refused) {
@@ -903,7 +946,7 @@ async function main(argv) {
       failed.push({ num: entry.num, detail: r.detail });
       log(`  ⊘ #${entry.num} resume still failing (${r.detail}) — backing off`);
     }
-    writeAllSync(1, JSON.stringify({ retried, resumed, surfaced, waiting, failed, rearmed }) + '\n');
+    writeReport(JSON.stringify({ retried, resumed, surfaced, waiting, failed, rearmed }) + '\n');
     return 0;
   }
 
@@ -912,7 +955,7 @@ async function main(argv) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main(process.argv.slice(2)).then((code) => process.exit(code || 0)).catch((e) => {
+  runInfraBlocked(process.argv.slice(2)).then((code) => process.exit(code || 0)).catch((e) => {
     process.stderr.write(`infra-blocked: ${String(e?.message || e)}\n`);
     process.exit(1);
   });

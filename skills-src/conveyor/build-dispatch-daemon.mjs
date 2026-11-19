@@ -35,6 +35,9 @@ import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/bui
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
 import { readPreparePolicy } from '../../scripts/conveyor/prepare-policy-settings.mjs';
+import { readInfraStore, resolveInfraStorePath, infraRecoveryCard, runInfraBlocked } from '../../scripts/conveyor/infra-blocked.mjs';
+import { producerBuildContext } from '../../scripts/operations/build-pr-authorship.mjs';
+import { withRuntimeAdmission, assertRuntimeAdmitted, validRuntimeGroupMembers } from '../../scripts/lib/runtime-admission.mjs';
 import { readBuildPrioritySettings } from '../../scripts/lib/build-queue.mjs';
 import { readBuildGroupingSettings, formatBuildGroupingLine, planBuildGroups, retireMemberWhy } from '../../scripts/conveyor/build-grouping.mjs';
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
@@ -2094,7 +2097,8 @@ export function primaryInfraStoreEnv({ env = process.env, home = homedir() } = {
  * `cli*` shell function in this file. `exec`/`env`/`home` are injectable so a test can assert the child env
  * really carries the primary store path (that env line IS the #4348 fix).
  *
- * #4517 — `timeoutMs` (default {@link INFRA_RETRY_TIMEOUT_MS}) bounds the child via `execFileSync`'s own
+ * #4517 — `timeoutMs` (default {@link INFRA_RETRY_TIMEOUT_MS}) is one deadline for the entire pass.
+ * Each child receives only the remaining budget via `execFileSync`'s own
  * `timeout`/`killSignal` options, so a slow nested `pr-land --label-on-green` CI wait can never block this call
  * — and therefore the daemon tick that `await`s it — past that bound. A killed-on-timeout result carries
  * `timedOut: true` (detected from `e.signal === 'SIGTERM'` or `e.code === 'ETIMEDOUT'`) so a caller/log can tell
@@ -2103,17 +2107,62 @@ export function primaryInfraStoreEnv({ env = process.env, home = homedir() } = {
  * `node infra-blocked.mjs retry` child; a `pr-land` grandchild it may itself be waiting on is not signaled and
  * can outlive the bound as a harmless orphan (its own stdio is independently piped by `infra-blocked.mjs`'s own
  * `execFileSync` call, never inherited from this one, so an orphaned grandchild cannot hold this call's pipes
- * open or delay its return — see this file's own test for a real, non-fake-exec proof of exactly that shape). */
+ * open or delay its return — see this file's own test for a real, non-fake-exec proof of exactly that shape).
+ * Exhausting the pass deadline reports the untouched remaining entries as waiting for the next tick. */
 export function cliRetryInfraBlocked({
   exec = execFileSync, env = process.env, home = homedir(), timeoutMs = INFRA_RETRY_TIMEOUT_MS,
+  readEntries = path => readInfraStore(path), now = () => performance.now(),
 } = {}) {
+  const deadline = now() + timeoutMs;
   try {
-    const text = exec('node', [join(SCRIPTS, 'conveyor', 'infra-blocked.mjs'), 'retry'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, cwd: REPO_ROOT,
-      timeout: timeoutMs, killSignal: 'SIGTERM',
-      env: { ...env, ...primaryInfraStoreEnv({ env, home }) },
-    });
-    return JSON.parse(text || '{}');
+    const childEnv = { ...env, ...primaryInfraStoreEnv({ env, home }) };
+    const entries = readEntries(childEnv.CONVEYOR_INFRA_FILE || resolveInfraStorePath());
+    const result = { retried: [], resumed: [], surfaced: [], waiting: [], failed: [], rearmed: [] };
+    const deferRemaining = index => {
+      // Nothing is removed from the store: deferred cards retry on the next daemon tick.
+      result.timedOut = true;
+      result.waiting.push(...entries.slice(index).map(entry => ({
+        num: entry.num, reason: 'infra-retry-deadline; retained for next tick', waitSec: 0,
+      })));
+      return result;
+    };
+    for (const [index, stored] of entries.entries()) {
+      if (now() >= deadline) return deferRemaining(index);
+      let entry;
+      try { entry = infraRecoveryCard(stored, { readContext: producerBuildContext }); }
+      catch {
+        // A damaged historical context refuses only its own card, never the rest of the pass.
+        result.failed.push({ num: stored.num, refused: true, reason: 'unproven infra recovery identity',
+          detail: 'Entry retained; repair its original dispatch context before retrying.' });
+        continue;
+      }
+      if (!validRuntimeGroupMembers(entry.groupMembers)) {
+        result.failed.push({ num: entry.num, refused: true, reason: 'runtime-malformed',
+          detail: 'Entry retained; repair groupMembers before retrying.' });
+        continue;
+      }
+      const admission = assertRuntimeAdmitted(entry, 'infra-recovery');
+      if (!admission.admitted) { result.failed.push({ num: entry.num, refused: true, reason: admission.reason }); continue; }
+      const groupMembers = entry.groupMembers ?? [];
+      if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery').admitted)) {
+        result.failed.push({ num: entry.num, refused: true, reason: 'runtime admission refused group' }); continue;
+      }
+      // Charge validation and earlier retries to the same pass deadline; never give each card a fresh budget.
+      const remainingMs = Math.floor(deadline - now());
+      if (remainingMs <= 0) return deferRemaining(index);
+      // Scope the child to this admitted identity; an unrestricted retry can publish other cards' PRs.
+      const text = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', [fileURLToPath(import.meta.url), '--infra-retry', 'retry', `--num=${entry.num}`], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, cwd: REPO_ROOT,
+        timeout: remainingMs, killSignal: 'SIGTERM',
+        env: childEnv,
+      }));
+      if (text?.outcome === 'runtime-refused') { result.failed.push({ num: entry.num, refused: true, reason: text.reason }); continue; }
+      const pass = JSON.parse(text || '{}');
+      // Only collections participate in aggregation; error/deadline metadata stays separate.
+      for (const key of ['retried', 'resumed', 'surfaced', 'waiting', 'failed', 'rearmed']) result[key].push(...(pass[key] ?? []));
+      if (pass.error) result.error = result.error ? `${result.error}\n${pass.error}` : pass.error;
+    }
+    return result;
   } catch (e) {
     const timedOut = e?.signal === 'SIGTERM' || e?.code === 'ETIMEDOUT';
     return {
@@ -2131,6 +2180,8 @@ export function cliRetryInfraBlocked({
  * dispatch logs so a stuck landing is discoverable the same way a stuck build dispatch already is.
  */
 export async function cliSpawnHoldLand(entry) {
+  const admission = assertRuntimeAdmitted(entry, 'route');
+  if (!admission.admitted) return { spawned: false, reason: admission.reason };
   const { defaultSpawnDetached, deliveryDispatchLogPath } = await import('../../scripts/operations/detached-dispatch.mjs');
   const argv = [
     join(SCRIPTS, 'operations', 'build-dispatch-hold-route-land.mjs'),
@@ -2139,7 +2190,7 @@ export async function cliSpawnHoldLand(entry) {
   if (entry.commit) argv.push(`--commit=${entry.commit}`);
   if (entry.reason) argv.push(`--reason=${entry.reason}`);
   const logPath = deliveryDispatchLogPath(`hold-route-${entry.num}`, REPO_ROOT);
-  return defaultSpawnDetached(argv, { cwd: REPO_ROOT, logPath });
+  return withRuntimeAdmission(entry, 'route', () => defaultSpawnDetached(argv, { cwd: REPO_ROOT, logPath, card: entry, kind: 'route' }));
 }
 
 /** #4465 — the real IO wiring for `runBuildDispatchTick`'s `effects.routeHeldItems`: dedup via
@@ -3213,6 +3264,11 @@ function rearm(flags) {
 }
 
 async function main(argv) {
+  // This child owns policy imports; infra-blocked stays in the watchdog's small closure.
+  if (argv[0] === '--infra-retry') {
+    process.exitCode = await runInfraBlocked(argv.slice(1), { admission: { assertRuntimeAdmitted, withRuntimeAdmission }, readContext: producerBuildContext });
+    return;
+  }
   installDaemonLog(); // item 68a/68b: ISO stamp, collapse identical repeats, size-rotate (see daemon-log.mjs)
   const flags = parseFlags(argv);
   if (flags['rearm-false-holds']) return rearm(flags);
