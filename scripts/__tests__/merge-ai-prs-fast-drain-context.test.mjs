@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
   fastDrainListingAfterBranches, validateLeanOpenPrs, LEAN_OPEN_PR_FIELDS } from '../lib/fast-drain-context.mjs';
-import { cachedDefaultBranch, DEFAULT_BRANCH_CACHE_TTL_MS, resolveCachedDefaultBranch } from '../lib/default-branch-cache.mjs';
+import { cachedDefaultBranch, DEFAULT_BRANCH_CACHE_TTL_MS, resolveCachedDefaultBranch, createLiveDefaultBranchReader } from '../lib/default-branch-cache.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, DEFAULT_TTL_MS } from '../lib/pr-snapshot.mjs';
 import { snapshotPath, PR_SNAPSHOT_VERSION, markPrSnapshotDirty } from '../lib/pr-snapshot-store.mjs';
 import { resolveFastDrainListingSetting } from '../lib/fast-drain-scope.mjs';
@@ -234,24 +234,56 @@ test('default branch cache rejects stale, future, missing and ambiguous names', 
   }
 });
 
-test('failed default-branch live read retains warning and the existing non-default-base hold-off', async () => {
+test('failed live default-branch resolution fails closed even with a cached hint', async () => {
   const warnings = [], map = new Map();
-  const branch = await resolveCachedDefaultBranch({ repo, map, readCache: () => null,
-    readLive: async () => { throw new Error('fixture branch unreadable'); }, warn: e => warnings.push(e.message) });
+  const verify = createLiveDefaultBranchReader({ map, readLive: async () => { throw new Error('fixture branch unreadable'); },
+    warn: e => warnings.push(e.message) });
+  const branch = await verify(repo);
   assert.deepEqual(warnings, ['fixture branch unreadable']);
-  assert.equal(map.has(repo), false);
-  assert.equal(revalidateForMerge(pr(7, { baseRefName: 'develop' }), { defaultBranch: branch }).decision, 'merge');
-  const live = runFastDrainContextCli({ failDefaultBranch: true, outputAsJson: false });
-  assert.equal(live.status, 0, live.stderr);
-  assert.match(live.stderr, /default branch unresolved .* — the non-default-base hold is off for it this pass/);
+  assert.equal(map.get(repo), null);
+  const verdict = revalidateForMerge(pr(7), { defaultBranch: branch });
+  assert.equal(verdict.decision, 'skip');
+  assert.match(verdict.reason, /default branch unresolved live.*deferring merge\/enqueue/);
+  for (const killSwitch of [false, true]) {
+    const live = runFastDrainContextCli({ failDefaultBranch: true, cachedBranch: 'main', killSwitch });
+    assert.equal(live.status, 0, live.stderr);
+    const result = JSON.parse(live.stdout);
+    assert.deepEqual(result.toMerge, []);
+    assert.deepEqual(result.enqueueOutcomes ?? [], []);
+    assert.ok(result.skipped.some(v => /default branch unresolved live/.test(v.reason)), live.stdout);
+    assert.match(live.stderr, /default branch unresolved live .* — deferring merge\/enqueue/);
+  }
 });
 
-test('default branch completes before synchronous pages start, including the full-list fallback', async () => {
-  const events = [];
+test('gate-time live branch read starts after synchronous pages and never uses a hint as authority', async () => {
+  const events = [], hints = new Map();
+  const verify = createLiveDefaultBranchReader({ readLive: async () => {
+    events.push('live start'); await setImmediate(); events.push('live done'); return 'develop';
+  }, writeCache: () => {} });
   await fastDrainListingAfterBranches({
-    resolveBranches: async () => { events.push('branch start'); await setImmediate(); events.push('branch done'); },
-    list: () => { events.push('sync pages start'); assert.deepEqual(events, ['branch start', 'branch done', 'sync pages start']); },
+    resolveBranches: () => resolveCachedDefaultBranch({ repo, map: hints, readCache: () => 'main' }),
+    list: () => { events.push('sync pages done'); },
   });
+  assert.deepEqual(events, ['sync pages done']);
+  assert.equal(await verify(repo), 'develop');
+  assert.deepEqual(events, ['sync pages done', 'live start', 'live done']);
+});
+
+test('cached main and parent round main cannot authorize a PR when live default is develop', () => {
+  for (const killSwitch of [false, true]) {
+    const live = runFastDrainContextCli({ cachedBranch: 'main', roundBranch: 'main', liveDefaultBranch: 'develop', killSwitch });
+    assert.equal(live.status, 0, live.stderr);
+    const result = JSON.parse(live.stdout);
+    assert.deepEqual(result.toMerge, []);
+    assert.ok(result.skipped.some(v => v.num === 7 && v.reason === 'base is not develop (main)'), live.stdout);
+    assert.equal(live.cachedBranch, 'develop');
+    const branchCalls = live.calls.filter(a => a[0] === 'repo' && a[1] === 'view');
+    assert.equal(branchCalls.length, 1);
+    const branchIndex = live.calls.indexOf(branchCalls[0]);
+    assert.ok(live.calls.every((a, i) => !(a[0] === 'pr' && a[1] === 'list'
+      || a[0] === 'api' && a.some(v => v.includes('pullRequests(states:OPEN'))) || i < branchIndex));
+    if (!killSwitch) assert.equal(live.fullListings, 0);
+  }
 });
 
 test('lean inventory validation rejects an unknown state and never requests heavy fields', () => {

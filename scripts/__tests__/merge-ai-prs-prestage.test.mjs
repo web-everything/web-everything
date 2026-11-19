@@ -23,7 +23,10 @@ fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\\n\\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
 const page = ${openPrPageFixture};
-if (a[0] === 'repo') out('main');
+if (a[0] === 'repo') {
+  if (process.env.PRESTAGE_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture live default branch unreadable'); process.exit(1); }
+  out(process.env.PRESTAGE_DEFAULT_BRANCH);
+}
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
 if (a[0] === 'pr' && a[1] === 'list') out([pr]);
@@ -86,12 +89,14 @@ async function world(fn, { slug = 'fixture/prestage' } = {}) {
       commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
       statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
       comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-    const run = (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off' } = {}) => {
+    const run = (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
       writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
       const r = spawnSync(process.execPath, [script, ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
         '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
         ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
         env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
+          PRESTAGE_DEFAULT_BRANCH:defaultBranch, PRESTAGE_FAIL_BRANCH:failDefaultBranch ? '1' : '0',
+          ...(failDefaultBranch ? { WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS:'1' } : {}),
           WE_COORDINATION_ROOT:coord, WE_ASYNC_DRAIN:shadowMode, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
           WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
           WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0',
@@ -463,6 +468,38 @@ describe('real drain pre-stage path', () => {
     const next = run(true, { numbering:true });
     expect(next.stderr).toContain('full fast drain');
     expect(next.report.prestaged).not.toBe(true);
+  }));
+  it('prestage refuses enqueue when the live default branch changed after preparation', () => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('prepared while CI pending (eligible=true)');
+    const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
+    expect(cache.get('fixture/prestage', 42, 30)).toMatchObject({ eligible:true, baseRefName:'main' });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { defaultBranch:'develop' });
+    // The shortcut's guard must run before fallback listing/classification can defend admission.
+    const branchAt = next.calls.findIndex(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef'));
+    const listingAt = next.calls.findIndex(a => a.some(x => x.includes('pullRequests(')));
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(listingAt).toBeGreaterThan(branchAt);
+    expect(next.calls.slice(0, listingAt).filter(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef')), JSON.stringify(next.calls)).toHaveLength(1);
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.report.skipped).toEqual(expect.arrayContaining([expect.objectContaining({num:42,reason:'base is not develop (main)'})]));
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(0);
+  }));
+  it('prestage fails closed without enqueue when its live default-branch read fails', () => world(({pr,run,coord}) => {
+    expect(run().stderr).toContain('prepared while CI pending (eligible=true)');
+    const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
+    expect(cache.get('fixture/prestage', 42, 30)).toMatchObject({ eligible:true, baseRefName:'main' });
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    const next = run(true, { failDefaultBranch:true });
+    const branchAt = next.calls.findIndex(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef'));
+    const listingAt = next.calls.findIndex(a => a.some(x => x.includes('pullRequests(')));
+    expect(branchAt).toBeGreaterThan(-1);
+    expect(listingAt).toBeGreaterThan(branchAt);
+    expect(next.calls.slice(0, listingAt).filter(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef')), JSON.stringify(next.calls)).toHaveLength(1);
+    expect(next.report.prestaged).not.toBe(true);
+    expect(next.stderr).toContain('default branch unresolved live');
+    expect(next.report.skipped).toEqual(expect.arrayContaining([expect.objectContaining({num:42,reason:expect.stringContaining('deferring merge/enqueue')})]));
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(0);
   }));
   it('prepares while pending, then a green event enqueues without listing or gate reads', () => world(({pr,run,coord}) => {
     const first = run();

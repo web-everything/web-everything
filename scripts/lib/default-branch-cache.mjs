@@ -1,7 +1,7 @@
 /** Host-wide, advisory default-branch reads. One atomic file per GitHub host/repo,
  * outside checkouts, retained for one hour. Cache failures always leave the live
- * reader available; failed live reads retain the drain's existing hold-off warning.
- * Test/fake-GitHub processes require an explicit cache directory.
+ * reader available. Hints never authorize a merge: gate-time verification is live,
+ * once per repo/process, and failures defer. Test/fake-GitHub processes require an explicit cache directory.
  */
 import { mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -49,22 +49,42 @@ export function writeDefaultBranchCache(repo, name, { env = process.env, now = D
   } catch { return false; }
 }
 
-/** The drain's exact lookup order, with transport/cache IO injectable for hermetic probes. */
+/** Listing/ordering hints only. No network IO and no authority to merge. */
 export async function resolveCachedDefaultBranch({ repo, map, key = repo, readRound = () => null,
-  readCache = readDefaultBranchCache, writeCache = writeDefaultBranchCache, readLive, warn = () => {} }) {
+  readCache = readDefaultBranchCache }) {
   if (map.has(key)) return map.get(key);
   let name;
-  try { name = readRound(); } catch { /* Corrupt round metadata cannot hide the other sources. */ }
+  try { name = readRound(); } catch { /* Corrupt round metadata cannot hide the host hint. */ }
   if (!validDefaultBranch(name)) {
-    try { name = readCache(repo); } catch { /* Cache IO failure: read live. */ }
+    try { name = readCache(repo); } catch { /* Gate-time verification remains mandatory. */ }
   }
-  if (!validDefaultBranch(name)) {
-    try {
-      name = (await readLive()).trim();
-      if (!validDefaultBranch(name)) throw new Error('default branch unreadable');
-      try { writeCache(repo, name); } catch { /* Cache writes never fail a successful live read. */ }
-    } catch (e) { warn(e); return null; }
-  }
+  if (!validDefaultBranch(name)) return null;
   map.set(key, name);
   return name;
+}
+
+/** Call only after synchronous listing work. Memoize successes AND failures, so concurrent
+ * admissions share one live read per repo/process. This map must never contain cache hints.
+ */
+export function createLiveDefaultBranchReader({ readLive, map = new Map(), writeCache = writeDefaultBranchCache,
+  warn = () => {} }) {
+  const pending = new Map();
+  return repo => {
+    if (!pending.has(repo)) pending.set(repo, (async () => {
+      try {
+        const raw = await readLive(repo);
+        const name = typeof raw === 'string' ? raw.trim() : null;
+        if (!validDefaultBranch(name)) throw new Error('default branch unreadable');
+        map.set(repo, name);
+        try { writeCache(repo, name); } catch { /* Cache failure cannot invalidate live evidence. */ }
+        return name;
+      } catch (e) { map.set(repo, null); warn(e, repo); return null; }
+    })());
+    return pending.get(repo);
+  };
+}
+
+export function defaultBranchHold(base, liveBranch) {
+  if (!validDefaultBranch(liveBranch)) return 'default branch unresolved live — deferring merge/enqueue; retry in a new drain process';
+  return base === liveBranch ? null : `base is not ${liveBranch} (${base || 'unreadable'})`;
 }

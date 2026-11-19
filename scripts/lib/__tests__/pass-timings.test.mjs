@@ -95,6 +95,10 @@ describe('formatTimingsSummary', () => {
     expect(formatTimingsSummary(timer.snapshot(), { order: PASS_STEP_ORDER }))
       .toBe('setup.opsFetch=21ms setup.policy=12ms setup.other=1ms listing=2ms total=36ms');
   });
+  it('reports live branch verification after listing and before classification', () => {
+    expect(formatTimingsSummary({ classifyGateReads: 3, 'gate.defaultBranch': 2, listing: 1 }, { order: PASS_STEP_ORDER }))
+      .toBe('listing=1ms gate.defaultBranch=2ms classifyGateReads=3ms total=6ms');
+  });
   it('renders label=NNNms pairs plus a trailing total, in caller order', () => {
     const line = formatTimingsSummary({ b: 20, a: 10 }, { order: ['a', 'b'] });
     expect(line).toBe('a=10ms b=20ms total=30ms');

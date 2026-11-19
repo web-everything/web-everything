@@ -835,6 +835,7 @@ export function createEnqueueOnEvent({
       || pr.state && pr.state !== 'OPEN') { missBackoff.delete(num); return null; }
     return now() - held.at < missSettings(s).ttlMinutes * 60_000 ? held : null;
   };
+  let defaultBranchReadAt = null; // Only an actual live read in this daemon can timestamp branch evidence.
   let listingSnapshot = null;
   const snapshotPrefix = `we-fast-drain-${process.pid}-${randomUUID()}`;
   const clearSnapshot = () => {
@@ -945,6 +946,7 @@ export function createEnqueueOnEvent({
           { cwd, env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
         if (typeof branch !== 'string' || !branch.trim() || branch.trim() === 'null') throw new Error('default branch unreadable');
         defaultBranch = branch.trim();
+        defaultBranchReadAt = now();
       } catch {
         log('enqueue-on-event: default branch unreadable — deferring wakes and catch-up; retrying on next tick');
         return [];
@@ -983,7 +985,8 @@ export function createEnqueueOnEvent({
         catchUpRound++;
         clearSnapshot();
         listingSnapshot = join(tmpdir(), `${snapshotPrefix}-${catchUpRound}.json`);
-        writeRoundSnapshot({ path: listingSnapshot, repo: localSlug, defaultBranch, now: now() });
+        if (defaultBranchReadAt !== null) writeRoundSnapshot({ path: listingSnapshot, repo: localSlug,
+          defaultBranch, observedAt: defaultBranchReadAt });
         listedPrs = result.prs;
         catchUpMainCiRunId = result.mainCiRunId;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));

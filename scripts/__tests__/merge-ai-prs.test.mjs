@@ -292,13 +292,17 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('fixture/repo'))).toBe(true);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
-  it('re-lists fresh snapshot context live without resolving the stored default branch', () => {
+  it('re-lists fresh snapshot context then verifies the default branch live exactly once', () => {
     const { stderr, calls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
       && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
     expect(localListings).toHaveLength(1);
-    expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
+    const branchReads = calls.filter(a => a[0] === 'repo' && a[1] === 'view');
+    expect(branchReads).toHaveLength(1);
+    const branchIndex = calls.indexOf(branchReads[0]);
+    expect(calls.every((a, i) => !(a[0] === 'api' && a[1] === 'graphql'
+      && a.some(v => v.includes('pullRequests(states:OPEN'))) || i < branchIndex)).toBe(true);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
   });
   it('discovers blockers live after an expired round is refreshed too', () => {
@@ -355,21 +359,16 @@ it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => 
 });
 
 
-it('retries a failed default-branch read on a later call and caches the successful read', async () => {
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
-  const end = source.indexOf('\n  let [listings]', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
-  const cache = new Map();
-  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
-    .mockResolvedValueOnce({ stdout: 'trunk\n' });
-  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
-    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
-  await resolveDefaultBranch('fixture/repo');
-  expect(cache.has('fixture/repo')).toBe(false);
-  await resolveDefaultBranch('fixture/repo');
-  expect(cache.get('fixture/repo')).toBe('trunk');
-  await resolveDefaultBranch('fixture/repo');
+it('a failed live default-branch gate stays closed in this process; a new process verifies again', async () => {
+  const { createLiveDefaultBranchReader, defaultBranchHold } = await import('../lib/default-branch-cache.mjs');
+  const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure')).mockResolvedValueOnce('trunk\n');
+  const options = { readLive: read, writeCache: () => {} };
+  const firstProcess = createLiveDefaultBranchReader(options);
+  expect(defaultBranchHold('main', await firstProcess('fixture/repo'))).toContain('deferring merge/enqueue');
+  expect(await firstProcess('fixture/repo')).toBeNull();
+  expect(read).toHaveBeenCalledOnce();
+  const newProcess = createLiveDefaultBranchReader(options);
+  expect(await newProcess('fixture/repo')).toBe('trunk');
+  expect(await newProcess('fixture/repo')).toBe('trunk');
   expect(read).toHaveBeenCalledTimes(2);
 });

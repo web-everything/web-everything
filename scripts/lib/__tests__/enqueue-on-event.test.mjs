@@ -2216,7 +2216,7 @@ describe('catch-up round listing and admission', () => {
     ['DIRTY', { mergeStateStatus: 'DIRTY' }],
   ];
   it('shares one snapshot path per round, rotates it, and leaves event children unchanged', async () => {
-    const { handle, calls, advance } = catchUpSetup({ writeRoundSnapshot: undefined }); // exercise the production atomic writer
+    const { handle, calls, advance } = catchUpSetup({ writeRoundSnapshot: undefined, defaultBranch: undefined, execFileSyncImpl: () => 'main' }); // exercise the production atomic writer
     await handle.catchUp();
     const snapshot = args => args.find(a => a.startsWith('--listing-snapshot='));
     const first = snapshot(calls[0].args);
@@ -2226,6 +2226,7 @@ describe('catch-up round listing and admission', () => {
     const record = JSON.parse(readFileSync(path, 'utf8'));
     expect(record.defaultBranch).toBe('main');
     expect(record.repo).toBe(REPO);
+    expect(record.defaultBranchReadAt).toBe(1000);
     expect(readFastDrainRoundDefaultBranch({ path, repo: REPO, now: record.writtenAt })).toBe('main');
     expect(readFastDrainRoundSnapshot({ path, repo: REPO, now: record.writtenAt })).toBeNull(); // metadata never claims a complete PR set
     writeFileSync(path, '{}');
@@ -2238,6 +2239,33 @@ describe('catch-up round listing and admission', () => {
     expect(snapshot(calls.at(-1).args)).not.toBe(first);
     expect(existsSync(path)).toBe(false);
     handle.kill();
+  });
+  it('catch-up rounds preserve the original live branch timestamp without a new live read', async () => {
+    const execFileSyncImpl = vi.fn(() => 'main');
+    const writeRoundSnapshot = vi.fn();
+    const { handle, advance } = catchUpSetup({ defaultBranch: undefined, execFileSyncImpl, writeRoundSnapshot });
+    try {
+      await handle.catchUp();
+      expect(writeRoundSnapshot).toHaveBeenCalledOnce();
+      expect(writeRoundSnapshot.mock.calls[0][0]).toMatchObject({ defaultBranch: 'main', observedAt: 1000 });
+      advance(600_000);
+      await handle.catchUp();
+      expect(writeRoundSnapshot).toHaveBeenCalledTimes(2);
+      expect(writeRoundSnapshot.mock.calls[1][0]).toMatchObject({ defaultBranch: 'main', observedAt: 1000 });
+      expect(execFileSyncImpl).toHaveBeenCalledOnce();
+    } finally { handle.kill(); }
+  });
+  it('a retained branch without a live observation never receives a fresh round timestamp', async () => {
+    const execFileSyncImpl = vi.fn();
+    const writeRoundSnapshot = vi.fn();
+    const { handle, advance } = catchUpSetup({ defaultBranch: 'main', execFileSyncImpl, writeRoundSnapshot });
+    try {
+      await handle.catchUp();
+      advance(600_000);
+      await handle.catchUp();
+      expect(execFileSyncImpl).not.toHaveBeenCalled();
+      expect(writeRoundSnapshot).not.toHaveBeenCalled();
+    } finally { handle.kill(); }
   });
   it.each(holds)('planCatchUp spends no slot on %s', (reason, patch) => {
     const plan = planCatchUp({ prs: [candidate(1, 0, patch), candidate(2, 1)], capacity: 1, queued: 0 });

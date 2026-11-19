@@ -164,9 +164,9 @@ export function readFastDrainRoundSnapshot(options) {
 }
 
 /** Parent catch-up writes only branch metadata; it never claims a partial PR set is complete. */
-export function writeFastDrainRoundDefaultBranch({ path, repo, defaultBranch, now = Date.now(), write = writeJsonAtomic }) {
-  if (!validDefaultBranch(defaultBranch)) return false;
-  try { write(path, { repo, writtenAt: now, defaultBranch }); return true; } catch { return false; }
+export function writeFastDrainRoundDefaultBranch({ path, repo, defaultBranch, observedAt, write = writeJsonAtomic }) {
+  if (!validDefaultBranch(defaultBranch) || !Number.isFinite(observedAt)) return false;
+  try { write(path, { repo, writtenAt: observedAt, defaultBranch, defaultBranchReadAt: observedAt }); return true; } catch { return false; }
 }
 
 export function readFastDrainRoundDefaultBranch(options) {

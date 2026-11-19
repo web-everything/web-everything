@@ -85,6 +85,7 @@ export const PASS_STEP_ORDER = [
   'setup.policy',
   'setup.other',
   'listing',
+  'gate.defaultBranch',
   'classifyGateReads',
   'rebaseDropManifest',
   'mergeCascade',

@@ -160,7 +160,7 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
   }
 }
 
-/** Await branch reads before starting synchronous page work, including on context fallback. */
+/** Load cheap branch hints before listing. Live merge authorization must wait until pages finish. */
 export async function fastDrainListingAfterBranches({ resolveBranches, list }) {
   await resolveBranches();
   return list();

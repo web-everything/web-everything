@@ -4812,9 +4812,14 @@ open inventory owns membership; number, head and updatedAt must match before reu
 or changed rows and dependency/couple/overlap/card-group components are read fully live.
 Unknown inventories or related evidence fall back to the original full listing with one
 `fast-drain: context fell back to full listing (...)` diagnostic. Both `WE_FAST_DRAIN_CONTEXT=live`
-and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch resolution uses the in-process map, fresh round metadata, then a host-wide
-one-hour atomic cache under `~/.claude/conveyor/default-branches`, then live GitHub. Test
-processes require an explicit `WE_DEFAULT_BRANCH_CACHE_DIR`. Branch-only parent round records
-never count as complete PR listings. Branch resolution must finish before synchronous fallback pages start; keep that ordering covered by a causal probe.
+and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch hints use a separate
+in-process map, round metadata, then a host-wide one-hour atomic cache under
+`~/.claude/conveyor/default-branches`. Test processes require an explicit
+`WE_DEFAULT_BRANCH_CACHE_DIR`. Neither cache nor parent metadata can authorize merge/enqueue.
+Every admission requires a live default-branch read in the child process, once per repo/process,
+after synchronous listing/context pages finish (prestage verifies before enqueue). Failure defers;
+live evidence overrides hints and rewrites the cache. Parent round metadata preserves the original
+live observation timestamp; a retained branch never receives fresh evidence timestamps. Branch-only
+records never count as complete PR listings. Keep branch-change, failure, and read-order probes.
 The node:test regression and soak also support the existing Vitest runner; run either through
 heavy-admission, with only the affected files.
