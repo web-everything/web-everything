@@ -80,10 +80,23 @@ export function existingTrackedPaths(paths, lstat = path => lstatSync(resolve(ro
   });
 }
 
-function readTracked(path) {
+export function readTracked(path, lstat = lstatSync, indexMode = path => {
+  const records = execFileSync('git', ['ls-files', '-s', '-z', '--', path], { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024 })
+    .split('\0');
+  for (const record of records) {
+    const match = record.match(/^(\d{6}) [0-9a-f]+ [0-3]\t([\s\S]*)$/);
+    if (match?.[2] === path) return match[1];
+  }
+  return undefined;
+}) {
   const filename = resolve(root, path);
-  const stat = lstatSync(filename);
+  const stat = lstat(filename);
   if (stat.isSymbolicLink()) return Buffer.from(readlinkSync(filename));
+  // Forge projects tracked directory links into directories; count each as one link-text line.
+  if (stat.isDirectory()) {
+    if (indexMode(path) === '120000') return Buffer.from(path);
+    throw new Error(`Cannot count non-file: ${path}`);
+  }
   if (!stat.isFile()) throw new Error(`Cannot count non-file: ${path}`);
   return readFileSync(filename);
 }
