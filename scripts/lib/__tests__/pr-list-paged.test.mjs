@@ -172,6 +172,20 @@ describe('query and gh row shape', () => {
       expect(() => buildOpenPrPageQuery({ repo: bad, pageSize: 20 })).toThrow(TypeError);
     }
   });
+  it('inventory-only pages retain full-list ordering and metadata while omitting all heavy/check fields', () => {
+    const query = buildOpenPrPageQuery({ repo, pageSize: 100, inventoryOnly: true });
+    expect(query).toContain('states:OPEN,first:100,orderBy:{field:CREATED_AT,direction:DESC}');
+    expect(query).toContain('totalCount pageInfo{hasNextPage endCursor} nodes{number headRefOid updatedAt baseRefName isDraft state}');
+    expect(query).not.toMatch(/statusCheckRollup|labels|body|files|commits/);
+    expect(buildOpenPrPageQuery({ repo, pageSize: 100 })).toContain('statusCheckRollup');
+  });
+  it('the shared page parser validates lean metadata without inventing full PR fields', () => {
+    const lean = { number: 1, headRefOid: 'a'.repeat(40), updatedAt: '2026-11-18T00:00:00Z', baseRefName: 'main', isDraft: false, state: 'OPEN' };
+    const raw = JSON.stringify({ data: { repository: { pullRequests: { nodes: [lean], totalCount: 1,
+      pageInfo: { hasNextPage: false, endCursor: null } } } } });
+    expect(parseOpenPrPage(raw, { mapNode: n => n })).toEqual({ rows: [lean], totalCount: 1, hasNextPage: false, endCursor: null });
+    expect(() => parseOpenPrPage(JSON.stringify({ ...JSON.parse(raw), errors: [{ message: 'partial' }] }), { mapNode: n => n })).toThrow('partial');
+  });
   it('maps both check kinds exactly, including nulls and empty connections', () => {
     const check = { __typename: 'CheckRun', name: 'test', status: 'IN_PROGRESS', completedAt: null,
       conclusion: null, startedAt: null, detailsUrl: 'https://example.com/check' };

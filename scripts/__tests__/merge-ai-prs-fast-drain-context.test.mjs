@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
-  fastDrainListingAfterBranches, validateLeanOpenPrs, LEAN_OPEN_PR_FIELDS } from '../lib/fast-drain-context.mjs';
+  fastDrainListingAfterBranches, validateLeanOpenPrs, listLeanOpenPrsPaged, LEAN_OPEN_PR_FIELDS } from '../lib/fast-drain-context.mjs';
 import { cachedDefaultBranch, DEFAULT_BRANCH_CACHE_TTL_MS, resolveCachedDefaultBranch, createLiveDefaultBranchReader } from '../lib/default-branch-cache.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, DEFAULT_TTL_MS } from '../lib/pr-snapshot.mjs';
 import { snapshotPath, PR_SNAPSHOT_VERSION, markPrSnapshotDirty } from '../lib/pr-snapshot-store.mjs';
@@ -25,6 +25,7 @@ const pr = (number, extra = {}) => ({
   files: [{ path: `src/${number}.mjs` }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
   rowsHead: number.toString(16).padStart(40, '0'), rowsComplete: true, ...extra,
 });
+const inventory = (rows, extra = {}) => ({ rows, totalCount: rows.length, hasNextPage: false, truncated: false, ...extra });
 const lean = p => Object.fromEntries(LEAN_OPEN_PR_FIELDS.split(',').map(f => [f, p[f]]));
 
 async function run({ snapshot = [pr(7), pr(8)], live = snapshot, full = live, leanRead, snapshotRead,
@@ -33,7 +34,7 @@ async function run({ snapshot = [pr(7), pr(8)], live = snapshot, full = live, le
   const options = {
     repos, targetRepo: repo, onlyPr: 7,
     readSnapshot: snapshotRead ?? (() => snapshot),
-    listLean: async r => { calls.lean.push(r); return leanRead ? leanRead(r) : live.map(lean); },
+    listLean: async r => { calls.lean.push(r); return leanRead ? leanRead(r) : inventory(live.map(lean)); },
     readFull: async (r, n) => { calls.full.push([r, n]); return readFull ? readFull(r, n) : full.find(p => p.number === n); },
     readManifest: async (r, p) => manifests.get(fastDrainPrKey(r, p.number)) ?? p.manifest ?? null,
     readGroups: () => groups ?? { groups: [] },
@@ -157,9 +158,9 @@ for (const reason of ['unavailable', 'stale', 'dirty', 'disabled']) {
   const cases = {
     snapshotThrows: { snapshotRead: () => { throw new Error('snapshot read failed'); } },
     leanThrows: { leanRead: () => { throw new Error('lean read failed'); } },
-    leanMalformed: { leanRead: () => [{ number: 8 }] },
-    leanDuplicate: { leanRead: () => [lean(pr(7)), lean(pr(7))] },
-    leanTruncated: { leanRead: () => Array.from({ length: OPEN_PR_LIST_LIMIT }, (_, i) => lean(pr(i + 1))) },
+    leanMalformed: { leanRead: () => inventory([{ number: 8 }]) },
+    leanDuplicate: { leanRead: () => inventory([lean(pr(7)), lean(pr(7))]) },
+    leanTruncated: { leanRead: () => inventory(Array.from({ length: OPEN_PR_LIST_LIMIT }, (_, i) => lean(pr(i + 1)))) },
     unknownGroups: { groups: { unreadable: true } },
     partialTarget: { readFull: () => ({ number: 7, state: 'OPEN' }) },
     relatedUnreadable: { snapshot: [pr(7, { manifest: manifest(107, [108]) }), pr(8, { manifest: manifest(108) })], readFull: (_r, n) => n === 7 ? pr(7, { manifest: manifest(107, [108]) }) : null },
@@ -192,7 +193,7 @@ test('edges include both dependency directions, stack, couple, overlap, transiti
 
 test('same PR number in another repo does not replace the target; each context repo gets one lean read', async () => {
   const { calls, rows } = await run({ repos: [repo, other], snapshotRead: r => r === repo ? [pr(7)] : [pr(7, { body: 'other repo' })],
-    leanRead: () => [lean(pr(7))] });
+    leanRead: () => inventory([lean(pr(7))]) });
   assert.deepEqual(calls.lean, [repo, other]);
   assert.deepEqual(calls.full, [[repo, 7]]);
   assert.equal(rows.get(other)[0].body, 'other repo');
@@ -287,7 +288,7 @@ test('cached main and parent round main cannot authorize a PR when live default 
 });
 
 test('lean inventory validation rejects an unknown state and never requests heavy fields', () => {
-  assert.throws(() => validateLeanOpenPrs([{ ...lean(pr(7)), state: 'CLOSED' }]), /incomplete/);
+  assert.throws(() => validateLeanOpenPrs(inventory([{ ...lean(pr(7)), state: 'CLOSED' }])), /incomplete/);
   assert.deepEqual(LEAN_OPEN_PR_FIELDS.split(','), ['number', 'headRefOid', 'updatedAt', 'baseRefName', 'isDraft', 'state']);
 });
 
@@ -301,4 +302,103 @@ test('real CLI uses lean context for all repos and no full listing; live kill sw
   assert.equal(live.status, 0, live.stderr);
   assert.ok(live.fullListings > 0);
   assert.equal(live.leanListings, 0);
+});
+
+const leanPage = (rows, totalCount, hasNextPage = false, endCursor = null) => JSON.stringify({
+  data: { repository: { pullRequests: { nodes: rows, totalCount, pageInfo: { hasNextPage, endCursor } } } },
+});
+
+async function pagedContext(pages, options = {}) {
+  const queries = [];
+  const result = await run({ leanRead: () => listLeanOpenPrsPaged({ repo, ...options, readPage: async query => {
+    queries.push(query);
+    const page = pages[queries.length - 1];
+    if (page instanceof Error) throw page;
+    return page;
+  } }) });
+  return { ...result, queries };
+}
+
+test('lean totalCount 2 with only 1 returned PR falls back through the full-list completeness guard', async () => {
+  const { calls } = await pagedContext([leanPage([lean(pr(7))], 2)]);
+  assert.equal(calls.fullPages, 1);
+  assert.equal(calls.contextRelists, 1);
+  assert.match(calls.log[0], /1 unique of 2 open PRs/);
+});
+
+test('two lean GraphQL pages are accepted only after complete metadata and rows agree', async () => {
+  const { calls, rows, queries } = await pagedContext([
+    leanPage([lean(pr(7))], 2, true, 'cursor"one'), leanPage([lean(pr(8))], 2),
+  ], { pageSize: 1 });
+  assert.equal(calls.fullPages, 0);
+  assert.deepEqual(rows.get(repo).map(p => p.number), [7, 8]);
+  assert.equal(new Set(rows.get(repo).map(p => p.number)).size, 2);
+  assert.equal(queries.length, 2);
+  assert.ok(queries[1].includes(`after:${JSON.stringify('cursor"one')}`));
+  for (const query of queries) {
+    assert.match(query, /orderBy:\{field:CREATED_AT,direction:DESC\}/);
+    assert.match(query, /totalCount pageInfo\{hasNextPage endCursor\}/);
+    assert.match(query, /nodes\{number headRefOid updatedAt baseRefName isDraft state\}/);
+    assert.doesNotMatch(query, /statusCheckRollup|labels|body|files|commits/);
+  }
+});
+
+for (const [name, second] of [
+  ['transport page error', new Error('second lean page unreadable')],
+  ['GraphQL page error with partial data', JSON.stringify({ errors: [{ message: 'partial lean page' }],
+    data: JSON.parse(leanPage([lean(pr(8))], 2)).data })],
+  ['truncated JSON page', '{'],
+  ['missing final rows', leanPage([], 2)],
+  ['duplicate hiding an omitted PR', leanPage([lean(pr(7))], 2)],
+  ['a PR opened mid-read', leanPage([lean(pr(8))], 3)],
+  ['a PR closed mid-read', leanPage([lean(pr(8))], 1)],
+]) test(`${name} falls back instead of publishing a partial lean inventory`, async () => {
+  const { calls } = await pagedContext([leanPage([lean(pr(7))], 2, true, 'next'), second], { pageSize: 1 });
+  assert.equal(calls.fullPages, 1);
+  assert.equal(calls.contextRelists, 1);
+  assert.equal(calls.log.length, 1);
+});
+
+for (const [name, pages, options] of [
+  ['a short intermediate page', [leanPage([lean(pr(7))], 3, true, 'next')], { pageSize: 2 }],
+  ['unread hasNextPage at the bound', [leanPage([lean(pr(7))], 2, true, 'next')], { pageSize: 1, maxRows: 1 }],
+  ['a repeated cursor', [leanPage([lean(pr(7))], 3, true, 'same'), leanPage([lean(pr(8))], 3, true, 'same')], { pageSize: 1 }],
+  ['too many rows for totalCount', [leanPage([lean(pr(7)), lean(pr(8))], 1)], {}],
+  ['duplicate numbers even if the unique count matches', [leanPage([lean(pr(7)), lean(pr(7))], 1)], {}],
+  ['an oversized page', [leanPage([lean(pr(7)), lean(pr(8))], 2)], { pageSize: 1 }],
+  ['a next page without a cursor', [leanPage([lean(pr(7))], 2, true)], { pageSize: 1 }],
+  ['missing connection metadata', ['{}'], {}],
+]) test(`${name} falls back to full listing`, async () => {
+  const { calls } = await pagedContext(pages, options);
+  assert.equal(calls.fullPages, 1);
+  assert.equal(calls.log.length, 1);
+});
+
+test('uncertified flattened lean rows cannot bypass the shared inventory guard', async () => {
+  const { calls } = await run({ leanRead: () => [lean(pr(7))] });
+  assert.equal(calls.fullPages, 1);
+});
+
+test('real CLI falls back to full listing when lean GraphQL silently omits rows', () => {
+  const live = runFastDrainContextCli({ leanIncomplete: true });
+  assert.equal(live.status, 0, live.stderr);
+  assert.ok(live.leanListings > 0);
+  assert.ok(live.fullListings > 0);
+  assert.match(live.stderr, /fast-drain: context fell back to full listing.*1 unique of 48/);
+});
+
+test('real CLI accepts a complete two-page lean inventory without heavy listing', () => {
+  const live = runFastDrainContextCli({ rowCount: 101 });
+  assert.equal(live.status, 0, live.stderr);
+  assert.equal(live.leanListings, 4);
+  assert.equal(live.fullListings, 0);
+  assert.equal(live.heavyListings, 0);
+});
+
+test('real CLI falls back when the second lean GraphQL page fails', () => {
+  const live = runFastDrainContextCli({ rowCount: 101, leanPageError: true });
+  assert.equal(live.status, 0, live.stderr);
+  assert.equal(live.leanListings, 2);
+  assert.ok(live.fullListings > 0);
+  assert.match(live.stderr, /fast-drain: context fell back to full listing.*fixture lean page error/);
 });

@@ -71,14 +71,15 @@ export function resolvePrListPaging({ env = process.env, file } = {}) {
 }
 
 /** PURE: an ordered light page; quote the opaque cursor as a GraphQL string. */
-export function buildOpenPrPageQuery({ repo, pageSize, after = null }) {
+export function buildOpenPrPageQuery({ repo, pageSize, after = null, inventoryOnly = false }) {
   if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
     throw new TypeError('repo must be an owner/name slug');
   }
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}}}}}`;
+  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
+  return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{${fields}}}}}`;
 }
 
 const ZERO = '0001-01-01T00:00:00Z';
@@ -241,7 +242,7 @@ export function mapGraphqlPr(n) {
 }
 
 /** PURE: reject GraphQL errors even when accompanied by partial data. */
-export function parseOpenPrPage(text) {
+export function parseOpenPrPage(text, { mapNode = mapGraphqlPr } = {}) {
   const data = JSON.parse(String(text));
   if (data?.errors?.length) throw new Error(data.errors.map(e => e.message ?? String(e)).join('\n'));
   const prs = data?.data?.repository?.pullRequests;
@@ -251,7 +252,7 @@ export function parseOpenPrPage(text) {
     || (prs.pageInfo.hasNextPage && !prs.pageInfo.endCursor)) {
     throw new Error('missing open-PR page data');
   }
-  return { rows: prs.nodes.map(mapGraphqlPr), hasNextPage: prs.pageInfo.hasNextPage,
+  return { rows: prs.nodes.map(mapNode), hasNextPage: prs.pageInfo.hasNextPage,
     endCursor: prs.pageInfo.endCursor, totalCount: prs.totalCount };
 }
 

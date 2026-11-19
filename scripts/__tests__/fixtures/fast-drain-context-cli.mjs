@@ -10,12 +10,12 @@ import { buildManifest, embedManifestInBody } from '../../readiness/lane-manifes
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null } = {}) {
+  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, leanPageError = false } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
     mkdirSync(bin); mkdirSync(snapshots); mkdirSync(join(dir, 'backlog'));
-    const rows = Array.from({ length: 48 }, (_, i) => {
+    const rows = Array.from({ length: rowCount }, (_, i) => {
       const number = i + 7, headRefOid = number.toString(16).padStart(40, '0');
       return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
         updatedAt: '2026-11-18T00:00:00Z', baseRefName: 'main', isDraft: false,
@@ -62,6 +62,17 @@ if (a[0] === 'pr' && a[1] === 'view') {
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   const query = a.find(v => v.includes('pullRequests(states:OPEN'));
   const pageRows = query.includes('name:"web-everything"') ? rows : [];
+  if (!query.includes('statusCheckRollup')) {
+    const size = Number(/first:(\\d+)/.exec(query)?.[1]);
+    const offset = Number(/after:"lean-(\\d+)"/.exec(query)?.[1] || 0);
+    if (offset && process.env.CONTEXT_LEAN_PAGE_ERROR === '1') out({errors:[{message:'fixture lean page error'}]});
+    const partial = pageRows.length && process.env.CONTEXT_LEAN_INCOMPLETE === '1';
+    const nodes = (partial ? pageRows.slice(0, 1) : pageRows.slice(offset, offset + size))
+      .map(p => Object.fromEntries(['number','headRefOid','updatedAt','baseRefName','isDraft','state'].map(f => [f,p[f]])));
+    const hasNextPage = !partial && offset + size < pageRows.length;
+    out({data:{repository:{pullRequests:{totalCount:pageRows.length,
+      pageInfo:{hasNextPage,endCursor:hasNextPage ? 'lean-'+(offset+size) : null},nodes}}}});
+  }
   out({data:{repository:{pullRequests:{totalCount:pageRows.length, pageInfo:{hasNextPage:false,endCursor:null},
     nodes:pageRows.map(p => ({...p, labels:{nodes:p.labels}, commits:{nodes:[{commit:{oid:p.headRefOid,
       statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false},totalCount:p.statusCheckRollup.length,nodes:p.statusCheckRollup}}}}]}}))}}}});
@@ -77,13 +88,14 @@ out({});
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0', CONTEXT_LIVE_BRANCH: liveDefaultBranch,
         WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',
         WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
+        CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0',
         CONTEXT_CALLS: join(dir, 'calls.jsonl'), CONTEXT_ROWS: join(dir, 'rows.json') },
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
       cachedBranch: readDefaultBranchCache('fixture/web-everything', { env: cacheEnv }),
-      fullListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))).length,
-      leanListings: calls.filter(a => a[0] === 'pr' && a[1] === 'list' && a.includes('number,headRefOid,updatedAt,baseRefName,isDraft,state')).length,
+      fullListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && v.includes('statusCheckRollup'))).length,
+      leanListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && !v.includes('statusCheckRollup'))).length,
       heavyListings: calls.filter(a => a[0] === 'pr' && a[1] === 'list' && a.some(v => v.includes('statusCheckRollup'))).length };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }

@@ -7,6 +7,7 @@
  */
 import { asItemId, isItemId } from '../readiness/lane-manifest.mjs';
 import { isDegradedOpenPrListing, OPEN_PR_LIST_LIMIT } from './no-search-backed-pr-list.mjs';
+import { assertInventoryComplete, buildOpenPrPageQuery, parseOpenPrPage } from './pr-list-paged.mjs';
 import { queueFileOverlap, completeListedFiles } from './queue-file-overlap.mjs';
 
 export const LEAN_OPEN_PR_FIELDS = 'number,headRefOid,updatedAt,baseRefName,isDraft,state';
@@ -18,18 +19,47 @@ export function useFastDrainContext({ onlyPr, fromGreenEvent, onlyRepo, localSlu
 }
 
 /** Reject incomplete inventories, including partial pages and repeated identities. */
-export function validateLeanOpenPrs(rows, maxRows = OPEN_PR_LIST_LIMIT) {
-  if (!Array.isArray(rows) || isDegradedOpenPrListing(rows.length, maxRows)) throw new Error('lean inventory truncated');
-  const numbers = new Set();
+export function validateLeanOpenPrs(inventory, maxRows = OPEN_PR_LIST_LIMIT, repo = '') {
+  const { rows, totalCount, hasNextPage, truncated } = inventory ?? {};
+  if (!Array.isArray(rows) || !Number.isInteger(totalCount) || totalCount < 0
+    || hasNextPage !== false || truncated !== false) throw new Error('lean inventory incomplete');
+  // The full listing's guard counts unique numbers and rejects duplicates/shortfalls.
+  assertInventoryComplete({ repo, rows, totalCount, truncated });
+  if (rows.length !== totalCount) throw new Error('lean inventory count changed during read');
+  if (isDegradedOpenPrListing(rows.length, maxRows)) throw new Error('lean inventory truncated');
   for (const p of rows) {
-    if (!Number.isInteger(p?.number) || p.number <= 0 || numbers.has(p.number)
-      || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '') || !Number.isFinite(Date.parse(p.updatedAt))
+    if (!/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '') || !Number.isFinite(Date.parse(p.updatedAt))
       || typeof p.baseRefName !== 'string' || !p.baseRefName || typeof p.isDraft !== 'boolean' || p.state !== 'OPEN') {
       throw new Error('lean inventory incomplete');
     }
-    numbers.add(p.number);
   }
   return rows;
+}
+
+/** Lean pages share the full listing's query ordering, parser and completeness guard.
+ * No partial result escapes on transport errors, count drift, cursor loops or bounded truncation.
+ */
+export async function listLeanOpenPrsPaged({ repo, readPage, pageSize = 100, maxRows = OPEN_PR_LIST_LIMIT }) {
+  const rows = [], cursors = new Set();
+  let after = null, expectedCount;
+  for (;;) {
+    const query = buildOpenPrPageQuery({ repo, pageSize, after, inventoryOnly: true });
+    const page = parseOpenPrPage(await readPage(query), { mapNode: node =>
+      Object.fromEntries(LEAN_OPEN_PR_FIELDS.split(',').map(field => [field, node?.[field]])) });
+    if (expectedCount !== undefined && page.totalCount !== expectedCount) throw new Error('lean inventory totalCount changed between pages');
+    expectedCount = page.totalCount;
+    if (page.rows.length > pageSize || (page.hasNextPage && page.rows.length !== pageSize)) throw new Error('lean inventory page truncated');
+    rows.push(...page.rows);
+    const inventory = { rows, totalCount: expectedCount, hasNextPage: page.hasNextPage, truncated: rows.length >= maxRows && page.hasNextPage };
+    if (!page.hasNextPage) {
+      validateLeanOpenPrs(inventory, maxRows, repo);
+      return { ...inventory, rows: [...new Map(rows.map(row => [row.number, row])).values()] };
+    }
+    if (rows.length >= maxRows || expectedCount >= maxRows) throw new Error('lean inventory truncated');
+    if (cursors.has(page.endCursor)) throw new Error('lean inventory cursor repeated');
+    cursors.add(page.endCursor);
+    after = page.endCursor;
+  }
 }
 
 export function matchingSnapshotRow(snapshot, live) {
@@ -88,7 +118,7 @@ export function relatedFastDrainPrs(entries, targetKey, groups = []) {
 async function hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean, readFull, liveReads }) {
   const byRepo = new Map();
   for (const repo of repos) {
-    const lean = validateLeanOpenPrs(await listLean(repo));
+    const lean = validateLeanOpenPrs(await listLean(repo), OPEN_PR_LIST_LIMIT, repo);
     const snap = new Map(snapshots.get(repo).map(p => [p.number, p]));
     const rows = [];
     for (const p of lean) {

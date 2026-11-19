@@ -4808,7 +4808,10 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 Local `--only --from-green-event` context may reuse full shared-snapshot rows only through
 `cacheOnly: true` (normal TTL/dirty rules, even when stale-ok is configured). A lean live
-open inventory owns membership; number, head and updatedAt must match before reuse. Missing
+open inventory owns membership. Its GraphQL pages use the full listing’s query ordering, connection
+parser and `assertInventoryComplete` guard; counts must stay stable, unique row count must equal
+`totalCount`, and no next page may remain unread. Partial pages, errors, duplicates or count drift
+fall back to full listing. Number, head and updatedAt must match before snapshot reuse. Missing
 or changed rows and dependency/couple/overlap/card-group components are read fully live.
 Unknown inventories or related evidence fall back to the original full listing with one
 `fast-drain: context fell back to full listing (...)` diagnostic. Both `WE_FAST_DRAIN_CONTEXT=live`

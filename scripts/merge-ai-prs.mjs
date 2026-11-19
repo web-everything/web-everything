@@ -130,7 +130,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
-import { LEAN_OPEN_PR_FIELDS, useFastDrainContext, readFastDrainContext, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
+import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
 import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
@@ -5670,11 +5670,13 @@ async function runCli() {
     const slugs = [...new Set(CONTEXT_REPOS.map(repo => repo || localSlug))];
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
       readSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true }),
-      listLean: async repo => {
-        const { stdout } = await execFileP('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', LEAN_OPEN_PR_FIELDS],
-          { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-        return parseListOutput(stdout, { repo });
-      },
+      listLean: repo => listLeanOpenPrsPaged({ repo,
+        readPage: async query => {
+          const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`],
+            { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: { ...process.env, GH_REPO: repo } });
+          return stdout;
+        },
+      }),
       readFull: (repo, num) => readFullListingPr(repo, num, true),
       readManifests: async entries => {
         // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
