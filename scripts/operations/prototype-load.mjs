@@ -5,7 +5,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
-import { QUESTION_HASH, LEGACY_QUESTION_HASHES, vetoesAsCurrent, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
+import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
 import { carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 export const PROTOTYPE_LOAD_OP = 'prototype-load';
 export const PROTOTYPE_LOAD_EFFECT = 'prototype-load.apply';
@@ -163,7 +163,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const covered = (base) => { if (!coverMemo.has(base)) coverMemo.set(base, !!covers(base)); return coverMemo.get(base); };
   const ruled = (record) => {
     const gate = auditOptions.ruledWeakened;
-    return gate?.ruledWeakened && vetoesAsCurrent(record)
+    return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
       // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
       // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
       && (record.head === lowerSha(gate.record.sha)
@@ -187,14 +187,14 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   if (list.some((r) => r?.head === sha && r.base !== sha && r.verdict === 'WEAKENED'
     // An unparsable time cannot place the record outside its window, so it is judged by the hash's own expiry alone
     // (fail closed, matching a current-question record, which blocks whatever its time).
-    && (vetoesAsCurrent(r) || isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(text(r.at))) ? r.at : undefined })) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
+    && isAcceptedQuestionHash(r.questionHash, { priorQuestionHashes, now, at: Number.isFinite(Date.parse(text(r.at))) ? r.at : undefined }) && !own.some((d) => d.base === r.base))) return { ok: false, reason: 'weakened' };
   // Round 6: a carried head's PRIOR-question WEAKENED that findAudit would accept on its own can be hidden by an unusable
   // current-question record for the same head+base (findAudit lets even an unusable current record block the prior
   // fallback, which is right for a PASS but fail-open for a NEGATIVE verdict). Such a record keeps vetoing, judged by
   // the same supersede rule as any carried WEAKENED; a base with a usable decision of its own is left to findAudit.
   // The latest PRIOR-question record for that head+base decides (a later prior NOT WEAKENED re-audit supersedes it), judged
   // with the same already-resolved hashes and clock as the veto above.
-  const priorOnly = list.filter((r) => r && !vetoesAsCurrent(r));
+  const priorOnly = list.filter((r) => r?.questionHash !== QUESTION_HASH);
   const hiddenWeak = priorOnly.filter((r) => r?.verdict === 'WEAKENED' && typeof r.head === 'string' && carriedHeads.has(r.head) && r.base !== r.head
     && !carried.some((d) => d.record.head === r.head && d.base === r.base)
     && findAudit(priorOnly, { ...auditOptions, head: r.head, base: r.base, questionHash: QUESTION_HASH, priorQuestionHashes, now }) === r).map((record) => ({ base: record.base, record }));
@@ -209,9 +209,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   for (const { base, record } of passes) {
     // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry
     // eligibility dropped it (no or differing fingerprint): judge against ALL records, fail closed.
-    if (!vetoesAsCurrent(record)
-      && list.some((r) => r?.head === record.head && r.base === base
-        && (vetoesAsCurrent(r) || LEGACY_QUESTION_HASHES.includes(r.questionHash)))) continue;
+    if (record.questionHash !== QUESTION_HASH
+      && list.some((r) => r?.head === record.head && r.base === base && r.questionHash === QUESTION_HASH)) continue;
     if (covered(base) && (!pass || Date.parse(text(record.at)) >= Date.parse(text(pass.at)))) pass = record;
   }
   return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };

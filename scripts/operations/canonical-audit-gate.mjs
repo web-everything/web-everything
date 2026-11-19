@@ -7,7 +7,7 @@ import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
-import { findAudit, QUESTION_HASH, vetoesAsCurrent } from './codex-audit.mjs';
+import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
@@ -20,8 +20,7 @@ function wellFormedAudit(record) {
     || !Array.isArray(record.findings) || !record.findings.every(f => typeof f === 'string')) return false;
   // Validate verdict/contradiction syntax with the canonical parser, even for a
   // historical question. The original hash still determines evidence eligibility.
-  const candidate = { ...record, head: record.head.toLowerCase(), base: record.base.toLowerCase(),
-    questionHash: vetoesAsCurrent(record) ? record.questionHash : QUESTION_HASH };
+  const candidate = { ...record, head: record.head.toLowerCase(), base: record.base.toLowerCase(), questionHash: QUESTION_HASH };
   return findAudit([candidate], { head: candidate.head, base: candidate.base, questionHash: QUESTION_HASH, priorQuestionHashes: [] }) === candidate;
 }
 

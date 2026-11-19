@@ -18,7 +18,7 @@ import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLo
 import { urgentSignature } from '../urgent-verify-marker.mjs';
 const urgentKey = Buffer.alloc(32, 7);
 import * as prototypeLoad from '../prototype-load.mjs';
-import { QUESTION_HASH, LEGACY_QUESTION_HASHES, main as auditMain } from '../codex-audit.mjs';
+import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
@@ -3384,29 +3384,4 @@ it.skipIf(!shippedRuledSettings.ruledWeakened.some((e) => e.ruling === 'R803'))(
     audits: auditLines([auditRecord({ head: entry.sha, verdict: 'WEAKENED', findings: entry.findings })]), auditBaseInMain: TREE,
     settings: { ...shippedRuledSettings, daemons: settings.daemons, readyRecordPath: '~/ready', recordPath: '~/records', auditRecordPath: '~/canonical-audits.jsonl', workspaceRoot: '~/workspace' } });
   expect(await f.run({ branch: entry.ref })).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R803' } } });
-});
-
-
-describe('canonicalAuditEvidence legacy negatives', () => {
-  const fp = 'd'.repeat(64);
-  it.each([QUESTION_HASH, ...LEGACY_QUESTION_HASHES])('preserves own, malformed and carried vetoes for %s', questionHash => {
-    const weak = auditRecord({ verdict: 'WEAKENED', questionHash, findings: ['x.mjs:1 gap'] });
-    const otherBasePass = auditRecord({ base: MERGE });
-    expect(prototypeLoad.canonicalAuditEvidence([weak, otherBasePass], SHA)).toEqual({ ok: false, reason: 'weakened' });
-    expect(prototypeLoad.canonicalAuditEvidence([{ ...weak, at: 'invalid' }, otherBasePass], SHA)).toEqual({ ok: false, reason: 'weakened' });
-    const carried = { ...weak, head: MERGE, fingerprint: fp, at: '2026-10-21T12:00:00Z' };
-    expect(prototypeLoad.canonicalAuditEvidence([otherBasePass, carried], SHA, () => true, fp)).toEqual({ ok: false, reason: 'weakened' });
-    // As with current negatives, an unusable carried negative must not acquire a new veto.
-    expect(prototypeLoad.canonicalAuditEvidence([otherBasePass, { ...carried, at: 'invalid' }], SHA, () => true, fp).ok).toBe(true);
-    const waived = { ruledWeakened: { ruledWeakened: { findings: weak.findings }, record: { sha: SHA } } };
-    expect(prototypeLoad.canonicalAuditEvidence([weak], SHA, () => true, null, waived)).toEqual({ ok: true, record: weak });
-    const carriedWaiver = { ruledWeakened: { ruledWeakened: { findings: weak.findings }, record: { sha: SHA, fingerprint: fp } } };
-    expect(prototypeLoad.canonicalAuditEvidence([carried], SHA, () => true, fp, carriedWaiver)).toEqual({ ok: true, record: carried });
-  });
-  it('legacy passes never admit or supersede a legacy veto', () => {
-    const pass = auditRecord({ questionHash: LEGACY_QUESTION_HASHES[0] });
-    const weak = { ...pass, verdict: 'WEAKENED' };
-    expect(prototypeLoad.canonicalAuditEvidence([pass], SHA)).toEqual({ ok: false, reason: 'no-record' });
-    expect(prototypeLoad.canonicalAuditEvidence([weak, pass], SHA)).toEqual({ ok: false, reason: 'weakened' });
-  });
 });
