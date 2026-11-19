@@ -41,6 +41,14 @@ export default {
     const incident = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1,
       repo: 'web-everything/web-everything', priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } });
     check(incident.run[0]?.num === 99, 'BLOCKED P0 incident fix must beat ordinary CLEAN at capacity one');
+    const cleanIncidentPrs = [{ ...incidentPrs[0], mergeStateStatus: 'CLEAN', readyAt: 900 },
+      { ...incidentPrs[1], readyAt: 0 }];
+    const priorityInput = { prs: cleanIncidentPrs, queued: 0, capacity: 1,
+      repo: 'web-everything/web-everything', priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 } };
+    check(planCatchUp({ ...priorityInput, deprioritize: [99] }).run[0]?.num === 7,
+      'recently missed CLEAN P0 must stay behind unmissed CLEAN P3');
+    check(planCatchUp({ ...priorityInput, order: 'oldest-ready' }).run[0]?.num === 7,
+      'oldest-ready must select older CLEAN P3 before newer CLEAN P0');
     const missed = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1, deprioritize: [7] });
     check(missed.run[0]?.num === 99, 'recently missed CLEAN must stay behind non-missed BLOCKED');
     const held = planCatchUp({ prs: incidentPrs, queued: 0, capacity: 1, now: 1000,

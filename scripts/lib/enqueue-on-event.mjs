@@ -697,12 +697,12 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
     return typeof h?.reason === 'string' && !!h.reason && Number.isFinite(h.at) && now >= h.at
       && now - h.at < Math.min(CATCH_UP_DECLINE_TTL_MS, Number.isFinite(h.ttlMs) && h.ttlMs > 0 ? h.ttlMs : CATCH_UP_DECLINE_TTL_MS); };
   candidates.sort((a, b) => Number(knownHold(a.num)) - Number(knownHold(b.num)));
-  // Clean heads lead only within the same priority class and hold/miss demotion group.
+  // Clean heads lead only when hold/miss and configured class keys are equal.
   if (cleanFirst) {
     const clean = pr => ['CLEAN', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
-    candidates.sort((a, b) => classes.get(a.num) - classes.get(b.num)
-      || Number(knownHold(a.num)) - Number(knownHold(b.num))
+    candidates.sort((a, b) => Number(knownHold(a.num)) - Number(knownHold(b.num))
       || Number(recentMisses.has(a.num)) - Number(recentMisses.has(b.num))
+      || (order === 'oldest-ready' ? 0 : classes.get(a.num) - classes.get(b.num))
       || Number(clean(b)) - Number(clean(a)));
   }
   const room = Math.max(0, capacity - queued);

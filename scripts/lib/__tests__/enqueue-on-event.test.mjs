@@ -2942,6 +2942,48 @@ describe('planCatchUp clean-first within priority and demotion groups', () => {
     const plan = planCatchUp({ ...input, cleanFirst: false });
     expect([...plan.run.map(p => p.num), ...plan.later]).toEqual([1, 2, 4, 5, 6, 7, 3]);
   });
+  it.each(['priority-then-first-accept', 'oldest-ready'])('matches the old sequential ordering byte-for-byte with cleanFirst:false (%s)', order => {
+    const mixed = [
+      candidate(99, 900, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
+      candidate(7, 0), candidate(8, 30, { mergeStateStatus: 'HAS_HOOKS' }),
+      candidate(9, 20, { mergeStateStatus: 'BLOCKED', itemIds: ['urgent'] }),
+      candidate(10, 10, { firstAcceptedAt: 40 }), candidate(11, 10),
+      candidate(12, 10, { mergeStateStatus: 'UNKNOWN' }),
+      candidate(13, null, { mergeStateStatus: 'BLOCKED' }),
+    ];
+    const missed = new Set([99, 8]);
+    const held = new Set([7, 8]);
+    // Reference the original three stable sorts, before cleanFirst existed.
+    const old = [...mixed];
+    const cls = pr => pr.num === 99 ? 0 : 3;
+    const build = pr => pr.itemIds?.includes('urgent') ? 0 : Infinity;
+    const age = pr => (order === 'oldest-ready' ? pr.readyAt : pr.firstAcceptedAt ?? pr.readyAt) ?? Infinity;
+    old.sort((a, b) => (order === 'oldest-ready' ? 0 : cls(a) - cls(b) || build(a) - build(b))
+      || age(a) - age(b) || a.num - b.num);
+    old.sort((a, b) => Number(missed.has(a.num)) - Number(missed.has(b.num)));
+    old.sort((a, b) => Number(held.has(a.num)) - Number(held.has(b.num)));
+    const plan = planCatchUp({ prs: mixed, queued: 0, capacity: 3, order, cleanFirst: false,
+      repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      buildPriority: ['urgent'], deprioritize: missed, now: 1000,
+      declines: new Map([...held].map(num => [num, { reason: 'held', at: 1000 }])) });
+    expect(JSON.stringify(plan)).toBe(JSON.stringify({
+      run: old.slice(0, 3).map(({ num, readyAt }) => ({ num, readyAt })),
+      later: old.slice(3).map(pr => pr.num), skipped: [], skippedUnchanged: [],
+    }));
+  });
+  it('keeps a recently missed CLEAN P0 behind an unmissed CLEAN P3 with one slot', () => {
+    const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      prs: [candidate(99, 0), candidate(7, 900)], queued: 0, capacity: 1, deprioritize: [99] });
+    expect(plan.run.map(p => p.num)).toEqual([7]);
+    expect(plan.later).toEqual([99]);
+  });
+  it('keeps older CLEAN P3 ahead of newer CLEAN P0 under oldest-ready', () => {
+    const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
+      prs: [candidate(99, 900, { itemIds: ['urgent'] }), candidate(7, 0)],
+      queued: 0, capacity: 1, order: 'oldest-ready', buildPriority: ['urgent'] });
+    expect(plan.run.map(p => p.num)).toEqual([7]);
+    expect(plan.later).toEqual([99]);
+  });
   it('selects BLOCKED P0 incident fix #99 over ordinary CLEAN #7 with one slot', () => {
     const plan = planCatchUp({ repo: REPO, priority: { mode: 'enforce' }, mainFix: { repo: 'we', pr: 99 },
       prs: [candidate(7, 0), candidate(99, 900, { mergeStateStatus: 'BLOCKED' })], queued: 0, capacity: 1 });
