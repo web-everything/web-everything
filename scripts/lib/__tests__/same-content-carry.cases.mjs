@@ -46,12 +46,16 @@ test('history bound refuses with an operator fallback', t => {
   const result = classify(f, { exec }); assert.equal(result.carries, false); assert.match(result.reason, /256.*re-audit/);
 });
 import { execFileSync as realExec } from 'node:child_process';
-test('normalization removes all supported line references and preserves case', () => {
-  for (const suffix of [':123', ':123-140', ':123:5']) assert.equal(normalizeFinding(` code.js${suffix}   issue `), 'code.js issue');
-  for (const suffix of ['line 123', 'lines 12-14', 'L123']) assert.equal(normalizeFinding(`code.js ${suffix} issue`), 'code.js issue');
-  assert.equal(findingsSubset(['New'], ['new']), false); assert.equal(findingsSubset([], ['old']), false);
+test('findings match exact text including line numbers and whitespace', () => {
+  assert.equal(findingsSubset(['x.js:10 — a'], ['x.js:12 — a']), false);
+  for (const value of ['code.js:123:5 issue', 'line 123 issue', 'L123 issue', ' a  b ']) {
+    assert.equal(normalizeFinding(value), value);
+    assert.equal(findingsSubset([value], [value]), true);
+  }
+  assert.equal(findingsSubset(['New'], ['new']), false);
+  assert.equal(findingsSubset([], ['old']), false);
 });
-function waiver(f, { findings = ['code.js:25 issue'], ruling = 'R12', records, ruledFindings = ['code.js:10 issue', 'second issue'] } = {}) {
+function waiver(f, { findings = ['code.js:10 issue'], ruling = 'R12', records, ruledFindings = ['code.js:10 issue', 'second issue'] } = {}) {
   const ref = 'lane/example', entry = { ref, sha: f.from, ruling: 'R12', findings: ruledFindings };
   const ready = { ref, sha: f.to, tests: 'green', audit: 'WEAKENED', auditRuling: ruling, auditDisclosed: findings };
   const sameContent = createSameContentProof(f);
@@ -59,7 +63,7 @@ function waiver(f, { findings = ['code.js:25 issue'], ruling = 'R12', records, r
   const audit = { head: f.to, base: f.root, verdict: 'WEAKENED', findings, questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z' };
   return { gate, audit, result: canonicalAuditEvidence([audit], f.to, () => true, null, { ruledWeakened: gate, sameContent }) };
 }
-test('waiver subset and line shifts carry; canonical new findings refuse', t => {
+test('waiver exact subset carries; canonical new findings refuse', t => {
   const f = fixture(t, 'clean'), w = waiver(f); assert.ok(w.gate); assert.equal(w.result.ok, true);
   assert.equal(waiver(f, { findings: ['new issue'] }).gate, null);
   assert.equal(waiver(f, { ruling: 'R99' }).gate, null);
@@ -95,11 +99,11 @@ for (const kind of ['clean', 'jit', 'code', 'test']) test(`review and red-team $
 });
 
 import { checkCanonicalAuditForOpen } from '../../operations/canonical-audit-gate.mjs';
-test('PR admission carries a normalized canonical subset, logs once, and refuses new findings or setting off', t => {
+test('PR admission carries an exact canonical subset, logs once, and refuses new findings or setting off', t => {
   const f = fixture(t, 'clean'), ref = 'lane/example';
   const path = join(f.repo, 'audits.jsonl');
   const entry = { ref, sha: f.from, ruling: 'R12', findings: ['code.js:12 issue', 'second issue'] };
-  const audit = { head: f.to, base: f.root, verdict: 'WEAKENED', findings: ['code.js:100 issue'], questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z' };
+  const audit = { head: f.to, base: f.root, verdict: 'WEAKENED', findings: ['code.js:12 issue'], questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z' };
   let emitted = [];
   const check = (findings = audit.findings, env = f.env, recordCarry = record => emitted.push(record)) => checkCanonicalAuditForOpen({
     repo: f.repo, ref, sha: f.to, env: { ...env, WE_PLATFORM_PREFERENCES_FILE: join(f.repo, 'prefs.json') },
@@ -120,7 +124,7 @@ test('PR admission carries a normalized canonical subset, logs once, and refuses
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 test('daemon waiver carry requires canonical subset admission on the correct repository', t => {
   const f = fixture(t, 'clean'), ref = 'lane/example', path = join(f.repo, 'ready.jsonl'), platform = join(f.repo, 'platform.json');
-  f.write('ready.jsonl', JSON.stringify({ ref, sha: f.to, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: ['code.js:44 issue'] }));
+  f.write('ready.jsonl', JSON.stringify({ ref, sha: f.to, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: ['code.js:12 issue'] }));
   f.write('platform.json', JSON.stringify({ prototypeLoad: { ruledWeakened: [{ ref, sha: f.from, ruling: 'R12', findings: ['code.js:12 issue', 'other issue'] }] } }));
   const env = { ...f.env, HOME: f.repo, WE_FIX_READY_PATH: path, WE_PLATFORM_PREFERENCES_FILE: platform, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
   for (const ok of [false, true]) {
@@ -161,28 +165,16 @@ test('history carry records remain recognized machine evidence and malformed com
   assert.equal(parseVerdictCarriedMarker(marker.replace('jit-rename', 'jit-rename:extra')), null);
 });
 
-test('normalization preserves differing endpoint ports and refuses carried waiver admission', t => {
+test('changed source lines and endpoint ports refuse waiver admission', t => {
   const f = fixture(t, 'clean');
   const ruled = 'code.js:12 connects to http://127.0.0.1:8000';
-  const shifted = 'code.js:100 connects to http://127.0.0.1:8000';
-  const changed = 'code.js:100 connects to http://127.0.0.1:9000';
-  assert.equal(classify(f, { allowTestOnly: true }).carries, true);
-  assert.equal(normalizeFinding(ruled), normalizeFinding(shifted));
-  assert.notEqual(normalizeFinding(ruled), normalizeFinding(changed));
-  assert.equal(findingsSubset([changed], [ruled]), false);
-  const accepted = waiver(f, { findings: [shifted], ruledFindings: [ruled] });
+  const accepted = waiver(f, { findings: [ruled], ruledFindings: [ruled] });
   assert.equal(accepted.result.ok, true);
-  assert.equal(waiver(f, { findings: [changed], ruledFindings: [ruled] }).gate, null);
-  assert.equal(canonicalAuditEvidence([{ ...accepted.audit, findings: [changed] }], f.to,
-    () => true, null, { ruledWeakened: accepted.gate, sameContent: createSameContentProof(f) }).ok, false);
-});
-test('normalization preserves numeric finding content and URLs even when their path resembles source', () => {
-  for (const content of ['http://127.0.0.1:8000', 'http://127.0.0.1:9000', '127.0.0.1:8000',
-    'https://example.test:9000/src/server.js:123', 'http://[::1]:8000', 'retry:123', 'ratio:12:5'])
-    assert.equal(normalizeFinding(content), content);
-  for (const source of ['scripts/lib/tool.mjs', './scripts/tool.ts', '/src/tool.py'])
-    assert.equal(normalizeFinding(`[${source}:123:5] issue`), `[${source}] issue`);
-  assert.equal(normalizeFinding('unknown-extension.xyz:123 issue'), 'unknown-extension.xyz:123 issue');
+  for (const changed of ['code.js:100 connects to http://127.0.0.1:8000',
+    'code.js:12 connects to http://127.0.0.1:9000']) {
+    assert.equal(findingsSubset([changed], [ruled]), false);
+    assert.equal(waiver(f, { findings: [changed], ruledFindings: [ruled] }).gate, null);
+  }
 });
 
 test('old NOT WEAKENED readiness cannot authorize a test-only successor through either consumer', t => {
@@ -300,14 +292,14 @@ for (const kind of ['test', 'conflict-test']) test(`${kind}: old WEAKENED tests 
   const gate = readyEvidence([live], { branch: ref, sha: f.to }, [entry], fp, { sameContent });
   assert.ok(gate);
   const audit = { head: f.from, base: f.root, verdict: 'WEAKENED', findings: entry.findings,
-    questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z', fingerprint: fp };
+    questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z', fingerprint: 'd'.repeat(64) };
   for (const verdict of ['WEAKENED', 'NOT WEAKENED']) {
     const prior = { ...audit, verdict, findings: verdict === 'WEAKENED' ? entry.findings : [] };
     assert.equal(canonicalAuditEvidence([prior], f.to, () => true, fp, { sameContent, ruledWeakened: gate }).ok, false);
   }
   assert.equal(canonicalAuditEvidence([{ ...audit, head: f.to }], f.to, () => true, fp,
     { sameContent, ruledWeakened: gate }).ok, true);
-  // The carried waiver's proof alone must also prevent fingerprint fallback.
+  // A mismatched fingerprint cannot lend predecessor audit evidence.
   assert.equal(canonicalAuditEvidence([{ ...audit, verdict: 'NOT WEAKENED', findings: [] }], f.to, () => true, fp,
     { ruledWeakened: gate }).ok, false);
   f.write('ready.jsonl', JSON.stringify(old));
@@ -348,12 +340,12 @@ for (const change of ['delete', 'net-removal', 'merge-net-removal']) test(`waive
 
 test('finding multiset consumes distinct rulings and preserves source paths', t => {
   const ruled = ['src/a.js:12 issue'];
-  const live = ['src/a.js:30 issue', 'src/a.js:40 issue'];
+  const live = ['src/a.js:12 issue', 'src/a.js:12 issue'];
   assert.equal(findingsSubset(live, ruled), false);
-  assert.equal(findingsSubset(live, [...ruled, 'src/a.js:20 issue']), true);
+  assert.equal(findingsSubset(live, [...ruled, 'src/a.js:12 issue']), true);
   assert.equal(findingsSubset(['src/b.js:30 issue'], ruled), false);
   const f = fixture(t, 'test');
-  const accepted = waiver(f, { findings: live, ruledFindings: [...ruled, 'src/a.js:20 issue'] });
+  const accepted = waiver(f, { findings: live, ruledFindings: [...ruled, 'src/a.js:12 issue'] });
   assert.equal(accepted.result.ok, true);
   assert.equal(waiver(f, { findings: live, ruledFindings: ruled }).gate, null);
   assert.equal(canonicalAuditEvidence([accepted.audit], f.to, () => true, null, {
@@ -383,11 +375,68 @@ test('open-pr requires a fresh canonical audit after test edits; only its findin
   const open = () => run({ argv: [`--ref=${ref}`, `--sha=${f.to}`] });
   assert.equal(open().outcome, 'refused');
   assert.equal(published, 0);
-  records = [old, { ...old, head: f.to, findings: ['code.js:50 issue'], at: '2026-11-02T00:00:00Z' }];
+  records = [old, { ...old, head: f.to, findings: ['code.js:12 issue'], at: '2026-11-02T00:00:00Z' }];
   assert.equal(open().outcome, 'opened');
   records[1] = { ...records[1], findings: ['code.js:50 issue', 'code.js:60 issue'] };
   assert.equal(open().outcome, 'refused');
   records[1] = { ...records[1], findings: ['other.js:50 issue'] };
   assert.equal(open().outcome, 'refused');
   assert.equal(published, 1);
+});
+
+import { createReviewJobIo } from '../../operations/review-job.mjs';
+test('replacement objects cannot disguise a code change in classifier or review wrapper', t => {
+  const f = fixture(t, 'code');
+  f.git('checkout', '-q', '--detach', f.from);
+  f.git('mv', 'backlog/xabc-story.md', 'backlog/7456-story.md');
+  const benign = f.commit('benign rename');
+  f.git('replace', f.to, benign);
+  const env = { ...f.env, GIT_NO_REPLACE_OBJECTS: '0', GIT_GRAFT_FILE: 'hostile' };
+  // The caller explicitly tries to disable replacement protection.
+  assert.equal(f.git('rev-parse', `${f.to}^{tree}`), f.git('rev-parse', `${benign}^{tree}`));
+  assert.equal(classify(f, { env }).carries, false);
+  const calls = [];
+  const io = createReviewJobIo({ env, log() {}, exec(file, args, options) {
+    calls.push(options);
+    return realExec(file, ['-C', f.repo, ...args.slice(2)], options);
+  } });
+  assert.equal(io.sameContentMove({ from: f.from, to: f.to, repo: 'web-everything/web-everything' }).carries, false);
+  assert.ok(calls.length);
+  // Assert outside the classifier's fail-closed catch so an assertion cannot masquerade as refusal.
+  for (const options of calls) {
+    assert.equal(options.env.GIT_NO_REPLACE_OBJECTS, '1');
+    assert.equal(options.env.GIT_GRAFT_FILE, '/dev/null');
+    const pins = Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+      [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]);
+    assert.deepEqual(pins.filter(([key]) => key === 'core.commitGraph').at(-1), ['core.commitGraph', 'false']);
+  }
+});
+test('grafts and caller history config cannot change a genuine clean-merge proof', t => {
+  const f = fixture(t, 'clean');
+  f.git('commit-graph', 'write', '--reachable');
+  f.write('.git/info/grafts', `${f.to}\n`);
+  assert.equal(f.git('show', '-s', '--format=%P', f.to), '');
+  const env = { ...f.env, GIT_GRAFT_FILE: join(f.repo, '.git/info/grafts'),
+    GIT_NO_REPLACE_OBJECTS: '0', GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'core.commitGraph', GIT_CONFIG_VALUE_0: 'true' };
+  assert.deepEqual(classify(f, { env }).commits, [{ sha: f.to, kind: 'clean-main-merge' }]);
+  assert.equal(classify(f, { env }).carries, true);
+});
+for (const kind of ['clean', 'jit']) test(`${kind}: predecessor green never supplies live readiness or history-only audit`, t => {
+  const f = fixture(t, kind), ref = 'lane/example', sameContent = createSameContentProof(f);
+  for (const fingerprint of [undefined, 'b'.repeat(64), 'c'.repeat(64)]) {
+    for (const audit of ['WEAKENED', 'NOT WEAKENED']) {
+      const entry = { ref, sha: f.from, ruling: 'R12', findings: ['issue'] };
+      const old = { ref, sha: f.from, fingerprint, tests: 'green', audit,
+        auditRuling: 'R12', auditDisclosed: entry.findings };
+      assert.equal(readyEvidence([old], { branch: ref, sha: f.to }, [entry], 'c'.repeat(64), { sameContent }), null);
+      const live = { ...old, sha: f.to };
+      const gate = readyEvidence([live], { branch: ref, sha: f.to }, [entry], 'c'.repeat(64), { sameContent });
+      assert.ok(gate);
+      const record = { head: f.from, base: f.root, fingerprint, verdict: audit,
+        findings: audit === 'WEAKENED' ? entry.findings : [], questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z' };
+      if (fingerprint !== 'c'.repeat(64)) assert.equal(canonicalAuditEvidence([record], f.to, () => true,
+        'c'.repeat(64), { sameContent, ruledWeakened: gate }).ok, false);
+    }
+  }
 });

@@ -584,7 +584,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { headSha: view.headRefOid, comments };
     },
     sameContentMove: ({ from, to, repo }) => classifyHeadMove({ from, to, repo: planReviewDispatch({ pr: 1, repo }).laneRepo,
-      env, exec: (f, a, o) => execRead(f, a, { ...o, env }) }),
+      env, exec: (f, a, o) => exec(f, a, { ...o, env: { ...env, ...o.env } }) }),
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
       exec: (f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {

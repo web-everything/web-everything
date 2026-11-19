@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 
 const REF = /^[A-Za-z0-9][A-Za-z0-9._/@^~-]*$/;
@@ -68,7 +69,7 @@ export function classifyHeadMove({ repo = process.cwd(), base = 'origin/main', f
     if (env.WE_SAME_DIFF_CARRY === 'off' || policy.value !== 'on') return refuse('sameDiffCarry is off');
     if (![base, from, to].every(v => typeof v === 'string' && REF.test(v))) return refuse('invalid ref');
     const git = args => String(exec('git', ['-C', repo, ...args], { encoding: 'utf8',
-      env: { ...env, GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
+      env: laneHistoryProofEnv(env),
       timeout: 10000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
     const resolve = ref => {
       const sha = git(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]).trim();
@@ -133,24 +134,21 @@ export function classifyHeadMove({ repo = process.cwd(), base = 'origin/main', f
   } catch { return refuse('git proof failed or non-ancestor head'); }
 }
 
-/** PURE: strip recognized source locations, preserving numeric content such as endpoint ports.
- * Unknown filename forms retain their locations (a conservative mismatch requires a fresh ruling).
- */
+/** PURE: findings retain their exact text, including source locations and whitespace. */
 export function normalizeFinding(finding) {
-  return typeof finding === 'string' ? finding.replace(/(^|[\s([{"'`])((?:\.{0,2}\/)?(?:[\w@.+-]+\/)*[\w@.+-]+\.(?:[cm]?[jt]sx?|json|njk|md|html?|css|scss|ya?ml|toml|py|rs|go|java|cs|[ch](?:pp)?|sh)):\d+(?:-\d+)?(?::\d+)?(?=$|[\s)\]},.;"'`])/g, '$1$2')
-    .replace(/\b(?:lines?\s+\d+(?:-\d+)?|L\d+(?:-L?\d+)?)\b/g, '').replace(/\s+/g, ' ').trim() : '';
+  return typeof finding === 'string' ? finding : '';
 }
 export function findingsSubset(findings, ruled) {
   if (!Array.isArray(findings) || !findings.length || !Array.isArray(ruled) || !ruled.length) return false;
   const remaining = new Map();
   for (const finding of ruled) {
     const text = normalizeFinding(finding);
-    if (!text) return false;
+    if (!text.trim()) return false;
     remaining.set(text, (remaining.get(text) || 0) + 1);
   }
   return findings.every(finding => {
     const text = normalizeFinding(finding), count = remaining.get(text) || 0;
-    if (!text || !count) return false;
+    if (!text.trim() || !count) return false;
     remaining.set(text, count - 1);
     return true;
   });

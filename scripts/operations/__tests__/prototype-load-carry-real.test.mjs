@@ -11,7 +11,7 @@ import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 
 describe('prototype-load real R503 candidate fetch', () => {
   it.each([['full clone', withBareOrigin], ['single-branch clone', withNarrowClone]])(
-    'carries readiness and canonical audit when the rebased candidate object is initially absent: %s', async (_, fixture) => {
+    'requires live readiness when the rebased candidate object is initially absent: %s', async (_, fixture) => {
       await fixture(async ({ tmp, clone, origin, seedOriginBranch, git }) => {
         const branch = 'lane/rebased';
         seedOriginBranch('lane/audited', { 'feature.txt': 'reviewed change\n' });
@@ -51,9 +51,8 @@ describe('prototype-load real R503 candidate fetch', () => {
             readyRecordPath, auditRecordPath, recordPath, adoption: { timeoutMs: 30, pollMs: 10 } },
         });
         const result = await load({ branch, sha, daemon: 'control', dryRun: true });
-        expect(result).toMatchObject({ ok: true, stopReason: null, wouldRegister: true,
-          gate: { source: 'ready-record', record: { sha: oldSha } },
-          canonicalAudit: { ok: true, record: { head: oldSha } } });
+        expect(result).toMatchObject({ ok: false, stopReason: 'no-ready' });
+        expect(result.gate).toBeNull();
         expect(git(['cat-file', '-e', `${sha}^{commit}`])).toBe('');
         expect(git(['rev-parse', `refs/remotes/origin/${branch}`]).trim()).toBe(sha);
         const fetch = calls.findIndex(({ args }) => args[0] === 'fetch' && args.includes(`+refs/heads/${branch}:refs/remotes/origin/${branch}`));

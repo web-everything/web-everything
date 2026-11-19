@@ -2471,7 +2471,7 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
   });
   // R503 red team round 5: a successful exact-sha load names only its own sha, so no live fingerprint is computed;
   // the readiness it appends must keep the stored fingerprint or the next rebase of the same code cannot carry.
-  it('an exact-sha load keeps the stored fingerprint so a later rebase still carries', async () => {
+  it('an exact-sha load retains provenance but a later rebase needs its own green readiness', async () => {
     const stored = 'e'.repeat(64), rebased = '9'.repeat(40);
     const ready = auditLines([{ ref: BASE.branch, sha: SHA, fingerprint: stored, tests: 'green', audit: 'NOT WEAKENED' }]);
     const audits = auditLines([auditRecord({ fingerprint: stored })]);
@@ -2480,7 +2480,7 @@ describe('canonicalAuditEvidence fingerprint carry (R503)', () => {
     expect(first.readyWrites.at(-1)).toMatchObject({ sha: SHA, fingerprint: stored });
     const appended = first.readyWrites.map(({ path, ...record }) => record);
     const second = auditedFixture('refuse', { sha: rebased, ready: ready + auditLines(appended), audits, auditBaseInMain: TREE, fingerprint: () => stored });
-    expect(await second.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true } });
+    expect(await second.run()).toMatchObject({ ok: false, stopReason: 'no-ready' });
     // Unreadable or different live code still refuses: the inherited fingerprint never loosens the carry.
     for (const fingerprint of [() => '1'.repeat(64), () => null]) {
       const other = auditedFixture('refuse', { sha: rebased, ready: ready + auditLines(appended), audits, auditBaseInMain: TREE, fingerprint });
@@ -2497,9 +2497,9 @@ describe('readyEvidence fingerprint carry (R503)', () => {
   const green = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'NOT WEAKENED', ...o });
   const weak = (o = {}) => green({ audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings, ...o });
   const entry = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, ruling: 'R396', findings, ...o });
-  it('a ready record for an older sha carries when the fingerprints match', () => {
+  it('an older sha needs fresh readiness even when the fingerprints match', () => {
     const r = green();
-    expect(prototypeLoad.readyEvidence([r], input, [], FP)).toEqual({ source: 'ready-record', record: r });
+    expect(prototypeLoad.readyEvidence([r], input, [], FP)).toBeNull();
   });
   it.each([['changed code', OTHER_FP], ['unreadable live fp', null], ['malformed live fp', 'zz']])('%s does not carry a ready record', (_, live) => {
     expect(prototypeLoad.readyEvidence([green()], input, [], live)).toBeNull();
@@ -2520,8 +2520,8 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     expect(prototypeLoad.readyEvidence([green({ fingerprint: undefined })], input, [], FP)).toBeNull();
     expect(prototypeLoad.readyEvidence([green({ ref: 'lane/other' })], input, [], FP)).toBeNull();
   });
-  it('a ruled-WEAKENED record plus entry carry when both fingerprints match the live one', () => {
-    const r = weak();
+  it('a live ready record binds a waiver when both fingerprints match the live one', () => {
+    const r = weak({ sha: SHA });
     expect(prototypeLoad.readyEvidence([r], input, [entry()], FP)).toEqual({ source: 'ready-record', record: r, ruledWeakened: { ruling: 'R396', findings } });
   });
   it.each([
@@ -2530,7 +2530,7 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     ['entry for another ruling', [entry({ ruling: 'R397' })]],
     ['entry findings differ', [entry({ findings: ['other'] })]],
   ])('%s refuses the carry', (_, entries) => {
-    expect(prototypeLoad.readyEvidence([weak()], input, entries, FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak({ sha: SHA })], input, entries, FP)).toBeNull();
   });
   it('carry keeps the sha for provenance: a record or entry without a valid originating sha never carries', () => {
     expect(prototypeLoad.readyEvidence([green({ sha: undefined })], input, [], FP)).toBeNull();
@@ -2543,17 +2543,17 @@ describe('readyEvidence fingerprint carry (R503)', () => {
     expect(prototypeLoad.readyEvidence([r], input, [entry({ sha: SHA, fingerprint: undefined })])).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
   });
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
-    const ready = auditLines([weak()]);
+    const ready = auditLines([weak({ sha: SHA })]);
     const settings = { ruledWeakened: [entry()] };
     const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     // A readable DIFFERENT fingerprint proves other code: readiness does not speak, so the audit gate refuses.
     const other = await auditedFixture('warn', { ready, settings, fingerprint: () => OTHER_FP }).run();
-    expect(other).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(other).toMatchObject({ ok: false, stopReason: 'no-ready' });
     // An unreadable live fingerprint proves nothing, so the record's readable fingerprint still refuses (fail closed).
     for (const fingerprint of [() => null, () => { throw new Error('boom'); }]) {
       const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
-      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
     }
   });
 });
@@ -2628,9 +2628,9 @@ describe('carried evidence precedence (R503 red team)', () => {
     expect(prototypeLoad.readyEvidence([own, carriedWeak], input, [], FP)).toBeNull();
     expect(prototypeLoad.readyEvidence([carriedWeak, own], input, [], FP)).toEqual({ source: 'ready-record', record: own });
   });
-  it('a superseded carried WEAKENED does not block that head\'s newer green record', () => {
+  it('a predecessor re-audit still cannot supply live green readiness', () => {
     const green = ready();
-    expect(prototypeLoad.readyEvidence([ready({ audit: 'WEAKENED' }), green], input, [], FP)).toEqual({ source: 'ready-record', record: green });
+    expect(prototypeLoad.readyEvidence([ready({ audit: 'WEAKENED' }), green], input, [], FP)).toBeNull();
   });
   it('an unsuperseded carried WEAKENED on another head blocks a carried green record', () => {
     expect(prototypeLoad.readyEvidence([ready(), ready({ sha: C, audit: 'WEAKENED' })], input, [], FP)).toBeNull();
@@ -2640,20 +2640,20 @@ describe('carried evidence precedence (R503 red team)', () => {
     const out = await auditedFixture('warn', { ready: auditLines([ready(), liveWeak]), fingerprint: () => FP }).run();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
   });
-  it('round 3: retired warn mode refuses a carried green record never loads over a canonical WEAKENED audit', async () => {
+  it('round 3: retired warn mode refuses a live green record never loads over a canonical WEAKENED audit', async () => {
     const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
-    const out = await auditedFixture('warn', { ready: auditLines([ready()]), audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    const out = await auditedFixture('warn', { ready: auditLines([ready({ sha: SHA })]), audits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(out).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { mode: 'refuse', ok: false, reason: 'weakened' } });
-    // A carried WEAKENED audit of the older head blocks the carried green record the same way.
+    // A carried WEAKENED audit of the older head blocks the live green record the same way.
     const carriedAudits = auditLines([auditRecord({ head: A, fingerprint: FP, verdict: 'WEAKENED', findings: ['weakened guard'] })]);
-    const carried = await auditedFixture('warn', { ready: auditLines([ready()]), audits: carriedAudits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
+    const carried = await auditedFixture('warn', { ready: auditLines([ready({ sha: SHA })]), audits: carriedAudits, auditBaseInMain: TREE, fingerprint: () => FP }).run();
     expect(carried).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
   });
   it('round 3: retired warn mode refuses live-head WEAKENED and missing audit', async () => {
     const own = ready({ sha: SHA, fingerprint: undefined });
     const audits = auditLines([auditRecord({ verdict: 'WEAKENED', findings: ['weakened guard'] })]);
     expect(await auditedFixture('warn', { ready: auditLines([own]), audits, auditBaseInMain: TREE }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'weakened' } });
-    expect(await auditedFixture('warn', { ready: auditLines([ready()]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
+    expect(await auditedFixture('warn', { ready: auditLines([ready({ sha: SHA })]), audits: '', fingerprint: () => FP }).run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit', canonicalAudit: { reason: 'no-record' } });
   });
   it('round 3 self-review: a live-head WEAKENED audit that findAudit drops as malformed still blocks the carried pass', () => {
     const pass = audit({ at: at(1) });
@@ -2668,10 +2668,10 @@ describe('carried evidence precedence (R503 red team)', () => {
   it('round 3 self-review: a newer WEAKENED ready record of another head without a fingerprint blocks the carry (rebase twice)', () => {
     const between = ready({ sha: C, fingerprint: undefined, audit: 'WEAKENED' });
     expect(prototypeLoad.readyEvidence([ready(), between], input, [], FP)).toBeNull();
-    // Proven different code (another fingerprint), an older one, or a green one does not block.
-    expect(prototypeLoad.readyEvidence([ready(), { ...between, fingerprint: '1'.repeat(64) }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
-    expect(prototypeLoad.readyEvidence([between, ready()], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
-    expect(prototypeLoad.readyEvidence([ready(), { ...between, audit: 'NOT WEAKENED' }], input, [], FP)).toEqual({ source: 'ready-record', record: ready() });
+    // No ordering or fingerprint of predecessor green records supplies live-head readiness.
+    expect(prototypeLoad.readyEvidence([ready(), { ...between, fingerprint: '1'.repeat(64) }], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([between, ready()], input, [], FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([ready(), { ...between, audit: 'NOT WEAKENED' }], input, [], FP)).toBeNull();
   });
 });
 
@@ -2793,9 +2793,9 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
   const green = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, tests: 'green', audit: 'NOT WEAKENED', ...o });
   const weak = (o = {}) => green({ audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: findings, ...o });
   const entry = (o = {}) => ({ ref: BASE.branch, sha: OLD, fingerprint: FP, ruling: 'R396', findings, ...o });
-  it('a ready record for an older sha carries when the fingerprints match', () => {
+  it('an older sha needs fresh readiness even when the fingerprints match', () => {
     const r = green();
-    expect(prototypeLoad.readyEvidence([r], input, [], FP)).toEqual({ source: 'ready-record', record: r });
+    expect(prototypeLoad.readyEvidence([r], input, [], FP)).toBeNull();
   });
   it.each([['changed code', OTHER_FP], ['unreadable live fp', null], ['malformed live fp', 'zz']])('%s does not carry a ready record', (_, live) => {
     expect(prototypeLoad.readyEvidence([green()], input, [], live)).toBeNull();
@@ -2804,8 +2804,8 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
     expect(prototypeLoad.readyEvidence([green({ fingerprint: undefined })], input, [], FP)).toBeNull();
     expect(prototypeLoad.readyEvidence([green({ ref: 'lane/other' })], input, [], FP)).toBeNull();
   });
-  it('a ruled-WEAKENED record plus entry carry when both fingerprints match the live one', () => {
-    const r = weak();
+  it('a live ready record binds a waiver when both fingerprints match the live one', () => {
+    const r = weak({ sha: SHA });
     expect(prototypeLoad.readyEvidence([r], input, [entry()], FP)).toEqual({ source: 'ready-record', record: r, ruledWeakened: { ruling: 'R396', findings } });
   });
   it.each([
@@ -2814,7 +2814,7 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
     ['entry for another ruling', [entry({ ruling: 'R397' })]],
     ['entry findings differ', [entry({ findings: ['other'] })]],
   ])('%s refuses the carry', (_, entries) => {
-    expect(prototypeLoad.readyEvidence([weak()], input, entries, FP)).toBeNull();
+    expect(prototypeLoad.readyEvidence([weak({ sha: SHA })], input, entries, FP)).toBeNull();
   });
   it('carry keeps the sha for provenance: a record or entry without a valid originating sha never carries', () => {
     expect(prototypeLoad.readyEvidence([green({ sha: undefined })], input, [], FP)).toBeNull();
@@ -2855,7 +2855,7 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
   });
   it('a current-head WEAKENED record for another ref or sha does not veto', () => {
     const older = green();
-    expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, ref: 'lane/other' })], input, [], FP)).toEqual({ source: 'ready-record', record: older });
+    expect(prototypeLoad.readyEvidence([older, weak({ sha: SHA, ref: 'lane/other' })], input, [], FP)).toBeNull();
   });
   it('the loader refuses with no-ready when the current head is WEAKENED over an older carried green record', async () => {
     const out = await auditedFixture('warn', { ready: auditLines([green(), weak({ sha: SHA })]), fingerprint: () => FP }).run();
@@ -2885,7 +2885,7 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
   describe('lazy live fingerprint', () => {
     it('accepts a function and reads it once even with label arguments', () => {
       const lazy = vi.fn(() => FP);
-      const r = green();
+      const r = green({ sha: SHA });
       expect(prototypeLoad.readyEvidence([r], input, [], lazy)).toEqual({ source: 'ready-record', record: r });
       expect(lazy).toHaveBeenCalledTimes(1);
       const skipped = vi.fn(() => FP);
@@ -2902,7 +2902,8 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       const fingerprint = vi.fn(() => FP);
       const f = auditedFixture('warn', { ready: auditLines([green()]), fingerprint });
       const out = await f.run({ testsRun: 'fixture-green', audit: 'NOT WEAKENED' });
-      expect(out.gate).toMatchObject({ source: 'ready-record' });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(out.gate).toBeNull();
       expect(fingerprint).toHaveBeenCalledTimes(1);
       expect(branchFetches(f)).toBe(await baselineFetches());
     });
@@ -2910,14 +2911,15 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       const fingerprint = vi.fn(() => FP);
       const f = auditedFixture('warn', { ready: auditLines([green()]), fingerprint });
       const out = await f.run();
-      expect(out.gate).toMatchObject({ source: 'ready-record' });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(out.gate).toBeNull();
       expect(fingerprint).toHaveBeenCalledTimes(1);
       expect(fingerprint).toHaveBeenCalledWith('origin/main', SHA);
       expect(branchFetches(f)).toBe(await baselineFetches());
     });
     it('a ruled-exception allowlist entry for another sha that stores a fingerprint also triggers the read', async () => {
       const fingerprint = vi.fn(() => FP);
-      const out = await auditedFixture('warn', { ready: auditLines([weak()]), settings: { ruledWeakened: [entry()] }, fingerprint }).run();
+      const out = await auditedFixture('warn', { ready: auditLines([weak({ sha: SHA })]), settings: { ruledWeakened: [entry()] }, fingerprint }).run();
       expect(out.gate).toMatchObject({ ruledWeakened: { ruling: 'R396' } });
       expect(fingerprint).toHaveBeenCalledTimes(1);
       // The entry alone is a trigger: the record stores no fingerprint, so only the entry's fingerprint can start the read.
@@ -2945,11 +2947,12 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
       await f.run();
       expect(fingerprint).toHaveBeenCalledTimes(1);
     });
-    it('the ready and audit stages share ONE read (memoized across stages)', async () => {
+    it('a predecessor readiness fingerprint is read once and cannot authorize the live head', async () => {
       const fingerprint = vi.fn(() => FP);
       const f = auditedFixture('refuse', { ready: auditLines([green()]), audits: auditLines([oldAudit()]), auditBaseInMain: TREE, fingerprint });
       const out = await f.run();
-      expect(out).toMatchObject({ ok: true });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
+      expect(out.gate).toBeNull();
       expect(fingerprint).toHaveBeenCalledTimes(1);
       expect(branchFetches(f)).toBe(await baselineFetches());
     });
@@ -2959,17 +2962,17 @@ describe('readyEvidence carry: ruled exceptions and lazy fingerprint (R503)', ()
     });
   });
   it('the loader loads the live tip on a matching fingerprint and refuses with no-ready otherwise', async () => {
-    const ready = auditLines([weak()]);
+    const ready = auditLines([weak({ sha: SHA })]);
     const settings = { ruledWeakened: [entry()] };
     const ok = await auditedFixture('warn', { ready, settings, fingerprint: () => FP }).run();
     expect(ok).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     // A readable DIFFERENT fingerprint proves other code: readiness does not speak, so the audit gate refuses.
     const other = await auditedFixture('warn', { ready, settings, fingerprint: () => OTHER_FP }).run();
-    expect(other).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(other).toMatchObject({ ok: false, stopReason: 'no-ready' });
     // An unreadable live fingerprint proves nothing, so the record's readable fingerprint still refuses (fail closed).
     for (const fingerprint of [() => null, () => { throw new Error('boom'); }]) {
       const out = await auditedFixture('warn', { ready, settings, fingerprint }).run();
-      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready', detail: 'no-fix-ready-record' });
+      expect(out).toMatchObject({ ok: false, stopReason: 'no-ready' });
     }
   });
 });
@@ -3201,12 +3204,12 @@ describe('a ruled carry stays loadable after it appends its own readiness', () =
   it('the second identical load admits: the gate record on the new sha binds to the carried WEAKENED audit', async () => {
     const audits = auditLines([oldAudit()]);
     const settings = { ruledWeakened: [entry()] };
-    const first = auditedFixture('warn', { ready: auditLines([weak()]), settings, audits, fingerprint: () => FP });
+    const first = auditedFixture('warn', { ready: auditLines([weak({ sha: SHA })]), settings, audits, fingerprint: () => FP });
     expect(await first.run()).toMatchObject({ ok: true, gate: { ruledWeakened: { ruling: 'R396' } } });
     expect(first.readyWrites).toHaveLength(1);
     const { path: _path, ...appended } = first.readyWrites[0];
     expect(appended).toMatchObject({ sha: SHA, fingerprint: FP, audit: 'WEAKENED', auditRuling: 'R396' });
-    const second = auditedFixture('warn', { ready: auditLines([weak(), appended]), settings, audits, fingerprint: () => FP });
+    const second = auditedFixture('warn', { ready: auditLines([weak({ sha: SHA }), appended]), settings, audits, fingerprint: () => FP });
     expect(await second.run()).toMatchObject({ ok: true, canonicalAudit: { ok: true }, gate: { ruledWeakened: { ruling: 'R396' } } });
   });
   it('binds only on the same net diff, the disclosed findings and a covered base', () => {
