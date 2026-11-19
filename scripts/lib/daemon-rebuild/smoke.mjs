@@ -24,7 +24,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, checkCodeUnchanged } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -226,14 +226,14 @@ export function smokeCheckOfChild(cmd, args = []) {
 
 /**
  * The `runChild` every smoke of one build gets: each child's timeout capped at the time left before `deadline`, no
- * child started once less than the per-call `opts.minChildMs` (default `minChildMs`) is left, and — when `failFast` names checks — every child after one of
- * them fails is refused at once. Exposes `deadline` / `failFast` for the caller's log and tests.
+ * child started once less than the per-call `opts.minChildMs` (default `minChildMs`) is left, and — when
+ * `failFast` names checks — only later children of those checks are refused after one of them fails. Exposes `deadline` / `failFast` for the caller's log and tests.
  */
 export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.now, failFast = [], minChildMs = 1_000 }) {
   const ff = new Set(failFast || []);
   let stopped = null;
   const run = async (cmd, args = [], opts = {}) => {
-    if (stopped) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
+    if (stopped && ff.has(smokeCheckOfChild(cmd, args))) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
     const { minChildMs: childFloor = minChildMs, ...childOpts } = opts;
     const left = deadline - now();
     if (!(left >= childFloor)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
@@ -455,10 +455,11 @@ export async function smokeAndAdopt({
     return d.status === 0 ? String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
   };
 
+  let firstSmoke = null;
+  let fallbackEnv = smokeEnv;
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
-    // Recovery compares failures in this run. Historical passes (including unchanged-code skips)
-    // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
+    // Recovery uses only evidence collected in this run, never historical passing trees.
     const freshComparison = label != null;
     if (freshComparison) changedFiles = null;
     const identity = smokePassIdentity(git, sha, cloneKind);
@@ -479,7 +480,27 @@ export async function smokeAndAdopt({
     const t0 = now();
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
-      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild });
+      let reuseRows = [];
+      if (freshComparison && firstSmoke) {
+        const diff = git(['diff', '--name-only', plan.finalSha, sha]);
+        const delta = diff.status === 0 ? String(diff.stdout ?? '').split('\n').filter(Boolean) : null;
+        reuseRows = (firstSmoke.smoke?.results || []).filter(row => {
+          const check = SMOKE_CHECKS.find(check => check.name === row.name);
+          return row.ok === true && !row.skipped && !row.skipReason && check && check.name !== 'tree-stays-clean'
+            && (check.kind === 'env' || checkCodeUnchanged({ check, changedFiles: delta, root: candidate.path }));
+        });
+        log.error?.(`daemon-rebuild: smoke-fallback-reuse ${JSON.stringify({ candidate: label, checks: reuseRows.map(row => row.name), budgets: Object.fromEntries(Object.values(SMOKE_BUDGET_ENV).map(key => [key, fallbackEnv[key]])) })}`);
+      }
+      smokeResult = await runSmoke({ root: candidate.path, env: freshComparison ? fallbackEnv : smokeEnv,
+        changedFiles: proven ? null : changedFiles, reuseCode: !!proven, reuseRows, runChild });
+      if (!freshComparison) {
+        firstSmoke = smokeResult;
+        const base = resolveSmokeBudgets(smokeEnv);
+        fallbackEnv = { ...smokeEnv };
+        for (const [key, name] of Object.entries(SMOKE_BUDGET_ENV)) {
+          fallbackEnv[name] = String(Math.max(base[key], smokeResult?.smoke?.budgets?.[key] || 0));
+        }
+      }
     } catch (e) {
       threw = e;
     }

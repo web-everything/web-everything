@@ -816,19 +816,30 @@ describe('rebuild smoke budget and fail-fast', () => {
     expect(result.alerts.find((a) => a.kind === 'smoke-budget-exhausted').detail).toMatchObject({ totalMs: 30 * 60_000, source: { totalMs: 'env' } });
   });
 
-  it('hands every smoke a budgeted runChild, and plain main a fail-fast one keyed by the checks A failed', async () => {
+  it('carries widened budgets and passing env rows to plain main alongside scoped fail-fast', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
     pushBranch(originDir, 'lane/bad2', (dir) => writeFile(dir, 'bad2.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/bad2' }, { env });
     const seen = [];
-    const runSmoke = vi.fn(async ({ root, runChild }) => {
-      seen.push({ bad: existsSync(join(root, 'bad2.txt')), failFast: [...(runChild?.failFast ?? [])], deadline: runChild?.deadline });
-      return existsSync(join(root, 'bad2.txt')) ? codeFail('dispatch-dry-run') : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    const runSmoke = vi.fn(async ({ root, runChild, env: smokeEnv, reuseRows }) => {
+      seen.push({ smokeEnv, reuseRows, bad: existsSync(join(root, 'bad2.txt')), failFast: [...(runChild?.failFast ?? [])], deadline: runChild?.deadline });
+      return existsSync(join(root, 'bad2.txt')) ? {
+        ...codeFail('dispatch-dry-run'), smoke: {
+          budgets: { reconcileMs: 3_000_000, dispatchPassMs: 4_000_000, dispatchDryRunMs: 2_000_000 },
+          results: [...codeFail('dispatch-dry-run').smoke.results,
+            { name: 'gh-api-repo', ok: true, ms: 10 },
+            { name: 'gh-pr-list', ok: true, skipped: true },
+            { name: 'tree-stays-clean', ok: true }],
+        },
+      } : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
     });
     const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
     expect(result.reason).toBe('fallback-plain-main');
     expect(seen.map((s) => s.failFast)).toEqual([[], ['dispatch-dry-run']]);
+    expect(seen[1].smokeEnv).toMatchObject({ WE_SMOKE_RECONCILE_MS: '3000000',
+      WE_SMOKE_DISPATCH_PASS_MS: '4000000', WE_SMOKE_DISPATCH_DRY_RUN_MS: '2000000' });
+    expect(seen[1].reuseRows.map(row => row.name)).toEqual(['gh-api-repo']);
     expect(seen.every((s) => Number.isFinite(s.deadline) && s.deadline === seen[0].deadline)).toBe(true);
   });
 });
@@ -857,16 +868,29 @@ describe('budgetedRunChild', () => {
     expect(base).toHaveBeenCalledTimes(3);
   });
 
-  it('fail-fast: once a listed check fails, every later child is refused without running', async () => {
+  it('fail-fast refuses listed checks but still runs boot and clean-tree children', async () => {
     const base = vi.fn(async (cmd, args) => {
       if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') throw new Error('timed out after 185024ms (process group killed)');
       return 'ok';
     });
-    const run = budgetedRunChild({ runChild: base, deadline: Infinity, now: () => 0, failFast: ['reconcile-dry-run'] });
+    const run = budgetedRunChild({ runChild: base, deadline: Infinity, now: () => 0, failFast: ['reconcile-dry-run', 'dispatch-dry-run'] });
     expect(await run('git', ['status', '--porcelain'], {})).toBe('ok');
     await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs', '--repo=a/b', '--json'], {})).rejects.toThrow(/timed out/);
     await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs', '--repo=c/d', '--json'], {})).rejects.toThrow(/fail-fast/);
     await expect(run('node', ['--input-type=module', '-e', 'x'], {})).rejects.toThrow(/fail-fast/);
+    expect(await run('node', ['scripts/readiness/daemon-entry-boot.mjs'], {})).toBe('ok');
+    expect(await run('git', ['status', '--porcelain'], {})).toBe('ok');
+    expect(base).toHaveBeenCalledTimes(4);
+  });
+
+  it('a listed failure still allows a later check outside the fail-fast set', async () => {
+    const base = vi.fn(async (_cmd, args) => {
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') throw new Error('boom');
+      return 'ok';
+    });
+    const run = budgetedRunChild({ runChild: base, deadline: Infinity, failFast: ['reconcile-dry-run'] });
+    await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs'])).rejects.toThrow('boom');
+    expect(await run('node', ['--input-type=module', '-e', 'x'])).toBe('ok');
     expect(base).toHaveBeenCalledTimes(2);
   });
 

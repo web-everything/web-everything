@@ -248,15 +248,15 @@ describe('resource shadow observations', () => {
   // children (not CPU) and were killed, so main, every overlay and last-good all failed the smoke.
   it('keeps load scaling for the I/O-bound checks even when admitted (smokeIoBoundLoadScale, standard on)', () => {
     const b = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
-    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 1_200_000, ghApiMs: 30_000 });
+    expect(b).toMatchObject({ reconcileMs: 1_200_000, dispatchDryRunMs: 1_200_000, ghApiMs: 30_000 });
     expect(resolveIoBoundLoadScale({})).toMatchObject({ enabled: true, source: 'standard' });
   });
   it('the I/O-bound rule never lowers a non-admit factor, and honours the env layer and absolute overrides', () => {
-    expect(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } }).reconcileMs).toBe(480_000);
+    expect(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } }).reconcileMs).toBe(1_200_000);
     const admit48 = { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } };
-    expect(resolveSmokeBudgets({ WE_SMOKE_IO_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(120_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_IO_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(300_000);
     expect(resolveIoBoundLoadScale({ WE_SMOKE_IO_LOAD_SCALE: '0' })).toMatchObject({ enabled: false, source: 'env' });
-    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(120_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(300_000);
     expect(resolveSmokeBudgets({ WE_SMOKE_RECONCILE_MS: '50000' }, admit48).reconcileMs).toBe(50_000);
   });
   it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
@@ -331,6 +331,48 @@ function withNewCheckDefaults(fn) {
     return fn(cmd, args, opts);
   });
 }
+
+describe('GitHub probe latency budgets', () => {
+  it.each([
+    ['slow API', 23_500, 1_000, {}, 1_200_000, 1_200_000, 4],
+    ['slow PR list', 1_000, 7_500, {}, 450_000, 450_000, 1.5],
+    ['fast probes', 4_999, 5_000, {}, 300_000, 300_000, null],
+    ['disabled', 23_500, 1_000, { WE_SMOKE_GH_LATENCY_SCALE: '0' }, 300_000, 300_000, null],
+    ['explicit budgets', 23_500, 1_000, { WE_SMOKE_RECONCILE_MS: '12345', WE_SMOKE_DISPATCH_DRY_RUN_MS: '23456' }, 12_345, 23_456, 4],
+  ])('%s preserves failures and applies only the allowed scale', async (_name, apiMs, listMs, overrides, reconcileMs, dispatchDryRunMs, factor) => {
+    let t = 0;
+    const seen = {};
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const defaults = withNewCheckDefaults(async (cmd, args) => {
+      if (cmd === 'gh' && args[0] === 'api') { t += apiMs; throw new Error('real non-timeout error'); }
+      if (cmd === 'gh' && args[0] === 'pr') t += listMs;
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') throw new Error('real non-timeout error');
+      if (args[1] === 'list') return '[]';
+      if (args[1] === 'acquire') return '{"lane":1}';
+      return '';
+    });
+    const runChild = async (cmd, args, opts) => {
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') seen.reconcileMs = opts.timeoutMs;
+      if (args[2] === DISPATCH_DRY_RUN_SCRIPT) seen.dispatchDryRunMs ??= opts.timeoutMs;
+      return defaults(cmd, args, opts);
+    };
+    try {
+      const result = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_DISPATCH_PASSES: '0', ...overrides },
+        clock: () => t, repos: ['example/repo'], runChild, shadow: () => undefined, admit: () => undefined });
+      expect(result.pass).toBe(false);
+      expect(result.results.find((r) => r.name === 'reconcile-dry-run').ok).toBe(false);
+      expect(seen.reconcileMs).toBe(reconcileMs);
+      expect(seen.dispatchDryRunMs).toBe(dispatchDryRunMs);
+      const lines = log.mock.calls.map(([line]) => line).filter((line) => line.startsWith('daemon-live-smoke: gh-latency-scale '));
+      expect(lines).toHaveLength(factor === null ? 0 : 1);
+      if (factor !== null) expect(JSON.parse(lines[0].slice(lines[0].indexOf('{')))).toEqual({
+        probeMs: Math.max(apiMs, listMs), factor, reconcileMs, dispatchDryRunMs,
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
 
 describe('runBounded failure details', () => {
   const runCheck = (name, error, releaseOnly = false) => SMOKE_CHECKS.find((c) => c.name === name).run({
@@ -646,13 +688,13 @@ describe('load-aware smoke budgets', () => {
     expect(resolveSmokeBudgets({}, host(load))).toEqual({
       lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
       laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
-      ghApiMs: 30_000, ghPrListMs: 30_000, ghEnvProbeMs: 60_000, reconcileMs: 120_000,
+      ghApiMs: 30_000, ghPrListMs: 30_000, ghEnvProbeMs: 60_000, reconcileMs: 300_000,
       dispatchDryRunMs: 300_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
     });
   });
 
   it('load 48 on 12 cores scales dispatch and reconcile by four', () => {
-    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 1_200_000, reconcileMs: 480_000 });
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 1_200_000, reconcileMs: 1_200_000 });
   });
 
   it('load 100 on 12 cores is capped at four times the defaults', () => {
@@ -676,7 +718,7 @@ describe('load-aware smoke budgets', () => {
 
   it('WE_SMOKE_LOAD_SCALE_MAX=2 caps scaling at twice the defaults', () => {
     expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host())).toMatchObject({
-      dispatchDryRunMs: 600_000, reconcileMs: 240_000,
+      dispatchDryRunMs: 600_000, reconcileMs: 600_000,
     });
   });
 
@@ -711,7 +753,7 @@ describe('load-aware smoke budgets', () => {
     delete widened.WE_SMOKE_LOAD_SCALE;
     const retry = resolveSmokeBudgets(widened, host());
     expect(retry.dispatchDryRunMs).toBe(3_000_000);
-    expect(retry.reconcileMs).toBe(1_200_000);
+    expect(retry.reconcileMs).toBe(3_000_000);
   });
 });
 
@@ -2798,5 +2840,84 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
     const withCode = { ...state, held: { ...state.held, details: [...state.held.details, { name: 'x', detail: 'TypeError: boom' }] } };
     expect(stickyLoadShaped.cachedRejectionLoadRetry(withCode, { WE_SMOKE_HOST_LOAD1: '120', WE_SMOKE_HOST_CORES: '12' }, { now })).toBeNull();
     expect(stickyLoadShaped.cachedRejectionLoadRetry({ ...state, rejected: { ...state.rejected, retryAt: '2026-11-05T18:00:00Z' } }, {}, { now })).toBeNull();
+  });
+});
+
+
+describe('same-run smoke evidence', () => {
+  it('retries only env-timeout checks and counts retained passing rows once', async () => {
+    let t = 0;
+    const calls = [];
+    let lists = 0;
+    const defaults = withNewCheckDefaults(async (_cmd, args) => {
+      if (args[1] === 'list') return '[]';
+      return args[1] === 'acquire' ? '{"lane":1}' : '';
+    });
+    const runChild = async (cmd, args, opts) => {
+      calls.push([cmd, args]);
+      if (cmd === 'node' && args[1] === 'list' && lists++ === 0) {
+        t += 120_000;
+        throw Error('timed out after 120000ms (process group killed)');
+      }
+      return defaults(cmd, args, opts);
+    };
+    const result = await runLiveSmokeWithRetry({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' },
+      runChild, clock: () => t, refreshAuth: async ({ env }) => ({ env }), sleep: async () => {} });
+    expect(result.verdict).toBe('pass');
+    expect(result.attempts).toBe(2);
+    expect(lists).toBe(2);
+    expect(calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'api')).toHaveLength(1);
+    expect(calls.filter(([, args]) => args[0] === 'scripts/conveyor/reconcile-pass.mjs')).toHaveLength(Object.keys(CONSTELLATION_REPOS).length);
+    expect(result.smoke.results).toHaveLength(SMOKE_CHECKS.length);
+    expect(result.smoke.results.filter(row => row.name !== 'lane-pool-list')
+      .every(row => row.reused && row.ok === true && !row.skipped && !row.skipReason)).toBe(true);
+    expect(result.smoke.budgets.dispatchPassMs).toBeGreaterThanOrEqual(1_500_000);
+  });
+
+  it('keeps a retained non-timeout failure as a code verdict', async () => {
+    const runChild = withNewCheckDefaults(async (_cmd, args) => {
+      if (args[1] === 'list') return '[]';
+      return args[1] === 'acquire' ? '{"lane":1}' : '';
+    });
+    const failed = { name: 'gh-api-repo', ok: false, ms: 10, detail: 'invalid API response', mayBeTransient: false };
+    const smoke = await runLiveSmoke({ root: '/x', env: {}, runChild, retainedRows: [failed] });
+    expect(smoke.pass).toBe(false);
+    expect(classifySmokeFailure(smoke.results)).toBe('code');
+    expect(smoke.results.find(row => row.name === failed.name)).toEqual({ ...failed, reused: true });
+    expect(runChild.mock.calls.some(([cmd, args]) => cmd === 'gh' && args[0] === 'api')).toBe(false);
+  });
+
+  it('does not reuse failed, skipped, duplicate or absent rows', async () => {
+    const baselineChild = withNewCheckDefaults(async (_cmd, args) => {
+      if (args[1] === 'list') return '[]';
+      return args[1] === 'acquire' ? '{"lane":1}' : '';
+    });
+    const baseline = await runLiveSmoke({ root: '/x', env: {}, runChild: baselineChild });
+    const rows = baseline.results.filter(row => row.name !== 'gh-pr-list').map(row => ({ ...row, skipped: false }));
+    rows.find(row => row.name === 'gh-api-repo').ok = false;
+    rows.find(row => row.name === 'reconcile-dry-run').skipped = true;
+    rows.push({ ...rows.find(row => row.name === 'dispatch-dry-run') });
+    const result = await runLiveSmoke({ root: '/x', env: {}, runChild: baselineChild, reuseRows: rows });
+    for (const name of ['gh-api-repo', 'gh-pr-list', 'reconcile-dry-run', 'dispatch-dry-run']) {
+      expect(result.results.find(row => row.name === name).reused).toBeUndefined();
+    }
+    expect(result.results).toHaveLength(SMOKE_CHECKS.length);
+  });
+
+  it('starts every reconcile repo in parallel and collects failures in repo order', async () => {
+    const started = [];
+    const releases = [];
+    const check = SMOKE_CHECKS.find(check => check.name === 'reconcile-dry-run');
+    const pending = check.run({ root: '/x', repos: ['a/one', 'b/two', 'c/three'], budgets: { reconcileMs: 10 }, env: {},
+      runChild: async (_cmd, args) => {
+        started.push(args[1]);
+        await new Promise(resolve => releases.push(resolve));
+        throw Error(args[1]);
+      } });
+    expect(started).toEqual(['--repo=a/one', '--repo=b/two', '--repo=c/three']);
+    releases.reverse().forEach(release => release());
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.detail).toMatch(/a\/one:.*b\/two:.*c\/three:/);
   });
 });

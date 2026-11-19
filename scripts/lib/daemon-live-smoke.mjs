@@ -205,10 +205,10 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
     ghApiMs: envMs(env, SMOKE_BUDGET_ENV.ghApiMs, 30_000),
     ghPrListMs: envMs(env, SMOKE_BUDGET_ENV.ghPrListMs, 30_000),
     ghEnvProbeMs: envMs(env, SMOKE_BUDGET_ENV.ghEnvProbeMs, 60_000),
-    // Live 2026-10-04: the dispatch dry-run's three LIVE passes took ~90s on a quiet host (load ~10), all of it
-    // waiting on gh/git children — the cost grows with the open-PR count, not with load. 45s/60s held every
-    // daemon clone off main (`smoke-env-timeout`). Generous defaults, still load-scaled below.
-    reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 120_000),
+    // Live 2026-11-18 19:19–19:22 ET (wev-review-daemon): reconcile's three passes took
+    // 152s + 147s + 42s (~340s) during GitHub GraphQL 504s; gh-api-repo took 23.5s.
+    // Start at 300s, then allow measured gh latency to widen it below; the rebuild deadline still caps it.
+    reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 300_000),
     // Live 2026-10-11 on plain main, quiet host: three passes took 168s (fix 61s, ci-heal 92s,
     // review 11s), leaving little margin under 180s. Allow 300s before the load scaling below.
     dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 300_000),
@@ -520,12 +520,20 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
   const failures = [];
   const stderrTails = [];
   const causes = [];
-  for (const slug of repos) {
+  const outcomes = await Promise.all(repos.map(async (slug) => {
     try {
       // x5wbsbc — `env` too (like every lane-pool check, #4139): a candidate smoke's env carries the LIVE
       // clone's pool root / dispatch root (`daemon-rebuild.mjs#candidateSmokeEnv`), never the candidate path's.
       await runChild('node', ['scripts/conveyor/reconcile-pass.mjs', `--repo=${slug}`, '--json'], { cwd: root, timeoutMs: budgets.reconcileMs, env });
     } catch (e) {
+      return { ok: false, error: e };
+    }
+    return { ok: true };
+  }));
+  for (const [i, outcome] of outcomes.entries()) {
+    if (!outcome.ok) {
+      const e = outcome.error;
+      const slug = repos[i];
       causes.push(throttleCause(e));
       failures.push(`${slug}: ${firstLine(e).replaceAll('smoke-env-cause', 'smoke-env-cause\u200b')}`);
       const { stderrTail } = childFailureDiagnostics(e);
@@ -918,7 +926,7 @@ export function decideSmokeVerdict(results) {
 export async function runLiveSmoke({
   root, env = process.env, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
-  clock = Date.now, hostBusy = undefined, reuseCode = false,
+  clock = Date.now, hostBusy = undefined, reuseCode = false, reuseRows = [], retainedRows = [],
   load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
   makeReadMemoDir = () => mkdtempSync(join(tmpdir(), 'smoke-read-memo-')),
 } = {}) {
@@ -978,6 +986,17 @@ export async function runLiveSmoke({
     for (const check of SMOKE_CHECKS) {
       const startedAt = clock();
       let result;
+      const retained = retainedRows.find(row => row?.name === check.name && typeof row.ok === 'boolean');
+      if (retained) {
+        results.push({ ...retained, ...(retained.ok ? { ms: 0 } : {}), reused: true });
+        continue;
+      }
+      // Explicit same-run evidence only; failed, skipped, duplicate or missing rows cannot pass a check.
+      const prior = reuseRows.filter(row => row?.name === check.name);
+      if (prior.length === 1 && prior[0].ok === true && !prior[0].skipped && !prior[0].skipReason) {
+        results.push({ ...prior[0], ms: 0, reused: true });
+        continue;
+      }
       if (check.kind === 'code' && (reuseCode || checkCodeUnchanged({ check, changedFiles, root, closureOf }))) {
         results.push({
           name: check.name, ms: 0, ok: true, skipped: true, mayBeTransient: check.mayBeTransient !== false,
@@ -1024,8 +1043,24 @@ export async function runLiveSmoke({
           || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
       results.push({ name: check.name, ms: clock() - startedAt, ...result,
         ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
+      // Both external probes have completed before the expensive tree checks begin. Budgets are a fresh
+      // per-run object from resolveSmokeBudgets; explicit operator timeouts remain absolute.
+      if (check.name === 'gh-pr-list' && env.WE_SMOKE_GH_LATENCY_SCALE !== '0') {
+        const probeMs = Math.max(...results.filter((r) => ['gh-api-repo', 'gh-pr-list'].includes(r.name)).map((r) => r.ms));
+        if (probeMs > 5_000) {
+          const factor = Math.min(4, probeMs / 5_000);
+          for (const key of ['reconcileMs', 'dispatchDryRunMs']) {
+            if (envMs(env, SMOKE_BUDGET_ENV[key], null) === null) ctx.budgets[key] = Math.round(ctx.budgets[key] * factor);
+          }
+          try {
+            console.error(`daemon-live-smoke: gh-latency-scale ${JSON.stringify({ probeMs, factor,
+              reconcileMs: ctx.budgets.reconcileMs, dispatchDryRunMs: ctx.budgets.dispatchDryRunMs })}`);
+          } catch { /* logging never changes the smoke */ }
+        }
+      }
     }
     return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
+      budgets: Object.fromEntries(Object.keys(SMOKE_BUDGET_ENV).map(key => [key, budgets[key]])),
       ...(admission ? { admission: { verdict: admission.verdict, reason: admission.reason } } : {}) };
   } finally {
     if (memoDir) {
@@ -1146,7 +1181,7 @@ export async function runLiveSmokeWithRetry({
   root, env = process.env, runChild = runBounded, sleep = defaultSleep,
   retries = envNonNegInt(env, SMOKE_TRANSIENT_RETRIES_ENV, 2),
   backoffMs = envMs(env, SMOKE_RETRY_BACKOFF_MS_ENV, 15_000),
-  changedFiles = null, reuseCode = false,
+  changedFiles = null, reuseCode = false, reuseRows = [],
   refreshAuth = refreshSmokeGithubEnv,
   clock = Date.now,
   loadAvg = () => loadavg(),
@@ -1159,6 +1194,7 @@ export async function runLiveSmokeWithRetry({
   let forceRefresh = false;
   let authRetried = false;
   let auth = null;
+  let retryRetainedRows = [];
   let attemptEnv = env; // widened once, for the env-timeout retry below
   let envTimeout = null;
   let githubEnv = null;
@@ -1170,7 +1206,8 @@ export async function runLiveSmokeWithRetry({
     // Fresh token for EVERY attempt, the same way the daemon's own tick gets one (see refreshSmokeGithubEnv).
     const { env: runEnv, refresh } = await refreshAuth({ env: attemptEnv, force: forceRefresh });
     forceRefresh = false;
-    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, clock });
+    smoke = await runLiveSmoke({ root, env: runEnv, runChild, changedFiles, reuseCode, reuseRows, retainedRows: retryRetainedRows, clock });
+    retryRetainedRows = [];
     verdict = classifySmokeFailure(smoke.results);
     // A gate-confirmed outage may spend the retry's remaining budget before later checks can run.
     // Those gate-observed refusals are incomplete evidence, not a newly discovered code regression.
@@ -1188,7 +1225,9 @@ export async function runLiveSmokeWithRetry({
       if (!envTimeout) {
         const factor = envMs(env, SMOKE_ENV_TIMEOUT_BUDGET_FACTOR_ENV, DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR);
         envTimeout = { first: rows, budgetFactor: factor, loadAvg: safeLoadAvg(loadAvg) };
-        attemptEnv = widenSmokeBudgetsEnv(env, factor);
+        attemptEnv = widenSmokeBudgetsEnv(env, factor, smoke.budgets);
+        // Keep all completed non-timeout rows, including transient failures: only timeouts retry.
+        retryRetainedRows = smoke.results.filter(row => !isEnvTimeoutRow(row, { minElapsedMs }));
         continue;
       }
       envTimeout.retry = rows;
@@ -1337,9 +1376,10 @@ export function isEnvTimeoutFailureSet(results, opts = {}) {
 
 /** A COPY of `env` with every smoke budget, and lane-pool's own scan budget, multiplied by `factor`. The
  *  lane-pool-list child budget always leaves 30s over the scan budget, so the scan's own give-up is what fires. */
-export function widenSmokeBudgetsEnv(env = process.env, factor = DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR) {
+export function widenSmokeBudgetsEnv(env = process.env, factor = DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR, lastBudgets = {}) {
   const out = { ...env };
-  const budgets = resolveSmokeBudgets(env);
+  const base = resolveSmokeBudgets(env);
+  const budgets = Object.fromEntries(Object.keys(SMOKE_BUDGET_ENV).map(key => [key, Math.max(base[key], lastBudgets[key] || 0)]));
   for (const [key, name] of Object.entries(SMOKE_BUDGET_ENV)) out[name] = String(Math.round(budgets[key] * factor));
   const scan = Math.round(envMs(env, LANE_POOL_SCAN_TIMEOUT_ENV, LANE_POOL_DEFAULT_SCAN_TIMEOUT_MS) * factor);
   out[LANE_POOL_SCAN_TIMEOUT_ENV] = String(scan);

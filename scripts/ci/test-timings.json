@@ -1860,6 +1860,7 @@
   "scripts/conveyor/soak/breaks/skipped-tick-ontick.soak.test.mjs": 17.87,
   "scripts/conveyor/soak/breaks/small-pr-lands-over-large-in-review.soak.test.mjs": 64.52,
   "scripts/conveyor/soak/breaks/smoke-expired-gh-token.soak.test.mjs": 34.96,
+  "scripts/conveyor/soak/breaks/smoke-failfast-env-checks.soak.test.mjs": 1.0,
   "scripts/conveyor/soak/breaks/stacked-fork-pr-never-restacked.soak.test.mjs": 1.89,
   "scripts/conveyor/soak/breaks/smoke-github-outage.soak.test.mjs": 131.46,
   "scripts/conveyor/soak/breaks/stacked-pr-missing-checks-refused.soak.test.mjs": 0.76,
