@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { handoffHome } from '../../operations/handoff-home.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../../lib/constellation-repos.mjs';
 import { daemonEventsPath, appendDaemonEvent } from '../../lib/daemon-events.mjs';
 import { readSettingsChecked } from '../../lib/settings-files.mjs';
 import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
@@ -123,7 +124,7 @@ export function collectExpectationEvidence({ repo, pr, read, now }) {
     eligible: pull.mergeStateStatus === 'CLEAN' && pull.labels.nodes.some(l => l.name === 'ready-to-merge') };
 }
 
-export async function runExpectationPass({ repo = 'web-everything/web-everything', pr,
+export async function runExpectationPass({ repo = ghRepoSlug(DEFAULT_REPO_KEY), pr,
   now = new Date().toISOString(), eventsFile, stateFile, evidenceFile, settings,
   gh, emitEvent, env = process.env, home, log = console.error } = {}) {
   const config = settings ?? readExpectationSettings({ env, log });
