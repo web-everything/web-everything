@@ -4468,7 +4468,11 @@ statuses by id only: timestamps and marker mtimes establish no publication autho
 our automation-created success id and every S1 id; any new non-success id, even below ours, or a changed
 latest App run restores a held status and retains `.unpublished`. Tests inject GitHub IO, including
 installation-token resolution, and exercise each race separately. Result authors use the gate's
-`isTrustedMarkerAuthor` rule. A no-op rerun posts nothing; CLI dry-run returns S1 and the decision
+`isTrustedMarkerAuthor` rule. Republish requires a completed successful round App run with a readable
+title: Live-check and Policy-clear runs and their hold descriptions belong to their validated writers
+and never authorize round recovery. S2 repeats the fresh head, labels, trusted publishable result and
+enqueue-hold reads; changed labels or result comments/authors, moved heads, blocking or unreadable
+evidence restore the hold and retain the outbox. A no-op rerun posts nothing; CLI dry-run returns S1 and the decision
 without publication or outbox removal. Round writers must resolve the App token before any remote hold;
 not-owed transitions persist local state without publishing. The finished-publication-hold soak probes
 planner behavior for fix presence and unconditionally requires both the fix and its race-recovery scenario.

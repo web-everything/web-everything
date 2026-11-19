@@ -155,7 +155,7 @@ export function createLiveCheckPublisher({ env = process.env, run = runGhSync, p
   };
 }
 
-export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId } = {}) {
+export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId, requireRound = false } = {}) {
   if (!validApp(appId)) return failure(WE_APP_ID_UNSET);
   if (!validHead(headSha)) return failure('red-team head missing or invalid');
   if (!Array.isArray(checkRuns)) return failure('red-team check runs unreadable');
@@ -172,6 +172,9 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
   // GitHub run ids order creations, including reruns whose timestamps tie or are absent.
   runs.sort((a, b) => Number(b.id) - Number(a.id));
   if (!runs[0]) return failure('no red-team check run on head');
+  // Round publication recovery cannot validate another writer's success or clear that writer's hold.
+  if (requireRound && (typeof runs[0].output?.title !== 'string' || isLiveCheckRun(runs[0]) || isPolicyClearRun(runs[0])))
+    return failure('latest App check is not a round run; retry its validated writer or operator must inspect');
   // PR #6601 block ruling: a policy-clear success never outranks a round. The policy-clear writer only posts its
   // success when the newest ROUND run is absent or a completed success, so a policy-clear success that is newest over
   // an unfinished or failed round run is unverified (a failed supersede post, a crash before the re-read, or a round

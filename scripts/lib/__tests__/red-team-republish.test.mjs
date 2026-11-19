@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
 import { recordRedTeamStatus, redTeamStatusDir, republishPublicationStatus } from '../drain-red-team-evidence.mjs';
-import { readStatusHistory, readRedTeamCheckFact, postRedTeamPublicationHold, resolveRedTeamWriter, redTeamWriterEnv } from '../red-team-check-run.mjs';
+import { readStatusHistory, readRedTeamCheckFact, postRedTeamPublicationHold, resolveRedTeamWriter, redTeamWriterEnv,
+  LIVE_CHECK_TITLE_PREFIX, POLICY_CLEAR_TITLE_PREFIX } from '../red-team-check-run.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { main } from '../../operations/red-team-republish.mjs';
@@ -28,7 +29,7 @@ function fixture() {
   const state = { history: [status(10), status(1, 'success')], posts: [], checks: 0, reads: 0, runId: 50,
     comments: [{ author: bot, body: renderRedTeamComment({ pr, rev: head, provider: 'codex', model: 'fixture',
       findings: [], recheckStatus: 'not-needed', foldedVerdict: 'accept' }) }],
-    live: { headRefOid: head, labels: [] }, local, path, env };
+    live: { headRefOid: head, labels: [] }, checkRun: { output: { title: 'Red-team round clear' } }, extraRuns: [], local, path, env };
   const gh = vi.fn((args, options = {}) => {
     if (args[0] === 'auth') {
       expect(options.env.GH_TOKEN).toBeUndefined();
@@ -46,13 +47,16 @@ function fixture() {
     }
     expect(options.env.WE_GH_READ_MEMO_DIR).toBeUndefined();
     expect(options.throttle.env.WE_GH_READ_MEMO_DIR).toBeUndefined();
+    if ((state.unreadablePr && args[0] === 'pr') || (state.unreadableComments && args[1]?.includes('/comments?')))
+      throw Error('live evidence unreadable');
     if (args[0] === 'pr') return JSON.stringify(state.live);
     if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequest: { comments: { totalCount: state.comments.length } } } } });
     if (args[1].includes('/comments?')) return JSON.stringify(state.comments.map((c, i) => ({ ...c, node_id: `IC_${i}`, user: c.author })));
     if (args[1].includes('/check-runs?')) {
       state.checks++; state.beforeCheck?.();
-      return JSON.stringify({ total_count: 1, check_runs: [{ id: state.runId, name: 'red-team', app: { id: SYNTHETIC_APP },
-        external_id: `${repo}#${pr}`, head_sha: head, status: 'completed', conclusion: 'success' }] });
+      const run = { id: state.runId, name: 'red-team', app: { id: SYNTHETIC_APP },
+        external_id: `${repo}#${pr}`, head_sha: head, status: 'completed', conclusion: 'success', ...state.checkRun };
+      return JSON.stringify({ total_count: 1 + state.extraRuns.length, check_runs: [run, ...state.extraRuns.map(over => ({ ...run, ...over }))] });
     }
     if (args[1].includes('/statuses?')) {
       state.reads++; state.beforeHistory?.();
@@ -63,8 +67,8 @@ function fixture() {
   const options = { repo, pr, head, env, gh, isAlive: () => false, readComments: () => state.comments };
   return { ...state, state, gh, options, run: over => republishPublicationStatus({ ...options, ...over }) };
 }
-const expectRestored = f => {
-  expect(f.run()).toMatchObject({ ok: false });
+const expectRestored = (f, options) => {
+  expect(f.run(options)).toMatchObject({ ok: false });
   expect(f.state.posts.map(s => s.state)).toEqual(['success', 'failure']);
   expect(existsSync(`${f.path}.unpublished`)).toBe(true);
 };
@@ -76,6 +80,31 @@ describe('publication republish id-based race verification', () => {
   });
   it('restores when a new check run appears between observations', () => {
     const f = fixture(); f.state.afterPost = () => { f.state.runId = 51; }; expectRestored(f);
+  });
+  it.each([
+    ['blocking label', f => { f.state.live.labels = [{ name: 'review:human' }]; }],
+    ['nonblocking label change', f => { f.state.live.labels = ['new-label']; }],
+    ['unreadable labels', f => { f.state.live.labels = [null]; }],
+    ['head change', f => { f.state.live.headRefOid = 'b'.repeat(40); }],
+    ['untrusted result author', f => { f.state.comments[0].author = { login: 'outsider' }; }],
+    ['changed trusted result author', f => { f.state.comments[0].author = { login: OPERATOR_LOGINS[0] }; }],
+    ['result comment change', f => { f.state.comments[0].body += '\nEdited after publication'; }],
+    ['result comment removed', f => { f.state.comments = []; }],
+    ['unreadable result comment', f => { f.state.comments[0].body = null; }],
+    ['unreadable PR evidence', f => { f.state.unreadablePr = true; }],
+    ['unreadable comment evidence', f => { f.state.unreadableComments = true; }],
+    ['same check becomes live-helper success', f => { f.state.checkRun.output.title = `${LIVE_CHECK_TITLE_PREFIX}clear`; }],
+    ['same check becomes policy-clear success', f => { f.state.checkRun.output.title = `${POLICY_CLEAR_TITLE_PREFIX}clear`; }],
+    ['same check becomes failed', f => { f.state.checkRun.conclusion = 'failure'; }],
+  ])('restores when %s appears between POST and S2', (_name, change) => {
+    const f = fixture(); f.state.afterPost = next => { if (next.state === 'success') change(f); };
+    expectRestored(f, { readComments: undefined });
+  });
+  it.each(['new enqueue hold', 'unreadable enqueue hold'])('restores for %s between POST and S2', name => {
+    const f = fixture();
+    const enqueueHold = vi.fn(() => f.state.posts.length ? (name === 'new enqueue hold' ? 'unsealed result' : undefined) : null);
+    expectRestored(f, { enqueueHold, readComments: undefined });
+    expect(enqueueHold).toHaveBeenCalledTimes(2);
   });
   it('restores when S2 is missing our id', () => {
     const f = fixture(); f.state.afterPost = next => { if (next.state === 'success') f.state.history.shift(); }; expectRestored(f);
@@ -124,6 +153,8 @@ describe('publication republish closed paths', () => {
     ['unreadable labels', f => { f.state.live.labels = [null]; }],
     ['untrusted result author', f => { f.state.comments[0].author = { login: 'outsider' }; }],
     ['unknown writer description', f => { f.state.history[0].description = 'held: unknown writer'; }],
+    ['live-helper hold description', f => { f.state.history[0].description = 'held: live red-team check not clear: awaiting post-publication validation'; }],
+    ['policy-clear hold description', f => { f.state.history[0].description = 'held: live red-team check not clear: policy-clear awaiting post-publication validation'; }],
     ['untrusted hold author', f => { f.state.history[0].creator = { login: 'outsider' }; }],
     ['App token missing', f => { f.state.token = 'ghp_personal'; }],
   ])('refuses %s before any POST', (_name, change) => {
@@ -138,9 +169,30 @@ describe('publication republish closed paths', () => {
   });
   it('refuses a failed latest App check', () => { const f = fixture(); expect(f.run({ readCheck: () => ({ ok: false, reason: 'failed' }) }).ok).toBe(false); expect(f.state.posts).toEqual([]); });
   it('accepts trusted operator results at gate parity', () => { const f = fixture(); f.state.comments[0].author = { login: OPERATOR_LOGINS[0] }; expect(f.run().ok).toBe(true); });
-  it('accepts resumed and live-helper successes without timestamps', () => {
+  it.each([
+    ['live-check success hiding a failed round', LIVE_CHECK_TITLE_PREFIX, 'failure'],
+    ['live-check success over a successful round', LIVE_CHECK_TITLE_PREFIX, 'success'],
+    ['policy-clear success hiding a failed round', POLICY_CLEAR_TITLE_PREFIX, 'failure'],
+    ['policy-clear success over a successful round', POLICY_CLEAR_TITLE_PREFIX, 'success'],
+  ])('refuses %s before any POST', (_name, prefix, conclusion) => {
+    const f = fixture(); f.state.checkRun.output.title = `${prefix}clear`;
+    f.state.extraRuns = [{ id: 49, output: { title: 'Red-team round' }, conclusion }];
+    expect(f.run()).toMatchObject({ ok: false, reason: expect.stringContaining('not a round run') });
+    expect(f.state.posts).toEqual([]); expect(existsSync(`${f.path}.unpublished`)).toBe(true);
+  });
+  it.each([
+    ['incomplete', { status: 'in_progress' }],
+    ['failed', { conclusion: 'failure' }],
+    ['unreadable title', { output: null }],
+    ['wrong App', { app: { id: SYNTHETIC_APP + 1 } }],
+  ])('refuses %s round check evidence before any POST', (_name, change) => {
+    const f = fixture(); Object.assign(f.state.checkRun, change);
+    expect(f.run().ok).toBe(false); expect(f.state.posts).toEqual([]);
+    expect(existsSync(`${f.path}.unpublished`)).toBe(true);
+  });
+  it('accepts resumed round successes without timestamps', () => {
     const f = fixture(); f.state.local.result = 'resumed'; writeJsonAtomic(f.path, f.state.local);
-    expect(f.run({ readCheck: () => ({ ok: true, runId: 90, liveCheck: true, completedAt: null }) }).ok).toBe(true);
+    expect(f.run()).toMatchObject({ ok: true, runId: 50 });
   });
   it('keeps dry-run read-only while returning before history and decision', () => {
     const f = fixture(); const marker = readFileSync(`${f.path}.unpublished`, 'utf8');

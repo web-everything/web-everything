@@ -67,7 +67,6 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
 
 const knownPublicationHold = description => typeof description === 'string' && (
   /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(description)
-  || description.startsWith('held: live red-team check not clear:')
   || description === 'held: red-team round not confirmed published'
   || description === 'held: publication republish unconfirmed; operator must inspect');
 
@@ -99,7 +98,7 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
   const liveGh = (args, options = {}) => exec('gh', args, { ...options, env: freshEnv });
   readCheck ??= key => {
     const app = resolveWeAppId({ env: freshEnv });
-    return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh: liveGh }) : app;
+    return app.ok ? readRedTeamCheckFact({ ...key, appId: app.appId, gh: liveGh, requireRound: true }) : app;
   };
   readComments ??= () => readCompletePrComments(pr, { repo, gh: args => JSON.parse(liveGh(args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024 })) });
@@ -135,19 +134,23 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
         const fact = readCheck({ repo, pr, headSha: head });
         if (fact?.ok !== true || !Number.isSafeInteger(fact.runId) || fact.runId <= 0) return fail(fact?.reason ?? 'latest App check unreadable');
         // 4. Recompute the current intent with fresh reads, using gate-parity author trust.
-        const live = readLivePr();
-        if (live?.headRefOid !== head || !Array.isArray(live.labels)) return fail('live head moved or labels unreadable');
-        const labels = live.labels.map(l => typeof l === 'string' ? l : l?.name);
-        if (labels.some(l => typeof l !== 'string')) return fail('live labels unreadable');
-        const blocked = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(l => labels.includes(l));
-        if (blocked) return fail(`blocking label: ${blocked}`);
-        const comments = readComments();
-        if (!Array.isArray(comments)) return fail('result comments unreadable');
-        const result = redTeamResultCommentForHead(comments, pr, head);
-        if (!result || !isTrustedMarkerAuthor(result.comment) || !isPublishableRedTeamResult(result.parsed))
-          return fail('publishable result with trusted author absent on head');
-        const hold = enqueueHold({ repo, pr, head, comments, labels: live.labels, recorded: true, scheduled: true, env });
-        if (hold !== null) return fail(hold ?? 'enqueue hold unreadable');
+        const readIntent = () => {
+          const live = readLivePr();
+          if (live?.headRefOid !== head || !Array.isArray(live.labels)) throw Error('live head moved or labels unreadable');
+          const labels = live.labels.map(l => typeof l === 'string' ? l : l?.name);
+          if (labels.some(l => typeof l !== 'string')) throw Error('live labels unreadable');
+          const blocked = ['red-team:blocked', 'red-team:pending', ...REVIEW_HOLD_LABELS].find(l => labels.includes(l));
+          if (blocked) throw Error(`blocking label: ${blocked}`);
+          const comments = readComments();
+          if (!Array.isArray(comments)) throw Error('result comments unreadable');
+          const result = redTeamResultCommentForHead(comments, pr, head);
+          if (!result || !isTrustedMarkerAuthor(result.comment) || !isPublishableRedTeamResult(result.parsed))
+            throw Error('publishable result with trusted author absent on head');
+          const hold = enqueueHold({ repo, pr, head, comments, labels: live.labels, recorded: true, scheduled: true, env });
+          if (hold !== null) throw Error(hold ?? 'enqueue hold unreadable');
+          return JSON.stringify({ labels: labels.sort(), result: result.comment });
+        };
+        const intent = readIntent();
         writer = resolveWriter({ env: freshEnv, gh });
         if (writer?.ok !== true) return fail(writer?.reason ?? 'App token unresolved');
         if (dryRun) return { ok: true, dryRun: true, before, runId: fact.runId, decision: 'republish' };
@@ -166,6 +169,7 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
           || after.some(s => s.state !== 'success' && !ids.has(s.id))) throw Error('publication history changed or missing ids after POST');
         const check = readCheck({ repo, pr, headSha: head });
         if (check?.ok !== true || check.runId !== fact.runId) throw Error('latest App check changed after POST');
+        if (readIntent() !== intent) throw Error('live publication intent changed after POST; operator must inspect');
         // 7. Only confirmed publication removes the local outbox.
         rmSync(`${path}.unpublished`, { force: true });
         return { ok: true, runId: fact.runId, statusId: success.id };
