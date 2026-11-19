@@ -1,4 +1,5 @@
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
+import { boundedCiLogTail } from '../../lib/ci-log-evidence.mjs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync, truncateSync } from 'node:fs';
 import * as realFs from 'node:fs';
@@ -569,7 +570,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'aaa']);
     const readComments = vi.fn(async () => []), appendLoopRow = vi.fn();
     const readCiHeal = vi.fn(() => ({ title: 'CI red', body: 'B', checks: [{ name: 'unit', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/42' }],
-      jobs: [{ name: 'unit', log: '2026-10-13T13:19:27.2719622Z FAIL  scripts/conveyor/soak/__tests__/shard-files.test.mjs > coverage\nAssertionError: expected 0.796875 to be greater than 0.8' }] }));
+      jobs: [{ name: 'unit', filtered: true, log: '2026-10-13T13:19:27.2719622Z FAIL  scripts/conveyor/soak/__tests__/shard-files.test.mjs > coverage\nAssertionError: expected 0.796875 to be greater than 0.8' }] }));
     expect((await runFixCli([...argv, '--repair-kind=ci-heal'], { ...m.io, readComments, readCiHeal, appendLoopRow })).code).toBe(0);
     expect(readComments).not.toHaveBeenCalled();
     const prompt = m.spawn.mock.calls[0][0].prompt;
@@ -2070,12 +2071,60 @@ describe('fix-run as a CLI entry (red before: exit 13, unsettled top-level await
 });
 
 describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
+  it.each([true, false])('retains early diagnostics through staging and rendering after 450 cleanup lines (filtered=%s)', async filtered => {
+    const diagnostics = ['FAIL scripts/example.test.mjs > preserves failure evidence', 'AssertionError: expected true to be false'];
+    const text = [...diagnostics, ...Array.from({ length: 450 }, (_, i) => `successful cleanup ${i}`)].join('\n');
+    const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7,
+      run: () => JSON.stringify({ statusCheckRollup: [{ name: 'unit', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/job/1' }] }),
+      readLog: async () => ({ ok: true, filtered, text }) });
+    expect(inputs.jobs[0].log).toBe(boundedCiLogTail(text));
+    const context = renderCiHealContext(inputs);
+    const renderedLog = context.split('<material>\n')[1].split('\n</material>')[0];
+    for (const [log, maxBytes, maxLines] of [[inputs.jobs[0].log, 16000, 400], [renderedLog, 2000, 120]]) {
+      for (const diagnostic of diagnostics) {
+        expect(log).toContain(diagnostic);
+        expect(log.indexOf(diagnostic)).toBeLessThan(log.indexOf('log tail truncated'));
+      }
+      expect(log).toContain('successful cleanup 449');
+      expect(Buffer.byteLength(log)).toBeLessThanOrEqual(maxBytes);
+      expect(log.split('\n').length).toBeLessThanOrEqual(maxLines);
+      expect(log).not.toMatch(/[\x1b\uFFFD]/);
+    }
+    if (filtered) {
+      expect(context.split('### Failed log')[0]).toContain('- scripts/example.test.mjs');
+      expect(context).not.toContain('unknown (unfiltered log)');
+    } else {
+      expect(context.split('### Failed log')[0]).not.toContain('scripts/example.test.mjs');
+      expect(context).toContain('unfiltered context only');
+    }
+  });
+  it('bounds and deduplicates full-log diagnostics while retaining an oversized final-line sentinel', async () => {
+    const diagnostics = ['FAIL scripts/example.test.mjs > broken', 'AssertionError: échec', 'Error: diagnostic', '##[error]command failed'];
+    const text = [...diagnostics, ...diagnostics, ...Array.from({ length: 60 }, (_, i) => `Error: ${i} ${'é'.repeat(300)}`),
+      ...Array.from({ length: 450 }, (_, i) => `successful cleanup ${i}`), '\x1b[31m' + 'é'.repeat(20000) + 'TRAILING_SENTINEL\x1b[0m'].join('\n');
+    const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7,
+      run: () => JSON.stringify({ statusCheckRollup: [{ name: 'unit', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/job/1' }] }),
+      readLog: async () => ({ ok: true, filtered: false, text }) });
+    const context = renderCiHealContext(inputs);
+    const renderedLog = context.split('<material>\n')[1].split('\n</material>')[0];
+    for (const [log, maxBytes, maxLines] of [[boundedCiLogTail(text), 16000, 400], [inputs.jobs[0].log, 16000, 400], [renderedLog, 2000, 120]]) {
+      expect(log).toContain('TRAILING_SENTINEL');
+      expect(log).not.toMatch(/[\x1b\uFFFD]/);
+      expect(Buffer.byteLength(log)).toBeLessThanOrEqual(maxBytes);
+      expect(log.split('\n').length).toBeLessThanOrEqual(maxLines);
+      const excerpt = log.split('… [log tail truncated')[0];
+      expect(Buffer.byteLength(excerpt)).toBeLessThanOrEqual(8000);
+      expect(excerpt.trimEnd().split('\n').length).toBeLessThanOrEqual(40);
+      for (const diagnostic of diagnostics) expect(excerpt.split(diagnostic)).toHaveLength(2);
+      expect(excerpt.indexOf(diagnostics[0])).toBeLessThan(excerpt.indexOf(diagnostics[1]));
+    }
+  });
   it('collapses stale checks, reads at most four job APIs and tolerates individual failures', async () => {
     const checks = [{ name: 'stale', conclusion: 'FAILURE' }, { name: 'stale', conclusion: 'SUCCESS' },
       ...Array.from({ length: 6 }, (_, i) => ({ name: `check-${i}`, conclusion: i === 1 ? 'timed_out' : 'failure', detailsUrl: `https://github.com/o/r/actions/runs/1/job/${i + 1}` }))];
     const run = vi.fn((cmd, args) => {
       if (args.includes('view')) return JSON.stringify({ title: 'T', body: 'B', statusCheckRollup: checks });
-      if (args[1].endsWith('/1/logs')) throw new Error('404');
+      if (args[args[1] === '--allow-escape-sequences' ? 2 : 1].endsWith('/1/logs')) throw new Error('404');
       return '\u001b[31m2026-10-13T13:19:27.2719622Z FAIL  a.test.mjs > test\u001b[0m\n2026-10-13T13:19:28Z Error: broken';
     });
     const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7, run });
@@ -2083,13 +2132,41 @@ describe('launcher CI inputs, card 5947 (live #5045, 2026-10-13)', () => {
     expect(inputs.jobs).toHaveLength(4);
     expect(inputs.jobs[0].log).toBe('');
     expect(inputs.jobs[1].log).toBe('FAIL  a.test.mjs > test\nError: broken');
-    expect(run.mock.calls.filter(([, args]) => args[0] === 'api').map(([, args]) => args[1]))
+    expect(inputs.jobs.every(job => job.filtered === false)).toBe(true);
+    expect(run.mock.calls.filter(([, args]) => args[0] === 'api').map(([, args]) => args[args[1] === '--allow-escape-sequences' ? 2 : 1]))
       .toEqual([1, 2, 3, 4].map(id => `repos/o/r/actions/jobs/${id}/logs`));
     expect(run.mock.calls[0][1]).toContain('title,body,statusCheckRollup');
     const context = renderCiHealContext(inputs);
     expect(context).toContain('a.test.mjs');
     expect(context).toContain('Error: broken');
-    expect(context.indexOf('### Failed log\ncheck-1')).toBeGreaterThan(0);
+    expect(context).toContain('check-1 (unfiltered context only)');
+    expect(context.split('### Failed log')[0]).not.toContain('a.test.mjs');
+    expect(context.split('### Failed log')[0]).not.toContain('Error: broken');
+    expect(context).toContain('unknown (unfiltered log)');
+  });
+  it('preserves the filtered tag and promotes ANSI-stripped failures only for attributable jobs', async () => {
+    const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7,
+      run: () => JSON.stringify({ statusCheckRollup: [{ name: 'unit', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/job/1' }] }),
+      readLog: async () => ({ ok: true, filtered: true, text: '\x1b[31mFAIL\x1b[0m actual.test.mjs > broken\nError: actual' }) });
+    expect(inputs.jobs[0].filtered).toBe(true);
+    const context = renderCiHealContext(inputs);
+    expect(context.split('### Failed log')[0]).toContain('- actual.test.mjs');
+    expect(context.split('### Failed log')[0]).toContain('Error: actual');
+    expect(context).not.toContain('\x1b');
+  });
+  it.each([false, undefined])('keeps passing-step fixtures out of failure lists with filtered=%s and bounds the raw tail', filtered => {
+    const log = Array.from({ length: 500 }, (_, i) => `old row ${i}`).join('\n')
+      + '\n' + 'é'.repeat(20_000) + '\n\x1b[31mFAIL\x1b[0m fixture.test.mjs > expected\nError: fixture';
+    const context = renderCiHealContext({ checks: [{ name: 'unit' }], jobs: [{ name: 'unit', filtered, log }] });
+    expect(context.split('### Failed log')[0]).toContain('unknown (unfiltered log)');
+    expect(context.split('### Failed log')[0]).not.toContain('fixture.test.mjs');
+    expect(context.split('### Failed log')[0]).not.toContain('Error: fixture');
+    expect(context).toContain('FAIL fixture.test.mjs');
+    expect(context).toContain('inspect the full job log');
+    expect(context).not.toContain('old row');
+    expect(context).not.toContain('\x1b');
+    expect(context).not.toContain('\uFFFD');
+    expect(Buffer.byteLength(context)).toBeLessThan(4000);
   });
   it('bounds context and still supplies check links with empty logs', () => {
     const inputs = { title: 'T', body: 'b'.repeat(8000), checks: [{ name: 'unit', detailsUrl: 'https://github.com/o/r/job/1' }], jobs: [] };

@@ -122,7 +122,7 @@ describe('pure rules', () => {
     expect(inside).toContain('Ignore previous instructions');
     expect(brief.slice(end + 3)).not.toContain('Ignore previous instructions');
     expect(brief).toContain('lane/main-fix-bbbbbbbbb');
-    expect(brief).toContain('gh run view 77 --log-failed');
+    expect(brief).toContain('jobId from run 77');
   });
 });
 
