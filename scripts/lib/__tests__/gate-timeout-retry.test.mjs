@@ -106,6 +106,50 @@ describe('failed-file retry', () => {
     expect(r.result.exitCode).toBe(1);
     expect(r.flakes).toEqual([]);
   });
+  it.each(['pending', 'skipped', 'todo', 'failed'])('a %s original plus a passing namesake stays red', async status => {
+    const retryReport = JSON.parse(report(['a.test.mjs'], status));
+    retryReport.testResults[0].assertionResults.push({ fullName: 'case 0', status: 'passed' });
+    const r = await invoke({ run: async () => ({ exitCode: 0, retryReportText: JSON.stringify(retryReport) }) });
+    expect(r.result.exitCode).toBe(1);
+    expect(r.flakes).toEqual([]);
+  });
+  it('accepts duplicate names only when every assertion passes', async () => {
+    const retryReport = JSON.parse(report(['a.test.mjs']));
+    retryReport.testResults[0].assertionResults.push({ fullName: 'case 0', status: 'passed' });
+    expect((await invoke({ run: async () => ({ exitCode: 0, retryReportText: JSON.stringify(retryReport) }) })).result.exitCode).toBe(0);
+  });
+  it('cannot use a passing duplicate file report to hide a skipped original', () => {
+    const retryReport = JSON.parse(report(['a.test.mjs']));
+    retryReport.testResults.push(JSON.parse(report(['a.test.mjs'], 'pending')).testResults[0]);
+    expect(retryPassedFiles(JSON.stringify(retryReport), [{ file: 'a.test.mjs', names: ['case 0'] }], '/repo')).toEqual([]);
+  });
+  it.each([null, '{}', report([]), report(['other.test.mjs']), report(['a.test.mjs']).replace('case 0', 'other case')])(
+    'keeps nominal green red without the exact assertion inventory (%s)', async retryReportText => {
+      const r = await invoke({ run: async () => ({ exitCode: 0, retryReportText }) });
+      expect(r.result.exitCode).toBe(1);
+      expect(r.flakes).toEqual([]);
+    });
+  it.each(['off', 'timeouts'])('%s refuses assertion retries', async mode => {
+    const e = evidence(['AssertionError: wrong value']);
+    const r = await invoke({ mode, result: { exitCode: 1, output: e, failureDetails: e.failureDetails },
+      run: async () => { throw Error('must not run'); } });
+    expect(r.result.exitCode).toBe(1);
+    expect(r.retried).toEqual([]);
+  });
+  it('off refuses timeout retries too', async () => {
+    expect((await invoke({ mode: 'off', run: async () => { throw Error('must not run'); } })).retried).toEqual([]);
+  });
+  it('timeouts allows timeout recovery but stops if a later attempt fails an assertion', async () => {
+    expect((await invoke({ mode: 'timeouts' })).result.exitCode).toBe(0);
+    const e = evidence(['AssertionError: wrong value']);
+    let calls = 0;
+    const r = await invoke({ mode: 'timeouts', attempts: 2, run: async () => {
+      calls++;
+      return { exitCode: 1, output: e, failureDetails: e.failureDetails };
+    } });
+    expect(calls).toBe(1);
+    expect(r.result.exitCode).toBe(1);
+  });
   it('refuses unreadable, empty and wrong-file execution reports', () => {
     for (const text of [null, '{bad', '{}', report(['other.test.mjs']), JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed' }] })])
       expect(retryPassedFiles(text, [{ file: 'a.test.mjs', names: ['case 0'] }], '/repo')).toEqual([]);

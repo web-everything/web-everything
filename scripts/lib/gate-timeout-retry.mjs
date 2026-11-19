@@ -139,21 +139,26 @@ export function retryPassedFiles(reportText, failures, cwd) {
   try {
     const report = JSON.parse(reportText);
     if (!Array.isArray(report.testResults)) return [];
-    return failures.filter(f => report.testResults.some(r => normalize(relative(cwd, r.name)) === f.file
-      && r.status === 'passed' && Array.isArray(r.assertionResults)
-      && f.names.every(name => r.assertionResults.some(a => (Array.isArray(a.ancestorTitles) && typeof a.title === 'string'
-        ? [...a.ancestorTitles.filter(Boolean), a.title].join(' > ') === name : a.fullName === name) && a.status === 'passed'))));
+    return failures.filter(f => {
+      const files = report.testResults.filter(r => normalize(relative(cwd, r.name)) === f.file);
+      return files.length > 0 && files.every(r => r.status === 'passed' && Array.isArray(r.assertionResults)
+        && f.names.every(name => {
+          const matches = r.assertionResults.filter(a => (Array.isArray(a.ancestorTitles) && typeof a.title === 'string'
+            ? [...a.ancestorTitles.filter(Boolean), a.title].join(' > ') : a.fullName) === name);
+          return matches.length > 0 && matches.every(a => a.status === 'passed');
+        }));
+    });
   } catch { return []; }
 }
 
 /** Complete bounded evidence only. Each attempt runs just the remaining red files under the caller's admission. */
-export async function retryFailedPhase({ result, attempts, cwd, run, infrastructureFailure, onFlake = () => {} }) {
+export async function retryFailedPhase({ result, attempts, cwd, run, infrastructureFailure, mode = 'all', onFlake = () => {} }) {
   const flakes = [], retried = [];
   const requiredNames = new Map();
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (result.exitCode === 0 || result.signal || result.timedOut || infrastructureFailure(result) || !result.output) break;
     const files = isolatedRetryFailures({ ...result.output, failureDetails: result.failureDetails, mode: 'all', changedFiles: [], cwd });
-    if (!files.length) break;
+    if (!files.length || !['all', 'timeouts'].includes(mode) || (mode === 'timeouts' && files.some(f => f.kind !== 'timeout'))) break;
     for (const f of files) if (!retried.some(r => r.file === f.file)) retried.push(f);
     const initial = result;
     const named = files.map(f => {

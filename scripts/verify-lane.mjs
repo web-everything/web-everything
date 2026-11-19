@@ -21,9 +21,11 @@
  * build.finalGate=related selects related tests; build.finalGateStandards defaults to always,
  * retaining standards on every diff. Set finalGateStandards=selected for the verify-settings selection.
  * retryFailed (default 1; WE_VERIFY_RETRY_FAILED, 0 restores legacy isolatedRetry) retries only failed
- * files, including edited files, serially with scaled timeouts. At most three files per phase; incomplete
- * inventories or larger failures stay red: fix them or run a fresh verify. Each retry requires a JSON report
- * proving the original failing assertions passed. Green recoveries carry flakes + flaky-retried-green and
+ * files, including edited files, serially with scaled timeouts.
+ * isolatedRetry=off disables all retries; isolatedRetry=timeouts restricts retries to timeout-only failures.
+ * At most three files per phase; incomplete inventories or larger failures stay red: fix them or run a fresh
+ * verify. Each retry requires a JSON report proving the original failing assertions passed.
+ * Green recoveries carry flakes + flaky-retried-green and
  * append advisory host telemetry to <coordination root>/.operations/test-flakes.jsonl; CI is unchanged.
  * Selected Vitest, scan, guard and the recognized full-unit default gate support this. The full default
  * runs tests and standards separately so retry never masks a standards failure. Opaque explicit combined
@@ -975,6 +977,7 @@ const alwaysRun = retryableGate
 async function retryPhase(result, phase, previousOutcome) {
   const phaseKind = phase === 'vitest' ? 'vitest' : 'scan';
   const audit = await retryFailedPhase({ result, attempts: retryFailed, cwd: realpathSync(REPO),
+    mode: isolatedRetryMode === 'untouched' ? 'all' : isolatedRetryMode,
     infrastructureFailure: verificationInfrastructureFailure,
     onFlake: entry => {
       if (loggedFlakeFiles.has(entry.file)) return;

@@ -1521,7 +1521,7 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, tooMany = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, retrySkipped = false, outputLines = 148 } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, tooMany = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, retrySkipped = false, passingNamesake = false, outputLines = 148 } = {}) {
     const files = (truncated || tooMany) ? Array.from({ length: truncated ? 21 : 4 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1567,7 +1567,7 @@ if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('-
   const files = args.filter(a => a.startsWith('./') && a.endsWith('.test.mjs')).map(a => a.slice(2));
   const report = args.find(a => a.startsWith('--outputFile.json='));
   writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: files.map(file => ({
-    name: process.cwd() + '/' + file, status: 'passed', assertionResults: [{ fullName: file.includes('conformance') ? 'scans changed files' : file === 'guard.test.mjs' ? 'repo-wide guard' : 'case ' + ${JSON.stringify(files)}.indexOf(file), status: ${retryExit} ? 'failed' : ${retrySkipped} ? 'pending' : 'passed' }]
+    name: process.cwd() + '/' + file, status: 'passed', assertionResults: [{ fullName: file.includes('conformance') ? 'scans changed files' : file === 'guard.test.mjs' ? 'repo-wide guard' : 'case ' + ${JSON.stringify(files)}.indexOf(file), status: ${retryExit} ? 'failed' : ${retrySkipped} ? 'pending' : 'passed' }, ...(${passingNamesake} ? [{ fullName: 'case ' + ${JSON.stringify(files)}.indexOf(file), status: 'passed' }] : [])]
   })) }));
   if (${retryExit}) {
     writeAllSync(2, ${JSON.stringify(stderr)});
@@ -1648,6 +1648,33 @@ process.exit(${standardsExit});
     expect(f.calls()[1].args).toEqual(expect.arrayContaining(['--maxWorkers=1', '--testTimeout=15000', ...f.files.map(file => `./${file}`)]));
   });
 
+  it.each([
+    ['vitest', {}], ['scan', { scan: true, scanExit: 1 }], ['guard', { guard: true, guardExit: 1 }],
+  ])('isolatedRetry=off disables retryFailed in %s', (phase, options) => {
+    const f = fixture(options);
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_VERIFY_ISOLATED_RETRY: 'off' });
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.outcomes[phase].result).toBe('fail');
+    expect(f.calls().some(c => c.args.includes('--maxWorkers=1'))).toBe(false);
+  });
+
+  it.each([
+    ['vitest', { mixed: true }], ['scan', { scan: true, scanExit: 1 }], ['guard', { guard: true, guardExit: 1 }],
+  ])('isolatedRetry=timeouts refuses retryFailed assertion failures in %s', (phase, options) => {
+    const f = fixture(options);
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_VERIFY_ISOLATED_RETRY: 'timeouts' });
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.outcomes[phase].result).toBe('fail');
+    expect(f.calls().filter(c => c.args.includes('--maxWorkers=1'))).toHaveLength(phase === 'vitest' ? 0 : 1);
+  });
+
+  it('isolatedRetry=timeouts permits retryFailed timeout recovery in edited files', () => {
+    const f = fixture({ edited: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_VERIFY_ISOLATED_RETRY: 'timeouts' });
+    expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green' });
+    expect(f.calls().filter(c => c.args.includes('--maxWorkers=1'))).toHaveLength(1);
+  });
+
   it.each([['vitest', {}], ['scan', { scan: true, scanExit: 1 }], ['guard', { guard: true, guardExit: 1 }]])(
     'retryFailed recovers %s using only its failed files', (phase, options) => {
       const f = fixture(options);
@@ -1710,6 +1737,13 @@ process.exit(${standardsExit});
 
   it('retryFailed refuses a nominal green whose failing assertions were skipped', () => {
     const f = fixture({ edited: true, retrySkipped: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.json).toMatchObject({ status: 'red', isolatedRetry: 'still-red' });
+    expect(r.json.flakes).toBeUndefined();
+  });
+
+  it('retryFailed keeps a skipped original plus a passing namesake red', () => {
+    const f = fixture({ edited: true, retrySkipped: true, passingNamesake: true });
     const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
     expect(r.json).toMatchObject({ status: 'red', isolatedRetry: 'still-red' });
     expect(r.json.flakes).toBeUndefined();
