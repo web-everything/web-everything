@@ -102,21 +102,23 @@ test('entry opt-in supports health-watch and environment rollback wins', () => {
   assert.equal(resolveEarlyLaunch({ tool, env: {}, entries: ['review-daemon.mjs'] }).enabled, false);
 });
 
-test('early and tick-start use the same job queue; early never calls adoption; existing job suppresses launch', async () => {
+test('early and tick-start use the same admission and job queue; early prepares read-only; existing job suppresses launch', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'early-jobs-'));
   try {
     const store = createJobStore(join(dir, 'jobs')); let adopts = 0;
     const base = { root: dir, env: {}, store, codeSha: 'a'.repeat(40), snapshot: {}, now: () => 1000,
       reattach: async () => {}, evict: () => {}, log: { error() {} }, settings: { minIntervalMs: 0, minIntervalJitterPct: 0 },
-      adopt: async () => { adopts += 1; return { reason: 'needs-build', plan: { finalSha: 'target' } }; } };
+      adopt: async (options) => { adopts += 1; if (adopts === 1) assert.deepEqual(options, { readyOnly: true });
+        return { reason: 'needs-build', plan: { finalSha: 'target' } }; } };
     const early = await rebuildCloneAsJob({ ...base, launchOnly: true, launchedBy: 'early', waitInFlightTickMs: 40 });
-    assert.equal(early.reason, 'rebuild-job-started'); assert.equal(adopts, 0);
+    assert.equal(early.reason, 'rebuild-job-started'); assert.equal(adopts, 1);
     const input = store.list().records[0].input;
     assert.equal(input.launchedBy, 'early'); assert.equal(input.waitInFlightTickMs, 40);
     const second = await rebuildCloneAsJob({ ...base, launchOnly: true, launchedBy: 'early' });
     assert.equal(second.reason, 'rebuild-job-running'); assert.equal(store.list().records.length, 1);
+    assert.equal(adopts, 1);
     const fallback = await rebuildCloneAsJob({ ...base, store: createJobStore(join(dir, 'fallback')) });
-    assert.equal(fallback.reason, 'rebuild-job-started'); assert.equal(adopts, 1);
+    assert.equal(fallback.reason, 'rebuild-job-started'); assert.equal(adopts, 2);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -4944,6 +4944,9 @@ opts in an entry such as `health-watch.mjs`. `WE_DAEMON_REBUILD_EARLY_LAUNCH=0|1
 `WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS` overrides the trailing debounce. Missing or oversized event
 history defers to tick-start. The declared self-sync rebuild path must resolve to job mode;
 `WE_DAEMON_REBUILD_AS_JOB=0` or an inline setting prevents early launch. The watcher only queues a job; ready candidates still adopt at tick boundaries.
+`launchOnly` must run the shared adopt-only preparation with `readyOnly: true` before queuing, so sticky
+rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests__/rebuild-job.test.mjs`
+checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
 
 Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
 and the `rebuild-held-recovery` soak break. Environment timeout

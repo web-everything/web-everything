@@ -249,7 +249,8 @@ export async function rebuildCloneAsJob({
     }
     inFlight = null; // finished during the pass — fall through, the next tick consumes it
   }
-  r ??= launchOnly ? { reason: 'needs-build' } : await adopt();
+  // Between ticks, use the same admission checks without adopting or repairing the live tree.
+  r ??= await adopt(launchOnly ? { readyOnly: true } : undefined);
   const recover = !launchOnly && !r?.moved && !r?.adopted
     // Sticky rejections must still wait for changed inputs or operator intervention.
     && ['needs-build', 'up-to-date'].includes(r?.reason)

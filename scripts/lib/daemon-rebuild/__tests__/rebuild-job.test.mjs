@@ -5,8 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadRebuildAsJobSettings, rebuildJobInterval, rebuildCloneAsJob, REBUILD_JOB_KIND } from '../rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../../daemon-jobs-runtime.mjs';
-import { writeReadyCandidate, readReadyCandidate } from '../state.mjs';
+import { writeReadyCandidate, readReadyCandidate, writeRebuildState } from '../state.mjs';
 import { markSucceeded } from '../../daemon-jobs.mjs';
+import { rebuildClone } from '../rebuild.mjs';
+import * as planner from '../plan.mjs';
+import * as edgeFetch from '../edge-fetch.mjs';
+import * as laneRepair from '../../lane-repair.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-job-jitter-')); });
@@ -101,4 +105,45 @@ it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job 
   expect(store.list().records).toHaveLength(1);
   expect(reattach).toHaveBeenCalledTimes(1); // a non-adopting ready record must not suppress job recovery
   expect(adopt).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  ['sticky rejection', { rejected: { inputsKey: 'unchanged' } }, 'still-rejected'],
+  ['smoke backoff', { held: { reason: 'smoke-harness-broken' },
+    rejected: { inputsKey: 'older', harnessBroken: true, retryAt: new Date(2000).toISOString() } }, 'smoke-harness-broken-backoff'],
+  ['retry not yet due', { rejected: { inputsKey: 'unchanged', retryAt: new Date(2000).toISOString() } }, 'still-rejected'],
+  ['clean state', {}, 'rebuild-job-started'],
+])('launchOnly with %s applies real preparation admission before queuing', async (_name, state, reason) => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
+    WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_AUTO_REBASE: '0' };
+  const plan = { ok: true, upToDate: false, finalSha: 'b'.repeat(40), mainSha: 'b'.repeat(40),
+    inputsKey: 'unchanged', applied: [], decisions: [], alerts: [] };
+  writeRebuildState(root, state, env);
+  // Keep the real prepare/decision path; only Git and clone diagnosis are fixture IO.
+  vi.spyOn(planner, 'planRebuild').mockResolvedValue(plan);
+  vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
+  vi.spyOn(laneRepair, 'probeBrokenRefs').mockReturnValue({ probeFailed: false, broken: [] });
+  vi.spyOn(laneRepair, 'diagnoseLane').mockReturnValue({ ok: true, problems: [] });
+  const run = vi.fn(args => {
+    if (args[0] === 'symbolic-ref') return { status: 0, stdout: 'main' };
+    if (args[0] === 'rev-parse') return args.includes('MERGE_HEAD')
+      ? { status: 1, stdout: '' } : { status: 0, stdout: 'a'.repeat(40) };
+    if (['commit-graph', 'ls-files', 'status', 'rev-list'].includes(args[0])) return { status: 0, stdout: '' };
+    throw new Error(`unexpected git: ${args.join(' ')}`);
+  });
+  const runSmoke = vi.fn(() => { throw new Error('unexpected smoke'); });
+  const adopt = vi.fn(options => rebuildClone({ root, env, run, runSmoke, versions: null,
+    now: () => 1000, log: { error() {} }, lockOpts: { waitMs: 0 },
+    ...options, adoptOnly: true, asJob: false }));
+  const store = createJobStore(join(root, 'jobs'));
+  const reattach = vi.fn(async () => ({}));
+  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, launchOnly: true,
+    codeSha: 'a'.repeat(40), now: () => 1000, log: { error() {} }, evict: () => ({}),
+    settings: { minIntervalMs: 0, minIntervalJitterPct: 0 } });
+  expect(result.reason).toBe(reason);
+  expect(adopt).toHaveBeenCalledTimes(1);
+  expect(adopt).toHaveBeenCalledWith({ readyOnly: true });
+  expect(store.list().records).toHaveLength(reason === 'rebuild-job-started' ? 1 : 0);
+  expect(reattach).toHaveBeenCalledTimes(reason === 'rebuild-job-started' ? 1 : 0);
+  expect(runSmoke).not.toHaveBeenCalled();
 });
