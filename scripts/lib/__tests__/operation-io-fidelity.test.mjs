@@ -292,6 +292,30 @@ describe('the fs shell, against a REAL directory tree (this rule obeying its own
     expect(scanOperationIoFidelity(root, EMPTY).errors).toEqual([]);
   });
 
+  it('requires repo proof when module source is unavailable', () => {
+    const result = findIoModulesWithoutFidelityTest({ ioModules: ['alpha'],
+      tests: [{ file: 'alpha.test.mjs', content:
+        "import { withRealDirectory } from './helpers/real-repo.mjs';\n"
+        + "import { a } from '../alpha-io.mjs';\nwithRealDirectory(() => {});" }],
+      ...EMPTY });
+    expect(result.errors.map(e => e.descriptor.kind)).toEqual(['io-fidelity-missing']);
+  });
+
+  it.each([
+    ["export const a = () => run('git status');", true],
+    ["export const a = () => spawnSync('git', ['status']);", true],
+    ["export const a = () => readFileSync('record.json');", false],
+  ])('directory-only proof is rejected for Git IO: %s', (source, needsRepo) => {
+    write('scripts/operations/alpha-io.mjs', source);
+    write('scripts/operations/__tests__/alpha.test.mjs',
+      "import { withRealDirectory } from './helpers/real-repo.mjs';\n"
+      + "import { a } from '../alpha-io.mjs';\n"
+      + "it('empty directory', () => withRealDirectory(() => {}));\n"
+      + "it('mocked Git', () => a());\n");
+    expect(scanOperationIoFidelity(root, EMPTY).errors.map(e => e.descriptor.kind))
+      .toEqual(needsRepo ? ['io-fidelity-missing'] : []);
+  });
+
   it('descends into SUBDIRECTORIES and credits non-`.test.mjs` fixture modules', () => {
     // Both halves of the collector's contract in one tree: the proof lives in a nested helper module whose
     // name is not `*.test.mjs`. A shallow walk, or a `.test.mjs`-only filter, reports this module untested.

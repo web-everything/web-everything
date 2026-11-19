@@ -183,7 +183,7 @@ describe('declared prep operation', () => {
     const run = advanceWhileRunning(startRun({ op: PREP_OP, id: 'test-prep', input: { action: 'check', id: 'card-123' }, registry }), { registry });
     expect(run.verdict.flow).toBe('standard');
     expect(run.verdict.write).toBe(false);
-    expect(finishPrep({ run, code: 1, lines: [], json: false }).code).toBe(0);
+    expect(finishPrep({ run, code: 0, lines: [], json: false }).code).toBe(0);
   });
   it('amends paths and fields, retaining the previous record and hash in history', () => {
     const original = good();
@@ -195,7 +195,7 @@ describe('declared prep operation', () => {
   });
   it('reports problems as advice and refuses a write on unreadable evidence', () => {
     expect(assessPrep({ action: 'new' }, { errors: ['Unreadable input'], config: PREP_DEFAULTS })).toEqual({ advice: ['Unreadable input'], write: false });
-    expect(finishPrep({ run: { verdict: { advice: ['Missing acceptance'] } }, code: 1 }).code).toBe(0);
+    expect(finishPrep({ run: { verdict: { advice: ['Missing acceptance'] } }, code: 0 }).code).toBe(0);
     const malformed = assessPrep({ action: 'check' }, { record: { ...good(), touchSet: 'not-an-array' }, config: PREP_DEFAULTS });
     expect(malformed.ok).toBe(false);
     expect(malformed.flow).toBe('opus-design');

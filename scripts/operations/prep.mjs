@@ -38,7 +38,9 @@ export function prepOperation({ readContext } = {}) {
       ? [{ type: PREP_STORE_EFFECT, payload: { record: verdict.record, action: input.action }, idempotent: true }] : [] }),
   });
 }
-export function finishPrep({ run, lines, json }) {
+export function finishPrep({ run, code, lines, json }) {
+  // Validation is advisory; adapter refusals and failed effects retain their status and diagnostics.
+  if (!run || code !== 0) return { code, lines };
   const result = run?.verdict;
-  return { code: 0, lines: json ? lines : [JSON.stringify(result ?? { advice: ['Preparation unavailable; inspect inputs and retry.'] })] };
+  return { code, lines: json ? lines : [JSON.stringify(result ?? { advice: ['Preparation unavailable; inspect inputs and retry.'] })] };
 }

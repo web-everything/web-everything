@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { readdirSync } from 'node:fs';
+import { readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { withRealDirectory } from './helpers/real-repo.mjs';
 import { createPrepIO, createPrepStore } from '../prep-io.mjs';
 import { buildRecord, recordHash } from '../../lib/prep-record.mjs';
 import { PREP_DEFAULTS } from '../../lib/prep-settings.mjs';
-import { prepOperation, PREP_OP, PREP_STORE_EFFECT } from '../prep.mjs';
+import { prepOperation, finishPrep, PREP_OP, PREP_STORE_EFFECT } from '../prep.mjs';
 import { createRegistry } from '../registry.mjs';
 import { advanceWhileRunning, startRun } from '../engine.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
 
 describe('prep store real filesystem fidelity', () => {
   it('atomically refuses concurrent new operations after both existence checks pass, preserving the first record and allowing amend', async () => {
@@ -66,6 +68,55 @@ describe('prep store real filesystem fidelity', () => {
       expect(createPrepStore({ storeDir, env: {} }).read(record.id)).toEqual(amended);
       expect(store.read(record.id).hash).toBe(recordHash(amended));
       expect(readdirSync(storeDir)).toEqual(['card-123.json']);
+    });
+  });
+});
+
+describe('prep CLI completion', () => {
+  const cli = async (io, argv) => {
+    const declaration = prepOperation({ readContext: io.readContext });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const outcome = await runOperationCli({ declaration, registry, argv, sinks: io.sinks,
+      store: createMemoryRunStore(), newRunId: () => 'prep-cli' });
+    return { outcome, finished: finishPrep({ ...outcome, json: argv.includes('--json') }) };
+  };
+
+  it('keeps a bad-argument refusal non-zero with its diagnostic', async () => {
+    const { outcome, finished } = await cli({ readContext: () => { throw new Error('must not read'); }, sinks: {} }, ['--unknown-prep-flag']);
+    expect(outcome.code).not.toBe(0);
+    expect(finished.code).toBe(outcome.code);
+    expect(finished.lines).toEqual(outcome.lines);
+    expect(finished.lines.join(' ')).toContain('unknown-prep-flag');
+  });
+
+  it.each([false, true])('keeps a failed real store write non-zero with its diagnostic (json=%s)', async json => {
+    await withRealDirectory(async ({ root }) => {
+      const storeDir = join(root, 'blocked-store');
+      const io = createPrepIO({ env: {}, store: createPrepStore({ storeDir, env: {} }),
+        settings: { config: PREP_DEFAULTS, errors: [] } });
+      const persist = io.sinks[PREP_STORE_EFFECT];
+      io.sinks[PREP_STORE_EFFECT] = payload => {
+        // Reads succeed first; the filesystem becomes unwritable at the write boundary.
+        writeFileSync(storeDir, 'a file cannot be a store directory');
+        return persist(payload);
+      };
+      const { outcome, finished } = await cli(io, ['--action=new', '--id=card-123', ...(json ? ['--json'] : [])]);
+      expect(outcome.code).not.toBe(0);
+      expect(finished.code).toBe(outcome.code);
+      expect(finished.lines).toEqual(outcome.lines);
+      expect(finished.lines.join(' ')).toContain('EEXIST');
+    });
+  });
+
+  it('keeps incomplete validation advisory after a successful CLI run', async () => {
+    await withRealDirectory(async ({ root }) => {
+      const io = createPrepIO({ env: {}, store: createPrepStore({ storeDir: root, env: {} }),
+        settings: { config: PREP_DEFAULTS, errors: [] } });
+      const { outcome, finished } = await cli(io, ['--action=new', '--id=card-123']);
+      expect(outcome.run.verdict.ok).toBe(false);
+      expect(finished.code).toBe(0);
+      expect(JSON.parse(finished.lines[0]).advice).toContain('Missing or placeholder: acceptance');
     });
   });
 });
