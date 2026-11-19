@@ -39,10 +39,34 @@ describe('codex-audit real IO', () => {
       expect(deps.refsPointingAt(current)).toContain('lane/audit');
       expect(deps.isAncestor(prior, current)).toBe(true);
       expect(deps.isAncestor(current, prior)).toBe(false);
-      expect(deps.deltaPaths(main, current)).toEqual(['branch.txt']);
+      expect(deps.deltaPaths([base, prior], [main, current])).toEqual(['branch.txt']);
       // The actual range contains the main change, but the path filter excludes it.
-      const delta = git(['diff', prior, current, '--', ...deps.deltaPaths(main, current)]);
+      const delta = git(['diff', '--no-renames', prior, current, '--', ...deps.deltaPaths([base, prior], [main, current])]);
       expect(String(delta).trim()).toBe('');
+    });
+  });
+
+
+  it('keeps reverted guard paths, both rename sides and paths from a changed base in the union', async () => {
+    await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
+      commit({ 'guard.mjs': 'base guard\n', 'test.mjs': 'guard test\n' });
+      const base = head();
+      commit({ 'guard.mjs': 'improved guard\n' });
+      const prior = head();
+      commit({ 'guard.mjs': 'base guard\n' });
+      git(['mv', 'test.mjs', 'relocated.mjs']);
+      git(['commit', '--quiet', '-m', 'relocate guard test']);
+      const current = head();
+      const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
+      expect(deps.deltaPaths([base, current])).not.toContain('guard.mjs');
+      const paths = deps.deltaPaths([base, prior], [prior, current]);
+      expect(paths).toEqual(['guard.mjs', 'relocated.mjs', 'test.mjs']);
+      const delta = String(git(['diff', '--no-renames', prior, current, '--', ...paths]));
+      expect(delta).toContain('-improved guard');
+      expect(delta).toContain('deleted file mode');
+      expect(delta).toContain('+++ b/relocated.mjs');
+      // Even a base advanced to the current head cannot erase the previously audited guard path.
+      expect(deps.deltaPaths([base, prior], [current, current])).toEqual(['guard.mjs']);
     });
   });
 

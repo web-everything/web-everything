@@ -4810,3 +4810,16 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Audit convergence evidence (R1081)
+
+Convergence selects the last appended record per ref in each ledger, then uses commit ancestry
+to compare ledgers; timestamps only enforce the five-minute future-clock bound. Keep malformed
+prior evidence, exact-head refusal, equal-head lineage, and unrelated-head fallbacks covered in
+`codex-audit-converge.test.mjs`. The real Git regression in `codex-audit-io-real.test.mjs`
+keeps reverted guards and both rename paths in the union of prior and current base/head diffs.
+The canonical question hash stays stable: exhaustive full-pass instructions live outside its text.
+
+Canonical audit lookup rejects non-full positive records even with the current question hash,
+while current-question negative records still block prior-hash fallback regardless of mode.
+Keep both directions parameterized in `codex-audit-converge.test.mjs`.

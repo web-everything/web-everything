@@ -1,7 +1,7 @@
 /** R1081 convergence is advisory evidence, never canonical gate evidence. */
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { main, findAudit, QUESTION_HASH, CONVERGE_QUESTION, CONVERGE_QUESTION_HASH, resolvePriorQuestionHashes } from '../codex-audit.mjs';
+import { main, findAudit, QUESTION_HASH, CONVERGE_QUESTION, CONVERGE_QUESTION_HASH } from '../codex-audit.mjs';
 import { createAuditDeps, resolveConvergeRecordPath } from '../codex-audit-io.mjs';
 import { canonicalAuditEvidence } from '../prototype-load.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
@@ -19,7 +19,7 @@ function fixture(answer = `NOT WEAKENED\nFIXED: ${finding}`) {
     resolveSha: vi.fn(ref => ref === 'origin/main' ? BASE : ref),
     refsPointingAt: vi.fn(() => [REF]), recordPath: () => 'audits.jsonl', convergeRecordPath: () => 'audits-converge.jsonl',
     readRecords: vi.fn(path => path === 'audits.jsonl' ? full : converge),
-    isAncestor: vi.fn(() => true), deltaPaths: vi.fn(() => ['scripts/gate.mjs']),
+    isAncestor: vi.fn((a, b) => a <= b), deltaPaths: vi.fn(() => ['scripts/gate.mjs']),
     runCodex: vi.fn(() => answer), fingerprint: vi.fn(() => 'e'.repeat(64)),
     appendRecord: vi.fn((record, path) => (path === 'audits-converge.jsonl' ? converge : full).push(record)),
     now: () => AT, stdout: text => out.push(text), stderr: text => err.push(text),
@@ -35,12 +35,12 @@ describe('R1081 converge rounds', () => {
     expect(CONVERGE_QUESTION_HASH).toBe(createHash('sha256').update(CONVERGE_QUESTION).digest('hex'));
     expect(CONVERGE_QUESTION_HASH).not.toBe(QUESTION_HASH);
     const prompt = f.deps.runCodex.mock.calls[0][0];
-    expect(prompt).toContain(`git diff ${PRIOR} ${HEAD} -- ':(literal)scripts/gate.mjs'`);
+    expect(prompt).toContain(`git diff --no-renames ${PRIOR} ${HEAD} -- ':(literal)scripts/gate.mjs'`);
     expect(prompt).not.toContain(`git diff ${BASE}...${HEAD}`);
     expect(prompt).not.toContain('Judge the WHOLE diff');
     expect(prompt).toContain(`prior record ${original.at} on ${PRIOR}`);
     expect(prompt).toContain(`<findings>\n${finding}\n</findings>`);
-    expect(f.deps.deltaPaths).toHaveBeenCalledWith(BASE, HEAD);
+    expect(f.deps.deltaPaths).toHaveBeenCalledWith([BASE, PRIOR], [BASE, HEAD]);
     expect(f.deps.isAncestor).toHaveBeenCalledWith(PRIOR, HEAD);
   });
 
@@ -90,15 +90,15 @@ describe('R1081 converge rounds', () => {
     expect(f.deps.refsPointingAt).not.toHaveBeenCalled();
   });
 
-  it('refuses no prior (including an exact-head-only record) with the required fallback', async () => {
-    const f = fixture(); f.full[0] = { ...original, head: HEAD };
+  it('refuses an exact-head latest record instead of falling back to an ancestor', async () => {
+    const f = fixture(); f.full.push({ ...original, head: HEAD });
     expect(await main(ARGS, f.deps)).toBe(2);
-    expect(f.err.join('')).toContain(`no prior audit on ${REF}; run a full audit first`);
+    expect(f.err.join('')).toContain('already audited at this head; run a full audit if you need a fresh verdict');
     expect(f.deps.runCodex).not.toHaveBeenCalled();
   });
 
   it('refuses a non-ancestor as rebased and requires a full audit', async () => {
-    const f = fixture(); f.deps.isAncestor.mockReturnValue(false);
+    const f = fixture(); f.deps.isAncestor.mockImplementation((a, b) => b !== HEAD);
     expect(await main(ARGS, f.deps)).toBe(2);
     expect(f.err.join('')).toMatch(/rebased.*full audit/);
     expect(f.deps.runCodex).not.toHaveBeenCalled();
@@ -138,6 +138,100 @@ describe('R1081 converge rounds', () => {
     expect(prompt).toContain("':(literal)weird'\\''$(touch bad).mjs'");
   });
 
+
+  it('requires a full audit when neither ledger has a prior record', async () => {
+    const f = fixture(); f.full.length = 0;
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('run a full audit first');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+  });
+
+  it.each(['full', 'converge'])('refuses an exact-head record in the %s ledger even with another ancestor', async ledger => {
+    const f = fixture();
+    (ledger === 'full' ? f.full : f.converge).push({ ...original, head: HEAD });
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('already audited at this head');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { mode: null }, { mode: 'unknown' }, { questionHash: 'f'.repeat(64), verdict: 'INVALID', findings: [] },
+    { questionHash: CONVERGE_QUESTION_HASH }, { verdict: 'INVALID' }, { head: 'bad' }, { base: 'bad' },
+    { findings: [null] }, { findings: null }, { at: 'unparseable' }, { at: '2026-11-18T00:05:00.001Z' },
+    { base: NEXT },
+  ])('fails closed on malformed latest full evidence %j without using an older pass', async over => {
+    const f = fixture(); f.full.push({ ...original, ...over });
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.err.join('')).toContain('human review of the full diff');
+  });
+
+  const priorConverge = { ...original, mode: 'converge', head: 'b'.repeat(39) + 'c', priorHead: PRIOR,
+    priorAt: original.at, questionHash: CONVERGE_QUESTION_HASH, findings: [`OPEN: ${finding}`] };
+  it.each([
+    { questionHash: QUESTION_HASH }, { verdict: 'INVALID' }, { head: 'bad' }, { base: 'bad' },
+    { priorHead: 'bad' }, { priorHead: NEXT }, { priorHead: priorConverge.head },
+    { findings: [finding] }, { findings: ['OPEN: '] }, { findings: [null] },
+    { at: 'bad' }, { at: '2026-11-18T00:05:00.001Z' },
+  ])('fails closed on malformed converge evidence %j even beside valid full evidence', async over => {
+    const f = fixture(); f.converge.push({ ...priorConverge, ...over });
+    expect(await main(ARGS, f.deps)).toBe(3);
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+    expect(f.converge).toHaveLength(1);
+  });
+
+  it('accepts a candidate at the five-minute clock bound', async () => {
+    const f = fixture(); f.full[0] = { ...original, at: '2026-11-18T00:05:00.000Z' };
+    expect(await main(ARGS, f.deps)).toBe(0);
+  });
+
+  it('selects a descendant full audit over an older future-dated converge pass', async () => {
+    const f = fixture();
+    f.full[0] = { ...original, head: priorConverge.head };
+    f.converge.push({ ...priorConverge, head: PRIOR, priorHead: BASE, at: '2026-11-18T00:04:00Z', findings: [] });
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.converge.at(-1).priorHead).toBe(priorConverge.head);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(finding);
+  });
+
+  it('selects descendant convergence evidence despite an older timestamp', async () => {
+    const f = fixture(); f.converge.push({ ...priorConverge, at: '2026-11-16T00:00:00Z' });
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.converge.at(-1).priorHead).toBe(priorConverge.head);
+  });
+
+  it('requires a full audit for unrelated ledger heads', async () => {
+    const f = fixture(); f.converge.push({ ...priorConverge, priorHead: BASE });
+    f.deps.isAncestor.mockImplementation((a, b) => a === BASE || b === HEAD);
+    expect(await main(ARGS, f.deps)).toBe(2);
+    expect(f.err.join('')).toContain('Unrelated audit heads; run a full audit');
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('ties prefer converge only with a consistent prior chain: %s', async consistent => {
+    const f = fixture();
+    f.full.push({ ...original, head: priorConverge.head, findings: ['full:1 unresolved'] });
+    f.converge.push({ ...priorConverge, priorAt: consistent ? original.at : 'missing' });
+    f.deps.runCodex.mockReturnValue(`NOT WEAKENED\nFIXED: ${consistent ? finding : 'full:1 unresolved'}`);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(consistent ? finding : 'full:1 unresolved');
+  });
+
+  it('prefers a valid tied full audit when a historical converge parent is malformed', async () => {
+    const f = fixture('NOT WEAKENED\nFIXED: full:1 unresolved');
+    f.full[0] = { ...original, questionHash: 'invalid' };
+    f.full.push({ ...original, head: priorConverge.head, findings: ['full:1 unresolved'] });
+    f.converge.push(priorConverge);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain('full:1 unresolved');
+  });
+
+  it('passes both base/head pairs when the requested base changes', async () => {
+    const f = fixture(); f.full[0] = { ...original, base: '0'.repeat(40) };
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.deltaPaths).toHaveBeenCalledWith(['0'.repeat(40), PRIOR], [BASE, HEAD]);
+  });
+
   it('declares converge and optional ref as operation inputs for the generic CLI', () => {
     const declaration = OPERATIONS['codex-audit']().declaration;
     expect(declaration.input).toMatchObject({
@@ -168,9 +262,29 @@ function gate(records) {
 }
 
 describe('convergence never satisfies gate consumers', () => {
-  it.each([CONVERGE_QUESTION_HASH, QUESTION_HASH])('rejects a converge record even if planted in the full ledger with hash %s', hash => {
-    const converge = { ...original, head: HEAD, mode: 'converge', questionHash: hash, verdict: 'NOT WEAKENED', findings: [] };
+  it('rejects a converge record planted in the full ledger by its distinct question hash', () => {
+    const converge = { ...original, head: HEAD, mode: 'converge', questionHash: CONVERGE_QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [] };
     expect(findAudit([converge], query)).toBeNull();
+    expect(canonicalAuditEvidence([converge], HEAD).ok).toBe(false);
+    expect(gate([converge]).ok).toBe(false);
+  });
+
+  it.each(['converge', 'unknown', null, undefined])('rejects current-question positive evidence with explicit mode %j', mode => {
+    const positive = { ...original, head: HEAD, mode, verdict: 'NOT WEAKENED', findings: [] };
+    const options = { ...query, now: Date.parse(AT), priorQuestionHashes: [] };
+    expect(findAudit([positive], options)).toBeNull();
+    const negative = { ...positive, mode: 'full', verdict: 'WEAKENED', findings: [finding] };
+    expect(findAudit([negative, positive], options)).toBe(negative);
+    const hash = 'f'.repeat(64);
+    const prior = { ...positive, mode: 'full', questionHash: hash };
+    expect(findAudit([prior, positive], { ...options,
+      priorQuestionHashes: [{ hash, acceptUntil: '2026-11-20T00:00:00Z' }] })).toBeNull();
+  });
+
+  it('rejects a same-hash converge pass planted in the full ledger at all three consumers', () => {
+    const converge = { ...original, head: HEAD, mode: 'converge', questionHash: QUESTION_HASH,
+      verdict: 'NOT WEAKENED', findings: [] };
+    expect(findAudit([converge], { ...query, now: Date.parse(AT) })).toBeNull();
     expect(canonicalAuditEvidence([converge], HEAD).ok).toBe(false);
     expect(gate([converge]).ok).toBe(false);
   });
@@ -182,17 +296,28 @@ describe('convergence never satisfies gate consumers', () => {
     expect(gate([full])).toMatchObject({ ok: true, record: full });
   });
 
-  it('non-full records neither pass nor set sawCurrent to block a prior-question full record', () => {
-    const priorQuestionHashes = resolvePriorQuestionHashes({ env: {} });
-    const full = { ...original, head: HEAD, questionHash: priorQuestionHashes[0].hash, verdict: 'NOT WEAKENED', findings: [] };
-    const now = Date.parse(AT);
-    expect(findAudit([full], { ...query, now, priorQuestionHashes })).toBe(full);
-    for (const mode of ['converge', 'unknown', null]) {
-      const other = { ...full, mode, questionHash: QUESTION_HASH, verdict: 'WEAKENED' };
-      expect(findAudit([full, other], { ...query, now, priorQuestionHashes })).toBe(full);
-    }
-    expect(findAudit([full], { ...query, priorQuestionHashes, now: Date.parse('2026-11-27') })).toBeNull();
+  it('a converge hash neither passes nor blocks a current full pass in the same ledger', () => {
+    const full = { ...original, head: HEAD, verdict: 'NOT WEAKENED', findings: [] };
+    const converge = { ...full, mode: 'converge', questionHash: CONVERGE_QUESTION_HASH, verdict: 'WEAKENED' };
+    expect(findAudit([full, converge], query)).toBe(full);
+    expect(findAudit([converge, full], query)).toBe(full);
   });
+
+  it.each(['unknown', null, 'converge'])('mode %j cannot hide a current negative behind an accepted prior hash', mode => {
+    const hash = 'f'.repeat(64);
+    const prior = { ...original, head: HEAD, questionHash: hash, verdict: 'NOT WEAKENED', findings: [] };
+    const negative = { ...prior, mode, questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: [finding] };
+    const options = { ...query, now: Date.parse(AT), priorQuestionHashes: [{ hash, acceptUntil: '2026-11-20T00:00:00Z' }] };
+    expect(findAudit([prior], options)).toBe(prior);
+    expect(findAudit([prior, negative], options)).toBe(negative);
+  });
+
+  it.each(['unknown', null, 'converge'])('current-question negative evidence still blocks with mode %j', mode => {
+    const full = { ...original, head: HEAD, verdict: 'NOT WEAKENED', findings: [] };
+    const negative = { ...full, mode, verdict: 'WEAKENED', findings: [finding] };
+    expect(findAudit([full, negative], query)).toBe(negative);
+  });
+
 });
 
 describe('converge IO boundaries', () => {
@@ -229,13 +354,14 @@ describe('converge IO boundaries', () => {
     expect(deps.refsPointingAt(HEAD)).toEqual([REF]);
     expect(spawnSync.mock.calls[0][1]).toEqual(['for-each-ref', `--points-at=${HEAD}`, '--format=%(refname:short)', 'refs/remotes/origin/']);
     spawnSync.mockReturnValue({ status: 0, stdout: 'one\ntwo\0three\0' });
-    expect(deps.deltaPaths(BASE, HEAD)).toEqual(['one\ntwo', 'three']);
-    expect(spawnSync.mock.calls[1][1]).toEqual(['diff', '--name-only', '-z', `${BASE}...${HEAD}`]);
+    expect(deps.deltaPaths([BASE, HEAD], [PRIOR, HEAD])).toEqual(['one\ntwo', 'three']);
+    expect(spawnSync.mock.calls[1][1]).toEqual(['diff', '--name-only', '--no-renames', '-z', `${BASE}...${HEAD}`]);
+    expect(spawnSync.mock.calls[2][1]).toEqual(['diff', '--name-only', '--no-renames', '-z', `${PRIOR}...${HEAD}`]);
     spawnSync.mockReturnValue({ status: 1 }); expect(deps.isAncestor(PRIOR, HEAD)).toBe(false);
     spawnSync.mockReturnValue({ status: 0 }); expect(deps.isAncestor(PRIOR, HEAD)).toBe(true);
     spawnSync.mockReturnValue({ status: 128 }); expect(() => deps.isAncestor(PRIOR, HEAD)).toThrow();
     spawnSync.mockReturnValue({ status: null, error: new Error('maxBuffer exceeded') });
-    expect(() => deps.deltaPaths(BASE, HEAD)).toThrow();
+    expect(() => deps.deltaPaths([BASE, HEAD], [PRIOR, HEAD])).toThrow();
     for (const call of spawnSync.mock.calls) expect(call[2]).toMatchObject({ timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
   });
 });
