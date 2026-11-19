@@ -88,33 +88,44 @@ function envRecord(env) {
     if (typeof value !== 'string' || value.includes('\0')) fail(`inheritEnv.${key} must be a NUL-free string`);
   }
 }
-// A value-dependent var (registry `restrictiveValues`) is forward-restrictive only when it holds one of
-// its tightening values (e.g. WE_GH_AUTH_PERSONAL_FALLBACK=refuse); any other value is dropped.
+// Parse bounded positive quantities; canonicalize counts for integer-only consumers.
+function quantity(value, unit) {
+  const match = /^(\d+(?:\.\d+)?|\.\d+)([kmgt]?)$/i.exec(String(value).trim());
+  if (!match || (unit !== 'bytes' && match[2])) return NaN;
+  const parsed = Number(match[1]) * (1024 ** (match[2] ? 'kmgt'.indexOf(match[2].toLowerCase()) + 1 : 0));
+  const n = unit === 'count' ? Math.floor(parsed) : parsed;
+  return Number.isFinite(n) && n > 0 ? n : NaN;
+}
 function classOf(rule, value) {
-  if ((rule?.class === 'forward-restrictive' || rule?.restrictiveValues) && !String(value).trim()) return 'drop';
-  if (Array.isArray(rule?.restrictiveValues)) {
-    return rule.restrictiveValues.includes(String(value).trim().toLowerCase()) ? 'forward-restrictive' : 'drop';
+  if ((rule?.class === 'forward-restrictive' || rule?.restrictiveValues || rule?.restrictivePrefixes || rule?.tighterThan)
+    && !String(value).trim()) return 'drop';
+  if (rule?.tighterThan) {
+    const n = quantity(value, rule.tighterThan.unit);
+    return n >= (rule.tighterThan.minimum ?? 0) && n < rule.tighterThan.default ? 'forward-restrictive' : 'drop';
+  }
+  if (rule?.restrictiveValues || rule?.restrictivePrefixes) {
+    return rule.restrictiveValues?.includes(String(value).trim().toLowerCase())
+      || rule.restrictivePrefixes?.some(prefix => String(value).startsWith(prefix)) ? 'forward-restrictive' : 'drop';
   }
   return rule?.class;
 }
 function inheritedEnv(inherit, ambient) {
   const out = Object.create(null);
+  const checked = (rule, value, key) => rule.value === 'absolute-path' ? absolute(value, key)
+    : rule.tighterThan ? String(quantity(value, rule.tighterThan.unit))
+    : rule.restrictiveValues?.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : value;
   for (const [key, value] of Object.entries(inherit)) {
     const rule = envRule(key), cls = classOf(rule, value);
-    if (cls === 'forward' || cls === 'forward-restrictive') {
-      out[key] = rule.value === 'absolute-path' ? absolute(value, key)
-        : rule.restrictiveValues ? value.trim().toLowerCase() : value;
-    }
+    if (cls === 'forward' || cls === 'forward-restrictive') out[key] = checked(rule, value, key);
   }
   for (const [key, value] of Object.entries(ambient)) {
     const rule = envRule(key);
     if (classOf(rule, value) !== 'forward-restrictive') continue;
-    // A malformed ambient isolation root is a refusal, even if the bag supplies another root.
-    const checked = rule.value === 'absolute-path' ? absolute(value, key)
-      : rule.restrictiveValues ? value.trim().toLowerCase() : value;
-    // The bag cannot remove a restriction: a dropped (relaxing) bag value yields to the ambient tightening one.
-    // Value-gated policies can have different tightening strengths; retain the parent's choice.
-    if (rule.restrictiveValues || !Object.hasOwn(out, key)) out[key] = checked;
+    // Validate even an overridden ambient root: malformed isolation evidence refuses launch.
+    const parent = checked(rule, value, key);
+    if (!Object.hasOwn(out, key) || (rule.tighterThan
+      ? quantity(parent, rule.tighterThan.unit) < quantity(out[key], rule.tighterThan.unit)
+      : (rule.precedence ?? 'ambient') === 'ambient')) out[key] = parent;
   }
   return out;
 }
@@ -194,7 +205,7 @@ export function findAgentBinary(agent, dirs) {
 /** Pure PATH projection; production supplies the real account home and snapshotted parent paths.
  * Keep this exact structure aligned with gh-app-shim's defaultShimDir/checkoutShimDir.
  */
-export function buildAgentPath({ parentPaths, home, pathPrefix, nodePath, binary }) {
+export function buildAgentPath({ parentPaths, home, pathPrefix, nodePath, binary = nodePath }) {
   const legacy = join(home, '.claude/github-app-token/gh-shim');
   const checkouts = join(home, '.claude/github-app-token/gh-shim.d') + '/';
   const restrictive = parentPaths.flatMap(path => String(path ?? '').split(':')).filter(dir =>
@@ -210,7 +221,7 @@ export function buildAgentArgs(descriptor) { return argsFrom(snapshot(descriptor
 /** Snapshot is the first operation, including before any test seam executes. */
 export function buildAgentInvocation(descriptor, io) {
   const d = snapshot(descriptor);
-  const args = argsFrom(d);
+  argsFrom(d); // Validate the entire snapshot before any IO seam executes.
   // Copy trusted process.env before any IO seam can mutate it; it is not a plain record itself.
   const ambient = snapshot({ ...process.env });
   const forwarded = inheritedEnv(d.inheritEnv ?? ambient, ambient);
@@ -221,6 +232,11 @@ export function buildAgentInvocation(descriptor, io) {
   const env = { ...forwarded, PATH: buildAgentPath({ parentPaths: [d.inheritEnv?.PATH, ambient.PATH],
     home, pathPrefix: d.pathPrefix, nodePath: process.execPath, binary: file }), HOME: home };
   if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) env[key] = d.tempRoot;
+  // The launcher owns both child PATHs; finalize after fixed binary resolution so the agent dir agrees.
+  if (d.config && Object.hasOwn(d.config, 'shell_environment_policy.set.PATH')) {
+    d.config['shell_environment_policy.set.PATH'] = env.PATH;
+  }
+  const args = argsFrom(d);
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
 }
 

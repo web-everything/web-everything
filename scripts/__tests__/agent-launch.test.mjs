@@ -154,9 +154,10 @@ describe('built invocation positive controls', () => {
     ['normal edit', {}], ['read-only review', { review: true }], ['resume', { resumeThreadId: SID.toUpperCase() }],
     ['output schema', { outputSchemaFile: '/schema with spaces.json' }], ['add-dirs', { addDirs: ['/one', '/two'] }],
   ])('pins the pre-S1 Codex argv tokens for %s', (_label, extra) => {
+    vi.stubEnv('PATH', '/arbitrary-ambient');
     const input = { cwd, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high', env: { PATH: '/usr/bin:/bin' }, ...extra };
     const d = buildCodexDirectTaskDescriptor(input);
-    const configPath = `${CODEX_SHIM_DIR}:/usr/bin:/bin`;
+    const configPath = fixedPath(CODEX_SHIM_DIR);
     const expected = ['exec', '--json', '-s', extra.review ? 'read-only' : 'workspace-write', '--skip-git-repo-check', '-C', cwd,
       ...(extra.outputSchemaFile ? ['--output-schema', extra.outputSchemaFile] : []), '-o', '/last',
       ...(extra.addDirs ?? []).flatMap(dir => ['--add-dir', dir]), '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=high',
@@ -275,14 +276,14 @@ describe('three-class environment boundary', () => {
   });
   it('retains every restrictive ambient variable even when the caller bag omits them', () => {
     const restrictive = Object.fromEntries(Object.entries(registry).filter(([, rule]) => rule.class === 'forward-restrictive')
-      .map(([key, rule]) => [key, rule.value === 'absolute-path' ? '/isolated/pool' : 'restrictive-identity']));
+      .map(([key, rule]) => [key, rule.value === 'absolute-path' ? '/isolated/pool' : rule.restrictivePrefixes ? rule.restrictivePrefixes[0] + 'test' : 'restrictive-identity']));
     for (const [key, value] of Object.entries(restrictive)) vi.stubEnv(key, value);
     expect(buildAgentInvocation({ ...base(), inheritEnv: {} }, seam()).options.env).toMatchObject(restrictive);
   });
-  it('uses bag values when present, and does not inherit ambient neutral metadata for an explicit bag', () => {
+  it('keeps ambient identity and does not inherit ambient neutral metadata for an explicit bag', () => {
     vi.stubEnv('WE_GH_DAEMON_CALLER', 'host-daemon'); vi.stubEnv('USER', 'host-user');
     const env = buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' } }, seam()).options.env;
-    expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' });
+    expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'host-daemon', LC_MESSAGES: 'C' });
     expect(env).not.toHaveProperty('USER');
   });
   it('drops every registered drop name and unknown names from both sources, retaining launcher-owned paths', () => {
@@ -340,6 +341,7 @@ describe('three-class environment boundary', () => {
     const env = { LANE_POOL_ROOT: '/caller/pool', VITEST: 'caller-vitest', WE_UNDER_TEST: 'caller-test', WE_GH_DAEMON_CALLER: 'caller-daemon' };
     const d = buildCodexDirectTaskDescriptor({ cwd, env, model: 'gpt-5.6-sol', effort: 'high' });
     expect(d.inheritEnv).toBe(env);
+    for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) vi.stubEnv(name, undefined);
     expect(buildAgentInvocation(d, seam()).options.env).toMatchObject(env);
   });
 });
@@ -442,5 +444,21 @@ describe('value-gated restrictions reach exact-string consumers', () => {
       bag.PATH = '/attacker'; process.env.PATH = '/other-attacker'; return process.execPath;
     });
     expect(buildAgentInvocation({ ...base(), inheritEnv: bag }, io).options.env.PATH).toBe(`${shim}:${fixedPath()}`);
+  });
+});
+
+
+describe('registry identity predicates match the gh shim daemon reader', () => {
+  it.each(['', ' ', '\t\n', 'com.we.', 'com.we.worker', 'com.plateau.worker', 'com.apple.worker',
+    'com.we', 'COM.WE.worker', ' com.we.worker', 'interactive', 'false', '0'])('projects %j without changing daemon detection', value => {
+    for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) vi.stubEnv(name, undefined);
+    for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) {
+      const projected = buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env;
+      // Empty-is-absent is the boundary contract, even for a truthy whitespace presence marker.
+      expect(isDaemonCaller(projected)).toBe(isDaemonCaller({ [name]: value.trim() ? value : '' }));
+      vi.stubEnv(name, name === 'XPC_SERVICE_NAME' ? 'com.we.parent' : 'parent');
+      expect(isDaemonCaller(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env)).toBe(true);
+      vi.stubEnv(name, undefined);
+    }
   });
 });

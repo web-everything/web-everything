@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, symlinkSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
@@ -35,7 +35,7 @@ import {
   parseRolloutQuota,
   readRolloutQuota,
   collectAndClearRolloutQuota,
-  buildCodexDirectTaskArgv,
+  buildCodexDirectTaskArgv, buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR,
   buildCodexPrompt,
   buildScratchCloneArgv,
   planDepsInstall,
@@ -50,6 +50,9 @@ import {
   runCodexDirectExec as realRunCodexDirectExec,
   codexDirectTask as realCodexDirectTask,
 } from '../codex-direct-task.mjs';
+
+import { buildAgentInvocation, buildAgentPath } from '../lib/agent-launch.mjs';
+import { defaultShimDir } from '../lib/gh-app-shim.mjs';
 
 const FAKE_CODEX_BINARY = '/fixture/bin/codex';
 // Pair every injected agent spawn with a resolver, including repair turns.
@@ -3928,5 +3931,34 @@ describe('R731 slice 1 — a scratch clone is deleted only when it is clean', ()
         expect(readFileSync(join(cwd, 'half.txt'), 'utf8')).toBe('x');
       } finally { if (cwd) rmSync(cwd, { recursive: true, force: true }); }
     });
+  });
+});
+
+
+describe('Codex shell and launcher share the restricted child PATH', () => {
+  it('retains the ambient gh shim and R650 shim, removes caller directories, and includes the resolved agent directory', () => {
+    const shim = defaultShimDir(userInfo().homedir);
+    vi.stubEnv('PATH', `/ambient-attacker:${shim}`);
+    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env: { PATH: '/caller-attacker' } });
+    const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => FAKE_CODEX_BINARY });
+    const shellPath = JSON.parse(invocation.args.find(arg => arg.startsWith('shell_environment_policy.set.PATH=')).split('=').slice(1).join('='));
+    expect(shellPath).toBe(invocation.options.env.PATH);
+    expect(shellPath).toBe(buildAgentPath({ parentPaths: ['/caller-attacker', process.env.PATH],
+      home: userInfo().homedir, pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath, binary: FAKE_CODEX_BINARY }));
+    expect(shellPath.split(':').slice(0, 2)).toEqual([shim, CODEX_SHIM_DIR]);
+    expect(shellPath.split(':')).toContain(dirname(FAKE_CODEX_BINARY));
+    expect(shellPath).not.toMatch(/caller-attacker|ambient-attacker/);
+  });
+  it('finalizes both PATHs from snapshots before a resolver mutates the descriptor or ambient PATH', () => {
+    const shim = defaultShimDir(userInfo().homedir);
+    vi.stubEnv('PATH', shim);
+    const descriptor = buildCodexDirectTaskDescriptor({ cwd: process.cwd(), env: { PATH: '/caller-attacker' } });
+    const invocation = buildAgentInvocation(descriptor, { resolveBinary: () => {
+      process.env.PATH = '/mutated'; descriptor.config['shell_environment_policy.set.PATH'] = '/mutated';
+      return FAKE_CODEX_BINARY;
+    } });
+    expect(invocation.args).toContain(`shell_environment_policy.set.PATH=${JSON.stringify(invocation.options.env.PATH)}`);
+    expect(invocation.options.env.PATH.split(':')[0]).toBe(shim);
+    expect(invocation.options.env.PATH).not.toContain('/mutated');
   });
 });

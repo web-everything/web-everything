@@ -4830,7 +4830,7 @@ daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
 
 
-## Launcher restriction projection (SEC1 S1 round 4)
+## Launcher restriction projection (SEC1 S1 round 5)
 
 An explicit environment bag must not erase parent restrictions. Blank/whitespace restrictive
 markers count as absent, including isolation roots; malformed nonblank roots still refuse.
@@ -4845,8 +4845,22 @@ independent of host HOME and prove bare gh resolves to its first shim. Agent bin
 still uses only the fixed installation search, independently of this child PATH.
 
 Audit every registry drop entry for tightening modes when updating the boundary. Reasons
-that mention value dependence require restrictiveValues or relaxOnly: true; relaxOnly means
-no value tightens the unset policy. Keep throughput tuning dropped. Record uncertain numeric
-or policy-relative guards explicitly rather than inventing thresholds or claiming relax-only.
+that mention value dependence require restrictiveValues, restrictivePrefixes, tighterThan, or
+relaxOnly: true; relaxOnly means no value tightens the unset policy. Prefix predicates match
+raw case-sensitive values, exactly as the daemon reader does. Restrictive entries default to
+ambient precedence; shared lock roots and identities keep the parent, while LANE_POOL_ROOT
+explicitly uses bag precedence to agree with direct-task writable roots. Numeric restrictions
+retain the smaller valid parent/bag quantity strictly below the evidenced default. Counts emit
+positive integers (flooring fractions for integer-only readers); CPU quantities must also satisfy the consumer's >= 1 floor. Byte suffixes
+k/m/g/t use powers of 1024 and emit numeric bytes, so Number-based and Docker readers agree.
+Consumer floors belong in tighterThan.minimum (CPU reader: 1; call-log reader: 1 MiB). Test all
+restrictive entries, including invalid quantities and malformed roots, from both sources.
+Keep policy-relative guards without a fixed numeric default explicitly unresolved.
+
+Codex shell_environment_policy.set.PATH uses the same pure projection as spawn env.PATH.
+The launcher finalizes both from snapshots after binary resolution, including the resolved
+agent directory; the gh shim precedes pathPrefix, and the R650 pathPrefix precedes real tools.
+Test shell/spawn equality, ambient shim retention, arbitrary directory removal, and resolver
+mutation without executing Codex.
 The launcher and registry regressions run with agent-launch-structure.test.mjs and
 codex-direct-task.test.mjs through host heavy-admission, never a bare test runner.

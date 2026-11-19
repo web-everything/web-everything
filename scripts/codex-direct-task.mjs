@@ -112,7 +112,8 @@ import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } fro
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
-import { buildAgentArgs, launchAgent } from './lib/agent-launch.mjs';
+import { userInfo } from 'node:os';
+import { buildAgentArgs, buildAgentPath, launchAgent } from './lib/agent-launch.mjs';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
@@ -248,12 +249,6 @@ export function assertResumeRequest({ resumeThreadId, ephemeral = false, outputS
 
 /** R650: directory of refusing vitest/playwright/npx shims, prepended to PATH inside Codex runs only. */
 export const CODEX_SHIM_DIR = resolve(process.env.WE_CODEX_SHIM_DIR || join(dirname(new URL(import.meta.url).pathname), 'codex-shims'));
-/** PATH with the shim dir first (deduped). */
-export function codexShimPath(env = process.env) {
-  const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
-  return [CODEX_SHIM_DIR, ...rest].join(':');
-}
-
 export function buildCodexDirectTaskDescriptor({
   cwd,
   outputLastMessageFile,
@@ -315,8 +310,9 @@ export function buildCodexDirectTaskDescriptor({
     }
     descriptor.config['sandbox_workspace_write.network_access'] = true;
     if (writableRoots.length) descriptor.config['sandbox_workspace_write.writable_roots'] = writableRoots;
-    // R650: shim dir first on the shell PATH so bare vitest/playwright/npx-vitest refuse (heavy-admission bypass).
-    descriptor.config['shell_environment_policy.set.PATH'] = codexShimPath(env);
+    // R650: pathPrefix precedes real tools; gh auth/throttle shims retain first priority.
+    descriptor.config['shell_environment_policy.set.PATH'] = buildAgentPath({ parentPaths: [env.PATH, process.env.PATH],
+      home: userInfo().homedir, pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath });
     descriptor.pathPrefix = CODEX_SHIM_DIR;
     if (tempRoot) {
       descriptor.tempRoot = tempRoot;
