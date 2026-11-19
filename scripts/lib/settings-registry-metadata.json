@@ -1,0 +1,2247 @@
+{
+  "$comment": "Add metadata for every non-$comment top-level declared key and CAPACITY_LEAVES key. Descriptions live only here (max 160 characters). owner is the primary declaring file; the generator lists every declaring file. Record capacity aliases under leaves ($ means the scalar itself). Arrays count as one leaf. toSettle preserves pass-table values; pass C instant means its env-only column indicates an override, not proof of live reload. R1076: behavior belongs in product settings; this inventory does not convert constants.",
+  "settings": {
+    "heavyAdmissionCap": {
+      "description": "Maximum concurrent heavy commands admitted on the host.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fixDispatchMaxConcurrent": {
+      "description": "Maximum concurrent fix dispatches.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "maxLoadPerCore": {
+      "description": "Host load ceiling per CPU core for dispatch admission.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "memFreeMinPct": {
+      "description": "Minimum free memory percentage for dispatch admission.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "cpuIdleMinPct": {
+      "description": "Minimum idle CPU percentage by dispatch kind.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fixDispatch": {
+      "description": "Fix slot borrowing, parked-run accounting and completion release policy.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "freeze": {
+      "description": "Main-red dispatch freeze policy.",
+      "owner": "scripts/dispatch-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "acceptCarryForward": {
+      "description": "Carry an accept to a new head with an identical reviewed net diff.",
+      "owner": "scripts/settings/accept-carry-forward.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "aiRouting": {
+      "description": "AI role routing overrides; empty preserves existing resolvers.",
+      "owner": "scripts/settings/ai-routing.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mergeQueue": {
+      "description": "Enqueue, human approval, card numbering and obsolete-run cancellation policy.",
+      "owner": "scripts/settings/approved-human-surface-hold.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "archive": {
+      "description": "Archive retention and bounded archive batch policy.",
+      "owner": "scripts/settings/archive-retention.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "briefRedTeam": {
+      "description": "Advisory red-team checks on briefs before implementation.",
+      "owner": "scripts/settings/brief-red-team.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "build": {
+      "description": "Build grouping, priorities, launch limits and verification policy.",
+      "owner": "scripts/settings/build-grouping.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "buildQueuePriority": {
+      "description": "Build queue priority enforcement and request ordering within a class.",
+      "owner": "scripts/settings/build-queue-priority.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "builder": {
+      "description": "Health polling cadence while the builder is paused.",
+      "owner": "scripts/settings/builder-paused-poll.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "cardBatch": {
+      "description": "Adoption of eligible descendant heads in card batches.",
+      "owner": "scripts/settings/card-batch.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "cards": {
+      "description": "Mechanical finding deduplication and similarity threshold.",
+      "owner": "scripts/settings/card-dedupe.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "we": {
+      "description": "Known legacy duplicate card identities and their canonical numbers.",
+      "owner": "scripts/settings/card-ledger-legacy-identities.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "allowedSigners": {
+      "description": "Trusted card-ledger signers.",
+      "owner": "scripts/settings/card-ledger-trust.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "quarantine": {
+      "description": "Quarantined card-ledger identities.",
+      "owner": "scripts/settings/card-ledger-trust.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "backlog": {
+      "description": "Card numbering and remote numbering policy.",
+      "owner": "scripts/settings/card-numbering.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ciGhostRerun": {
+      "description": "Age, frequency and cancellation bounds for ghost CI recovery.",
+      "owner": "scripts/settings/ci-ghost-rerun.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ciHeal": {
+      "description": "Try a stale-base refresh before waking a CI fixer.",
+      "owner": "scripts/settings/ci-heal.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "_doc": {
+      "description": "Documentation of Claude account mappings and enforcement.",
+      "owner": "scripts/settings/claude-accounts.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "accounts": {
+      "description": "Claude account IDs mapped to Keychain credentials, without secret values.",
+      "owner": "scripts/settings/claude-accounts.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "daemons": {
+      "description": "Daemon inventory and launch-label account mappings.",
+      "owner": "scripts/settings/claude-accounts.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "*": {
+      "description": "Default account mapping for unmapped daemon launch labels.",
+      "owner": "scripts/settings/claude-accounts.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "enforce": {
+      "description": "Enable Claude daemon account enforcement.",
+      "owner": "scripts/settings/claude-accounts.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "claudeHelper": {
+      "description": "Default Claude helper and juror model.",
+      "owner": "scripts/settings/claude-helper.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "cloneMaintenance": {
+      "description": "Interval between idle daemon clone garbage collections.",
+      "owner": "scripts/settings/clone-maintenance.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "audit": {
+      "description": "Audit verdict, pre-existing finding and protected path policy.",
+      "owner": "scripts/settings/codex-audit.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "transcriptCheck": {
+      "description": "Post-run Codex transcript diagnostics mode and token cap.",
+      "owner": "scripts/settings/codex-transcript-check.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "codex": {
+      "description": "Per-task Codex model, effort and pre-launch retry choices.",
+      "owner": "scripts/settings/codex.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "conflictWatch": {
+      "description": "Disposition of same-line parked PR conflicts.",
+      "owner": "scripts/settings/conflict-watch.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "coroner": {
+      "description": "Nightly analysis and postmortem policy overrides.",
+      "owner": "scripts/settings/coroner-postmortem.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "benchmarkSource": {
+      "description": "Source of the recorded delivery handoff benchmarks.",
+      "owner": "scripts/settings/coroner-postmortem.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "handoffP90Minutes": {
+      "description": "Recorded p90 handoff durations in minutes by delivery transition.",
+      "owner": "scripts/settings/coroner-postmortem.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prepareStaleHours": {
+      "description": "Age in hours at which preparation is treated as stale.",
+      "owner": "scripts/settings/coroner-postmortem.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "version": {
+      "description": "Daemon task manifest format version.",
+      "owner": "scripts/settings/daemon-tasks.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "daemonTasksDescription": {
+      "description": "Documentation of the daemon task manifest and host token substitution.",
+      "owner": "scripts/settings/daemon-tasks.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "tasks": {
+      "description": "Daemon task definitions used to render launchd plists.",
+      "owner": "scripts/settings/daemon-tasks.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "deliveryCapacity": {
+      "description": "Delivery capacity measurement, weighted units and automatic tuning policy.",
+      "owner": "scripts/settings/delivery-capacity.json",
+      "changeVia": "pr",
+      "instant": false,
+      "leaves": {
+        "pinUnits": {
+          "range": "integer 1–200",
+          "unit": "units",
+          "note": "also instant via operator-override capacity leaf"
+        },
+        "pinUntil": {
+          "range": "positive safe integer ≤ now + 72 hours",
+          "unit": "epoch milliseconds",
+          "note": "also instant via operator-override capacity leaf"
+        },
+        "holdUntil": {
+          "range": "positive safe integer ≤ now + 72 hours",
+          "unit": "epoch milliseconds",
+          "note": "also instant via operator-override capacity leaf"
+        }
+      }
+    },
+    "deliveryFlow": {
+      "description": "Ordered delivery stages by change class, retaining protected spine stages.",
+      "owner": "scripts/settings/delivery-flow.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "delivery": {
+      "description": "Role-based GitHub App identities and delivery metrics collection policy.",
+      "owner": "scripts/settings/delivery-identity.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "routes": {
+      "description": "Task type to delivery mode routing.",
+      "owner": "scripts/settings/delivery-routes.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "modes": {
+      "description": "Instructions defining the available delivery modes.",
+      "owner": "scripts/settings/delivery-routes.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "daemonDegradedModes": {
+      "description": "Delivery modes used when daemon tooling is degraded.",
+      "owner": "scripts/settings/delivery-routes.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "directionAwareHuman": {
+      "description": "Direction-aware human review classification mode.",
+      "owner": "scripts/settings/direction-aware-human.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "draftPromotion": {
+      "description": "Required-check exceptions for draft promotion.",
+      "owner": "scripts/settings/draft-promotion.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "drain": {
+      "description": "Merge drain grouping, recovery and infrastructure classification policy.",
+      "owner": "scripts/settings/drain-card-group.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "drainFactsSource": {
+      "description": "Preferred source of merge drain facts.",
+      "owner": "scripts/settings/drain-facts-source.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "drainFollowupJob": {
+      "description": "Enable follow-up drain jobs.",
+      "owner": "scripts/settings/drain-followup-job.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fixLoop": {
+      "description": "Retry policy for exhausted fixes after main advances.",
+      "owner": "scripts/settings/exhausted-retry.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fix": {
+      "description": "Fix context, local verification, round limits and exception policy.",
+      "owner": "scripts/settings/fix-context-pack.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fixExecutor": {
+      "description": "Fix executor fallback chain and critical Claude routing rung.",
+      "owner": "scripts/settings/fix-executor.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fixPassBudget": {
+      "description": "Per-pass time budgets for fixer recovery and draft promotion.",
+      "owner": "scripts/settings/fix-pass-budget.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "fixScope": {
+      "description": "Line margin around a finding region in fix scope.",
+      "owner": "scripts/settings/fix-scope.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "target": {
+      "description": "Target fraction of heavy work executed remotely.",
+      "owner": "scripts/settings/forge-share.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "windowMinutes": {
+      "description": "Measurement window for remote execution share.",
+      "owner": "scripts/settings/forge-share.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "alertAfterMinutes": {
+      "description": "Duration before low remote execution share raises an alert.",
+      "owner": "scripts/settings/forge-share.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "expectedLocalReasons": {
+      "description": "Local execution reasons excluded from remote-share warnings.",
+      "owner": "scripts/settings/forge-share.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ghThrottle": {
+      "description": "GitHub call concurrency, per-caller share and slot lifetime bounds.",
+      "owner": "scripts/settings/gh-throttle.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ghThrottleSlotWait": {
+      "description": "GitHub slot wait budgets by caller pattern.",
+      "owner": "scripts/settings/gh-throttle.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "gitFetchFresh": {
+      "description": "Maximum age of a reusable Git fetch.",
+      "owner": "scripts/settings/git-fetch-fresh.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ghAuth": {
+      "description": "Policy for falling back to personal GitHub authentication.",
+      "owner": "scripts/settings/github-auth.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "github": {
+      "description": "GitHub authentication mode and documented personal-identity exceptions.",
+      "owner": "scripts/settings/github-auth.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "files": {
+      "description": "Per-file allowances for grandfathered tracked content.",
+      "owner": "scripts/settings/host-path-baseline.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "review": {
+      "description": "Review equivalence, human clearance and precedent policy.",
+      "owner": "scripts/settings/human-clearance-carry.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "humanClearance": {
+      "description": "Mechanical carry-forward policy for human clearance.",
+      "owner": "scripts/settings/human-clearance-carry.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "humanReviewSurfaces": {
+      "description": "Scope of surfaces requiring human review.",
+      "owner": "scripts/settings/human-review-surfaces.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "livenessSweep": {
+      "description": "Staleness thresholds, escalation rungs and recovery attempt limits.",
+      "owner": "scripts/settings/liveness-sweep.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "loadGovernor": {
+      "description": "Host load targets, pause priorities and resumption thresholds.",
+      "owner": "scripts/settings/load-governor.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mainFixCapacity": {
+      "description": "Allow main-fix work beyond the ordinary fix cap.",
+      "owner": "scripts/settings/main-fix-capacity.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mergeGate": {
+      "description": "Treatment of candidacy holds in merge-gate checks.",
+      "owner": "scripts/settings/merge-gate.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mergeQueueBatching": {
+      "description": "Merge queue group size and groups in flight.",
+      "owner": "scripts/settings/merge-queue-batching.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mergeDelivery": {
+      "description": "Merge strategy, batch size, wait time and call concurrency.",
+      "owner": "scripts/settings/merge-queue.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "mergeFreshness": {
+      "description": "Freshness age, disjoint main moves and retest scope.",
+      "owner": "scripts/settings/merge-queue.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "description": {
+      "description": "Documentation of V8 old-space memory caps.",
+      "owner": "scripts/settings/node-heap-cap.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "floorMb": {
+      "description": "Minimum child-process V8 old-space cap in megabytes.",
+      "owner": "scripts/settings/node-heap-cap.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "caps": {
+      "description": "V8 old-space caps by review child and daemon role.",
+      "owner": "scripts/settings/node-heap-cap.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "openPrCap": {
+      "description": "Population exclusions for the open PR cap.",
+      "owner": "scripts/settings/open-pr-cap.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "operatorCli": {
+      "description": "Allow a fresh operator CLI fallback.",
+      "owner": "scripts/settings/operator-cli.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "session": {
+      "description": "Commands permitted for orchestrator delegation.",
+      "owner": "scripts/settings/orchestrator-session.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "overlayDropped": {
+      "description": "Freshness window for detecting dropped overlays.",
+      "owner": "scripts/settings/overlay-dropped.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prLandReady": {
+      "description": "Configuration paths requiring guarded landing readiness.",
+      "owner": "scripts/settings/pr-land-ready.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prLimit": {
+      "description": "PR limit exclusions and explicit focus references.",
+      "owner": "scripts/settings/pr-limit.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prListPaging": {
+      "description": "Page size for GitHub PR listing.",
+      "owner": "scripts/settings/pr-list-paging.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prMergeWatch": {
+      "description": "PR progress, stuck-state and overdue CI thresholds.",
+      "owner": "scripts/settings/pr-merge-watch.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prOwnership": {
+      "description": "Advisory review policy when CI repair hands ownership to a human.",
+      "owner": "scripts/settings/pr-ownership.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prStack": {
+      "description": "Stack detection, bottom-first order, restacking and hold expiry.",
+      "owner": "scripts/settings/pr-stack.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prStallDetector": {
+      "description": "Repeated-reason and unchanged-label stall detection.",
+      "owner": "scripts/settings/pr-stall-sweep.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prStallSweep": {
+      "description": "Stalled PR recovery modes, cadence and action limits.",
+      "owner": "scripts/settings/pr-stall-sweep.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prSweep": {
+      "description": "Idle PR sweep cadence, thresholds and diagnosis policy.",
+      "owner": "scripts/settings/pr-sweep.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prepare": {
+      "description": "Preparation retries, sizing, runner and per-tick PR listing budgets.",
+      "owner": "scripts/settings/prepare.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "prevention": {
+      "description": "Prevention card batching and filing limits.",
+      "owner": "scripts/settings/prevention-batch.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "operatorUsernameSha256": {
+      "description": "Hashed operator usernames recognized by the portability gate.",
+      "owner": "scripts/settings/privacy-terms-allowlist.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "entries": {
+      "description": "Explicit portability exceptions pinned to matched text and line hashes.",
+      "owner": "scripts/settings/privacy-terms-allowlist.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "daemonAliases": {
+      "description": "Alias names mapped to canonical daemon roles.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "launchAgentsDir": {
+      "description": "Host directory for rendered launchd agent definitions.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "workspaceRoot": {
+      "description": "Workspace root used by prototype daemon loading.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "adoption": {
+      "description": "Prototype load adoption timeout and polling interval.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "recordPath": {
+      "description": "Prototype load coordination record location.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "readyRecordPath": {
+      "description": "Fix readiness coordination record location.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "auditRecordPath": {
+      "description": "Audit coordination record location.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "loaderCli": {
+      "description": "CLI used to load daemon overlays.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ruledWeakened": {
+      "description": "Pinned audit weakenings explicitly accepted by operator rulings.",
+      "owner": "scripts/settings/prototype-load.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "raisedByMigrate": {
+      "description": "Maximum PRs attempted per raised-by migration apply run.",
+      "owner": "scripts/settings/raised-by-migrate.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "rebuildSmokeReadMemo": {
+      "description": "Share identical read-only GitHub calls within a rebuild smoke.",
+      "owner": "scripts/settings/rebuild-smoke.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "rebuildSmokeDryRun": {
+      "description": "PR sample, snapshot age and lane list cache for dry-run smoke.",
+      "owner": "scripts/settings/rebuild-smoke.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "rebuildSmoke": {
+      "description": "Reuse of passing rebuild proofs and boot retry/concurrency bounds.",
+      "owner": "scripts/settings/rebuild-smoke.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "redMainHold": {
+      "description": "Contain merge drain work while main CI is red.",
+      "owner": "scripts/settings/red-main-hold.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "redMainMode": {
+      "description": "Stop or quarantine behavior while main CI is red.",
+      "owner": "scripts/settings/red-main-hold.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "freezeReadLastGoodTtlMin": {
+      "description": "Lifetime in minutes of the last good freeze read.",
+      "owner": "scripts/settings/red-main-hold.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "redMainQuarantine": {
+      "description": "Quarantine duration and test population bounds for red main.",
+      "owner": "scripts/settings/red-main-hold.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "redTeam": {
+      "description": "Red-team queue floor, idle starts and status publication policy.",
+      "owner": "scripts/settings/red-team-queue.json",
+      "changeVia": "pr",
+      "instant": false,
+      "leaves": {
+        "queue.minConcurrent": {
+          "range": "integer 0–24",
+          "unit": "jobs",
+          "note": "also instant via operator-override capacity leaf"
+        }
+      }
+    },
+    "redTeamGate": {
+      "description": "Red-team gate source and publication recovery policy.",
+      "owner": "scripts/settings/red-team.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "referralHoldAutoResolve": {
+      "description": "Resolve ruled referral holds by resuming or sending back work.",
+      "owner": "scripts/settings/referral-hold-auto-resolve.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "referralWindowMinutes": {
+      "description": "Time window in minutes for referral judgment.",
+      "owner": "scripts/settings/referral-judge-window.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "requiredChecksCache": {
+      "description": "Lifetime of cached required-status-check reads.",
+      "owner": "scripts/settings/required-checks-cache.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "maxLiveReviewRounds": {
+      "description": "Maximum concurrent host review rounds.",
+      "owner": "scripts/settings/review-concurrency.json",
+      "changeVia": "pr",
+      "instant": false,
+      "leaves": {
+        "$": {
+          "range": "integer 1–16",
+          "unit": "rounds",
+          "note": "also instant via operator-override capacity leaf"
+        }
+      }
+    },
+    "reviewHeadIndex": {
+      "description": "Retention and log compaction bounds for reviewed heads.",
+      "owner": "scripts/settings/review-head-index.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "reviewNoVerdictRetry": {
+      "description": "Bounded cooldown releases when a review verdict never lands.",
+      "owner": "scripts/settings/review-no-verdict-retry.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "_comment": {
+      "description": "Documentation of missing red-team recovery controls.",
+      "owner": "scripts/settings/review-red-team-on-skip.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "enabled": {
+      "description": "Enable recovery of missing red-team results on reviewed heads.",
+      "owner": "scripts/settings/review-red-team-on-skip.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "retryCooldownMin": {
+      "description": "Cooldown in minutes between missing red-team recovery attempts.",
+      "owner": "scripts/settings/review-red-team-on-skip.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "staleRedispatchDailyCap": {
+      "description": "Daily cap on stale red-team redispatches.",
+      "owner": "scripts/settings/review-red-team-on-skip.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ciHeldRecordRetryMax": {
+      "description": "Maximum CI-held record recovery retries.",
+      "owner": "scripts/settings/review-red-team-on-skip.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "careExemptPaths": {
+      "description": "Narrow paths exempted from care classification, retaining human gates.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "timing": {
+      "description": "Review start timing, early-start mode and cancellation on CI failure.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "postAcceptAdvisory": {
+      "description": "Advisory review mode after acceptance.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "parallelSeats": {
+      "description": "Enable parallel review seats.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "seatsByTouchSet": {
+      "description": "Select review seats using the touched paths.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "shadowSeats": {
+      "description": "Shadow review provider trials, sample rate and promotion policy.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "carryAcrossRebase": {
+      "description": "Carry review state across eligible rebases.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "minNonClaudeSeats": {
+      "description": "Minimum number of non-Claude review seats.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "autoRoundGrant": {
+      "description": "Automatic bounded extra review rounds for eligible card-only work.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "reviewChurn": {
+      "description": "Review churn detection and loop cap policy.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "rounds": {
+      "description": "Shadow round judge grants and non-convergence detection.",
+      "owner": "scripts/settings/round-judge.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "routing": {
+      "description": "Builder and audit provider routing based on quota and reservations.",
+      "owner": "scripts/settings/routing.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "runs": {
+      "description": "Bounds on run record parsing.",
+      "owner": "scripts/settings/runs-scan.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "smokeRealWorker": {
+      "description": "Allow real workers for smoke sentinel PRs.",
+      "owner": "scripts/settings/smoke-real-worker.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "stackAwareReview": {
+      "description": "Stack-aware review mode.",
+      "owner": "scripts/settings/stack-aware-review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "stack": {
+      "description": "Permit review while the base PR remains open.",
+      "owner": "scripts/settings/stack.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "staleReferralHumanShadow": {
+      "description": "Enable shadow detection of stale human referral holds.",
+      "owner": "scripts/settings/stale-referral-human-shadow.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "standDown": {
+      "description": "Lapse head-bound stand-downs when a new head arrives.",
+      "owner": "scripts/settings/stand-down.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "$description": {
+      "description": "Documentation of tests-first delivery policy.",
+      "owner": "scripts/settings/tests-first.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "ci": {
+      "description": "Concurrency of timeout-evidence child readers.",
+      "owner": "scripts/settings/timeout-evidence.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "urgentSweep": {
+      "description": "Urgent work sweep interval in minutes.",
+      "owner": "scripts/settings/urgent-sweep.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "vendorRouting": {
+      "description": "Preferred vendors by task type.",
+      "owner": "scripts/settings/vendor-routing.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "verify": {
+      "description": "Verification load and infrastructure retries and gate ceiling policy.",
+      "owner": "scripts/settings/verify-recovery.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "workerCapacity": {
+      "description": "Shadow worker load target and worker ceiling.",
+      "owner": "scripts/settings/worker-capacity.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "deliveryPriority": {
+      "description": "Delivery priority mode, aging, P0 concurrency and unblock weight.",
+      "owner": "scripts/lib/delivery-priority-settings.json",
+      "changeVia": "pr",
+      "instant": false
+    }
+  },
+  "capacityLeaves": {
+    "reviewConcurrency.maxLiveReviewRounds": {
+      "description": "Maximum live host review rounds.",
+      "range": "integer 1–16",
+      "unit": "rounds"
+    },
+    "host.maxReviewDispatchPerTick": {
+      "description": "Maximum host review dispatches per tick.",
+      "range": "integer 1–16",
+      "unit": "dispatches/tick"
+    },
+    "resourceGate.fixCap.floor": {
+      "description": "Minimum adaptive fix capacity.",
+      "range": "integer 1–24",
+      "unit": "workers"
+    },
+    "resourceGate.fixCap.ceiling": {
+      "description": "Maximum adaptive fix capacity.",
+      "range": "integer 1–24",
+      "unit": "workers"
+    },
+    "resourceGate.fixCap.raiseMinMemFreePct": {
+      "description": "Free memory required to raise fix capacity.",
+      "range": "finite number 25–60",
+      "unit": "percent"
+    },
+    "redTeamQueue.minConcurrent": {
+      "description": "Minimum concurrent red-team jobs.",
+      "range": "integer 0–24",
+      "unit": "jobs"
+    },
+    "deliveryCapacity.pinUnits": {
+      "description": "Pinned delivery capacity.",
+      "range": "integer 1–200",
+      "unit": "units"
+    },
+    "deliveryCapacity.pinUntil": {
+      "description": "Expiry of a delivery capacity pin.",
+      "range": "positive safe integer ≤ now + 72 hours",
+      "unit": "epoch milliseconds"
+    },
+    "deliveryCapacity.holdUntil": {
+      "description": "End of a delivery capacity hold.",
+      "range": "positive safe integer ≤ now + 72 hours",
+      "unit": "epoch milliseconds"
+    }
+  },
+  "instantGaps": [
+    {
+      "key": "ghThrottle.cap",
+      "today": "Repo setting; no operator capacity leaf.",
+      "needed": "make capacity leaf",
+      "why": "Bound total GitHub calls live during contention."
+    },
+    {
+      "key": "ghThrottle.perCallerMax",
+      "today": "Repo setting; no operator capacity leaf.",
+      "needed": "make capacity leaf",
+      "why": "Adjust caller fairness while the host is running."
+    },
+    {
+      "key": "heavyAdmissionCap",
+      "today": "Legacy repo setting with environment override.",
+      "needed": "make capacity leaf",
+      "why": "Adjust heavy command admission without rebuilding daemons."
+    },
+    {
+      "key": "fixDispatchMaxConcurrent",
+      "today": "Legacy repo setting; adaptive fix leaves cover a different bound.",
+      "needed": "make capacity leaf",
+      "why": "Adjust the dispatcher ceiling alongside adaptive fix capacity."
+    },
+    {
+      "key": "workerCapacity.ceiling",
+      "today": "Repo shadow measurement setting; not an enforced worker bound.",
+      "needed": "make capacity leaf",
+      "why": "Tune the shadow ceiling live; enforcement still needs separate implementation."
+    },
+    {
+      "key": "workerCapacity.targetLoad",
+      "today": "Repo shadow measurement target.",
+      "needed": "read per tick",
+      "why": "Fresh policy reads are required for live shadow target changes."
+    },
+    {
+      "key": "deliveryCapacity.autoTune.minUnits",
+      "today": "Repo tuning lower bound.",
+      "needed": "make capacity leaf",
+      "why": "Change the delivery tuning floor live."
+    },
+    {
+      "key": "deliveryCapacity.autoTune.maxUnits",
+      "today": "Repo tuning upper bound; pinUnits is only a temporary pin.",
+      "needed": "make capacity leaf",
+      "why": "Change the automatic delivery ceiling live."
+    },
+    {
+      "key": "redTeam.queue.reviewStartsPerTickWhileIdle",
+      "today": "Repo idle review start ceiling; not host.maxReviewDispatchPerTick.",
+      "needed": "make capacity leaf",
+      "why": "Adjust idle burst starts live."
+    },
+    {
+      "key": "redTeam.queue.minConcurrentIdlePct",
+      "today": "Repo CPU threshold for applying the red-team floor.",
+      "needed": "make capacity leaf",
+      "why": "Control when the live concurrency floor applies."
+    },
+    {
+      "key": "mergeQueueBatching.maxGroupsInFlight",
+      "today": "Repo maximum active merge groups.",
+      "needed": "make capacity leaf",
+      "why": "Bound concurrent merge queue groups live."
+    },
+    {
+      "key": "mergeDelivery.concurrency.gateReads",
+      "today": "Repo read concurrency.",
+      "needed": "make capacity leaf",
+      "why": "Reduce concurrent merge gate reads live under API pressure."
+    },
+    {
+      "key": "mergeDelivery.concurrency.enqueue",
+      "today": "Repo enqueue concurrency.",
+      "needed": "make capacity leaf",
+      "why": "Adjust concurrent enqueue calls live."
+    },
+    {
+      "key": "prepare.maxPrListingCallsPerTick",
+      "today": "Repo per-tick GitHub listing budget.",
+      "needed": "make capacity leaf",
+      "why": "Tune preparation API work per tick."
+    },
+    {
+      "key": "prepare.launchPrListingReserve",
+      "today": "Repo reserved launch listing budget.",
+      "needed": "make capacity leaf",
+      "why": "Rebalance tick budget reserved for launches."
+    },
+    {
+      "key": "prStallSweep.maxActionsPerSweep",
+      "today": "Repo sweep dispatch bound.",
+      "needed": "make capacity leaf",
+      "why": "Limit recovery work started by each sweep live."
+    },
+    {
+      "key": "prStallSweep.maxActionsPerHour",
+      "today": "Repo hourly recovery bound.",
+      "needed": "make capacity leaf",
+      "why": "Control aggregate live recovery throughput."
+    },
+    {
+      "key": "rebuildSmoke.bootConcurrency",
+      "today": "Repo boot concurrency.",
+      "needed": "make capacity leaf",
+      "why": "Tune simultaneous daemon smoke boots live."
+    },
+    {
+      "key": "ci.timeoutEvidenceConcurrency",
+      "today": "Repo child-reader concurrency.",
+      "needed": "make capacity leaf",
+      "why": "Bound timeout evidence subprocess fan-out live."
+    },
+    {
+      "key": "build.unconfirmedLaunchMax",
+      "today": "Repo repeated launch bound.",
+      "needed": "make capacity leaf",
+      "why": "Reduce repeated starts for unconfirmed work live."
+    },
+    {
+      "key": "heavyAdmission.cap",
+      "today": "Platform admission policy; the legacy heavyAdmissionCap is a separate declaration.",
+      "needed": "make capacity leaf",
+      "why": "Tune the shared host semaphore without rebuilding readers. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "heavyAdmission.fastSlots",
+      "today": "Platform fast-lane slot policy.",
+      "needed": "make capacity leaf",
+      "why": "Tune fast-lane capacity independently of the ordinary pool. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "heavyAdmission.remote.maxConcurrent",
+      "today": "Platform remote admission ceiling.",
+      "needed": "make capacity leaf",
+      "why": "Tune remote concurrency during host or provider pressure. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "deliveryPriority.maxLiveP0",
+      "today": "Platform P0 concurrency bound.",
+      "needed": "make capacity leaf",
+      "why": "Adjust the number of urgent items allowed concurrently. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "build.maxConcurrentBuilds",
+      "today": "BUILD_DISPATCH_POLICY.maxConcurrentBuilds; startup CLI/env override.",
+      "needed": "make capacity leaf",
+      "why": "Tune Claude build concurrency without restarting the builder. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "build.maxConcurrentExternalBuilds",
+      "today": "BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds; startup CLI/env override.",
+      "needed": "make capacity leaf",
+      "why": "Tune external build concurrency without restarting the builder. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "build.maxOpenPrs",
+      "today": "BUILD_DISPATCH_POLICY.maxOpenPrs; startup CLI override.",
+      "needed": "make capacity leaf",
+      "why": "Tune the builder open-PR backlog ceiling live. Add operator-leaf resolution in the per-tick consumer."
+    },
+    {
+      "key": "build.maxOpenItems",
+      "today": "BUILD_DISPATCH_POLICY.maxOpenItems; startup policy.",
+      "needed": "make capacity leaf",
+      "why": "Tune delivery-card work in progress live. Add operator-leaf resolution in the per-tick consumer."
+    }
+  ],
+  "toSettle": [
+    {
+      "where": "scripts/lib/lane-concurrency.mjs:38",
+      "identifier": "DEFAULT_MAX_CONCURRENT_LANES",
+      "current": "8; env override",
+      "proposedKey": "laneCapacity.maxConcurrent",
+      "range": "1–64",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/review-seat-caps.mjs:30",
+      "identifier": "PROVIDER_CAP_DEFAULT",
+      "current": "codex: 80, agy-claude: 300, agy-gemini: 0 calls/day; env overrides",
+      "proposedKey": "reviewSeats.providerDailyCaps",
+      "range": "0–2,000 per provider",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/review-seat-pool.mjs:13",
+      "identifier": "SEAT_POOL_MAX_SLOTS",
+      "current": "16",
+      "proposedKey": "reviewSeatPool.maxSlots",
+      "range": "1–64",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/prep-review.mjs:470",
+      "identifier": "PREP_REVIEW_MAX_PER_TICK",
+      "current": "3",
+      "proposedKey": "prepReview.maxPerTick",
+      "range": "0–20",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/daemon-manifest.mjs:220",
+      "identifier": "HEALTH_WATCH_JOB_CAP",
+      "current": "2",
+      "proposedKey": "healthWatch.maxConcurrentJobs",
+      "range": "1–8",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/gh-throttle.mjs:540",
+      "identifier": "GH_PRIORITY_THRESHOLDS",
+      "current": "background: 25%, normal: 10%, critical: 0% remaining",
+      "proposedKey": "ghThrottle.priorityHeadroom",
+      "range": "0–90% per priority; ordered",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/gh-throttle.mjs:226",
+      "identifier": "DEFAULT_RETRY_MAX_ATTEMPTS",
+      "current": "5; env override",
+      "proposedKey": "ghThrottle.retryMaxAttempts",
+      "range": "1–10",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/gh-throttle.mjs:214",
+      "identifier": "DEFAULT_ACQUIRE_TIMEOUT_MS",
+      "current": "120,000 ms; env override",
+      "proposedKey": "ghThrottle.acquireTimeoutMs",
+      "range": "0–300,000 ms",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/gh-throttle.mjs:223",
+      "identifier": "DEFAULT_RETRY_CAP_MS",
+      "current": "60,000 ms; env override",
+      "proposedKey": "ghThrottle.retryCapMs",
+      "range": "1,000–300,000 ms",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/gh-throttle.mjs:895",
+      "identifier": "DEFAULT_HEADER_WAIT_CAP_MS",
+      "current": "600,000 ms; env override",
+      "proposedKey": "ghThrottle.headerWaitCapMs",
+      "range": "0–3,600,000 ms",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/operations/verify-io.mjs:51",
+      "identifier": "VERIFY_TIMEOUT_MS",
+      "current": "30 min",
+      "proposedKey": "verify.suiteTimeoutMs",
+      "range": "5–120 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/provider-quota-hold.mjs:3",
+      "identifier": "CODEX_QUOTA_FULL_PERCENT",
+      "current": "98%",
+      "proposedKey": "providerQuota.codexFullPercent",
+      "range": "80–100%",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/provider-quota-hold.mjs:2",
+      "identifier": "QUOTA_COOLOFF_MS",
+      "current": "1 h",
+      "proposedKey": "providerQuota.unknownResetCooloffMs",
+      "range": "5 min–6 h",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:913",
+      "identifier": "INFRA_RETRY_CAP",
+      "current": "4",
+      "proposedKey": "infraRetry.streakCap",
+      "range": "1–10",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:918",
+      "identifier": "INFRA_RETRY_CAPPED_COOLOFF_MS",
+      "current": "1 h",
+      "proposedKey": "infraRetry.exhaustedCooloffMs",
+      "range": "15 min–6 h",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:877",
+      "identifier": "INFRA_RETRY_COOLOFF_MS",
+      "current": "15 min; env override",
+      "proposedKey": "infraRetry.cooloffMs",
+      "range": "1–120 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:891",
+      "identifier": "INFRA_TRANSIENT_COOLOFF_MS",
+      "current": "3 min; env override",
+      "proposedKey": "infraRetry.transientCooloffMs",
+      "range": "10 s–15 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:933",
+      "identifier": "PERMISSION_RETRY_CAP",
+      "current": "3",
+      "proposedKey": "permissionRetry.streakCap",
+      "range": "1–10",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:922",
+      "identifier": "PERMISSION_BLOCKED_COOLOFF_MS",
+      "current": "1 h",
+      "proposedKey": "permissionRetry.cooloffMs",
+      "range": "15 min–24 h",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:936",
+      "identifier": "PERMISSION_CAPPED_COOLOFF_MS",
+      "current": "24 h",
+      "proposedKey": "permissionRetry.exhaustedCooloffMs",
+      "range": "1–72 h",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:591",
+      "identifier": "CONFLICT_FIX_ROUND_CAP",
+      "current": "3",
+      "proposedKey": "conflictFix.maxRoundsPerTarget",
+      "range": "1–10",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:612",
+      "identifier": "CONFLICT_FIX_ABSOLUTE_CEILING",
+      "current": "9 (round cap × 3)",
+      "proposedKey": "conflictFix.maxTotalRounds",
+      "range": "3–30; ≥ per-target cap",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-core.mjs:627",
+      "identifier": "ADVISORY_FIX_ROUND_CAP",
+      "current": "3",
+      "proposedKey": "advisoryFix.maxRounds",
+      "range": "1–10",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/orphan-fix-round.mjs:63",
+      "identifier": "ORPHAN_REDISPATCH_CAP",
+      "current": "2",
+      "proposedKey": "orphanFix.maxRedispatches",
+      "range": "0–5",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/orphan-fix-round.mjs:65",
+      "identifier": "EVIDENCELESS_ROUND_CAP",
+      "current": "2",
+      "proposedKey": "orphanFix.maxEvidencelessRounds",
+      "range": "1–5",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/orphan-fix-round.mjs:62",
+      "identifier": "DEFAULT_ORPHAN_GRACE_MS",
+      "current": "15 min",
+      "proposedKey": "orphanFix.graceMs",
+      "range": "1–60 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/fix-slot-borrow.mjs:153",
+      "identifier": "BORROW_MAX_UNPRODUCTIVE",
+      "current": "2",
+      "proposedKey": "fixBorrow.maxUnproductiveRuns",
+      "range": "1–5",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/fix-slot-borrow.mjs:157",
+      "identifier": "ROUTED_CODEX_MAX_UNPRODUCTIVE",
+      "current": "2",
+      "proposedKey": "fixRouting.maxCodexUnproductiveRuns",
+      "range": "1–5",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/review-referral-hold.mjs:413",
+      "identifier": "VERDICT_COOLDOWN_BASE_MS",
+      "current": "1 h",
+      "proposedKey": "reviewNoVerdictRetry.cooldownBaseMs",
+      "range": "5 min–4 h",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/review-referral-hold.mjs:414",
+      "identifier": "VERDICT_COOLDOWN_CAP_MS",
+      "current": "8 h",
+      "proposedKey": "reviewNoVerdictRetry.cooldownCapMs",
+      "range": "1–24 h; ≥ base",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/review-referral-hold.mjs:448",
+      "identifier": "VERDICT_GRACE_MS",
+      "current": "10 min",
+      "proposedKey": "reviewNoVerdictRetry.verdictGraceMs",
+      "range": "30 s–30 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/review-referral-hold.mjs:30",
+      "identifier": "RESUME_MAX_ATTEMPTS",
+      "current": "3",
+      "proposedKey": "reviewResume.maxAttempts",
+      "range": "1–10",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/review-referral-hold.mjs:48",
+      "identifier": "REFERRAL_RETRY_MS",
+      "current": "15, 30, 60 min",
+      "proposedKey": "referralPersistence.retryDelaysMs",
+      "range": "1–6 increasing delays, each 1–120 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/build-dispatch-daemon.mjs:123",
+      "identifier": "PREPARE_REFUSAL_HOLD_MS",
+      "current": "30 min",
+      "proposedKey": "buildPrepare.refusalHoldMs",
+      "range": "1–120 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/build-dispatch-daemon.mjs:120",
+      "identifier": "PREPARE_SESSION_DEAD_GRACE_MS",
+      "current": "20 min",
+      "proposedKey": "buildPrepare.deadSessionGraceMs",
+      "range": "1–60 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/daemon-jobs.mjs:68",
+      "identifier": "DEFAULT_HEARTBEAT_STALE_MS",
+      "current": "60,000 ms",
+      "proposedKey": "daemonJobs.heartbeatStaleMs",
+      "range": "30,000–600,000 ms; > heartbeat interval",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/daemon-jobs.mjs:71",
+      "identifier": "DEFAULT_FOREIGN_STALE_MS",
+      "current": "30 min",
+      "proposedKey": "daemonJobs.foreignStaleMs",
+      "range": "5 min–6 h",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/daemon-jobs.mjs:74",
+      "identifier": "DEFAULT_LAUNCH_GRACE_MS",
+      "current": "30,000 ms",
+      "proposedKey": "daemonJobs.launchGraceMs",
+      "range": "5,000–300,000 ms",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/daemon-manifest.mjs:34",
+      "identifier": "DEFAULT_PASS_INTERVAL_MS",
+      "current": "120,000 ms",
+      "proposedKey": "conveyor.passIntervalMs",
+      "range": "10,000–900,000 ms",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/supervisor.mjs:77",
+      "identifier": "DEFAULT_IDLE_MAX_BACKOFF_MS",
+      "current": "900,000 ms; CLI override",
+      "proposedKey": "supervisor.idleMaxBackoffMs",
+      "range": "30,000–1,800,000 ms",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/jury/subject-jury.workflow.js:154",
+      "identifier": "PANEL_JUROR_BUDGET_USD",
+      "current": "$0.50 per juror",
+      "proposedKey": "jury.jurorBudgetUsd",
+      "range": "$0.05–$5",
+      "impact": "H",
+      "instant": false,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/jury/subject-jury.workflow.js:155",
+      "identifier": "PANEL_MAX_TOTAL_BUDGET_USD",
+      "current": "$8; launch override",
+      "proposedKey": "jury.maxTotalBudgetUsd",
+      "range": "$0.50–$50",
+      "impact": "H",
+      "instant": false,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/jury/subject-jury.workflow.js:152",
+      "identifier": "PANEL_JUROR_MODEL",
+      "current": "sonnet",
+      "proposedKey": "jury.jurorModel",
+      "range": "Validated supported model IDs",
+      "impact": "H",
+      "instant": false,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/jury/subject-jury.workflow.js:153",
+      "identifier": "PANEL_JUROR_EFFORT",
+      "current": "medium",
+      "proposedKey": "jury.jurorEffort",
+      "range": "Supported effort levels for selected model",
+      "impact": "H",
+      "instant": false,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/prep-review.mjs:41",
+      "identifier": "PREP_REVIEW_BUDGET_USD",
+      "current": "$0.25",
+      "proposedKey": "prepReview.budgetUsd",
+      "range": "$0.05–$2",
+      "impact": "H",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/ci-heal-owed.mjs:47",
+      "identifier": "OWED_MAX_ATTEMPTS",
+      "current": "24",
+      "proposedKey": "ciHealOwed.maxAttempts",
+      "range": "1–100",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/ci-heal-owed.mjs:44",
+      "identifier": "OWED_MAX_AGE_MS",
+      "current": "6 h",
+      "proposedKey": "ciHealOwed.maxAgeMs",
+      "range": "1–48 h",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/build-dispatch-daemon.mjs:128",
+      "identifier": "INFRA_RETRY_TIMEOUT_MS",
+      "current": "60,000 ms",
+      "proposedKey": "buildDispatch.infraRetryTimeoutMs",
+      "range": "5,000–120,000 ms",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/build-dispatch-daemon.mjs:2488",
+      "identifier": "STAMP_RECOVERY_LEASE_MINUTES",
+      "current": "360 min",
+      "proposedKey": "buildPrepare.stampRecoveryLeaseMinutes",
+      "range": "15–720 min",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/fix-slot-borrow.mjs:154",
+      "identifier": "BORROW_FAILURE_WINDOW_MS",
+      "current": "1 h",
+      "proposedKey": "fixBorrow.failureWindowMs",
+      "range": "5 min–6 h",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/fix-slot-borrow.mjs:144",
+      "identifier": "BORROW_WAIT_GAP_MS",
+      "current": "20 min",
+      "proposedKey": "fixBorrow.waitGapMs",
+      "range": "2–120 min",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lib/daemon-jobs.mjs:77",
+      "identifier": "DEFAULT_BACKOFF_BASE_MS",
+      "current": "30,000 ms",
+      "proposedKey": "daemonJobs.backoffBaseMs",
+      "range": "1,000–300,000 ms",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/daemon-manifest.mjs:136",
+      "identifier": "MERGE_ORPHAN_SWEEP_INTERVAL_MS",
+      "current": "15 min",
+      "proposedKey": "mergeOrphanSweep.intervalMs",
+      "range": "1–60 min",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/daemon-manifest.mjs:99",
+      "identifier": "ORPHAN_CLAIM_INTERVAL_MS",
+      "current": "6 h",
+      "proposedKey": "orphanClaimRelease.intervalMs",
+      "range": "15 min–24 h",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/supervisor.mjs:64",
+      "identifier": "DEFAULT_MAX_BACKOFF_MS",
+      "current": "300,000 ms; CLI override",
+      "proposedKey": "supervisor.maxBackoffMs",
+      "range": "10,000–1,800,000 ms",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/supervisor.mjs:63",
+      "identifier": "DEFAULT_BASE_BACKOFF_MS",
+      "current": "5,000 ms; CLI override",
+      "proposedKey": "supervisor.baseBackoffMs",
+      "range": "1,000–60,000 ms",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "skills-src/conveyor/supervisor.mjs:76",
+      "identifier": "DEFAULT_IDLE_BASE_BACKOFF_MS",
+      "current": "30,000 ms; CLI override",
+      "proposedKey": "supervisor.idleBaseBackoffMs",
+      "range": "5,000–300,000 ms",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/reconcile-pass.mjs:1388",
+      "identifier": "CONFLICT_DISPOSITION_MAX_PER_PASS",
+      "current": "20",
+      "proposedKey": "conflictDisposition.maxPerPass",
+      "range": "1–100",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/prep-review.mjs:39",
+      "identifier": "PREP_REVIEW_MAX_BLOCK_ROUNDS",
+      "current": "1",
+      "proposedKey": "prepReview.maxBlockRounds",
+      "range": "0–5",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/conveyor/prep-review.mjs:40",
+      "identifier": "PREP_REVIEW_EFFORT",
+      "current": "low",
+      "proposedKey": "prepReview.effort",
+      "range": "Supported effort levels for selected model",
+      "impact": "M",
+      "instant": true,
+      "pass": "B"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:4743",
+      "identifier": "TRIM_DEFAULT_CAP",
+      "current": "web-everything 60, frontierui/plateau-app 20",
+      "proposedKey": "lanePool.trimCap.<repo>",
+      "range": "5-200",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:4749",
+      "identifier": "TRIM_DEFAULT_CAP_FALLBACK",
+      "current": "20",
+      "proposedKey": "lanePool.trimCap.default",
+      "range": "5-200",
+      "impact": "M",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:4784",
+      "identifier": "ACQUIRE_HARD_MAX",
+      "current": "90 / 30",
+      "proposedKey": "lanePool.acquireHardMax.<repo>",
+      "range": "10-300",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:4811",
+      "identifier": "ACQUIRE_GROWTH_MAX_NEW_DEFAULT",
+      "current": "4",
+      "proposedKey": "lanePool.acquireGrowthMaxNew",
+      "range": "0-16",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:1796",
+      "identifier": "ACQUIRABLE_PROVISION_MAX_NEW_DEFAULT",
+      "current": "4",
+      "proposedKey": "lanePool.provisionMaxNew",
+      "range": "0-32",
+      "impact": "M",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:1007",
+      "identifier": "ACQUIRE_DEFAULT_WAIT_MS",
+      "current": "8000",
+      "proposedKey": "lanePool.acquireWaitMs",
+      "range": "0-60000",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:1006",
+      "identifier": "ACQUIRE_POLL_MS",
+      "current": "1000",
+      "proposedKey": "lanePool.acquirePollMs",
+      "range": "250-5000",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:731",
+      "identifier": "HEAL_LOCK_STALE_MS",
+      "current": "15 min",
+      "proposedKey": "lanePool.healLockStaleMs",
+      "range": "2-60 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:860",
+      "identifier": "LS_TIMEOUT_MS",
+      "current": "15000",
+      "proposedKey": "lanePool.lsRemoteTimeoutMs",
+      "range": "5-60 s",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:4012,4013",
+      "identifier": "DEFAULT_LIST_CACHE_TTL_MS / DEFAULT_LIST_SCAN_TIMEOUT_MS",
+      "current": "30 s / 120 s",
+      "proposedKey": "lanePool.list.{cacheTtlMs,scanTimeoutMs}",
+      "range": "5 s-5 min",
+      "impact": "M",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-pool.mjs:4055",
+      "identifier": "DEFAULT_VERDICT_MEMO_MAX_AGE_MS",
+      "current": "10 min",
+      "proposedKey": "lanePool.verdictMemoMaxAgeMs",
+      "range": "1-60 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:202",
+      "identifier": "DEFAULT_ADMISSION_CEILING_MS",
+      "current": "120 min",
+      "proposedKey": "heavyAdmission.ceilingMs",
+      "range": "10-240 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:198",
+      "identifier": "DEFAULT_TIMEOUT_MS",
+      "current": "20 min",
+      "proposedKey": "heavyAdmission.timeoutMs",
+      "range": "1-120 min",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:1702",
+      "identifier": "DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT",
+      "current": "15",
+      "proposedKey": "heavyAdmission.load.minIdlePct",
+      "range": "5-50",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:1712",
+      "identifier": "DEFAULT_LOAD_ADMISSION_WINDOW",
+      "current": "4 samples",
+      "proposedKey": "heavyAdmission.load.window",
+      "range": "1-20",
+      "impact": "M",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:213",
+      "identifier": "ADMISSION_LEASE_MINUTES",
+      "current": "60",
+      "proposedKey": "heavyAdmission.leaseMinutes",
+      "range": "15-180",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:219",
+      "identifier": "WAITING_TTL_MINUTES",
+      "current": "30",
+      "proposedKey": "heavyAdmission.waitingTtlMinutes",
+      "range": "5-120",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:190",
+      "identifier": "DEFAULT_POLL_MS",
+      "current": "2000",
+      "proposedKey": "heavyAdmission.pollMs",
+      "range": "500-10000",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-admission.mjs:1128",
+      "identifier": "REMOTE_FULL_WAIT_MS",
+      "current": "30000",
+      "proposedKey": "heavyAdmission.remote.fullWaitMs",
+      "range": "0-300 s",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-exec-run.mjs:16",
+      "identifier": "FORGE_RUN_WALL_MS",
+      "current": "29 min",
+      "proposedKey": "forge.runWallMs",
+      "range": "10-60 min",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-exec-run.mjs:38",
+      "identifier": "MAX_GATE_TIMEOUT_MS",
+      "current": "60 min",
+      "proposedKey": "forge.maxGateTimeoutMs",
+      "range": "15-120 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-exec-run.mjs:802",
+      "identifier": "REAP_GRACE_MS",
+      "current": "15 min",
+      "proposedKey": "forge.reapGraceMs",
+      "range": "5-60 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-slot-markers.mjs:17",
+      "identifier": "RUNLESS_DEAD_GRACE_MS",
+      "current": "15 min",
+      "proposedKey": "forge.slots.runlessDeadGraceMs",
+      "range": "2-60 min",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-slot-markers.mjs:552",
+      "identifier": "ORPHAN_RUN_BOUND_MS",
+      "current": "120 min (hand copy of admission ceiling)",
+      "proposedKey": "derive from heavyAdmission.ceilingMs",
+      "range": "= ceiling",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-remote-health.mjs:64",
+      "identifier": "UNREACHABLE_BACKOFF_MS",
+      "current": "15000",
+      "proposedKey": "heavyAdmission.remote.unreachableBackoffMs",
+      "range": "5-300 s",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/forge-exec-limits.mjs:98",
+      "identifier": "FORGE_EXEC_SLOTS",
+      "current": "getent count 1..128",
+      "proposedKey": "forge.execSlots",
+      "range": "1-128",
+      "impact": "H",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/remote-exec.mjs:39",
+      "identifier": "MANIFEST_CONCURRENCY",
+      "current": "16",
+      "proposedKey": "heavyAdmission.remote.manifestConcurrency",
+      "range": "1-64",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/conveyor-state.mjs:74",
+      "identifier": "DEFAULT_STALL_MS",
+      "current": "180000",
+      "proposedKey": "conveyor.stallMs",
+      "range": "1-30 min",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/conveyor-state.mjs:676",
+      "identifier": "RUN_JSON_TIMEOUT_MS",
+      "current": "2 min",
+      "proposedKey": "conveyor.runJsonTimeoutMs",
+      "range": "30 s-10 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/conveyor-instrument.mjs:74,75",
+      "identifier": "DEFAULT_POLL_INTERVAL_S / DEFAULT_SATURATION_THRESHOLD",
+      "current": "60 / 0.5",
+      "proposedKey": "conveyor.instrument.{pollIntervalS,saturationThreshold}",
+      "range": "15-600 / 0.1-1",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/dispatch-plan.mjs:306",
+      "identifier": "ALREADY_DONE_AGE_GATE_MS",
+      "current": "2 h",
+      "proposedKey": "dispatch.alreadyDone.ageGateMs",
+      "range": "15 min-24 h",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/already-done-cache.mjs:17",
+      "identifier": "NOT_DONE / DONE cooldowns",
+      "current": "30 min / 24 h",
+      "proposedKey": "dispatch.alreadyDone.{notDoneCooldownMs,doneCooldownMs}",
+      "range": "5 min-7 d",
+      "impact": "M",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/claimScope.mjs:35 + scripts/readiness/reservations.mjs:35",
+      "identifier": "DEFAULT_TTL_MINUTES",
+      "current": "120",
+      "proposedKey": "scope.claimTtlMinutes",
+      "range": "30-480",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/file-locks.mjs:47",
+      "identifier": "DEFAULT_LEASE_MINUTES",
+      "current": "15",
+      "proposedKey": "locks.fileLeaseMinutes",
+      "range": "5-120",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/drain-lock.mjs:75,277",
+      "identifier": "NUMBERING / POC_LAND lease",
+      "current": "5 / 20 min",
+      "proposedKey": "drain.{numberingLeaseMinutes,landLeaseMinutes}",
+      "range": "1-60",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/scope-lease-collect.mjs:174",
+      "identifier": "GHOST_GRACE_MS",
+      "current": "5 min",
+      "proposedKey": "scope.ghostGraceMs",
+      "range": "1-30 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/heavy-queue-projection.mjs:81,134,141",
+      "identifier": "fast lane queue wait / max files / run timeout",
+      "current": "30 / 30 / 8 min",
+      "proposedKey": "heavyAdmission.fastLane.{queueMaxWaitMin,maxFiles,runTimeoutMs}",
+      "range": "5-120 / 5-200 / 2-30 min",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/operator/dispatch.mjs:56",
+      "identifier": "DEFAULT_AGENT_TIMEOUT_MS",
+      "current": "60 min",
+      "proposedKey": "operator.agentTimeoutMs",
+      "range": "10-180 min",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/codex-direct-task.mjs:143",
+      "identifier": "task / install / clone / git-step timeouts",
+      "current": "30 / 5 / 10 / 5 min",
+      "proposedKey": "codexDirect.{taskTimeoutMs,installTimeoutMs,cloneTimeoutMs,gitStepTimeoutMs}",
+      "range": "1-120 min",
+      "impact": "H",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/readiness/model-proposer.mjs:20",
+      "identifier": "MODEL (+max_tokens 1024)",
+      "current": "claude-opus-4-8",
+      "proposedKey": "readiness.proposer.{model,maxTokens}",
+      "range": "model ids / 256-8192",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/autofix/modelFixer.mjs:162",
+      "identifier": "DEFAULT_MODEL",
+      "current": "claude-opus-4-8",
+      "proposedKey": "autofix.model",
+      "range": "model ids",
+      "impact": "M",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/lane-whois.mjs:85 + scripts/lane-pool.mjs:5203",
+      "identifier": "WE_LANE_WHOIS_* budgets (duplicated)",
+      "current": "15 s / 30 s / 60 s / 500",
+      "proposedKey": "laneWhois.*",
+      "range": "-",
+      "impact": "L",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/land-advance-hook.mjs:17",
+      "identifier": "DEFAULT_COOLDOWN_MS",
+      "current": "60 s",
+      "proposedKey": "landAdvance.cooldownMs",
+      "range": "10 s-10 min",
+      "impact": "L",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/converge-daemon-install.mjs:44",
+      "identifier": "DEFAULT_INTERVAL_SEC",
+      "current": "900",
+      "proposedKey": "converge.intervalSec",
+      "range": "60-3600",
+      "impact": "L",
+      "instant": true,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/held-cards.mjs:10",
+      "identifier": "DEFAULT_MAX_LOAD",
+      "current": "15",
+      "proposedKey": "heldCards.maxLoad",
+      "range": "1-50",
+      "impact": "L",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/drain-classify-only.mjs:8",
+      "identifier": "BATCH_PR_CAP",
+      "current": "10",
+      "proposedKey": "drain.classifyBatchCap",
+      "range": "1-50",
+      "impact": "L",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/merge-ai-prs.mjs:1218",
+      "identifier": "UNKNOWN_MERGEABILITY_MAX_RECOMPUTE",
+      "current": "10",
+      "proposedKey": "drain.unknownMergeabilityMaxRecompute",
+      "range": "1-30",
+      "impact": "L",
+      "instant": false,
+      "pass": "C"
+    },
+    {
+      "where": "scripts/merge-gate-check.mjs:404",
+      "identifier": "MAIN_CI_RUNS",
+      "current": "30",
+      "proposedKey": "mergeGate.mainCiRuns",
+      "range": "5-100",
+      "impact": "L",
+      "instant": false,
+      "pass": "C"
+    }
+  ]
+}
