@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate, classifyOverlayRemoval,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -631,6 +631,14 @@ export async function prepareRebuild({
         }),
         contentInBuild: (sha, build) => contentContainedInBuild(git, sha, build),
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
+        // Adopt the build that passed, then add: benign removals (merged/no longer wanted) and still-registered overlays the
+        // build omits queue an incremental rebuild instead of discarding the build; safety/unknown removals still discard.
+        removalSafety: (ref) => classifyOverlayRemoval({ ref, decisions: plan.decisions, events: readOverlayEvents() }),
+        readdable: (ref) => wantedRefs.has(ref) && registeredRefs.has(ref),
+        dependsOn: (ref) => {
+          const deps = (overlaysBefore || []).find((o) => o?.ref === ref)?.dependsOn;
+          return Array.isArray(deps) ? deps : [];
+        },
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
@@ -666,6 +674,7 @@ export async function prepareRebuild({
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
+          ...(m.rebuildAfter?.length ? { rebuildAfter: m.rebuildAfter } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({

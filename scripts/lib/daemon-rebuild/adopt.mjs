@@ -48,9 +48,22 @@ export function matchReadyCandidate({
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, retiredByOperator = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
-  tipInMain = () => false,
+  tipInMain = () => false, removalSafety = () => 'unknown', dependsOn = () => [], readdable = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
+  // Adopt the build that passed, then add: an applied overlay that has since LEFT the registry for a benign reason
+  // (PR merged, retired, no longer wanted) does not void a smoke-passed build; the next tick's incremental rebuild drops it.
+  // Only safety removals (failure, rollback, rejected/closed PR, security unload) and UNKNOWN reasons discard it.
+  // `removalSafety(ref, sha)` answers 'benign' | 'unsafe' | 'unknown'; anything but 'benign' fails closed.
+  const staleRefs = [];
+  const wantedOrBenign = (a, sha) => {
+    if (stillWanted(a.ref, sha)) return true;
+    if (registered(a.ref) !== false || !a.sha) return false; // tip moved on a live overlay: content may be retracted
+    if (removalSafety(a.ref, a.sha) !== 'benign') return false;
+    staleRefs.push(a.ref);
+    return true;
+  };
+  const staleInfo = () => (staleRefs.length ? { rebuildAfter: [...staleRefs] } : {});
   // The live plan could not persist its audit pin. No ready/fallback path may replace that history with a build
   // lacking the pin (even a same-tree candidate or a record claiming pinnedFrom for a different sha).
   if (plan.reason === 'pinned-overlay-hold-marker-failed') return { adopt: null, reason: plan.reason };
@@ -89,28 +102,28 @@ export function matchReadyCandidate({
   const applied = ready.adopt.applied || [];
   if (ready.kind === 'fallback') {
     if (!allowFallback) return { adopt: null, reason: 'fallback-not-allowed' };
-    if (!applied.every((a) => stillWanted(a.ref))) return { adopt: null, reason: 'overlay-no-longer-wanted' };
+    if (!applied.every((a) => wantedOrBenign(a))) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
     const revokedFallback = revokedAudit(ready.adopt);
     if (revokedFallback.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedFallback };
     if (plan.inputsKey === ready.forInputsKey) {
-      return { adopt: ready.adopt, dropRefs: ready.dropRefs || [], failed: ready.failed || '', match: 'fallback' };
+      return { adopt: ready.adopt, dropRefs: ready.dropRefs || [], failed: ready.failed || '', match: 'fallback', ...staleInfo() };
     }
     // Main moved: only suspects still registered matter (one that already left needs no drop, and no alert).
     const dropRefs = (ready.dropRefs || []).filter((s) => registered(s.ref));
     const suspectMoved = dropRefs.some((s) => !s.sha || overlayTip(s.ref) !== s.sha);
     return suspectMoved
       ? { adopt: null, reason: 'fallback-inputs-moved' }
-      : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved' };
+      : { adopt: ready.adopt, dropRefs, failed: ready.failed || '', match: 'fallback-main-moved', ...staleInfo() };
   }
   // Each recorded tip must itself remain wanted. Successor ancestry cannot authorize a removed ref:
   // the successor's current descendant may have retracted content present in this candidate.
-  const carriesOnlyWanted = applied.every((a) => a.sha && stillWanted(a.ref, a.sha));
+  const carriesOnlyWanted = applied.every((a) => a.sha && wantedOrBenign(a, a.sha));
   if (plan.finalSha === ready.adopt.finalSha) {
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const revokedExact = revokedAudit(ready.adopt);
     if (revokedExact.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedExact };
-    return { adopt: ready.adopt, dropRefs: [], match: 'exact' };
+    return { adopt: ready.adopt, dropRefs: [], match: 'exact', ...staleInfo() };
   }
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {
@@ -120,7 +133,7 @@ export function matchReadyCandidate({
     };
     const revokedSameTree = revokedAudit(adopt);
     if (revokedSameTree.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSameTree };
-    return { adopt, dropRefs: [], match: 'same-tree' };
+    return { adopt, dropRefs: [], match: 'same-tree', ...staleInfo() };
   }
   if (!verifyBuilt(ready.adopt)) return { adopt: null, reason: 'unverified-build' };
   if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
@@ -145,10 +158,26 @@ export function matchReadyCandidate({
     if (a.sha && retiredByOperator(a) === true) { retired.push(a.ref); return false; }
     return true;
   });
-  if (omitted.length > 0) {
-    return { adopt: null, reason: `superseded-omits-live-overlay: ${omitted.map((a) => a.ref).join(', ')}`, omitted: omitted.map((a) => a.ref) };
+  // Adopt, then add: a live overlay the candidate omits but that is STILL registered is not lost by adopting; the next
+  // tick's incremental rebuild adds it back. Refused only when something the candidate applies declares it a dependency.
+  const readd = [];
+  const blocked = omitted.filter((a) => {
+    if (readdable(a.ref) !== true) return true;
+    const needed = applied.some((x) => {
+      const deps = dependsOn(x.ref);
+      return Array.isArray(deps) && deps.includes(a.ref);
+    });
+    if (needed) return true;
+    readd.push(a.ref);
+    return false;
+  });
+  if (blocked.length > 0) {
+    return { adopt: null, reason: `superseded-omits-live-overlay: ${blocked.map((a) => a.ref).join(', ')}`, omitted: blocked.map((a) => a.ref) };
   }
-  return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
+  return {
+    adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}), ...staleInfo(),
+    ...(readd.length ? { rebuildAfter: [...new Set([...staleRefs, ...readd])] } : {}),
+  };
 }
 
 /** Only authenticated operator auto-retirement retires its exact tip, after every recorded add. Unknown evidence refuses. */
@@ -166,6 +195,30 @@ export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) 
       && history.lastIndexOf(removed) > history.findLastIndex((e) => e.kind === 'added')
       && added.every((e) => typeof e.at === 'string' && Number.isFinite(Date.parse(e.at)) && removedAt > Date.parse(e.at));
   } catch { return false; }
+}
+
+const UNSAFE_REMOVAL_RE = /fail|rollback|rolled|reject|closed|unmerged|secur|unload|weaken|revok|broken|regress|\bred\b|conflict|ref-gone|poison|suspect/i;
+const BENIGN_REMOVAL_RE = /pr[- ]?merged|\bmerged\b|in-main|no longer wanted|not wanted|unwanted|retired|superseded|replaced|graduat/i;
+
+/**
+ * Why did a registered overlay leave? 'benign' (its PR merged, or it is simply no longer wanted), 'unsafe' (dropped for
+ * failure, rolled back, PR rejected/closed unmerged, security unload) or 'unknown'. Callers adopt a smoke-passed build
+ * only for 'benign'; anything else (including a missing or unreadable trail) discards it: fail closed.
+ * @param {{ref:string, decisions?:object[], events?:object[]}} o — this tick's plan decisions plus the overlay audit trail
+ * @returns {'benign'|'unsafe'|'unknown'}
+ */
+export function classifyOverlayRemoval({ ref, decisions = [], events } = {}) {
+  try {
+    const d = decisions.find((x) => x?.ref === ref && x.action === 'remove');
+    if (d) return d.reason === 'pr-merged' || d.reason === 'in-main' ? 'benign' : 'unsafe';
+    if (!ref || !Array.isArray(events)) return 'unknown';
+    const last = events.filter((e) => e?.ref === ref).at(-1);
+    if (!last || !['removed', 'auto-dropped', 'auto-retired'].includes(last.kind)) return 'unknown';
+    const reason = typeof last.reason === 'string' ? last.reason : '';
+    if (!reason.trim()) return 'unknown';
+    if (UNSAFE_REMOVAL_RE.test(reason)) return 'unsafe';
+    return BENIGN_REMOVAL_RE.test(reason) ? 'benign' : 'unknown';
+  } catch { return 'unknown'; }
 }
 
 // R790: one-time ruled weakening for this exact legacy drop; content/driver and time proof still apply.
