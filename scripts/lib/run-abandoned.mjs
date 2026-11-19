@@ -52,7 +52,11 @@ export function hasRejectingReviewVerdict(run) {
   return run.effects.some(effect => {
     try {
       if (!object(effect) || typeof effect.status !== 'string' || typeof effect.type !== 'string') return true;
-      if (['applied', 'failed', 'skipped'].includes(effect.status)) return false;
+      // A finished effect is still evidence: an applied/failed/skipped send-back (`to: "changes"`) always counts as
+      // rejecting, so its payload is inspected like any other; only a missing payload is treated as nothing to read.
+      if (['applied', 'failed', 'skipped'].includes(effect.status)) {
+        return effect.payload !== undefined && effect.payload !== null && rejectingPayload(effect.payload, budget);
+      }
       if (!['declared', 'pending', 'in-flight', 'refused'].includes(effect.status)) return true;
       const payload = effect.payload;
       if (!object(payload) || rejectingPayload(payload, budget)) return true;

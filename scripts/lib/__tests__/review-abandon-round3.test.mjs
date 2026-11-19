@@ -311,3 +311,11 @@ it('finding-level juror verdicts in a declared ledger payload are not rejections
   expect(hasRejectingReviewVerdict(run([{ verdict: 'changes' }]))).toBe(true);
   expect(hasRejectingReviewVerdict(run([{ nested: [{ verdict: 'changes' }] }]))).toBe(true);
 });
+
+// Audit: an applied/failed/skipped send-back next to an accept verdict must count as rejecting.
+it.each(['applied', 'failed', 'skipped'])('a %s label-swap to changes counts as rejecting; to accepted does not', status => {
+  const run = to => ({ verdict: 'accept', findings: { confirm: 'accept' }, effects: [
+    { key: 'k#13#0', type: 'review.label-swap', status, payload: { to } }] });
+  expect(hasRejectingReviewVerdict(run('changes'))).toBe(true);
+  expect(hasRejectingReviewVerdict(run('accepted'))).toBe(false);
+});
