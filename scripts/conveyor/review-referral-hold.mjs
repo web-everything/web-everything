@@ -4,12 +4,12 @@
  * (no new panel), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { resolveRunsDir, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -185,8 +185,7 @@ function writeEvidenceDiskCache(file, entries) {
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
-  let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  const names = runFileEntries(dir);
   const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
   let disk = null;
   let dirty = false;
@@ -196,7 +195,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).map(name => {
+  const rows = names.filter(n => n.startsWith('review-pr-')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };

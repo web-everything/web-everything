@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
@@ -83,7 +84,7 @@ export function migrateLegacyRuns(legacyDir, sharedDir) {
   const skipped = [];
   if (!legacyDir || !existsSync(legacyDir) || resolve(legacyDir) === resolve(sharedDir)) return { moved, skipped };
   let names;
-  try { names = readdirSync(legacyDir).filter((f) => f.endsWith('.json') && isValidRunId(f.slice(0, -5))); } catch { return { moved, skipped }; }
+  try { names = runFileEntries(legacyDir); } catch { return { moved, skipped }; }
   if (!names.length) return { moved, skipped };
   try { mkdirSync(sharedDir, { recursive: true }); } catch { return { moved, skipped: names }; }
   for (const f of names) {
@@ -194,14 +195,31 @@ export function writeRun(record, dir = resolveRunsDir()) {
   return path;
 }
 
-/** Every run id currently on disk (sorted). Temp files and stray names are ignored. */
+const reportedInvalidEntries = new Set();
+
+/** Run-record filenames only. Sidecars are silent; unexpected JSON names emit one best-effort event per path. */
+export function runFileEntries(dir = resolveRunsDir()) {
+  let names;
+  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  return names.filter(name => {
+    if (!name.endsWith('.json') || name.startsWith('.') || /\.tmp(?:\.|$)/.test(name)) return false;
+    const id = name.slice(0, -5);
+    if (isValidRunId(id)) return true;
+    if (id.endsWith('.abandoned') && isValidRunId(id.slice(0, -10))) return false;
+    const path = resolve(dir, name);
+    if (!reportedInvalidEntries.has(path)) {
+      reportedInvalidEntries.add(path);
+      try {
+        void appendDaemonEvent({ kind: 'run-store-invalid-entry', detail: { path } }).catch(() => {});
+      } catch { /* reporting must never interrupt enumeration */ }
+    }
+    return false;
+  });
+}
+
+/** Every run id currently on disk (sorted). */
 export function listRunIds(dir = resolveRunsDir()) {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.endsWith('.json'))
-    .map((f) => f.slice(0, -'.json'.length))
-    .filter(isValidRunId)
-    .sort();
+  return runFileEntries(dir).map(name => name.slice(0, -5)).sort();
 }
 
 /** Delete a run's record. A no-op when it is already gone. */

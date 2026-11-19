@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import * as daemonEvents from '../../lib/daemon-events.mjs';
 import { createActionStore } from '../../operations/action-store.mjs';
 import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge } from '../../operations/needs-you-feed.mjs';
 import { tmpdir } from 'node:os';
@@ -232,6 +233,25 @@ describe('attempted mandatory referrals', () => {
       expect(hold(pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] }))).toBeNull();
     }
   });
+  it('enumerates valid evidence beside tombstones and stray JSON, alerting once before any record reads', () => {
+    const dir = temp();
+    writeRun(run(), dir);
+    for (const name of ['x y.json', 'review-pr-abc.abandoned.json', 'review-pr-bad name.json']) writeFileSync(join(dir, name), '{}');
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    const read = vi.fn(tryReadRun);
+    try {
+      const options = { dir, readRun: read, memo: new Map(), persist: false };
+      expect(readReviewRunEvidence(options)).toHaveLength(1);
+      expect(readReviewRunEvidence(options)).toHaveLength(1);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(read).toHaveBeenCalledWith('review-pr-parked', dir);
+      expect(alert.mock.calls.map(([event]) => event)).toEqual([
+        { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'review-pr-bad name.json') } },
+        { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'x y.json') } },
+      ]);
+    } finally { alert.mockRestore(); }
+  });
+
   it('reads real run-store shape and withholds an unchanged head in the shared planner, across repeated passes', () => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir); writeRun(run(), dir);
     for (let tick = 0; tick < 3; tick++) {
