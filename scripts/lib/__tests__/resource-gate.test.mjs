@@ -376,6 +376,37 @@ describe('dynamic fixer cap', () => {
     it.each([2, 4])('refuses under memory pressure level %s', (pressure) => {
       expect(mk(() => snap({ pressure })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
     });
+    it('admits sticky warn, but corroborated warn and critical still refuse with inputs', () => {
+      expect(mk(() => snap({ pressure: 2, freePct: 45 })).tryAdmit('fix').admit).toBe(true);
+      const low = mk(() => snap({ pressure: 2, freePct: 10 })).tryAdmit('fix');
+      expect(low).toMatchObject({ admit: false, signal: 'mem-floor' });
+      expect(low.why).toContain('free 10% (<20%)');
+      const growing = mk(() => ({ ...snap({ pressure: 3, freePct: 45 }),
+        memory: { ...snap({ pressure: 3, freePct: 45 }).memory, swapGrowthMb: 512 } })).tryAdmit('fix');
+      expect(growing.why).toContain('swap +512MB (>256MB)');
+      expect(mk(() => snap({ pressure: 4, freePct: 45 })).tryAdmit('fix').admit).toBe(false);
+    });
+    it('reads warn thresholds from the same admission settings environment', () => {
+      const t = createResourceFixThrottle({ env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '5' },
+        sendBackReservedSlots: 0, listClaims: () => [], queueLength: 0, readSnap: () => snap({ pressure: 2, freePct: 10 }),
+        nowMs: () => NOW, settings: { cutover: 'enforce', fixCap: { ...fixCap, floor: 4, ceiling: 4 } },
+        gate: () => ({ admit: true }), log: quiet });
+      expect(t.tryAdmit('fix').admit).toBe(true);
+    });
+    it.each([undefined, null, NaN, -1, 101])('warn refuses unreadable free percent %s despite flat swap', freePct => {
+      const s = snap({ pressure: 2, freePct });
+      s.memory.swapGrowthMb = 0;
+      expect(mk(() => s).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it.each([3, 4, 5, 2.5])('refuses non-warn pressure %s despite clean free memory and swap', pressure => {
+      const s = snap({ pressure, freePct: 45 });
+      s.memory.swapGrowthMb = 0;
+      expect(mk(() => s).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
+    it('warn compares unrounded free memory and allows unknown swap growth', () => {
+      expect(mk(() => snap({ pressure: 2, freePct: 19.96 })).tryAdmit('fix').admit).toBe(false);
+      expect(mk(() => snap({ pressure: 2, freePct: 20 })).tryAdmit('fix').admit).toBe(true);
+    });
     it.each([['no snapshot', () => null], ['read throws', () => { throw Error('x'); }], ['stale', () => snap({ ageMs: 600000 })],
       ['no available reading', () => snap({ availableMb: null })],
       ['no pressure', () => snap({ pressure: null })]])('fails closed on %s', (_n, readSnap) => {
