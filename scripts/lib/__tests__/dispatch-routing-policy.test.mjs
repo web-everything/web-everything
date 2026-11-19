@@ -450,7 +450,7 @@ it('preserves operator-protected Astra and ruling escalation routes', () => {
   const policy = copy();
   for (const k of ['prepare', 'prepare-decision', 'prepare-item', 'investigate']) expect(policy.operations[k].model).toBe('astra');
   for (const k of ['design', 'diagnosis']) expect(policy.taskTypes[k].model).toBe('astra');
-  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ inherit: true });
+  expect(policy.operations['fix:ruling-escalation-stronger']).toMatchObject({ provider: 'claude', model: 'sonnet', fallback: [] });
   expect(policy.operations['fix:takeover']).toMatchObject({ provider: 'claude', model: 'sonnet', fallback: [] });
   expect(policy.operations['fix:ruling-escalation-cross-provider']).toMatchObject({ provider: 'codex', model: 'astra', fallback: [{ provider: 'claude', model: 'sonnet', effort: 'high' }] });
 });
@@ -480,30 +480,20 @@ it('does not resurrect a vetoed Codex retry model at launch', () => {
   expect(models).toEqual(['gpt-6.1-sol', 'claude-sonnet-5-5']);
 });
 
-it('critical fix tier gate cannot be bypassed by capacityTierSelected on explicit routes', () => {
+it('closed critical-fix gate refuses a Codex-only route even with a tier-qualified model', () => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
   policy.operations.fix = { provider: 'codex', model: 'sol', fallback: [] };
-  const dispatch = { kind: 'fix', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' };
-  const config = { minimumTiers: { 'fix:critical-work': 3 }, providers: [{ id: 'codex', launcher: 'codex', model: 'gpt-6.1-sol', tier: 3 }] };
-  expect(decideDispatchRoute(dispatch, { routingPolicy: policy, providerCapacity: config }).policyRoute.provider).toBe('codex');
-  for (const providers of [[], [{ ...config.providers[0], tier: 1 }], [{ ...config.providers[0], model: 'gpt-6-luna' }]]) {
-    const out = decideDispatchRoute(dispatch, { routingPolicy: policy, capacityTierSelected: true, providerCapacity: { ...config, providers } });
-    expect(out.outcome).toBe('refused');
-    expect(out.refusal).toMatch(/minimum tier/);
-  }
+  const out = decideDispatchRoute({ kind: 'fix', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' },
+    { routingPolicy: policy, providerCapacity: { providers: [{ id: 'codex', model: 'gpt-6.1-sol', tier: 3 }] } });
+  expect(out.outcome).toBe('refused');
+  expect(out.refusal).toMatch(/critical-work gate/);
 });
 
-it.each(['critical-work', 'ruling-escalation-stronger'])('%s enforces configured model tiers on every explicit and inherited path', taskType => {
+
+it.each([false, true])('scoped inheritance cannot discard parent disabledProviders (gateClosed=%s)', gateClosed => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  const providerCapacity = { minimumTiers: { [`fix:${taskType}`]: 3 },
-    providers: [{ id: 'codex', launcher: 'codex', model: 'gpt-6.1-sol', tier: 2 }] };
-  policy.operations[`fix:${taskType}`] = { provider: 'codex', model: 'sol', fallback: [] };
-  expect(() => resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity })).toThrow(/minimum tier/);
-  providerCapacity.providers[0].tier = 3;
-  expect(resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity }).provider).toBe('codex');
-  providerCapacity.minimumTiers = {};
-  expect(() => resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity })).toThrow(/unknown tier/);
-  policy.operations[`fix:${taskType}`] = { inherit: true };
-  expect(() => resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity,
-    inheritedRoute: { provider: 'codex', model: 'sol', fallback: [] } })).toThrow(/unknown tier/);
+  policy.operations.fix = { inherit: true, disabledProviders: ['codex'] };
+  policy.operations['fix:critical-work'] = { inherit: true };
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', gateClosed, policy }))
+    .toThrow(/inherited route cannot enforce disabled providers; configure an explicit provider and fallback/);
 });

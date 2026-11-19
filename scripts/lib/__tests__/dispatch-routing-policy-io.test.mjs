@@ -2,8 +2,9 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { chooseBuilder } from '../provider-capacity.mjs';
 import { DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
-import { createRoutingPolicyReader, resolveOperationRoute } from '../dispatch-routing-policy-io.mjs';
+import { createRoutingPolicyReader, resolveOperationRoute, resolveDispatchRoute } from '../dispatch-routing-policy-io.mjs';
 
 const dirs = [];
 const key = 'review-seat:red-team';
@@ -64,110 +65,29 @@ it('accepts a live disable when the reader environment gives the remaining Gemin
 });
 
 it.each([
-  { gateClosed: true, availability: { codex: 'operator hold' }, vetoes: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },
-  { availability: { codex: 'operator hold' } },
-  { vetoes: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },
-  { disabled: ['codex'] },
-  { invalidModel: true },
-  { available: ['claude'] },
-])('capacity selection enforces existing route checks %j and tries the next candidate', checks => {
+  ['critical-work', 'opus'],
+  ['ruling-escalation-stronger', 'sonnet'],
+])('%s stays pinned when tier-qualified Codex has the best capacity score', (taskType, alias) => {
   const now = Date.parse('2026-11-19T12:00:00Z');
-  const capacity = ['codex', 'claude'].map((provider, i) => ({ provider, known: true, health: 1, ...(provider === 'claude' ? { account: 'claude-a' } : {}),
-    model: i ? 'claude-opus-5-5' : checks.invalidModel ? 'invalid-model' : 'gpt-6.1-sol',
-    windows: [{ usedPercent: i ? 80 : 1, resetsAt: now + 3600000 }] }));
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations['fix:critical-work'] = { inherit: true, disabledProviders: checks.disabled ?? [] };
-  const out = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy, capacity, now, env: {}, providerCapacity: { claudeUsageAccount: 'claude-a' }, ...checks });
-  expect(out.provider).toBe('claude');
-  expect(out.model).toBe('claude-opus-5-5');
-});
-it('all-unknown readers retain the historical policy fallback', () => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations['fix:critical-work'] = { inherit: true };
-  policy.operations.fix = { provider: 'claude', model: 'opus', fallback: [] };
-  expect(resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', gateClosed: true, policy,
-    env: {}, capacity: [] }).provider).toBe('claude');
-});
-
-it('capacity cannot bypass a disabled provider on the inherited parent operation', () => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations.fix = { inherit: true, disabledProviders: ['codex'] };
-  policy.operations['fix:critical-work'] = { inherit: true };
-  expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy, env: {},
-    inheritedRoute: { provider: 'codex', model: 'sol', fallback: [] },
-    now: 1800000000000, capacity: [{ provider: 'codex', known: true, health: 1,
-      windows: [{ usedPercent: 10, resetsAt: 1800003600000 }] }] })).toThrow(/unknown tier|disabled providers/);
+  const capacity = [
+    { provider: 'codex', tier: 3, model: 'gpt-6.1-sol', health: 1, known: true,
+      windows: [{ usedPercent: 1, resetsAt: now + 3600000 }] },
+    { provider: 'claude', account: 'claude-a', health: 1, known: true,
+      windows: [{ usedPercent: 80, resetsAt: now + 120 * 3600000 }] },
+  ];
+  expect(chooseBuilder({ kind: 'fix', capacities: capacity, settings: { now }, fallback: null }).provider).toBe('codex');
+  const options = { operation: 'fix', taskType, policy: DEFAULT_ROUTING_POLICY, capacity, now, env: {} };
+  for (const observations of [capacity, [], [{ ...capacity[0], held: true }, { ...capacity[1], held: true }]]) {
+    const route = resolveOperationRoute({ ...options, capacity: observations });
+    expect(route).toMatchObject({ provider: 'claude', model: DEFAULT_ROUTING_POLICY.aliases.claude[alias], fallback: [] });
+    expect(route.source).not.toBe('capacity-score');
+    const dispatch = resolveDispatchRoute({ kind: 'fix', taskType, scopePaths: ['we:scripts/lib/critical-work.mjs'], risk: 'high' },
+      { routingPolicy: DEFAULT_ROUTING_POLICY, capacity: observations, now, env: { WE_ROUTING_BUILDER: 'auto' } });
+    expect(dispatch).toMatchObject({ outcome: 'routed', executed: 'claude', policyRoute: { provider: 'claude', model: DEFAULT_ROUTING_POLICY.aliases.claude[alias] } });
+  }
 });
 
-
-it.each(['held', 'exhausted'])('known %s Claude capacity cannot escape through the historical fallback', label => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations.fix = { provider: 'claude', model: 'opus', effort: 'high', fallback: [] };
-  const now = 1800000000000;
-  expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy, env: {}, now,
-    providerCapacity: { claudeUsageAccount: 'claude-a' },
-    capacity: [{ provider: 'claude', account: 'claude-a', health: 1, known: true, held: label === 'held',
-      windows: [{ usedPercent: label === 'exhausted' ? 99 : 10, resetsAt: now + 3600000 }] }] }))
-    .toThrow(new RegExp(`no eligible capacity:.*claude: ${label}.*wait for quota reset`));
-});
-
-it('operation capacity route preserves configured effort and never exposes account selection', () => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations['fix:critical-work'].effort = 'max';
-  const now = 1800000000000;
-  const out = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy, env: {}, now,
-    providerCapacity: { claudeUsageAccount: 'claude-a' },
-    capacity: [{ provider: 'claude', account: 'claude-a', health: 1, known: true,
-      windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }] });
-  expect(out).toMatchObject({ provider: 'claude', effort: 'max', model: 'claude-opus-5-5' });
-  expect(out).not.toHaveProperty('account');
-});
-
-
-it('multi-account operation routing refuses the attributed held account despite spare quota elsewhere', () => {
-  const now = 1800000000000;
-  const capacity = ['claude-a', 'claude-b'].map(account => ({ provider: 'claude', account, known: true,
-    health: 1, held: account === 'claude-a', windows: [{ usedPercent: 10, resetsAt: now + 3600000 }] }));
-  const options = { operation: 'fix', taskType: 'critical-work', policy: DEFAULT_ROUTING_POLICY, env: {}, now, capacity };
-  expect(() => resolveOperationRoute({ ...options, providerCapacity: { claudeUsageAccount: 'claude-a' } })).toThrow(/claude: held/);
-  expect(resolveOperationRoute({ ...options, providerCapacity: { claudeUsageAccount: 'claude-b' } }))
-    .toMatchObject({ provider: 'claude', model: 'claude-opus-5-5' });
-});
-
-it('non-build operations never enter capacity projection even with an inherited tier policy', () => {
-  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
-  policy.operations['prepare-decision:probe'] = { inherit: true };
-  expect(resolveOperationRoute({ operation: 'prepare-decision', taskType: 'probe', policy, env: {},
-    providerCapacity: { minimumTiers: { 'prepare-decision:probe': 3 } },
-    now: 1800000000000, capacity: [{ provider: 'claude', account: 'claude-a', known: true, health: 1,
-      windows: [{ usedPercent: 10, resetsAt: 1800003600000 }] }] })).toBeNull();
-});
-
-it.each(['held', 'exhausted'])('unavailable preferred provider cannot launch a configured %s capacity fallback', label => {
-  const now = 1800000000000;
-  const options = { operation: 'fix', taskType: 'critical-work', policy: DEFAULT_ROUTING_POLICY, env: {}, now,
-    providerCapacity: { claudeUsageAccount: 'claude-a' }, operatorKeys: [],
-    aiRouting: { fallback: [{ provider: 'claude', model: 'opus', effort: 'high' }] },
-    capacity: [
-      { provider: 'codex', known: true, health: 1, windows: [{ usedPercent: 1, resetsAt: now + 3600000 }] },
-      { provider: 'claude', account: 'claude-a', known: true, health: 1, held: label === 'held',
-        windows: [{ usedPercent: label === 'exhausted' ? 99 : 80, resetsAt: now + 3600000 }] },
-    ] };
-  expect(() => resolveOperationRoute({ ...options, available: ['claude'] }))
-    .toThrow(new RegExp(`no eligible capacity:.*claude: ${label}.*wait for quota reset`));
-  // A runnable primary must not hand the launcher a rejected fallback either.
-  expect(resolveOperationRoute({ ...options, available: ['codex', 'claude'] }))
-    .toMatchObject({ provider: 'codex', fallback: [] });
-});
-
-it('capacity routing preserves an eligible configured fallback when the preferred provider is unavailable', () => {
-  const now = 1800000000000;
-  expect(resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy: DEFAULT_ROUTING_POLICY, env: {}, now,
-    providerCapacity: { claudeUsageAccount: 'claude-a' }, available: ['claude'], operatorKeys: [],
-    aiRouting: { fallback: [{ provider: 'claude', model: 'opus', effort: 'max' }] },
-    capacity: [
-      { provider: 'codex', known: true, health: 1, windows: [{ usedPercent: 1, resetsAt: now + 3600000 }] },
-      { provider: 'claude', account: 'claude-a', known: true, health: 1,
-        windows: [{ usedPercent: 80, resetsAt: now + 3600000 }] },
-    ] })).toMatchObject({ provider: 'claude', model: 'claude-opus-5-5', effort: 'max' });
+it('pinned routes still refuse an unavailable Claude launcher', () => {
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy: DEFAULT_ROUTING_POLICY,
+    availability: { claude: 'operator hold' } })).toThrow(/no available route/);
 });

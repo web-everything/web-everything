@@ -1,5 +1,5 @@
 {
-  "$comment": "Provider/account quota contracts and operator-maintained observations. Unknown values require operator input. quotaOf shares observations, never adds quota. Override providerCapacity through policy-cascade; arrays replace as a whole. No future grants enter planning.",
+  "$comment": "Provider/account quota contracts and operator-maintained observations. Unknown values require operator input. quotaOf shares observations, never adds quota. Override providerCapacity through policy-cascade; arrays replace as a whole. No future grants enter planning. Pinned routes bypass capacity scoring: fix:critical-work stays claude/opus and fix:ruling-escalation-stronger stays claude/sonnet. A closed critical-work gate permits only Claude.",
   "providerCapacity": {
     "providers": [
       {
@@ -195,9 +195,6 @@
         }
       }
     ],
-    "minimumTiers": {
-      "fix:critical-work": 3,
-      "fix:ruling-escalation-stronger": 2
-    }
+    "minimumTiers": {}
   }
 }

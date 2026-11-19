@@ -38,7 +38,7 @@ export function loadFixerLadder({
   path, read, routingPolicy = readRoutingPolicy(), externalFixProviders = EXTERNAL_FIX_PROVIDERS,
   override, // injectable: skip the file
   capacity, now, // injectable observations and clock; production reads live capacity
-  providerCapacity, // injectable configured model tiers; production resolves through the settings cascade
+  providerCapacity, // legacy injectable capacity settings; pinned routes bypass capacity scoring
   aiRouting, operatorKeys, // optional resolver input (fix coordinator slice); absent = unchanged
 } = {}) {
   if (aiRouting !== undefined && !Array.isArray(operatorKeys)) throw new TypeError('aiRouting requires operatorKeys from the policy snapshot');

@@ -50,8 +50,8 @@ describe('fixer-ladder site: optional aiRouting input', () => {
     const base = rungs(ladder());
     expect(rungs(ladder({ aiRouting: { effort: 'low' }, operatorKeys: [] }))).toEqual(base);
     const invalid = ladder({ aiRouting: { provider: 'claude', model: 'haiku', effort: 'high' }, operatorKeys: [] });
-    expect(invalid.routes['stronger-model']).toBeUndefined();
-    expect(invalid.error).toMatch(/minimum tier/);
+    expect(invalid.routes['stronger-model']).toEqual(base['stronger-model']);
+    expect(invalid.error).toBeNull();
   });
   it('an operator override on the fix operation wins over aiRouting', () => {
     expect(rungs(ladder({ aiRouting: { effort: 'xhigh' }, operatorKeys: ['fix'] }))).toEqual(rungs(ladder()));

@@ -131,10 +131,10 @@ describe('accounts, config and horizon', () => {
   });
   it('minimum tiers exclude tier two and select the higher scoring eligible provider', () => {
     const capacities = [cap('fixed', 20, { tier: 3 }), cap('fixed', 10, { provider: 'claude', tier: 3 }), cap('fixed', 0, { provider: 'agy-gemini', tier: 2, allowedKinds: ['fix'] })];
-    const result = chooseBuilder({ kind: 'fix', capacities, settings: { routeKey: 'fix:critical-work', now } });
+    const result = chooseBuilder({ kind: 'fix', capacities, settings: { minimumTiers: { fix: 3 }, now } });
     expect(result.provider).toBe('claude'); expect(result.inputs[2].label).toBe('tier-excluded');
     capacities[0].windows[0].usedPercent = 0;
-    expect(chooseBuilder({ kind: 'fix', capacities, settings: { routeKey: 'fix:critical-work', now } }).provider).toBe('codex');
+    expect(chooseBuilder({ kind: 'fix', capacities, settings: { minimumTiers: { fix: 3 }, now } }).provider).toBe('codex');
   });
   it('settings use the declared provider block and expose provenance', () => {
     const providers = [{ ...PROVIDER_DEFAULTS.providers[0], id: 'new-model' }];

@@ -1,7 +1,6 @@
 /** Pure validation and resolution for the declarative routing policy. */
 import { CODEX_EFFORT_MAP } from './codex-model-routing.mjs';
 import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-source.mjs';
-import capacityDefaults from '../settings/provider-capacity.json' with { type: 'json' };
 import { rosterForKey } from './dispatch-routing-providers.mjs';
 
 const CATALOG = Object.freeze({
@@ -149,7 +148,7 @@ export function applyRoutingOverrides(base, overrides = {}) {
 /** Null retains the evidence/tier decision, or omits the optional agy advisory seat.
  * Constrained inheritance requires an explicit route, except added seats with filtered candidates.
  * Availability is supplied by the launch boundary. */
-export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY, aiRouting, operatorKeys, inheritedRoute, providerCapacity = capacityDefaults.providerCapacity } = {}) {
+export function resolveOperationRoute({ operation, taskType, size, designQuestion, wellScoped, available, availability = {}, gateClosed = false, vetoes = [], policy = DEFAULT_ROUTING_POLICY, aiRouting, operatorKeys } = {}) {
   if (aiRouting !== undefined && !Array.isArray(operatorKeys)) fail('aiRouting requires operatorKeys from the policy snapshot');
   let entry = policy.operations[`${operation}:${taskType}`] ?? policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
   const disabledProviders = new Set([...(entry?.disabledProviders ?? []),
@@ -161,9 +160,6 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     const filteredAddedSeat = operation === 'review-seat' && taskType && !SETTINGS_SEAT_TASKS.includes(taskType)
       && !gateClosed && Array.isArray(available) && available.every(provider => !disabledProviders.has(provider));
     if (disabledProviders.size && !optionalAdvisory && !filteredAddedSeat) fail(`${operation}: inherited route cannot enforce disabled providers; configure an explicit provider and fallback`);
-    if (inheritedRoute) return resolveOperationRoute({ operation, taskType, available, availability, gateClosed, vetoes, providerCapacity,
-      policy: { ...policy, operations: { ...policy.operations, [taskType ? `${operation}:${taskType}` : operation]: {
-        ...inheritedRoute, disabledProviders: [...disabledProviders] } } } });
     return null;
   };
   if (['prepare', 'prepare-item'].includes(operation) && policy.smallPrepare && Number.isFinite(size) && size > 0 && size <= policy.smallPrepare.maxSize && designQuestion === false && wellScoped === true) entry = policy.smallPrepare.route;
@@ -205,22 +201,16 @@ export function resolveOperationRoute({ operation, taskType, size, designQuestio
     entry = policy.operations[operation] ?? policy.operations[String(operation).split(':')[0]];
     if (!entry || entry.inherit) return inheritRoute();
   }
-  const tierKey = operation === 'fix' && gateClosed ? 'fix:critical-work' : `${operation}:${taskType}`;
-  const minimumTier = providerCapacity.minimumTiers?.[tierKey];
-  const tierRequired = operation === 'fix' && (gateClosed || ['critical-work', 'ruling-escalation-stronger'].includes(taskType));
-  const meetsTier = route => !tierRequired || (Number.isFinite(minimumTier) && providerCapacity.providers?.some(p =>
-    (p.launcher === route.provider || p.id === route.provider) && p.model === route.model && Number.isFinite(p.tier) && p.tier >= minimumTier));
-  const gatePermits = route => !gateClosed || (operation === 'fix' ? meetsTier(route) : route.provider === 'claude');
   const candidates = [entry, ...entry.fallback].map(({ provider, model, effort }) => ({ provider, model: modelFor(policy, provider, model, operation), effort: resolvePolicyEffort(provider, typeof effort === 'string' ? effort : effort?.[provider] ?? operationEffort(operation, provider, taskType, policy)) }));
-  const chain = candidates.filter(meetsTier).filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
-    .filter(route => gatePermits(route) && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
+  const chain = candidates.filter(route => !disabledProviders.has(route.provider) && !entry.disabledProviders?.includes(route.provider))
+    .filter(route => (!gateClosed || route.provider === 'claude') && (route.provider === 'claude' || !vetoes.some(veto => veto.model === route.model && veto.provider === (route.provider.startsWith('agy-') ? 'antigravity' : route.provider))))
     .filter(route => !availability?.[route.provider]
       && !(route.provider.startsWith('agy-') && availability?.antigravity)
       && !(route.model.startsWith('gemini-') && availability?.codex));
-  const selected = chain.find(route => gatePermits(route) && (!available || available.includes(route.provider)));
+  const selected = chain.find(route => (!gateClosed || route.provider === 'claude') && (!available || available.includes(route.provider)));
   // This optional seat may be switched off without preventing mandatory review.
   if (!selected && optionalAdvisory && disabledProviders.size) return null;
-  if (!selected) fail(`${operation}: no available route${tierRequired ? ' meeting configured minimum tier (unknown tier refused)' : gateClosed ? ' permitted by critical-work gate' : ''}`);
+  if (!selected) fail(`${operation}: no available route${gateClosed ? ' permitted by critical-work gate' : ''}`);
   const mode = entry.mode && selected === (overlaid ? candidates[0] : chain[0]) ? entry.mode : undefined;
   if (overlaid && mode === 'shadow'
     && !chain.slice(1).some(route => route.provider === 'claude' && (!available || available.includes('claude')))) {

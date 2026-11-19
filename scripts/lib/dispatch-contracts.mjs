@@ -1365,7 +1365,7 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
   const criticalWorkGate = options.criticalWorkGate ?? policy.criticalWorkGate;
   // CI heals retain their pre-existing explicit refusal when the offered roster is entirely held.
   const record = decideDispatchRouteLegacy(dispatch, { ...options, availability: dispatch.kind === 'ci-heal' ? {} : availability, criticalWorkGate });
-  if (record.outcome === 'refused' || record.refusal) return record;
+  if (record.outcome === 'refused' || record.refusal || record.override) return record;
   // PR #3311 split: repair dispatch retains the main evidence/tier path.
   if (dispatch.kind === 'ci-heal' && Object.keys(availability).length && record.probationWorker) {
     const picked = selectProbationWorker({ taskType: record.taskType, tier: record.tier,
@@ -1387,21 +1387,12 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
     criticalWork: criticalWorkVerdict({ filesTouched: dispatch.cardPath ? [dispatch.cardPath] : dispatch.scopePaths, risk: dispatch.risk, tags: dispatch.tags }),
     criticalMisses: criticalMissesFor(options.scorecards ?? [], dispatch.kind === 'prepare-item' ? 'prepare' : dispatch.kind),
   });
-  const gateClosed = ((roleGate && !roleGate.open) || record.auditTrail?.some(row => row.criterion === 'critical-work-gate' && row.result === 'claude-only'));
+  const gateClosed = (roleGate && !roleGate.open) || record.auditTrail?.some(row => row.criterion === 'critical-work-gate' && row.result === 'claude-only');
   try {
-    if (record.override) {
-      if (dispatch.kind === 'fix' && gateClosed) {
-        // Explicit delivery overrides owe the same model-tier evidence as policy routes.
-        resolveOperationRoute({ operation: 'fix', gateClosed: true, providerCapacity: options.providerCapacity,
-          availability, policy: { ...policy, operations: { fix: { provider: record.executed, model: record.model, fallback: [] } } } });
-      }
-      return record;
-    }
     // Critical-miss vetoes are scored per taskType and apply to EVERY routed operation, gated or not
     // (prepare-item is role-path: no record.taskType, scored as 'prepare').
     const vetoTaskType = record.taskType ?? (dispatch.kind === 'prepare-item' ? 'prepare' : dispatch.kind);
-    const route = resolveOperationRoute({ operation: dispatch.kind, size: dispatch.size, designQuestion: dispatch.designQuestion, wellScoped: dispatch.wellScoped, taskType: record.taskType ?? (dispatch.kind === 'prepare-item' ? 'prepare' : null), gateClosed, policy, availability, providerCapacity: options.providerCapacity,
-      inheritedRoute: dispatch.kind === 'fix' && gateClosed ? { provider: record.routed, model: record.model, fallback: [] } : undefined, vetoes: criticalMissesFor(options.scorecards ?? [], vetoTaskType) });
+    const route = resolveOperationRoute({ operation: dispatch.kind, size: dispatch.size, designQuestion: dispatch.designQuestion, wellScoped: dispatch.wellScoped, taskType: record.taskType ?? (dispatch.kind === 'prepare-item' ? 'prepare' : null), gateClosed, policy, availability, vetoes: criticalMissesFor(options.scorecards ?? [], vetoTaskType) });
     if (!route) {
       if (roleGate && !roleGate.open) record.probationWorker = null;
       return record;
@@ -1422,7 +1413,7 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
         return { ...record, outcome: 'refused', probationWorker: null, refusal: 'feature builds require a non-simple feature roster worker' };
       }
     }
-    record.auditTrail.push(audit('routing-policy', `${route.provider}/${route.model}`, 'we:scripts/lib/dispatch-routing-policy.json', gateClosed ? 'Critical-work gate enforces the configured minimum tier for fixes and Claude fallback for other kinds.' : 'Operator policy selects this explicit provider/model; supervision remains full.'));
+    record.auditTrail.push(audit('routing-policy', `${route.provider}/${route.model}`, 'we:scripts/lib/dispatch-routing-policy.json', gateClosed ? 'Critical-work gate requires the Claude fallback.' : 'Operator policy selects this explicit provider/model; supervision remains full.'));
     return record;
   } catch (error) {
     return { ...record, outcome: 'refused', refusal: error.message };

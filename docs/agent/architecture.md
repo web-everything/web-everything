@@ -117,9 +117,10 @@ fixtures must supply continuous working hours. The shared Claude usage file maps
 An unattributed multi-account provider is unknown. Account IDs appear only in the capacity decision
 log, never in executable route results (follow-up: account-aware provider launchers).
 
-`fix:critical-work` and `fix:ruling-escalation-stronger` inherit capacity selection with minimum tiers
-3 and 2 respectively. Explicit takeover and ruling-not-addressed routes remain Claude policy data.
-Unknown eligible capacity refuses with an operator-visible wait/reset/readings fallback.
+`fix:critical-work` and `fix:ruling-escalation-stronger` remain Claude-only pins to opus and sonnet
+respectively, exactly as declared in routing policy. Pinned routes bypass capacity scoring entirely;
+capacity cannot select or change their provider/model. Explicit takeover and ruling-not-addressed
+routes also remain Claude policy data.
 
 
 
@@ -132,8 +133,8 @@ are tried in order; only all-unknown readers may use the historical policy fallb
 capacity holds with named reasons and a wait/reset/clear-hold fallback. Apply capacity eligibility
 both to route selection and to every returned fallback rung: the pure router's `available` input
 constrains its selected route, but does not filter its returned fallback list.
-Critical fixes and ruling-escalation-stronger require their configured `providerCapacity.minimumTiers`
-with an exact provider/model tier from `providerCapacity.providers`; unknown tiers refuse.
+A closed critical-work gate permits only Claude, including for fixes; a Codex-only route refuses.
+Provider tiers remain capacity data for other configured minimum-tier constraints.
 Critical takeover and ruling-not-addressed send-backs remain Claude-only and hold when Claude is unavailable.
 Escalation preserves rung order while removing held, exhausted, inactive, reserve-only, disallowed
 and below-minimum providers. Unknown rungs retain their configured position;

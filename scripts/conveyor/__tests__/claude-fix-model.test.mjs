@@ -22,14 +22,14 @@ const ruling = { rung: { id: 'stronger-model', at: 2 }, route: { provider: 'clau
 const ordinary = { pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] };
 
 describe('daemon Claude fix models', () => {
-  it('shipped inherited stronger routing uses live Claude capacity while cross-provider fallback stays Sonnet', () => {
+  it('shipped stronger routing stays pinned to Sonnet while cross-provider fallback stays Sonnet', () => {
     expect(routingPolicyIO.resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-stronger',
       available: ['claude'], policy: DEFAULT_ROUTING_POLICY, providerCapacity: fixCapacity, capacity, now: capacityNow }))
-      .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.opus, effort: 'high' });
+      .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.sonnet, effort: 'high' });
     expect(resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-cross-provider', available: ['claude'], policy: DEFAULT_ROUTING_POLICY }))
       .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.sonnet, effort: 'high' });
     expect(routingPolicyIO.resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-stronger',
-      policy: DEFAULT_ROUTING_POLICY, providerCapacity: { ...PROVIDER_DEFAULTS, enabled: false } })).toBeNull();
+      policy: DEFAULT_ROUTING_POLICY, providerCapacity: { ...PROVIDER_DEFAULTS, enabled: false } })).toMatchObject({ provider: 'claude', model: DEFAULT_ROUTING_POLICY.aliases.claude.sonnet });
   });
 
   it('resolves the escalation model through standard, platform, tool and env and logs its source', () => {
