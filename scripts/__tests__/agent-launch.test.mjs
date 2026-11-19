@@ -159,7 +159,8 @@ describe('built invocation positive controls', () => {
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(process.execPath, expected, expect.objectContaining({ shell: false, detached: true, cwd, stdio: ['pipe', 'pipe', 'pipe'] }));
     expect(isAbsolute(io.spawn.mock.calls[0][0])).toBe(true);
-    expect(Object.keys(io.spawn.mock.calls[0][2].env).every(k => ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR'].includes(k))).toBe(true);
+    expect(Object.keys(io.spawn.mock.calls[0][2].env).every(k => ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR',
+      'VITEST', 'WE_UNDER_TEST', 'LANE_POOL_ROOT'].includes(k))).toBe(true);
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
     const tempRoot = '/task "quote" \\ $TMP';
@@ -208,6 +209,24 @@ describe('built invocation positive controls', () => {
     expect(() => launchAgent(base(), io)).toThrow(/binary/); expect(io.spawn).not.toHaveBeenCalled();
     io.resolveBinary.mockReturnValue(process.execPath); io.spawn.mockImplementation(() => { throw Error('spawn failed'); });
     expect(() => launchAgent(base(), io)).toThrow('spawn failed');
+  });
+});
+
+describe('test-isolation markers survive the env allowlist (they only narrow)', () => {
+  it('forwards VITEST, WE_UNDER_TEST and an absolute LANE_POOL_ROOT, never the real-pool escape hatch', () => {
+    vi.stubEnv('VITEST', 'true'); vi.stubEnv('WE_UNDER_TEST', '1');
+    vi.stubEnv('LANE_POOL_ROOT', '/isolated/pool'); vi.stubEnv('WE_ALLOW_REAL_LANE_POOL_IN_TESTS', '1');
+    const { env } = buildAgentInvocation(base(), seam()).options;
+    expect(env).toMatchObject({ VITEST: 'true', WE_UNDER_TEST: '1', LANE_POOL_ROOT: '/isolated/pool' });
+    expect(env).not.toHaveProperty('WE_ALLOW_REAL_LANE_POOL_IN_TESTS');
+  });
+  it('refuses to launch when a set isolation root is malformed instead of silently dropping it', () => {
+    for (const bad of ['relative/pool', '-pool', '']) {
+      vi.stubEnv('LANE_POOL_ROOT', bad);
+      const io = seam();
+      expect(() => launchAgent(base(), io)).toThrow(/LANE_POOL_ROOT/);
+      expect(io.spawn).not.toHaveBeenCalled();
+    }
   });
 });
 

@@ -14,8 +14,12 @@ import { types } from 'node:util';
 
 const FIXED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const ENV_KEYS = ['USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'TZ', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR'];
+// Test-isolation markers only NARROW what the child's tooling may touch (under-test.cjs, guardedPoolRoot), so a
+// sandboxed parent keeps its sandbox. The widening escape hatch WE_ALLOW_REAL_LANE_POOL_IN_TESTS is never passed.
+const ISOLATION_KEYS = ['VITEST', 'WE_UNDER_TEST'];
+const ISOLATION_ROOTS = ['LANE_POOL_ROOT'];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot'];
+const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'lanePoolRoot', 'underTest'];
 const CODEX = ['sandbox', 'outputSchemaFile', 'outputLastMessageFile', 'ephemeral', 'addDirs', 'model', 'config', 'resumeThreadId'];
 const CLAUDE = ['print', 'sessionId', 'resumeId', 'model', 'outputFormat', 'verbose', 'prompt'];
 const fail = reason => { throw new TypeError(`agent-launch: ${reason}`); };
@@ -94,7 +98,8 @@ function argsFrom(d) {
   choice(d.agent, ['claude', 'codex'], 'agent');
   for (const key of Object.keys(d)) if (![...COMMON, ...(d.agent === 'codex' ? CODEX : CLAUDE)].includes(key)) fail(`unknown field ${key}`);
   absolute(d.cwd, 'cwd'); flag(d.processGroup, 'processGroup');
-  for (const key of ['pathPrefix', 'tempRoot']) if (d[key] !== undefined) absolute(d[key], key);
+  for (const key of ['pathPrefix', 'tempRoot', 'lanePoolRoot']) if (d[key] !== undefined) absolute(d[key], key);
+  flag(d.underTest, 'underTest');
   if (d.model !== undefined && (!/^[a-z0-9][a-z0-9._:/-]*$/i.test(text(d.model, 'model')) || /\s/.test(d.model))) fail('model must be a model name');
   const args = [];
   const option = (key, token, check = text) => { if (d[key] !== undefined) args.push(token, check(d[key], key)); };
@@ -156,7 +161,12 @@ export function buildAgentInvocation(descriptor, io) {
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
   const env = { PATH: [d.pathPrefix, FIXED_PATH, dirname(file)].filter(Boolean).join(':'), HOME: userInfo().homedir };
-  for (const key of ENV_KEYS) if (process.env[key] !== undefined) env[key] = process.env[key];
+  for (const key of [...ENV_KEYS, ...ISOLATION_KEYS]) if (process.env[key] !== undefined) env[key] = process.env[key];
+  // Dropping a set-but-malformed isolation root would widen the child's reach, so refuse instead.
+  for (const key of ISOLATION_ROOTS) if (process.env[key] !== undefined) env[key] = absolute(process.env[key], key);
+  // The launching parent's own isolation (its env bag, not process.env) is explicit grammar and wins.
+  if (d.lanePoolRoot !== undefined) env.LANE_POOL_ROOT = d.lanePoolRoot;
+  if (d.underTest === true) env.WE_UNDER_TEST = '1';
   if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) env[key] = d.tempRoot;
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
 }

@@ -1231,7 +1231,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
         await codexDirectTask({ dir, task: 't', review, env, execFn, spawnFn, stream: false });
         if (review) {
           expect(seen.opts.env).not.toBe(env);
-          expect(seen.opts.env).not.toHaveProperty('LANE_POOL_ROOT');
+          expect(seen.opts.env.LANE_POOL_ROOT).toBe(env.LANE_POOL_ROOT);
+          expect(seen.opts.env.WE_UNDER_TEST).toBe('1');
           expect(seen.opts.env).not.toHaveProperty('TMPDIR');
           expect(flagValue(seen.argv, '-s')).toBe('read-only');
           expect(seen.argv.some((v) => /sandbox_workspace_write|shell_environment_policy/.test(v))).toBe(false);
@@ -1241,7 +1242,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
           allocated.push(root);
           expect(statSync(root).isDirectory()).toBe(true);
           expect(seen.opts.env).toMatchObject({ TMP: root, TEMP: root });
-          expect(seen.opts.env).not.toHaveProperty('LANE_POOL_ROOT');
+          // The parent's pool override reaches the child, so its admission uses the same shared slots.
+          expect(seen.opts.env.LANE_POOL_ROOT).toBe(env.LANE_POOL_ROOT);
           expect(seen.argv).toContain('sandbox_workspace_write.network_access=true');
           expect(seen.argv).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([join(dir, 'metadata'), join(env.LANE_POOL_ROOT, '.admission', 'heavy'), join(env.LANE_POOL_ROOT, '.admission', 'remote'), root])}`);
           expect(seen.argv).toContain(`shell_environment_policy.set.TMPDIR=${JSON.stringify(root)}`);
