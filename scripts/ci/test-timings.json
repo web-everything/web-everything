@@ -1971,6 +1971,7 @@
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-daemon-budget-lists-real-processes.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/duplicate-live-sessions-test-dynamic-import.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/established-overlay-conflict-park.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/live-changes-stale-accepted-phase.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/unchecked-draft-and-stale-accepted-status.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/ready-candidate-adopted-across-overlay-churn.soak.test.mjs": 2,
