@@ -14,6 +14,8 @@ import {decodeManifest} from './forge-exec-manifest.mjs';
 import {readPruneStatus, validPruneStatus} from './forge-cache-prune.mjs';
 const LIMIT = 4 * 1024 * 1024;
 const FORGE_RUN_WALL_MS = 1_740_000;
+// How long the supervisor waits for the slot uid to empty after a run (sleep-polled). A loaded host reaps slowly.
+const FORGE_UID_CLEANUP_WAIT_MS = 120_000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const runName = value => typeof value === 'string' && /^r-[a-f0-9]{32}$/.test(value);
 const nonceOK = value => typeof value === 'string' && /^[a-f0-9]{32}$/.test(value);
@@ -734,17 +736,30 @@ if cfg.get('usage') is not None:
     except (OSError, StopIteration, ValueError): pass
     if process_count is None:
         diag('forge-exec-run: task-pressure sample unavailable; near-limit status unknown; inspect the run cgroup\n')
-deadline = time.monotonic() + 30
+# Persist the verdict BEFORE the uid sweep: a slow reap on a loaded host must not discard a finished run's
+# result. The wrapper still fences the slot when the sweep is unconfirmed (the .unsafe marker below).
+verdict_path = cfg['status'] + '.verdict'
+verdict_fd = os.open(verdict_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+with os.fdopen(verdict_fd, 'w') as verdict: verdict.write(str(code if 0 <= code <= 255 else 255))
+cleanup_wait_ms = cfg.get('cleanupWaitMs', 120000)
+if not isinstance(cleanup_wait_ms, int) or isinstance(cleanup_wait_ms, bool) or cleanup_wait_ms < 1 or cleanup_wait_ms > 600000: cleanup_wait_ms = 120000
+deadline = time.monotonic() + cleanup_wait_ms / 1000
 while True:
     # Escaped sessions and externally reparented children still belong only to
     # this slot UID. Re-scan after killing to close the fork-during-scan race.
-    if time.monotonic() > deadline: raise RuntimeError('uid cleanup unconfirmed; operator must stop reserved uid')
+    if time.monotonic() > deadline:
+        unsafe_path = cfg['status'] + '.unsafe'
+        os.close(os.open(unsafe_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644))
+        raise RuntimeError('uid cleanup unconfirmed; operator must stop reserved uid')
     for pid in children() | uid_processes():
         try: os.kill(pid, signal.SIGKILL)
         except ProcessLookupError: pass
-    try: os.waitpid(-1, 0)
+    # Sleep-poll: a blocking wait cannot honour the deadline while a victim is slow to die.
+    try:
+        while os.waitpid(-1, os.WNOHANG)[0]: pass
     except ChildProcessError:
         if not uid_processes(): break
+    time.sleep(0.05)
 # Read this scope's counters only after every descendant has been reaped.
 # Missing kernel counters are unknown, not a measured zero.
 if 'usage' in cfg:
@@ -1237,15 +1252,28 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const unit='forge-exec-run-'+randomBytes(16).toString('hex'),runFile=statePath(worker.reservation.run,'running'),running=await readRecord(runFile);
       if(running?.owner)await atomicJSON(runFile,{...running,owner:{...running.owner,unit}});
       const launcher=elasticScopeArgv({limits,units,slot,unit,sudo:false,source:supervisorSource,
-        json:JSON.stringify({argv,cwd:work,env,status,usage,...(worker.reservation?.receiptCapabilities?.throttle === 1 ? {receiptCapabilities:{throttle:1}} : {}),writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
+        json:JSON.stringify({argv,cwd:work,env,status,usage,cleanupWaitMs:FORGE_UID_CLEANUP_WAIT_MS,...(worker.reservation?.receiptCapabilities?.throttle === 1 ? {receiptCapabilities:{throttle:1}} : {}),writer,reapUid:true,wallMs:FORGE_RUN_WALL_MS,...(cancel?{cancel}:{}),...(archive?{archive}:{}),...ids})});
       const result=await execute(launcher[0],launcher.slice(1),{inherit:true});
-      if(result.code!==0) throw new Error('Supervisor failed');
-      const code=Number((await readPinned(status)).toString());
+      // A supervisor that persisted the verdict but could not confirm the uid sweep leaves .unsafe: keep the
+      // verdict, report the uid as unconfirmed, and let the caller fence the slot. Anything else fails as before.
+      let uidUnconfirmed=false;
+      if(result.code!==0) {
+        if(cleanup) throw new Error('Supervisor failed');
+        try {await readPinned(status+'.unsafe');} catch {throw new Error('Supervisor failed');}
+        uidUnconfirmed=true;
+      }
+      const code=Number((await readPinned(uidUnconfirmed?status+'.verdict':status)).toString());
       if(!Number.isInteger(code) || code<0 || code>255) throw new Error('Invalid supervisor status');
       let measured;
-      try {measured=JSON.parse((await readPinned(usage)).toString());} catch(error) {if(error.code!=='ENOENT')throw error;}
-      return {...result,code,usage:measured,slotCpus:cpus,tasksMax:grant.tasksMax};
-    } finally {await Promise.all([rm(status,{force:true}),rm(usage,{force:true})]);}
+      if(!uidUnconfirmed) try {measured=JSON.parse((await readPinned(usage)).toString());} catch(error) {if(error.code!=='ENOENT')throw error;}
+      return {...result,code,usage:measured,slotCpus:cpus,tasksMax:grant.tasksMax,...(uidUnconfirmed?{uidUnconfirmed:true}:{})};
+    } finally {await Promise.all([rm(status,{force:true}),rm(usage,{force:true}),rm(status+'.verdict',{force:true}),rm(status+'.unsafe',{force:true})]);}
+  }
+  // Protected evidence that this run's verdict was kept while its uid sweep was unconfirmed: finish may then
+  // retry the reap instead of refusing on the executing lock, and still returns the verdict if the reap fails.
+  async function fenceRun(record) {
+    if(typeof record?.run!=='string')return;
+    await writeFile(statePath(record.run,'uid-unconfirmed'),'',{flag:'wx',mode:0o600}).catch(error=>{if(error.code!=='EEXIST')throw error;});
   }
   async function exclusiveWorker(action,record) {
     return withWorkerWriter(writerName(record),async()=>{
@@ -1253,7 +1281,16 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const worker=await workerFor(record),executing=join(worker.active,'executing');
       await mkdir(executing,{mode:0o700}).catch(error=>{if(error.code==='EEXIST')throw busy();throw error;});
       let settled=true;
-      const command=async(...args)=>{settled=false;const result=await workCommand(worker,...args);settled=true;return result;};
+      let fenced=false;
+      const command=async(...args)=>{
+        if(fenced)throw new Error('uid cleanup unconfirmed; slot fenced');
+        settled=false;
+        const result=await workCommand(worker,...args);
+        // Verdict kept, slot fenced: the executing lock stays until a later finish/cancel reap confirms the uid is empty.
+        if(result.uidUnconfirmed===true){fenced=true;await fenceRun(record);return result;}
+        settled=true;
+        return result;
+      };
       try{return await action(command,worker);}
       finally{if(settled)await rmdir(executing);}
     }
@@ -1268,9 +1305,12 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
     });
     await writeFile(join(active,'reservation.json'),JSON.stringify({...record,writerGuard:1}),{flag:'wx',mode:0o600});
     let settled=true;
+    let fenced=false;
     const command=async (...args)=>{
+      if(fenced)throw new Error('uid cleanup unconfirmed; slot fenced');
       settled=false;
       const result=await workCommand({user:'forge-exec',reservation:record},...args);
+      if(result.uidUnconfirmed===true){fenced=true;await fenceRun(record);return result;}
       settled=true;
       return result;
     };
@@ -1711,7 +1751,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
           await new Promise(resolve=>setTimeout(resolve,50));
         }
       }
-      let finishingWorker,settled=true;
+      let finishingWorker,settled=true,fencedRun=false;
       try {
       // Only the protected state is evidence; receipt-like files in work are data.
       let phase='running';
@@ -1720,7 +1760,9 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       try {receipt=JSON.parse(await readPinned(statePath(request.run,'receipt')));} catch(e) {if(e.code!=='ENOENT') throw e;}
       const record=await state(request,phase),worker=await workerFor(record,request);
       if(worker.active){
-        await mkdir(join(worker.active,'executing'),{mode:0o700}).catch(error=>{if(error.code==='EEXIST')throw new Error('Worker execution unconfirmed; operator must stop the reserved UID');throw error;});
+        // A run that kept its verdict with an unconfirmed uid sweep left the lock itself: retry the reap below.
+        fencedRun=await lstat(statePath(request.run,'uid-unconfirmed')).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+        await mkdir(join(worker.active,'executing'),{mode:0o700}).catch(error=>{if(error.code==='EEXIST'&&fencedRun)return;if(error.code==='EEXIST')throw new Error('Worker execution unconfirmed; operator must stop the reserved UID');throw error;});
         finishingWorker=worker;
       }
       const container=join(worker.root,request.run);
@@ -1728,8 +1770,14 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if(worker.active){
         // Includes cancelled rsync and children left before task execution.
         settled=false;
-        const reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});
-        if(reaped.code!==0)throw new Error('Worker cleanup unconfirmed');
+        let reaped;
+        try {reaped=await workCommand(worker,['/usr/bin/true'],container,{PATH:path,HOME:'/nonexistent'},undefined,{cleanup:true});}
+        catch(error) {if(!fencedRun)throw error;}
+        if(reaped?.code!==0) {
+          // Still unconfirmed: the slot stays fenced (executing lock and run state untouched). A kept verdict is still returned.
+          if(fencedRun&&receipt)return receipt;
+          throw new Error('Worker cleanup unconfirmed');
+        }
         settled=true;
       }
       // The worker owns work and may remove ops' write permission. Only the
@@ -1745,6 +1793,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if(remaining) throw new Error('Run cleanup incomplete; use local fallback and inspect protected run state');
       await rename(statePath(request.run,phase),statePath(request.run,'consumed'));
       await rm(statePath(request.run,'receipt'),{force:true});
+      await rm(statePath(request.run,'uid-unconfirmed'),{force:true});
       const rejected = await readPinned(statePath(request.run,'rejected')).then(bytes => JSON.parse(bytes),error => {if(error.code !== 'ENOENT') throw error;});
       await rm(statePath(request.run,'rejected'),{force:true});
       await rm(join(bases,'active',request.run),{force:true});

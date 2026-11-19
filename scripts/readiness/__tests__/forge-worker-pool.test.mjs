@@ -414,7 +414,7 @@ with patch.object(ctypes, 'CDLL') as libc, patch.object(os, 'listdir', return_va
     expect(await fs.readdir(join(root,'receipts'))).toEqual([]);
   });
   it('the actual supervisor UID scanner selects only A live processes and excludes B and zombies',()=>{
-    const helper=supervisorSource.slice(supervisorSource.indexOf('def uid_processes():'),supervisorSource.indexOf('deadline ='));
+    const helper=supervisorSource.slice(supervisorSource.indexOf('def uid_processes():'),supervisorSource.indexOf('verdict_path ='));
     const probe=`import types, io, json\nuid=1001\ncfg={'reapUid':True}\nos=types.SimpleNamespace(listdir=lambda _:['11','22','33','not-a-pid'],getpid=lambda:99,stat=lambda path:types.SimpleNamespace(st_uid=1002 if path.endswith('/22') else 1001))\nopen=lambda path,mode:io.BytesIO(b'33 (zombie) Z 1' if '/33/' in path else b'11 (live) S 1')\n${helper}\nprint(json.dumps(sorted(uid_processes())))`;
     const result=spawnSync('python3',['-I','-c',probe],{encoding:'utf8',timeout:10000});
     expect(result.status,result.stderr).toBe(0);expect(JSON.parse(result.stdout)).toEqual([11]);

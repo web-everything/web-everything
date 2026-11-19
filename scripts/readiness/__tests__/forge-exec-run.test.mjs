@@ -1946,3 +1946,57 @@ it.each([1,2])('keeps throttle counters unknown after an unmeasured command %s',
   await runner.run(request);
   expect((await runner.finish(request)).resources).toMatchObject({throttledUsec:null,nrThrottled:null});
 });
+
+describe('uid cleanup keeps the verdict and still fences the slot',()=>{
+  const block=()=>supervisorSource.slice(supervisorSource.indexOf('verdict_path ='),supervisorSource.indexOf("# Read this scope's counters"));
+  const probe=`import sys, json, time, types, os as real
+cfg=json.loads(sys.argv[2]); code=3
+calls=[0]
+def uid_processes():
+    calls[0]+=1
+    return {999} if (cfg['mode']=='stuck' or calls[0] < 4) else set()
+def waitpid(*a):
+    raise ChildProcessError()
+ns=types.SimpleNamespace(**{n:getattr(real,n) for n in dir(real)})
+ns.kill=lambda *a:None
+ns.waitpid=waitpid
+exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9),'cfg':cfg,'code':code,'children':lambda:set(),'uid_processes':uid_processes})
+`;
+  const run=(mode,ms)=>{
+    const status=join(root,'sup-status');
+    const result=spawnSync('python3',['-I','-c',probe,block(),JSON.stringify({mode,status,cleanupWaitMs:ms})],{encoding:'utf8',timeout:10000});
+    return {result,status};
+  };
+  it('sleep-polls a slow uid to a clean sweep without marking it unsafe',async()=>{
+    const {result,status}=run('slow',2000);
+    expect(result.status,result.stderr).toBe(0);
+    expect(await readFile(status+'.verdict','utf8')).toBe('3');
+    await expect(stat(status+'.unsafe')).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('persists the verdict, marks the uid unsafe and fails when the sweep never confirms',async()=>{
+    const {result,status}=run('stuck',300);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('uid cleanup unconfirmed');
+    expect(await readFile(status+'.verdict','utf8')).toBe('3');
+    await stat(status+'.unsafe');
+    await expect(stat(status)).rejects.toMatchObject({code:'ENOENT'});
+  });
+  it('keeps the run verdict in the receipt but leaves the worker lock held',async()=>{
+    let count=0;
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>{
+      count++;
+      return {code:count>=2?0:0,stdout:'',stderr:'',...(count>=2?{uidUnconfirmed:true}:{})};
+    }});
+    await runner.run(request);
+    const receipt=JSON.parse(await readFile(join(root,'receipts',request.run+'.receipt'),'utf8'));
+    expect(receipt.code).toBe(0);
+    await stat(join(root,'receipts',request.run+'.uid-unconfirmed'));
+    await stat(join(root,'receipts','worker-active'));
+    const second=await runner.prepare({nonce:'c'.repeat(32),label:'abcdef-2'});
+    await expect(runner.run({...request,nonce:'c'.repeat(32),run:second.run})).rejects.toThrow(/busy|interrupted|unconfirmed/);
+  });
+  it('wires a 120 s cleanup wait and rejects a stuck supervisor without .unsafe',()=>{
+    expect(supervisorSource).toContain('cleanupWaitMs');
+    expect(supervisorSource.indexOf('verdict_path =')).toBeLessThan(supervisorSource.indexOf('uid cleanup unconfirmed'));
+  });
+});
