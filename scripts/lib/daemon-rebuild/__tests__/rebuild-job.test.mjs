@@ -134,7 +134,7 @@ it.each([true, false])('launchOnly=%s refuses unreadable state and permits only 
     expect(result.reason, failure).toBe(absent ? 'rebuild-job-started' : 'state-unreadable');
     expect(store.list().records, failure).toHaveLength(absent ? 1 : 0);
     expect(reattach, failure).toHaveBeenCalledTimes(absent ? 1 : 0);
-    expect(adopt, failure).toHaveBeenCalledTimes(launchOnly && !absent ? 0 : 1);
+    expect(adopt, failure).toHaveBeenCalledTimes(absent ? 1 : 0);
     // Legacy consumers still receive empty state on every read/parse failure.
     if (!['EACCES', 'EIO'].includes(failure)) expect(readRebuildState(root, env)).toMatchObject({ held: null, rejected: null });
     if (absent) expect(readRebuildStateStrict(root, env)).toEqual(readRebuildState(root, env));
@@ -148,12 +148,22 @@ it.each([
     rejected: { inputsKey: 'older', harnessBroken: true, retryAt: new Date(2000).toISOString() } }, 'smoke-harness-broken-backoff'],
   ['retry not yet due', { rejected: { inputsKey: 'unchanged', retryAt: new Date(2000).toISOString() } }, 'still-rejected'],
   ['clean state', {}, 'rebuild-job-started'],
-])('launchOnly with %s applies real preparation admission before queuing', async (_name, state, reason) => {
+  ...[true, false].flatMap(launchOnly => ['corrupt', 'EACCES'].map(failure =>
+    [failure, { rejected: { inputsKey: 'unchanged' } }, 'state-unreadable', launchOnly, failure])),
+])('%s applies real preparation admission before queuing', async (_name, state, reason, launchOnly = true, failure) => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
     WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_AUTO_REBASE: '0' };
   const plan = { ok: true, upToDate: false, finalSha: 'b'.repeat(40), mainSha: 'b'.repeat(40),
     inputsKey: 'unchanged', applied: [], decisions: [], alerts: [] };
   writeRebuildState(root, state, env);
+  const file = rebuildStatePath(root, env);
+  if (failure === 'corrupt') writeFileSync(file, '{broken');
+  const original = readFileSync(file, 'utf8');
+  // Inject the OS read error rather than chmod: privileged runners can read mode-000 files.
+  const readState = (root, env) => readRebuildStateStrict(root, env, (path, ...args) => {
+    if (path === file && failure === 'EACCES') throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+    return readFileSync(path, ...args);
+  });
   // Keep the real prepare/decision path; only Git and clone diagnosis are fixture IO.
   vi.spyOn(planner, 'planRebuild').mockResolvedValue(plan);
   vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [] });
@@ -172,12 +182,13 @@ it.each([
     ...options, adoptOnly: true, asJob: false }));
   const store = createJobStore(join(root, 'jobs'));
   const reattach = vi.fn(async () => ({}));
-  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, launchOnly: true,
+  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, launchOnly, readState,
     codeSha: 'a'.repeat(40), now: () => 1000, log: { error() {} }, evict: () => ({}),
     settings: { minIntervalMs: 0, minIntervalJitterPct: 0 } });
   expect(result.reason).toBe(reason);
-  expect(adopt).toHaveBeenCalledTimes(1);
-  expect(adopt).toHaveBeenCalledWith({ readyOnly: true });
+  expect(adopt).toHaveBeenCalledTimes(failure ? 0 : 1);
+  if (failure) expect(readFileSync(file, 'utf8')).toBe(original);
+  else expect(adopt).toHaveBeenCalledWith({ readyOnly: true });
   expect(store.list().records).toHaveLength(reason === 'rebuild-job-started' ? 1 : 0);
   expect(reattach).toHaveBeenCalledTimes(reason === 'rebuild-job-started' ? 1 : 0);
   expect(runSmoke).not.toHaveBeenCalled();

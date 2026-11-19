@@ -185,10 +185,8 @@ export async function rebuildCloneAsJob({
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
   // Refuse before preparation or reattach can erase evidence or launch an existing job.
-  if (launchOnly) {
-    try { readState(root, env); }
-    catch { return { moved: false, reason: 'state-unreadable' }; }
-  }
+  try { readState(root, env); }
+  catch { return { moved: false, reason: 'state-unreadable' }; }
   mkdirSync(store.dir, { recursive: true });
   if (store.list().corrupt?.length) return { moved: false, reason: 'rebuild-job-running', unknownJobState: true };
   const kind = REBUILD_JOB_KIND.kind;

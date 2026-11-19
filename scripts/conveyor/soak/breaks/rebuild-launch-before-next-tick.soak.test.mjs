@@ -4,6 +4,9 @@ import b from './rebuild-launch-before-next-tick.mjs';
 import { probeEarlyRebuild } from '../fixtures/early-rebuild-probe.mjs';
 import { defineBreakTest } from '../define-break-test.mjs';
 defineBreakTest(b);
+it('launches between ticks on the working tree', async () => {
+  expect(b.judge(await b.run({}))).toEqual([]);
+});
 it('reproduces the missing between-tick launch with the watcher disabled', async () => {
   expect(b.judge(await b.run({ probe: () => probeEarlyRebuild(undefined, false) }))).toHaveLength(1);
 });

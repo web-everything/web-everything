@@ -4955,7 +4955,11 @@ rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests
 checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
 Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is empty state.
 The job fixture injects EACCES/EIO and corrupt JSON, asserting refusal without a queued job;
-the legacy fail-open reader remains unchanged for other consumers. Repair unreadable state before retrying.
+the legacy fail-open reader remains unchanged for other consumers. Strict admission must precede
+preparation/adoption and reattachment: real preparation can overwrite corrupt state through that legacy
+reader. Assert the original state bytes survive refusal. Repair unreadable state before retrying.
+Both rebuild soak wrappers also require an unconditional positive test, so a behavioural `fixPresent`
+regression cannot turn the protected behaviour into an expected failure.
 
 Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
 and the `rebuild-held-recovery` soak break. Environment timeout
