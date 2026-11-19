@@ -77,6 +77,44 @@ export default {
       check(r.alerts.some(a => a.kind === 'established-overlay-parked' && a.detail.ref === ref && a.detail.sha === sha), 'park must alert with the lost overlay tip');
       check(!r.alerts.some(a => a.kind === 'established-overlay-hold'), 'park must stop holding');
       check(readOverlayEventLog(root, env).some(e => e.kind === 'established-overlay-parked' && e.ref === ref), 'park must leave audit evidence');
+
+      // PR #7104 round 4 — a mechanism-pinned live overlay A conflicts with main, and its registered clean repair B
+      // (A + main) applies. The identity marker kept for A must not erase B's carrier proof: no hold, no needs-you.
+      const repairRoot = join(dir, 'repair');
+      const repairEnv = { ...env, WE_DAEMON_STATE_DIR: join(dir, 'repair-state'), WE_DAEMON_OVERLAY_DIR: join(dir, 'repair-overlays'),
+        WE_DAEMON_EVENTS: join(dir, 'repair-events.jsonl'), WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only',
+        WE_FIX_READY_PATH: join(dir, 'no-ready-records.jsonl') };
+      git('init', '-q', '-b', 'main', repairRoot);
+      const MECH = 'scripts/daemon-overlay.mjs';
+      const files = { [MECH]: 'base\n', 'scripts/lib/daemon-rebuild.mjs': 'export {};\n', 'scripts/lib/daemon-overlays.mjs': 'export {};\n' };
+      const snap = (mech, ...parents) => {
+        for (const [p, text] of Object.entries({ ...files, [MECH]: mech })) {
+          const blob = spawnSync('git', ['-C', repairRoot, 'hash-object', '-w', '--stdin'],
+            { cwd: dir, env, input: text, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 }).stdout.trim();
+          git('-C', repairRoot, 'update-index', '--add', '--cacheinfo', `100644,${blob},${p}`);
+        }
+        const tree = git('-C', repairRoot, 'write-tree');
+        return git('-C', repairRoot, 'commit-tree', tree, ...parents.flatMap(p => ['-p', p]), '-m', mech.trim());
+      };
+      const rBase = snap('base\n');
+      const a = snap('live mechanism fix\n', rBase);
+      const rMain = snap('main rewrite\n', rBase);
+      const b = snap('live mechanism fix + main rewrite\n', a, rMain);
+      const repairRef = 'lane/live-rebased';
+      git('-C', repairRoot, 'update-ref', 'refs/heads/main', a);
+      git('-C', repairRoot, 'reset', '-q', '--hard', a);
+      git('-C', repairRoot, 'update-ref', `refs/remotes/origin/${ref}`, a);
+      git('-C', repairRoot, 'update-ref', `refs/remotes/origin/${repairRef}`, b);
+      git('-C', repairRoot, 'update-ref', 'refs/remotes/origin/main', rMain);
+      addOverlay(repairRoot, { ref }, { env: repairEnv });
+      addOverlay(repairRoot, { ref: repairRef, reason: `auto-rebase of ${ref}` }, { env: repairEnv });
+      writeRebuildState(repairRoot, { adopted: { head: a, applied: [{ ref, sha: a }] } }, repairEnv);
+      const repaired = await prepareRebuild({ root: repairRoot, env: repairEnv, run, now: () => start, prBaseChain: () => [] });
+      check(!(repaired.terminal && repaired.result?.reason === 'established-overlay-conflict'),
+        'a clean registered repair carrying the lost mechanism tip must not hold');
+      check(repaired.plan?.applied?.some(x => x.ref === repairRef && x.sha === b), 'the carrier repair must apply');
+      check(!repaired.alerts.some(x => x.kind === 'established-overlay-needs-you'), 'a carried mechanism tip must not need you');
+      check(readRebuildState(repairRoot, repairEnv).held == null, 'a carried mechanism tip must not persist a hold');
       return { violations };
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -977,13 +977,18 @@ export async function planRebuild({
 
   // Parking omits the conflicting tree, but must retain the adopted identity for the next exact-tip audit.
   // Add markers only after loss detection: their ancestry is bookkeeping, not proof that the content survived.
-  if (typeof auditedTip === 'function') {
+  // Judge carrier proof against the build BEFORE any marker of this pass: a marker must neither fabricate it (for
+  // its own ref or a sibling whose head it happens to descend from) nor erase a real one (a registered clean repair
+  // that merged the lost tip). `identityOnly` = no content of this build carries the tip; only markers link it.
+  if (typeof auditedTip === 'function' && establishedLost.length > 0) {
+    const content = cur;
+    for (const lost of establishedLost) {
+      // Fail closed: a git error answering "is it carried?" counts as not carried.
+      if (!lost.sha || git(['merge-base', '--is-ancestor', lost.sha, content]).status !== 0) lost.identityOnly = true;
+    }
     for (const lost of establishedLost) {
       const keep = adoptedTips.get(lost.ref) ?? (establishedRefs.has(lost.ref) ? lost.sha : null);
-      if (keep && recordHold(lost.ref, lost.pr, keep, null)) {
-        lost.identityOnly = true;
-        adoptedTips.set(lost.ref, keep);
-      }
+      if (keep && recordHold(lost.ref, lost.pr, keep, null)) adoptedTips.set(lost.ref, keep);
     }
   }
 

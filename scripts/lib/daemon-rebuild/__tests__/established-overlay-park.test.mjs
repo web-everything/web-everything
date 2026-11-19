@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { gitRun } from '../../main-staleness.mjs';
+import { rebuildClone } from '../rebuild.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import { readRebuildState, writeRebuildState } from '../state.mjs';
 import * as planner from '../plan.mjs';
@@ -331,5 +334,109 @@ describe('bounded established overlay hold', () => {
     const r = await tick();
     expect(r.result.reason).toBe('pinned-overlay-conflict');
     expect(parked(r)).toEqual([]);
+  });
+
+  // PR #7104 round 4 — an identity marker is bookkeeping, but a registered clean repair that really carries the lost
+  // tip is content. The marker must not erase that carrier proof (nor fabricate one for a sibling it does not carry).
+  describe('real Git: identity markers versus a carrier repair', () => {
+    const MECH = 'scripts/daemon-overlay.mjs';
+    const text = (two) => `line 1\n${two}\nline 3\n`;
+    const gitOk = (cwd, args) => {
+      const r = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', timeout: 20_000 });
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr || r.stdout}`);
+      return r.stdout.trim();
+    };
+    const fixture = async ({ stacked = false } = {}) => {
+      // Real clone, real fetch and real planner: only the rebuild's own Git and state, no injected plan.
+      vi.restoreAllMocks();
+      const origin = join(root, 'origin.git'), clone = join(root, 'clone'), author = join(root, 'author');
+      gitOk(root, ['init', '--bare', '-q', origin]);
+      gitOk(root, ['init', '-q', '-b', 'main', clone]);
+      mkdirSync(join(clone, 'scripts/lib'), { recursive: true });
+      writeFileSync(join(clone, MECH), text('line 2'));
+      // main runs the rebuild mechanism itself, so the conflicting pinned base may be skipped (xpinskip), not refused.
+      for (const m of ['scripts/lib/daemon-rebuild.mjs', 'scripts/lib/daemon-overlays.mjs']) writeFileSync(join(clone, m), 'export {};\n');
+      gitOk(clone, ['add', '-A']);
+      gitOk(clone, ['commit', '-q', '-m', 'init']);
+      gitOk(clone, ['remote', 'add', 'origin', origin]);
+      gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
+      gitOk(root, ['clone', '-q', origin, author]);
+      const commit = (branch, from, body, extra = []) => {
+        gitOk(author, ['fetch', '-q', 'origin']);
+        gitOk(author, ['checkout', '-q', '-B', branch, from]);
+        for (const m of extra) spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '-q', m], { cwd: author });
+        writeFileSync(join(author, MECH), text(body));
+        gitOk(author, ['add', '-A']);
+        gitOk(author, ['commit', '-q', '-m', branch]);
+        gitOk(author, ['push', '-q', 'origin', `HEAD:refs/heads/${branch}`]);
+        return gitOk(author, ['rev-parse', 'HEAD']);
+      };
+      const e = { ...process.env, ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only', WE_FIX_READY_PATH: join(root, 'no-ready-records.jsonl'),
+        WE_DAEMON_OVERLAY_DIR: join(root, 'clone-overlays'), WE_DAEMON_STATE_DIR: join(root, 'clone-state'),
+        WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'clone-lock') };
+      const top = 'lane/live-top';
+      // A — a mechanism-pinned overlay, adopted into the running build through a real rebuild merge record. Stacked
+      // variant: top C builds on A, so C's adopted head descends from A's tip; nothing else carries either.
+      const a = commit(ref, 'origin/main', 'live mechanism fix');
+      const listed = [{ ref, pr: 7001 }];
+      if (stacked) {
+        gitOk(author, ['checkout', '-q', '-B', top, `origin/${ref}`]);
+        writeFileSync(join(author, MECH), 'line 1\nlive mechanism fix\nlive top\n');
+        gitOk(author, ['commit', '-q', '-am', top]);
+        gitOk(author, ['push', '-q', 'origin', `HEAD:refs/heads/${top}`]);
+        listed.push({ ref: top, pr: 7002 });
+      }
+      for (const o of listed) addOverlay(clone, o, { env: e });
+      gitOk(clone, ['fetch', '-q', 'origin']);
+      const first = await planRebuild({ git: (args) => gitRun(args, { cwd: clone, env: e }), headSha: gitOk(clone, ['rev-parse', 'HEAD']),
+        mainRef: 'origin/main', overlays: listed, prState: async () => 'OPEN', stackMode: 'independent' });
+      expect(first.applied?.map(x => x.ref), JSON.stringify(first)).toEqual(listed.map(o => o.ref));
+      gitOk(clone, ['checkout', '-q', '-B', 'main', first.finalSha]);
+      writeRebuildState(clone, { adopted: { head: first.finalSha, applied: first.applied } }, e);
+      // main rewrites the same line: A (and C) now conflict. B is the clean repair carrying both A and main.
+      commit('main', 'origin/main', 'main rewrite');
+      const b = stacked ? null : commit('lane/live-rebased', `origin/${ref}`, 'live mechanism fix + main rewrite', ['origin/main']);
+      if (!stacked) addOverlay(clone, { ref: 'lane/live-rebased', pr: 7001, reason: `auto-rebase of ${ref}` }, { env: e });
+      gitOk(clone, ['fetch', '-q', 'origin']);
+      const args = { root: clone, env: e, run: (argv, o = {}) => gitRun(argv, { ...o, env: { ...e, ...o.env } }), now: () => time, prBaseChain: () => [], prState: async () => 'OPEN' };
+      return { clone, e, a, b, top, liveHead: first.finalSha,
+        prepare: () => prepareRebuild(args),
+        rebuild: () => rebuildClone({ ...args, runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) }) };
+    };
+
+    it('a clean registered repair carrying the lost mechanism tip proceeds instead of holding', async () => {
+      const f = await fixture();
+      const r = await f.prepare();
+      expect(r.result?.reason, JSON.stringify(r.result)).not.toBe('established-overlay-conflict');
+      expect(r.plan?.applied.map(x => x.ref), JSON.stringify(r)).toContain('lane/live-rebased');
+      const lost = r.plan.establishedLost.find(l => l.ref === ref);
+      expect(lost).toMatchObject({ sha: f.a });
+      expect(lost.identityOnly).not.toBe(true);
+      expect(r.alerts.filter(x => x.kind === 'established-overlay-needs-you')).toEqual([]);
+      expect(readRebuildState(f.clone, f.e).held ?? null).toBeNull();
+    }, 60_000);
+
+    it('the carrier repair smokes and is adopted, so a pending swap can retire the original', async () => {
+      const f = await fixture();
+      const r = await f.rebuild();
+      expect(r, JSON.stringify(r)).toMatchObject({ adopted: true });
+      const adopted = readRebuildState(f.clone, f.e);
+      expect(adopted.held ?? null).toBeNull();
+      // finishPendingSwaps retires the original once the repair's sha is an ancestor of the adopted HEAD.
+      expect(spawnSync('git', ['merge-base', '--is-ancestor', f.b, 'HEAD'], { cwd: f.clone }).status).toBe(0);
+      expect(adopted.adopted.applied.map(x => x.ref)).toContain('lane/live-rebased');
+    }, 60_000);
+
+    it('markers never fabricate carrier proof: a stacked base and top that both conflict still hold', async () => {
+      const f = await fixture({ stacked: true });
+      const r = await f.prepare();
+      expect(r.result?.reason, JSON.stringify(r.result)).toBe('established-overlay-conflict');
+      const lost = r.result.detail.lost;
+      expect(lost.map(l => l.ref).sort()).toEqual([ref, f.top].sort());
+      // Each lost tip is an ancestor of the build only through this pass's markers (the top's marker descends from
+      // the base's tip), so none counts as carried.
+      expect(lost.every(l => l.identityOnly === true)).toBe(true);
+      expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: f.clone, encoding: 'utf8' }).stdout.trim()).toBe(f.liveHead);
+    }, 60_000);
   });
 });
