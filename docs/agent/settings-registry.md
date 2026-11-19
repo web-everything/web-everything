@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 152 (154 declaration rows).
-- Declared leaves: 632 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 152.
+- Top-level keys: 151 (153 declaration rows).
+- Declared leaves: 562 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 151.
 - Instant capacity leaves: 9.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -99,7 +99,6 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | enforce | scripts/settings/claude-accounts.json | 1 | false | pr | no | Enable Claude daemon account enforcement. |
 | entries | scripts/settings/privacy-terms-allowlist.json | 1 | [{"path":"scripts/lib/__tests__/daemon-jobs-runtime.test.mj… | pr | no | Explicit portability exceptions pinned to matched text and line hashes. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
-| files | scripts/settings/host-path-baseline.json | 70 | {".claude/commands/continue.md":2,".claude/commands/handoff… | pr | no | Per-file allowances for grandfathered tracked content. |
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 17 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
 | fixDispatch | scripts/dispatch-settings.json, scripts/settings/fix-empty-steps.json | 8 | {"borrowBuildSlots":"on","borrowAfterMinutes":15,"borrowExe… | pr | no | Fix slot borrowing, parked-run accounting and completion release policy. |
 | fixDispatchMaxConcurrent | scripts/dispatch-settings.json | 1 | 2 | pr | no | Maximum concurrent fix dispatches. |
@@ -245,9 +244,10 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 
 ## Discovery convergence
 
+Pass A established the unquantified baseline inventory (declared settings, platform files, capacity leaves, operator prefs keys and env vars). Numeric discovery evidence starts at pass B.
+
 | Pass | Family | Scope | New items | New H-impact items |
 | --- | --- | --- | --- | --- |
-| A | Claude (mechanical script) | declared settings, platform files, capacity leaves, operator prefs keys, env vars | inventory (see summary) | - |
 | B | Codex | scripts/conveyor, scripts/lib, scripts/operations, skills-src (top 60) | 60 | 45 |
 | C | Claude | scripts/readiness, ci, hooks, operator, autofix, backlog, top-level scripts | 50 | 15 |
 | D | Codex | conveyor/operations remainder, skills-src remainder, workflows, model pins | 56 | 17 |
@@ -257,7 +257,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | H | Codex | whole sweep incl. workflows | 17 | 2 |
 | I | Claude | whole sweep incl. workflows | 23 | 0 |
 
-H-impact discovery converged (fewer than 5 new H items in passes H and I); the M-impact tail had not fallen below 5 per pass when discovery stopped; agy-gemini (a third model family) is off by ruling and can be added as an optional extra pass if the operator enables it.
+H-impact discovery converged (fewer than 5 new H items in each of passes H and I); the M-impact tail has not converged (at least 5 new items total in one or both of the last two passes); agy-gemini (a third model family) is off by ruling and can be added as an optional extra pass if the operator enables it.
 
 ## Top 10 proposals
 

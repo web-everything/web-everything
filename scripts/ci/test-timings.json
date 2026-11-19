@@ -1361,6 +1361,7 @@
   "scripts/lib/__tests__/same-gap-judge.test.mjs": 0.04,
   "scripts/lib/__tests__/scheduled-lane-maintenance.test.mjs": 0.79,
   "scripts/lib/__tests__/settings-files.test.mjs": 0.27,
+  "scripts/lib/__tests__/settings-registry.test.mjs": 0.11,
   "scripts/lib/__tests__/skill-operation-wiring.test.mjs": 0.06,
   "scripts/lib/__tests__/smoke-real-worker.test.mjs": 0.03,
   "scripts/lib/__tests__/smoke-stub-resume-round.test.mjs": 0.08,

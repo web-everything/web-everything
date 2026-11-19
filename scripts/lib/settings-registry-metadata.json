@@ -1,5 +1,5 @@
 {
-  "$comment": "Add metadata for every non-$comment top-level declared key and CAPACITY_LEAVES key. Descriptions live only here (max 160 characters). owner is the primary declaring file; the generator lists every declaring file. Record capacity aliases under leaves ($ means the scalar itself). Arrays count as one leaf. toSettle preserves pass-table values; pass C instant means its env-only column indicates an override, not proof of live reload. R1076: behavior belongs in product settings; this inventory does not convert constants.",
+  "$comment": "Add metadata for every non-$comment top-level declared key and CAPACITY_LEAVES key. Descriptions live only here (max 160 characters). owner is the primary declaring file; the generator lists every declaring file. Record capacity aliases under leaves ($ means the scalar itself). Arrays count as one leaf. toSettle preserves pass-table values; pass C instant means its env-only column indicates an override, not proof of live reload. Pass A was an unquantified baseline inventory of declared settings, platform files, capacity leaves, operator prefs keys and env vars; numeric discovery evidence starts at B. R1076: behavior belongs in product settings; this inventory does not convert constants.",
   "settings": {
     "heavyAdmissionCap": {
       "description": "Maximum concurrent heavy commands admitted on the host.",
@@ -411,12 +411,6 @@
     "github": {
       "description": "GitHub authentication mode and documented personal-identity exceptions.",
       "owner": "scripts/settings/github-auth.json",
-      "changeVia": "pr",
-      "instant": false
-    },
-    "files": {
-      "description": "Per-file allowances for grandfathered tracked content.",
-      "owner": "scripts/settings/host-path-baseline.json",
       "changeVia": "pr",
       "instant": false
     },
@@ -4295,13 +4289,6 @@
     }
   ],
   "discoveryPasses": [
-    {
-      "pass": "A",
-      "family": "Claude (mechanical script)",
-      "scope": "declared settings, platform files, capacity leaves, operator prefs keys, env vars",
-      "newItems": "inventory (see summary)",
-      "newHighImpactItems": "-"
-    },
     {
       "pass": "B",
       "family": "Codex",

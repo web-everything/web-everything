@@ -4,10 +4,10 @@
  * Usage: node scripts/lib/settings-registry.mjs --write | --check
  * API: buildRegistry({ root }), renderMarkdown(registry). Descriptions belong in the metadata JSON.
  */
-import { readFileSync, writeFileSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readDeclaredSettings, settingsLeaves } from './settings-files.mjs';
+import { readSettingsChecked, settingsLeaves } from './settings-files.mjs';
 import { CAPACITY_LEAVES } from './operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -36,9 +36,9 @@ export function buildRegistry({ root = ROOT } = {}) {
       if (path.endsWith('.json') ? !stat.isFile() : !stat.isDirectory()) throw Error('wrong file type');
     } catch (error) { problems.push(`${path}: ${error.message}`); }
   }
-  const declared = readDeclaredSettings({ dir: join(root, 'scripts/settings'), legacyPath: join(root, 'scripts/dispatch-settings.json') });
-  for (const { source, error } of declared.errors) problems.push(`${source}: ${error}`);
-  for (const { path } of declared.duplicates) if (!path.split('.').some(k => k.startsWith('$comment'))) problems.push(`duplicate setting leaf: ${path}`);
+  const declared = readSettingsChecked({ dir: join(root, 'scripts/settings'), legacyPath: join(root, 'scripts/dispatch-settings.json') });
+  for (const { source, reason } of declared.taint) problems.push(`scripts/${source}: ${reason}`);
+  for (const { path } of declared.duplicates) problems.push(`duplicate setting leaf: ${path}`);
   const metadata = read(META);
   for (const section of ['settings', 'capacityLeaves']) if (!object(metadata[section])) problems.push(`invalid metadata section: ${section}`);
   for (const section of ['instantGaps', 'toSettle', 'discoveryPasses']) if (!Array.isArray(metadata[section])) problems.push(`invalid metadata section: ${section}`);
@@ -47,19 +47,25 @@ export function buildRegistry({ root = ROOT } = {}) {
     if (![0, 10].includes(topCount)) problems.push(`top proposals must number 10 or 0: ${topCount}`);
     if (metadata.toSettle.some(row => Object.hasOwn(row, 'top') && typeof row.top !== 'boolean')) problems.push('invalid top proposal boolean');
   }
+  if (Array.isArray(metadata.discoveryPasses) && metadata.discoveryPasses.length < 2) problems.push('invalid discovery passes: at least two numeric passes required');
   if (Array.isArray(metadata.discoveryPasses)) for (const row of metadata.discoveryPasses) {
     if (!row || !['pass', 'family', 'scope'].every(key => typeof row[key] === 'string' && row[key].trim()) || !['newItems', 'newHighImpactItems'].every(key =>
-      typeof row[key] === 'string' ? row[key].trim().length > 0 : Number.isSafeInteger(row[key]) && row[key] >= 0)) problems.push('invalid discovery pass');
+      Number.isSafeInteger(row[key]) && row[key] >= 0)) problems.push('invalid discovery pass');
   }
   const owners = new Map();
-  for (const source of declared.sources) {
+  const sources = new Set(['dispatch-settings.json']);
+  // Enumerate declarations for ownership only; checked validation above owns merge safety.
+  try {
+    for (const file of readdirSync(join(root, 'scripts/settings')).filter(file => file.endsWith('.json')).sort()) sources.add(`settings/${file}`);
+  } catch (error) { problems.push(`scripts/settings: ${error.message}`); }
+  for (const source of sources) {
     const path = `scripts/${source}`;
     for (const key of Object.keys(read(path)).filter(documented)) {
       if (!owners.has(key)) owners.set(key, []);
       owners.get(key).push(path);
     }
   }
-  const rows = entries(declared.settings).filter(([key]) => documented(key)).map(([key, value]) => ({ key, value, owners: owners.get(key) ?? [] }));
+  const rows = entries(declared.value).filter(([key]) => documented(key)).map(([key, value]) => ({ key, value, owners: owners.get(key) ?? [] }));
   // Platform declarations remain distinct rows: their defaults can differ from tool defaults of the same key.
   for (const path of PLATFORM) for (const [key, value] of entries(read(path)).filter(([key]) => documented(key))) rows.push({ key, value, owners: [path] });
   const keys = new Set(rows.map(row => row.key));
@@ -101,6 +107,10 @@ export function renderMarkdown(registry) {
   const proposalTable = proposals => table(['Impact', 'Proposed key', 'Identifier', 'Current', 'Range', 'Instant candidate', 'Pass', 'Location'], [...proposals]
     .sort((a, b) => 'HML'.indexOf(a.impact) - 'HML'.indexOf(b.impact) || compare(a.proposedKey, b.proposedKey) || compare(a.identifier, b.identifier))
     .map(row => [row.impact, row.proposedKey, row.identifier, row.current, row.range, row.instant ? 'yes' : 'no', row.pass, row.where]));
+  const lastTwo = discoveryPasses.slice(-2);
+  const passes = lastTwo.map(row => row.pass).join(' and ');
+  const hConverged = lastTwo.every(row => row.newHighImpactItems < 5);
+  const mConverged = lastTwo.every(row => row.newItems < 5);
   const unique = [...new Map(rows.map(row => [row.key, row])).values()];
   const out = ['Generated by scripts/lib/settings-registry.mjs — do not edit by hand', '', '# Centralised settings registry', '',
     '## How to read', '',
@@ -127,8 +137,9 @@ export function renderMarkdown(registry) {
     '## Instant gaps', '',
     table(['Key', 'Today', 'Needed', 'Why'], [...instantGaps].sort((a, b) => compare(a.key, b.key)).map(row => [row.key, row.today, row.needed, row.why])), '',
     '## Discovery convergence', '',
+    'Pass A established the unquantified baseline inventory (declared settings, platform files, capacity leaves, operator prefs keys and env vars). Numeric discovery evidence starts at pass B.', '',
     table(['Pass', 'Family', 'Scope', 'New items', 'New H-impact items'], discoveryPasses.map(row => [row.pass, row.family, row.scope, row.newItems, row.newHighImpactItems])), '',
-    'H-impact discovery converged (fewer than 5 new H items in passes H and I); the M-impact tail had not fallen below 5 per pass when discovery stopped; agy-gemini (a third model family) is off by ruling and can be added as an optional extra pass if the operator enables it.', '',
+    `H-impact discovery ${hConverged ? 'converged' : 'has not converged'} (${hConverged ? 'fewer than 5 new H items in each of' : 'at least 5 new H items in one or both of'} passes ${passes}); the M-impact tail ${mConverged ? 'converged (fewer than 5 new items total in each of the last two passes)' : 'has not converged (at least 5 new items total in one or both of the last two passes)'}; agy-gemini (a third model family) is off by ruling and can be added as an optional extra pass if the operator enables it.`, '',
     '## Top 10 proposals', '',
     'Prioritised for throughput and stuck-work impact, favouring capacity and concurrency controls that should be instant; these remain proposals.', '',
     proposalTable(toSettle.filter(row => row.top === true)), '',

@@ -2247,6 +2247,15 @@ if (!LOCAL_MODE) {
 }
 
 mark("7. AGENTS.md inventory must be in sync (generated, not hand-edited)");
+// Settings documentation is generated from checked declarations and curated metadata.
+try {
+  execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check'], {
+    cwd: ROOT, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+  });
+} catch (error) {
+  err(`Settings registry check failed: ${error.stderr || error.message}`);
+}
+mark("7a. Settings registry documentation must be in sync");
 // ── 8. No compiled artifacts shadowing TS sources ────────────────────────────
 // A stray `tsc <file>` (or an editor "compile on save") emits `.js`/`.d.ts` next to the `.ts`/
 // `.tsx` source, ignoring tsconfig `outDir`. Because Vite/vitest resolve extensionless imports

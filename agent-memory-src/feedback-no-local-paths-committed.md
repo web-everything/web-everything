@@ -18,5 +18,5 @@ operator's home layout, only worked on one machine, and broke ~8 CI tests that r
 
 **How to apply:** use a name + host env var (or `$HOME`). In tests and fixtures use an obvious placeholder
 (`/Users/x/`, `/home/user/`) or build the string. The gate is we:scripts/lint-host-paths.mjs (CI `test` job),
-ratcheted by we:scripts/settings/host-path-baseline.json: a new file or a higher count fails, and the baseline may
+ratcheted by we:scripts/lib/host-path-baseline.json: a new file or a higher count fails, and the baseline may
 only shrink.
