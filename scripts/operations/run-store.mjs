@@ -202,7 +202,7 @@ export function runFileEntries(dir = resolveRunsDir()) {
   let names;
   try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   return names.filter(name => {
-    if (!name.endsWith('.json') || name.startsWith('.') || /\.tmp(?:\.|$)/.test(name)) return false;
+    if (!name.endsWith('.json')) return false;
     const id = name.slice(0, -5);
     if (isValidRunId(id)) return true;
     if (id.endsWith('.abandoned') && isValidRunId(id.slice(0, -10))) return false;

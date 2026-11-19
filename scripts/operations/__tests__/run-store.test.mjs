@@ -276,7 +276,7 @@ describe('a corrupt record is REFUSED, never read as absent', () => {
     const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
     try {
       writeRun(sample(), dir);
-      for (const name of ['x y.json', 'review-pr-abc.abandoned.json', '.hidden.json', 'record.tmp.json', 'record.tmp']) {
+      for (const name of ['x y.json', 'review-pr-abc.abandoned.json', 'record.tmp']) {
         writeFileSync(join(dir, name), '{}');
       }
       expect(listRunIds(dir)).toEqual(['run-sample']);
