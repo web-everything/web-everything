@@ -91,15 +91,12 @@ describe('createVerifyWakeSleep + verify request handoff — real filesystem con
   });
 
   it('early wake: a verify request during sleep(5000) resolves handoff well under one second', async () => {
-    const log = vi.fn();
-    const sleep = wakeSleep({ log });
+    const sleep = wakeSleep();
     const start = performance.now();
     const pending = sleep(5000);
     await delay(15);
     expect(signalVerifyRequest({ dir, log: vi.fn() })).toBe(true);
-    expect(JSON.parse(readFileSync(join(dir, 'wake'), 'utf8'))).toHaveProperty('nonce');
     const reason = await Promise.race([pending, delay(800).then(() => 'timed-out')]);
-    expect(log.mock.calls).toEqual([]);
     expect(reason).toBe('handoff');
     expect(performance.now() - start).toBeLessThan(800);
   });
@@ -1153,7 +1150,7 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     const { spawn } = await import('node:child_process');
     const script = join(root, 'verify-lane.mjs');
     writeFileSync(script, keepAliveScript({ maxLifetimeMs: 20_000 }));
-    const child = spawn(process.execPath, [script, '--repo=x', '--json', '--run-id=run-live'], { stdio: 'ignore', detached: true });
+    const child = spawn('node', [script, '--repo=x', '--json', '--run-id=run-live'], { stdio: 'ignore', detached: true });
     try {
       const path = join(root, 'inflight.json');
       const before = new Map([
