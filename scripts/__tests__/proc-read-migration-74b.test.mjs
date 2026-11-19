@@ -6,10 +6,12 @@ import { join } from 'node:path';
 
 const BIG = 2 * 1024 * 1024;
 let dir; let savedPath; let savedThrottle;
+let defaultFetchDiff; let defaultFetchLandGuardSignals;
+let readManifestFromPrBody; let defaultListLaneChangedFiles;
 // Fake `gh`/`git` that print a >1 MiB payload, or fail when FAKE_FAIL=1.
 const fake = (body) => `#!/usr/bin/env node\nif (process.env.FAKE_FAIL === '1') { process.stderr.write('boom'); process.exit(1); }\n${body}\n`;
 
-beforeAll(() => {
+beforeAll(async () => {
   dir = mkdtempSync(join(tmpdir(), 'proc-read-74b-'));
   const gh = fake(`const a = process.argv.slice(2);
 if (a[1] === 'diff') process.stdout.write('d'.repeat(${BIG}));
@@ -20,7 +22,18 @@ else process.stdout.write(JSON.stringify({ body: 'b'.repeat(${BIG}), files: [{ p
   chmodSync(join(dir, 'gh'), 0o755); chmodSync(join(dir, 'git'), 0o755);
   savedPath = process.env.PATH; savedThrottle = process.env.WE_GH_THROTTLE_CAP;
   process.env.PATH = `${dir}:${savedPath}`;
-});
+  // Cold drain imports can exceed a test's 5s budget on a busy coverage shard.
+  // Load after installing the fixture PATH, with a separate bounded setup budget;
+  // keep every read/failure assertion inside its original test deadline.
+  const [merge, lane, adopt] = await Promise.all([
+    import('../merge-ai-prs.mjs'),
+    import('../lane-drain.mjs'),
+    import('../conveyor/build-dispatch-orphan-adopt.mjs'),
+  ]);
+  ({ defaultFetchDiff, defaultFetchLandGuardSignals } = merge);
+  ({ readManifestFromPrBody } = lane);
+  ({ defaultListLaneChangedFiles } = adopt);
+}, 30_000);
 afterAll(() => {
   process.env.PATH = savedPath;
   if (savedThrottle === undefined) delete process.env.WE_GH_THROTTLE_CAP; else process.env.WE_GH_THROTTLE_CAP = savedThrottle;
@@ -30,7 +43,6 @@ afterAll(() => {
 
 describe('merge-ai-prs migrated reads', () => {
   it('defaultFetchDiff reads a >1 MiB diff in full; a failed read is null, never an empty string', async () => {
-    const { defaultFetchDiff } = await import('../merge-ai-prs.mjs');
     delete process.env.FAKE_FAIL;
     expect(defaultFetchDiff({ num: 1 })).toHaveLength(BIG);
     process.env.FAKE_FAIL = '1';
@@ -38,7 +50,6 @@ describe('merge-ai-prs migrated reads', () => {
   });
 
   it('defaultFetchLandGuardSignals parses a >1 MiB body; a failed read reports unknown files (null)', async () => {
-    const { defaultFetchLandGuardSignals } = await import('../merge-ai-prs.mjs');
     delete process.env.FAKE_FAIL;
     const ok = defaultFetchLandGuardSignals({ num: 1 });
     expect(ok.body).toHaveLength(BIG);
@@ -50,7 +61,6 @@ describe('merge-ai-prs migrated reads', () => {
 
 describe('lane-drain migrated reads', () => {
   it('readManifestFromPrBody reads a >1 MiB PR body in full; a failed read is null (unknown), not a manifest', async () => {
-    const { readManifestFromPrBody } = await import('../lane-drain.mjs');
     delete process.env.FAKE_FAIL;
     expect(readManifestFromPrBody(process.cwd(), 'lane/x')?.item).toBe(74);
     process.env.FAKE_FAIL = '1';
@@ -60,7 +70,6 @@ describe('lane-drain migrated reads', () => {
 
 describe('build-dispatch-orphan-adopt migrated reads', () => {
   it('defaultListLaneChangedFiles lists >1 MiB of paths in full; a failed read is null, never []', async () => {
-    const { defaultListLaneChangedFiles } = await import('../conveyor/build-dispatch-orphan-adopt.mjs');
     delete process.env.FAKE_FAIL;
     expect(defaultListLaneChangedFiles({ lane: process.cwd() }).length).toBeGreaterThan(20000);
     process.env.FAKE_FAIL = '1';
