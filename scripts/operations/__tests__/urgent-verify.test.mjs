@@ -230,6 +230,17 @@ describe('CI gate mirroring fails closed', () => {
     });
   });
   const real = yaml.safeLoad(workflow);
+  it.each(['changed command', 'removed', 'duplicated', 'missing condition'])(
+    'refuses %s unit-test shell provisioning', change => {
+      const changed = yaml.safeLoad(workflow), steps = changed.jobs['test-shard'].steps;
+      const index = steps.findIndex(step => step.name === 'Install unit-test shell dependencies');
+      expect(index).toBeGreaterThanOrEqual(0);
+      if (change === 'changed command') steps[index].run += '\necho unexpected';
+      if (change === 'removed') steps.splice(index, 1);
+      if (change === 'duplicated') steps.push({ ...steps[index] });
+      if (change === 'missing condition') delete steps[index].if;
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
+    });
   const mirroredJobs = ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'];
   it.each(mirroredJobs)('refuses an added download-artifact step in %s', job => {
     const changed = yaml.safeLoad(workflow);

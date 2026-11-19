@@ -46,8 +46,11 @@ export function ciUnitPlan(workflow) {
 // Do not derive this allowlist from the workflow at runtime: new validation must update the mirror.
 const runText = run => run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#')).join('\n');
 const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci\nnpm run build:tools'];
+// CI provisions the shell; local verification uses the host's installed shells,
+// exercised by the mandatory real-shell probes in agent-launch.test.mjs.
+const unitShellSetup = 'if ! command -v zsh >/dev/null 2>&1; then\nsudo apt-get update\nsudo apt-get install --yes --no-install-recommends zsh\nfi\nzsh --version';
 const jobSetupRuns = {
-  standards: setupRuns, 'test-shard': setupRuns, integration: setupRuns,
+  standards: setupRuns, 'test-shard': [...setupRuns, unitShellSetup], integration: setupRuns,
   'coverage-merge': ['npm ci'],
 };
 const mirroredRuns = {
@@ -183,6 +186,9 @@ const mirroredActions = {
 const fullUnit = "${{ needs.changes.outputs.light != 'true' }}";
 const fullIntegration = "${{ steps.gate.outputs.run == 'true' }}";
 function mirroredRunContext(job, text) {
+  if (job === 'test-shard' && text === unitShellSetup) return {
+    'working-directory': undefined, if: fullUnit, shell: undefined, 'continue-on-error': undefined, env: undefined,
+  };
   const index = mirroredRuns[job].map(runText).indexOf(text);
   const setup = setupRuns.includes(text);
   const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
