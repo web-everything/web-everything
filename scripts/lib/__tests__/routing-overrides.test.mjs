@@ -285,7 +285,7 @@ describe('operator routing overrides', () => {
     expect(resolveRoutingProviderCap('agy-gemini', {}, DEFAULT_ROUTING_POLICY.operations[key])).toBe(0);
     expect(resolveRoutingProviderCap('codex', {}, { disabledProviders: ['codex'] })).toBe(0);
     expect(resolveRoutingProviderCap('codex', {}, { enabledProviders: ['codex'] })).toBe(600);
-    expect(resolveRoutingProviderCap('agy-claude', {}, { enabledProviders: ['agy-claude'] })).toBe(300);
+    expect(resolveRoutingProviderCap('agy-claude', {}, { enabledProviders: ['agy-claude'] })).toBe(10);
   });
 
   it.each([

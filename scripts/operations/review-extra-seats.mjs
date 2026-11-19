@@ -1860,23 +1860,26 @@ export async function speculateRedTeam({
       try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
     }
     const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
-    const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-claude'
+    const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
       : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
-    const builderProviders = preferred ? [preferred, preferred === 'codex' ? 'agy-claude' : 'codex'] : null;
-    const providers = builderProviders ?? rosterForKey('review-seat:red-team');
+    const builderProviders = preferred ? [preferred, preferred === 'codex' ? 'agy-gemini' : 'codex'] : null;
+    const providers = rosterForKey('review-seat:red-team');
+    const capped = new Set();
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry, readSeatSettings)]));
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
+      if (usedByProvider[p] >= caps[p]) {
+        deferredByCap = true;
+        capped.add(p);
+        unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
+        continue;
+      }
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
       const hold = quotaHoldOrProbe(records, p, now, env);
       if (hold) {
         deferredByCap = true;
+        capped.add(p);
         unavailable.push(`${p}: ${hold}`);
-        continue;
-      }
-      if (usedByProvider[p] >= caps[p]) {
-        deferredByCap = true;
-        unavailable.push(`${p}: daily-cap: ${usedByProvider[p]}/${caps[p]} non-Claude seat calls already used today`);
         continue;
       }
       available.push(p);
@@ -1886,24 +1889,37 @@ export async function speculateRedTeam({
     let lastReason = null;
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
+      // agy-claude is eligible only after both ordinary providers exhaust their budgets.
+      const emergency = ['codex', 'agy-gemini'].every(p => capped.has(p));
+      const candidates = available.filter(p => p !== 'agy-claude' || emergency);
+      if (!candidates.length) break;
       let routeError = null;
-      try { configuredRoute = builderProviders ? null : resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available, policy: routingPolicy }); }
+      try { configuredRoute = builderProviders ? null : resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available: candidates, policy: routingPolicy }); }
       catch (error) { configuredRoute = null; routeError = error; }
       try {
-        if (!builderProviders) configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available,
+        if (!builderProviders) configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available: candidates,
           operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
         // A valid overlay can supply a route even when the default chain is exhausted.
-        // Without one, preserve the policy failure rather than selecting outside its chain.
-        if (routeError && !configuredRoute) throw routeError;
+        // Exhausted caps may fall back outside that chain to keep the owed seat running.
+        if (routeError && !configuredRoute) {
+          if (!['codex', 'agy-gemini'].some(p => capped.has(p))
+            || !routeError.message.endsWith(': no available route')) throw routeError;
+          const chosen = candidates[0];
+          configuredRoute = { provider: chosen, ...RED_TEAM_MODELS[chosen] };
+          io.log(`red team: routing unavailable (${routeError.message}); fallback to ${chosen}`);
+        }
       } catch (error) { lastReason = error.message; break; }
       if (builderProviders) {
-        const chosen = builderProviders.find(p => available.includes(p));
+        const chosen = [...builderProviders, 'agy-claude'].find(p => candidates.includes(p));
         if (!chosen) break;
-        configuredRoute = { provider: chosen, model: chosen === 'codex' ? 'sol' : 'claude-sonnet-5-5', effort: 'high' };
+        configuredRoute = { provider: chosen, model: chosen === 'codex' ? 'sol' : RED_TEAM_MODELS[chosen].model, effort: 'high' };
         if (chosen !== preferred) io.log(`red team: builder route ${preferred} unavailable (${unavailable.join('; ') || lastReason}); fallback to ${chosen}`);
       }
-      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
+      const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
+      if (!builderProviders && deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
+      if (pick.provider === 'agy-claude') io.log('red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
+      if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');
       let reservation;
       try {
         reservation = io.reserveCalls({ provider: pick.provider, want: 1, dailyCap: caps[pick.provider], now });
@@ -1915,6 +1931,9 @@ export async function speculateRedTeam({
       else {
         deferredByCap = true;
         lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        capped.add(pick.provider);
+        unavailable.push(`${pick.provider}: ${lastReason}`);
+        io.log(`red team: ${lastReason}; retrying fallback provider`);
         available = available.filter((x) => x !== pick.provider);
       }
     }

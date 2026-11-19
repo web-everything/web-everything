@@ -44,11 +44,8 @@ export const PROVIDER_CAP_ENV = Object.freeze({
   'agy-claude': 'WE_REVIEW_SEAT_CAP_AGY_CLAUDE',
   'agy-gemini': 'WE_REVIEW_SEAT_CAP_AGY_GEMINI',
 });
-/** The default cap per provider when its own env var (and, for codex only, the legacy shared one) is unset.
- *  Codex's default is 600; agy-claude
- *  keeps its default of 300. Gemini is off by default under the operator ruling of 2026-10-02:
- *  Gemini too weak for review until Gemini 4; its own env cap can explicitly enable it. */
-export const PROVIDER_CAP_DEFAULT = Object.freeze({ codex: 600, 'agy-claude': 300, 'agy-gemini': 0 });
+/** Standard daily caps: Codex 600, Gemini 0 (operator ruling 2026-10-02; opt-in only), agy-claude 10 (red-team emergency only). */
+export const PROVIDER_CAP_DEFAULT = Object.freeze({ codex: 600, 'agy-claude': 10, 'agy-gemini': 0 });
 /** The daily call cap for ONE provider: its own env var, else (codex only) the legacy shared env var, else its
  *  settings cascade, then its own default. Invalid settings fall through. Reads settings on every call. */
 export function resolveProviderCap(provider, env = process.env, readSettings = readReviewSeatPolicy) {

@@ -21,7 +21,7 @@ describe('R1077 live review seat policy', () => {
     const read = reader({ seatDailyCaps: { codex: -1, 'agy-claude': Number.MAX_SAFE_INTEGER + 1 } },
       { seatDailyCaps: { codex: 17, 'agy-claude': 'invalid' } });
     expect(resolveProviderCap('codex', { WE_REVIEW_SEAT_CAP_CODEX: 'invalid' }, read)).toBe(17);
-    expect(resolveProviderCap('agy-claude', {}, read)).toBe(300);
+    expect(resolveProviderCap('agy-claude', {}, read)).toBe(10);
     expect(resolveProviderCap('unknown', {}, read)).toBe(40);
   });
 
@@ -47,6 +47,21 @@ describe('R1077 live review seat policy', () => {
     expect(resolveRoutingProviderCap('agy-gemini', {}, { enabledProviders: ['agy-gemini'] }, reader())).toBe(300);
     expect(resolveRoutingProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, { enabledProviders: ['agy-gemini'] }, reader())).toBe(0);
     expect(resolveRoutingProviderCap('codex', {}, { disabledProviders: ['codex'] }, reader())).toBe(0);
+  });
+
+  it('resolves Gemini routing caps live without re-enabling an explicit settings zero', () => {
+    const platform = { seatDailyCaps: { 'agy-gemini': 30 } };
+    const tool = { seatDailyCaps: {} };
+    const read = reader(tool, platform);
+    const entry = {};
+    expect(resolveRoutingProviderCap('agy-gemini', {}, {}, reader())).toBe(0);
+    expect(resolveRoutingProviderCap('agy-gemini', {}, entry, read)).toBe(30);
+    tool.seatDailyCaps['agy-gemini'] = 0;
+    expect(resolveRoutingProviderCap('agy-gemini', {}, entry, read)).toBe(0);
+    expect(resolveRoutingProviderCap('agy-gemini', { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '7' }, entry, read)).toBe(7);
+    delete tool.seatDailyCaps['agy-gemini'];
+    platform.seatDailyCaps['agy-gemini'] = 40;
+    expect(resolveRoutingProviderCap('agy-gemini', {}, entry, read)).toBe(40);
   });
 
   it('defaults builder routing on and accepts platform/tool false with provenance', () => {
