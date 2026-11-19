@@ -5,7 +5,6 @@
  * Cascade: standard → Platform Forever preference → tool override, per field.
  * This library returns observations only; callers retain their existing gates.
  */
-import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -57,17 +56,20 @@ export function loadResourcePolicy({ env = process.env, repoRoot, home = homedir
   if (repoRoot === undefined) {
     try { repoRoot = repoRootOf(); } catch (error) { (sources.errors ??= []).push({ source: 'tool', path: null, error: String(error?.message ?? error) }); }
   }
-  const path = env.WE_PLATFORM_PREFERENCES_FILE || env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json');
-  const merged = readPlatformPreferences({ env, operatorPath: join(home, '.claude', 'platform-preferences.json') });
-  for (const error of merged.errors) (sources.errors ??= []).push({ source: 'platform', path, error });
-  let platform = merged.prefs.resourceAdmission;
-  if (platform !== undefined) {
-    if (isValidPolicyLayer(platform)) sources.platform = path;
-    else {
-      (sources.errors ??= []).push({ source: 'platform', path, error: 'invalid resourceAdmission policy' });
-      platform = undefined;
+  const readLayer = (source, path) => {
+    try {
+      const file = JSON.parse(readFileSync(path, 'utf8'));
+      if (file === null || typeof file !== 'object' || Array.isArray(file)) throw Error('expected an object');
+      if (!Object.hasOwn(file, 'resourceAdmission')) return undefined;
+      if (!isValidPolicyLayer(file.resourceAdmission)) throw Error('invalid resourceAdmission policy');
+      sources[source] = path;
+      return file.resourceAdmission;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') (sources.errors ??= []).push({ source, path, error: String(error?.message ?? error) });
+      return undefined;
     }
-  }
+  };
+  const platform = readLayer('platform', env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'));
   if (repoRoot === undefined) return { policy: resolveResourcePolicy({ platform }), sources };
   // The tool layer is the merged scripts/ settings (legacy shared file + scripts/settings/*.json), so a feature file can
   // carry `resourceAdmission` too. The legacy file sits beside the settings dir, so it is derived from it, not named here.

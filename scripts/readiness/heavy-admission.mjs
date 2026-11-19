@@ -442,9 +442,9 @@ function persistPlatformBlock(path, platform, cachePath) {
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
     temp = `${cachePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    writeFileSync(temp, JSON.stringify({ path, heavyAdmission: withoutCachedClientPath(platform) ?? null }), { flag: 'wx', mode: 0o600 });
+    writeFileSync(temp, JSON.stringify({ path, at: Date.now(), heavyAdmission: withoutCachedClientPath(platform) ?? null }), { flag: 'wx', mode: 0o600 });
     renameSync(temp, cachePath);
-  } catch { /* Best effort: settings reads must survive an unwritable cache. */ }
+  } catch { try { unlinkSync(cachePath); } catch { /* never leave an older permissive cache behind a failed refresh */ } }
   finally { if (temp) try { unlinkSync(temp); } catch { /* renamed or unavailable */ } }
 }
 /**
@@ -469,7 +469,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     path = envSelected ? env.WE_PLATFORM_PREFERENCES : join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
   }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const cachePath = join(admissionLockRoot(checkoutRoot, env), 'platform-last-good.json');
+  const cachePath = path ? join(dirname(path), '.heavy-admission-last-good.json') : undefined;
   const key = JSON.stringify([path, cachePath, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
@@ -491,7 +491,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
       reused = true;
     } else try {
       const saved = readPersistedPlatformBlock(cachePath);
-      if (saved.path === path && (saved.heavyAdmission === null || admissionObject(saved.heavyAdmission))) {
+      if (saved.path === path && Number.isFinite(saved.at) && Date.now() - saved.at >= 0 && Date.now() - saved.at <= 30 * 60_000 && (saved.heavyAdmission === null || admissionObject(saved.heavyAdmission))) {
         platform = withoutCachedClientPath(saved.heavyAdmission) ?? undefined;
         reused = true;
       }

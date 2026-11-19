@@ -1,4 +1,3 @@
-import { readPlatformPreferences } from './policy-cascade.mjs';
 import { decideMemoryFloor } from './memory-available.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
@@ -32,6 +31,7 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  */
 import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
 import { readOperatorPolicy } from './policy-cascade.mjs';
+import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,9 +164,11 @@ export function loadResourceGateSettings({ env = process.env, repoRoot, home = h
   let platform; let tool; const errors = [];
   // Resolved here, not as a default param: some harnesses load modules from a non-file URL, where it throws.
   try { repoRoot ??= repoRootOf(); } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const merged = readPlatformPreferences({ env, operatorPath: join(home, '.claude', 'platform-preferences.json') });
-  platform = merged.prefs.resourceGate;
-  errors.push(...merged.errors.map(error => `platform: ${error}`));
+  try {
+    const path = env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json');
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    if (isObj(file) && Object.hasOwn(file, 'resourceGate')) platform = file.resourceGate;
+  } catch (e) { if (e?.code !== 'ENOENT') errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
   if (repoRoot) try {
     const settingsDir = join(repoRoot, 'scripts', 'settings');
     const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });

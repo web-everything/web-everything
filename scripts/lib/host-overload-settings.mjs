@@ -1,9 +1,8 @@
 /** Host overload policy: standard → platform preferences → tool → environment.
  * Invalid/unreadable policy refuses background work. All reads are bounded; sources go to stderr.
  */
-import { PLATFORM_FILE_MAX_BYTES } from './platform-preferences-io.mjs';
 import { openSync, readSync, closeSync } from 'node:fs';
-import { userInfo } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, readPlatformPreferences, readOperatorPolicy } from './policy-cascade.mjs';
@@ -95,14 +94,18 @@ export function resolveHostOverloadSettings({ platform = {}, tool = {}, env = pr
 export function loadHostOverloadSettings({ env = process.env, log, toolPath = join(dirname(fileURLToPath(import.meta.url)), '../settings/host-overload.json') } = {}) {
   const canonical = {};
   const p = readPlatformPreferences({ env, readFile: (path) => {
-    const text = boundedText(path, PLATFORM_FILE_MAX_BYTES);
+    const text = boundedText(path);
     // Preserve sibling leaves across the canonical reader's legacy/default files too.
     // Validate each file before merging, so later overrides cannot conceal invalid policy.
     Object.assign(canonical, flatten(JSON.parse(text), 'platform'));
     return text;
   } });
   if (p.errors.length) throw Error(`host-overload: ${p.errors.join(', ')}`);
+  let legacy = {};
+  // Existing host preferences use this location; the canonical cascade file wins when both are present.
+  try { legacy = flatten(JSON.parse(boundedText(env.WE_PLATFORM_PREFERENCES || join(homedir(), '.claude', 'platform-preferences.json'))), 'platform legacy'); }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
   let tool = {};
   try { tool = JSON.parse(boundedText(toolPath)); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-  return resolveHostOverloadSettings({ platform: expand(canonical), tool, env, log });
+  return resolveHostOverloadSettings({ platform: expand({ ...legacy, ...canonical }), tool, env, log });
 }

@@ -5076,18 +5076,3 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
-
-## Platform settings size and heavy-admission recovery
-
-Platform preferences are a growing settings bag: readers share the 4 MiB bound in
-`scripts/lib/platform-preferences-io.mjs`; ordinary settings use the merged `readPlatformPreferences`
-accessor. Executable tooling selection (`tools.root`) reads only the host preferences file (or its
-explicit environment override), never repository platform layers. `tools-root.test.mjs` pins this
-restriction through both resolution and the re-execution guard.
-Heavy admission retains its host-only source restrictions and persists the parsed `heavyAdmission`
-block in `<admission lock root>/platform-last-good.json` with atomic rename. After a read failure,
-it uses in-process evidence first, then source-matching persisted evidence; `policy.invalid` records
-both the read failure and `last-good used`. With neither, it resolves standard defaults. The saved
-block has no TTL: it represents the last configured policy until a successful parse replaces it.
-Recovery regressions spawn fresh processes in `heavy-admission-platform-fallback.test.mjs`;
-`platform-preferences-readers.test.mjs` pins the shared bound and selected-test remote routing.

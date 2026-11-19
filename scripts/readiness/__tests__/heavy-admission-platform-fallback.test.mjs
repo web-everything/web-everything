@@ -12,7 +12,7 @@ function fixture() {
   const root = mkdtempSync(join(process.env.TMPDIR, 'platform-fallback-')); roots.push(root);
   const path = join(root, 'preferences.json');
   const options = { repoRoot: root, checkoutRoot: root, env: { WE_UNDER_TEST: '1', WE_PLATFORM_PREFERENCES: path, LANE_POOL_ROOT: join(root, 'pool') } };
-  return { root, path, options, cache: join(admissionLockRoot(root, options.env), 'platform-last-good.json') };
+  return { root, path, options, cache: join(root, '.heavy-admission-last-good.json') };
 }
 function freshPolicy(options) {
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
@@ -29,8 +29,8 @@ it('a platform file above 256 KiB retains platform routing and atomically persis
   const policy = loadAdmissionPolicy(f.options);
   expect(policy.settings.remote).toMatchObject(block.remote);
   expect(policy.sources['remote.enabled']).toBe('platform');
-  expect(JSON.parse(readFileSync(f.cache, 'utf8'))).toEqual({ path: f.path, heavyAdmission: block });
-  expect(readdirSync(join(f.cache, '..'))).toEqual(['platform-last-good.json']);
+  expect(JSON.parse(readFileSync(f.cache, 'utf8'))).toMatchObject({ path: f.path, heavyAdmission: block });
+  expect(readdirSync(join(f.cache, '..')).sort()).toEqual(['.heavy-admission-last-good.json', 'preferences.json']);
 });
 it.each(['corrupt', 'oversized', 'non-object'])('a fresh process uses persisted last-good after a %s platform read', failure => {
   const f = fixture();
@@ -61,7 +61,6 @@ it('an unwritable persistence destination never breaks successful platform parsi
   mkdirSync(f.cache);
   writeFileSync(f.path, JSON.stringify({ heavyAdmission: block }));
   expect(loadAdmissionPolicy(f.options).settings.remote.enabled).toBe(true);
-  expect(readdirSync(join(f.cache, '..'))).toEqual(['platform-last-good.json']);
 });
 it.each([0.1, NaN])('mode=always routes remotely regardless of loadPerCore=%s', loadPerCore => {
   expect(decideRemote({ policy: resolveAdmissionPolicy({ platform: block }), loadPerCore, argv: ['npx', 'vitest', 'run', 'a.test.mjs'] })).toMatchObject({ remote: true, reason: expect.stringContaining('mode=always') });
@@ -86,7 +85,7 @@ it('clientPath is selected only from a successful host read, never memory or dis
   const f = fixture();
   f.options.home = f.root; delete f.options.env.WE_PLATFORM_PREFERENCES;
   f.path = join(f.root, '.claude', 'platform-preferences.json');
-  mkdirSync(join(f.root, '.claude'));
+  mkdirSync(join(f.root, '.claude')); f.cache = join(f.root, '.claude', '.heavy-admission-last-good.json');
   let now = Date.now(); vi.spyOn(Date, 'now').mockImplementation(() => now);
   const clientPath = join(f.root, 'remote-exec.mjs');
   writeFileSync(f.path, JSON.stringify({ heavyAdmission: { remote: { ...block.remote, clientPath } } }));
@@ -96,7 +95,7 @@ it('clientPath is selected only from a successful host read, never memory or dis
   writeFileSync(f.path, '{'); now += 11000;
   expect(loadAdmissionPolicy(f.options).settings.remote).toMatchObject({ ...block.remote, clientPath: null });
   // Historical cache files may still contain the executable selection: discard it on read too.
-  writeFileSync(f.cache, JSON.stringify({ path: f.path, heavyAdmission: { remote: { ...block.remote, clientPath } } }));
+  writeFileSync(f.cache, JSON.stringify({ path: f.path, at: Date.now() - 11000, heavyAdmission: { remote: { ...block.remote, clientPath } } }));
   expect(freshPolicy(f.options).settings.remote).toMatchObject({ ...block.remote, clientPath: null });
 });
 it.each(['symlink', 'directory', 'group-writable', 'other-writable', 'foreign-owner'])(
