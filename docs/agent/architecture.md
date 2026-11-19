@@ -148,3 +148,8 @@ When critical or unproductive escalation requires Claude but filtering removed C
 holds instead of continuing on Codex. An invalid AI overlay makes the fixer-ladder rung unavailable
 and surfaces its error. Routing tests consume shipped defaults; injected capacity observations or
 the capacity enable switch isolate quota-dependent and legacy paths without replacing route data.
+`readTick` accepts `routingOptions` for hermetic dispatch tests: supply the routing policy,
+repo settings, isolated preferences environment, capacity snapshot, quota reader and decision
+recorder together. A Claude-only launcher fixture must not consume live Codex quota: auto
+capacity can otherwise select Codex and make the fixture refuse at launch. Omitted options
+retain production settings, host observations and decision persistence.

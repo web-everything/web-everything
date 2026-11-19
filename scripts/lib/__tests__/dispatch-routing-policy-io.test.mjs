@@ -91,3 +91,24 @@ it('pinned routes still refuse an unavailable Claude launcher', () => {
   expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy: DEFAULT_ROUTING_POLICY,
     availability: { claude: 'operator hold' } })).toThrow(/no available route/);
 });
+
+it.each(['fix', 'ci-heal'])('%s dispatch injects settings, quota, capacity and decision persistence', kind => {
+  const f = fixture();
+  const now = Date.parse('2026-11-19T12:00:00Z');
+  const quota = vi.fn(() => null), record = vi.fn();
+  const options = { env: { WE_PLATFORM_PREFERENCES_FILE: join(dirs.at(-1), 'absent.json') },
+    repo: { routing: { builder: 'auto' } }, routingPolicy: f.reader(), now, quota, record,
+    scorecards: [], capacity: [{ provider: 'claude', health: 1, known: false, held: false, windows: [] }] };
+  const dispatch = { kind, scopePaths: ['we:scripts/example.mjs'], size: 3 };
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'routed', executed: 'claude' });
+  expect(quota).toHaveBeenCalledTimes(1);
+  expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ reason: 'all-readers-unknown' }), expect.any(Object));
+
+  options.capacity = [{ provider: 'codex', health: 1, known: true, held: false,
+    windows: [{ name: 'weekly', usedPercent: 31, resetsAt: now + 24 * 3600000 }] }];
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'routed', executed: 'codex' });
+  expect(record).toHaveBeenLastCalledWith(expect.objectContaining({ reason: 'capacity-score' }), expect.any(Object));
+
+  options.capacity[0].held = true;
+  expect(resolveDispatchRoute(dispatch, options)).toMatchObject({ outcome: 'refused', refusal: expect.stringContaining('no eligible capacity') });
+});

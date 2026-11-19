@@ -92,7 +92,9 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   let routingPolicy = options.routingPolicy ?? readRoutingPolicy();
   // Scoped explicit routes are policy pins; capacity must never replace or refuse them.
   const pinned = taskType && routingPolicy.operations[routeKey]?.provider;
-  const builder = !pinned && BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity, routeKey, queuedDemand: options.queuedDemand ?? options.queuedDispatches?.filter(d => BUILD_KINDS.includes(d.kind)).length ?? 1, demandRatePerHour: options.demandRatePerHour }) : null;
+  const builder = !pinned && BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity, routeKey, queuedDemand: options.queuedDemand ?? options.queuedDispatches?.filter(d => BUILD_KINDS.includes(d.kind)).length ?? 1, demandRatePerHour: options.demandRatePerHour,
+    repo: options.repo, declared: options.declared, quota: options.quota, record: options.record,
+  }) : null;
   if (builder?.decision?.provider === null) return { outcome: 'refused', refusal: 'no eligible capacity; wait for quota reset or clear provider hold', auditTrail: [] };
   for (const input of builder?.decision?.inputs ?? []) {
     if (['held', 'exhausted'].includes(input.label)) availability[input.provider.startsWith('agy-') ? 'antigravity' : input.provider] = `capacity: ${input.label}`;
