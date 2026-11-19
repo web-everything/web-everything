@@ -209,6 +209,7 @@
     "scripts/conveyor/soak/breaks/review-dispatch-stalls-on-unrelated-clone-lag.mjs",
     "scripts/conveyor/soak/breaks/review-held-pr-redispatched-by-advisory-fix-branch.mjs",
     "scripts/conveyor/soak/breaks/review-human-red-ci-never-healed.mjs",
+    "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.mjs",
     "scripts/conveyor/soak/breaks/ruling-needed-pr-waits-silently.mjs",
     "scripts/conveyor/soak/breaks/runner-shutdown-abandons-passes.mjs",
     "scripts/conveyor/soak/breaks/runner-snapshot-blocks-deadlines.mjs",

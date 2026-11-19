@@ -81,17 +81,17 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
-    "fingerprint": "module-sha256-v2:d0d02676b9a62443cb789cdd63dc13df8086f80c902a2f5bb98e4fb89dc9f126",
+    "fingerprint": "module-sha256-v2:4a3b12dbcc68e5464321cb1b0304d76a88a4d3d46fb0c7f66911e1fe85799f35",
     "function": "launchAgent",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:220a0709c824628c068ea98f74bbbd2260f1f618d29ca89005892929db254720",
+    "moduleFingerprint": "module-sha256-v2:5fa911a94cdb6b27951545ade75587d385764da6e604012e8293f45c036ed538",
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
     "fingerprint": "module-sha256-v2:4db8d1022792a74a662ef204b1775ac870ad6a31248f940bcbeb48415a21d1cc",
     "function": "launchAgentToCompletion",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:220a0709c824628c068ea98f74bbbd2260f1f618d29ca89005892929db254720",
+    "moduleFingerprint": "module-sha256-v2:5fa911a94cdb6b27951545ade75587d385764da6e604012e8293f45c036ed538",
   },
   {
     "file": "scripts/lib/claude-sessions.mjs",
@@ -161,7 +161,7 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
     "fingerprint": "module-sha256-v2:c57e85354a136adb5cc8e2607f16878738ca1fa4010235590b139b0bd01d6d93",
     "function": "runConvergeEdit",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:d62922eeeafda4f323250f21ebeb134d6c588b3d29b9e102a9668c3361389e51",
+    "moduleFingerprint": "module-sha256-v2:eba6cc91670e9f1edc62cf7db67e69f835c22c0224202ca0d59ff4e34424a90a",
   },
   {
     "file": "scripts/operations/dispatch-abort.mjs",

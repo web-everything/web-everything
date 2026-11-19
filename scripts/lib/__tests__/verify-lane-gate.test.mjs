@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
 import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
+import { localChangedSet } from '../verify-lane-gate.mjs';
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -45,6 +46,53 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } =
 
 /** Factor 1 = vitest's own timeouts, i.e. the exact pre-WE_VERIFY_TEST_TIMEOUT_FACTOR command. */
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
+
+it('R984 preserves whitespace in tracked, deleted and untracked changed-file names', () => {
+  const result = localChangedSet({ runGit: fakeGit(['notes.md ', ' leading.md'],
+    { deleted: ['deleted.md '], untracked: [' new.md '] }) });
+  expect(result.changedFiles).toEqual([' leading.md', ' new.md ', 'notes.md ']);
+  expect(result.deletedFiles).toEqual(['deleted.md ']);
+  expect(result.untrackedFiles).toEqual([' new.md ']);
+});
+
+// PR 7008 red team: Git C-quotes non-ASCII, quote, backslash and control-byte paths by default
+// (core.quotePath). Every changed-file reader must hand callers the real filename.
+it('decodes Git-quoted tracked, deleted and untracked changed-file names', () => {
+  const result = localChangedSet({ runGit: fakeGit(['"docs/caf\\303\\251.md"', '"a\\"b\\\\c.md"'],
+    { deleted: ['"gone\\tfile.md"'], untracked: ['"new\\nline.md"', 'plain.md'] }) });
+  expect(result.changedFiles).toEqual(['a"b\\c.md', 'docs/café.md', 'new\nline.md', 'plain.md']);
+  expect(result.deletedFiles).toEqual(['gone\tfile.md']);
+  expect(result.untrackedFiles).toEqual(['new\nline.md', 'plain.md']);
+});
+
+it('reads real Git output for Unicode changed files as paths that exist on disk', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quoted-path-'));
+  try {
+    const git = (args) => execSync(`git ${args.map((a) => `'${a}'`).join(' ')}`, { cwd: dir, encoding: 'utf8' });
+    git(['init', '-q']);
+    git(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'base']);
+    git(['config', 'core.quotePath', 'true']);
+    mkdirSync(join(dir, 'docs'));
+    writeFileSync(join(dir, 'docs', 'café.md'), 'neutral\n');
+    writeFileSync(join(dir, 'tracked-é.md'), 'one\n');
+    git(['add', 'tracked-é.md']);
+    const result = localChangedSet({ base: 'HEAD', runGit: git });
+    expect(result.changedFiles.map((f) => f.normalize('NFC'))).toEqual(['docs/café.md', 'tracked-é.md']);
+    for (const file of result.changedFiles) expect(readFileSync(join(dir, file), 'utf8')).toBeTruthy();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('classifies a Git-quoted Unicode backlog card by its real path', () => {
+  const runGit = (args) => {
+    if (args[0] === 'merge-base') return 'deadbeef';
+    if (args[0] === 'diff') return '"backlog/100-caf\\303\\251.md"\n';
+    if (args[0] === 'ls-files') return '';
+    throw new Error(`unexpected git invocation in test: ${args.join(' ')}`);
+  };
+  expect(localDiffIsCardOnly({ runGit })).toBe(true);
+});
 
 describe('#4540 — untracked lane scratch selection', () => {
   it('filters scratch before both related targets and reference discovery, preserving standards inputs', () => {

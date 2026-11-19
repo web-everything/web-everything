@@ -21,7 +21,7 @@
  * for a reason unrelated to "the gate found real findings" — most plausibly a crash under real memory/CPU
  * contention (e.g. a V8 OOM abort), which exits non-zero with whatever partial stdout had been written so
  * far, no signal involved. Reproducing that precisely proved elusive (ruled out: pure CPU oversubscription
- * up to 16 busy-loops/12 cores, and up to 32-way concurrent real subprocess spawning — both 100% clean), but
+ * up to 16 busy-loops against the host core count, and up to 32-way concurrent real subprocess spawning — both 100% clean), but
  * the FIX does not need the exact trigger pinned down: validate the SHAPE of whatever came back, on every
  * attempt (success or caught non-zero exit alike), and retry when it's invalid — this catches truncation
  * from ANY mechanism (signal, crash, or something else entirely), not just the one first suspected.

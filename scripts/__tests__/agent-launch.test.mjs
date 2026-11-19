@@ -1,8 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { registerAgentLaunchTestPrimitive, AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
+import { AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
 import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
+import { registerAgentLaunchTestPrimitive } from '../lib/agent-launch.test-seam.mjs';
+
+// Module substitution happens before imports; production exports no mutable registry.
+vi.mock('../lib/agent-launch.test-seam.mjs', () => {
+  const primitives = new WeakSet();
+  return {
+    isAgentLaunchTestPrimitive: primitive => primitives.has(primitive),
+    registerAgentLaunchTestPrimitive: primitive => { primitives.add(primitive); return primitive; },
+  };
+});
 
 
 const testPrimitive = (...args) => registerAgentLaunchTestPrimitive(vi.fn(...args));
@@ -11,6 +21,22 @@ const SID = '12345678-1234-4234-8234-123456789abc';
 
 // Audit probes use the real boundary with an injected primitive, never an actual agent process.
 it.each([
+  { name: 'R37.24 real fork cannot execute unrelated JavaScript with fresh Codex evidence', realPrimitive: 'fork',
+    options: { execPath: process.execPath, execArgv: ['-e', 'process.exit(0)'], stdio: 'ignore' },
+    refused: true, reason: 'unapproved primitive identity' },
+  ...['exec', 'execSync'].map(realPrimitive => ({
+    name: `R37.24 real ${realPrimitive} refuses array-shaped options`, realPrimitive,
+    command: 'codex exec -', argv: Object.assign([], { env: { NODE_OPTIONS: '--import=untrusted' } }),
+    refused: true, reason: 'execution options must be an object',
+  })),
+  { name: 'R37.25 ordinary Node VITEST=true cannot register a closure ignoring validated arguments', spoofVitest: true },
+  ...['execPath', 'execArgv', 'shell'].flatMap(key => [false, true].map(omitArgv => ({
+    name: `R37.24 refuses execution option ${key} with ${omitArgv ? 'omitted' : 'array'} argv`, omitArgv,
+    options: { [key]: key === 'execArgv' ? [] : process.execPath }, refused: true,
+  }))),
+  ...['NODE_OPTIONS', 'NODE_PATH', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'BASH_ENV', 'ENV'].map(key => ({
+    name: `R37.24 refuses loader environment ${key}`, options: { env: { [key]: 'untrusted' } }, refused: true,
+  })),
   { name: 'R37.23 unchecked closure with fresh evidence refuses', opaque: 'closure', command: 'claude', argv: ['-p', 'hello'], refused: true, reason: 'unapproved primitive identity' },
   { name: 'R37.23 registered primitive with fresh evidence positive control', command: 'claude', argv: ['-p', 'hello'] },
   ...['exec', 'e'].flatMap(alias => ['array', 'string', 'argv-string', 'shell'].flatMap(form => {
@@ -167,16 +193,29 @@ it.each([
     mode: 'claude-print', argv: ['--system-prompt', '--continue', '--model', '-c'] },
   { name: 'R37.14 Codex -c remains a value option control', argv: ['-c', 'model=fixture', 'exec', '-'] },
 ])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
-  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText }) => {
+  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText, realPrimitive, options: suppliedOptions, spoofVitest, omitArgv }) => {
+  if (spoofVitest) {
+    const result = childProcess.spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import {launchAgent} from './scripts/lib/agent-launch.mjs';
+      import {registerAgentLaunchTestPrimitive} from './scripts/lib/agent-launch.test-seam.mjs';
+      const primitive = registerAgentLaunchTestPrimitive(() => console.log('BYPASS_EXECUTED'));
+      launchAgent({mode:'codex-exec', resumeId:null}, primitive, 'codex', ['exec','-']);
+    `], { cwd: process.cwd(), env: { ...process.env, VITEST: 'true', NODE_ENV: 'test' },
+      encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('requires import-time test module substitution');
+    expect(result.stdout).not.toContain('BYPASS_EXECUTED');
+    return;
+  }
   if (argvText !== undefined) argv = argvText;
   const primitive = testPrimitive(), original = Array.isArray(argv) ? [...argv] : argv, findings = source ? findAgentLaunches({ 'scripts/r37-audit.mjs': source }) : [];
-  let invoke = primitive;
+  let invoke = realPrimitive ? childProcess[realPrimitive] : primitive;
   if (opaque === 'preset' || opaque === 'renamed') invoke = primitive.bind(null, 'claude', ['--resume', 'other-id']);
   if (opaque === 'renamed') Object.defineProperty(invoke, 'name', { value: 'start' });
   if (opaque === 'receiver') invoke = Function.prototype.call.bind(primitive, null, 'claude', ['--resume', 'other-id']);
   if (opaque === 'closure') invoke = () => primitive('claude', ['--resume', 'unchecked-id']);
   if (opaque === 'proxy') invoke = new Proxy(primitive, { apply(target) { return target('claude', ['--resume', 'other-id']); } });
-  const options = shell || mutateShell ? { shell: shell ?? false } : undefined;
+  const options = suppliedOptions ?? (shell || mutateShell ? { shell: shell ?? false } : undefined);
   const execute = () => {
     if (findings.length) throw new Error('structural launch gate refused');
     return launchAgent({ mode, resumeId, log() {},
@@ -188,7 +227,7 @@ it.each([
         if (mutateShell) options.shell = true;
         return true;
       } } : {}),
-    }, invoke, ...(noArgs ? [] : closureArg ? [() => primitive('claude', ['--resume', 'unchecked-id'])] : [command, argv, ...(options ? [options] : [])]));
+    }, invoke, ...(noArgs ? [] : closureArg ? [() => primitive('claude', ['--resume', 'unchecked-id'])] : [command, omitArgv ? undefined : argv, ...(options ? [options] : [])]));
   };
   if (refused) {
     if (source) expect(findings).toMatchObject([{ kind: 'module', reason: expect.stringContaining('outside approved boundary') }]);
@@ -209,20 +248,20 @@ it.each(['exec', 'e'])('R37.22 standalone helper canonicalises %s', alias => {
 });
 
 describe('launch refusal', () => {
-  it.each(['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync', 'fork'])
+  it.each(['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync'])
   ('R37.23 real %s identity reaches the guard positive control', name => {
     const log = vi.fn();
     expect(() => launchAgent({ mode: 'codex-exec', resumeId: null, log, launchGuard: () => false },
-      childProcess[name], 'codex', ['exec', '-'])).toThrow('launchGuard returned false');
+      childProcess[name], ...(name === 'exec' || name === 'execSync' ? ['codex exec -'] : ['codex', ['exec', '-']]))).toThrow('launchGuard returned false');
   });
   it('R37.23 registration is refused outside Vitest, even with NODE_ENV=test', () => {
     const env = { ...process.env, NODE_ENV: 'test' };
     delete env.VITEST;
     const result = childProcess.spawnSync(process.execPath, ['--input-type=module', '-e',
-      "import {registerAgentLaunchTestPrimitive} from './scripts/lib/agent-launch.mjs'; registerAgentLaunchTestPrimitive(()=>{});"],
+      "import {registerAgentLaunchTestPrimitive} from './scripts/lib/agent-launch.test-seam.mjs'; registerAgentLaunchTestPrimitive(()=>{});"],
       { cwd: process.cwd(), env, encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('registration requires Vitest');
+    expect(result.stderr).toContain('registration requires import-time test module substitution');
   });
 
   it.each([
@@ -293,8 +332,29 @@ describe('launch refusal', () => {
 });
 
 describe('transparent execution', () => {
+  it('R37.24 snapshots safe options and environment before a guard can redirect execution', () => {
+    const primitive = testPrimitive(), options = { env: { PATH: 'fixture-bin', NODE_OPTIONS: '' } };
+    launchAgent({ mode: 'codex-exec', resumeId: null, launchGuard() {
+      options.execPath = process.execPath;
+      options.execArgv = ['-e', 'process.exit(0)'];
+      options.env.NODE_OPTIONS = '--import=untrusted';
+      return true;
+    } }, primitive, 'codex', ['exec', '-'], options);
+    expect(primitive).toHaveBeenCalledWith('codex', ['exec', '-'], { env: { PATH: 'fixture-bin', NODE_OPTIONS: '' } });
+  });
+  it.each(['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync'])
+  ('R37.24 real %s refuses redirection before the guard', name => {
+    const guard = vi.fn(() => false);
+    const invocation = name === 'exec' || name === 'execSync'
+      ? ['codex exec -', { shell: process.execPath }]
+      : ['codex', ['exec', '-'], { env: { LD_PRELOAD: 'untrusted' } }];
+    expect(() => launchAgent({ mode: 'codex-exec', resumeId: null, log() {}, launchGuard: guard },
+      childProcess[name], ...invocation)).toThrow('execution redirection');
+    expect(guard).not.toHaveBeenCalled();
+  });
+
   it.each(AGENT_LAUNCH_MODES.flatMap(mode => ['spawn', 'exec'].map(kind => [mode, kind])))
-  ('preserves argv, env, cwd, options, return identity for %s via %s', (mode, kind) => {
+  ('preserves argv identity, option values and return identity for %s via %s', (mode, kind) => {
     const argv = mode === 'codex-exec-resume' ? ['exec', 'resume', SID, 'literal $() `text`', '\n']
       : mode === 'claude-resume' ? ['--resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
     const env = { PATH: 'fixture-bin', TOKEN: 'fixture-token' };
@@ -303,7 +363,8 @@ describe('transparent execution', () => {
     expect(launchAgent({ mode, resumeId: mode.endsWith('-resume') ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
     expect(primitive.mock.calls).toEqual([[mode.startsWith('codex') ? 'codex' : 'claude', argv, options]]);
     expect(primitive.mock.calls[0][1]).toBe(argv);
-    expect(primitive.mock.calls[0][2]).toBe(options);
+    expect(primitive.mock.calls[0][2]).not.toBe(options);
+    expect(primitive.mock.calls[0][2].env).not.toBe(env);
     expect(options.env).toBe(env);
   });
   it('returns no resume id for fresh launches and preserves a single native id unchanged', () => {
@@ -508,7 +569,8 @@ describe('completion wrapper', () => {
     expect(spawnFn).toHaveBeenCalledWith('claude', argv,
       { cwd: 'fixture-lane', env, stdio: ['ignore', 'pipe', 'pipe'] });
     expect(spawnFn.mock.calls[0][1]).toBe(argv);
-    expect(spawnFn.mock.calls[0][2].env).toBe(env);
+    expect(spawnFn.mock.calls[0][2].env).toEqual(env);
+    expect(spawnFn.mock.calls[0][2].env).not.toBe(env);
     expect(child.kill).not.toHaveBeenCalled();
   });
   it('refuses a denied guard with its logged reason before injected spawn', async () => {

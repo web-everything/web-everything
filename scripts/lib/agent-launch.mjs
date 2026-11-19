@@ -3,20 +3,42 @@
  * Normalise command evidence once; only validated argv may reach the injected primitive.
  * Inject the existing primitive so synchronous returns, promises and child handles stay intact.
  */
-import { spawn, spawnSync, exec, execFile, execSync, execFileSync, fork } from 'node:child_process';
+import { spawn, spawnSync, exec, execFile, execSync, execFileSync } from 'node:child_process';
 import { spawnToCompletion } from './spawn-to-completion.mjs';
+import { isAgentLaunchTestPrimitive } from './agent-launch.test-seam.mjs';
 
 // Identity, never name/source text: closures, bound functions and proxies can discard argv.
-const approvedPrimitives = new Set([spawn, spawnSync, exec, execFile, execSync, execFileSync, fork]);
-const testPrimitives = new WeakSet();
+const approvedPrimitives = new Set([spawn, spawnSync, exec, execFile, execSync, execFileSync]);
 
-/** Explicit hermetic test seam; never enable registration in an ordinary Node process. */
-export function registerAgentLaunchTestPrimitive(primitive) {
-  if (process.env.VITEST !== 'true' || typeof primitive !== 'function') {
-    throw new TypeError('agent-launch test primitive registration requires Vitest and a function');
+// No caller needs Node's fork: its JavaScript module/execArgv grammar is not agent argv.
+// Keep execution-redirection options closed for every remaining primitive, too.
+function snapshotInvocation(args, primitive) {
+  const forwarded = [...args];
+  const stringCommand = primitive === exec || primitive === execSync;
+  // Node supports options in either position, including spawn(file, undefined, options).
+  for (let index = 1; index < args.length; index++) {
+    const options = args[index];
+    if (!options || typeof options !== 'object') continue;
+    if (Array.isArray(options)) {
+      if (index === 1 && !stringCommand) continue;
+      throw new SyntaxError('execution options must be an object, never an argv array; use literal argv with spawn or execFile');
+    }
+    const snapshot = { ...options };
+    if ('execPath' in options || 'execArgv' in options || (snapshot.shell !== undefined && snapshot.shell !== false)) {
+      throw new SyntaxError('execution redirection options are unsupported; omit execPath, execArgv and shell');
+    }
+    if (snapshot.env != null) {
+      snapshot.env = { ...snapshot.env };
+      for (const [key, value] of Object.entries(snapshot.env)) {
+        if (/^(?:NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|BASH_ENV|ENV)$/i.test(key)
+          && value !== undefined && value !== null && value !== '') {
+          throw new SyntaxError('execution redirection environment is unsupported; remove loader and shell startup overrides');
+        }
+      }
+    }
+    forwarded[index] = snapshot;
   }
-  testPrimitives.add(primitive);
-  return primitive;
+  return forwarded;
 }
 
 // Codex CLI help aliases: exec (e), review, resume, fork. Canonicalise before grammar checks.
@@ -283,14 +305,15 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
   if (!Object.hasOwn(descriptor, 'resumeId')) refuse('resumeId key is required', descriptor, log);
   if (typeof primitive !== 'function') refuse('execution primitive is required', descriptor, log);
-  if (!approvedPrimitives.has(primitive) && !testPrimitives.has(primitive)) {
+  if (!approvedPrimitives.has(primitive) && !isAgentLaunchTestPrimitive(primitive)) {
     refuse('unapproved primitive identity; use an approved unbound primitive and literal argv', descriptor, log);
   }
+  const callerArgs = args;
   let normalised;
-  try { normalised = normaliseInvocation(args); }
+  try { args = snapshotInvocation(args, primitive); normalised = normaliseInvocation(args); }
   catch (cause) {
     refuse('cannot parse native resume id; use literal argv and a plain resume id with an unbound primitive'
-      + (cause.message.startsWith('implicit continuation') ? `; ${cause.message}` : ''), descriptor, log, cause);
+      + `; ${cause.message}`, descriptor, log, cause);
   }
   if (!normalised.length) refuse('missing invocation evidence; use explicit literal argv', descriptor, log);
   const nativeIds = normalised.flatMap(command => command.resumeIds);
@@ -299,7 +322,6 @@ export function launchAgent(descriptor, primitive, ...args) {
   }
   // Snapshot the validated words before the guard can mutate a captured argv reference.
   const validatedArgv = Array.isArray(args[1]) ? [...args[1]] : args[1];
-  const validatedShell = args[2]?.shell;
   // A resume flag with no value reads as an empty native id: that is a MISSING id, never one an empty/blank
   // descriptor resumeId can "equal". Require plain literal ids: never shell expansions or metacharacters.
   if (((descriptor.resumeId != null || descriptor.mode.endsWith('-resume')) && nativeIds.length === 0)
@@ -322,7 +344,8 @@ export function launchAgent(descriptor, primitive, ...args) {
     }
     if (allowed !== true && allowed !== undefined) refuse('launchGuard must return true or undefined', descriptor, log);
   }
-  if (args[2]?.shell !== validatedShell || (Array.isArray(validatedArgv) && (args[1].length !== validatedArgv.length
+  if (callerArgs.some((arg, i) => arg && typeof arg === 'object' && !Array.isArray(arg) && arg.shell !== args[i]?.shell)
+    || (Array.isArray(validatedArgv) && (args[1].length !== validatedArgv.length
     || validatedArgv.some((word, i) => word !== args[1][i])))) {
     refuse('launchGuard changed validated argv; use literal argv and a plain resume id', descriptor, log);
   }

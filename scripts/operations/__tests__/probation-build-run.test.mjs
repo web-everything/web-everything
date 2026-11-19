@@ -12,7 +12,7 @@
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { symlinkSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { symlinkSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -1502,6 +1502,8 @@ describe('Findings publication regressions', () => {
     const dir = mkdtempSync(join(tmpdir(), 'findings-standards-'));
     try {
       cloneFixture(resolve('.'), dir);
+      // R984: exercise the checker under review, including uncommitted fixes in this checkout.
+      copyFileSync(resolve('scripts/check-standards.mjs'), join(dir, 'scripts/check-standards.mjs'));
       // A CI checkout has no local `main` for the shared clone to track, so `origin/main` is missing and the
       // backlog scope guards refuse to run; pin it to HEAD so the changed set is just this test's edit.
       try { execFileSync('git', ['-C', dir, 'rev-parse', '--verify', '-q', 'origin/main'], { stdio: 'ignore' }); }

@@ -111,7 +111,7 @@ describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
     expect(new Set(routes.map((r) => r.provider)).size).toBe(3);
     // The Gemini seat pins high effort in the model id; launchers omit the separate flag.
     expect(REVIEW_SEAT_MODELS['agy-gemini'].effort).toBe('high');
-    expect(REVIEW_SEAT_MODELS['agy-gemini'].model).toBe('gemini-4-argon-high');
+    expect(REVIEW_SEAT_MODELS['agy-gemini'].model).toBe('gemini-4-carbon-high');
   });
 
   it('routes every advisory lens review-pr does not already seat off-Claude, and leaves Claude\'s mandatory seats alone', () => {
@@ -128,7 +128,7 @@ describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
     expect(routes.length).toBeGreaterThan(0);
     for (const route of [pin, ...routes]) {
       const argv = buildAgyDirectTaskArgv({ ...route, review: true });
-      expect(argv).toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+      expect(argv).toEqual(expect.arrayContaining(['--model', 'gemini-4-carbon-high']));
       expect(argv).not.toContain('--effort');
     }
   });
@@ -386,7 +386,7 @@ describe('#4194 the direct-task scripts in --review mode', () => {
     expect(argvs).toHaveLength(2);
     for (const a of argvs) {
       expect(a).not.toContain('--dangerously-skip-permissions');
-      expect(a).toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+      expect(a).toEqual(expect.arrayContaining(['--model', 'gemini-4-carbon-high']));
       expect(a).not.toContain('--effort');
     }
   });

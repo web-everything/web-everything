@@ -296,8 +296,8 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
   // process through a module map, across processes through a `.finish-<run>` stamp (newest wins). A missing, unreadable
   // or future-dated stamp is ignored: it can only allow one extra attempt, never suppress the retry for good.
   let shared = sharedFinishState.get(root);
-  if (!shared) { shared = {attempts: new Map(), logged: new Set(), finished: new Set()}; sharedFinishState.set(root, shared); }
-  const {attempts: finishAttempts, logged: finishFailuresLogged, finished: finishedRuns} = shared;
+  if (!shared) { shared = {attempts: new Map(), logged: new Set(), finished: new Set(), cancel: new Set()}; sharedFinishState.set(root, shared); }
+  const {attempts: finishAttempts, logged: finishFailuresLogged, finished: finishedRuns, cancel: cancelRuns} = shared;
   // Bounded: the oldest entries go first (insertion order); forgetting one can only allow one extra throttled attempt.
   const trim = store => { while (store.size > FINISH_STATE_MAX) store.delete(store.keys().next().value); };
   const finishStamp = run => join(root, `.finish-${run}`);
@@ -384,7 +384,7 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
     async step(getTelemetry, now = clock()) {
       let names;
       try { names = fs.readdirSync(root); } catch { return []; }
-      const dead = [], reaped = [], held = [];
+      const dead = [], reaped = [], held = [], boundRuns = new Map();
       let finishedStillActive = false;
       for (const name of names) {
         const m = NAME.exec(name);
@@ -394,6 +394,10 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
         try { ({mtimeMs, ino} = fs.statSync(file)); } catch { continue; }
         const marker = readMarker(file), index = Number(m[1]);
         if (marker.unreadable) continue;
+        if (marker.run && marker.owner !== undefined && host !== undefined && marker.host === host) { // only this Forge host's own markers claim runs
+          if (!boundRuns.has(marker.run)) boundRuns.set(marker.run, new Set());
+          boundRuns.get(marker.run).add(marker.owner);
+        }
         const gone = ownerGone(root, index, file, liveness, selfPid);
         // Only an old marker whose owner is provably gone is "stuck": a live owner is a long-running job, not a leak.
         const trace = {pid: marker.pid, caller: marker.caller ?? null, lane: marker.lane ?? null, pr: marker.pr ?? null, exit: marker.exit ?? 'no-exit-record'};
@@ -440,13 +444,25 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
                   if (last !== undefined && decisionAt - last < FINISH_RETRY_MS) continue;
                   finishAttempts.delete(entry.run); finishAttempts.set(entry.run, decisionAt); trim(finishAttempts);
                   try { writeFileSync(finishStamp(entry.run), JSON.stringify({at: decisionAt}), {mode: 0o600}); } catch { /* the in-memory time still throttles */ }
+                  const cancel = cancelRuns.has(finishKey);
                   let timer;
                   try {
-                    await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce})),
-                      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), FINISH_TIMEOUT_MS); })]);
+                    await Promise.race([Promise.resolve().then(() => finishRun({run: entry.run, nonce: entry.nonce, ...(cancel ? {cancel: true} : {})})),
+                      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('finish timeout')), cancel ? 100_000 : FINISH_TIMEOUT_MS); })]);
                     finishedRuns.add(finishKey); trim(finishedRuns);
                     // The stamp stays until the marker is released: another process's lagging sample may still list the run.
-                  } catch {
+                  } catch (error) {
+                    const reason = `${error?.stderr ?? ''} ${error?.message ?? error}`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').trim();
+                    if (cancel) {
+                      raise(`slot-uid-unprovable-${entry.index}`, {slot: entry.index, run: entry.run, reason: reason.slice(0, 240),
+                        action: 'operator: stop forge uid forge-exec-<n> and remove its worker-active executing lock'}, decisionAt);
+                      if (!finishFailuresLogged.has(finishKey)) {
+                        finishFailuresLogged.add(finishKey); trim(finishFailuresLogged);
+                        log(`heavy-admission: slot-${entry.index} UID cleanup unprovable; marker retained; operator cleanup required\n`);
+                      }
+                    } else if (/execution unconfirmed/i.test(reason)) {
+                      cancelRuns.add(finishKey); trim(cancelRuns);
+                    }
                     if (!finishFailuresLogged.has(entry.run)) {
                       finishFailuresLogged.add(entry.run); trim(finishFailuresLogged);
                       log(`heavy-admission: finish failed for ${entry.run}; marker retained; retry after ${FINISH_RETRY_MS}ms (operator cleanup if persistent)\n`);
@@ -478,8 +494,11 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
               }
             } else {
               const at = entry.at ?? entry.mtimeMs;
-              if (!evidence.complete && ((!runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, decisionAt)
-                && !boundedOrphan(telemetry, evidence, sampledAt, at, diedBy)) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
+              // This entry is run-less, so every bound run belongs to another marker.
+              // A run also bound by a marker of the SAME owner may be this client's own multi-slot run: it never counts as foreign.
+              const foreign = new Set([...boundRuns].filter(([, owners]) => entry.owner !== undefined && !owners.has(entry.owner)).map(([run]) => run));
+              if (!evidence.complete && ((!runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, decisionAt, foreign)
+                && !boundedOrphan(telemetry, evidence, sampledAt, at, diedBy, foreign)) || maybeSurvivingDescendants(telemetry, at, diedBy))) continue;
               if (maybeOwnsInflight(telemetry, at, diedBy)) continue;
             }
             // Claim whatever is at the marker name with one atomic rename, THEN prove it is the file we judged. A replacement
@@ -511,13 +530,14 @@ export function createMarkerReaper({root, host, clock = Date.now, liveness = pro
 // The dead client never issues `run`, so only a prepared run can exist. If the late-start case occurs, at most one
 // extra concurrent Forge run lasts until completion, within Forge's own cap. No run is killed and no result is lost:
 // the owner is dead and cannot collect one. This grace is an operator ruling, not an enforced remote start deadline.
-function runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, now) {
+function runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, now, boundRuns) {
   if (evidence.byIds !== true || !Number.isFinite(entry.at)
     || now - entry.mtimeMs < RUNLESS_DEAD_GRACE_MS || sampledAt - entry.at < RUNLESS_DEAD_GRACE_MS
     || sampledAt - diedBy < RUNLESS_DEAD_GRACE_MS
     || now - sampledAt < -CLOCK_SKEW_MS || now - sampledAt > 30_000) return false;
   const starts = new Map(telemetry.recent.map(item => [item.runId, Date.parse(item.startedAtET)]));
   return telemetry.activeRunIds.every(run => {
+    if (boundRuns.has(run)) return true;
     const started = starts.get(run);
     return Number.isFinite(started) && (started < entry.at - CLOCK_SKEW_MS || started > diedBy + CLOCK_SKEW_MS);
   });
@@ -527,13 +547,14 @@ function runlessDeadGrace(telemetry, evidence, sampledAt, entry, diedBy, now) {
 // so count-only proof leaked the marker for good (a dozen of them walled off the cap while Forge sat idle). Owner death
 // does not enforce a remote start deadline, and a 97/254 supervisor failure can leave descendants past the run ceiling.
 // Its receipt may already have fallen out of `recent`, even before this reaper first observes the marker.
-// Past the ceiling plus skew, release only if receipts place EVERY authoritative active run outside the ownership
-// window. Missing receipts fail closed; no remembered failure state or sidecar is needed across reaper restarts.
+// Past the ceiling plus skew, release only if another marker owns each authoritative active run or receipts place it
+// outside the ownership window. Missing receipts for unclaimed runs fail closed.
 export const ORPHAN_RUN_BOUND_MS = 120 * 60_000; // = heavy-admission DEFAULT_ADMISSION_CEILING_MS
-function boundedOrphan(telemetry, evidence, sampledAt, at, diedBy) {
+function boundedOrphan(telemetry, evidence, sampledAt, at, diedBy, boundRuns) {
   if (evidence.byIds !== true || sampledAt - diedBy <= ORPHAN_RUN_BOUND_MS + CLOCK_SKEW_MS) return false;
   const starts = new Map(telemetry.recent.map(item => [item.runId, Date.parse(item.startedAtET)]));
   return telemetry.activeRunIds.every(run => {
+    if (boundRuns.has(run)) return true;
     const started = starts.get(run);
     return Number.isFinite(started) && (started < at - CLOCK_SKEW_MS || started > diedBy + CLOCK_SKEW_MS);
   });
