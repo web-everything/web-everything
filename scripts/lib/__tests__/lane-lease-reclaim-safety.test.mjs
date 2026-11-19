@@ -1,6 +1,7 @@
 import { it, expect, vi } from 'vitest';
 import { holderPidAlive, laneReclaimDecision, probeLaneReclaim } from '../lane-lease-liveness.mjs';
 import { applyReclaimSafety } from '../../conveyor/lease-reaper.mjs';
+import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitLocationEnv } from '../lane-git-hardening.mjs';
 
 it.each([[true, false, 'stale-but-live'], [false, true, 'stale-but-dirty'],
   [null, false, 'stale-but-live'], [false, null, 'stale-but-dirty']])(
@@ -31,8 +32,19 @@ it.each([
 it('bounds the git probe and detects untracked work', () => {
   const run = vi.fn(() => ({ status: 0, stdout: '?? work.txt\n' }));
   expect(probeLaneReclaim('lane', {}, { run }).safe).toBe(false);
-  expect(run).toHaveBeenCalledWith('git', ['status', '--porcelain', '--untracked-files=all'],
+  expect(run).toHaveBeenCalledWith('git', [...laneGitConfigArgs(), 'status', '--porcelain', '--untracked-files=all'],
     expect.objectContaining({ timeout: 5000, maxBuffer: 1024 * 1024 }));
+});
+it('hardens the dirty-lane probe environment and argv against lane-controlled fsmonitor', () => {
+  const run = vi.fn(() => ({ status: 0, stdout: '' }));
+  expect(probeLaneReclaim('lane', {}, { run }).safe).toBe(true);
+  const [file, args, options] = run.mock.calls[0];
+  expect(file).toBe('git');
+  expect(args.slice(0, 2)).toEqual(['-c', 'core.fsmonitor=false']);
+  expect(options.env).toEqual(laneGitHardeningEnv({ ...scrubGitLocationEnv(process.env), GIT_OPTIONAL_LOCKS: '0' }));
+  const pins = Object.fromEntries(Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+    [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]));
+  expect(pins['core.fsmonitor']).toBe('false');
 });
 it('the conveyor keeps unsafe lanes even with terminal PR evidence', () => {
   const candidate = { dir: 'lane', lease: {}, reason: 'pr-merged' };

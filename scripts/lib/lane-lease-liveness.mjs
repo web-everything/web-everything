@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { readLiveCwds, pidsWithCwdIn } from './lane-salvage.mjs';
+import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitLocationEnv } from './lane-git-hardening.mjs';
 
 export function journalLiveProcessRefusal(dir, livePids, journal) {
   if (!livePids?.length) return false;
@@ -39,9 +40,9 @@ export function probeLaneReclaim(dir, lease, { run = spawnSync, ...pidOptions } 
   if (pidAlive !== false) return laneReclaimDecision({ pidAlive });
   let dirty = null;
   try {
-    const result = run('git', ['status', '--porcelain', '--untracked-files=all'], {
+    const result = run('git', [...laneGitConfigArgs(), 'status', '--porcelain', '--untracked-files=all'], {
       cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+      env: laneGitHardeningEnv({ ...scrubGitLocationEnv(process.env), GIT_OPTIONAL_LOCKS: '0' }),
     });
     if (result.status === 0 && typeof result.stdout === 'string') dirty = result.stdout.length > 0;
   } catch { /* unreadable evidence refuses; repair the git probe before retrying */ }

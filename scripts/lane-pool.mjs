@@ -178,6 +178,7 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
 import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal, probeLaneReclaim } from './lib/lane-lease-liveness.mjs';
+import { withLaneLeaseGuard } from './lib/lane-lease-guard.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
 import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane, salvageRefName } from './lib/lane-pool-salvage-push.mjs';
 import {
@@ -977,6 +978,10 @@ function laneFingerprint(dir, branch) {
  *   exists); default mirrors a plain overwrite.
  */
 function writeLeaseAtomic(file, body, { exclusive = false } = {}) {
+  return withLaneLeaseGuard(file, () => writeLeaseAtomicGuarded(file, body, { exclusive }));
+}
+
+function writeLeaseAtomicGuarded(file, body, { exclusive = false } = {}) {
   const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   writeFileSync(tmp, body, { flag: 'wx' }); // the temp name is always fresh — no clobber risk here
   try {
@@ -2287,7 +2292,7 @@ function restoreLeaseAfterRefusedClaim(dir, preExisting) {
   try {
     if (preExisting && !isLeaseStale(preExisting, Date.now(), ttlMsFromFlags())) writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
     // journal-exempt: drops only the claim THIS refused acquire just wrote — the lane never changed hands.
-    else rmSync(LEASE_MARKER(dir), { force: true });
+    else withLaneLeaseGuard(LEASE_MARKER(dir), () => rmSync(LEASE_MARKER(dir), { force: true }));
   } catch { /* the refusal still stands; a stale lease ages out on its own */ }
 }
 
@@ -2892,7 +2897,7 @@ async function cmdAcquire(repo) {
       // either), and a fresh, dedicated, ONE-TIME live remote-reachability probe taken only here (never on the
       // hot scan path above) — a network/remote outage must never be misread as "genuinely starved, so clone
       // more".
-      if (!grownOnce && !sawScanTimeout && !sawLockContention) {
+      if (!grownOnce && !sawScanTimeout && !sawLockContention && !sawProvisionFailure) {
         grownOnce = true;
         // Probe the exact URL growth will clone from (`provisionLane` → `repo.originUrl`, resolved against the
         // same process cwd the clone uses) — never from inside an existing lane: a vanished/corrupted `lanes[0]`
@@ -4953,6 +4958,12 @@ const TRIM_REACQUIRED = { kind: 'leased', reason: 're-leased after trim evaluate
  *  accepts what was moved; otherwise put it back without clobbering a marker written meanwhile (`link` fails if
  *  the name exists). Returns true iff the marker was taken. */
 function takeMarkerIf(dir, isMine, n) {
+  try {
+    return withLaneLeaseGuard(LEASE_MARKER(dir), () => takeMarkerIfGuarded(dir, isMine, n));
+  } catch { return false; } // contention or unreadable guard: leave the marker alone
+}
+
+function takeMarkerIfGuarded(dir, isMine, n) {
   const file = LEASE_MARKER(dir);
   const aside = `${file}.trim-${process.pid}`;
   try { renameSync(file, aside); } catch { return false; } // gone or replaced since — don't guess
@@ -5456,7 +5467,7 @@ function cmdReclaim(repo) {
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
   execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
-  rmSync(file, { force: true }); // back to the free-pool state — the same end state a normal `release` leaves
+  withLaneLeaseGuard(file, () => rmSync(file, { force: true })); // back to the free-pool state
   journalLaneEvent(dir, {
     action: 'reclaim-reset', before, headAfter: laneHead(dir),
     unpushed: !reproof.preserved, preserved: reproof.preserved, override: overriding || undefined,
@@ -5551,7 +5562,7 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
   execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
-  rmSync(file, { force: true });
+  withLaneLeaseGuard(file, () => rmSync(file, { force: true }));
   // #4370 — unpushed content here was SAVED first (a verified bundle), and the owner was proven gone (g2).
   journalLaneEvent(dir, {
     action: 'salvage-reset', before, headAfter: laneHead(dir),
@@ -5631,7 +5642,7 @@ function cmdAdopt(repo) {
       `    If that agent is gone, pass --force to take it over deliberately; otherwise acquire your own lane (\`acquire --purpose=<why> --adopt\`).`,
     );
   }
-  writeFileSync(LEASE_MARKER(dir), JSON.stringify({ ...lease, workerSession: me }, null, 2) + '\n');
+  writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify({ ...lease, workerSession: me }, null, 2) + '\n');
   // #3383 — record the occupancy hand-off in the lane-history ledger (best-effort).
   appendLaneHistory(dir, laneHistoryEntry({ event: 'adopt', ownerSession: me, workerSession: me, session: lease.session }));
   journalLaneEvent(dir, {
