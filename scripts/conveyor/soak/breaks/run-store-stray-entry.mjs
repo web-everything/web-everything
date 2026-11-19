@@ -29,12 +29,15 @@ export function probe(checkout) {
           { step: 'read', stepIndex: 0, startedAt: '2026-10-01T00:00:00Z', finishedAt: '2026-10-01T00:00:01Z', durationMs: 1000 },
           { step: 'advise', stepIndex: 1, startedAt: '2026-10-01T00:00:01Z', finishedAt: '2026-10-01T00:00:02Z', durationMs: 1000 },
         ], pending: null };
-      const misnamed = { ...valid, id: 'review-pr-bad name', input: { pr: 102 },
-        findings: { ...valid.findings, read: { ...valid.findings.read, pr: 102 } } };
+      const completed = { verdict: 'accept', pendingReferrals: [] };
+      const misnamed = { ...valid, verdict: completed, id: 'review-pr-bad name', input: { pr: 102 },
+        findings: { ...valid.findings, referralVerdict: completed, read: { ...valid.findings.read, pr: 102 } } };
       writeFileSync(join(dir, 'review-pr-valid.json'), JSON.stringify(valid));
       writeFileSync(join(dir, 'review-pr-bad name.json'), JSON.stringify(misnamed));
+      writeFileSync(join(dir, 'review-pr-unparseable name.json'), '{');
       const expected = [valid, misnamed].map(reviewRunEvidence);
-      ok(expected.every(row => row?.parked && row.pending.length && row.pr));
+      ok(expected.every(row => row?.pr));
+      ok(expected[0].parked && !expected[1].parked && expected[1].completedAt);
       deepStrictEqual(expected.map(row => row.pr), [valid.input.pr, misnamed.input.pr]);
       for (let pass = 0; pass < 2; pass++) {
         const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });

@@ -51,7 +51,7 @@ describe('behavioral fix detection', () => {
           return [reviewRunEvidence(JSON.parse(readFileSync(join(dir, 'review-pr-valid.json'), 'utf8')))];
         }
       `);
-      expect(b.fixPresent(root)).toBe(false); // retaining only the well-named record still loses a hold
+      expect(b.fixPresent(root)).toBe(false); // dropping the misnamed completed review still loses evidence
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

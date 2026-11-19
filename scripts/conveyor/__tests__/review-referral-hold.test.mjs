@@ -249,16 +249,18 @@ describe('attempted mandatory referrals', () => {
       expect(read).toHaveBeenCalledTimes(1);
       expect(read).toHaveBeenCalledWith('review-pr-parked', dir);
       expect(alert.mock.calls.map(([event]) => event)).toEqual([
-        { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'review-pr-bad name.json') } },
         { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'x y.json') } },
+        { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'review-pr-bad name.json'), severity: 'high', reason: 'no PR number' } },
       ]);
     } finally { alert.mockRestore(); }
   });
 
-  it('retains misnamed pending referrals through the default reader without weakening named reads or id lists', () => {
+  it.each(['parked', 'completed', 'incomplete'])('retains misnamed %s evidence without weakening named reads or id lists', state => {
     const dir = temp();
     const valid = run();
     const invalid = { ...run(), id: 'review-pr-bad name' };
+    if (state === 'completed') invalid.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
+    if (state === 'incomplete') invalid.stepTimings = invalid.stepTimings.filter(t => t.step !== 'advise');
     writeRun(valid, dir);
     writeFileSync(join(dir, 'review-pr-bad name.json'), JSON.stringify(invalid));
     writeFileSync(join(dir, 'review-pr-valid.abandoned.json'), JSON.stringify(invalid));
@@ -267,7 +269,8 @@ describe('attempted mandatory referrals', () => {
       for (const persist of [false, true]) {
         const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
         expect(rows).toEqual([reviewRunEvidence(valid), reviewRunEvidence(invalid)]);
-        expect(hold(pr(), [rows[1]])).not.toBeNull();
+        if (state === 'parked') expect(hold(pr(), [rows[1]])).not.toBeNull();
+        else expect(rows[1]).toMatchObject(state === 'completed' ? { parked: false } : { incomplete: true });
       }
       expect(listRunIds(dir)).toEqual([valid.id]);
       expect(() => tryReadRun(invalid.id, dir)).toThrow(/invalid run id/);
@@ -276,45 +279,83 @@ describe('attempted mandatory referrals', () => {
     } finally { alert.mockRestore(); }
   });
 
-  it.each(['unparseable', 'no PR', 'no pending referral', 'oversized'])(
+  it.each(['unparseable', 'no PR', 'oversized'])(
     'skips %s misnamed content with an operator-visible invalid-entry alert', kind => {
       const dir = temp();
       const path = join(dir, 'review-pr-bad name.json');
       const r = { ...run(), id: 'review-pr-bad name' };
       if (kind === 'no PR') delete r.input.pr;
-      if (kind === 'no pending referral') r.findings.referralVerdict.pendingReferrals = [];
       writeFileSync(path, kind === 'unparseable' ? '{' : JSON.stringify(r));
       if (kind === 'oversized') truncateSync(path, INVALID_RUN_EVIDENCE_MAX_BYTES + 1);
       const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
       try {
         expect(readReviewRunEvidence({ dir, memo: new Map(), persist: false })).toEqual([]);
         expect(alert).toHaveBeenCalledTimes(1);
-        expect(alert).toHaveBeenCalledWith({ kind: 'run-store-invalid-entry', detail: { path } });
+        expect(alert).toHaveBeenCalledWith({ kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) } });
       } finally { alert.mockRestore(); }
     });
 
-  it.each(['FIFO', 'directory'])('rejects a misnamed %s without blocking, retaining the invalid-entry alert', type => {
+  it('retries HIGH alerts until durably delivered even after a filename warning', async () => {
+    const dir = temp();
+    const path = join(dir, 'review-pr-bad name.json');
+    writeFileSync(path, '{');
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValueOnce(true)
+      .mockImplementationOnce(() => { throw new Error('unavailable'); })
+      .mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce(false).mockResolvedValue(true);
+    const scan = () => readReviewRunEvidence({ dir, memo: new Map(), persist: false });
+    const settle = () => new Promise(resolve => setImmediate(resolve));
+    try {
+      expect(listRunIds(dir)).toEqual([]);
+      await settle();
+      expect(scan()).toEqual([]); // synchronous delivery failure
+      expect(scan()).toEqual([]); // rejection
+      expect(scan()).toEqual([]); // concurrent delivery suppressed
+      expect(alert).toHaveBeenCalledTimes(3);
+      await settle();
+      expect(scan()).toEqual([]); // false delivery
+      await settle();
+      expect(scan()).toEqual([]); // successful durable delivery
+      await settle();
+      expect(scan()).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(5);
+      for (const [event] of alert.mock.calls.slice(1)) expect(event).toMatchObject({
+        kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) },
+      });
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each(['FIFO', 'directory', 'unreadable file'])('rejects a misnamed %s without blocking, retaining the invalid-entry alert', type => {
     const dir = temp();
     const path = join(dir, 'review-pr-bad name.json');
     if (type === 'FIFO') execFileSync('mkfifo', [path]);
-    else mkdirSync(path);
+    else if (type === 'directory') mkdirSync(path);
+    else writeFileSync(path, '{}');
     const events = join(dir, 'events.jsonl');
     const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
       import fs from 'node:fs';
       import { syncBuiltinESMExports } from 'node:module';
       import { readReviewRunEvidence } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/conveyor/review-referral-hold.mjs')).href)};
       let reads = 0;
+      if (${JSON.stringify(type)} === 'unreadable file') {
+        const open = fs.openSync;
+        fs.openSync = (path, ...args) => {
+          if (path === process.argv[2]) throw new Error('EACCES: unreadable record');
+          return open(path, ...args);
+        };
+      }
       const read = fs.readSync;
       fs.readSync = (...args) => { reads++; return read(...args); };
       syncBuiltinESMExports();
       const rows = readReviewRunEvidence({ dir: process.argv[1], persist: false });
       console.log(JSON.stringify({ rows, reads }));
-    `, dir], { encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    `, dir, path], { encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
       env: { ...process.env, WE_UNDER_TEST: '1', WE_DAEMON_EVENTS: events } });
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout.trim())).toEqual({ rows: [], reads: 0 });
-    expect(readFileSync(events, 'utf8')).toContain('run-store-invalid-entry');
+    expect(JSON.parse(readFileSync(events, 'utf8').trim())).toMatchObject({
+      kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) },
+    });
   });
 
   it('reads at most MAX_BYTES+1 bytes from the same descriptor when a misnamed file grows after fstat', () => {
@@ -352,7 +393,9 @@ describe('attempted mandatory referrals', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout.trim())).toEqual({ rows: [], stats: 1,
       bytes: INVALID_RUN_EVIDENCE_MAX_BYTES + 1, sameFd: true, closed: true });
-    expect(readFileSync(events, 'utf8')).toContain('run-store-invalid-entry');
+    expect(JSON.parse(readFileSync(events, 'utf8').trim())).toMatchObject({
+      kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) },
+    });
   });
 
   it('reads real run-store shape and withholds an unchanged head in the shared planner, across repeated passes', () => {

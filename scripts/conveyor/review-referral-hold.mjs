@@ -5,11 +5,11 @@
  */
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { isValidRunId, resolveRunsDir, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
+import { isValidRunId, resolveRunsDir, reportInvalidRunEntry, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -187,16 +187,19 @@ function writeEvidenceDiskCache(file, entries) {
 // Stray records are untrusted. Oversized/unreadable files retain the invalid-entry alert for operator repair.
 export const INVALID_RUN_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
-  const entries = runFileEntries(dir, { includeInvalid: true });
+  const entries = runFileEntries(dir, { includeInvalid: true, reportInvalid: path => {
+    if (!basename(path).startsWith('review-pr-')) reportInvalidRunEntry(path);
+  } });
   const invalidEvidence = entries.flatMap(name => {
     if (!name.startsWith('review-pr-') || isValidRunId(name.slice(0, -5))) return [];
     let fd;
+    const path = join(dir, name);
     try {
-      const path = join(dir, name);
       // Nonblocking open avoids hanging on a FIFO before we can reject its descriptor's type.
       fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
       const stat = fstatSync(fd);
-      if (!stat.isFile() || stat.size > INVALID_RUN_EVIDENCE_MAX_BYTES) return [];
+      if (!stat.isFile()) throw new Error('not a regular file');
+      if (stat.size > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
       const buffer = Buffer.alloc(INVALID_RUN_EVIDENCE_MAX_BYTES + 1);
       let length = 0;
       while (length < buffer.length) {
@@ -204,12 +207,16 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
         if (bytes === 0) break;
         length += bytes;
       }
-      if (length > INVALID_RUN_EVIDENCE_MAX_BYTES) return [];
+      if (length > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
       const run = JSON.parse(buffer.toString('utf8', 0, length));
-      if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) return [];
+      if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
       const evidence = reviewRunEvidence(run);
-      return evidence?.parked && evidence.pending.length ? [evidence] : [];
-    } catch { return []; } // enumeration already emitted the operator-visible invalid-entry alert
+      reportInvalidRunEntry(path);
+      return evidence ? [evidence] : [];
+    } catch (error) {
+      reportInvalidRunEntry(path, { severity: 'high', reason: error.message });
+      return [];
+    }
     finally { if (fd !== undefined) closeSync(fd); }
   });
   const names = entries.filter(name => isValidRunId(name.slice(0, -5)));

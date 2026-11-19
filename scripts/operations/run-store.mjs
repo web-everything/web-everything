@@ -202,9 +202,24 @@ export function writeRun(record, dir = resolveRunsDir()) {
 const reportedInvalidEntries = new Set();
 const reportingInvalidEntries = new Set();
 
+/** Mark an invalid entry only after its durable event is delivered; failed writes retry on the next scan.
+ * Severity has its own delivery key so an earlier filename warning cannot hide lost PR evidence. */
+export function reportInvalidRunEntry(path, detail = {}) {
+  path = resolve(path);
+  const key = `${path}:${detail.severity ?? 'normal'}`;
+  if (reportedInvalidEntries.has(key) || reportingInvalidEntries.has(key)) return;
+  reportingInvalidEntries.add(key);
+  try {
+    void Promise.resolve(appendDaemonEvent({ kind: 'run-store-invalid-entry', detail: { path, ...detail } }))
+      .then(delivered => { if (delivered !== false) reportedInvalidEntries.add(key); })
+      .catch(() => {})
+      .finally(() => reportingInvalidEntries.delete(key));
+  } catch { reportingInvalidEntries.delete(key); /* retry on the next enumeration */ }
+}
+
 /** Run-record filenames; includeInvalid also exposes stray JSON for fail-safe evidence readers.
  * Tombstones are silent; unexpected JSON names emit one successfully delivered event per path. */
-export function runFileEntries(dir = resolveRunsDir(), { includeInvalid = false } = {}) {
+export function runFileEntries(dir = resolveRunsDir(), { includeInvalid = false, reportInvalid = reportInvalidRunEntry } = {}) {
   let names;
   try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
   return names.filter(name => {
@@ -212,16 +227,7 @@ export function runFileEntries(dir = resolveRunsDir(), { includeInvalid = false 
     const id = name.slice(0, -5);
     if (isValidRunId(id)) return true;
     if (id.endsWith('.abandoned') && isValidRunId(id.slice(0, -10))) return false;
-    const path = resolve(dir, name);
-    if (!reportedInvalidEntries.has(path) && !reportingInvalidEntries.has(path)) {
-      reportingInvalidEntries.add(path);
-      try {
-        void Promise.resolve(appendDaemonEvent({ kind: 'run-store-invalid-entry', detail: { path } }))
-          .then(delivered => { if (delivered !== false) reportedInvalidEntries.add(path); })
-          .catch(() => {})
-          .finally(() => reportingInvalidEntries.delete(path));
-      } catch { reportingInvalidEntries.delete(path); /* retry on the next enumeration */ }
-    }
+    reportInvalid(resolve(dir, name));
     return includeInvalid;
   });
 }
