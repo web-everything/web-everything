@@ -10,6 +10,7 @@ import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../dae
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
+import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
@@ -30,7 +31,7 @@ function evidence() {
   const platform = join(dir, 'platform.json');
   writeFileSync(platform, '{}');
   return { path, dir, env: {
-    WE_FIX_READY_PATH: path, WE_PLATFORM_PREFERENCES_FILE: platform,
+    HOME: dir, WE_FIX_READY_PATH: path, WE_PLATFORM_PREFERENCES_FILE: platform,
     WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only',
   }, save: (...rows) => writeFileSync(path, rows.map(r => JSON.stringify(r)).join('\n')) };
 }
@@ -923,6 +924,18 @@ describe('unaudited-tip evidence and policy', () => {
       return { ...f.env, WE_PLATFORM_PREFERENCES_FILE: platform };
     };
     const entry = (extra = {}) => ({ ref, sha, ruling: 'R907', findings: ['finding'], ...extra });
+    it('authorizes exact ops-store evidence and refuses an unreadable store', () => {
+      const f = evidence();
+      f.save(weakened());
+      const path = storePath(f.env);
+      appendEntry({ ...entry(), actor: 'operator', quote: 'approved' }, { path });
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(true);
+      expect(makeAuditedTipGate(f.env)(ref, 'c'.repeat(40))).toBe(false);
+      rmSync(path);
+      mkdirSync(path);
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(false);
+      expect(makeAuditedTipGate(withAllowlist(f, [entry()]))(ref, sha)).toBe(true);
+    });
     it('a self-declared ruling and disclosure with no operator allowlist entry stays held', () => {
       const f = evidence();
       f.save(weakened());

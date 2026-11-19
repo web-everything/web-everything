@@ -95,22 +95,30 @@ describe('ops ruled-weakened evidence', () => {
     fs.writeFileSync(path, rows.slice(0, -1).join('\n'));
     expect(gate(union({ warn }))).toBeNull();
   });
-  it('skips an extra fingerprint field with a warning and grants no waiver for another SHA with a matching live fingerprint', () => {
+  it('preserves a valid optional carry fingerprint through append, read and the ops waiver union', () => {
     const fingerprint = 'c'.repeat(64);
-    fs.mkdirSync(join(path, '..'), { recursive: true });
-    fs.writeFileSync(path, JSON.stringify(entry({ fingerprint })) + '\n');
+    const value = append(entry({ fingerprint }));
     const warn = vi.fn();
-    const loaded = readStore({ path, fs, warn });
-    expect(loaded).toEqual({ entries: [], error: null });
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn).toHaveBeenCalledWith('WARNING: ruled-weakened store line 1: malformed JSON or invalid entry; ignored');
+    expect(readStore({ path, fs, warn })).toEqual({ entries: [value], error: null });
+    expect(warn).not.toHaveBeenCalled();
     const liveInput = { ...input, sha: 'b'.repeat(40) };
     const carriedRecord = { ...record, fingerprint };
-    expect(readyEvidence([carriedRecord], liveInput, loaded.entries, fingerprint)).toBeNull();
-    expect(readyEvidence([carriedRecord], liveInput, union({ warn }), fingerprint)).toBeNull();
+    expect(readyEvidence([carriedRecord], liveInput, union({ warn }), fingerprint))
+      .toMatchObject({ ruledWeakened: { layer: 'ops' } });
+    expect(readyEvidence([carriedRecord], liveInput, union({ warn }), 'd'.repeat(64))).toBeNull();
+  });
+  it('malformed optional fingerprints remain unreadable and grant no waiver', () => {
+    fs.mkdirSync(join(path, '..'), { recursive: true });
+    for (const fingerprint of [null, true, 12, '', 'c'.repeat(63), 'z'.repeat(64)]) {
+      fs.writeFileSync(path, JSON.stringify(entry({ fingerprint })) + '\n');
+      const warn = vi.fn();
+      expect(readStore({ path, fs, warn })).toEqual({ entries: [], error: null });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(gate(union({ warn }))).toBeNull();
+    }
   });
   it('rejects unknown fields in validation and append without writing', () => {
-    for (const extra of [{ fingerprint: 'c'.repeat(64) }, { unexpected: true }]) {
+    for (const extra of [{ fingerprint: 'invalid' }, { unexpected: true }]) {
       const value = entry(extra);
       expect(validateEntry(value)).toBe(false);
       expect(() => append(value)).toThrow(/invalid ruled-weakened entry/);

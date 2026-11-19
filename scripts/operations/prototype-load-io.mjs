@@ -23,7 +23,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
 import { clearPendingAdoption, recordPendingAdoption, OVERLAY_ADOPTION_MAX_PENDING, OVERLAY_ADOPTION_TTL_MS } from '../lib/overlay-adoption.mjs';
 import { isGraphSourceFile, isVitestTestFile } from '../lib/related-test-selection.mjs';
-import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
+import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, testWorkflowBound, TEST_CHECK_APP_ID, readyEvidence, waiverForHead, readyRecordSpeaksFor, mergeRuledWeakened, canonicalAuditEvidence, changedPaths, comparePaths, nextMergeRef, refusal, resolveDaemonKey } from './prototype-load.mjs';
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
@@ -508,12 +508,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         fetchMain();
         return ancestor(base, 'origin/main');
       } catch { return false; } };
-      const liveFp = liveFingerprint(auditRecords);
+      const liveFp = liveFingerprint([...auditRecords, ...config.ruledWeakened]);
+      const waiver = !out.gate ? waiverForHead(config.ruledWeakened, input, liveFp) : null;
+      const auditGate = out.gate || (waiver ? { ruledWeakened: {
+        ruling: waiver.ruling, findings: waiver.findings, layer: waiver.layer } } : null);
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: out.gate }) };
+        { ruledWeakened: auditGate }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
-        fallback: `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
-      if (out.gate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${out.gate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${out.gate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${out.gate.ruledWeakened.findings.join(' | ')}`);
+        fallback: waiver ? `waiver exists but no fix-ready record. Run the canonical audit/readiness so a fix-ready record is written, then retry prototype-load.` : `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
+      if (auditGate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${auditGate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${auditGate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${auditGate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
@@ -600,7 +603,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const producedFp = liveFp || (stored.length === 1 ? stored[0] : null);
       const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
         audit: canonical.verdict, testCheck: checkRun, ...(producedFp ? { fingerprint: producedFp } : {}),
-        ...(out.gate?.ruledWeakened ? { auditRuling: out.gate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
+        ...(auditGate?.ruledWeakened ? { auditRuling: auditGate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
       out.gate ||= { source: 'canonical-check-run', record: producedReady };
       stage = 'no-ready';
       requireGit('fetch', 'origin', input.branch);
