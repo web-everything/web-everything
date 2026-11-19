@@ -1,6 +1,6 @@
 import { it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -58,6 +58,23 @@ it('foreign re-adoption still requires a canonical origin', () => {
   expect(result.status).not.toBe(0);
   expect(result.stderr).toMatch(/canonical origin/);
   expect(readLease().session).toBe('owner');
+});
+
+it('owned re-adoption refuses missing ancestor history without repair or reset', () => {
+  seed();
+  const parent = git(['rev-parse', 'HEAD'], lane).trim();
+  git(['-c', 'user.name=test', '-c', 'user.email=test@example.test',
+    'commit', '--quiet', '--allow-empty', '-m', 'local tip'], lane);
+  const object = join(lane, '.git', 'objects', parent.slice(0, 2), parent.slice(2));
+  rmSync(object);
+  writeFileSync(join(lane, 'work'), 'precious work');
+
+  const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('QUARANTINED');
+  expect(existsSync(object)).toBe(false);
+  expect(existsSync(join(pool, 'fixture', '.quarantine-state', 'lane-1.json'))).toBe(true);
+  expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
 
 it('verify-lane renews its selected cwd lease throughout a failing gate', () => {

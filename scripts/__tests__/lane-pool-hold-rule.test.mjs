@@ -318,7 +318,7 @@ describe('every guard has a test that reddens without it', () => {
     git(['push', '--quiet', 'origin', 'HEAD:refs/heads/trunk'], dir);
     git(['fetch', '--quiet', 'origin'], dir);
     const lease = JSON.parse(readFileSync(join(dir, '.git', '.lane-lease'), 'utf8'));
-    writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify({ ...lease, acquiredAt: minutesAgo(24 * 60) }));
+    writeFileSync(join(dir, '.git', '.lane-lease'), JSON.stringify({ ...lease, acquiredAt: minutesAgo(24 * 60), pid: 2147483646 })); // abandoned holder
     const env = { ...fakeGh([{ headRefName: 'lane/4453-some-slug', state: 'MERGED', mergedAt: '2026-08-01T00:00:00Z' }]), CLAUDE_CODE_SESSION_ID: 'fresh' };
     const held = runPool(['acquire', '--lane=2', '--session=fresh', '--no-reset', ...poolArgs()], env);
     expect(held.code).toBe(0);

@@ -388,15 +388,17 @@ function resolveRepo(repoFlags = flags) {
   const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
   const gitOptions = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
   const topLevel = tryGit(['rev-parse', '--show-toplevel'], referencePath, gitOptions) || referencePath;
-  // Re-adopting an owned lane is metadata-only: no trusted transport is needed.
-  const ownLane = /^lane-(\d+)$/.exec(basename(topLevel));
-  const ownPoolDir = dirname(topLevel);
-  if (cmd === 'acquire' && repoFlags.adopt && ownLane && Number(repoFlags.lane) === Number(ownLane[1])
-      && dirname(ownPoolDir) === resolve(POOL_ROOT)
-      && (!repoFlags.pool || repoFlags.pool === basename(ownPoolDir))
-      && leaseOwnedBy(readLease(topLevel), defaultSession()) && !repoFlags.base && !repoFlags.reserve) {
-    return { name: basename(ownPoolDir), poolDir: ownPoolDir, referencePath: topLevel,
-      branch: repoFlags.branch || 'main', originUrl: null, renewOwnLease: true };
+  // Only explicit owned re-adoption is metadata-only; every other path retains origin validation.
+  if (cmd === 'acquire' && repoFlags.adopt && repoFlags.lane !== undefined && !repoFlags.base && !repoFlags.reserve) {
+    const ownLane = /^lane-(\d+)$/.exec(basename(topLevel));
+    const ownPoolDir = dirname(topLevel);
+    if (ownLane && Number(repoFlags.lane) === Number(ownLane[1])
+        && dirname(ownPoolDir) === resolve(POOL_ROOT)
+        && (!repoFlags.pool || repoFlags.pool === basename(ownPoolDir))
+        && leaseOwnedBy(readLease(topLevel), defaultSession())) {
+      return { name: basename(ownPoolDir), poolDir: ownPoolDir, referencePath: topLevel,
+        branch: repoFlags.branch || 'main', originUrl: null, renewOwnLease: true };
+    }
   }
   const needsOrigin = ['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim'].includes(cmd)
     || (cmd === 'list' && repoFlags.acquirable);
@@ -2994,13 +2996,15 @@ async function cmdAcquire(repo) {
   // its own picking loop above (falling through to the next candidate on a provisioning failure instead of
   // failing outright — see that loop's own `provisionClaimedLane` call and comment). Calling it again here
   // would silently re-run `fetchOriginPruneWithRetry`/`checkout -B`/`ensureDeps` a second time for no reason.
-  if (flags.lane !== undefined && !repo.renewOwnLease) {
+  if (flags.lane !== undefined) {
     try {
       requireReadableLaneHistory(repo, chosen, { allowRepair: !flags['no-reset'] && !targetWasReserved });
-      provisionClaimedLane(repo, chosen, targetWasReserved, {
-        beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
-        beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
-      });
+      if (!repo.renewOwnLease) {
+        provisionClaimedLane(repo, chosen, targetWasReserved, {
+          beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
+          beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
+        });
+      }
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
       fail(e && e.message ? e.message : String(e));
@@ -5314,10 +5318,14 @@ function cmdReclaim(repo) {
   const nowMs = Date.now();
   const ttlMs = ttlMsFromFlags();
   const lease = readLease(dir);
-  const safety = reclaimSafety(dir, lease);
-  if (!safety.safe) fail(`lane-${n}: ${safety.reason} — inspect the holder and working tree before retrying`);
   if (lease && !isLeaseStale(lease, nowMs, ttlMs)) {
     fail(`lane-${n} is held (${describeLease(lease)}) — reclaim only ever touches an unleased (or provably-stale-leased) lane; a live lease means someone is using it right now.`);
+  }
+  // A stale marker never authorizes taking a live/dirty holder's lane, even with override.
+  // Unleased lanes retain the preservation proof and liveness gates below.
+  if (lease) {
+    const safety = reclaimSafety(dir, lease);
+    if (!safety.safe) fail(`lane-${n}: ${safety.reason} — inspect the holder and working tree before retrying`);
   }
 
   // xbdixjc — the hold rule runs before salvage, preservation proofs and `--override` alike.

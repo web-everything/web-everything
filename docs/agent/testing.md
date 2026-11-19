@@ -4646,6 +4646,10 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ## Lane lease heartbeats
 
 Use `lane-lease-heartbeat.mjs` for best-effort atomic renewal from any lane subdirectory.
+Owned `acquire --lane=N --adopt` may skip canonical-origin resolution, but must still
+probe local history without repair; missing ancestors quarantine the lane. Stale-lease
+PID/dirty refusals precede takeover; unleased reclaim retains its preservation-report contract.
+Fixtures for abandoned leases must use a dead PID (2147483646), never the test process PID.
 Heartbeat owners must keep the event loop available while children run and stop in `finally`;
 synchronous child execution prevents interval renewals. The Codex child runner covers detached
 jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.

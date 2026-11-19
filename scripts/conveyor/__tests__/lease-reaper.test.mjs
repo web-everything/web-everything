@@ -845,7 +845,7 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
       buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
         pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
-      reapPlan, applyLaneHold: (plan) => plan,
+      reapPlan, applyLaneHold: (plan) => plan, applyReclaimSafety: (plan) => plan,
       releaseLane: () => { throw new Error('dry-run must never release'); },
     }, { timeout: 1000 });
     return { report: JSON.parse(stdout), logs };
