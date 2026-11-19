@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -9,7 +8,7 @@ import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const registry = JSON.parse(readFileSync(join(root, 'scripts/lib/agent-launch-env-registry.json'), 'utf8'));
-// Same bounded rg inventory used to generate the registry. Include literal bracket and optional reads,
+// Same bounded inventory used to generate the registry. Include literal bracket and optional reads,
 // prose examples conservatively too; exclude test/spec files and test/fixture directory trees.
 const reads = /\b(?:process\.env|env)(?:\??\.([A-Za-z_][A-Za-z0-9_]*)|(?:\?\.)?\s*\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])/g;
 function namesIn(text) {
@@ -25,11 +24,34 @@ const hasValueDecision = rule => !/value[\s-]*depend/i.test(rule.why)
   || Boolean(rule.tighterThan) || rule.relaxOnly === true;
 function inventoryNames(result) {
   if (result.error || result.status !== 0) {
-    throw Error(`env inventory incomplete; repair rg/read access or split the inventory for human review: ${result.error?.message ?? result.stderr}`);
+    throw Error(`env inventory incomplete; repair read access or split the inventory for human review: ${result.error?.message ?? result.stderr}`);
   }
   const names = namesIn(result.stdout);
   if (!names.length) throw Error('env inventory empty; repair the scan scope before reviewing drift');
   return names;
+}
+
+// Pure-Node inventory (no rg: the remote test hosts don't have it). Same scope as the generator: follows
+// symlinked skills, skips test/fixture trees, test/spec files and binary files; a read error fails closed.
+const SKIP_DIRS = new Set(['__tests__', 'tests', 'fixtures', 'node_modules', '.git']);
+function scanTree(dirs) {
+  const seen = new Set(), chunks = [];
+  try {
+    const walk = dir => {
+      const real = realpathSync(dir);
+      if (seen.has(real)) return;
+      seen.add(real);
+      for (const name of readdirSync(dir)) {
+        const path = join(dir, name), stat = statSync(path);
+        if (stat.isDirectory()) { if (!SKIP_DIRS.has(name)) walk(path); continue; }
+        if (!stat.isFile() || /\.(test|spec)\./.test(name) || stat.size > 4 * 1024 * 1024) continue;
+        const text = readFileSync(path, 'utf8');
+        if (!text.includes('\0')) chunks.push(text);
+      }
+    };
+    for (const dir of dirs) walk(join(root, dir));
+  } catch (error) { return { status: 2, error }; }
+  return { status: 0, stdout: chunks.join('\n') };
 }
 
 function validRule(rule) {
@@ -63,10 +85,7 @@ afterEach(() => vi.unstubAllEnvs());
 
 describe('agent environment registry drift', () => {
   it('classifies every literal env read under scripts and .claude/skills; unreadable or oversized evidence fails', () => {
-    const result = spawnSync('rg', ['-n', '-o', '--hidden', '--follow',
-      '--glob', '!**/{__tests__,tests,fixtures,node_modules,.git}/**', '--glob', '!**/*.{test,spec}.*',
-      reads.source, 'scripts/', '.claude/skills/'], { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024 });
-    expect(unclassified(inventoryNames(result))).toEqual([]);
+    expect(unclassified(inventoryNames(scanTree(['scripts', '.claude/skills'])))).toEqual([]);
   });
   it('refuses failed, oversized and empty scan evidence with an operator-visible fallback', () => {
     for (const result of [{ status: 2, stderr: 'unreadable' },
