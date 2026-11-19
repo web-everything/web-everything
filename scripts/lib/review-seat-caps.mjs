@@ -13,18 +13,19 @@ export function readReviewSeatPolicy({ env = process.env, readFile = readFileSyn
     tool = JSON.parse(String(readFile(SETTINGS_FILE, 'utf8')));
     if (!tool || typeof tool !== 'object' || Array.isArray(tool)) throw new Error('expected a settings object');
   } catch (error) {
-    warn(`WARNING review seat settings unreadable/malformed: ${error.message}; using repo defaults`);
+    warn(`WARNING review seat settings unreadable/malformed: ${error.message}; ignoring tool layer, using remaining settings or repo defaults`);
     tool = {}; failed = true;
   }
   const preferences = platform === undefined ? readPlatformPreferences({ env, readFile }) : { prefs: { review: platform }, errors: [] };
   if (preferences.prefs.review !== undefined && (!preferences.prefs.review || typeof preferences.prefs.review !== 'object' || Array.isArray(preferences.prefs.review))) {
     preferences.errors.push('review: expected a settings object');
+    delete preferences.prefs.review;
   }
   if (preferences.errors.length) {
-    warn(`WARNING review seat platform settings unreadable/malformed: ${preferences.errors.join('; ')}; using repo defaults`);
+    warn(`WARNING review seat platform settings unreadable/malformed: ${preferences.errors.join('; ')}; ignoring invalid layers, using remaining settings or repo defaults`);
     failed = true;
   }
-  return { tool: failed ? {} : tool, platform: failed ? {} : preferences.prefs.review ?? {}, log, failed };
+  return { tool, platform: preferences.prefs.review ?? {}, log, failed };
 }
 
 function seatPolicy(key, standard, valid, env, reader, envValues = {}) {
@@ -36,21 +37,20 @@ function seatPolicy(key, standard, valid, env, reader, envValues = {}) {
   const invalid = new Set();
   const project = layer => {
     if (layer !== undefined && (!layer || typeof layer !== 'object' || Array.isArray(layer))) {
-      (settings.log ?? console.error)(`WARNING review.${key}: malformed settings block; using repo defaults`);
+      (settings.log ?? console.error)(`WARNING review.${key}: malformed settings block; ignoring block, using remaining settings or repo defaults`);
       Object.keys(standard).forEach(k => invalid.add(k));
-      return { ...standard };
+      return {};
     }
     return Object.fromEntries(Object.keys(standard)
-    .filter(k => layer?.[k] !== undefined).map(k => {
-      if (valid(layer[k])) return [k, layer[k]];
-      (settings.log ?? console.error)(`WARNING review.${key}.${k}: malformed setting; using repo default ${standard[k]}`);
+    .filter(k => layer?.[k] !== undefined).flatMap(k => {
+      if (valid(layer[k])) return [[k, layer[k]]];
+      (settings.log ?? console.error)(`WARNING review.${key}.${k}: malformed setting; ignoring entry, using remaining settings or repo default ${standard[k]}`);
       invalid.add(k);
-      return [k, standard[k]];
+      return [];
     }));
   };
   const platform = project(settings.platform?.[key]);
   const tool = project(settings.tool?.[key]);
-  for (const k of invalid) tool[k] = standard[k];
   const result = cascadePolicy(`review.${key}`, tool, {
     standard, platform, env, envValues, valid, log: settings.log,
   });
@@ -87,10 +87,10 @@ export function resolveCarbonShadowCap(env = process.env) {
   const n = typeof value === 'boolean' ? NaN : Number(value);
   return Number.isSafeInteger(n) && n >= 0 ? n : 0;
 }
-/** Standard daily caps: Codex 600, Gemini 0 (operator ruling 2026-10-02; opt-in only), agy-claude 10 (red-team emergency only). */
-export const PROVIDER_CAP_DEFAULT = Object.freeze({ codex: 600, 'agy-claude': 10, 'agy-gemini': 0 });
+/** Standard daily caps: Codex 80, Gemini 0 (operator ruling 2026-10-02; opt-in only), agy-claude 10 (red-team emergency only). */
+export const PROVIDER_CAP_DEFAULT = Object.freeze({ codex: 80, 'agy-claude': 10, 'agy-gemini': 0 });
 /** The daily call cap for ONE provider: its own env var, else (codex only) the legacy shared env var, else its
- *  settings cascade, then its own default. Malformed settings warn and use repo defaults. Reads settings on every call. */
+ *  settings cascade, then its own default. Invalid entries/layers warn and are skipped. Reads settings on every call. */
 function providerCapPolicy(provider, env, readSettings) {
   const ownName = PROVIDER_CAP_ENV[provider];
   const own = Number(env?.[ownName]);
