@@ -10,7 +10,8 @@ const headSha = 'a'.repeat(40);
 const row = (status, conclusion = null) => ({ name: 'test', head_sha: headSha, status, conclusion });
 const pr = checks => ({ number: 12, state: 'OPEN', headRefOid: headSha, headRefName: 'lane/early-review',
   baseRefName: 'main', isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', body: 'Review early CI policy.',
-  labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [], statusCheckRollup: checks });
+  labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], comments: [], statusCheckRollup: checks,
+  rowsComplete: true, rowsHead: headSha });
 
 describe('early review never grants landing permission', () => {
   it.each([2, 3, 4])('enforces maxLiveReviewRounds=3 for pending-CI early review with %i live rounds', live => {

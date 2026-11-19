@@ -312,7 +312,8 @@ describe('CI pre-stage', () => {
     const p = pending();
     expect(prestageCi(p, ['test', 'integration'])).toBe('unknown');
     p.statusCheckRollup[0].head_sha = 'other';
-    expect(prestageCi(p, ['test'])).toBe('red');
+    // Another head's row is unreadable evidence for this head (the review CI contract): never a shortcut.
+    expect(prestageCi(p, ['test'])).toBe('unknown');
     p.statusCheckRollup[0].head_sha = head; p.mergeable = 'CONFLICTING';
     expect(classifyPr(p, { preparePendingCi: true, queueRequiredChecks: ['test'] }).decision).toBe('skip');
   });

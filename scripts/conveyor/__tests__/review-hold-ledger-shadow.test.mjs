@@ -30,7 +30,8 @@ const referral = (sha = head) => ev(EVENT_TYPES.REFERRAL, { headSha: sha, findin
 const ruling = (findingKey, r = 'not-real') => ev(EVENT_TYPES.RULING, { findingKey, ruling: r }, 2);
 const pr = (o = {}) => ({ number: 3988, headRefOid: head, headRefName: 'lane/x', body: '', createdAt: iso(at - 3_600_000),
   labels: [{ name: 'review:human' }], comments: [], mergeStateStatus: 'CLEAN',
-  statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], referralHold: null, blockRuledReferrals: [], ...o });
+  statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }], referralHold: null, blockRuledReferrals: [],
+  rowsComplete: true, rowsHead: o.headRefOid ?? head, ...o });
 const env = (o = {}) => ({ ...o });
 const sources = o => resolveReadSources(env(o));
 const noRuling = () => false;

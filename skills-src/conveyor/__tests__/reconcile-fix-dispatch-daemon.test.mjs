@@ -625,12 +625,15 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     const opts = fixture({ repos: ['we', 'frontierui'], readPrs: options => reconcilePass.defaultReadPrs(options) });
     for (let pass = 0; pass < 2; pass++) {
       expect((await runTickAllRepos(opts)).refusals).toEqual([]);
-      expect(exec).toHaveBeenCalledTimes((pass + 1) * 2);
+      expect(exec.mock.calls.filter(([, argv]) => argv[0] === 'pr')).toHaveLength((pass + 1) * 2);
+      // The direct-listing fallback proves CI evidence with one batched per-head rollup read per repo with heads.
+      expect(exec.mock.calls.filter(([, argv]) => argv[0] === 'api')).toHaveLength(activeOwner ? (pass + 1) * 2 : 0);
       for (const repo of opts.repos) {
         expect(exec.mock.calls.filter(([, argv]) => argv.includes(CONSTELLATION_REPOS[repo].slug))).toHaveLength(pass + 1);
       }
     }
-    expect(exec.mock.calls.every(([command, argv]) => command === 'gh' && argv[0] === 'pr' && argv[1] === 'list')).toBe(true);
+    expect(exec.mock.calls.every(([command, argv]) => command === 'gh' && ((argv[0] === 'pr' && argv[1] === 'list')
+      || (argv[0] === 'api' && argv[1] === 'graphql' && argv.some(arg => arg.includes(':object(oid:')))))).toBe(true);
     expect(reconcile).not.toHaveBeenCalled();
   });
 
@@ -740,7 +743,10 @@ describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => 
     const opts = fixture({ readPrs });
     const result = await runTickAllRepos(opts);
     expect(readComments).toHaveReturnedWith(returned);
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls.filter(([, argv]) => argv[0] === 'pr')).toHaveLength(1);
+    // Plus at most the one batched per-head rollup-evidence read.
+    expect(exec.mock.calls.filter(([, argv]) => argv[0] !== 'pr').every(([, argv]) => argv[0] === 'api' && argv[1] === 'graphql')).toBe(true);
+    expect(exec.mock.calls.length).toBeLessThanOrEqual(2);
     expect(readPrs.mock.results[0].value).toHaveLength(dropped === 'all' ? 0 : 1);
     expect(readPrs.mock.results[0].value.discoveryIncomplete).toBe(true);
     expect(result.skippedSteps).toEqual([]);

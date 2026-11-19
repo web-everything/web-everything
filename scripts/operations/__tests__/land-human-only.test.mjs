@@ -477,7 +477,7 @@ describe('land-human-only — the reader', () => {
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (_bin, args) => {
-      if (args[0] === 'api' && args[1] === 'graphql') return checkReply(live, complete);
+      if (args[0] === 'api' && args[1] === 'graphql' && args.join(' ').includes(':object(oid:')) return checkReply(live, complete);
       if (args[0] === 'pr') return JSON.stringify(live);
       if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (args.join(' ').includes('isInMergeQueue')) return JSON.stringify({ data: { repository: {
@@ -558,7 +558,7 @@ describe('land-human-only — the reader', () => {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (bin, args) => {
       const a = args.join(' ');
-      if (args[0] === 'api' && args[1] === 'graphql') return checkReply(live);
+      if (args[0] === 'api' && args[1] === 'graphql' && a.includes(':object(oid:')) return checkReply(live);
       if (a.startsWith('pr view')) return JSON.stringify(live);
       if (a.startsWith('repo view')) return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
