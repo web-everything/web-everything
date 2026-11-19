@@ -144,6 +144,8 @@ describe('testing ledger union', () => {
     ['prose', 'unrestricted prose\n'], ['unterminated row', '- incomplete'], ['inline fence', '- ```\n'],
     ['inline comment', '- <!-- hidden\n'], ['list heading', '- # Disabled\n'],
     ['list HTML', '- <div>\n'], ['table delimiter', '| --- | --- |\n'],
+    ['nested bullet heading', '- + # Disabled\n'], ['nested dash item', '- - nested\n'], ['nested ordered item', '- 1. nested\n'],
+    ['nested quote', '- > quoted\n'], ['nested table row', '- | a | b |\n'],
     ['thematic break (spaced stars)', '* * *\n'], ['thematic break (dashes)', '- - -\n'],
     ['thematic break (stars)', '***\n'], ['thematic break (underscores)', '___\n'], ['list thematic break', '- ***\n'],
   ])('refuses a testing ledger insertion containing %s', async (_, insertion) => {

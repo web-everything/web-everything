@@ -42,7 +42,8 @@ function markdownRow(line) {
   // A thematic break (`* * *`, `- - -`, `***`, `___`) is structure, never a data row.
   if (/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(text)) return null;
   const item = text.match(/^(?:- |\* |\d+\. )(.+)$/);
-  if (item) return /^(?:\s|#|---(?:\s|$)|>|[-*_](?:\s*[-*_])*\s*$)/.test(item[1]) ? null : 'list';
+  // A nested block marker after the item marker (`- + # x`, `- - x`, `- 1. x`, `- > x`, `- | x`) is structure, not data.
+  if (item) return /^(?:\s|#|---(?:\s|$)|>|\||[-*_+](?:\s|$)|\d+[.)](?:\s|$)|[-*_](?:\s*[-*_])*\s*$)/.test(item[1]) ? null : 'list';
   if (!/^\|.+/.test(text)) return null;
   const cells = text.replace(/^\||\|$/g, '').split('|').map(cell => cell.trim());
   return cells.every(cell => /^:?-+:?$/.test(cell)) ? null : 'table';
