@@ -133,6 +133,8 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/lib/__tests__/daemon-host-guard.test.mjs': 'false positive: readdirSync(join(root, ...)) lists only mkdtemp host-identity fixtures to assert atomic publication and cleanup; imports daemon-host-guard.mjs, so vitest related already selects it when the guard changes',
+  'scripts/operations/__tests__/daemon-preflight.test.mjs': 'false positive: readdirSync(join(root, ...)) lists only mkdtemp identity fixtures to assert read-only behavior; reads named checkout files without scanning the repo and imports daemon-preflight.mjs, so vitest related already selects it when preflight changes',
   'scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs': 'false positive: recursively snapshots only its mkdtemp cache fixture to assert zero writes, never the live repo; imports reconcile-pass.mjs, so vitest related already selects it when reconciliation changes',
   'scripts/readiness/__tests__/forge-cache-prune-running-record.test.mjs': 'false positive: its `snapshotBinding` readdir walk enumerates only the mkdtemp fixture tree it builds, never the live repo; a hermetic prune-record test, not a repo rule scanner',
   'scripts/__tests__/daemon-heavy-spawn-lint.test.mjs': 'repo scan: reads and TypeScript-parses every non-test .mjs under scripts/ (all subdirectories) plus skills-src/conveyor for unadmitted heavy child_process spawns; the lint helper is unit-tested hermetically and CI runs the full test',
