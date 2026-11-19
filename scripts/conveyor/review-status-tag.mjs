@@ -45,7 +45,10 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 // The ONE `status:*` label (what the PR waits on) — written here, by the same owner, never a second writer (D5).
 import { observeRoundCap } from './round-judge-shadow.mjs';
-import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_DESCRIPTIONS } from './pr-status-label.mjs';
+import { derivePrStatusLabel, planPrStatusLabel, readyFromDecisionLabels, PR_STATUS_DESCRIPTIONS } from './pr-status-label.mjs';
+
+// Stale-prone states a head-bound accept + red-team clear overrides (never needs-you, ci-red, conflict, stood-down).
+const STALE_STATUS_STATES = new Set(['sent-back-review', 'at-round-limit', 'awaiting-review', 'awaiting-ci', 'waiting-on-base', 'red-team']);
 
 /** Compatibility default while dispatch and hold readers still use review-status labels. */
 export const LEGACY_REVIEW_STATUS_DEFAULT = true;
@@ -287,7 +290,14 @@ export function tagReviewStatus({
   // The `status:*` label: one per PR, kept current every tick from the same facts plus the plan rows.
   let prStatus;
   const applyPrStatus = () => {
-    if (!Array.isArray(planRows)) return;
+    // A standalone call (no planner rows) cannot derive every state, but it can still lift a PR to ready from its
+    // CURRENT decision labels; otherwise it leaves any `status:*` label untouched.
+    const standalone = !Array.isArray(planRows);
+    // Cheap precheck so a standalone call reads nothing unless the decision labels could qualify.
+    if (standalone) {
+      const have = currentLabels.map((l) => (typeof l === 'string' ? l : l?.name));
+      if (!have.includes('review:accepted') || !have.includes('red-team:clear')) return;
+    }
     if (requiredChecks === undefined) {
       requiredChecks = null; // Unknown requirements must never filter a CI refusal into a review signal.
       try {
@@ -306,15 +316,23 @@ export function tagReviewStatus({
       // Unreadable evidence retains the original failing checks (fail closed).
       try { statusSubject = excuseMergeGate(statusSubject, { repo }); } catch { /* Keep the raw subject. */ }
     }
-    const state = derivePrStatusLabel({ pr: statusSubject, labels: currentLabels,
+    // Decision labels on the live head outrank a stale `status:*` label (never the reverse).
+    const ready = readyFromDecisionLabels({ pr: statusSubject, labels: currentLabels, requiredChecks, settings: prStatusSettings });
+    if (standalone && !ready.ready) return;
+    let state = standalone ? null : derivePrStatusLabel({ pr: statusSubject, labels: currentLabels,
       reviewStatus: status, rows: planRows, defaultBranch, requiredChecks, settings: prStatusSettings });
+    if (ready.ready && (state === null || STALE_STATUS_STATES.has(state))) state = 'ready-to-merge';
     const sp = planPrStatusLabel({ state, currentLabels });
+    const labelNames = currentLabels.map((l) => (typeof l === 'string' ? l : l?.name));
+    const addReady = ready.ready && state === 'ready-to-merge' && !labelNames.includes('ready-to-merge');
     prStatus = state ? `status:${state}` : null;
     // Shadow round judge: logs what it WOULD do at a round cap; never acts, never throws (round-judge-shadow.mjs).
     observeRoundCap({ pr, repo, state, subject: statusSubject });
-    if (sp.add || sp.remove.length) {
+    if (sp.add || sp.remove.length || addReady) {
       if (sp.add) provider.ensureLabel(repo, sp.add, { color: 'fbca04', description: PR_STATUS_DESCRIPTIONS[state] ?? 'auto-managed PR status' });
-      provider.setLabels(repo, pr, { add: sp.add ?? undefined, remove: sp.remove });
+      if (addReady) provider.ensureLabel(repo, 'ready-to-merge', { color: '0e8a16', description: 'Accepted with no red required checks; waiting to land' });
+      if (sp.add || sp.remove.length) provider.setLabels(repo, pr, { add: sp.add ?? undefined, remove: sp.remove });
+      if (addReady) provider.setLabels(repo, pr, { add: 'ready-to-merge', remove: [] });
       signalFix({ repo, pr, label: sp.add });
     }
   };

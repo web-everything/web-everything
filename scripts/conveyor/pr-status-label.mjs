@@ -69,6 +69,38 @@ function requiredCiRed(pr, labels, requiredChecks, settings) {
       || ['FAILURE', 'ERROR'].includes(c.state)));
 }
 
+const DECISION_BLOCK_LABELS = ['review:human', 'review:changes', 'review:pending', 'red-team:blocked', 'ci:failed'];
+
+/**
+ * PURE: is the PR ready to merge judged ONLY from its CURRENT decision labels on the live head? Every stale
+ * `status:*` label is ignored. `review:accepted` + `red-team:clear`, no hold or conflicting label, a trusted
+ * accept advisory AND red-team gate comment bound to this exact head, no conflict, and required checks green
+ * (merge-gate and review-gate excluded — they follow this decision). Anything else fails closed.
+ * @returns {{ready:boolean, reason:string|null}}
+ */
+export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = FALLBACK_REQUIRED_STATUS_CHECKS, settings = PR_STATUS_SETTING_DEFAULTS } = {}) {
+  const l = names(labels ?? pr?.labels);
+  if (!l.includes('review:accepted')) return { ready: false, reason: 'not-accepted' };
+  if (!l.includes('red-team:clear')) return { ready: false, reason: 'red-team-not-clear' };
+  const blocker = DECISION_BLOCK_LABELS.find((name) => l.includes(name));
+  if (blocker) return { ready: false, reason: `conflicting-label:${blocker}` };
+  if (pr.isDraft === true) return { ready: false, reason: 'draft' };
+  if (pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY') return { ready: false, reason: 'conflict' };
+  const head = String(pr?.headRefOid ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head)) return { ready: false, reason: 'head-unknown' };
+  const trusted = trustedAdvisoryComments(pr?.comments);
+  const advisory = parseAdvisories(trusted).find((a) => advisoryCoversHead(a, head));
+  if (!advisory || advisory.outcome !== ADVISORY_OUTCOMES.ACCEPT) return { ready: false, reason: 'no-head-accept' };
+  const gateAtHead = trusted.some((c) => String(c?.body ?? '').trimStart().startsWith('<!-- we:red-team-gate')
+    && new RegExp(`^<!-- we:red-team-gate pr=\\d+ rev=${head}[\\s]`).test(String(c.body).trimStart()));
+  if (!gateAtHead) return { ready: false, reason: 'no-head-red-team-evidence' };
+  const merged = { ...PR_STATUS_SETTING_DEFAULTS, ...settings };
+  const checks = (requiredChecks ?? FALLBACK_REQUIRED_STATUS_CHECKS)
+    .filter((name) => name !== 'merge-gate' && name !== 'review-gate');
+  if (requiredCiRed({ ...pr, labels: l.map((name) => ({ name })) }, l, checks, merged)) return { ready: false, reason: 'required-check-red' };
+  return { ready: true, reason: null };
+}
+
 /** PURE: classify a planner refusal using only this caller's required checks. */
 function reviewCiWait(row, { pr, defaultBranch, requiredChecks, settings }) {
   if (!['required-checks-not-successful', 'required-review-gate-conflict'].includes(row.ci?.reason)

@@ -1919,6 +1919,8 @@
   "scripts/conveyor/soak/breaks/red-team-gate-send-back-failed-never-retried.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/withdrawn-operator-block-directs-takeover.soak.test.mjs": 0.53,
   "scripts/conveyor/soak/breaks/ci-held-record-effect-never-resumes.soak.test.mjs": 2,
+  "scripts/conveyor/__tests__/status-from-decision-labels.test.mjs": 0.3,
+  "scripts/conveyor/soak/breaks/accepted-clear-stale-status-never-ready.soak.test.mjs": 5,
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
   "scripts/conveyor/soak/breaks/fixer-brief-chains-rearm-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
