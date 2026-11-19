@@ -200,6 +200,13 @@ describe('pinned diff context', () => {
 });
 
 describe('pinned caller evidence', () => {
+  it('an uppercase head SHA as baseRev cannot certify an empty own delta', () => {
+    const f = fixture(); const basis = resolve(f);
+    const plain = computeNetDiffSignals({ exec: f.exec, basis });
+    const upper = computeNetDiffSignals({ exec: f.exec, basis, baseRev: basis.headSha.toUpperCase() });
+    expect(upper.cumulativeDiffLines).toBe(plain.cumulativeDiffLines);
+    expect(upper.diffLines).toBe(plain.diffLines);
+  });
   it.each(['café.test.mjs', 'quote"slash\\.test.mjs'])('deleted test %s raises tamper hold or stays unscored', name => {
     const f = fixture();
     writeFileSync(join(f.dir, name), 'test("guard", () => expect(true).toBe(true));\n');

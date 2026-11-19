@@ -4460,7 +4460,7 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
     try {
       const cumulative = parseNumstat(diff(mergeBaseSha, ['--numstat']));
       let own = cumulative;
-      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseRev ?? '') && baseRev !== headSha) {
+      if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(baseRev ?? '') && baseRev.toLowerCase() !== String(headSha).toLowerCase()) {
         try {
           pinnedGit(exec, ['merge-base', '--is-ancestor', '--end-of-options', baseRev, headSha]);
           own = parseNumstat(diff(baseRev, ['--numstat']));
