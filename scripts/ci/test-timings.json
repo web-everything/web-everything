@@ -2028,6 +2028,7 @@
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2
+  "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1
  }
 }
