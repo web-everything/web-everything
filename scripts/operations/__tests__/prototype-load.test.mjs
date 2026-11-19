@@ -58,6 +58,7 @@ function fixture(options = {}) {
   const fs = {
     readFileSync(p) {
       reads.push(p);
+      if (options.waiverRequests && p.endsWith('/handoff/waiver-requests.jsonl')) return nodeFs.readFileSync(options.waiverRequests, 'utf8');
       if (options.waiverStore && p.endsWith('/coordination/ruled-weakened.jsonl')) return nodeFs.readFileSync(options.waiverStore, 'utf8');
       if (p.endsWith('/urgent-full-green.jsonl')) {
         if (options.urgentLedger === undefined) throw new Error('unreadable urgent ledger');
@@ -615,6 +616,20 @@ describe('prototype-load ruled-WEAKENED admission', () => {
       expect(warning).toHaveBeenCalledWith(expect.stringContaining(`Disclosed findings: ${findings[0]}`));
       expect(mutations(f, 'add')).toHaveLength(1);
     } finally { warning.mockRestore(); }
+  });
+
+  it('admits a recorded waiver then refuses after a later WITHDRAWN request is appended', async () => {
+    const dir = nodeFs.mkdtempSync(join(process.env.TMPDIR, 'waiver-revocation-'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const waiverStore = join(dir, 'store.jsonl'), waiverRequests = join(dir, 'requests.jsonl');
+      nodeFs.writeFileSync(waiverStore, JSON.stringify({ ...allowed, actor: 'operator', quote: 'approved', at: '2026-11-17T12:00:00Z' }) + '\n');
+      nodeFs.writeFileSync(waiverRequests, '');
+      const make = () => auditedFixture('refuse', { ready: auditLines([ready]), waiverStore, waiverRequests });
+      expect(await make().run()).toMatchObject({ ok: true, registered: true });
+      nodeFs.appendFileSync(waiverRequests, JSON.stringify({ ref: BASE.branch, sha: SHA, ruling: 'WITHDRAWN', at: '2026-11-18T12:00:00Z' }) + '\n');
+      expect(await make().run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready' });
+    } finally { warning.mockRestore(); nodeFs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it.each([

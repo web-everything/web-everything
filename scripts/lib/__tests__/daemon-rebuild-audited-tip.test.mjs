@@ -936,6 +936,19 @@ describe('unaudited-tip evidence and policy', () => {
       expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(false);
       expect(makeAuditedTipGate(withAllowlist(f, [entry()]))(ref, sha)).toBe(true);
     });
+    it('refuses an ops waiver revoked by a later WITHDRAWN request', () => {
+      const f = evidence();
+      f.save(weakened());
+      appendEntry({ ...entry(), actor: 'operator', quote: 'approved' }, {
+        path: storePath(f.env), now: () => '2026-11-17T12:00:00Z',
+      });
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(true);
+      write(f.dir, 'workspace/.operations/handoff/waiver-requests.jsonl', JSON.stringify({
+        ref: `${ref} (withdrawn)`, sha: sha.toUpperCase(), ruling: 'WITHDRAWN', at: '2026-11-18T12:00:00Z',
+      }) + '\n');
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(false);
+      expect(makeAuditedTipGate(withAllowlist(f, [entry()]))(ref, sha)).toBe(false);
+    });
     it('a self-declared ruling and disclosure with no operator allowlist entry stays held', () => {
       const f = evidence();
       f.save(weakened());

@@ -27,6 +27,69 @@ const union = (opts = {}) => loadRuledWeakened({ fs, env, ...opts });
 const append = (e = entry(), opts = {}) => appendEntry(e, { path, fs, now: () => at, ...opts });
 
 describe('ops ruled-weakened evidence', () => {
+  const requests = (...rows) => {
+    const file = join(home, 'workspace/.operations/handoff/waiver-requests.jsonl');
+    fs.mkdirSync(join(file, '..'), { recursive: true });
+    fs.appendFileSync(file, rows.map(r => typeof r === 'string' ? r : JSON.stringify(r)).join('\n') + '\n');
+    return file;
+  };
+  const withdrawn = (over = {}) => ({ ref: 'lane/fix (description)', sha: SHA.toUpperCase(), ruling: 'WITHDRAWN', at: '2026-11-18T12:00:00Z', ...over });
+  it('revokes a recorded waiver after a later WITHDRAWN, matching bare ref and case-insensitive sha', () => {
+    append();
+    expect(gate(union())).not.toBeNull();
+    requests(withdrawn());
+    expect(union()).toEqual([]);
+    expect(gate(union())).toBeNull();
+  });
+  it('keeps waivers newer than WITHDRAWN and admits a later store re-approval over revoked settings', () => {
+    append();
+    requests(withdrawn({ at: '2026-11-16T12:00:00Z' }));
+    expect(gate(union())).not.toBeNull();
+    requests(withdrawn());
+    append(entry(), { now: () => '2026-11-19T12:00:00Z' });
+    expect(union({ platform: [{ ...entry(), at: undefined }], tool: [{ ...entry(), at: undefined }] }))
+      .toEqual([expect.objectContaining({ layer: 'ops', at: '2026-11-19T12:00:00.000Z' })]);
+  });
+  it('does not revoke for another ref, sha or ruling', () => {
+    append();
+    requests(withdrawn({ ref: 'lane/other' }), withdrawn({ sha: 'b'.repeat(40) }), withdrawn({ ruling: 'APPROVED' }));
+    expect(gate(union())).not.toBeNull();
+  });
+  it.each([undefined, 'not-a-date', 0])('revokes all matching layers when WITHDRAWN has unusable at: %s', at => {
+    append();
+    requests(withdrawn({ at }));
+    expect(union({ platform: [entry()], tool: [entry()] })).toEqual([]);
+  });
+  it('revokes at equal timestamps and revokes undated platform/tool waivers even for older WITHDRAWN', () => {
+    append();
+    requests(withdrawn({ at }));
+    expect(union()).toEqual([]);
+    requests(withdrawn({ at: '2026-11-16T12:00:00Z' }));
+    for (const layer of ['platform', 'tool']) expect(union({ [layer]: [{ ...entry(), at: undefined }] })).toEqual([]);
+  });
+  it('ignores malformed request lines with warnings while still applying valid revocations', () => {
+    append();
+    requests('{bad', 'null', '{}', withdrawn());
+    const warn = vi.fn();
+    expect(union({ warn })).toEqual([]);
+    expect(warn.mock.calls.map(([s]) => s)).toEqual([1, 2, 3].map(i => expect.stringContaining(`line ${i}:`)));
+  });
+  it('fails closed for an unreadable request log, including platform/tool waivers, with a recovery warning', () => {
+    append();
+    const file = requests();
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    const warn = vi.fn();
+    expect(union({ platform: [entry()], tool: [entry()], warn })).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('Restore log readability'));
+  });
+  it('fails closed for a request log exceeding 16 MiB and asks the operator to archive it', () => {
+    append();
+    requests(' '.repeat(16 * 1024 * 1024));
+    const warn = vi.fn();
+    expect(union({ warn })).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/16 MiB.*archive/i));
+  });
   it('matches through the loader merge only with the same ref, full sha and verbatim ordered findings', () => {
     append();
     expect(gate(union())).toMatchObject({ ruledWeakened: { layer: 'ops' } });

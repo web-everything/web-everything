@@ -11,6 +11,43 @@ export function storePath(env = process.env) {
   return join(env.HOME, 'workspace/.operations/coordination/ruled-weakened.jsonl');
 }
 const nonblank = (v) => typeof v === 'string' && v.trim().length > 0;
+const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim();
+const revocationKey = e => JSON.stringify([bareRef(e.ref), String(e.sha ?? '').toLowerCase()]);
+const isoTime = at => typeof at === 'string'
+  && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(at) ? Date.parse(at) : NaN;
+
+/** Admission-time revocations for every waiver layer. Unreadable evidence revokes all waivers. */
+export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn } = {}) {
+  // Use the same HOME validation as the store; never fall back to an ambient home.
+  storePath(env);
+  const path = join(env.HOME, 'workspace/.operations/handoff/waiver-requests.jsonl');
+  let body;
+  try {
+    body = String(fs.readFileSync(path, 'utf8'));
+    if (Buffer.byteLength(body) > 16 * 1024 * 1024) throw Error('Input exceeds 16 MiB; archive old records and retry');
+  } catch (e) {
+    if (e.code === 'ENOENT') return () => false;
+    warn(`WARNING: waiver request log unreadable: ${e.message ?? e}; no waivers loaded. Restore log readability (archive oversized logs) and retry.`);
+    return () => true;
+  }
+  const withdrawn = new Map();
+  body.split(/\r?\n/).forEach((line, i) => {
+    if (!line.trim()) return;
+    try {
+      const request = JSON.parse(line);
+      if (!request || typeof request !== 'object' || Array.isArray(request)
+        || !nonblank(request.ref) || typeof request.sha !== 'string' || !/^[a-f0-9]{40}$/i.test(request.sha)
+        || !nonblank(request.ruling)) throw Error('invalid request');
+      if (request.ruling !== 'WITHDRAWN') return;
+      const key = revocationKey(request), time = isoTime(request.at);
+      withdrawn.set(key, Math.max(withdrawn.get(key) ?? -Infinity, Number.isFinite(time) ? time : Infinity));
+    } catch { warn(`WARNING: waiver request log line ${i + 1}: malformed JSON or invalid request; ignored`); }
+  });
+  return entry => {
+    const time = withdrawn.get(revocationKey(entry));
+    return time !== undefined && !(isoTime(entry.at) > time);
+  };
+}
 const entryFields = new Set(['ref', 'sha', 'ruling', 'findings', 'actor', 'at', 'quote', 'fingerprint']);
 export function validateEntry(e) {
   return !!e && typeof e === 'object' && !Array.isArray(e)

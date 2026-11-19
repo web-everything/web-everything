@@ -7,7 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
-import { readStore, storePath } from './ruled-weakened-store.mjs';
+import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -224,12 +224,14 @@ export function defaultDeps() {
 }
 /** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
 export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
-  const merged = mergeRuledWeakened(platform, tool, warn);
+  const isRevoked = withdrawnRevocations({ fs, env, warn });
+  const merged = mergeRuledWeakened(platform, tool, warn).filter(e => !isRevoked(e));
   const store = readStore({ path: storePath(env), fs, warn });
   if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);
   const key = e => JSON.stringify([e.ref, e.sha.toLowerCase(), e.ruling]);
   const seen = new Set(merged.map(key));
   for (const entry of store.entries) {
+    if (isRevoked(entry)) continue;
     if (!seen.has(key(entry))) { seen.add(key(entry)); merged.push({ ...entry, layer: 'ops' }); }
   }
   return merged;
