@@ -4588,6 +4588,11 @@ still list them. Changed live heads are re-keyed in place with attempts and bloc
 unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
 runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
 Planner skips retain the existing bounded, fair probe rotation.
+The `red-team-queue-verdict-evict` break also replays decided-head eviction: use
+`redTeamForHead` over complete trusted comments, never an unbound status label.
+Readable live fixtures must supply `comments: []` when no result exists; missing
+comment evidence retains the entry and defers admission. Decided heads must stay
+evicted when stale planner candidates return, including the card-only bypass.
 Run the soak `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
 
 ## Timeout evidence synchronous worker pool

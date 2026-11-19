@@ -9,13 +9,20 @@ import { isRealHead } from './red-team-skip-outcome.mjs';
 import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { isUnderTest } from './under-test.mjs';
-import { readRedTeamProbes } from './red-team-gate.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { readRedTeamProbes, redTeamForHead } from './red-team-gate.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 
 export function readLiveRedTeamPr({ repo, pr }) {
   if (isUnderTest()) return null; // Hermetic callers inject evidence; never spawn gh under tests.
-  return JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
+  const live = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
     { encoding: 'utf8', timeout: 15000, maxBuffer: 65536, throttle: { maxAttempts: 1 } }));
+  if (live.state === 'OPEN') {
+    try { live.comments = readCompletePrComments(pr, { repo,
+      exec: (_file, args, options) => runGhSync(args, { ...options, throttle: { maxAttempts: 1 } }),
+    }); } catch { live.comments = null; } // Keep live state/head even when verdict evidence cannot be read.
+  }
+  return live;
 }
 
 const transactions = new WeakMap();
@@ -110,7 +117,7 @@ export function defaultQueueFile(env = process.env, home = homedir()) {
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
   writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr } = {}) {
   let entries = [];
-  let live = new Map(), waiting = new Set();
+  let live = new Map(), waiting = new Set(), decided = new Set();
   let pending = null;
   let stale = false; // true after a failed persist, until a later write succeeds
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : 3;
@@ -164,7 +171,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     // Validate incoming PRs too: maintenance may have removed a terminal PR still present in a stale plan.
     // Each PR is read once per reconciliation; the daemon reader shares evidence across the tick.
     reconcile({ readLivePr: read = readLivePr, candidates = [] } = {}) {
-      live = new Map(); waiting = new Set();
+      live = new Map(); waiting = new Set(); decided = new Set();
       const persisted = new Set(entries);
       const subjects = new Map(entries.map(entry => [entry.key, entry]));
       for (const { repo, pr } of candidates) {
@@ -180,13 +187,24 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           continue;
         }
         live.set(entry.key, pr);
-        if (!persisted.has(entry)) continue;
-        if (pr.state !== 'OPEN') { remove(entry, `live PR ${pr.state.toLowerCase()}`); continue; }
-        if (pr.headRefOid !== entry.head) {
+        if (pr.state !== 'OPEN') {
+          if (persisted.has(entry)) remove(entry, `live PR ${pr.state.toLowerCase()}`);
+          continue;
+        }
+        if (persisted.has(entry) && pr.headRefOid !== entry.head) {
           // Re-key in place, preserving FIFO position; stale planner rows are deferred until they match.
           entry.head = pr.headRefOid; entry.attempts = 0;
           delete entry.blocked; delete entry.lastProbeTurn;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
+        }
+        if (!Array.isArray(pr.comments)) {
+          waiting.add(entry.key);
+          note(log, `keep ${entry.key}: red-team verdict evidence unreadable; admission deferred`);
+          continue;
+        }
+        if (redTeamForHead(pr.comments, entry.pr, pr.headRefOid)) {
+          decided.add(entry.key);
+          if (persisted.has(entry)) remove(entry, `red-team result already on head ${pr.headRefOid}`);
         }
       }
       return live;
@@ -194,7 +212,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     sync(repo, candidates) {
       candidates = candidates.filter(candidate => {
         const key = `${repo}#${Number(candidate.pr)}`, pr = live.get(key);
-        if (pr && pr.state !== 'OPEN') return false;
+        if (decided.has(key) || (pr && pr.state !== 'OPEN')) return false;
+        if (waiting.has(key)) return false;
         if (live.has(key) && (!pr || pr.headRefOid !== candidate.head)) { waiting.add(key); return false; }
         return true;
       });
@@ -282,7 +301,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   // Stage all queue mutations, including reconciliation, until the runner succeeds.
   transactions.set(queue, () => {
     const before = copy(entries), previousAdmissions = new Map(admissions);
-    const previousLive = live, previousWaiting = new Set(waiting);
+    const previousLive = live, previousWaiting = new Set(waiting), previousDecided = new Set(decided);
     pending = [];
     return {
       commit() {
@@ -301,7 +320,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       },
       abort() {
         entries = before;
-        live = previousLive; waiting = previousWaiting;
+        live = previousLive; waiting = previousWaiting; decided = previousDecided;
         admissions.clear();
         for (const [repo, admitted] of previousAdmissions) admissions.set(repo, admitted);
         pending = null;
@@ -383,7 +402,8 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const bypassed = new Set();
     for (const entry of cardOnlyCandidates) {
       const key = `${repo}#${entry.pr}`, livePr = liveEvidence.get(key);
-      const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head);
+      const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head
+        && Array.isArray(livePr.comments) && !redTeamForHead(livePr.comments, entry.pr, entry.head));
       if (current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
       else candidates.push(entry);
     }
