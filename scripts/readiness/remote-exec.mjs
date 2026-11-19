@@ -9,7 +9,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
-import {trackedTree, validateTrackedFile, validateCoverage, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_COVERAGE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
+import {trackedTree, validateTrackedFile, validateManifestFileBounds, validateCoverage, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_COVERAGE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
 export {FORGE_MANIFEST_SIZE_EXCEPTIONS, FORGE_MANIFEST_BINARY_EXTENSIONS} from './forge-manifest-tracked.mjs';
 
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
@@ -623,7 +623,7 @@ export async function buildManifest(options = {}) {
 }
 
 async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning,
-  manifestMode = 'legacy', sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS, totalCap = FORGE_MANIFEST_TOTAL_CAP, onTrackedHead} = {}) {
+  manifestMode = 'legacy', sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS, totalCap = FORGE_MANIFEST_TOTAL_CAP, byteBudget = {bytes:0}, onTrackedHead} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
   const trackedMode = manifestMode === 'tracked' && !trackedOnly;
@@ -825,20 +825,24 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     if(previous && stable && st.size===previous.size && executable===previous.executable)
       return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
-    const coverageInput=path.equals(Buffer.from('coverage/coverage-final.json'));
-    if (tree) {
+    const coverageInput=!trackedOnly && path.equals(Buffer.from('coverage/coverage-final.json'));
+    if (manifestMode === 'tracked') {
       const cap=coverageInput ? FORGE_MANIFEST_COVERAGE_CAP : FORGE_MANIFEST_FILE_CAP;
-      const blob=tree.entries.get(path.toString('base64'));
-      if (st.size>cap && (coverageInput || !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===blob?.oid)))
+      const oid=tree ? tree.entries.get(path.toString('base64'))?.oid : indexBlobs.get(path.toString('base64'));
+      if (st.size>cap && (coverageInput || !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===oid)))
         throw manifestRefusal('oversize',path);
     }
     const content = await readManifestFile(absolute,st,fs);
     if (tree) {
-      if (coverageInput) validateCoverage({content,cwd,tree,refuse:manifestRefusal,path});
+      if (coverageInput) await validateCoverage({content,cwd,tree,refuse:manifestRefusal,path,exec});
       if (!coverageInput || tree.entries.has(path.toString('base64'))) validateTrackedFile({path,content,st,tree,refuse:manifestRefusal,sizeExceptions});
+    } else if (manifestMode === 'tracked') {
+      validateManifestFileBounds({path,content,oid:indexBlobs.get(path.toString('base64')),refuse:manifestRefusal,sizeExceptions});
+    }
+    if (manifestMode === 'tracked') {
       admittedBytes+=content.length;
       admittedSizes.set(path.toString('hex'),content.length);
-      if (admittedBytes>totalCap) throw manifestRefusal('total-oversize',path);
+      if (byteBudget.bytes+admittedBytes>totalCap) throw manifestRefusal('total-oversize',path);
     }
     if (publicOid || trackedOnly) {
       publicOid ??= indexBlobs.get(path.toString('base64'));
@@ -896,9 +900,10 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
     return leaves;
   }
   for(const link of trackedLinks.values())entries.push(...project(link));
-  if (tree) {
+  if (manifestMode === 'tracked') {
     const total=entries.reduce((sum,entry)=>sum+(admittedSizes.get((entry.sourcePath??entry.path).toString('hex'))??0),0);
-    if(total>totalCap)throw manifestRefusal('total-oversize','.');
+    if(byteBudget.bytes+total>totalCap)throw manifestRefusal('total-oversize','.');
+    byteBudget.bytes+=total;
   }
   if(trackedLinks.size) {
     entries.sort((a,b)=>Buffer.compare(a.path,b.path));
@@ -929,14 +934,16 @@ async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, 
         const prefixes = Object.values(SIBLING_PATHS).map(path => Buffer.from(path.slice('../frontierui/'.length)+'/'));
         if (files.some(path => !prefixes.some(prefix => path.subarray(0,prefix.length).equals(prefix)))) throw new Error('Unsupported sibling inventory');
         const siblingDone=beginSub('sibling-inventory');
-        const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning});
+        const snapshot = await buildManifest({cwd:siblingRoot,exec,fs,listFiles:async()=>files,trackedOnly:true,onWarning,
+          ...(manifestMode === 'tracked' ? {manifestMode,env,sizeExceptions,totalCap,byteBudget} : {})});
         siblingDone();
         if (!sameSiblingEvidence(await checkSibling(siblingRoot,exec,fs),checked)) throw new Error('Sibling HEAD changed');
         siblings = {frontierui:{sha:checked.sha,roots:checked.roots,entries:snapshot.entries,excluded:snapshot.excluded}};
       }
     } catch (error) {
       if(typeof error.path==='string'){const rel=relative(resolve(cwd,'../frontierui'),Buffer.isBuffer(error.path)?error.path.toString('utf8'):error.path);if(rel&&!rel.startsWith('..'))error.siblingPath=rel;}
-      error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file'].includes(error.code) ? error.code : 'sibling-inventory-failed';
+      error.code = ['unsupported-sibling-dependency','excluded-source-file','ignored-test-file',
+        ...(manifestMode === 'tracked' ? ['oversize','total-oversize','binary-type'] : [])].includes(error.code) ? error.code : 'sibling-inventory-failed';
       throw error;
     }
   }

@@ -4815,12 +4815,20 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 ## Forge tracked-at-HEAD manifests (S1)
 
 `remote.manifest` defaults to `legacy`; `tracked` binds shipped regular files to the
-pinned HEAD blob and executable mode. Resolve it through the admission policy cascade
-(platform → tool → `WE_HEAVY_ADMISSION_REMOTE_MANIFEST`); the policy log includes its source.
+pinned HEAD blob and executable mode. Resolve it from the standard and platform preferences
+only; checkout settings and `WE_HEAVY_ADMISSION_REMOTE_MANIFEST` cannot override it, even
+in private pools. The policy log includes its source.
 Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
 Coverage is structure-validated Istanbul JSON, including absolute paths under the checkout;
-it is transported as input, never generated on Forge. Unknown fields or untracked paths
-refuse remote execution. Sibling snapshots keep their existing index-based behavior.
+it is transported as input, never generated on Forge. Named functions must occur as whole
+identifier tokens in the covered HEAD blob, read through the injected Git executor. Locations
+must fit that source, counters must be safe nonnegative integers, counter/map keys must match,
+and branch counter arrays must match the location counts. Unknown fields, unreadable HEAD
+source or untracked paths refuse remote execution. Sibling snapshots keep their existing
+index-based selection and identity checks; tracked runs also apply the path+oid size
+exceptions and binary allowlist, and count sibling bytes against the main manifest's total cap.
+Size/type refusals keep their manifest reason and are logged; operators can run locally or
+review a path+oid size exception. Legacy sibling behavior remains unchanged.
 
 Every tracked refusal and every legacy shadow verdict appends metadata only to
 `~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.

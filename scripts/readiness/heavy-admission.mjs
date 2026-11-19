@@ -309,16 +309,15 @@ const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
   wholeSuite: 'WE_HEAVY_ADMISSION_WHOLE_SUITE',
-  'remote.manifest': 'WE_HEAVY_ADMISSION_REMOTE_MANIFEST',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
 /** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite', 'remote.manifest']);
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'remote.manifest' || leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
+  if (leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -368,7 +367,7 @@ export function privateAdmissionPool(env, checkoutRoot) {
  * PURE: valid leaves override standard → platform → tool → env. Capacity and priority (everything but onTimeout) of
  * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
  * give two callers of one pool different caps or queue ordering. A private pool (see {@link privateAdmissionPool})
- * keeps both local override layers, except remote.clientPath is always platform-only.
+ * keeps both local override layers, except remote.clientPath and remote.manifest are always platform-only.
  */
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
@@ -387,6 +386,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         v = Symbol('unreadable admission setting'); // invalid even in the trusted platform layer
       }
       if (v === undefined) continue;
+      if (layer === 'tool' && leaf === 'remote.manifest') {
+        ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (only platform preferences may select manifest validation)`);
+        continue;
+      }
       if (layer === 'tool' && leaf === 'remote.clientPath') {
         ignored.push(`tool.${leaf}=${clientPathForLog(v)} (only platform preferences may select executable client code)`);
         continue;

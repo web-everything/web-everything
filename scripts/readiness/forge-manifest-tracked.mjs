@@ -50,28 +50,32 @@ export async function trackedTree({ cwd, exec, head, refuse, onHead }) {
   return { entries, head, algorithm };
 }
 
-export function validateTrackedFile({ path, content, st, tree, refuse, sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS }) {
-  const entry = tree.entries.get(path.toString('base64'));
-  if (!entry) throw refuse('untracked', path);
+export function validateManifestFileBounds({ path, content, oid, refuse, sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS }) {
   if (content.length > FORGE_MANIFEST_FILE_CAP && !sizeExceptions.some(exception =>
-    Buffer.from(exception.path).equals(path) && exception.oid === entry.oid)) throw refuse('oversize', path);
-  const oid = createHash(tree.algorithm).update(`blob ${content.length}\0`).update(content).digest('hex');
-  if (oid !== entry.oid || !!(st.mode & 0o111) !== (entry.mode === '100755')) throw refuse('dirty', path);
+    Buffer.from(exception.path).equals(path) && exception.oid === oid)) throw refuse('oversize', path);
   try { utf8(content); } catch {
     if (!FORGE_MANIFEST_BINARY_EXTENSIONS.includes(extname(path.toString('utf8')).toLowerCase())) throw refuse('binary-type', path);
   }
 }
 
+export function validateTrackedFile({ path, content, st, tree, refuse, sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS }) {
+  const entry = tree.entries.get(path.toString('base64'));
+  if (!entry) throw refuse('untracked', path);
+  validateManifestFileBounds({ path, content, oid: entry.oid, refuse, sizeExceptions });
+  const oid = createHash(tree.algorithm).update(`blob ${content.length}\0`).update(content).digest('hex');
+  if (oid !== entry.oid || !!(st.mode & 0o111) !== (entry.mode === '100755')) throw refuse('dirty', path);
+}
+
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const shape = (value, required, optional = []) => object(value)
   && required.every(key => Object.hasOwn(value, key)) && Object.keys(value).every(key => required.includes(key) || optional.includes(key));
-const count = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const integer = value => Number.isSafeInteger(value) && value >= 0;
+const count = integer;
 const position = value => shape(value, ['line', 'column']) && integer(value.line) && integer(value.column);
 const location = value => shape(value, ['start', 'end']) && position(value.start) && position(value.end);
 const map = (value, valid) => object(value) && Object.entries(value).every(([key, entry]) => /^\d+$/.test(key) && valid(entry));
-// Free text is the exfiltration channel: names are JS identifiers (or Istanbul's
-// anonymous label), branch types a closed set, hashes hex digests.
+// Free text is the exfiltration channel: names must also bind to HEAD source
+// below; branch types are a closed set and hashes are hex digests.
 const label = value => typeof value === 'string' && (/^[A-Za-z_$][\w$]{0,99}$/.test(value) || /^\(anonymous_\d{1,6}\)$/.test(value));
 const BRANCH_TYPES = new Set(['if', 'binary-expr', 'cond-expr', 'switch', 'default-arg', 'logical-assignment']);
 const digest = value => typeof value === 'string' && /^[a-f0-9]{1,64}$/.test(value);
@@ -81,7 +85,7 @@ const branch = value => shape(value, ['type', 'loc', 'locations'], ['line']) && 
   && location(value.loc) && Array.isArray(value.locations) && value.locations.every(location)
   && (!Object.hasOwn(value, 'line') || integer(value.line));
 
-export function validateCoverage({ content, cwd, tree, refuse, path }) {
+export async function validateCoverage({ content, cwd, tree, refuse, path, exec }) {
   if (content.length > FORGE_MANIFEST_COVERAGE_CAP) throw refuse('oversize', path);
   const invalid = () => refuse('coverage-invalid', path);
   let coverage;
@@ -91,11 +95,36 @@ export function validateCoverage({ content, cwd, tree, refuse, path }) {
     const repoPath = isAbsolute(key) ? relative(cwd, key) : key;
     // Reject normalization tricks, paths outside cwd and paths not in the pinned tree.
     try { pathParts(Buffer.from(repoPath)); } catch { throw invalid(); }
-    if (!tree.entries.has(Buffer.from(repoPath).toString('base64'))
+    const blob = tree.entries.get(Buffer.from(repoPath).toString('base64'));
+    if (!blob || !['100644', '100755'].includes(blob.mode)
       || !shape(value, ['path', 'statementMap', 'fnMap', 'branchMap', 's', 'f', 'b'], ['_coverageSchema', 'hash'])
       || value.path !== key || !map(value.statementMap, location) || !map(value.fnMap, fn) || !map(value.branchMap, branch)
       || !map(value.s, count) || !map(value.f, count) || !map(value.b, hits => Array.isArray(hits) && hits.every(count))
       || ['_coverageSchema', 'hash'].some(field => Object.hasOwn(value, field) && !digest(value[field]))) throw invalid();
+    const sameKeys = (hits, locations) => Object.keys(hits).length === Object.keys(locations).length
+      && Object.keys(locations).every(key => Object.hasOwn(hits, key));
+    if (!sameKeys(value.s, value.statementMap) || !sameKeys(value.f, value.fnMap) || !sameKeys(value.b, value.branchMap)
+      || Object.entries(value.b).some(([key, hits]) => hits.length !== value.branchMap[key].locations.length)) throw invalid();
+    let source;
+    try {
+      const result = await exec({ file: 'git', args: ['cat-file', 'blob', blob.oid], cwd });
+      if (result.code !== 0 || !Buffer.isBuffer(result.stdout)
+        || createHash(tree.algorithm).update(`blob ${result.stdout.length}\0`).update(result.stdout).digest('hex') !== blob.oid) throw invalid();
+      source = utf8(result.stdout);
+    } catch { throw invalid(); }
+    const lines = source.split(/\r\n|[\n\r\u2028\u2029]/);
+    const line = n => Number.isSafeInteger(n) && n >= 1 && n <= lines.length;
+    const boundedPosition = p => line(p.line) && p.column <= lines[p.line - 1].length + 1;
+    const boundedLocation = loc => boundedPosition(loc.start) && boundedPosition(loc.end);
+    // Token boundaries include Unicode identifier continuations so an ASCII
+    // substring inside a larger JS identifier cannot authorize an arbitrary name.
+    const identifiers = new Set(source.match(/(?<![$\u200c\u200d\p{ID_Continue}])[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*/gu) ?? []);
+    if (!Object.values(value.statementMap).every(boundedLocation)
+      || !Object.values(value.fnMap).every(fn => boundedLocation(fn.decl) && boundedLocation(fn.loc)
+        && (!Object.hasOwn(fn, 'line') || line(fn.line))
+        && (/^\(anonymous_\d{1,6}\)$/.test(fn.name) || identifiers.has(fn.name)))
+      || !Object.values(value.branchMap).every(branch => boundedLocation(branch.loc) && branch.locations.every(boundedLocation)
+        && (!Object.hasOwn(branch, 'line') || line(branch.line)))) throw invalid();
   }
 }
 

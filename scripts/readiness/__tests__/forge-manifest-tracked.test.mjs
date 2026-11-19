@@ -82,7 +82,7 @@ it('allowlisted WebP binary is admitted', async () => {
 });
 
 const location = () => ({ start: { line: 1, column: 0 }, end: { line: 1, column: 5 } });
-const coverageEntry = path => ({ path, statementMap: { 0: location() }, fnMap: { 0: { name: 'fn', decl: location(), loc: location(), line: 1 } },
+const coverageEntry = path => ({ path, statementMap: { 0: location() }, fnMap: { 0: { name: 'clean', decl: location(), loc: location(), line: 1 } },
   branchMap: { 0: { type: 'if', loc: location(), locations: [location()], line: 1 } }, s: { 0: 1 }, f: { 0: 0 }, b: { 0: [1] } });
 async function coverage(value) { await fs.mkdir(join(cwd, 'coverage'), { recursive: true }); await write('coverage/coverage-final.json', JSON.stringify(value)); }
 it.each(['relative', 'absolute'])('admits a structure-validated Istanbul map with %s paths', async kind => {
@@ -93,7 +93,9 @@ it.each(['relative', 'absolute'])('admits a structure-validated Istanbul map wit
 it('forged coverage extra text field falls back as coverage-invalid', async () => {
   await coverage({ 'clean.txt': { ...coverageEntry('clean.txt'), text: 'private text' } }); await fallback('coverage-invalid');
 });
-it.each(['unknown path', 'mismatched path', 'nested field', 'invalid location', 'negative hits', 'invalid name', 'text name', 'text branch type', 'text hash', 'array root', 'invalid JSON'])('coverage fails closed: %s', async fault => {
+it.each(['unknown path', 'mismatched path', 'nested field', 'invalid location', 'negative hits', 'invalid name', 'text name', 'text branch type', 'text hash', 'array root', 'invalid JSON',
+  'identifier-shaped secret', 'identifier substring', 'out-of-range line', 'out-of-range column', 'out-of-range function line', 'out-of-range branch line',
+  'statement counter keys', 'function counter keys', 'branch counter keys', 'branch counter length', 'unsafe hits', 'fractional hits'])('coverage fails closed: %s', async fault => {
   const value = { 'clean.txt': coverageEntry('clean.txt') }, entry = value['clean.txt'];
   if (fault === 'unknown path') { value['missing.txt'] = coverageEntry('missing.txt'); }
   if (fault === 'mismatched path') entry.path = 'package-lock.json';
@@ -104,9 +106,50 @@ it.each(['unknown path', 'mismatched path', 'nested field', 'invalid location', 
   if (fault === 'text name') entry.fnMap[0].name = 'AKIA secret key text';
   if (fault === 'text branch type') entry.branchMap[0].type = 'secret';
   if (fault === 'text hash') entry.hash = 'not a digest';
+  if (fault === 'identifier-shaped secret') entry.fnMap[0].name = 'AKIAIOSFODNN7EXAMPLE';
+  if (fault === 'identifier substring') entry.fnMap[0].name = 'lean';
+  if (fault === 'out-of-range line') entry.statementMap[0].end.line = 3;
+  if (fault === 'out-of-range column') entry.branchMap[0].locations[0].end.column = 7;
+  if (fault === 'out-of-range function line') entry.fnMap[0].line = 3;
+  if (fault === 'out-of-range branch line') entry.branchMap[0].line = 0;
+  if (fault === 'statement counter keys') entry.s = { 1: 1 };
+  if (fault === 'function counter keys') entry.f = {};
+  if (fault === 'branch counter keys') entry.b = { 0: [1], 1: [0] };
+  if (fault === 'branch counter length') entry.b[0] = [1, 0];
+  if (fault === 'unsafe hits') entry.f[0] = Number.MAX_SAFE_INTEGER + 1;
+  if (fault === 'fractional hits') entry.s[0] = 0.5;
   await coverage(fault === 'array root' ? [] : value);
   if (fault === 'invalid JSON') await write('coverage/coverage-final.json', '{');
   await expect(build()).rejects.toMatchObject({ code: 'coverage-invalid' });
+});
+it('admits a real HEAD function name and the line-length +1 boundary', async () => {
+  await write('clean.txt', 'function fn() {}\n'); commit();
+  const entry = coverageEntry('clean.txt');
+  entry.fnMap[0].name = 'fn';
+  entry.statementMap[0].end.column = 17;
+  entry.s[0] = Number.MAX_SAFE_INTEGER;
+  await coverage({ 'clean.txt': entry });
+  await expect(build()).resolves.toHaveProperty('entries');
+});
+it('admits Istanbul anonymous names without a source token', async () => {
+  const entry = coverageEntry('clean.txt'); entry.fnMap[0].name = '(anonymous_0)';
+  await coverage({ 'clean.txt': entry });
+  await expect(build()).resolves.toHaveProperty('entries');
+});
+it.each(['unreadable', 'wrong blob'])('coverage refuses %s HEAD source through the injected executor', async fault => {
+  await coverage({ 'clean.txt': coverageEntry('clean.txt') });
+  const exec = call => call.args.includes('cat-file') && call.args[call.args.indexOf('cat-file') + 1] === 'blob'
+    ? Promise.resolve({ code: fault === 'unreadable' ? 1 : 0, stdout: Buffer.from('clean') }) : defaultExec(call);
+  await expect(build({ exec })).rejects.toMatchObject({ code: 'coverage-invalid' });
+});
+it('coverage names cannot come from unverified working-tree bytes', async () => {
+  const entry = coverageEntry('clean.txt'); entry.fnMap[0].name = 'AKIAIOSFODNN7EXAMPLE';
+  await coverage({ 'clean.txt': entry });
+  const fakeDisk = { ...fs, readFile: async (...args) => {
+    const bytes = await fs.readFile(...args);
+    return Buffer.isBuffer(args[0]) && args[0].toString().endsWith('/clean.txt') ? Buffer.from('AKIAIOSFODNN7EXAMPLE') : bytes;
+  } };
+  await expect(build({ fs: fakeDisk })).rejects.toMatchObject({ code: expect.stringMatching(/^(dirty|coverage-invalid)$/) });
 });
 it('coverage has its own bounded cap before parsing', async () => {
   await fs.mkdir(join(cwd, 'coverage')); await write('coverage/coverage-final.json', ' '.repeat(FORGE_MANIFEST_COVERAGE_CAP + 1));
@@ -167,7 +210,7 @@ it('rejects malformed HEAD-tree evidence with a mode fallback', async () => {
   await fallback('mode', { exec: call => call.args.includes('--full-tree') ? Promise.resolve({ code: 0, stdout: Buffer.from('100600 blob ' + 'a'.repeat(40) + '\tclean.txt\0') })
     : call.file === 'git' ? defaultExec(call) : Promise.resolve({ code: 0, stdout: Buffer.alloc(0) }) });
 });
-it('resolves manifest setting through standard, platform, tool, environment with provenance', () => {
+it('resolves manifest setting through standard and platform with provenance', () => {
   expect(resolveAdmissionPolicy().settings.remote.manifest).toBe('legacy');
   for (const mode of ['tracked', 'legacy']) {
     const policy = resolveAdmissionPolicy({ platform: { remote: { manifest: mode } } });
@@ -175,6 +218,54 @@ it('resolves manifest setting through standard, platform, tool, environment with
     expect(formatAdmissionPolicy(policy)).toContain(`remote.manifest=${mode} (platform)`);
   }
   expect(resolveAdmissionPolicy({ platform: { remote: { manifest: 'unknown' } } }).invalid).toContain('platform.remote.manifest="unknown"');
-  const policy = resolveAdmissionPolicy({ platform: { remote: { manifest: 'tracked' } }, tool: { remote: { manifest: 'legacy' } }, env: { WE_HEAVY_ADMISSION_REMOTE_MANIFEST: 'tracked' } });
-  expect(policy.settings.remote.manifest).toBe('tracked'); expect(policy.sources['remote.manifest']).toBe('env WE_HEAVY_ADMISSION_REMOTE_MANIFEST');
+});
+it.each(['shared', 'private'])('env and checkout settings cannot downgrade platform tracked in a %s pool', pool => {
+  const env = { WE_HEAVY_ADMISSION_REMOTE_MANIFEST: 'legacy', ...(pool === 'private' ? { LANE_POOL_ROOT: join(root, 'private-pool') } : {}) };
+  for (const overrides of [{ env }, { env, tool: { remote: { manifest: 'legacy' } } }]) {
+    const policy = resolveAdmissionPolicy({ platform: { remote: { manifest: 'tracked' } }, ...overrides });
+    expect(policy.settings.remote.manifest).toBe('tracked');
+    expect(policy.sources['remote.manifest']).toBe('platform');
+    expect(formatAdmissionPolicy(policy)).toContain('remote.manifest=tracked (platform)');
+    if (overrides.tool) expect(policy.ignored).toContainEqual(expect.stringContaining('tool.remote.manifest='));
+  }
+});
+
+async function sibling(content, path = 'plugs/input.dat') {
+  await write('vitest.shared.ts', "export const root = '../frontierui/plugs';\n"); commit();
+  const main = cwd;
+  cwd = join(root, 'frontierui');
+  try {
+    await fs.mkdir(join(cwd, 'plugs'), { recursive: true }); await fs.mkdir(join(cwd, 'webtheme'));
+    git(['init', '-q']); await write(path, content); commit();
+    return git(['rev-parse', `HEAD:${path}`]);
+  } finally { cwd = main; }
+}
+it.each(['oversize', 'binary-type'])('tracked sibling refuses %s without dispatch and logs the manifest reason', async reason => {
+  await sibling(reason === 'oversize' ? 'x'.repeat(1048577) : Buffer.from([255, 254]));
+  await fallback(reason);
+  expect(await lines()).toContainEqual(expect.objectContaining({ mode: 'tracked', reason, path: 'plugs/input.dat' }));
+});
+it('tracked sibling size exceptions require the exact path and oid', async () => {
+  const oid = await sibling('x'.repeat(1048577));
+  await expect(build({ sizeExceptions: [{ path: 'plugs/input.dat', oid }] })).resolves.toHaveProperty('siblings');
+  for (const exception of [{ path: 'plugs/other.dat', oid }, { path: 'plugs/input.dat', oid: '0'.repeat(40) }])
+    await expect(build({ sizeExceptions: [exception] })).rejects.toMatchObject({ code: 'oversize' });
+});
+it('tracked sibling and main files share the total byte cap', async () => {
+  await sibling('x'.repeat(100));
+  // Each inventory fits separately, but their combined bytes exceed this cap.
+  await expect(build({ totalCap: 120 })).rejects.toMatchObject({ code: 'total-oversize' });
+  expect(await lines()).toContainEqual(expect.objectContaining({ reason: 'total-oversize' }));
+});
+it('tracked sibling admits allowlisted binary assets', async () => {
+  await sibling(Buffer.from([255, 254]), 'plugs/image.webp');
+  expect((await build()).siblings.frontierui.entries[0].path.toString()).toBe('plugs/image.webp');
+});
+it.each(['oversize', 'binary'])('legacy sibling still ships %s bytes with the same inventory', async kind => {
+  const content = kind === 'oversize' ? 'x'.repeat(1048577) : Buffer.from([255, 254]);
+  await sibling(content);
+  const manifest = await build({ manifestMode: 'legacy', env: { ...env, FORGE_MANIFEST_SHADOW: '0' }, totalCap: 1 });
+  expect(manifest.siblings.frontierui.entries).toEqual([expect.objectContaining({ path: Buffer.from('plugs/input.dat'),
+    sha256: createHash('sha256').update(content).digest('hex'), tracked: true })]);
+  await expect(fs.stat(log)).rejects.toMatchObject({ code: 'ENOENT' });
 });
