@@ -386,7 +386,7 @@ The four requirements below apply to that sequence; they do not require an earli
 1. **Related tests green on the exact commit, BEFORE the audit.** On the single final commit (card already resolved per step 8),
    run the diff-driven related-test selection (`verify-lane.mjs request`/`check`, no explicit `--gate` override). Any later commit invalidates the
    audit record and its waiver binding, so do not change code after this point without re-running both.
-2. **Codex audit on the net diff.** Push the commit, then run
+2. **Codex audit on the net diff.** After pushing that verified HEAD, run
    `node scripts/operations/run.mjs codex-audit --base=origin/main --head=<40-hex sha of your lane HEAD>` from the lane.
    Open the PR only on the verdict `NOT WEAKENED`. On `WEAKENED`: fix the findings, re-test, re-audit; at most 2 repair
    rounds. A new finding class in round 3 means stop and return `not-ready (audit-non-convergence)` with the findings;
