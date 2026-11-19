@@ -4470,7 +4470,15 @@ latest App run restores a held status and retains `.unpublished`. Tests inject G
 installation-token resolution, and exercise each race separately. Result authors use the gate's
 `isTrustedMarkerAuthor` rule. Republish requires a completed successful round App run with a readable
 title: Live-check and Policy-clear runs and their hold descriptions belong to their validated writers
-and never authorize round recovery. S2 repeats the fresh head, labels, trusted publishable result and
+and never authorize round recovery. Every round-writer publication attempt gives its holds and check
+summary the same unique round id (the hold precedes creation of the GitHub check id). Recovery takes
+that id from the successful App check, or uses the check-run id for checks without that marker, and requires an
+exact match on every unsettled bound hold. The only recoverable unbound legacy description is exactly
+`held: finished round not confirmed published`; queued/running/pending and unknown descriptions require
+operator inspection, even when the latest successful check is unchanged in both reads. Refusals name
+the offending status id and description. Restored holds preserve the recovered round binding. An
+inherited local hold flag never skips posting the new attempt's own bound hold before its check.
+S2 repeats the fresh head, labels, trusted publishable result and
 enqueue-hold reads; changed labels or result comments/authors, moved heads, blocking or unreadable
 evidence restore the hold and retain the outbox. A no-op rerun posts nothing; CLI dry-run returns S1 and the decision
 without publication or outbox removal. Round writers must resolve the App token before any remote hold;

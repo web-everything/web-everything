@@ -81,6 +81,20 @@ describe('publication republish id-based race verification', () => {
   it('restores when a new check run appears between observations', () => {
     const f = fixture(); f.state.afterPost = () => { f.state.runId = 51; }; expectRestored(f);
   });
+  it('restores when the same check changes its round binding between observations', () => {
+    const f = fixture(); f.state.checkRun.output.summary = 'Result\nRed-team round: recovered-round';
+    f.state.afterPost = next => { if (next.state === 'success') f.state.checkRun.output.summary = 'Result\nRed-team round: other-round'; };
+    expectRestored(f);
+    expect(f.state.posts[1].description).toBe('held: finished round recovered-round not confirmed published');
+  });
+  it('a restored hold keeps its binding and remains recoverable after an ambiguous POST', () => {
+    const f = fixture(); f.state.checkRun.output.summary = 'Result\nRed-team round: recovered-round';
+    f.state.response = next => { if (next.state === 'success') throw Error('timeout'); return next; };
+    expectRestored(f);
+    expect(f.state.posts[1].description).toBe('held: finished round recovered-round not confirmed published');
+    delete f.state.response;
+    expect(f.run()).toMatchObject({ ok: true, runId: 50 });
+  });
   it.each([
     ['blocking label', f => { f.state.live.labels = [{ name: 'review:human' }]; }],
     ['nonblocking label change', f => { f.state.live.labels = ['new-label']; }],
@@ -143,6 +157,62 @@ describe('publication republish id-based race verification', () => {
 });
 
 describe('publication republish closed paths', () => {
+  it.each(['queued', 'running', 'pending'].flatMap(state =>
+    ['publication in progress', 'not confirmed published'].map(reason => [state, reason])))
+  ('refuses an unbound %s hold already present in S1 (%s), naming it before any POST', (state, reason) => {
+    const f = fixture();
+    const description = `held: ${state} round ${reason}`;
+    f.state.history[0].description = description;
+    expect(f.run()).toMatchObject({ ok: false, reason: expect.stringContaining(`publication hold 10 (${description})`) });
+    expect(f.state.posts).toEqual([]);
+    expect(existsSync(`${f.path}.unpublished`)).toBe(true);
+  });
+  it('accepts the exact legacy unbound finished hold', () => {
+    const f = fixture();
+    expect(f.run()).toMatchObject({ ok: true, runId: 50 });
+    expect(f.state.posts.map(s => s.state)).toEqual(['success']);
+  });
+  it.each(['pending', 'queued', 'running', 'finished'].flatMap(state =>
+    ['publication in progress', 'not confirmed published'].map(reason => [state, reason])))
+  ('accepts a %s hold bound to the recovered check id (%s)', (state, reason) => {
+    const f = fixture(); f.state.history[0].description = `held: ${state} round 50 ${reason}`;
+    expect(f.run()).toMatchObject({ ok: true, runId: 50 });
+  });
+  it.each(['pending', 'queued', 'running', 'finished'])('refuses a %s hold bound to a different check, even when the successful check is unchanged', state => {
+    const f = fixture(); f.state.history[0].description = `held: ${state} round 51 not confirmed published`;
+    expect(f.run()).toMatchObject({ ok: false, reason: expect.stringContaining('publication hold 10') });
+    expect(f.state.posts).toEqual([]); expect(existsSync(`${f.path}.unpublished`)).toBe(true);
+    expect(f.state.runId).toBe(50);
+  });
+  it('requires every unsettled hold to match, including a foreign hold below our finished hold', () => {
+    const f = fixture(); f.state.history.splice(1, 0, status(9, 'failure', { description: 'held: queued round 51 publication in progress' }));
+    expect(f.run()).toMatchObject({ ok: false, reason: expect.stringContaining('publication hold 9') });
+    expect(f.state.posts).toEqual([]);
+  });
+  it('binds a new round id from the successful check summary rather than inferring it from local state', () => {
+    const f = fixture(), roundId = '9c59c9f9-29a2-4c1f-9a14-f8c867a15542';
+    f.state.checkRun.output.summary = `Round result\nRed-team round: ${roundId}`;
+    f.state.history[0].description = `held: running round ${roundId} publication in progress`;
+    expect(f.run()).toMatchObject({ ok: true, runId: 50 });
+  });
+  it('refuses a different round id even when the check run id still matches', () => {
+    const f = fixture(); f.state.checkRun.output.summary = 'Round result\nRed-team round: recovered-round';
+    f.state.history[0].description = 'held: running round 50 publication in progress';
+    expect(f.run()).toMatchObject({ ok: false, reason: expect.stringContaining('recovered round recovered-round') });
+    expect(f.state.posts).toEqual([]);
+  });
+  it.each([
+    'held: finished round publication in progress',
+    'held: red-team round not confirmed published',
+    'held: publication republish unconfirmed; operator must inspect',
+    'held: finished round 50 unknown state',
+    'held: queued round 050 not confirmed published',
+    `held: running round ${'x'.repeat(65)} not confirmed published`,
+  ])('refuses unknown, malformed or nonmatching hold descriptions: %s', description => {
+    const f = fixture(); f.state.history[0].description = description;
+    expect(f.run()).toMatchObject({ ok: false, reason: expect.stringContaining('operator must inspect') });
+    expect(f.state.posts).toEqual([]);
+  });
   it.each([
     ['foreign-host pid', f => { f.state.local.host = 'foreign-fixture-host'; }],
     ['not finished', f => { f.state.local.status = 'running'; }],
@@ -274,11 +344,50 @@ describe('round writers require App authentication and publish nothing for not-o
     expect(JSON.parse(readFileSync(f.path, 'utf8')).sendBack).toBe(true);
     expect(f.run().ok).toBe(false); expect(f.state.posts).toEqual([]);
   });
-  it('resolved synthetic App credentials are pinned on the actual round hold and check POSTs', () => {
+  it.each(['pending', 'queued', 'running', 'finished'])('the %s writer includes the same round id in its actual hold description and check POST', state => {
     const f = fixture(); rmSync(`${f.path}.unpublished`);
-    expect(recordRedTeamStatus({ repo, pr, loopPayload: { findings: { read: { netBasis: { rev: head } } } }, status: 'running' },
+    expect(recordRedTeamStatus({ repo, pr, loopPayload: { findings: { read: { netBasis: { rev: head } } } }, status: state },
       { env: f.env, gh: f.gh })).toEqual({ published: true });
-    expect(f.state.posts.map(s => s.state)).toEqual(['failure', 'in_progress', 'success']);
+    expect(f.state.posts.map(s => s.state)).toEqual(['failure', state === 'finished' ? 'completed' : 'in_progress', 'success']);
+    const roundId = /\nRed-team round: ([\w-]+)$/.exec(f.state.posts[1].output.summary)?.[1];
+    expect(roundId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(f.state.posts[0].description).toBe(`held: ${state} round ${roundId} publication in progress`);
+    expect(f.state.posts[0].description.length).toBeLessThanOrEqual(140);
+  });
+  it('the fallback hold and failure supersede retain the original round id after publication fails', () => {
+    const f = fixture(), checks = []; rmSync(`${f.path}.unpublished`);
+    let attempts = 0;
+    expect(recordRedTeamStatus({ repo, pr, loopPayload: { findings: { read: { netBasis: { rev: head } } } }, status: 'running' },
+      { env: f.env, gh: f.gh, log: () => {},
+        postPublicationHold: args => ++attempts === 1 ? { ok: false, reason: 'HTTP 502' } : postRedTeamPublicationHold(args),
+        postCheckRun: ({ payload }) => { checks.push(payload); return { ok: false, reason: 'HTTP 502' }; } }))
+      .toMatchObject({ published: false });
+    const roundId = /\nRed-team round: ([\w-]+)$/.exec(checks[0].output.summary)?.[1];
+    expect(roundId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(checks.every(check => check.output.summary.endsWith(`\nRed-team round: ${roundId}`))).toBe(true);
+    expect(f.state.posts[0].description).toBe(`held: running round ${roundId} not confirmed published`);
+    expect(f.state.posts[0].description.length).toBeLessThanOrEqual(140);
+  });
+  it('a new attempt with an inherited hold posts its own distinct binding before its check', () => {
+    const f = fixture(), checks = [], holds = []; rmSync(`${f.path}.unpublished`);
+    const input = { repo, pr, loopPayload: { findings: { read: { netBasis: { rev: head } } } } };
+    const options = { env: f.env, gh: f.gh, log: () => {},
+      postPublicationHold: hold => { holds.push(hold); return hold.held ? { ok: true } : { ok: false, reason: 'HTTP 502' }; },
+      postCheckRun: ({ payload }) => { checks.push(payload); return { ok: false, reason: 'HTTP 502' }; } };
+    expect(recordRedTeamStatus({ ...input, status: 'running' }, options)).toMatchObject({ published: false });
+    const firstRound = /\nRed-team round: ([\w-]+)$/.exec(checks[0].output.summary)?.[1];
+    expect(firstRound).toMatch(/^[a-f0-9-]{36}$/);
+    expect(recordRedTeamStatus({ ...input, status: 'finished' }, { ...options,
+      postCheckRun: ({ payload }) => {
+        expect(holds.at(-1).held).toBe(true);
+        checks.push(payload); return { ok: true };
+      } })).toMatchObject({ published: false });
+    const secondRound = /\nRed-team round: ([\w-]+)$/.exec(checks.at(-1).output.summary)?.[1];
+    expect(secondRound).toMatch(/^[a-f0-9-]{36}$/);
+    expect(secondRound).not.toBe(firstRound);
+    expect(holds.filter(h => h.held).map(h => h.reason)).toEqual([
+      `running round ${firstRound} publication in progress`, `finished round ${secondRound} publication in progress`,
+    ]);
   });
   it('token resolution strips inherited credentials and never exposes a token in its result', () => {
     const gh = vi.fn(() => 'ghs_synthetic_fixture_only');

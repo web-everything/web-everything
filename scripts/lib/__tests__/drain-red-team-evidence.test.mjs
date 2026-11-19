@@ -366,17 +366,17 @@ describe('status persistence and check publication share one claim', () => {
       .toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible publication hold set') });
     expect(order).toEqual(['hold', 'check', 'check', 'check', 'check']);
     expect(holds).toEqual([true]);
-    // A later attempt whose failure supersede does post must not drop the set hold.
+    // A later attempt posts its own bound hold; a confirmed failure supersede must not drop either hold.
     let calls = 0;
     expect(recordRedTeamStatus(input, options(() => (++calls > 3 ? { ok: true } : { ok: false, reason: 'flaky' }))))
       .toMatchObject({ published: false, reason: expect.stringContaining('failure check superseded prior success') });
-    expect(holds).toEqual([true]);
+    expect(holds).toEqual([true, true]);
     // Clearing that fails keeps both holds; the next confirmed publication clears them.
     expect(recordRedTeamStatus(input, { ...options(() => ({ ok: true })), postPublicationHold: () => ({ ok: false, reason: 'statuses API down' }) }))
       .toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible hold was not cleared') });
     expect(readRedTeamPublicationHold(f)).toMatch(/retry check publication/);
     expect(recordRedTeamStatus(input, options(() => ({ ok: true })))).toEqual({ published: true });
-    expect(holds).toEqual([true, false]);
+    expect(holds).toEqual([true, true, true, false]);
     expect(readRedTeamPublicationHold(f)).toBeNull();
     // A fresh transition sets the hold before its post and clears it after confirmation.
     order.length = 0;
@@ -416,7 +416,7 @@ describe('status persistence and check publication share one claim', () => {
     const result = recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {},
       postPublicationHold: hold => { calls.push(hold.held); return { ok: false, reason: 'HTTP 502' }; },
       postCheckRun: () => ({ ok: false, reason: 'down' }) });
-    expect(calls).toEqual([true]);
+    expect(calls).toEqual([true, true]); // this attempt's bound pre-hold, then its failed-publication fallback
     expect(result).toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible hold also failed') });
   });
 

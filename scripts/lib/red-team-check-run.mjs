@@ -184,7 +184,9 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId, 
     ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
+  const roundId = /\nRed-team round: ([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/.exec(runs[0].output?.summary ?? '')?.[1];
   return { ok: true, reason: 'red-team check run succeeded on head', runId: runs[0].id,
+    ...(roundId ? { roundId } : {}),
     completedAt: runs[0].completed_at ?? null, liveCheck: isLiveCheckRun(runs[0]) };
 }
 
@@ -203,7 +205,7 @@ export const isLiveCheckRun = run => typeof run?.output?.title === 'string'
   && run.output.title.startsWith(LIVE_CHECK_TITLE_PREFIX);
 
 export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBack = false, policyClear = false,
-  liveCheck = false } = {}) {
+  liveCheck = false, roundId } = {}) {
   const finished = status === 'finished';
   const clear = finished && hold === null && sendBack === false;
   // The live helper posts only finished runs; an in-progress run never carries its prefix.
@@ -211,7 +213,8 @@ export function redTeamCheckRunPayload({ repo, pr, headSha, status, hold, sendBa
   return { name: 'red-team', head_sha: headSha, external_id: prIdentity(repo, pr), status: finished ? 'completed' : 'in_progress',
     ...(finished ? { conclusion: clear ? 'success' : 'failure' } : {}),
     output: { title: `${prefix}${clear ? 'Red team clear' : finished ? 'Red team held' : 'Red team in progress'}`,
-      summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000) } };
+      summary: `${prIdentity(repo, pr) ?? 'Unknown PR'}: ${String(hold ?? (sendBack ? 'Red team requires send-back' : clear ? 'Red team cleared this head' : 'Awaiting red-team completion'))}`.slice(0, 60_000)
+        + (roundId ? `\nRed-team round: ${roundId}` : '') } };
 }
 
 /** Publication is best effort; callers must persist local status before calling. Posts as the WE App
@@ -696,18 +699,24 @@ const isLiveHoldDescription = description => typeof description === 'string' && 
 const isPolicyClearHoldDescription = description => description === `held: ${POLICY_CLEAR_HOLD_PENDING}`;
 
 /** Non-success entries above the newest trusted success, ordered only by GitHub status id.
- * Recovery always supplies a complete history, including entries below the prior success. */
-export function readUnsettledPublicationHolds({ statuses, context, complete }) {
+ * Recovery always supplies a complete history, including entries below the prior success, and validates every
+ * unsettled hold against the recovered round before posting a clear. */
+export function readUnsettledPublicationHolds({ statuses, context, complete, ownsHold, roundId }) {
   if (complete !== true || !Array.isArray(statuses)) throw Error('publication history incomplete; operator must inspect full commit status history');
   const ordered = statuses.filter(status => status.context === context).sort((a, b) => b.id - a.id);
   const settled = ordered.findIndex(status => status.state === 'success'
     && isTrustedMarkerAuthor({ user: status.creator }));
-  return (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
+  const holds = (settled < 0 ? ordered : ordered.slice(0, settled)).filter(status => status.state !== 'success');
+  if (ownsHold) {
+    const foreign = holds.find(status => !ownsPublicationHold(status, ownsHold, roundId));
+    if (foreign) throw Error(`publication hold ${foreign.id} (${foreign.description}) not owned by recovered round ${roundId}: binding mismatch, unknown writer description or untrusted author; operator must inspect`);
+  }
+  return holds;
 }
 
 /** A recognized writer description and trusted GitHub-assigned creator are both required. */
-export function ownsPublicationHold(status, ownsHold) {
-  return ownsHold(status.description, status) && isTrustedMarkerAuthor({ user: status.creator });
+export function ownsPublicationHold(status, ownsHold, roundId) {
+  return ownsHold(status.description, status, roundId) && isTrustedMarkerAuthor({ user: status.creator });
 }
 
 /** #6606: clear the GitHub-visible publication hold the live helper set, once a later attempt is confirmed. It clears

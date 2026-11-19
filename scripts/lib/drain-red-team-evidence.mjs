@@ -65,10 +65,17 @@ export function readRedTeamPublicationHold({ repo, pr, head, env = process.env }
   }
 }
 
-const knownPublicationHold = description => typeof description === 'string' && (
-  /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(description)
-  || description === 'held: red-team round not confirmed published'
-  || description === 'held: publication republish unconfirmed; operator must inspect');
+const knownPublicationHold = (description, _status, roundId) => {
+  if (typeof description !== 'string') return false;
+  const bound = /^held: (pending|running|finished|queued) round ([A-Za-z0-9][A-Za-z0-9._-]{0,63}) (publication in progress|not confirmed published)$/.exec(description);
+  if (bound) return roundId === undefined || bound[2] === String(roundId);
+  // Nomination is cheap and cannot clear anything. Execution requires the exact legacy finished state;
+  // another host's unbound queued/running/pending hold cannot belong to our finished check by inference.
+  if (roundId !== undefined) return description === 'held: finished round not confirmed published';
+  return /^held: (pending|running|finished|queued) round (publication in progress|not confirmed published)$/.test(description)
+    || description === 'held: red-team round not confirmed published'
+    || description === 'held: publication republish unconfirmed; operator must inspect';
+};
 
 /** Cheap nomination only; the executor rechecks all evidence under both writer locks. */
 export function readRoundPublicationHold({ repo, pr, head, env = process.env, gh = runGhSync }) {
@@ -88,7 +95,7 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
   readCheck, readComments, readLivePr, enqueueHold = redTeamEnqueueHold, postHold = postRedTeamPublicationHold,
   resolveWriter = resolveRedTeamWriter,
   lock = fn => withRedTeamCheckLock({ repo, pr, headSha: head, env }, fn) } = {}) {
-  let before = null, posted = false, writer;
+  let before = null, posted = false, writer, roundId;
   const fail = reason => ({ ok: false, reason: safeText(reason), ...(dryRun ? { before, decision: 'refuse' } : {}) });
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '') || !redTeamPublicationContext(pr) || !/^[a-f0-9]{40}$/i.test(head ?? ''))
     return fail('invalid publication identity');
@@ -126,13 +133,14 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
           return value.statuses.filter(s => s.context === redTeamPublicationContext(pr)).sort((a, b) => b.id - a.id);
         };
         before = history();
-        const holds = readUnsettledPublicationHolds({ statuses: before, context: redTeamPublicationContext(pr), complete: true });
-        if (!holds.length && before.some(s => s.state === 'success' && isTrustedMarkerAuthor({ user: s.creator })))
-          return { ok: true, noop: true, ...(dryRun ? { before, decision: 'noop' } : {}) };
-        if (holds.some(s => !ownsPublicationHold(s, knownPublicationHold))) return fail('unknown writer description or untrusted publication hold author; operator must inspect');
         // 3. Bind both observations to the latest App run id.
         const fact = readCheck({ repo, pr, headSha: head });
         if (fact?.ok !== true || !Number.isSafeInteger(fact.runId) || fact.runId <= 0) return fail(fact?.reason ?? 'latest App check unreadable');
+        roundId = fact.roundId ?? String(fact.runId);
+        const holds = readUnsettledPublicationHolds({ statuses: before, context: redTeamPublicationContext(pr), complete: true,
+          ownsHold: knownPublicationHold, roundId });
+        if (!holds.length && before.some(s => s.state === 'success' && isTrustedMarkerAuthor({ user: s.creator })))
+          return { ok: true, noop: true, ...(dryRun ? { before, decision: 'noop' } : {}) };
         // 4. Recompute the current intent with fresh reads, using gate-parity author trust.
         const readIntent = () => {
           const live = readLivePr();
@@ -168,7 +176,8 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
           || before.some(s => !after.some(t => t.id === s.id && t.state === s.state))
           || after.some(s => s.state !== 'success' && !ids.has(s.id))) throw Error('publication history changed or missing ids after POST');
         const check = readCheck({ repo, pr, headSha: head });
-        if (check?.ok !== true || check.runId !== fact.runId) throw Error('latest App check changed after POST');
+        if (check?.ok !== true || check.runId !== fact.runId || (check.roundId ?? String(check.runId)) !== roundId)
+          throw Error('latest App check changed after POST');
         if (readIntent() !== intent) throw Error('live publication intent changed after POST; operator must inspect');
         // 7. Only confirmed publication removes the local outbox.
         rmSync(`${path}.unpublished`, { force: true });
@@ -178,7 +187,7 @@ export function republishPublicationStatus({ repo, pr, head, env = process.env, 
         if (posted) {
           try {
             const restored = postHold({ repo, pr, headSha: head, held: true,
-              reason: 'publication republish unconfirmed; operator must inspect', gh: writer.gh, env: redTeamWriterEnv(freshEnv) });
+              reason: `finished round ${roundId} not confirmed published`, gh: writer.gh, env: redTeamWriterEnv(freshEnv) });
             if (restored?.ok !== true) reason += '; hold restore unconfirmed; operator must inspect';
           } catch { reason += '; hold restore unconfirmed; operator must inspect'; }
         }
@@ -864,6 +873,9 @@ export function recordRedTeamStatus(input, options = {}) {
         // unlocked: it is the last resort when the lock itself fails. A lock failure is a non-definite clear failure
         // (the hold stays and is retried). Tests without a lock directory keep the injected IO unlocked.
         const writerEnv = options.env ?? process.env;
+        // The check id does not exist when the pre-publication hold is posted. Give this attempt a unique
+        // round id and put it in both channels, so another host can prove which check owns the hold.
+        const roundId = randomUUID();
         const clearLock = options.publicationLock ?? (underTest && !writerEnv.WE_RED_TEAM_CHECK_LOCK_DIR ? fn => fn()
           : fn => withRedTeamCheckLock({ repo: input.repo, pr: input.pr, headSha: head, env: writerEnv }, fn));
         const postHold = ({ held, reason }) => {
@@ -882,17 +894,19 @@ export function recordRedTeamStatus(input, options = {}) {
         // Set the GitHub-visible hold BEFORE any check post, so no CI read during the retries below sees the older
         // success unheld. Record the intent first: a crash after the post still clears it on the next confirmation.
         // A definite rejection (HTTP 4xx: e.g. the token lacks statuses:write) created no status, so the intent is
-        // withdrawn and nothing is left that a later clear would have to remove (no wedge).
+        // withdrawn; an inherited hold still needs a clear even if this credential cannot post a new one.
         let preHold = null; // confirmed only when posted by THIS call; an inherited flag proves nothing landed
         const setRemoteHold = why => {
           if (!statusChannel) return { ok: false, reason: 'no status IO in this test run' };
+          const inheritedHold = remoteHold;
           remoteHold = true;
           writeHold();
           const result = postHold({ held: true, reason: why });
-          if (!result.ok && result.definite) { remoteHold = false; writeHold(); }
+          if (!result.ok && result.definite) { remoteHold = inheritedHold; writeHold(); }
           return result;
         };
-        if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
+        // An inherited flag may describe another round: this attempt must bind its own hold before its check.
+        preHold = setRemoteHold(`${input.status} round ${roundId} publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
         let checkStatus = input.status;
@@ -922,7 +936,7 @@ export function recordRedTeamStatus(input, options = {}) {
           if (!sendBack && typeof hold === 'string' && (hold.startsWith(RED_TEAM_UNSEALED_HOLD_PREFIX)
             || (hold.startsWith(RED_TEAM_NO_RESULT_HOLD_PREFIX) && persistedOwesPublication(path)))) checkStatus = 'running';
         }
-        const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack });
+        const payload = redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: checkStatus, hold, sendBack, roundId });
         const post = payload => {
           try {
             const result = (options.postCheckRun ?? postRedTeamCheckRun)({ repo: input.repo, pr: input.pr, headSha: head, payload, gh,
@@ -955,12 +969,12 @@ export function recordRedTeamStatus(input, options = {}) {
         }
         let reason = `Unpublished ${input.status} red-team round for PR #${input.pr} on ${head}: ${posted.reason}`;
         {
-          const supersede = post(redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: 'finished', hold: reason, sendBack: true }));
+          const supersede = post(redTeamCheckRunPayload({ repo: input.repo, pr: input.pr, headSha: head, status: 'finished', hold: reason, sendBack: true, roundId }));
           if (supersede.ok) reason += '; failure check superseded prior success';
           else {
             // The second channel (a head-bound commit status every CI host reads) was set before the posts. Retry
             // it once only if that attempt did not confirm.
-            const held = preHold?.ok === true ? preHold : setRemoteHold(`${input.status} round not confirmed published`);
+            const held = preHold?.ok === true ? preHold : setRemoteHold(`${input.status} round ${roundId} not confirmed published`);
             reason += held.ok ? `; failure supersede also failed: ${supersede.reason}; GitHub-visible publication hold set`
               : `; failure supersede also failed: ${supersede.reason}; GitHub-visible hold also failed: ${held.reason}; operator must inspect GitHub check history before merging`;
           }
