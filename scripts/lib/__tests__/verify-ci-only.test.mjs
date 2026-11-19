@@ -45,14 +45,18 @@ describe('R1086 measured host saturation', () => {
     expect(decide({ verify: undefined, saturation })).toBeNull();
     expect(saturation).not.toHaveBeenCalled();
   });
-  it('allows every open mode and ignores even an in-flight running marker without reading or waiting', () => {
+  it('allows every open mode and ignores an in-flight running marker', () => {
     for (const mode of ['park', 'label-on-green', 'open-only']) {
       const ciOnly = decide({ mode });
       const readMarker = vi.fn(() => ({ sha, status: 'running', startedAt: new Date().toISOString() }));
-      const runGit = vi.fn();
-      expect(resolveFinishGuardVerdict({ headSha: sha, ciOnly, readMarker, runGit })).toBe(ciOnly);
-      expect(readMarker).not.toHaveBeenCalled();
-      expect(runGit).not.toHaveBeenCalled();
+      expect(resolveFinishGuardVerdict({ headSha: sha, ciOnly, readMarker, runGit: vi.fn() })).toBe(ciOnly);
+    }
+  });
+  it('still refuses a red or corrupt marker for the sha', () => {
+    const ciOnly = decide();
+    for (const marker of [{ sha, status: 'red', exitCode: 1, finishedAt: new Date().toISOString() }, { corrupt: true }]) {
+      const v = resolveFinishGuardVerdict({ headSha: sha, ciOnly, readMarker: () => marker, runGit: vi.fn() });
+      expect(v.ok).toBe(false);
     }
   });
   it('discloses sanitized bounded reasons on create and rerun, idempotently', () => {

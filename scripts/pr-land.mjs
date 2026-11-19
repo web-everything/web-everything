@@ -783,10 +783,12 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
  * @returns {{ ok: boolean, status: string, reason: string, detail: string }}
  */
 export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs, ciOnly = null }) {
-  if (ciOnly) return ciOnly; // R1086: do not read, wait for, or judge the local marker.
   const verifyRecord = readMarker(gitDir);
   const laneRelevantChangeSinceRecord = laneRelevantChangeSinceForRecord({ record: verifyRecord, headSha, base: `${remote}/${base}`, runGit });
-  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs });
+  const verdict = verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs });
+  // R1086: host saturation substitutes CI only for a verify that is missing or still in flight; a red or corrupt marker still refuses.
+  if (ciOnly && !verdict.ok && (verdict.status === 'running' || verdict.status === 'absent')) return ciOnly;
+  return verdict;
 }
 
 /** Preserve the original push error while explaining a rejected lane tip. */
@@ -1060,9 +1062,9 @@ async function runCli() {
       verdict = resolveFinishGuardVerdict({ ...finishArgs, ciCheckRuns: readCiCheckRuns({ repo: slug, headSha: refSha }), ciWorkflowRuns: readCiWorkflowRuns({ repo: slug, headSha: refSha }), ciStuckQueuedMs });
       if (verdict.ok && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · verification source: CI ${(verdict.ciSources || []).map((x) => `${x.name} run ${x.runId} @ ${x.sha}`).join(', ')}\n`);
     }
-    const deferredOpen = ciOnly || (verdict.ok ? { ok: false } : deferredToCiDecision({ gate: verdict, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode }));
+    const deferredOpen = verdict === ciOnly ? ciOnly : (verdict.ok ? { ok: false } : deferredToCiDecision({ gate: verdict, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode }));
     if (deferredOpen.ok) {
-      if (ciOnly) recordCiOnly({ repo: REPO, coordinationRoot: resolveCoordinationRoot(), sha: refSha, reason: ciOnly.hostReason });
+      if (verdict === ciOnly) recordCiOnly({ repo: REPO, coordinationRoot: resolveCoordinationRoot(), sha: refSha, reason: ciOnly.hostReason });
       DEFERRED_TO_CI = deferredOpen;
       CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);
       if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · ${deferredOpen.disclosure} - opening only; ready-to-merge needs a green CI test check on ${refSha.slice(0, 8)}\n`);
