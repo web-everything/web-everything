@@ -1921,6 +1921,7 @@ export function runReconcileFixDispatch({
   let yieldedForAdoption = false;
   // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
   if (typeof now === 'function') now = now();
+  const tickEnteredAt = clock();
   const mainFixCapacity = resolveMainFixCapacity();
   const fixStep = (name, fn, pr = null) => {
     const startedAt = stepNow();
@@ -2166,6 +2167,10 @@ export function runReconcileFixDispatch({
   let handled = 0;
   let deferred = [];
   let conflictExemptHandled = 0;
+  // LIVE: the open-PR read and plan above take 8-15 min against a 5 min fix budget, so the budget was spent before
+  // the first dispatch and every pass launched ~2 fixers (red-team send-backs starved for hours). The budget bounds
+  // DISPATCH work only: slide the deadline by the time the read/plan consumed.
+  const dispatchDeadlineAt = deadlineAt == null ? deadlineAt : deadlineAt + Math.max(0, clock() - tickEnteredAt);
   const exemptCap = Number.isSafeInteger(fixSettings.conflictFixExemptPerPass) && fixSettings.conflictFixExemptPerPass >= 0
     ? fixSettings.conflictFixExemptPerPass : 0;
   console.error(`reconcile-fix-dispatch: fix.conflictFixExemptPerPass=${exemptCap} (source ${fixSettings.sources?.conflictFixExemptPerPass ?? 'invalid'})`);
@@ -2173,7 +2178,7 @@ export function runReconcileFixDispatch({
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
     const exempt = entry.isConflict === true && entry.conflictFixMechanical === true && !entry.restack
       && conflictExemptHandled < exemptCap;
-    if ((handled > 0 && deadlineAt != null && clock() > deadlineAt && !exempt) || yieldedForAdoption) {
+    if ((handled > 0 && dispatchDeadlineAt != null && clock() > dispatchDeadlineAt && !exempt) || yieldedForAdoption) {
       deferred.push(entry.pr);
       continue;
     }
