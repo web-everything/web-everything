@@ -255,7 +255,10 @@ export function ordinaryBufferFinding(content,layers=0) {
     if(finding)return finding;
   }
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
-  return ordinaryTextFinding(swapped.toString('utf16le'))??keyStructureFinding(content);
+  // Decoded candidates (base64, percent, hex, UTF-16 alignments) get the token and PEM checks as well.
+  const decoded=bytes=>bytes===content?null:ordinaryTextFinding(bytes.toString('latin1'))??ordinaryTextFinding(bytes.toString('utf8'))
+    ??ordinaryTextFinding(bytes.toString('utf16le'));
+  return ordinaryTextFinding(swapped.toString('utf16le'))??keyStructureFinding(content,decoded);
 }
 
 function entropy(text) {

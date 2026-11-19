@@ -210,10 +210,12 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   }
 }
 
-export function keyStructureFinding(buffer) {
+// `extra(bytes)` may name another finding for every decoded candidate (base64, percent, hex, UTF-16 views),
+// so callers can run their own detectors (token formats) over the same decoding pipeline.
+export function keyStructureFinding(buffer,extra) {
   if(!Buffer.isBuffer(buffer))return 'private-key-scan-unreadable-use-local';
   const queue=[],seen=new Set();
-  let total=0,steps=0;
+  let total=0,steps=0,extraFinding=null;
   const tick=()=>{if(++steps>LIMITS.steps)throw EXHAUSTED;};
   const add=(bytes,depth,options={})=>{
     tick();
@@ -223,6 +225,7 @@ export function keyStructureFinding(buffer) {
     if((total+=bytes.length)>LIMITS.bytes)throw EXHAUSTED;
     // Every decoded view reaches the byte detectors, including views with no more encodings.
     if(derFinding(bytes,tick)||jwkFinding(bytes))throw FINDING;
+    if(extra&&(extraFinding=extra(bytes)))throw FINDING;
     if(options.expand===false)return;
     // The shortest DER structure is eight bytes (already detected above); its
     // shortest supported text encoding is eleven base64 characters. This bounds
@@ -243,7 +246,7 @@ export function keyStructureFinding(buffer) {
     }
     return null;
   } catch(error) {
-    if(error===FINDING)return FINDING;
+    if(error===FINDING)return extraFinding??FINDING;
     if(error===EXHAUSTED)return EXHAUSTED;
     return 'private-key-scan-unreadable-use-local';
   }

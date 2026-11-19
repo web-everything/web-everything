@@ -66,6 +66,18 @@ describe('Forge scans all manifest content',()=>{
     refused('image.gz',Buffer.from([0x1f,0x8b,8,0,0,0]),true,'unreadable-compressed-content');
     expect(admit('image.gz',gzipSync(Buffer.from('# plain notes\n')))).toHaveProperty('sha256');
   });
+  it('refuses base64, percent-encoded and odd-aligned UTF-16 tokens at ordinary paths',()=>{
+    const token='gh'+'p_'+'A1b2C3d4'.repeat(5);
+    const percent=[...token].map(char=>'%'+char.charCodeAt(0).toString(16).padStart(2,'0')).join('');
+    const odd=Buffer.concat([Buffer.from([65]),Buffer.from(token,'utf16le')]);
+    for(const [name,bytes] of [
+      ['base64',Buffer.from(Buffer.from(token).toString('base64'))],
+      ['base64url wrapped',Buffer.from('config: '+Buffer.from(token).toString('base64url'))],
+      ['percent',Buffer.from(percent)],
+      ['odd utf16',odd],
+    ])for(const tracked of [true,false])
+      expect(()=>admit('docs/notes.md',bytes,tracked),name).toThrow(/content-detected credential/);
+  });
   it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
     const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);
     for(const tracked of [true,false])refused('a.png',png,tracked,'content-detected credential');

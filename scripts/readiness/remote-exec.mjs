@@ -332,7 +332,7 @@ export function createGitBlobReader({cwd, binding, timeoutMs=10000}={}) {
     },
   };
 }
-import {classifyManifestPath, credentialContentFinding, warnCredential, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
+import {ordinaryBufferFinding, classifyManifestPath, credentialContentFinding, warnCredential, sourceExtension, manifestEntry, decodeManifest, parseGitTree, parseGitStatus, nulPaths} from './forge-exec-manifest.mjs';
 
 // Project index-tracked directory links into regular leaves. The wire protocol
 // rejects symlinks, so neither rsync nor the worker ever follows a client link.
@@ -990,6 +990,9 @@ export async function buildDeltaManifest({cwd=process.cwd(),exec=defaultExec,fs=
             .update(`blob ${content.length}\0`).update(content).digest('hex');
           if(content.length!==blob.size || oid!==blob.oid)throw new Error('Invalid base blob evidence');
           blobHashes.set(blob.oid,createHash('sha256').update(content).digest('hex'));
+          // A base published before every file was content-scanned may hold an admitted credential: the reuse
+          // path must not skip the scan. A flagged blob is not reused, so manifestEntry re-reads and refuses it.
+          if(ordinaryBufferFinding(content))blobHashes.set(blob.oid,null);
         }
         if(blobHashes.get(blob.oid)!==entry.sha256)continue;
         reuse.set(key,{...entry,size:blob.size,stat});

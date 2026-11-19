@@ -2890,6 +2890,13 @@ describe('allowlisted sibling snapshots', { timeout: 30_000 }, () => {
   ])('%s cannot exempt siblings', async (_label, config) => {
     const f = siblingsFixture();
     writeFileSync(join(f.cwd, 'vitest.shared.ts'), config);
+    // 80 nested brackets exhaust the content scan every file now gets, so that file refuses (local fallback)
+    // before sibling proof matters; the other rows still build and include the sibling.
+    if (_label === 'deep static proof') {
+      await expect(remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false}))
+        .rejects.toMatchObject({code:'excluded-source-file'});
+      return;
+    }
     const manifest = await remoteManifestAPI.buildManifest({cwd:f.cwd, exec:f.exec, listFiles:f.listFiles, trackedOnly:false});
     expect(manifest.siblings?.frontierui?.sha).toBe(git('rev-parse', 'HEAD'));
   });
