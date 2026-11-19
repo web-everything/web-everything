@@ -783,6 +783,18 @@ describe('R1053 prove mode', () => {
     expect(f.errors.join('')).toContain('ineligible or conflicting class; human review required');
     expect(f.deps.fileCard).not.toHaveBeenCalled();
   });
+  it('an UNTAGGED security-looking finding relabelled E1 by the reproduction model still blocks; an ordinary one clears', async () => {
+    const f = proof(reply('E1'));
+    const securityFinding = 'x.mjs:2 authentication bypass via unsafe return';
+    f.deps.runCodex = vi.fn(async () => `WEAKENED\n${securityFinding}`);
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [securityFinding], preExisting: [] });
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
+    const g = proof(reply('E1'));
+    g.deps.runCodex = vi.fn(async () => `WEAKENED\n${finding}`);
+    expect(await main(ARGS, g.deps)).toBe(0);
+    expect(g.records[0]).toMatchObject({ verdict: 'NOT WEAKENED' });
+  });
   it('a5 findings beyond the bound block for human review', async () => {
     const f = proof(reply() + '\n' + reply().replace('#1', '#2'));
     f.deps.runCodex = () => `WEAKENED\n${finding}\n${finding}`;
