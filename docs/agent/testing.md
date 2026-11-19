@@ -1439,11 +1439,14 @@ concurrent-hook regression starts every `Edit|Write` hook at once and requires e
 ready while all leases are held, then exit 0. Keep test coordination event-driven (stdout and
 stderr lines), without sleep/poll loops.
 
-For macOS scheduling, initialize the clone first, then copy
-`scripts/hooks/com.we.guard-main-sync.plist.template` to
-`~/Library/LaunchAgents/com.we.guard-main-sync.plist`. Replace every placeholder with an
-XML-escaped absolute value: node executable, canonical guard clone, origin URL, executable
-search PATH (including Git), and an existing log directory. launchd does not expand shell
+For macOS scheduling, initialize the clone first, then render
+`scripts/hooks/com.we.guard-main-sync.plist.template` with
+`node scripts/hooks/render-guard-sync-plist.mjs --node-path=<absolute-node> --guard-clone-path=<absolute-clone> --origin-url=<origin> --executable-path=<PATH-including-Git> --log-directory=<existing-absolute-log-directory>`.
+Quote each argument as needed and redirect stdout to
+`~/Library/LaunchAgents/com.we.guard-main-sync.plist`. The renderer XML-escapes values,
+preserves an explicit `DEVELOPER_DIR`, and pins standalone Command Line Tools only when
+that directory exists; otherwise it omits the variable so full Xcode can remain selected.
+Use the renderer rather than copying the raw template. launchd does not expand shell
 variables or tildes. Install with
 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.we.guard-main-sync.plist"`;
 remove with `launchctl bootout gui/$(id -u)/com.we.guard-main-sync`.
