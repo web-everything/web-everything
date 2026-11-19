@@ -1,10 +1,13 @@
 import { statSync } from 'node:fs';
-import { URL } from 'node:url';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { criticalWorkVerdict } from './critical-work.mjs';
 
+// Node paths avoid Vite treating a dynamic new URL as an eager checkout-wide asset glob.
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const isDoc = p => /\.(md|mdx|txt|rst)$/.test(p);
 const isDirectory = p => {
-  try { return statSync(new URL(`../../${p}`, import.meta.url)).isDirectory(); }
+  try { return statSync(resolve(repoRoot, p)).isDirectory(); }
   catch { return false; }
 };
 const isDocScope = p => isDoc(p) || p === 'docs' || p.startsWith('docs/') && isDirectory(p);

@@ -1049,6 +1049,10 @@ source in an empty VM context and the real shim after its generating checkout is
 For Node subprocess script paths imported by Vitest's browser environment, use
 `join(dirname(fileURLToPath(import.meta.url)), filename)`: Vite can rewrite a relative `new URL(...,
 import.meta.url)` as a browser asset URL, which `fileURLToPath` then rejects.
+Use the same Node path pattern for filesystem probes. A dynamic relative `new URL` template can
+make Vite eagerly import the checkout as assets, stalling shared dispatch imports. Keep browser-mode
+coverage for shared Node helpers alongside their Node-mode tests; the confined admission browser
+regression exercises this import boundary and retains the scope refusals.
 
 ## Standalone probation builds
 
