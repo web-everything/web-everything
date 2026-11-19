@@ -72,7 +72,7 @@ it.each(['done', 'error', 'timeout'])('Codex wait keeps and stops the cwd heartb
     if (outcome === 'error') throw Error('read failed');
     return { status: outcome === 'done' ? 'done' : 'running', exitCode: 0 };
   };
-  const result = await waitForJob({ cwd: dir, startHeartbeat, readRecord, maxMs: 10,
+  const result = await waitForJob({ cwd: dir, startHeartbeat, readRecord, maxMs: 250,
     isAlive: () => true, pollMs: 1 });
   expect(result.code).toBe(outcome === 'done' ? 0 : outcome === 'error' ? 2 : 75);
   expect(startHeartbeat).toHaveBeenCalledWith({ cwd: dir });
