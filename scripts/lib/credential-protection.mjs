@@ -63,7 +63,22 @@ export function classifyProtectedPath(path, { home, repoRoot, protectedPaths = D
 }
 
 const pass = () => ({ decision: 'pass', path: null, reason: null });
-const normalizeWord = word => word.replace(/\\(.)/gs, '$1').replace(/["']/g, '');
+// Decode ANSI-C fragments before removing shell quoting or word escapes. Locale
+// quotes use ordinary quote removal; the '$' prefix is not part of the path.
+const decodeAnsi = text => text.replace(/\\(x[\da-fA-F]{1,2}|[0-7]{1,3}|u[\da-fA-F]{1,4}|U[\da-fA-F]{1,8}|c[\s\S]|[\s\S])/g, (whole, escape) => {
+  const simple = { a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', "'": "'", '"': '"', '\\': '\\', '?': '?' };
+  if (Object.hasOwn(simple, escape)) return simple[escape];
+  if (escape[0] === 'c') return String.fromCharCode(escape.charCodeAt(1) & 31);
+  if (/^[xuU]/.test(escape)) {
+    const point = parseInt(escape.slice(1), 16);
+    return point <= 0x10ffff ? String.fromCodePoint(point) : whole;
+  }
+  if (/^[0-7]/.test(escape)) return String.fromCharCode(parseInt(escape, 8) & 255);
+  return whole;
+});
+const normalizeWord = word => word
+  .replace(/\$'((?:\\[\s\S]|[^'\\])*)'/g, (_, body) => decodeAnsi(body))
+  .replace(/\$"/g, '"').replace(/\\(.)/gs, '$1').replace(/["']/g, '');
 const escapeRegex = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 // Compile a shell glob component. Braces are alternatives; stars never cross '/'.
 function globRegex(pattern) {
@@ -190,7 +205,9 @@ export function classifyBashCommand(command, options = {}) {
     const hit = references(m[1]);
     if (hit.decision === 'deny') return hit;
   }
-  for (const segment of text.split(/&&|\|\||[;|\n()]/)) {
+  // Split every nested command boundary, including backticks exposed by removing
+  // escape layers. No outer metadata/SSH exemption can hide a substitution body.
+  for (const segment of text.split(/&&|\|\||[;|\n()`]/)) {
     const words = segment.trim().split(/\s+/);
     while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
     if (['ls', 'ssh', 'ssh-add'].includes(basename(words[0] ?? ''))) continue;

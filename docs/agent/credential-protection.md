@@ -12,7 +12,10 @@ commit/push. Four layers reduce that risk:
 
 Configure `scripts/settings/credential-protection.json` (R528). Settings resolve
 standard → platform `credentialProtection` → tool → environment (`WE_GITLEAKS_MODE`
-only, and only to select `require`), reporting effective values and sources. Weaker
+only, and only to select `require`), reporting effective values and sources.
+Scanner mode retains the strictest value across all layers (`off` < `auto` < `require`);
+Bash decisions likewise retain `pass` < `ask` < `deny`. The standard `auto`/`deny`
+floor cannot be weakened by platform, tool, or environment settings. Weaker
 environment values are ignored with a notice. Invalid/unreadable settings restore
 the strict defaults, including requiring gitleaks; repair settings to recover.
 `auto` runs an installed gitleaks or prints **secret scan SKIPPED** with an install
@@ -28,10 +31,13 @@ Custom `protectedPaths` always extend the built-in floor: `~/.ssh`, `~/.gnupg`,
 `~/.config/gh/hosts.yml`, and `.env*`. Platform and file lists are unioned with the built-in floor; later layers cannot remove earlier paths.
 `.env*` matches the basename in any directory, including outside the repository.
 
-When pre-push evidence yields no ranges (including deletion-only input), `require`
-refuses the push and asks for ref evidence. `auto` prints a notice and scans
-`origin/main..HEAD` when that ref resolves, otherwise `HEAD~1..HEAD` (or `HEAD` for a single commit). That fallback does not verify all
-pushed history. Malformed or oversized evidence refuses the operation before scanner discovery in every mode except the explicit `off` setting.
+Empty, malformed, unreadable, or oversized pre-push evidence refuses both `auto`
+and `require`: coverage is unverifiable. Retry through Git with valid ref evidence;
+for oversized input, the operator must inspect refs before retrying. Only `off`
+skips this validation. No guessed Git range substitutes for actual push evidence.
+Valid deletion-only evidence introduces no content and passes without scanning.
+With valid content evidence, a missing scanner still prints **secret scan SKIPPED**
+and exits successfully in `auto`; `require` refuses it.
 
 Apply deliberately with `node scripts/bootstrap-session.mjs install`; preview with
 `node scripts/bootstrap-session.mjs install --dry-run`, verify with `--check`, and
@@ -46,8 +52,10 @@ bare `ssh-add` key operands. `ProxyCommand`, `LocalCommand`, backticks, command/
 substitution, and unrecognized `-o` options deny. The safe `-o` names are
 StrictHostKeyChecking, BatchMode, ConnectTimeout, UserKnownHostsFile, IdentityFile,
 Port, and User; their values still undergo protected-path checks. Directory listings
-(`ls`, including `-l`) pass. Redirects and nested local commands remain checked.
-Shell word escapes and adjacent quote fragments normalize before matching; HOME,
+(`ls`, including `-l`) pass. Redirects and all command/process substitution bodies remain checked independently
+of the outer command, including nested backticks and substitutions inside listings.
+Shell word escapes, locale `$"..."` quotes, adjacent quote fragments, and ANSI-C
+`$'...'` escapes (hex, octal, Unicode, and control characters) normalize before matching; HOME,
 repeated separators, dot segments and lexical parent segments resolve. Glob patterns
 that can reach protected paths also deny. Git, gh, scp, rsync, and curl deny protected path arguments;
 Git/gh commands without those arguments follow normal permission flow. Content

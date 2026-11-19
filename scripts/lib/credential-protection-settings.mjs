@@ -10,7 +10,7 @@ export function resolveCredentialProtection({ platform = {}, tool = {}, env = {}
   const object = v => v && typeof v === 'object' && !Array.isArray(v);
   const valid = { protectedPaths: validProtectedPaths, 'gitleaks.mode': v => ['auto', 'require', 'off'].includes(v),
     gitleaks: v => object(v) && ['auto', 'require', 'off'].includes(v.mode),
-    agentBashDecision: v => v === 'deny', readOnlyListing: v => v === 'pass' };
+    agentBashDecision: v => ['pass', 'ask', 'deny'].includes(v), readOnlyListing: v => v === 'pass' };
   const shape = v => object(v) && Object.entries(v).every(([key, value]) => key === '$comment'
     || (key === 'gitleaks' ? object(value) && Object.keys(value).every(k => k === 'mode')
       : Object.hasOwn(valid, key)));
@@ -18,6 +18,22 @@ export function resolveCredentialProtection({ platform = {}, tool = {}, env = {}
     envValues: { gitleaks: env.WE_GITLEAKS_MODE === 'require' ? { mode: 'require' } : undefined }, valid });
   const strict = invalid || !shape(platform) || !shape(tool) || r.invalid.length > 0;
   const settings = strict ? structuredClone(STRICT_CREDENTIAL_PROTECTION) : r.value;
+  if (!strict) {
+    // Keep the shared cascade's validation, then retain the strictest valid leaf.
+    // Equal values keep the later layer as their provenance.
+    for (const [key, order] of [['gitleaks', ['off', 'auto', 'require']], ['agentBashDecision', ['pass', 'ask', 'deny']]]) {
+      let strongest = -1;
+      for (const [source, layer] of [['standard', DEFAULT_CREDENTIAL_PROTECTION], ['platform', platform], ['tool', tool],
+        ['env', env.WE_GITLEAKS_MODE === 'require' ? { gitleaks: { mode: 'require' } } : {}]]) {
+        const value = key === 'gitleaks' ? layer[key]?.mode : layer[key];
+        if (order.indexOf(value) < strongest || value === undefined) continue;
+        strongest = order.indexOf(value);
+        settings[key] = key === 'gitleaks' ? { mode: value } : value;
+        delete r.sources['gitleaks.mode'];
+        r.sources[key] = source;
+      }
+    }
+  }
   settings.protectedPaths = withProtectedPathFloor([
     ...(validProtectedPaths(platform?.protectedPaths) ? platform.protectedPaths : []),
     ...(validProtectedPaths(tool?.protectedPaths) ? tool.protectedPaths : []),

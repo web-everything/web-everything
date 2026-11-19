@@ -39,6 +39,25 @@ for (const command of deny) test(`denies content read: ${command}`, () => {
   const hit = classifyBashCommand(command, options);
   assert.equal(hit.decision, 'deny'); assert.ok(hit.path); assert.ok(hit.reason);
 });
+for (const command of [
+  'ls `cat ~/.ssh/key`', 'ls $(cat ~/.ssh/key)', 'ls <(cat ~/.ssh/key)', 'ls >(cat ~/.ssh/key)',
+  'ls $(ls $(cat ~/.ssh/key))', "ls `ls \\`cat ~/.ssh/key\\``",
+  'ls `ls $(cat ~/.ssh/key)`', 'ls <(ls `cat ~/.ssh/key`)',
+  'ls $(ls <(cat ~/.ssh/key))', 'ls `cat ~/.ssh/key` ~/.ssh',
+]) test(`metadata exemption still checks nested substitution: ${command}`, () => {
+  assert.equal(classifyBashCommand(command, options).decision, 'deny');
+});
+for (const command of [
+  "cat $'/home/operator/.netrc'", "cat ~/.ssh$'/key'", 'cat $"/home/operator/.netrc"',
+  String.raw`cat $'\x2fhome\x2foperator\x2f.netrc'`,
+  String.raw`cat $'\057home\057operator\057.netrc'`,
+  String.raw`cat $'\u002fhome\U0000002foperator/.netrc'`,
+  String.raw`cat $'\x2fhome/operator/'$'.netrc'`,
+  String.raw`cat $'\n'~/.ssh/key`, String.raw`cat $'\t'~/.ssh/key`,
+  String.raw`cat $'\e' ~/.ssh/key`,
+]) test(`normalizes ANSI-C or locale quoted path: ${command}`, () => {
+  assert.equal(classifyBashCommand(command, options).decision, 'deny');
+});
 const allow = [
   'ssh host uptime', 'ssh -i ~/.ssh/id_rsa host uptime', 'ssh-add',
   'ssh host', 'ssh -F ~/.ssh/config host', '/usr/bin/ssh-add',
@@ -109,13 +128,29 @@ test('settings cascade logs effective values and sources; invalid evidence close
   assert.equal(loadCredentialProtection({ read: () => { throw Error('unreadable'); }, readPlatform: () => ({ prefs: {}, errors: [] }), log: () => {} }).settings.gitleaks.mode, 'require');
   assert.equal(loadCredentialProtection({ read: () => '{}', readPlatform: () => ({ prefs: {}, errors: ['bad'] }), log: () => {} }).settings.gitleaks.mode, 'require');
 });
+test('settings retain strictest scanner and Bash decision across every layer with provenance', () => {
+  for (const mode of ['off', 'auto', 'require']) {
+    for (const decision of ['pass', 'ask', 'deny']) {
+      const { settings, sources } = resolveCredentialProtection({
+        platform: { gitleaks: { mode: 'require' }, agentBashDecision: 'deny' },
+        tool: { gitleaks: { mode }, agentBashDecision: decision },
+      });
+      assert.equal(settings.gitleaks.mode, 'require');
+      assert.equal(settings.agentBashDecision, 'deny');
+      assert.equal(sources.gitleaks, mode === 'require' ? 'tool' : 'platform');
+      assert.equal(sources.agentBashDecision, decision === 'deny' ? 'tool' : 'platform');
+    }
+  }
+  assert.equal(resolveCredentialProtection({ platform: { gitleaks: { mode: 'off' } },
+    tool: { gitleaks: { mode: 'off' }, agentBashDecision: 'pass' } }).settings.gitleaks.mode, 'auto');
+});
 test('environment can only tighten scanner mode to require', () => {
   for (const mode of ['off', 'auto', 'require']) {
     for (const override of ['off', 'auto', 'wrong']) {
       const logs = [];
       const result = resolveCredentialProtection({ tool: { gitleaks: { mode } },
         env: { WE_GITLEAKS_MODE: override }, log: line => logs.push(line) });
-      assert.equal(result.settings.gitleaks.mode, mode);
+      assert.equal(result.settings.gitleaks.mode, mode === 'off' ? 'auto' : mode);
       assert.notEqual(result.sources.gitleaks, 'env');
       assert.match(logs.join('\n'), /ignored WE_GITLEAKS_MODE/);
     }
@@ -255,36 +290,24 @@ test('stub PATH covers scanner installed/clean, findings, missing auto/require, 
   assert.equal(gitleaksGuard({ ...common, phase: 'pre-push', input: 'broken' }), 1);
 });
 
-test('empty push ranges refuse require and visibly scan a fallback in auto with stub gitleaks', t => {
-  const dir = scratch(t), scanner = join(dir, 'gitleaks');
-  writeFileSync(scanner, '#!/bin/sh\n[ "$1" = detect ] && [ "$2" = --redact ] && [ "$3" = "--log-opts=$EXPECTED_RANGE" ]\n', { mode: 0o755 });
-  for (const input of ['', `refs/heads/a ${zero} refs/heads/a ${remote}`]) {
-    const logs = [];
-    assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode: 'require', find: () => scanner,
-      run: () => assert.fail('must not scan without evidence'), log: line => logs.push(line) }), 1);
-    assert.match(logs.join('\n'), /No pre-push ranges.*require/);
-    for (const range of ['origin/main..HEAD', 'HEAD~1..HEAD', 'HEAD']) {
-      const calls = [];
-      assert.equal(gitleaksGuard({ phase: 'pre-push', input, env: { ...process.env, EXPECTED_RANGE: range },
-        find: () => scanner, log: line => logs.push(line), run: (bin, args, opts) => {
-          calls.push([bin, args]);
-          if (bin !== 'git') return spawnSync(bin, args, opts);
-          if (args[0] === 'rev-parse') return range === 'origin/main..HEAD' ? { status: 0, stdout: local } : { status: 128 };
-          return { status: 0, stdout: range === 'HEAD' ? `${local}\n` : `${local}\n${remote}\n` };
-        } }), 0);
-      assert.equal(calls.length, range === 'origin/main..HEAD' ? 2 : 3);
-      assert.deepEqual(calls[0], ['git', ['rev-parse', '--verify', 'origin/main^{commit}']]);
-      assert.deepEqual(calls.at(-1), [scanner, ['detect', '--redact', `--log-opts=${range}`]]);
-      assert.match(logs.join('\n'), /auto falls back/);
+test('empty push evidence has unverifiable coverage in auto and require before scanner lookup', () => {
+  for (const input of ['', '  \n  ']) {
+    for (const mode of ['auto', 'require']) {
+      const logs = [];
+      assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode,
+        find: () => assert.fail('must validate evidence before scanner discovery'),
+        run: () => assert.fail('must never guess a fallback range'), log: line => logs.push(line) }), 1);
+      assert.match(logs.join(''), /Unverifiable coverage: empty pre-push evidence.*retry through Git/);
     }
+    assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode: 'off', log: () => {},
+      find: () => assert.fail('explicit disable') }), 0);
   }
 });
-test('fallback refuses failed parent evidence and scanner failure', () => {
-  for (const result of [{ error: Error('timeout') }, { status: 1 }, { status: 128 }, { status: 0, stdout: '' }, { status: 0, stdout: 'bad' }]) {
-    assert.equal(gitleaksGuard({ phase: 'pre-push', find: () => '/scanner', log: () => {}, run: () => result }), 1);
+test('valid deletion-only evidence introduces no content and needs no scanner', () => {
+  for (const mode of ['auto', 'require']) {
+    assert.equal(gitleaksGuard({ phase: 'pre-push', input: `refs/heads/a ${zero} refs/heads/a ${remote}`, mode,
+      find: () => assert.fail('no new content'), run: () => assert.fail('no fallback'), log: () => {} }), 0);
   }
-  assert.equal(gitleaksGuard({ phase: 'pre-push', find: () => '/scanner', log: () => {},
-    run: bin => bin === 'git' ? { status: 0, stdout: local } : { status: 1 } }), 1);
 });
 
 test('malformed and oversized push evidence refuses auto and require even without scanner; off explicitly disables', () => {
@@ -293,7 +316,7 @@ test('malformed and oversized push evidence refuses auto and require even withou
       const logs = [];
       assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode, log: line => logs.push(line),
         find: () => assert.fail('must validate evidence before scanner discovery') }), 1);
-      assert.match(logs.join(''), /invalid pre-push|operator must inspect/);
+      assert.match(logs.join(''), /Unverifiable coverage:.*(?:invalid pre-push|operator must inspect)/);
     }
     const logs = [];
     assert.equal(gitleaksGuard({ phase: 'pre-push', input, mode: 'off', log: line => logs.push(line),
@@ -304,17 +327,8 @@ test('malformed and oversized push evidence refuses auto and require even withou
 test('missing scanner auto visibly skips valid push evidence; require refuses', () => {
   for (const mode of ['auto', 'require']) {
     const logs = [];
-    assert.equal(gitleaksGuard({ phase: 'pre-push', input: '', mode, find: () => null,
+    assert.equal(gitleaksGuard({ phase: 'pre-push', input: `refs/heads/a ${local} refs/heads/a ${remote}`, mode, find: () => null,
       log: line => logs.push(line) }), mode === 'auto' ? 0 : 1);
     assert.match(logs.join(''), /secret scan SKIPPED/);
-  }
-});
-test('absent origin refuses unreadable or malformed parent evidence', () => {
-  for (const result of [{ error: Error('timeout') }, { status: 128 }, { status: 0, stdout: '' },
-    { status: 0, stdout: 'bad' }, { status: 0, stdout: `${local}\n${remote}\n${local}` }]) {
-    const logs = [];
-    assert.equal(gitleaksGuard({ phase: 'pre-push', find: () => '/scanner', log: l => logs.push(l),
-      run: (_bin, args) => args[0] === 'rev-parse' ? { status: 128 } : result }), 1);
-    assert.match(logs.join(''), /Cannot determine HEAD parent/);
   }
 });

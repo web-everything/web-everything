@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-/** R1082 commit/push backstop. Require mode refuses absent push ranges.
+/** R1082 commit/push backstop. Enabled modes refuse absent push evidence.
  * New remote refs scan all history reachable from the pushed SHA; updates scan remote..local.
- * Malformed/unreadable evidence fails closed; auto mode visibly falls back for empty ranges.
+ * Malformed/unreadable evidence fails closed; empty evidence has unverifiable coverage.
  */
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { delimiter, join, resolve } from 'node:path';
@@ -11,6 +11,7 @@ import { loadCredentialProtection } from './lib/credential-protection-settings.m
 
 export function pushedRanges(input) {
   if (typeof input !== 'string' || input.length > 1024 * 1024) throw Error('push evidence missing/over 1 MiB; operator must inspect refs and retry');
+  if (!input.trim()) throw Error('empty pre-push evidence; retry through Git with ref evidence.');
   const ranges = [];
   for (const line of input.trim().split('\n').filter(Boolean)) {
     const fields = line.trim().split(/\s+/);
@@ -37,37 +38,12 @@ export function gitleaksGuard({ phase, input = '', mode = 'auto', env = process.
   let commands;
   try { commands = phase === 'pre-commit' ? [['protect', '--staged', '--redact']]
     : pushedRanges(input).map(range => ['detect', '--redact', `--log-opts=${range}`]); }
-  catch (e) { log(e.message); return 1; }
+  catch (e) { log(`Unverifiable coverage: ${e.message}`); return 1; }
+  if (commands.length === 0) return 0; // Valid deletion-only evidence introduces no content.
   const binary = find(env);
   if (!binary) {
     log('!!! gitleaks not installed: secret scan SKIPPED !!!\nInstall: brew install gitleaks (or https://github.com/gitleaks/gitleaks#installing)\nSet gitleaks.mode=require in scripts/settings/credential-protection.json to refuse missing scanners.');
     return mode === 'require' ? 1 : 0;
-  }
-  if (phase === 'pre-push' && commands.length === 0) {
-    if (mode === 'require') {
-      log('No pre-push ranges supplied; mode=require refuses unscanned push. Retry through Git with ref evidence.');
-      return 1;
-    }
-    const origin = run('git', ['rev-parse', '--verify', 'origin/main^{commit}'], { env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-    if (origin.error || (origin.status !== 0 && origin.status !== 128)
-      || (origin.status === 0 && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(String(origin.stdout ?? '').trim()))) {
-      log('Cannot resolve origin/main evidence; repair Git evidence and retry.');
-      return 1;
-    }
-    let range;
-    if (origin.status === 0) range = 'origin/main..HEAD';
-    else {
-      const parent = run('git', ['rev-list', '--max-count=2', 'HEAD'], { env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-      const commits = String(parent.stdout ?? '').trim().split('\n');
-      if (parent.error || parent.status !== 0 || commits.length > 2
-        || !commits.every(sha => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha))) {
-        log('Cannot determine HEAD parent; repair Git evidence and retry.');
-        return 1;
-      }
-      range = commits.length === 2 ? 'HEAD~1..HEAD' : 'HEAD';
-    }
-    log(`No pre-push ranges supplied; mode=auto falls back to scanning ${range}. This does not verify all pushed history.`);
-    commands = [['detect', '--redact', `--log-opts=${range}`]];
   }
   for (const args of commands) {
     const result = run(binary, args, { env, stdio: ['ignore', 'inherit', 'inherit'], timeout: 300000, maxBuffer: 1024 * 1024 });
@@ -78,8 +54,8 @@ export function gitleaksGuard({ phase, input = '', mode = 'auto', env = process.
 export function main(argv = process.argv.slice(2)) {
   const { settings } = loadCredentialProtection();
   let input = '';
-  try { if (argv[0] === 'pre-push') input = readFileSync(0, 'utf8'); }
-  catch { console.error('Cannot read pre-push ref evidence; refusing push.'); return 1; }
+  try { if (argv[0] === 'pre-push' && settings.gitleaks.mode !== 'off') input = readFileSync(0, 'utf8'); }
+  catch { console.error('Unverifiable coverage: cannot read pre-push ref evidence; retry through Git with readable evidence.'); return 1; }
   return gitleaksGuard({ phase: argv[0], input, mode: settings.gitleaks.mode });
 }
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) process.exitCode = main();
