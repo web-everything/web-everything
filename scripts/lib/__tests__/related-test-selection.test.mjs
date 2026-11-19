@@ -336,6 +336,13 @@ describe('CI static edge policy', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('many repeated block comments in a specifier gap do not backtrack exponentially', () => {
+    const started = Date.now();
+    const files = { 'src.mjs': 'const from ' + '/* x */'.repeat(40) + '= 1;' };
+    expect(graph(files).size).toBe(0);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it('a line comment containing `from /*` cannot swallow later real imports', () => {
     const files = { 'a.mjs': '', 'b.mjs': '', 'src.mjs': "// from /*\nimport './a.mjs';\n// */\nimport './b.mjs';" };
     expect(graph(files).get('a.mjs')?.has('src.mjs')).toBe(true);
