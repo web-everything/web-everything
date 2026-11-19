@@ -45,7 +45,7 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
   cutover: 'enforce',
   fixCap: Object.freeze({
     floor: null, // null = the legacy static cap (dispatch-settings `fixDispatchMaxConcurrent`)
-    ceiling: null, // null = floor + ceilingAboveFloor
+    ceiling: 16, // conflict-fix capacity default; explicit null derives floor + ceilingAboveFloor
     ceilingAboveFloor: 4,
     raiseQueueOver: 5, // operator 2026-10-10: raise when the queue is longer than ~5
     raiseStepPerPass: 2,
