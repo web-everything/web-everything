@@ -1226,8 +1226,10 @@ export async function runLiveSmokeWithRetry({
         const factor = envMs(env, SMOKE_ENV_TIMEOUT_BUDGET_FACTOR_ENV, DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR);
         envTimeout = { first: rows, budgetFactor: factor, loadAvg: safeLoadAvg(loadAvg) };
         attemptEnv = widenSmokeBudgetsEnv(env, factor, smoke.budgets);
-        // Keep all completed non-timeout rows, including transient failures: only timeouts retry.
-        retryRetainedRows = smoke.results.filter(row => !isEnvTimeoutRow(row, { minElapsedMs }));
+        // Keep completed non-timeout rows, including transient failures. Always re-run the final
+        // cleanliness check after the retried checks, with this attempt's fresh beforePorcelain.
+        retryRetainedRows = smoke.results.filter(row => row.name !== 'tree-stays-clean'
+          && !isEnvTimeoutRow(row, { minElapsedMs }));
         continue;
       }
       envTimeout.retry = rows;

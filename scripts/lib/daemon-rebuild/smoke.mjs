@@ -24,7 +24,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, checkCodeUnchanged } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -482,12 +482,11 @@ export async function smokeAndAdopt({
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
       let reuseRows = [];
       if (freshComparison && firstSmoke) {
-        const diff = git(['diff', '--name-only', plan.finalSha, sha]);
-        const delta = diff.status === 0 ? String(diff.stdout ?? '').split('\n').filter(Boolean) : null;
+        // Only external reachability probes are independent of the candidate tree. Every check
+        // executing candidate code must run again, regardless of its kind or import closure.
         reuseRows = (firstSmoke.smoke?.results || []).filter(row => {
-          const check = SMOKE_CHECKS.find(check => check.name === row.name);
-          return row.ok === true && !row.skipped && !row.skipReason && check && check.name !== 'tree-stays-clean'
-            && (check.kind === 'env' || checkCodeUnchanged({ check, changedFiles: delta, root: candidate.path }));
+          return row.ok === true && !row.skipped && !row.skipReason
+            && ['gh-api-repo', 'gh-pr-list'].includes(row.name);
         });
         log.error?.(`daemon-rebuild: smoke-fallback-reuse ${JSON.stringify({ candidate: label, checks: reuseRows.map(row => row.name), budgets: Object.fromEntries(Object.values(SMOKE_BUDGET_ENV).map(key => [key, fallbackEnv[key]])) })}`);
       }

@@ -23,6 +23,7 @@ import {
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
 import { budgetedRunChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
+import { runLiveSmoke, SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
@@ -816,30 +817,53 @@ describe('rebuild smoke budget and fail-fast', () => {
     expect(result.alerts.find((a) => a.kind === 'smoke-budget-exhausted').detail).toMatchObject({ totalMs: 30 * 60_000, source: { totalMs: 'env' } });
   });
 
-  it('carries widened budgets and passing env rows to plain main alongside scoped fail-fast', async () => {
+  it('re-runs boot, cleanliness and every code check on fallback, retaining only GitHub probes and widened budgets', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+    advanceMain(originDir, (dir) => {
+      writeFile(dir, 'main-moved.txt', 'y\n');
+      // An unchanged importer with a missing dependency cannot prove the fallback safe.
+      writeFile(dir, 'scripts/conveyor/reconcile-pass.mjs', "import './missing.mjs';\n");
+    });
     pushBranch(originDir, 'lane/bad2', (dir) => writeFile(dir, 'bad2.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/bad2' }, { env });
     const seen = [];
-    const runSmoke = vi.fn(async ({ root, runChild, env: smokeEnv, reuseRows }) => {
+    let fallbackSmoke;
+    const children = vi.fn(async (cmd, args) => {
+      if (cmd === 'node' && args[0] === '--input-type=module') {
+        return String(args[2]).includes('daemon-boot-smoke:entry-boot')
+          ? '{"ok":true}' : '[{"kind":"stub","pr":null,"ok":true}]';
+      }
+      if (args[1] === 'list') return '[]';
+      if (args[1] === 'acquire') return '{"lane":1}';
+      return '';
+    });
+    const runSmoke = vi.fn(async ({ root, runChild, env: smokeEnv, reuseRows, changedFiles, reuseCode }) => {
       seen.push({ smokeEnv, reuseRows, bad: existsSync(join(root, 'bad2.txt')), failFast: [...(runChild?.failFast ?? [])], deadline: runChild?.deadline });
-      return existsSync(join(root, 'bad2.txt')) ? {
+      if (existsSync(join(root, 'bad2.txt'))) return {
         ...codeFail('dispatch-dry-run'), smoke: {
           budgets: { reconcileMs: 3_000_000, dispatchPassMs: 4_000_000, dispatchDryRunMs: 2_000_000 },
           results: [...codeFail('dispatch-dry-run').smoke.results,
-            { name: 'gh-api-repo', ok: true, ms: 10 },
-            { name: 'gh-pr-list', ok: true, skipped: true },
-            { name: 'tree-stays-clean', ok: true }],
+            ...SMOKE_CHECKS.filter(check => check.name !== 'dispatch-dry-run')
+              .map(check => ({ name: check.name, ok: true, ms: 10 }))],
         },
-      } : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+      };
+      fallbackSmoke = await runLiveSmoke({ root, changedFiles, reuseCode, reuseRows, runChild: children,
+        env: { ...smokeEnv, WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9', WE_SMOKE_DISPATCH_PASSES: '0' } });
+      return { verdict: fallbackSmoke.pass ? 'pass' : 'code', attempts: 1, smoke: fallbackSmoke };
     });
     const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
     expect(result.reason).toBe('fallback-plain-main');
     expect(seen.map((s) => s.failFast)).toEqual([[], ['dispatch-dry-run']]);
     expect(seen[1].smokeEnv).toMatchObject({ WE_SMOKE_RECONCILE_MS: '3000000',
       WE_SMOKE_DISPATCH_PASS_MS: '4000000', WE_SMOKE_DISPATCH_DRY_RUN_MS: '2000000' });
-    expect(seen[1].reuseRows.map(row => row.name)).toEqual(['gh-api-repo']);
+    expect(seen[1].reuseRows.map(row => row.name)).toEqual(['gh-api-repo', 'gh-pr-list']);
+    expect(fallbackSmoke.results.filter(row => row.reused).map(row => row.name)).toEqual(['gh-api-repo', 'gh-pr-list']);
+    for (const check of SMOKE_CHECKS.filter(check => !check.name.startsWith('gh-'))) {
+      expect(fallbackSmoke.results.find(row => row.name === check.name)).toMatchObject({ ok: true });
+      expect(fallbackSmoke.results.find(row => row.name === check.name).skipped).toBeUndefined();
+    }
+    expect(children.mock.calls.filter(([cmd, args]) => cmd === 'git' && args[0] === 'status')).toHaveLength(2);
+    expect(children.mock.calls.at(-1).slice(0, 2)).toEqual(['git', ['status', '--porcelain']]);
     expect(seen.every((s) => Number.isFinite(s.deadline) && s.deadline === seen[0].deadline)).toBe(true);
   });
 });

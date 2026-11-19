@@ -2845,7 +2845,7 @@ describe('load-shaped rows need host-load evidence (sticky rejection)', () => {
 
 
 describe('same-run smoke evidence', () => {
-  it('retries only env-timeout checks and counts retained passing rows once', async () => {
+  it('retries env-timeout checks and final cleanliness, counting other retained passing rows once', async () => {
     let t = 0;
     const calls = [];
     let lists = 0;
@@ -2869,9 +2869,45 @@ describe('same-run smoke evidence', () => {
     expect(calls.filter(([cmd, args]) => cmd === 'gh' && args[0] === 'api')).toHaveLength(1);
     expect(calls.filter(([, args]) => args[0] === 'scripts/conveyor/reconcile-pass.mjs')).toHaveLength(Object.keys(CONSTELLATION_REPOS).length);
     expect(result.smoke.results).toHaveLength(SMOKE_CHECKS.length);
-    expect(result.smoke.results.filter(row => row.name !== 'lane-pool-list')
+    expect(result.smoke.results.filter(row => !['lane-pool-list', 'tree-stays-clean'].includes(row.name))
       .every(row => row.reused && row.ok === true && !row.skipped && !row.skipReason)).toBe(true);
+    expect(result.smoke.results.at(-1)).toMatchObject({ name: 'tree-stays-clean', ok: true });
+    expect(result.smoke.results.at(-1).reused).toBeUndefined();
+    expect(calls.filter(([cmd, args]) => cmd === 'git' && args[0] === 'status')).toHaveLength(4);
+    expect(calls.at(-1)).toEqual(['git', ['status', '--porcelain']]);
     expect(result.smoke.budgets.dispatchPassMs).toBeGreaterThanOrEqual(1_500_000);
+  });
+
+  it('fails when a retried check dirties the tree and compares against the retry snapshot', async () => {
+    let t = 0;
+    let lists = 0;
+    let dirty = false;
+    const statuses = [];
+    const defaults = withNewCheckDefaults(async (_cmd, args) => args[1] === 'acquire' ? '{"lane":1}' : '');
+    const runChild = async (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'status') {
+        const out = dirty ? '?? retry-created.txt\n' : '';
+        statuses.push(out);
+        return out;
+      }
+      if (cmd === 'node' && args[1] === 'list') {
+        if (lists++ === 0) {
+          t += 120_000;
+          throw Error('timed out after 120000ms (process group killed)');
+        }
+        dirty = true;
+        return '[]';
+      }
+      return defaults(cmd, args, opts);
+    };
+    const result = await runLiveSmokeWithRetry({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' },
+      runChild, clock: () => t, refreshAuth: async ({ env }) => ({ env }), sleep: async () => {} });
+    expect(result.verdict).toBe('code');
+    expect(result.attempts).toBe(2);
+    expect(statuses).toEqual(['', '', '', '?? retry-created.txt\n']);
+    expect(result.smoke.results.at(-1)).toMatchObject({ name: 'tree-stays-clean', ok: false });
+    expect(result.smoke.results.at(-1).detail).toContain('1 path(s) newly dirtied');
+    expect(result.smoke.results.at(-1).detail).not.toContain('pre-existing');
   });
 
   it('keeps a retained non-timeout failure as a code verdict', async () => {
