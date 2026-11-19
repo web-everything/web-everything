@@ -24,6 +24,7 @@ import {
   clearTerminalFixAttempts,
   planCiHealSpawns,
   ciHealFloorFromComments,
+  readRetryFloors,
   retireCiHealGuards,
   clearTerminalCiHealAttempts,
   armWatchers,
@@ -53,6 +54,22 @@ import { buildRebaseOntoMainComment } from '../main-red-recovery.mjs';
 import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
+import { REARM_COMMENT_MARKER } from '../rearm-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER } from '../red-team-fix-round-count.mjs';
+
+describe('tick durable retry floors', () => {
+  it('restart floor includes red-team receipts', () => {
+    const comments = [REARM_COMMENT_MARKER, RED_TEAM_FIX_COMMENT_MARKER]
+      .map(body => ({ author: { login: 'web-everything' }, body }));
+    expect(readRetryFloors(() => comments, { wantsRearm: true })).toEqual({ rearm: 2 });
+  });
+
+  it('failed comment read leaves the restart floor unset (0, best effort, fail-open)', () => {
+    const floors = readRetryFloors(() => { throw Error('comment read failed'); }, { wantsRearm: true, wantsCiHeal: true });
+    expect(floors).toEqual({});
+    expect(floors.rearm ?? 0).toBe(0);
+  });
+});
 
 // ── The in-flight dispatch (build) guard — filter by num OR lane ──────────────────────────────────────────────
 
@@ -437,6 +454,18 @@ describe('planFixSpawns — in-flight test + retry cap across bounce cycles (SKI
     expect(r.spawns).toEqual([{ pr: 99, num: 40, lane: 5 }]);
     expect(r.newGuards).toEqual([{ pr: 99, num: 40, lane: 5, spawnedTick: 0, claimed: false }]);
     expect(r.fixAttempts).toEqual({}); // unchanged — nothing bumped merely by being planned
+  });
+
+  it('never launches a red-team-sent-back repair (dispatch-provider path only) and logs the refusal', () => {
+    const blocked = { num: 40, prNumber: 99, state: 'OPEN', labels: ['review:accepted', 'red-team:blocked', 'ready-to-merge'] };
+    const r = planFixSpawns({ prs: [blocked], launchedNums: [40], availableLanes: [5], tick: 0 });
+    expect(r.spawns).toEqual([]);
+    expect(r.newGuards).toEqual([]);
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'fix-dispatch-provider-only', pr: 99 }));
+    const explicit = planFixSpawns({ prs: [{ ...changesPr(98, 41), mode: 'red-team-sent-back' }], launchedNums: [41], availableLanes: [5], tick: 0 });
+    expect(explicit.spawns).toEqual([]);
+    expect(explicit.notes).toContainEqual(expect.objectContaining({ kind: 'fix-dispatch-provider-only', pr: 98 }));
+    expect(planFixSpawns({ prs: [changesPr(97, 42)], launchedNums: [42], availableLanes: [5], tick: 0 }).spawns).toHaveLength(1);
   });
 
   it('does NOT fix a review:changes PR the conveyor did not launch', () => {

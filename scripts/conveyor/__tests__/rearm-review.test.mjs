@@ -12,14 +12,80 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { buildRedTeamRearmComment, RED_TEAM_REARM_COMMENT_MARKER, decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 
+import { RED_TEAM_FIX_COMMENT_MARKER, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
+import { redTeamRearmRefusal } from '../rearm-review.mjs';
+import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+
+const repairThread = (head = 'b'.repeat(40), summary = 'Gate break') => {
+  const comments = [{ author: { login: 'web-everything' }, body: renderRedTeamComment({ pr: 7, rev: head,
+    provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+    findings: [{ summary, category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) }];
+  const result = liveResultGateState(comments, 7, head).resultId;
+  comments.push({ author: { login: 'web-everything' }, body: redTeamGateMarker(7, head, 'sent-back', result) });
+  comments.push({ author: { login: 'web-everything' }, body: `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRed-team repair dispatched: head=${head} result=${result} attempt=launch-1` });
+  return comments;
+};
+
+describe('red-team dispatch evidence', () => {
+  it.each([null, undefined, {}])('refuses unreadable comments (%s)', comments => {
+    expect(redTeamRearmRefusal({ comments, pr: 7 })).toMatch(/fresh reconciliation or ask an operator/);
+  });
+  it('accepts a counted receipt bound to the latest gate result on the pre-repair head', () => {
+    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7, head: 'a'.repeat(40) })).toBeNull();
+  });
+  it('refuses an unchanged live head at every shared-writer evidence check', () => {
+    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7, head: 'b'.repeat(40) })).toContain('no change made');
+  });
+  it.each([undefined, null, '', 'unknown'])('refuses an unreadable live head (%s)', head => {
+    expect(redTeamRearmRefusal({ comments: repairThread(), pr: 7, head })).toMatch(/fresh reconciliation or ask an operator/);
+  });
+  it.each([
+    ['missing receipt', c => c.slice(0, 2)],
+    ['legacy receipt without head', c => [...c.slice(0, 2), { ...c[2], body: RED_TEAM_FIX_COMMENT_MARKER }]],
+    ['missing receipt head', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace(/head=\S+ /, '') }]],
+    ['unparseable receipt head', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace(/head=\S+/, 'head=unknown') }]],
+    ['missing gate decision', c => [c[0], c[2]]],
+    ['untrusted gate result', c => [{ ...c[0], author: { login: 'mallory' } }, ...c.slice(1)]],
+    ['untrusted receipt', c => [...c.slice(0, 2), { ...c[2], author: { login: 'mallory' } }]],
+    ['wrong head', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace('b'.repeat(40), 'c'.repeat(40)) }]],
+    ['wrong result', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace(/result=\S+/, 'result=stale') }]],
+    ['oversized attempt', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace('launch-1', 'x'.repeat(129)) }]],
+    ['oversized result', c => [...c.slice(0, 2), { ...c[2], body: c[2].body.replace(/result=\S+/, `result=${'x'.repeat(257)}`) }]],
+    ['new gate result', c => [...c, ...repairThread('b'.repeat(40), 'New break').slice(0, 2)]],
+    ['new head result', c => [...c, ...repairThread('c'.repeat(40)).slice(0, 2)]],
+    ['completed hand-back', c => [...c, { author: { login: 'web-everything' }, body: RED_TEAM_REARM_COMMENT_MARKER }]],
+    ['new ordinary verdict', c => [...c, { author: { login: 'web-everything' }, body: '🔁 review — changes requested\n\nNew break' }]],
+  ])('refuses %s with an operator-visible fallback', (_name, change) => {
+    expect(redTeamRearmRefusal({ comments: change(repairThread()), pr: 7, head: 'a'.repeat(40) })).toMatch(/fresh reconciliation or ask an operator/);
+  });
+});
+
 const lbl = (...names) => names.map((name) => ({ name }));
+
+describe('red-team re-arm round accounting', () => {
+  it('records accepted-to-pending hand-back without double charging its dispatch', () => {
+    const decision = decideRearm({ currentLabels: lbl('review:accepted', 'ready-to-merge', 'red-team:blocked') });
+    expect(decision).toMatchObject({ allowed: true, rearmFrom: 'review:accepted', addLabel: 'review:pending' });
+    expect(decision.removeLabels).toContain('review:accepted');
+    expect(decision.removeLabels).toContain('ready-to-merge');
+    const body = buildRedTeamRearmComment({ actor: 'fix agent', decision });
+    expect(body.startsWith(RED_TEAM_REARM_COMMENT_MARKER)).toBe(true);
+    expect(body).toContain('re-armed `review:pending`');
+    const comments = [RED_TEAM_FIX_COMMENT_MARKER, body].map(body => ({ author: { login: 'web-everything' }, body }));
+    expect(countRedTeamFixComments(comments)).toBe(1);
+    expect(countRearmComments(comments)).toBe(0);
+    expect(countRearmComments([{ ...comments[1], body: buildRearmComment({ actor: 'fix agent', decision }) }])).toBe(1);
+  });
+});
 
 describe('decideRearm — the pure re-arm swap (#2630)', () => {
   it('re-arms a plain review:changes bounce → review:pending, dropping review:changes', () => {
@@ -429,9 +495,11 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
       "fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
       "const sc = JSON.parse(process.env.FAKE_GH_SCENARIO);",
       "const fail = (m) => { process.stderr.write(m + '\\n'); process.exit(1); };",
+      "if (sc.state && a[0] === 'pr' && a[1] === 'view' && !a.includes('headRefOid')) { const n = process.env.FAKE_GH_LOG + '.reads'; const reads = fs.existsSync(n) ? Number(fs.readFileSync(n, 'utf8')) : 0; fs.writeFileSync(n, String(reads + 1)); console.log(JSON.stringify({ ...sc.state, comments: reads >= (sc.changeAfterReads ?? 1) && sc.freshComments ? sc.freshComments : sc.state.comments, labels: fs.existsSync(process.env.FAKE_GH_LOG + '.edited') ? [{name:'review:pending'}] : sc.state.labels })); process.exit(0); }",
+      "if (sc.state && a[0] === 'pr' && a[1] === 'edit') { fs.writeFileSync(process.env.FAKE_GH_LOG + '.edited', '1'); process.exit(0); }",
       "if (a[0] === 'pr' && a[1] === 'view' && a.includes('headRefOid')) { if (sc.failView) fail('view failed'); console.log(JSON.stringify({ headRefOid: sc.head })); }",
       "else if (a[0] === 'api' && String(a[1]).includes('/comments')) { if (sc.failApi) fail('api failed'); console.log(JSON.stringify([sc.comments])); }",
-      "else if (a[0] === 'pr' && a[1] === 'comment') { fs.writeFileSync(process.env.FAKE_GH_LOG + '.body', fs.readFileSync(0, 'utf8')); if (sc.failComment) fail('comment failed'); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { const f = a[a.indexOf('--body-file') + 1]; fs.writeFileSync(process.env.FAKE_GH_LOG + '.body', fs.readFileSync(f === '-' ? 0 : f, 'utf8')); if (sc.failComment) fail('comment failed'); }",
       "else fail('fake gh: unsupported ' + a.join(' '));",
     ].join('\n'));
     chmodSync(join(dir, 'gh'), 0o755);
@@ -453,6 +521,109 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     return { ...r, log, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
+
+  it('production review:changes PR with no mode hands back a counted red-team launch without charging twice', () => {
+    const comments = repairThread();
+    const state = { number: 7, headRefOid: H0, headRefName: 'lane/7-repair', state: 'OPEN',
+      labels: lbl('review:changes'), comments };
+    expect(state).not.toHaveProperty('mode');
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], { head: H0, comments, state });
+    expect(r.status).toBe(0);
+    expect(bodyOf(r)).toContain(RED_TEAM_REARM_COMMENT_MARKER);
+    expect(countRearmComments([{ author: BOT, body: bodyOf(r) }])).toBe(0);
+    expect(countRedTeamFixComments([...comments, { author: BOT, body: bodyOf(r) }])).toBe(1);
+  });
+
+  it('the red-team hand-back argv reaches the real pinned CLI without the public CLI target rejection', () => {
+    const brief = readFileSync(resolve(dirname(SCRIPT), '../../skills-src/conveyor/fix-agent-brief.md'), 'utf8');
+    const command = 'node "{{WE_ROOT}}/scripts/conveyor/rearm-review.mjs" {{PR_NUM}} --repo={{REPO}} --round=red-team --expect-head=<full-pushed-sha>';
+    expect(brief).toContain(command);
+    expect(brief).not.toContain('--to=rearm');
+    const args = command.split(' ').slice(2).map(a => a.replace('{{PR_NUM}}', '7').replace('{{REPO}}', 'o/r').replace('<full-pushed-sha>', H0));
+    expect(hasUnexpectedPositionals(args)).toBe(false);
+    expect(hasInvalidArgs(args)).toBe(false);
+    const comments = repairThread();
+    const r = run(args, { head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted'), comments } });
+    expect(r.status).toBe(0);
+    expect(r.status).not.toBe(2);
+    expect(`${r.stdout}\n${r.stderr}`).not.toContain('invalid --to');
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'view' && !c.includes('headRefOid'))).toBe(true);
+    expect(bodyOf(r)).toContain(RED_TEAM_REARM_COMMENT_MARKER);
+    expect(countRearmComments([{ author: BOT, body: bodyOf(r) }])).toBe(0);
+    expect(countRedTeamFixComments(comments)).toBe(1);
+  });
+
+  it.each([
+    ['ordinary review:changes without a receipt', []],
+    ['untrusted receipt', repairThread().map((c, i) => i === 2 ? { ...c, author: { login: 'mallory' } } : c)],
+    ['receipt removed before label write', repairThread()],
+  ])('refuses red-team zero-charge hand-back: %s', (name, comments) => {
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], {
+      head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:changes'), comments },
+      ...(name.includes('removed') ? { freshComments: [] } : {}),
+    });
+    expect(r.status).toBe(1);
+    expect(r.wrote).toBe(false);
+    expect(r.out).toContain('red-team dispatch evidence');
+  });
+
+  it.each([[false, []], [true, []], [false, ['--only-if=accepted']], [false, ['--only-if=missing']]])('refuses an unchanged red-team head without a fix-begin claim (note fails: %s, flags: %j)', (failComment, flags) => {
+    const comments = repairThread(H0);
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`, ...flags], {
+      head: H0, comments, failComment,
+      state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted', 'red-team:blocked'), comments },
+    });
+    expect(r.status).toBe(1);
+    expect(r.out).toContain('no change made');
+    expect(bodyOf(r)).toContain(NO_CHANGE_COMMENT_MARKER);
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'edit')).toBe(false);
+  });
+
+  it.each([
+    ['missing receipt head', c => c.replace(/head=\S+ /, '')],
+    ['unparseable receipt head', c => c.replace(/head=\S+/, 'head=unknown')],
+    ['legacy marker-only receipt', () => RED_TEAM_FIX_COMMENT_MARKER],
+  ])('refuses %s without any write', (_name, change) => {
+    const comments = repairThread();
+    comments[2].body = change(comments[2].body);
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], {
+      head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted', 'red-team:blocked'), comments },
+    });
+    expect(r.status).toBe(1);
+    expect(r.wrote).toBe(false);
+    expect(r.out).toContain('fresh reconciliation or ask an operator');
+  });
+
+  it.each([
+    ['mismatched pin', { head: 'c'.repeat(40) }],
+    ['unreadable live head', { failView: true }],
+    ['unreadable receipt thread', { failApi: true }],
+  ])('refuses red-team %s without any write', (_name, fault) => {
+    const comments = repairThread();
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], {
+      head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted'), comments }, ...fault,
+    });
+    expect(r.status).toBe(1);
+    expect(r.wrote).toBe(false);
+  });
+
+  it('refuses an unpinned red-team hand-back before any forge call', () => {
+    const r = run(['7', '--repo=o/r', '--round=red-team']);
+    expect(r.status).toBe(1);
+    expect(r.calls).toEqual([]);
+  });
+
+  it('refuses the uncounted marker if dispatch evidence disappears after the label swap', () => {
+    const comments = repairThread();
+    const r = run(['7', '--repo=o/r', '--round=red-team', `--expect-head=${H0}`], {
+      head: H0, comments, state: { headRefOid: H0, state: 'OPEN', labels: lbl('review:accepted'), comments },
+      freshComments: [], changeAfterReads: 2,
+    });
+    expect(r.status).toBe(1);
+    expect(r.calls.some(c => c[0] === 'pr' && c[1] === 'edit')).toBe(true);
+    expect(bodyOf(r)).toBeNull();
+    expect(r.out).toContain('red-team dispatch evidence');
+  });
 
   it.each([{ login: 'chalbert' }, BOT, { login: 'web-everything[bot]', type: 'Bot' }])('passes a REST operator answer posted by $login with a GraphQL target through to the shared label CLI', (user) => {
     const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };

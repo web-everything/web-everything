@@ -1152,6 +1152,8 @@ export function runReviewLabelCli({
   refreshGate = undefined,
   // Pinned re-arm marker retries are bounded to three attempts; tests inject a no-op delay.
   rearmRetrySleep = sleepSyncMs,
+  // Specialized hand-backs must prove their accounting evidence on the same fresh reads as the label pin.
+  rearmEvidenceGuard = null,
   readTrialStore = readStore,
   logTrialFn = logDelegationTrial,
   trialLogIo = {},
@@ -1557,6 +1559,10 @@ export function runReviewLabelCli({
     return comments;
   };
   const rearmThread = to === 'rearm' ? fullThread() : null;
+  if (to === 'rearm' && rearmEvidenceGuard) {
+    const reason = rearmEvidenceGuard({ comments: rearmThread, pr, head: headSha });
+    if (reason) refuseRearm(reason);
+  }
   // Capture before either write; a send-back during the swap or comment must not
   // become the verdict this older re-arm claims to have handled.
   const rearmVerdict = to === 'rearm' ? latestChangesVerdict(rearmThread) : null;
@@ -2012,6 +2018,10 @@ export function runReviewLabelCli({
     if (!Array.isArray(fresh.comments)) refuse('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuse('head unreadable — cannot prove no human clearance');
     const freshComments = fullThread(fresh.comments, fresh.headRefOid, refuse).filter(isTrustedMarkerAuthor);
+    if (rearmEvidenceGuard) {
+      const reason = rearmEvidenceGuard({ comments: freshComments, pr, head: fresh.headRefOid });
+      if (reason) refuse(reason);
+    }
     if (headEverHumanCleared(freshComments, fresh.headRefOid.trim())) refuse('head carries a human clearance — a rearm never undoes it');
     return { fresh, freshComments };
   };
@@ -2159,7 +2169,8 @@ export function runReviewLabelCli({
         if (rearmVerdictKey(verdict) !== rearmVerdictKey(rearmVerdict)) fail('latest changes verdict changed before marker write — retry the pinned re-arm', 1);
         if (coveringRearm(freshComments, verdict)) return;
       } else {
-        try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
+        if (to === 'rearm' && rearmEvidenceGuard) recheckRearmClearance();
+        else try { assertPinnedRearmHead(); } catch (e) { fail(ghErr(e, 'gh pr comment failed'), 1); }
       }
       try {
         restampedAt = Date.now();
