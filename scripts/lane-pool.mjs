@@ -3004,6 +3004,10 @@ async function cmdAcquire(repo) {
           beforeFetch: () => assertReadableLaneEvidence(repo, chosen),
           beforeReset: getShas => assertNoUnpushedLaneWork(repo, chosen, getShas),
         });
+      } else {
+        // Re-adopting our own lane never resets it, but it still gets the same config scrub and env/hook repair.
+        scrubClaimedLaneConfig(dir, 'before acquire hand-out');
+        writeLaneEnv(repo, chosen);
       }
     } catch (e) {
       restoreLeaseAfterRefusedClaim(dir, preClaimLease);
