@@ -118,22 +118,25 @@ function classOf(rule, value, ceiling) {
   }
   return rule?.class;
 }
-// The sole indexed-config exception to GIT_*: validate the entire parent set first.
+// The sole indexed-config exception to GIT_*: the parent's hardening pins pass, nothing else does.
+// Each entry is kept only if its (key, value) pair EXACTLY equals a hardening pin; every other entry
+// (core.sshCommand, core.pager, url.*.insteadOf, even a harmless user.name) is dropped on its own, and the
+// kept pins are re-indexed in their original order, so one extra entry can never discard the protections.
 function ambientGitConfig(ambient) {
   const raw = ambient.GIT_CONFIG_COUNT;
   if (!/^\d+$/.test(raw)) return {};
   const count = Number(raw);
-  // A complete set needs two distinct entries per pin. Reject impossible counts
-  // before iterating; incomplete/oversized sets are dropped, so Git uses its defaults.
+  // Reject impossible counts before iterating (each entry needs a key and a value var).
   if (!Number.isSafeInteger(count) || count * 2 + 1 > Object.keys(ambient).length) return {};
   const pins = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
-  const out = { GIT_CONFIG_COUNT: raw };
+  const kept = [];
   for (let i = 0; i < count; i++) {
-    const key = `GIT_CONFIG_KEY_${i}`, value = `GIT_CONFIG_VALUE_${i}`;
-    if (!Object.hasOwn(ambient, key) || !Object.hasOwn(ambient, value)
-      || !pins.some(([k, v]) => ambient[key] === k && ambient[value] === v)) return {};
-    out[key] = ambient[key]; out[value] = ambient[value];
+    const key = ambient[`GIT_CONFIG_KEY_${i}`], value = ambient[`GIT_CONFIG_VALUE_${i}`];
+    if (pins.some(([k, v]) => key === k && value === v)) kept.push([key, value]);
   }
+  if (!kept.length) return count === 0 ? { GIT_CONFIG_COUNT: '0' } : {};
+  const out = { GIT_CONFIG_COUNT: String(kept.length) };
+  kept.forEach(([k, v], i) => { out[`GIT_CONFIG_KEY_${i}`] = k; out[`GIT_CONFIG_VALUE_${i}`] = v; });
   return out;
 }
 function inheritedEnv(inherit, ambient) {

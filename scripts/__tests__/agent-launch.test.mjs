@@ -565,10 +565,35 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     ['core.pager', 'less'], ['core.editor', 'vi'], ['diff.external', '/untrusted/diff'],
     ['diff.any.textconv', '/untrusted/conv'], ['protocol.ext.allow', 'always'],
     ['url.ext::sh -c touch% /tmp/x.insteadOf', 'https://'],
-  ])('drops the entire ambient set for one extra non-pin %s=%s', (key, value) => {
+  ])('drops only the extra non-pin %s=%s and keeps every hardening pin', (key, value) => {
     const parent = laneGitHardeningEnv({}), at = Number(parent.GIT_CONFIG_COUNT);
-    setParent({ ...parent, GIT_CONFIG_COUNT: String(at + 1), [`GIT_CONFIG_KEY_${at}`]: key, [`GIT_CONFIG_VALUE_${at}`]: value });
-    expect(configOf(envOf({}))).toEqual({});
+    const pinsOf = env => Array.from({ length: Number(env.GIT_CONFIG_COUNT ?? 0) },
+      (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+    const expected = pinsOf(parent);
+    // The extra entry goes FIRST so re-indexing is exercised, and once more at the end.
+    const extra = { GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value };
+    expected.forEach(([k, v], i) => { extra[`GIT_CONFIG_KEY_${i + 1}`] = k; extra[`GIT_CONFIG_VALUE_${i + 1}`] = v; });
+    extra[`GIT_CONFIG_KEY_${at + 1}`] = key; extra[`GIT_CONFIG_VALUE_${at + 1}`] = value;
+    setParent({ ...parent, ...extra, GIT_CONFIG_COUNT: String(at + 2) });
+    const child = envOf({});
+    expect(pinsOf(child)).toEqual(expected);
+    expect(pinsOf(child)).toContainEqual(['core.hooksPath', '/dev/null']);
+    expect(pinsOf(child)).not.toContainEqual([key, value]);
+  });
+  it('a harmless extra entry such as user.name cannot discard the pins (final audit)', () => {
+    const parent = laneGitHardeningEnv({}), at = Number(parent.GIT_CONFIG_COUNT);
+    setParent({ ...parent, GIT_CONFIG_COUNT: String(at + 1), [`GIT_CONFIG_KEY_${at}`]: 'user.name', [`GIT_CONFIG_VALUE_${at}`]: 'x' });
+    expect(Number(envOf({}).GIT_CONFIG_COUNT)).toBe(at);
+  });
+  it('GIT_GRAFT_FILE and GIT_SHALLOW_FILE pass only as /dev/null (final audit)', () => {
+    setParent({ GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' });
+    expect(envOf({})).toMatchObject({ GIT_GRAFT_FILE: '/dev/null', GIT_SHALLOW_FILE: '/dev/null' });
+    setParent({ GIT_GRAFT_FILE: '/tmp/grafts', GIT_SHALLOW_FILE: '/tmp/shallow' });
+    expect(envOf({})).not.toHaveProperty('GIT_GRAFT_FILE');
+    expect(envOf({})).not.toHaveProperty('GIT_SHALLOW_FILE');
+    // The caller may tighten (bag /dev/null passes) but never redirect.
+    expect(envOf({ GIT_GRAFT_FILE: '/dev/null' }).GIT_GRAFT_FILE).toBe('/dev/null');
+    expect(envOf({ GIT_GRAFT_FILE: '/tmp/forged' })).not.toHaveProperty('GIT_GRAFT_FILE');
   });
   it.each(['', '-1', '1.5', '1x', ' 1', '1e0', 'Infinity', '9007199254740992', '999999999'])
     ('drops malformed or impossible ambient count %j without forwarding a partial set', count => {
