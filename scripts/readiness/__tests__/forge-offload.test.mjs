@@ -895,7 +895,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     const runRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/work/'));
     const presyncRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/presync/'));
     it.each(['direct','redirected'].flatMap(mode=>
-      ['tracked','invalid','malformed','oversized','invalid object','unreadable',...(mode==='redirected'?['missing']:[])].map(fault=>[mode,fault])))('presync is a no-op for %s canonical %s policy despite a usable base and dirty/untracked bytes',async(mode,fault)=>{
+      ['missing','tracked','invalid','malformed','oversized','invalid object','unreadable'].map(fault=>[mode,fault])))('presync is a no-op for %s canonical %s policy despite a usable base and dirty/untracked bytes',async(mode,fault)=>{
       const f=await setup(),t=presyncTransport(f);
       await fs.writeFile(join(repo,'scratch.txt'),'private untracked bytes');
       const path=join(root,'.claude','platform-preferences.json');
@@ -913,9 +913,9 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
       expect(await remote.readPresyncState(gitDir())).toBeNull();
       await expect(fs.stat(join(gitDir(),'forge-presync.lock'))).rejects.toMatchObject({code:'ENOENT'});
     },30_000);
-    it.each(['legacy','absent'])('legacy presync still ships dirty and untracked delta leaves with %s canonical policy',async policyCase=>{
+    it.each(['legacy','no key'])('legacy presync still ships dirty and untracked delta leaves with %s canonical policy',async policyCase=>{
       const f=await setup(),t=presyncTransport(f);
-      if(policyCase==='absent')await fs.rm(join(root,'.claude','platform-preferences.json'));
+      if(policyCase==='no key')await fs.writeFile(join(root,'.claude','platform-preferences.json'),'{}');
       await fs.writeFile(join(repo,'scratch.txt'),'legacy untracked bytes');
       expect(await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{...process.env,WE_PLATFORM_PREFERENCES:undefined}})).toMatchObject({status:'synced',count:2});
       const state=await remote.readPresyncState(gitDir());

@@ -444,8 +444,8 @@ function readPlatformPreferences(path) {
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
  * remote client code or manifest validation. `home` injects the canonical host file's directory for tests.
- * remote.manifest always comes from the canonical file; failed reads require local execution, except ENOENT
- * for direct callers. Redirected callers require a valid canonical object even when the file is absent.
+ * remote.manifest always comes from an existing, valid canonical file; every failed read requires local
+ * execution. A valid canonical object that omits the key selects the standard manifest default.
  * Other settings keep their last good values after a failed read. Failures are not cached, so a torn write
  * is retried by the next caller instead of pinning the standard.
  */
@@ -498,12 +498,9 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
         throw new Error('invalid canonical preferences object');
       hostManifest = host.heavyAdmission?.remote?.manifest;
     } catch (e) {
-      // Only direct ENOENT is a default decision. Redirected callers must prove canonical policy exists.
-      if (envSelected || e?.code !== 'ENOENT') {
-        readFailed = true;
-        canonicalManifestReadFailed = true;
-        errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
-      }
+      readFailed = true;
+      canonicalManifestReadFailed = true;
+      errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
     }
     platform = { ...platform, remote: { ...remote, ...(hostManifest !== undefined ? { manifest: hostManifest } : {}) } };
   }
@@ -3144,7 +3141,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec, readTelemetry } = {}) {
+export async function main(argv, { remoteExec, readTelemetry, home } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -3152,7 +3149,7 @@ export async function main(argv, { remoteExec, readTelemetry } = {}) {
   const { flags, positionals } = parseFlags(preArgv);
   // Resolve before lock-root derivation so relative --repo uses the same shared pool and execution cwd.
   const repo = resolve(typeof flags.repo === 'string' ? flags.repo : process.cwd());
-  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo });
+  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo, home });
   const privatePool = privateAdmissionPool(process.env, repo);
   const cap = flags.cap != null && privatePool ? Number(flags.cap) : policy.settings.cap;
   if (flags.cap != null && !privatePool) {

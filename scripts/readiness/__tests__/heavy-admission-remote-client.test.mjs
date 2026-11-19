@@ -68,7 +68,9 @@ describe('remote client override', () => {
     const env = { WE_PLATFORM_PREFERENCES: prefs,
       ...(mode === 'private pool' ? { LANE_POOL_ROOT: join(f.root, 'private-pool') } : {}) };
     expect(privateAdmissionPool(env, f.root)).toBe(mode === 'private pool');
-    const policy = loadAdmissionPolicy({ env, repoRoot: f.root });
+    mkdirSync(join(f.root, '.claude'));
+    writeFileSync(join(f.root, '.claude', 'platform-preferences.json'), '{}');
+    const policy = loadAdmissionPolicy({ env, repoRoot: f.root, home: f.root });
     expect(policy.settings.remote).toEqual({ ...f.policy.settings.remote, clientPath: null });
     expect(policy.sources['remote.clientPath']).toBe('standard');
     const reason = `platform.remote.clientPath=${f.clientPath} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`;
@@ -117,7 +119,8 @@ describe('remote client override', () => {
     vi.setSystemTime(Date.now() + 11_000);
     writeFileSync(prefs, '{"heavyAdmission":');
     const selected = load(true);
-    expect(selected.settings.remote).toEqual({ ...f.policy.settings.remote, clientPath: null });
+    expect(selected.manifestFailClosed).toBe(true);
+    expect(selected.settings.remote).toEqual({ ...f.policy.settings.remote, clientPath: null, enabled: false });
     expect(selected.ignored).toContainEqual(expect.stringContaining('ignored: preferences selected via WE_PLATFORM_PREFERENCES'));
     expect(selected.invalid).toContainEqual(expect.stringContaining('platform:'));
     const host = load(false);
@@ -130,7 +133,9 @@ describe('remote client override', () => {
     const f = fixture();
     const prefs = join(f.root, 'preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { clientPath: '\n\x1b' + 'x'.repeat(4096) } } }));
-    const policy = loadAdmissionPolicy({ env: { WE_PLATFORM_PREFERENCES: prefs }, repoRoot: f.root });
+    mkdirSync(join(f.root, '.claude'));
+    writeFileSync(join(f.root, '.claude', 'platform-preferences.json'), '{}');
+    const policy = loadAdmissionPolicy({ env: { WE_PLATFORM_PREFERENCES: prefs }, repoRoot: f.root, home: f.root });
     expect(policy.settings.remote.clientPath).toBeNull();
     expect(policy.ignored).toEqual([
       `platform.remote.clientPath=${'??' + 'x'.repeat(1022)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`,
@@ -947,7 +952,11 @@ describe('remote client override', () => {
     const displayPath = clientPath.replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
     expect(formatted).toContain(`remote.clientPath=${displayPath} (platform)`);
     expect(formatted).toMatch(/^[\x20-\x7e\u00b7]+$/);
-    expect(formatted.length).toBeLessThan(2000);
+    // Bound the displayed path independently of the policy's growing set of named settings.
+    const pathless = formatAdmissionPolicy({ ...f.policy, settings: { ...f.policy.settings,
+      remote: { ...f.policy.settings.remote, clientPath: '' } } });
+    expect(pathless.length).toBeLessThan(1000);
+    expect(formatted).toBe(pathless.replace('remote.clientPath= (platform)', `remote.clientPath=${displayPath} (platform)`));
     const fs = { realpathSync: () => {
       if (kind === 'unreadable') throw new Error(`read\n\x1b failed: ${clientPath}`);
       return clientPath;

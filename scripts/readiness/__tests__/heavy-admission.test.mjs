@@ -18,7 +18,7 @@ import {
   tryAcquireSlot, releaseOwnedSlot, heldSlots, probeSlotHolderLiveness,
   markWaiting, clearWaiting, listWaiting,
   acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
-  runUnderAdmission, runWithRemoteDecision, shellQuoteWord,
+  runUnderAdmission, runWithRemoteDecision, decideRemote, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
   admissionLockRoot, admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
   DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_SWITCH_ENV,
@@ -3009,7 +3009,7 @@ describe('canonical host manifest policy', () => {
   });
 
   it.each(['direct', 'redirected'].flatMap(mode =>
-    ['malformed', 'oversized', 'unreadable', 'invalid root', 'invalid admission', 'invalid remote', ...(mode === 'redirected' ? ['missing'] : [])]
+    ['missing', 'malformed', 'oversized', 'unreadable', 'invalid root', 'invalid admission', 'invalid remote']
       .map(fault => [mode, fault])))('requires local execution when %s canonical evidence is %s', async (mode, fault) => {
     const home = join(lockRoot, 'host');
     const host = preferences(home, { manifest: 'tracked' });
@@ -3042,16 +3042,29 @@ describe('canonical host manifest policy', () => {
     expect(loadAdmissionPolicy({ home, repoRoot: lockRoot, env }).settings.remote).toMatchObject({ enabled: true, manifest: 'tracked' });
   });
 
-  it('an absent direct canonical file uses the standard default without failing closed', () => {
-    const policy = loadAdmissionPolicy({ home: join(lockRoot, 'absent-host'), repoRoot: lockRoot, env: {} });
-    expect(policy.manifestFailClosed).toBeUndefined();
-    expect(policy.settings.remote.manifest).toBe('legacy');
-    expect(policy.sources['remote.manifest']).toBe('standard');
-    expect(policy.invalid).toEqual([]);
+  it('deleting a previously tracked canonical policy fails closed after cache expiry and retries after repair', () => {
+    const home = join(lockRoot, 'host');
+    const host = preferences(home, { manifest: 'tracked', enabled: true, mode: 'always' });
+    const options = { home, repoRoot: lockRoot, env: {} };
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(T0);
+    try {
+      const initial = loadAdmissionPolicy(options);
+      expect(initial.settings.remote).toMatchObject({ manifest: 'tracked', enabled: true });
+      rmSync(host);
+      expect(loadAdmissionPolicy(options)).toBe(initial);
+      clock.mockReturnValue(T0 + 10_001);
+      const missing = loadAdmissionPolicy(options);
+      expect(missing.manifestFailClosed).toBe(true);
+      expect(missing.settings.remote.enabled).toBe(false);
+      expect(missing.invalid).toContainEqual(expect.stringContaining('ENOENT'));
+      preferences(home, { manifest: 'tracked', enabled: true });
+      expect(loadAdmissionPolicy(options).settings.remote).toMatchObject({ manifest: 'tracked', enabled: true });
+    } finally { clock.mockRestore(); }
   });
 
   it.each(['direct', 'redirected'].flatMap(mode =>
-    [{}, { heavyAdmission: {} }, { heavyAdmission: { remote: {} } }].map(hostSettings => [mode, hostSettings])))('valid %s canonical preferences without a manifest use the standard default (%j)', (mode, hostSettings) => {
+    [{}, { heavyAdmission: {} }, { heavyAdmission: { remote: {} } },
+      { heavyAdmission: { remote: { enabled: true, mode: 'always' } } }].map(hostSettings => [mode, hostSettings])))('valid %s canonical preferences without a manifest use the standard default (%j)', (mode, hostSettings) => {
     const home = join(lockRoot, 'host');
     const host = preferences(home, {});
     writeFileSync(host, JSON.stringify(hostSettings));
@@ -3060,6 +3073,9 @@ describe('canonical host manifest policy', () => {
     expect(policy.manifestFailClosed).toBeUndefined();
     expect(policy.settings.remote.manifest).toBe('legacy');
     if (mode === 'redirected') expect(policy.settings.remote.enabled).toBe(true);
+    if (hostSettings.heavyAdmission?.remote?.enabled) {
+      expect(decideRemote({ policy, argv: ['npm', 'run', 'build'], cwd: lockRoot, loadPerCore: 10 }).remote).toBe(true);
+    }
     expect(policy.sources['remote.manifest']).toBe('standard');
     expect(policy.invalid).toEqual([]);
   });

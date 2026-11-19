@@ -4851,11 +4851,12 @@ are logged; operators can run locally or review a path+oid size exception.
 `WE_PLATFORM_PREFERENCES` redirects other settings for a private pool or test. Inject `home`
 into `loadAdmissionPolicy` to test that path without reading the real home file. Missing,
 unreadable, oversized, malformed or structurally invalid canonical evidence disables remote
-execution for redirected callers, with a policy source explaining the local fallback. A valid
-canonical object without `remote.manifest` uses the standard manifest default. Failed reads
-also disable remote execution for direct callers; only `ENOENT` may select the default
-without a valid canonical object for a direct caller. Neither CLI enablement nor last-good
-settings may override that manifest refusal. The shared `loadAdmissionPolicy` resolver is
+execution for every caller, with a policy source explaining the local fallback. A valid,
+existing canonical object without `remote.manifest` uses the standard manifest default.
+Direct `ENOENT` also fails closed, including after a previously tracked policy's cache expires.
+Remote-capable fixtures must inject an existing canonical preferences file via `home`.
+Neither CLI enablement nor last-good settings may override that manifest refusal.
+The shared `loadAdmissionPolicy` resolver is
 the only canonical manifest source for admission, the explicit CLI and presync. Failed reads
 are retried on the next call; they never use the redirected manifest or a cached last-good
 host manifest. An invalid
