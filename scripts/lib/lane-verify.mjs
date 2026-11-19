@@ -134,6 +134,7 @@ import { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 /** 75c — the isolated-retry audit fields a record carries forward to every reader (marker, check, verdict). */
 function retryAuditOf(rec) {
   return {
+    ...(rec?.flakes?.length ? { flakes: rec.flakes } : {}),
     ...(rec?.retriedFailures?.length ? { retriedFailures: rec.retriedFailures } : {}),
     ...(rec?.retriedFailures?.length && rec.isolatedRetry ? { isolatedRetry: rec.isolatedRetry } : {}),
     ...(rec?.retriedTimeouts?.length ? { retriedTimeouts: rec.retriedTimeouts } : {}),
@@ -365,7 +366,7 @@ export function verificationInfrastructureFailure({ exitCode, signal, timedOutPh
   };
 }
 
-export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts, retriedFailures, isolatedRetry } = {}) {
+export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts, retriedFailures, isolatedRetry, flakes } = {}) {
   const base = prev && typeof prev === 'object' ? prev : {};
   const failure = infrastructure || verificationInfrastructureFailure({ exitCode, signal, failureDetails });
   const green = exitCode != null && Number(exitCode) === 0 && !failure;
@@ -373,7 +374,7 @@ export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, su
     sha: sha ?? base.sha ?? null,
     status: failure ? 'infrastructure-failure' : green ? 'green' : 'red',
     ...(failure ? { infrastructure: failure } : {}),
-    ...retryAuditOf({ retriedTimeouts, retriedFailures, isolatedRetry }),
+    ...retryAuditOf({ retriedTimeouts, retriedFailures, isolatedRetry, flakes }),
     // A test verdict only: an infrastructure failure produced no verdict, so it carries no failing-test names.
     ...(!green && !failure && failureDetails ? { failureDetails: boundFailureDetails(failureDetails) } : {}),
     startedAt: base.startedAt ?? null,
