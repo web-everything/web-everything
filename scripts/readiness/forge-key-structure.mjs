@@ -1,5 +1,11 @@
 // One bounded decoding pipeline feeds byte-only DER and parsed-JSON detectors.
 // Exhaustion refuses remote admission; the operator can inspect the file and run locally.
+//
+// ROLE: this is a TRIPWIRE, not the containment boundary. It catches common and nested encodings of private keys
+// (PEM, DER, JWK, base64 and URL-safe base64, hex, percent and HTML encodings, byte arrays) and refuses admission.
+// RESIDUAL: Keys hidden by junk padding over 50%, custom encodings, or other obfuscation are NOT detected;
+// containment is the allowlist manifest (S1/S2) plus read-deny on credential stores.
+// See designs/forge-allowlist-manifest.md (S1: only tracked files at HEAD; S2: only pushed commits).
 const LIMITS={bytes:32*1024*1024,candidates:16384,depth:8,steps:4*1024*1024};
 const EXHAUSTED='private-key-scan-budget-exhausted-use-local';
 const FINDING='private-key-structure';
