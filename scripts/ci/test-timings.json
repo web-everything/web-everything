@@ -2138,6 +2138,7 @@
   "scripts/conveyor/soak/breaks/verify-daemon-kills-same-sha-gate.soak.test.mjs": 0.11,
   "scripts/conveyor/soak/breaks/verify-daemon-runs-stale-code.soak.test.mjs": 0.11,
   "scripts/conveyor/soak/breaks/verify-request-stranded-undetected.soak.test.mjs": 1.72,
+  "scripts/conveyor/soak/breaks/verify-retries-failed-files.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/watcher-stand-down-git-clean-github-conflicting.soak.test.mjs": 0.27,
   "scripts/conveyor/soak/breaks/wip-cap-counts-worker-prs.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.soak.test.mjs": 93.82,
