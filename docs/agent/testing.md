@@ -1,5 +1,13 @@
 # Testing — Three-Tier Strategy
 
+## Stale merge-gate branch repair
+
+The drain's stale-gate repair is advisory: a BLOCKED skip remains a skip for the pass.
+Exercise the real `refreshStaleBlockedGates` hook with injected GitHub IO, including the exact
+`expected_head_sha` PUT, a repeated pass on the same head, and a 422. Reserve the head before
+the write; an uncertain response must not permit another attempt. The soak break
+`stale-failed-merge-gate-blocks-drain` detects fix presence by replaying behaviour in the target checkout.
+
 ## Review PR fetch isolation (R37)
 
 Review PR transport runs in a fresh temporary bare repository with empty global/system

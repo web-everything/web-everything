@@ -485,6 +485,8 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     });
     expect(readSettings().fixDispatch).toMatchObject({ borrowBuildSlots: 'on', borrowAfterMinutes: 15, borrowExecutor: 'codex', skipEmptySteps: true });
     expect(real.owners['fixDispatch.skipEmptySteps']).toBe('settings/fix-empty-steps.json');
+    expect(readSettings().drain.staleGateUpdateBranchMax).toBe(2);
+    expect(real.owners['drain.staleGateUpdateBranchMax']).toBe('settings/drain-stale-gate-update-branch.json');
     expect(resolveHeavyAdmissionCap({ env: {} })).toBe(3);
     expect(resolveCpuIdleMinPct('build', { env: {} })).toBe(15);
     expect(readCostAdmissionSettings({ env: {} })).toBeTruthy();

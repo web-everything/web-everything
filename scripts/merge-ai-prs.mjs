@@ -217,7 +217,7 @@ import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, h
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
-import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf, readQueueRequiredChecks } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -241,6 +241,7 @@ import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIO
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
+import { readStaleGateUpdateBranchMax, updateStaleGateBranches } from './lib/stale-gate-update-branch.mjs';
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
@@ -900,6 +901,14 @@ export function unlandableStateReason(state) {
     return 'merge state BLOCKED (branch protection unsatisfied: required checks pending or red, or an uncleared review) — owned by the ci-heal / review daemons, nothing for the drain to rebase';
   }
   return `merge state ${st} (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author`;
+}
+
+/** Select advisory repairs without changing any merge verdict. Shared with the hermetic soak replay. */
+export function refreshStaleBlockedGates(verdicts, { localSlug, ...options } = {}) {
+  return updateStaleGateBranches({ ...options,
+    candidates: verdicts.filter(v => v.decision === 'skip' && v.reason === unlandableStateReason('BLOCKED'))
+      .map(v => ({ repo: v.repo || localSlug, num: v.num, head: v.listedHeadSha || v.headSha })),
+  });
 }
 
 /** Unreadable verification defers this pass before any review-label writer runs. */
@@ -7321,6 +7330,27 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // hold below then keeps every source out of the queue this same pass. Never throws.
   runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts,
     mainFixNums: [...passMainFix], isLocalRepo });
+  // Advisory repair of the stale-failed gate only. These verdicts remain skips this pass.
+  const staleGateSetting = readStaleGateUpdateBranchMax({ env });
+  process.stderr.write(`drain.staleGateUpdateBranchMax=${staleGateSetting.value} (${staleGateSetting.source})\n`);
+  if (!DRY_RUN) {
+    const staleGateRosters = new Map();
+    const staleGateRepoKey = repo => REPOS.find(r => (r || localSlug) === repo);
+    refreshStaleBlockedGates(verdicts, {
+      localSlug, max: staleGateSetting.value,
+      defaultBranchOf: repo => defaultBranchOf(staleGateRepoKey(repo)),
+      requiredChecksOf: repo => {
+        if (!staleGateRosters.has(repo)) {
+          const repoKey = staleGateRepoKey(repo);
+          const names = queueRequiredChecksOf(repoKey) ?? readQueueRequiredChecks({ repo, branch: defaultBranchOf(repoKey) });
+          staleGateRosters.set(repo, names ? [...new Set(['test', REQUIRED, ...names])] : null);
+        }
+        return staleGateRosters.get(repo);
+      },
+      isRequiredCheckGreen,
+      fixClaimHeld: (repo, num) => !repoKeyForSlug(repo) || prestageFixClaimHeld(num, { claimKey: repoKeyForSlug(repo) }),
+    });
+  }
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has
