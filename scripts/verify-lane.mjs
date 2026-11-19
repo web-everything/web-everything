@@ -125,8 +125,6 @@ for (const a of process.argv.slice(2)) {
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
-const laneHeartbeat = startLaneLeaseHeartbeat({ cwd: REPO });
-process.once('exit', () => laneHeartbeat.stop());
 const AS_JSON = !!flags.json;
 // #2833 finding 5 — resolve the gate options through the SHARED resolver so `check` mode agrees with pr-land:
 // `--require-verified` OR `WE_REQUIRE_VERIFIED=1`, and the `WE_LAND_UNVERIFIED=1` break-glass. Previously `check`
@@ -138,6 +136,9 @@ const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_EN
 delete process.env[VERIFY_MARKER_NONCE_ENV];
 const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
+// Only a run that holds the lane while gating renews its lease; reset/check/print-gate must never revive one.
+const laneHeartbeat = (MODE === 'verify' || MODE === 'run') ? startLaneLeaseHeartbeat({ cwd: REPO }) : { stop() {} };
+process.once('exit', () => laneHeartbeat.stop());
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
 // a command here (`core.fsmonitor`, hooks, `diff.external`/textconv). Env-pinned config + argument rewrites; a lane that defines a
