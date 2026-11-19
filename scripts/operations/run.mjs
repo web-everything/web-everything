@@ -939,7 +939,7 @@ export function operatorControlCliPolicy(name, argv) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   const [name, ...rest] = process.argv.slice(2);
-  if (name === 'review-abandon') { const { main } = await import('./review-abandon.mjs'); const abandonCode = main(rest); process.exit(abandonCode); }
+  if (name === 'review-abandon') { const { cliMain } = await import('./review-abandon.mjs'); const abandonCode = cliMain(rest); process.exit(abandonCode); }
   if (name === 'worker-pause') { const { main: pause } = await import('./worker-pause.mjs'); const pauseCode = pause(rest); process.exit(pauseCode); } // R480: tiny flag CLI, not a run-record operation
   if (name === 'await-checks') { const { main } = await import('./await-checks.mjs'); const code = main(rest); process.exit(code); } // worker CI wait (guard-bash refuses raw --watch)
   if (name === 'await') { const { main } = await import('./await.mjs'); const code = main(rest); process.exit(code); }

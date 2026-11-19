@@ -4850,6 +4850,11 @@ rewritten record. Writer-lock/temp scans still inspect their sidecars for livene
 
 Open effects require readable object payloads and a known non-rejecting sink/accept-class target;
 missing historical payloads, unknown sinks and unproven label/verdict effects retain the hold.
+Label swaps require the writer's `to` field to belong to the shared `REVIEW_LABEL_TARGETS` list
+and be accept-class; decision vocabulary such as `needs-human` is not a supported label target.
+The standalone `review-abandon` CLI checks runner freshness before `--apply` enters `main`;
+dry-run inspection remains available. Keep the injected stale-runner refusal and readable #7109
+accepting label-swap regressions in the scoped gate.
 Inspect nested objects and arrays alike: over 16 levels, 4096 entries or 256 KiB of text retains
 the hold and directs the operator to inspect the full verdict/effect payload before retrying.
 Abandoned attempts still count toward the merge-watch repeated-review pause alert, including cached scans.

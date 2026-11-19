@@ -9,6 +9,7 @@ import * as nodeFs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { runPath, resolveRunsDir } from '../operations/run-store.mjs';
+import { REVIEW_LABEL_TARGETS } from '../review-set-label.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonRejecting = ['accept', 'accepted', 'prevention-outstanding', 'needs-human', 'abstain', 'review:accepted', 'review:pending', 'clear-human', 'rearm'];
@@ -53,7 +54,8 @@ export function hasRejectingReviewVerdict(run) {
       if (!object(payload) || rejectingPayload(payload, budget)) return true;
       const has = keys => keys.some(key => Object.hasOwn(payload, key));
       switch (effect.type) {
-        case 'review.label-swap': return !has(['to', 'target', 'addLabel', 'label']);
+        case 'review.label-swap': return typeof payload.to !== 'string'
+          || !REVIEW_LABEL_TARGETS.includes(payload.to) || !nonRejecting.includes(payload.to);
         case 'verdict-ledger.append': return !has(['to', 'target', 'verdict', 'outcome', 'decision']);
         case 'review.notice': return !has(['notice', 'verdict', 'outcome']);
         // These sinks only record bookkeeping/advisory evidence, never a review verdict or label swap.

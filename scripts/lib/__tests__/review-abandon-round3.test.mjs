@@ -45,6 +45,9 @@ it.each([
   ['in-flight send-back notice', { effects: [effect({ notice: renderReviewNotice({ event: 'cleared', repo, pr, outcome: 'changes' }) }, 'in-flight', 'review.notice')] }],
   ['unknown confirm shape', { findings: { confirm: { answer: 'changes' }, read: { netBasis: { rev: head } } } }],
   ['unreadable label payload', { effects: [effect(null)] }],
+  ...['needs-human', 'unknown', 'accept', 'review:accepted', 'changes', 'restamp', null, 1, {}, ['accepted']].map(to =>
+    [`unsupported or non-accept-class label target ${JSON.stringify(to)}`, { effects: [effect({ to })] }]),
+  ['label aliases without the writer target', { effects: [effect({ target: 'accepted', addLabel: 'review:accepted' })] }],
   ...['declared', 'pending', 'in-flight'].flatMap(status => [
     ...['review.label-swap', 'review.notice', 'verdict-ledger.append', 'unknown-effect'].map(type =>
       [`${status} ${type} missing payload`, { effects: [effect(undefined, status, type)] }]),

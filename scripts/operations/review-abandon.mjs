@@ -6,6 +6,22 @@
  */
 import { reapDeadReviewRuns } from '../lib/reap-dead-review-runs.mjs';
 import { isValidRunId } from './run-store.mjs';
+import { assertRunnerFreshness } from './runner-freshness.mjs';
+
+/** Standalone CLI dispatch: mutating calls owe the runner's freshness guard before entering main. */
+export function cliMain(argv, { assertFresh = assertRunnerFreshness, run = main, err = console.error } = {}) {
+  if (argv.includes('--apply')) {
+    try {
+      // This flag CLI has no engine run declaration; its write policy is an effect, never compute-only.
+      assertFresh({ declaration: { name: 'review-abandon', steps: [{ step: { kind: 'effect' } }] },
+        moduleUrl: import.meta.url });
+    } catch (e) {
+      err(String(e?.message ?? e));
+      return 1;
+    }
+  }
+  return run(argv);
+}
 
 export function main(argv, { out = console.log, err = console.error, reaperOptions = {} } = {}) {
   let run;

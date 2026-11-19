@@ -2,7 +2,9 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { main } from '../review-abandon.mjs';
+import { pathToFileURL } from 'node:url';
+import { cliMain, main } from '../review-abandon.mjs';
+import { assertRunnerFreshness } from '../runner-freshness.mjs';
 import { newRunRecord, runPath, writeRun } from '../run-store.mjs';
 import { abandonedPath, isRunAbandoned, markRunAbandoned } from '../../lib/run-abandoned.mjs';
 import { COMMENT_SETTLEABLE_REASONS, readDrainRedTeamEvidence, readRecoveryWitness, settleUnknownEvidenceByComment } from '../../lib/drain-red-team-evidence.mjs';
@@ -14,6 +16,42 @@ import { closeConfirmRunsAfterClearance } from '../../review-set-label.mjs';
 
 const MIN = 60000, now = Date.parse('2026-11-18T12:00:00Z');
 const repo = 'owner/repo', head = 'a'.repeat(40);
+it('CLI refuses stale apply before main with the shared freshness message and exit code 1', () => {
+  const run = vi.fn(), err = vi.fn();
+  const assertFresh = vi.fn(options => assertRunnerFreshness(options, {
+    env: {}, now: () => 1001,
+    filesystem: { realpathSync: p => p, readFileSync: () => JSON.stringify({ remote: 'fixture-origin', ref: 'abc', time: 1000 }) },
+    git: args => {
+      if (args.includes('--show-toplevel')) return root;
+      if (args.includes('--absolute-git-dir')) return join(root, '.git');
+      if (args[0] === 'remote') return 'fixture-origin';
+      if (args[0] === 'rev-list') return '1';
+      if (args[0] === 'fetch') throw Error('unexpected fetch');
+      return 'abc';
+    },
+  }));
+  expect(cliMain(['--apply'], { run, err, assertFresh })).toBe(1);
+  expect(assertFresh).toHaveBeenCalledWith({ declaration: { name: 'review-abandon', steps: [{ step: { kind: 'effect' } }] },
+    moduleUrl: pathToFileURL(join(process.cwd(), 'scripts/operations/review-abandon.mjs')).href });
+  expect(err).toHaveBeenCalledTimes(1);
+  expect(err).toHaveBeenCalledWith(`Refusing review-abandon: runner ${root}; HEAD abc; refs/remotes/origin/main: 1 commits behind; run from a lane.`);
+  expect(run).not.toHaveBeenCalled();
+});
+it('CLI permits dry-run inspection without freshness checks', () => {
+  const assertFresh = vi.fn(() => { throw Error('stale'); }), run = vi.fn(() => 0);
+  expect(cliMain(['--json'], { assertFresh, run })).toBe(0);
+  expect(assertFresh).not.toHaveBeenCalled();
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(run).toHaveBeenCalledWith(['--json']);
+});
+it('CLI checks freshness before a fresh apply and preserves main exit code', () => {
+  const order = [], assertFresh = vi.fn(() => { order.push('freshness'); });
+  const run = vi.fn(() => { order.push('main'); return 2; });
+  expect(cliMain(['--apply', '--json'], { assertFresh, run })).toBe(2);
+  expect(order).toEqual(['freshness', 'main']);
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(run).toHaveBeenCalledWith(['--apply', '--json']);
+});
 let root, dir, env, probes;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'review-abandon-'));
