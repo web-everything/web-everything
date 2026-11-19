@@ -21,9 +21,13 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
   const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
   // Appended (not prepended) so checkout-local binaries can never shadow system git/sh/npm.
+  const systemPath = childEnv.PATH ?? '';
   childEnv.PATH = [childEnv.PATH, ...binDirs].filter(Boolean).join(delimiter);
   const run = (cmd, args, dir = cwd) => {
-    const r = spawnSync(cmd, args, { cwd: dir, env: childEnv, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
+    // Checkout-local bins only for the admission wrapper that runs vitest/npm; git, gh and plain node calls
+    // (which decide trust, e.g. the FUI origin) get the system PATH so a local replacement cannot shadow them.
+    const env = String(args[0]).endsWith('heavy-admission.mjs') ? childEnv : { ...childEnv, PATH: systemPath };
+    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
     if (r.error || r.status !== 0) {
       const tail = String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n');
       const err = new Error(`urgent-verify subprocess failed or admission unavailable (exit ${r.status ?? r.error?.code ?? 'unknown'}): ${cmd} ${args.join(' ')}`);

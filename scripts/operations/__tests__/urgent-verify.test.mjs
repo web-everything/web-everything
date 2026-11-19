@@ -438,7 +438,7 @@ describe('FUI origin binding', () => {
 describe('urgent-verify blocker fixes', () => {
   it('appends the checkout node_modules/.bin after system PATH so it cannot shadow system tools', () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
-    createUrgentDeps({ cwd: '/repo', env: { PATH: '/usr/bin', HOME: '/h' }, spawnSync }).head();
+    createUrgentDeps({ cwd: '/repo', env: { PATH: '/usr/bin', HOME: '/h' }, spawnSync }).standards(); // the admission wrapper is the only caller that gets checkout-local bins
     const parts = spawnSync.mock.calls[0][2].env.PATH.split(':');
     expect(parts[0]).toBe('/usr/bin');
     expect(parts).toContain('/repo/node_modules/.bin');
@@ -523,6 +523,13 @@ describe('urgent-verify isolated worktree', () => {
     git(t.repo, 'worktree', 'add', '--detach', dead, t.head);
     await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
     expect(existsSync(dead)).toBe(false);
+  });
+  it('git and gh calls never see checkout-local node_modules/.bin on PATH', () => {
+    const paths = [], spawnSync = (cmd, args, o) => { paths.push(o.env.PATH); return { status: 0, stdout: 'https://github.com/frontier-ui/frontierui' }; };
+    const d = createUrgentDeps({ cwd: '/r', env: { PATH: '/bin' }, spawnSync });
+    d.head(); d.clean(); d.repo();
+    expect(paths.length).toBe(3);
+    for (const p of paths) expect(p).toBe('/bin');
   });
   it('child env carries no GIT_DIR / GIT_WORK_TREE', () => {
     const seen = [], spawnSync = (cmd, args, o) => { seen.push(o.env); return { status: 0, stdout: '' }; };
