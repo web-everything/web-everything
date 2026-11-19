@@ -68,14 +68,23 @@ export function resolveOperationRoute(options = {}, { readPolicy = readRoutingPo
   const settings = resolveRoutingSettings({ env: options.env ?? process.env }).capacity;
   if (settings.minimumTiers?.[key] !== undefined && policy.operations[key]?.inherit) {
     const now = options.now ?? Date.now();
-    const capacities = (options.capacity ?? observeCapacity({ env: options.env ?? process.env, now, settings }))
-      .filter(c => !options.available || options.available.includes(c.launcher ?? c.provider));
-    const decision = chooseBuilder({ kind: options.operation, capacities, settings: { ...settings, routeKey: key, now }, fallback: null });
-    if (!decision.provider) throw new Error('no eligible capacity meeting minimum tier; wait for quota reset or supply operator readings');
-    return { provider: decision.launcher === 'antigravity' ? decision.provider : decision.launcher ?? decision.provider,
-      model: decision.model, account: decision.account, effort: 'high', fallback: [], source: 'capacity-score' };
+    let capacities = options.capacity ?? observeCapacity({ env: options.env ?? process.env, now, settings });
+    while (capacities.length) {
+      const decision = chooseBuilder({ kind: options.operation, capacities, settings: { ...settings, routeKey: key, now }, fallback: null });
+      if (!decision.provider) break;
+      const entry = { ...policy.operations[key], inherit: undefined,
+        provider: decision.launcher === 'antigravity' ? decision.provider : decision.launcher ?? decision.provider,
+        model: decision.model, effort: 'high', fallback: [],
+        disabledProviders: [...new Set([...(policy.operations[options.operation]?.disabledProviders ?? []), ...(policy.operations[key].disabledProviders ?? [])])] };
+      try {
+        const route = resolvePureRoute({ ...options, providerCapacity: settings,
+          policy: { ...policy, operations: { ...policy.operations, [key]: entry } } });
+        if (route) return { ...route, account: decision.account, source: 'capacity-score' };
+      } catch { /* Try the next ranked capacity candidate, then the historical policy path. */ }
+      capacities = capacities.filter(c => c.provider !== decision.provider || (c.account ?? null) !== (decision.account ?? null));
+    }
   }
-  return resolvePureRoute({ ...options, policy,
+  return resolvePureRoute({ ...options, policy, providerCapacity: options.providerCapacity ?? settings,
     operatorKeys: options.operatorKeys ?? (options.policy === undefined ? readPolicy.operatorKeys() : undefined) });
 }
 export function resolvePolicyModel(provider, model, policy = readRoutingPolicy()) {
@@ -135,10 +144,8 @@ export function resolveDispatchRoute(dispatch, options = {}) {
       ...Object.fromEntries(Object.keys(routingPolicy.operations).filter(k => k.startsWith(`${dispatch.kind}:`) && routingPolicy.operations[k].inherit).map(k => [k, entry])),
     } };
   }
-  // A verified minimum tier replaces the Claude-only critical gate for these two build routes only.
-  const tierSelected = builder?.decision?.reason === 'capacity-score' && builder.settings.capacity.minimumTiers?.[routeKey] !== undefined;
   if (taskType && ['takeover', 'ruling-not-addressed'].includes(taskType)) routingPolicy = { ...routingPolicy, operations: { ...routingPolicy.operations, fix: routingPolicy.operations[`fix:${taskType}`] } };
-  const result = decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy, capacityTierSelected: tierSelected });
+  const result = decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy, providerCapacity: builder?.settings.capacity ?? resolveRoutingSettings({ env: options.env ?? process.env }).capacity });
   // Launchers that support account selection can consume this field; current launchers ignore it.
   return { ...result, ...(builder?.account ? { account: builder.account } : {}) };
 }

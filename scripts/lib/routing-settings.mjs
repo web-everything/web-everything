@@ -25,9 +25,10 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
   if (raw) { out.builder = BUILDERS.includes(raw) ? raw : 'claude'; out.source = 'env'; }
   const capacity = cascadePolicy('routing.capacity', file.capacity, {
     standard: { ...CAPACITY_DEFAULTS, enabled: out.builder === 'auto' }, env,
+    envValues: { operatorReadingMaxAgeHours: env.WE_ROUTING_CAPACITY_OPERATOR_READING_MAX_AGE_HOURS === undefined ? undefined : Number(env.WE_ROUTING_CAPACITY_OPERATOR_READING_MAX_AGE_HOURS) },
     platform: readPlatformPreferences({ env }).prefs.routing?.capacity ?? {},
     valid: Object.fromEntries(Object.entries({ ...CAPACITY_DEFAULTS, enabled: true }).map(([key, value]) => [key,
-      typeof value === 'number' ? v => Number.isFinite(v) && v >= 0 && (!['urgencyHorizonHours', 'staleHours', 'rateLookbackHours'].includes(key) || v > 0)
+      typeof value === 'number' ? v => Number.isFinite(v) && v >= 0 && (!['urgencyHorizonHours', 'staleHours', 'operatorReadingMaxAgeHours', 'rateLookbackHours'].includes(key) || v > 0)
         : typeof value === 'boolean' ? v => typeof v === 'boolean'
           : Array.isArray(value) ? v => Array.isArray(v) && v.every(x => typeof x === 'string')
             : key === 'workingHours' ? () => true : v => v === null || typeof v === 'object' || typeof v === 'number' || typeof v === 'string',

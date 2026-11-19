@@ -4,10 +4,10 @@ import { routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 import { resolveFixChainInput } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 import { resolveAiRouting } from '../../lib/ai-routing.mjs';
 import { resolveFixExecutorChain } from '../../lib/fix-executor-chain.mjs';
-import { DEFAULT_ROUTING_POLICY } from '../../lib/dispatch-routing-policy.mjs';
+import { fixPolicy as DEFAULT_ROUTING_POLICY, fixCapacity } from './fix-routing-fixture.mjs';
 
 const resolved = tool => resolveAiRouting({ tool, platform: {}, env: {}, accountMap: { accounts: {} }, log: false });
-const ladder = options => loadFixerLadder({ override: undefined, routingPolicy: DEFAULT_ROUTING_POLICY, ...options });
+const ladder = options => loadFixerLadder({ override: undefined, routingPolicy: DEFAULT_ROUTING_POLICY, providerCapacity: fixCapacity, ...options });
 const chain = options => resolveFixExecutorChain({ env: {}, platform: {}, repo: { routing: { builder: 'codex' } }, ...options });
 
 describe('daemon site: reconcile-fix-dispatch-daemon chain input', () => {

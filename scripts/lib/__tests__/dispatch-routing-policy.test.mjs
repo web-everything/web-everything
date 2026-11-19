@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, copyFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, copyFileSync, readFileSync, readdirSync } from 'node:fs';
 import matter from 'gray-matter';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -220,7 +220,11 @@ describe('operation routing policy', () => {
 
 
 it('a child uses the inherited last-good snapshot even while the policy file is syntactically broken', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'routing-policy-child-'));
+  const parent = mkdtempSync(join(tmpdir(), 'routing-policy-child-'));
+  const dir = join(parent, 'lib');
+  mkdirSync(dir);
+  mkdirSync(join(parent, 'settings'));
+  copyFileSync('scripts/settings/provider-capacity.json', join(parent, 'settings/provider-capacity.json'));
   try {
     for (const file of ['dispatch-routing-policy-source.mjs', 'codex-model-routing.mjs', 'dispatch-routing-policy.mjs', 'dispatch-routing-providers.mjs']) copyFileSync(`scripts/lib/${file}`, join(dir, file));
     writeFileSync(join(dir, 'dispatch-routing-policy.json'), '{broken edit');
@@ -229,7 +233,7 @@ it('a child uses the inherited last-good snapshot even while the policy file is 
       encoding: 'utf8', env: { ...process.env, WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) },
     });
     expect(JSON.parse(result)).toMatchObject({ provider: 'codex', model: 'gpt-6-astra' });
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(parent, { recursive: true, force: true }); }
 });
 
 it('adding prepare-item to gated kinds applies the same fail-closed check to its explicit policy', () => {
@@ -474,4 +478,32 @@ it('does not resurrect a vetoed Codex retry model at launch', () => {
     scriptExists: () => true, agent: r => { models.push(r.table.model); return 'session'; },
   });
   expect(models).toEqual(['gpt-6.1-sol', 'claude-sonnet-5-5']);
+});
+
+it('critical fix tier gate cannot be bypassed by capacityTierSelected on explicit routes', () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations.fix = { provider: 'codex', model: 'sol', fallback: [] };
+  const dispatch = { kind: 'fix', scopePaths: ['we:scripts/lib/critical-work.mjs'], size: 1, risk: 'high' };
+  const config = { minimumTiers: { 'fix:critical-work': 3 }, providers: [{ id: 'codex', launcher: 'codex', model: 'gpt-6.1-sol', tier: 3 }] };
+  expect(decideDispatchRoute(dispatch, { routingPolicy: policy, providerCapacity: config }).policyRoute.provider).toBe('codex');
+  for (const providers of [[], [{ ...config.providers[0], tier: 1 }], [{ ...config.providers[0], model: 'gpt-6-luna' }]]) {
+    const out = decideDispatchRoute(dispatch, { routingPolicy: policy, capacityTierSelected: true, providerCapacity: { ...config, providers } });
+    expect(out.outcome).toBe('refused');
+    expect(out.refusal).toMatch(/minimum tier/);
+  }
+});
+
+it.each(['critical-work', 'ruling-escalation-stronger'])('%s enforces configured model tiers on every explicit and inherited path', taskType => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  const providerCapacity = { minimumTiers: { [`fix:${taskType}`]: 3 },
+    providers: [{ id: 'codex', launcher: 'codex', model: 'gpt-6.1-sol', tier: 2 }] };
+  policy.operations[`fix:${taskType}`] = { provider: 'codex', model: 'sol', fallback: [] };
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity })).toThrow(/minimum tier/);
+  providerCapacity.providers[0].tier = 3;
+  expect(resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity }).provider).toBe('codex');
+  providerCapacity.minimumTiers = {};
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity })).toThrow(/unknown tier/);
+  policy.operations[`fix:${taskType}`] = { inherit: true };
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType, policy, providerCapacity,
+    inheritedRoute: { provider: 'codex', model: 'sol', fallback: [] } })).toThrow(/unknown tier/);
 });

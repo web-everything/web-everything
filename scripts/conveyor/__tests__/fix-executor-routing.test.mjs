@@ -177,10 +177,16 @@ describe('routed CI-heal and claim accounting', () => {
         profileFor: () => ({ slug: 'web-everything/web-everything', lanePoolRepo: '/repo' }),
       });
       const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      // Pin the native-provider fixture independently of live quota/operator readings.
+      const previousBuilder = process.env.WE_ROUTING_BUILDER;
+      process.env.WE_ROUTING_BUILDER = 'claude';
       const result = await run({ pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] }, {
         root: '/repo', repo: 'we', readBrief: () => 'CI-heal {{PR_NUM}}', pollAttempts: () => [], readFixClaim: () => null,
         acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, claimOwner: 'test-owner', stampRunner: vi.fn(), routeHeal,
-      }).finally(() => log.mockRestore());
+      }).finally(() => { log.mockRestore();
+        if (previousBuilder === undefined) delete process.env.WE_ROUTING_BUILDER;
+        else process.env.WE_ROUTING_BUILDER = previousBuilder;
+      });
       return { result, spawnAgent, launchCodex, routeHeal, log };
     };
 
@@ -573,4 +579,39 @@ describe('chain dispatch and critical scope', () => {
       expect(log.mock.calls.find(([line])=>line.includes('ruling-not-addressed rung'))[0]).toContain('model=gemini-4-argon-high');
     } finally {log.mockRestore();}
   });
+});
+
+it('executor null holds dispatchFix before claims or antigravity fallback', () => {
+  const acquireClaim = vi.fn(), spawnBorrowed = vi.fn(), spawnAgent = vi.fn();
+  const decision = { executor: null, reason: 'no eligible capacity; wait for quota reset' };
+  expect(dispatchFix({ pr: 42, itemNum: '42', lane: 2 }, {
+    root: '/repo', readFixClaim: () => null, acquireClaim, spawnBorrowed, spawnAgent,
+    fixExecutorRoute: () => decision,
+  })).toMatchObject({ held: true, reason: decision.reason });
+  expect(acquireClaim).not.toHaveBeenCalled();
+  expect(spawnBorrowed).not.toHaveBeenCalled();
+  expect(spawnAgent).not.toHaveBeenCalled();
+});
+it('executor null holds CI heal before sinks or launch', async () => {
+  const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+  const createSinks = vi.fn(), dispatch = vi.fn();
+  const out = await createRoutedCiHealDispatch({ route: () => ({ executor: null, reason: 'capacity held' }), createSinks, dispatch })({ pr: 42 });
+  expect(out).toEqual({ held: true, reason: 'capacity held' });
+  expect(createSinks).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
+});
+it.each([false, true])('executor null holds reconciliation before resume or dispatch (conflict=%s)', async isConflict => {
+  const { runReconcileFixDispatch } = await import('../reconcile-fix-dispatch.mjs');
+  const dispatch = vi.fn(), resume = vi.fn();
+  const out = runReconcileFixDispatch({ root: '/repo', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }),
+    reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefName: 'lane/42-x', attempts: 1, isConflict, ...(isConflict ? { reason: 'merge-status:conflicting' } : {}), files: ['scripts/x.mjs'] }], refusals: [], notes: [] }),
+    findItemFn: () => ({ num: '42', scope: ['we:scripts/x.mjs'], specPath: 'backlog/42-x.md' }),
+    loadItems: () => [], pickFreeLanes: () => [2], listBuildClaims: () => [], listFixClaims: () => [],
+    dispatchThrottle: { tryAdmit: () => ({ admit: true }) }, borrowGate: { consider: vi.fn(), clear: vi.fn() },
+    tryResume: resume, tryResumeRound: resume, dispatch,
+    fixExecutorRoute: () => ({ executor: null, reason: 'critical escalation requires Claude' }),
+  });
+  expect(out.refusals).toContainEqual(expect.objectContaining({ pr: 42, kind: 'executor-held', why: 'critical escalation requires Claude' }));
+  expect(resume).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
 });

@@ -21,6 +21,7 @@ export function operatorInputs(capacities, settings) {
   for (const c of capacities) {
     if (c.quotaOf) continue;
     const key = `${c.provider}/${c.account ?? c.id}`;
+    if (c.operatorReadingStale) missing.push(`${key}: operator reading stale — refresh`);
     if (!c.known) missing.push(`${key}: usage unknown; supply a live reading or operatorReading`);
     if (c.provider === 'claude' && !settings.claudeUsageAccount) missing.push(`${key}: shared claude-usage.json account unknown (set routing.capacity.claudeUsageAccount)`);
     if (c.resetSchedule === null) missing.push(`${key}: resetSchedule`);

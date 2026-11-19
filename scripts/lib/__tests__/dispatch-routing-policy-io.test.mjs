@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DEFAULT_ROUTING_POLICY } from '../dispatch-routing-policy.mjs';
-import { createRoutingPolicyReader } from '../dispatch-routing-policy-io.mjs';
+import { createRoutingPolicyReader, resolveOperationRoute } from '../dispatch-routing-policy-io.mjs';
 
 const dirs = [];
 const key = 'review-seat:red-team';
@@ -61,4 +61,40 @@ it('accepts a live disable when the reader environment gives the remaining Gemin
   expect(next.operations[key].disabledProviders).toEqual(['codex', 'agy-claude']);
   expect(f.log).not.toHaveBeenCalled();
   expect(f.emit).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  { gateClosed: true, availability: { codex: 'operator hold' }, vetoes: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },
+  { availability: { codex: 'operator hold' } },
+  { vetoes: [{ provider: 'codex', model: 'gpt-6.1-sol' }] },
+  { disabled: ['codex'] },
+  { invalidModel: true },
+  { available: ['claude'] },
+])('capacity selection enforces existing route checks %j and tries the next candidate', checks => {
+  const now = Date.parse('2026-11-19T12:00:00Z');
+  const capacity = ['codex', 'claude'].map((provider, i) => ({ provider, known: true, health: 1,
+    model: i ? 'claude-opus-5-5' : checks.invalidModel ? 'invalid-model' : 'gpt-6.1-sol',
+    windows: [{ usedPercent: i ? 80 : 1, resetsAt: now + 3600000 }] }));
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['fix:critical-work'] = { inherit: true, disabledProviders: checks.disabled ?? [] };
+  const out = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy, capacity, now, env: {}, ...checks });
+  expect(out.provider).toBe('claude');
+  expect(out.model).toBe('claude-opus-5-5');
+});
+it('capacity rejection reaches the historical policy fallback when no candidate passes', () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations['fix:critical-work'] = { inherit: true };
+  policy.operations.fix = { provider: 'claude', model: 'opus', fallback: [] };
+  expect(resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', gateClosed: true, policy,
+    env: {}, capacity: [] }).provider).toBe('claude');
+});
+
+it('capacity cannot bypass a disabled provider on the inherited parent operation', () => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.operations.fix = { inherit: true, disabledProviders: ['codex'] };
+  policy.operations['fix:critical-work'] = { inherit: true };
+  expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy, env: {},
+    inheritedRoute: { provider: 'codex', model: 'sol', fallback: [] },
+    now: 1800000000000, capacity: [{ provider: 'codex', known: true, health: 1,
+      windows: [{ usedPercent: 10, resetsAt: 1800003600000 }] }] })).toThrow(/unknown tier|disabled providers/);
 });

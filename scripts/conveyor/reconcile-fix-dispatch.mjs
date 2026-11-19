@@ -1310,7 +1310,8 @@ export function launchTableFor(planned, roundEscalation, { fixSettings = resolve
   const table = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
   const verdict = criticalWorkVerdict({ ...planned, taskType: 'fix', filesTouched: planned.scope ?? [] });
   if (verdict.critical) {
-    const route = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', available: ['claude'], gateClosed: true });
+    const route = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', available: ['claude'], gateClosed: true,
+      inheritedRoute: { provider: 'claude', model: CLAUDE_NATIVE_MODEL_BY_TIER.opus, effort: 'high', fallback: [] } });
     // Inherited (including omitted) routes retain the critical-work model, never the escalation rung's model.
     return { ...table, model: route?.model ?? CLAUDE_NATIVE_MODEL_BY_TIER.opus, effort: route?.effort ?? 'high',
       reason: `${route ? 'routing-policy fix:critical-work' : 'critical-work fallback'} (${verdict.reasons.map(r => r.proxy).join(', ')})` };
@@ -1554,6 +1555,7 @@ export function dispatchFix(planned, {
   const decision = repeat.action !== 'patch' ? { executor: 'codex', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
     ...planned, round: roundOf(planned), strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
   }) ?? chooseFixExecutor({ setting: { value: 'provider-routing', source: 'default' } });
+  if (decision.executor === null) return { held: true, reason: decision.reason, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane };
   const claim = acquireClaim({
     repo, pr: planned.pr, kind: 'fix', headSha: planned.headRefOid, scope: planned.overlapScope ?? planned.scope, owner: claimOwner, lockRoot: claimRoot,
     ...(borrowed ? { borrowed } : {}),
@@ -2240,6 +2242,10 @@ export function runReconcileFixDispatch({
     // rather than refusing just this one entry — the same per-entry isolation `dispatch(...)` below already
     // gets, now extended to cover this earlier call site too.
     const executorDecision = !borrowed && fixExecutorRoute ? fixExecutorRoute({ ...entry, repo: repoKey, round: roundOf(entry) }) : null;
+    if (executorDecision?.executor === null) {
+      refusals.push({ pr: entry.pr, kind: 'executor-held', why: executorDecision.reason });
+      continue;
+    }
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {

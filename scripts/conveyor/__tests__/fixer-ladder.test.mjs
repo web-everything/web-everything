@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
-import { loadFixerLadder, readFixerEscalationOverride } from '../fixer-ladder.mjs';
+import { loadFixerLadder as loadLadder, readFixerEscalationOverride } from '../fixer-ladder.mjs';
 import { fixerTableFor, withRulingNotAddressed } from '../reconcile-fix-dispatch.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { enrichPrsWithIgnoredRulings } from '../reconcile-pass.mjs';
 import { buildAgentArgv } from '../../operations/dispatch-lane-io.mjs';
-import { readRoutingPolicy } from '../../lib/dispatch-routing-policy-io.mjs';
-import { resolveOperationRoute } from '../../lib/dispatch-routing-policy.mjs';
+import { fixPolicy, fixCapacity } from './fix-routing-fixture.mjs';
+const readRoutingPolicy = () => fixPolicy;
+const loadFixerLadder = options => loadLadder({ routingPolicy: fixPolicy, providerCapacity: fixCapacity, ...options });
+import { resolveOperationRoute as resolveRoute } from '../../lib/dispatch-routing-policy.mjs';
 import { H1, H2, H3, H4, record, recordComment, ignoredRulingThread, BLOCK } from './ruling-fixtures.mjs';
 
+const resolveOperationRoute = options => resolveRoute({ providerCapacity: fixCapacity, ...options });
 const thread = (n) => [...ignoredRulingThread(),
   ...(n > 2 ? [recordComment(record({ head: H3, runId: 'run-3' }), 40)] : []),
   ...(n > 3 ? [recordComment(record({ head: H4, runId: 'run-4' }), 60)] : [])];

@@ -4,13 +4,14 @@ import { resolveFixSettings } from '../fix-takeover.mjs';
 import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, resolvePolicyModel, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
 import * as routingPolicyIO from '../../lib/dispatch-routing-policy-io.mjs';
 
+import { fixPolicy, fixCapacity } from './fix-routing-fixture.mjs';
 const ruling = { rung: { id: 'stronger-model', at: 2 }, route: { provider: 'claude', model: 'opus', effort: 'high' } };
 const ordinary = { pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] };
 
 describe('daemon Claude fix models', () => {
   it('the stronger route and its Claude fallback default to Sonnet at high effort', () => {
     for (const taskType of ['ruling-escalation-stronger', 'ruling-escalation-cross-provider']) {
-      expect(resolveOperationRoute({ operation: 'fix', taskType, available: ['claude'], policy: DEFAULT_ROUTING_POLICY }))
+      expect(resolveOperationRoute({ operation: 'fix', taskType, available: ['claude'], policy: fixPolicy, providerCapacity: fixCapacity }))
         .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.sonnet, effort: 'high' });
     }
   });

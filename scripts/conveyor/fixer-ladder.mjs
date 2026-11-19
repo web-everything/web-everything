@@ -37,6 +37,7 @@ const EFFORT_RANK = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 export function loadFixerLadder({
   path, read, routingPolicy = readRoutingPolicy(), externalFixProviders = EXTERNAL_FIX_PROVIDERS,
   override, // injectable: skip the file
+  providerCapacity, // injectable configured model tiers; production resolves through the settings cascade
   aiRouting, operatorKeys, // optional resolver input (fix coordinator slice); absent = unchanged
 } = {}) {
   if (aiRouting !== undefined && !Array.isArray(operatorKeys)) throw new TypeError('aiRouting requires operatorKeys from the policy snapshot');
@@ -49,11 +50,13 @@ export function loadFixerLadder({
     if (rung.action !== 'dispatch') continue;
     if (!rung.taskType) { routes[rung.id] = null; continue; }
     try {
-      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy };
+      const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, providerCapacity };
       routes[rung.id] = resolveOperationRoute(base);
       // aiRouting may only RAISE a rung's effort on the same provider and model: an escalation rung is never weakened.
       if (aiRouting !== undefined && routes[rung.id]) {
-        const routed = resolveOperationRoute({ ...base, aiRouting, operatorKeys });
+        let routed;
+        try { routed = resolveOperationRoute({ ...base, aiRouting, operatorKeys }); }
+        catch { /* An invalid overlay cannot discard the already validated escalation route. */ }
         const rank = effort => EFFORT_RANK.indexOf(effort);
         if (routed && routed.provider === routes[rung.id].provider && routed.model === routes[rung.id].model
           && rank(routed.effort) >= rank(routes[rung.id].effort)) routes[rung.id] = routed;

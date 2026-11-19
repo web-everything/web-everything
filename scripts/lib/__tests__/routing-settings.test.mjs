@@ -220,3 +220,18 @@ describe('routing settings', () => {
     expect(resolveFixExecutorChain({ env: {}, platform: {}, repo: { ...repo, routing: { builder: 'codex' } } }).value).toEqual(['codex', 'codex-alt', 'claude']);
   });
 });
+
+it('operator reading age defaults to 24h and resolves platform, tool and environment with provenance', () => {
+  expect(resolveRoutingSettings({ env: {}, repo: {} }).capacity.operatorReadingMaxAgeHours).toBe(24);
+  const dir = settingsDir({ 'routing.json': { routing: { capacity: { operatorReadingMaxAgeHours: 12 } } } });
+  const prefs = join(dir, 'platform.json');
+  writeFileSync(prefs, JSON.stringify({ routing: { capacity: { operatorReadingMaxAgeHours: 18 } } }));
+  const env = { WE_PLATFORM_PREFERENCES_FILE: prefs };
+  expect(resolveRoutingSettings({ env, repo: {} }).capacity.operatorReadingMaxAgeHours).toBe(18);
+  const tool = resolveRoutingSettings({ env });
+  expect(tool.capacity.operatorReadingMaxAgeHours).toBe(12);
+  expect(tool.capacitySources.operatorReadingMaxAgeHours).toBe('tool');
+  const overridden = resolveRoutingSettings({ env: { ...env, WE_ROUTING_CAPACITY_OPERATOR_READING_MAX_AGE_HOURS: '6' } });
+  expect(overridden.capacity.operatorReadingMaxAgeHours).toBe(6);
+  expect(overridden.capacitySources.operatorReadingMaxAgeHours).toBe('env');
+});

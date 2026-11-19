@@ -4,7 +4,7 @@ import defaults from '../settings/provider-capacity.json' with { type: 'json' };
 export const PROVIDER_DEFAULTS = defaults.providerCapacity;
 export const PROVIDERS = PROVIDER_DEFAULTS.providers.map(p => p.id);
 export const CAPACITY_DEFAULTS = {
-  staleHours: 6, rateLookbackHours: 24, exhaustedPercent: 98, urgencyWeight: 4, urgencyHorizonHours: 24,
+  staleHours: 6, operatorReadingMaxAgeHours: 24, rateLookbackHours: 24, exhaustedPercent: 98, urgencyWeight: 4, urgencyHorizonHours: 24,
   reserveReleaseHours: 6, fixedTargetPercent: 100, paceTolerance: 10,
   aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 24, burnUnusedPercent: 40,
   longKinds: [], resetAtPercent: 95, maxBurnBoost: 3,
@@ -46,6 +46,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
       const seed = def.operatorReading, seedAt = epoch(seed?.asOf);
+      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > s.operatorReadingMaxAgeHours * HOUR);
       const liveUsable = owner.readers?.some(r => r.type === 'codex-rollout') || (at <= now && now - at <= s.staleHours * HOUR);
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
@@ -54,7 +55,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
         if (typeof usedPercent === 'number' && usedPercent >= 0 && usedPercent <= 100 && resetsAt > now) windows.push({ name, usedPercent, resetsAt, source,
           lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
       };
-      if (seed && seedAt <= now && (!raw || !Number.isFinite(at) || at < seedAt)) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
+      if (seed && !operatorReadingStale && seedAt <= now && (!raw || !Number.isFinite(at) || at < seedAt)) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
       else if (liveUsable) {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
@@ -76,7 +77,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
       return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
-        known: windows.some(w => Number.isFinite(w.usedPercent)), now };
+        operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
   });
 }

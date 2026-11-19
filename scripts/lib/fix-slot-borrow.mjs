@@ -110,6 +110,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
       if (gate?.held) return { held: true, reason: gate.reason };
     }
     const decision = route({ ...planned, repo: options.repo ?? planned.repo ?? 'we', kind: 'ci-heal' });
+    if (decision.executor === null) return { held: true, reason: decision.reason };
     const nonClaude = decision.executor !== 'claude';
     const sinks = createSinks({ ...options, ...(nonClaude ? { provider: (request) => {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);

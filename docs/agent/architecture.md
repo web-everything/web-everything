@@ -120,3 +120,19 @@ fixtures must supply continuous working hours. The shared Claude usage file maps
 3 and 2 respectively. Explicit takeover and ruling-not-addressed routes remain Claude policy data.
 Unknown eligible capacity refuses with an operator-visible wait/reset/readings fallback.
 
+
+
+### Capacity routing safety
+
+Capacity ranks provider/model candidates; the normal routing gate, holds, vetoes, disabled-provider
+and model validation still apply, trying the next candidate before the historical policy fallback.
+Critical fixes and ruling-escalation-stronger require their configured `providerCapacity.minimumTiers`
+with an exact provider/model tier from `providerCapacity.providers`; unknown tiers refuse.
+Critical takeover and ruling-not-addressed send-backs remain Claude-only and hold when Claude is unavailable.
+Escalation preserves rung order while removing held, exhausted, inactive, reserve-only, disallowed
+and below-minimum providers. With mixed observations, unknown rungs follow all known eligible rungs;
+when every reader is unknown the historical effective-builder chain applies (Claude drops Codex).
+`routing.capacity.operatorReadingMaxAgeHours` defaults to 24 and follows the normal cascade with
+`capacitySources` provenance. Older operator readings never supply quota; the calendar reports
+“operator reading stale — refresh”. Refresh the reading, restore live quota, or wait for reset/clear
+holds when routing refuses. A chain decision with `executor:null` holds every launch and resume caller.

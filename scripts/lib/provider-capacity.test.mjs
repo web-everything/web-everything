@@ -40,7 +40,8 @@ test('all readers failing preserves historical threshold fallback and repair cha
   const capacity = readProviderCapacity({ settings: { providers }, now, readers: { codex: () => { throw Error(); } } });
   const out = effectiveBuilder({ repo, env: {}, capacity, now, quota: () => null, record: () => {} });
   assert.equal(out.builder, 'claude'); assert.equal(out.decision.reason, 'all-readers-unknown');
-  assert.deepEqual(chain(capacity), ['codex', 'codex-alt', 'claude']);
+  assert.deepEqual(chain(capacity), ['claude']);
+  assert.deepEqual(resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity, now, quota: () => ({ used_percent: 27 }), record: () => {} }).value, ['codex', 'codex-alt', 'claude']);
   assert.equal(effectiveBuilder({ repo, env: {}, capacity, now, quota: () => ({ used_percent: 27 }), record: () => {} }).builder, 'codex');
 });
 test('explicit builders bypass capacity and disabled auto retains threshold', () => {
@@ -136,4 +137,48 @@ test('observed Codex ledger rate reaches calendar on-track and aliases with conf
     assert.equal(capacityCalendar({ capacities: cs, now, settings: {} }).providers[0].planner.onTrack, false);
     assert.equal(observe({ rateLookbackHours: 12 })[0].currentRatePerHour, null);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('escalation removes reserve-only, inactive, disallowed and below-minimum capacity', () => {
+  for (const bad of [cap('codex', 90, 120), cap('codex', 10, 120, { active: false }),
+    cap('codex', 10, 120, { allowedKinds: [] }), cap('codex', 10, 120, { tier: -1 })]) {
+    assert.deepEqual(chain([bad, cap('claude', 10, 2)]), ['claude']);
+  }
+});
+test('mixed unknown capacity is last after known eligible rungs in their existing order', () => {
+  assert.deepEqual(chain([cap('codex', null), cap('claude', 10, 2)]), ['claude', 'codex', 'codex-alt']);
+  assert.deepEqual(chain([cap('codex', 70, 120), cap('claude', 10, 2)]), ['codex', 'codex-alt', 'claude']);
+});
+test('critical takeover and send-back refuse when exhausted Claude has been removed', () => {
+  const value = chain([cap('codex', 27, 2), cap('claude', 98, 120)]);
+  for (const trigger of ['takeover', 'ruling-not-addressed']) {
+    const decision = pickChainRung({ chain: value, critical: true, trigger });
+    assert.equal(decision.executor, null);
+    assert.match(decision.reason, /critical escalation requires Claude/);
+    assert.equal(pickChainRung({ chain: ['codex', 'claude'], critical: true, trigger,
+      launcherAvailable: executor => executor !== 'claude' }).executor, null);
+  }
+});
+test('operator readings expire at configured age despite a future reset and unavailable live quota', () => {
+  const settings = { providers: [{ ...providers[0], operatorReading: {
+    asOf: now - 72 * hour, usedPercent: 27, resetsAt: now + 120 * hour } }] };
+  const read = extra => readProviderCapacity({ settings: { ...settings, ...extra }, now, readers: { codex: () => null } });
+  const stale = read({});
+  assert.equal(stale[0].known, false);
+  assert.equal(choose(stale).provider, null);
+  assert.match(renderCalendar(capacityCalendar({ capacities: stale, settings, now })), /operator reading stale — refresh/);
+  assert.equal(read({ operatorReadingMaxAgeHours: 72 })[0].known, true);
+  assert.equal(read({ operatorReadingMaxAgeHours: 71 })[0].known, false);
+  const live = readProviderCapacity({ settings, now, readers: { codex: () => ({ at: now, used_percent: 10, resets_at: now + hour }) } });
+  assert.equal(live[0].known, true);
+  assert.equal(live[0].windows[0].usedPercent, 10);
+});
+
+test('escalation enforces the configured fix minimum tier on known and unknown rungs', () => {
+  for (const used of [10, null]) {
+    const result = resolveFixExecutorChain({ repo: { ...repo, providerCapacity: { minimumTiers: { fix: 3 } } },
+      platform: {}, env: {}, now, quota: () => null, record: () => {},
+      capacity: [cap('codex', used, 120, { tier: 2 }), cap('claude', 10, 2)] });
+    assert.deepEqual(result.value, ['claude']);
+  }
 });
