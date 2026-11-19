@@ -695,9 +695,10 @@ export function recordRedTeamStatus(input, options = {}) {
         catch { remoteHold = true; }
       }
     }
-    // A not-owed transition (no red-team review owed) with no earlier unconfirmed hold has nothing to publish or clear.
-    if (publish && !heldBefore && (input.status === 'finished'
-      && (input.result === 'skipped' || input.result?.status === 'skipped'))) publish = false;
+    // A not-owed transition (a proven card-only policy exemption, never a send-back) with no earlier unconfirmed hold
+    // has nothing to publish or clear.
+    if (publish && !heldBefore && input.status === 'finished' && input.sendBack !== true
+      && input.result?.status === 'skipped' && input.result.policy === 'card-only') publish = false;
     const writeHold = () => writeJsonAtomic(`${path}.unpublished`, { status: input.status, remoteHold });
     if (publish) writeHold();
     let written;
@@ -763,7 +764,7 @@ export function recordRedTeamStatus(input, options = {}) {
           return result;
         };
         // Fail closed BEFORE any hold: no WE App token means no check run can be created, so a hold would be orphaned.
-        const appWriter = requireRedTeamAppWriter({ gh: options.gh, env: writerEnv, appWriterProbe: options.appWriterProbe });
+        const appWriter = requireRedTeamAppWriter({ gh, env: writerEnv, appWriterProbe: options.appWriterProbe });
         if (appWriter.ok !== true) return report({ published: false, reason: safeReason(appWriter.reason) });
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';

@@ -1719,7 +1719,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       expect(fake.runs).toEqual([expect.objectContaining({ app: { id: Number(WE_APP) }, external_id: 'o/r#7', conclusion: 'success',
         output: expect.objectContaining({ title: 'Live-check: Red team clear' }) })]);
       // Reads keep the caller's env (the daemon's own identity); only writes switch to the writer env.
-      expect(fake.calls.filter(c => !c.args.includes('POST')).every(c => c.env === env)).toBe(true);
+      expect(fake.calls.filter(c => !c.args.includes('POST') && !String(c.args[1]).startsWith('installation/')).every(c => c.env === env)).toBe(true);
       expect(env.WE_GITHUB_APP_ROLE).toBe('reviewer');
     });
 

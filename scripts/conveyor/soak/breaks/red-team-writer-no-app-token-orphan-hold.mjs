@@ -37,7 +37,7 @@ export default {
       recordRedTeamStatus({ repo: REPO, pr: 6945, head: HEAD, loopPayload, status: 'running' }, options);
       if (posts.length) violations.push(`a round with no App token posted ${posts.join(',')} before refusing`);
       posts.length = 0;
-      recordRedTeamStatus({ repo: REPO, pr: 7149, head: HEAD, loopPayload, status: 'finished', result: 'skipped' }, { ...options, appWriterProbe: () => {} });
+      recordRedTeamStatus({ repo: REPO, pr: 7149, head: HEAD, loopPayload, status: 'finished', result: { status: 'skipped', policy: 'card-only' } }, { ...options, appWriterProbe: () => {} });
       if (posts.length) violations.push(`a not-owed transition posted ${posts.join(',')}`);
     } finally { rmSync(dir, { recursive: true, force: true }); }
     return { violations };

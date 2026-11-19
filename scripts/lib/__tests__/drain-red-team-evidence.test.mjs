@@ -364,11 +364,15 @@ describe('status persistence and check publication share one claim', () => {
 
   it('a not-owed (skipped) transition publishes nothing', () => {
     const f = fixture(), posts = [];
-    const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: 'skipped' };
-    recordRedTeamStatus(input, { env: f.env, gh: () => '', log: () => {}, appWriterProbe: () => {},
+    const input = { ...f, loopPayload: payload(f.head), status: 'finished', result: { status: 'skipped', policy: 'card-only' } };
+    const options = { env: f.env, gh: () => '', log: () => {}, appWriterProbe: () => {},
       postCheckRun: args => { posts.push(args); return { ok: true }; },
-      postPublicationHold: hold => { posts.push(hold); return { ok: true }; } });
+      postPublicationHold: hold => { posts.push(hold); return { ok: true }; } };
+    recordRedTeamStatus(input, options);
     expect(posts).toEqual([]);
+    // A send-back is never a no-op: it still publishes.
+    recordRedTeamStatus({ ...input, sendBack: true }, options);
+    expect(posts.length).toBeGreaterThan(0);
   });
 
   it('the normal App path still holds, posts the check, and clears', () => {

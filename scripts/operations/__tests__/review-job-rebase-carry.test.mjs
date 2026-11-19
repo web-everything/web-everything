@@ -163,6 +163,11 @@ describe('review job carried check outbox wiring', () => {
           runs.push({ ...JSON.parse(options.input), id: 100 + runs.length, app: { id: 5037855 } });
           return JSON.stringify({ id: 100 + runs.length - 1 });
         }
+        // The writer's App probe: only an installation token may read this.
+        if (String(args[1]).startsWith('installation/')) {
+          if (options.env?.WE_GITHUB_APP_ROLE !== 'legacy' || options.env?.GH_TOKEN) throw Error('HTTP 403: Resource not accessible by integration');
+          return '1';
+        }
         if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: b, labels: [] });
         if (String(args).includes('/issues/1/comments'))
           return `${JSON.stringify({ id: 'n1', url: 'u', author: { login: 'web-everything' }, body, createdAt: '2026-11-07T12:00:00Z' })}\n`;

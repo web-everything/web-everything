@@ -87,13 +87,14 @@ export const redTeamWriterEnv = (env = process.env) => {
   return out;
 };
 
-/** Fail closed BEFORE any hold or status is posted when the WE App token does not resolve. A free read (`rate_limit`)
- * through the writer env: the shim refuses personal fallback, so it fails exactly when no App token exists.
- * `options.appWriterProbe` overrides; a caller that injected its own `gh` (a test world) is not probed. */
-export function requireRedTeamAppWriter({ gh, env = process.env, appWriterProbe } = {}) {
-  const probe = appWriterProbe ?? (typeof gh === 'function' && gh !== runGhSync ? null
-    : () => runGhSync(['api', 'rate_limit'], { ...ioOptions, env: redTeamWriterEnv(env) }));
-  if (!probe) return { ok: true };
+/** Fail closed BEFORE any hold or status is posted when the WE App token does not resolve. The probe is
+ * `GET /installation/repositories`, which only an App INSTALLATION token can read (a personal login gets 403/404), so
+ * success proves App authentication without relying on the shim's refusal variables. It runs through the caller's own
+ * `gh` (production wrappers included) under the writer env. `options.appWriterProbe` overrides. */
+export const appWriterProbeFor = ({ gh = runGhSync, env = process.env } = {}) => () =>
+  gh(['api', 'installation/repositories?per_page=1', '--jq', '.total_count'], { ...ioOptions, env: redTeamWriterEnv(env) });
+export function requireRedTeamAppWriter({ gh = runGhSync, env = process.env, appWriterProbe } = {}) {
+  const probe = appWriterProbe ?? appWriterProbeFor({ gh, env });
   try { probe(); return { ok: true }; }
   catch (error) { return failure(`red-team writer refused: WE App token unavailable, no personal fallback (${message(error)}); no hold posted`); }
 }
@@ -131,7 +132,7 @@ export function createPolicyClearPublisher({ env = process.env, run = runGhSync,
   return args => {
     const app = resolveAppId();
     if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
-    return publish({ ...args, appId: app.appId, env, gh });
+    return publish({ ...args, appId: app.appId, env, gh, appWriterProbe: appWriterProbeFor({ gh, env }) });
   };
 }
 
@@ -150,7 +151,7 @@ export function createLiveCheckPublisher({ env = process.env, run = runGhSync, p
     publish: args => {
       const app = resolveAppId();
       if (app.ok !== true) return { ...failure(app.reason), ...(app.detail ? { detail: app.detail } : {}) };
-      return publish({ ...args, appId: app.appId, env, gh });
+      return publish({ ...args, appId: app.appId, env, gh, appWriterProbe: appWriterProbeFor({ gh, env }) });
     },
     clearHold: args => clearHold({ ...args, env, gh }),
   };
@@ -275,7 +276,8 @@ export function publishRedTeamPolicyClearCheck(options = {}) {
 function publishRedTeamPolicyClearCheckUnlocked({ repo, pr, headSha, appId, gh = runGhSync, env = process.env,
   clearHold = clearLivePublicationHold, resultComments, readResultHold = redTeamEnqueueHold,
   readComments = ({ repo, pr, exec }) => readCompletePrComments(Number(pr), { repo, exec }), appWriterProbe } = {}) {
-  const writer = requireRedTeamAppWriter({ gh, env, appWriterProbe });
+  // The production factories always pass the probe (through their own gh wrapper); a bare unit call passes none.
+  const writer = appWriterProbe ? requireRedTeamAppWriter({ gh, env, appWriterProbe }) : { ok: true };
   if (writer.ok !== true) return writer;
   const recovery = resultComments !== undefined;
   // The memo reads throttle.env, not the child env. Bypass both for live recovery evidence. A caller's own child env
@@ -423,7 +425,8 @@ export function publishRedTeamCheckFromLive(options = {}) {
 function publishRedTeamCheckFromLiveUnlocked({ repo, pr, headSha, appId, gh = runGhSync,
   env = process.env, readLive, readComments, readStandingRuling = standingRulingScope,
   holdFn = redTeamEnqueueHold, beforeHold, onConfirmed, clearHold = clearLivePublicationHold, appWriterProbe } = {}) {
-  const writer = requireRedTeamAppWriter({ gh, env, appWriterProbe });
+  // The production factories always pass the probe (through their own gh wrapper); a bare unit call passes none.
+  const writer = appWriterProbe ? requireRedTeamAppWriter({ gh, env, appWriterProbe }) : { ok: true };
   if (writer.ok !== true) return writer;
   let published = false, holdSet = false, holdPosted = false, holdIntent = '';
   try {

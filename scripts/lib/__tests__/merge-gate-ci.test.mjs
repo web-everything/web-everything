@@ -507,7 +507,7 @@ describe('gatherPrFacts red-team publication hold', () => {
     };
     const writerEnv = holdEnv('check-run');
     const status = { repo: 'o/r', pr: 7, loopPayload: { findings: { read: { netBasis: { rev: HEAD } } } }, status: 'running' };
-    const outage = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
+    const outage = recordRedTeamStatus(status, { env: writerEnv, log: () => {}, appWriterProbe: () => {},
       gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, creator: { login: 'web-everything[bot]' }, ...JSON.parse(opts.input) }); return ''; },
       postCheckRun: () => ({ ok: false, reason: 'checks API unavailable' }) });
     expect(outage).toMatchObject({ published: false, reason: expect.stringContaining('GitHub-visible publication hold set') });
@@ -522,7 +522,7 @@ describe('gatherPrFacts red-team publication hold', () => {
     const ci = () => gather(ciRules(), { env: holdEnv('check-run') });
     expect(ci().redTeamCheck).toMatchObject({ ok: false, reason: expect.stringMatching(/GitHub-visible hold/) });
     // Publication recovers: the running check posts, the hold clears, and the in-progress check still holds.
-    const recovered = recordRedTeamStatus(status, { env: writerEnv, log: () => {},
+    const recovered = recordRedTeamStatus(status, { env: writerEnv, log: () => {}, appWriterProbe: () => {},
       gh: (args, opts) => { writerGh(args); github.statuses.unshift({ id: github.statuses.length + 10, creator: { login: 'web-everything[bot]' }, ...JSON.parse(opts.input) }); return ''; },
       postCheckRun: ({ payload: check }) => { github.checkRuns.push({ ...check, id: github.checkRuns.length + 1, app: { id: 5037855 } }); return { ok: true }; } });
     expect(recovered).toEqual({ published: true });
