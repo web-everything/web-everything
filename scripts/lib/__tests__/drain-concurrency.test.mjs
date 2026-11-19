@@ -125,7 +125,7 @@ describe('bounded drain concurrency', () => {
     expect(createBranchPreparationRequired({ enabled: false })({})).toBe(false);
   });
   it('reduces gate reads for 20 PRs in candidate order with identical serial classification', async () => {
-    const prs = Array.from({ length: 20 }, (_, i) => ({ number: i + 1, headRefOid: `sha-${i}`, body: 'Fix the drain scheduling.',
+    const prs = Array.from({ length: 20 }, (_, i) => ({ baseRefName: 'main', number: i + 1, headRefOid: `sha-${i}`, body: 'Fix the drain scheduling.',
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', isDraft: i % 5 === 0,
       labels: [{ name: 'ready-to-merge' }], commits: [{ messageHeadline: 'Fix', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: i % 3 ? 'SUCCESS' : 'FAILURE' }] }));
@@ -138,7 +138,7 @@ describe('bounded drain concurrency', () => {
           active--;
           return p;
         } });
-      return { verdicts: [...reads].map(([num, r]) => ({ num, ...classifyPr(r.value) })), peak };
+      return { verdicts: [...reads].map(([num, r]) => ({ num, ...classifyPr(r.value, { defaultBranch: 'main' }) })), peak };
     };
     const serial = await read(1), parallel = await read(6);
     expect(parallel.verdicts).toEqual(serial.verdicts);

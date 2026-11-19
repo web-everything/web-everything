@@ -24,10 +24,10 @@ const response = (...pages) => ({ stdout: JSON.stringify(pages.map((check_runs) 
 describe('required checks beyond the gh listing context cap (#3432)', () => {
   it('makes a PR with exactly 100 contexts and no test merge-eligible from its head check', async () => {
     const listed = pr();
-    expect(classifyPr(listed).reason).toBe('required check "test" is not green');
+    expect(classifyPr(listed, { defaultBranch: 'main' }).reason).toBe('required check "test" is not green');
     const exec = vi.fn().mockResolvedValue(response([run()]));
     const resolved = await resolveRequiredCheck(listed, { repo, exec });
-    expect(classifyPr(resolved).decision).toBe('merge');
+    expect(classifyPr(resolved, { defaultBranch: 'main' }).decision).toBe('merge');
     expect(exec).toHaveBeenCalledWith('gh', ['api',
       `repos/${repo}/commits/${sha}/check-runs?check_name=test&filter=latest&per_page=100`, '--paginate', '--slurp'],
     { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -45,7 +45,7 @@ describe('required checks beyond the gh listing context cap (#3432)', () => {
       exec: async () => response([run({ id: 200, conclusion: 'failure' })], [run({ id: 100 })]),
     });
     expect(isRequiredCheckFailed(resolved)).toBe(true);
-    expect(classifyPr(resolved).decision).toBe('skip');
+    expect(classifyPr(resolved, { defaultBranch: 'main' }).decision).toBe('skip');
   });
 
   it('uses later pages and never substitutes a branch or another repository', async () => {
@@ -104,13 +104,13 @@ describe('required checks beyond the gh listing context cap (#3432)', () => {
     });
     expect(isRequiredCheckGreen(resolved)).toBe(false);
     expect(isRequiredCheckFailed(resolved)).toBe(false);
-    const verdict = classifyPr(resolved);
+    const verdict = classifyPr(resolved, { defaultBranch: 'main' });
     expect(verdict).toMatchObject({ decision: 'skip', reason: expect.stringContaining('deferred this pass: HTTP 503') });
     expect(onDeferred).toHaveBeenCalledWith(verdict.reason);
     expect(planLabelDrain([verdict])).toMatchObject({ ready: [], deferred: [{ num: 3432, waitOn: ['required-check-read'], reason: verdict.reason }] });
-    expect(revalidateForMerge(resolved, { expectedHeadSha: sha }).decision).toBe('skip');
+    expect(revalidateForMerge(resolved, { defaultBranch: 'main', expectedHeadSha: sha }).decision).toBe('skip');
     const retried = await resolveRequiredCheck(resolved, { repo, exec: async () => response([run()]) });
-    expect(classifyPr(retried).decision).toBe('merge');
+    expect(classifyPr(retried, { defaultBranch: 'main' }).decision).toBe('merge');
   });
 
   it.each([

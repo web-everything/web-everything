@@ -394,11 +394,11 @@ output({});
   });
 
   it.each(['blockedBy', 'stackParents'])('fast drain: an absent hash %s needs positive proof on incomplete context', (edge) => {
-    const opts = { openPrContext: incomplete, verdicts: [absentDep(edge, 'xaaaaaa')], strictAbsentHashDependencies: true };
+    const opts = { defaultBranchOf: () => 'main', openPrContext: incomplete, verdicts: [absentDep(edge, 'xaaaaaa')], strictAbsentHashDependencies: true };
     const { plan } = planDrainPass(opts);
     expect(plan.ready).toEqual([]);
     expect(plan.deferred[0].waitOn).toContain('xaaaaaa');
-    const proven = planDrainPass({ ...opts, provenOnMain: new Set(['xaaaaaa']) });
+    const proven = planDrainPass({ defaultBranchOf: () => 'main', ...opts, provenOnMain: new Set(['xaaaaaa']) });
     expect(proven.plan.ready).toHaveLength(1);
   });
 

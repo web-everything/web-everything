@@ -8,8 +8,8 @@ import * as strategy from '../lib/drain-merge-strategy.mjs';
 
 const required = ['test', 'smoke'];
 const green = name => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS' });
-const pr = (extra = {}) => ({ number: 42, title: 'Fix queue admission', body: 'Allow checked PRs into the required queue.', headRefOid: 'abc', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], reviewDecision: '', statusCheckRollup: required.map(green), ...extra });
-const opts = { queueRequiredChecks: required };
+const pr = (extra = {}) => ({ baseRefName: 'main', number: 42, title: 'Fix queue admission', body: 'Allow checked PRs into the required queue.', headRefOid: 'abc', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', labels: [{ name: 'ready-to-merge' }], reviewDecision: '', statusCheckRollup: required.map(green), ...extra });
+const opts = { defaultBranch: 'main', queueRequiredChecks: required };
 
 describe('required merge queue BLOCKED relief', () => {
   it.each(['', null, 'APPROVED'])('admits green uppercase CheckRuns with reviewDecision %s', reviewDecision => {
@@ -26,13 +26,13 @@ describe('required merge queue BLOCKED relief', () => {
     expect(classifyPr(pr({ reviewDecision }), opts)).toMatchObject({ decision: 'skip', reason: expect.stringContaining(reviewDecision.toUpperCase()) });
   });
   it.each([null, []])('preserves direct-mode verdict with %s', queueRequiredChecks => {
-    const verdict = classifyPr(pr(), { queueRequiredChecks });
-    expect(verdict).toEqual(classifyPr(pr()));
+    const verdict = classifyPr(pr(), { defaultBranch: 'main', queueRequiredChecks });
+    expect(verdict).toEqual(classifyPr(pr(), { defaultBranch: 'main' }));
     expect(verdict.reason).toBe(unlandableStateReason('BLOCKED'));
     expect(verdict).not.toHaveProperty('queueBlockedRelief');
   });
   it('leaves CLEAN unchanged and refuses DIRTY/BEHIND', () => {
-    expect(classifyPr(pr({ mergeStateStatus: 'CLEAN' }), opts)).toEqual(classifyPr(pr({ mergeStateStatus: 'CLEAN' })));
+    expect(classifyPr(pr({ mergeStateStatus: 'CLEAN' }), opts)).toEqual(classifyPr(pr({ mergeStateStatus: 'CLEAN' }), { defaultBranch: 'main' }));
     for (const mergeStateStatus of ['DIRTY', 'BEHIND']) expect(classifyPr(pr({ mergeStateStatus }), opts).decision).toBe('skip');
   });
   it('retains earlier and later safety gates', () => {
@@ -42,7 +42,7 @@ describe('required merge queue BLOCKED relief', () => {
     }
   });
   it('never lets a green aggregate stand in for a required check with no row of its own', () => {
-    const verdict = classifyPr(pr({ statusCheckRollup: [green('test')] }), { queueRequiredChecks: ['test', 'integration'] });
+    const verdict = classifyPr(pr({ statusCheckRollup: [green('test')] }), { defaultBranch: 'main', queueRequiredChecks: ['test', 'integration'] });
     expect(verdict).toMatchObject({ decision: 'skip', reason: expect.stringContaining('integration (missing)') });
     expect(verdict).not.toHaveProperty('queueBlockedRelief');
   });
@@ -56,17 +56,17 @@ describe('required merge queue BLOCKED relief', () => {
     expect(classifyPr(pr({ statusCheckRollup: [green('test'), { ...latest, conclusion: 'FAILURE' }, { ...old, conclusion: 'SUCCESS' }] }), opts).decision).toBe('skip');
   });
   it('threads relief into fresh revalidation while retaining the head pin', () => {
-    expect(revalidateForMerge(pr(), { ...opts, expectedHeadSha: 'abc' })).toMatchObject({ decision: 'merge', queueBlockedRelief: true, headSha: 'abc' });
-    expect(revalidateForMerge(pr(), { ...opts, expectedHeadSha: 'old' }).decision).toBe('skip');
+    expect(revalidateForMerge(pr(), { defaultBranch: 'main', ...opts, expectedHeadSha: 'abc' })).toMatchObject({ decision: 'merge', queueBlockedRelief: true, headSha: 'abc' });
+    expect(revalidateForMerge(pr(), { defaultBranch: 'main', ...opts, expectedHeadSha: 'old' }).decision).toBe('skip');
   });
   it('reads requirements per repo when building verdicts', () => {
     const queueRequiredChecksOf = vi.fn(repo => repo === 'owner/local' ? required : null);
-    const verdicts = buildDrainVerdicts({ prsByRepo: new Map([['owner/local', [pr()]], ['owner/sibling', [pr()]]]), repos: ['owner/local', 'owner/sibling'], queueRequiredChecksOf });
+    const verdicts = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([['owner/local', [pr()]], ['owner/sibling', [pr()]]]), repos: ['owner/local', 'owner/sibling'], queueRequiredChecksOf });
     expect(verdicts.map(v => v.decision)).toEqual(['merge', 'skip']);
     expect(queueRequiredChecksOf.mock.calls).toEqual([['owner/local'], ['owner/sibling']]);
   });
   it('threads requirements through preparation', () => {
-    const result = prepareDrainVerdicts({ listings: [{ repo: 'owner/local', prs: [pr()] }], repos: ['owner/local'], queueRequiredChecksOf: () => required });
+    const result = prepareDrainVerdicts({ defaultBranchOf: () => 'main', listings: [{ repo: 'owner/local', prs: [pr()] }], repos: ['owner/local'], queueRequiredChecksOf: () => required });
     expect(result.verdicts[0]).toMatchObject({ decision: 'merge', queueBlockedRelief: true });
   });
 });

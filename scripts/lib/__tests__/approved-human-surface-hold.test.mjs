@@ -57,13 +57,13 @@ it('excuses queue freshness while preserving actual checks, conflicts and native
   const { retainApprovedHumanQueueHead: retain } = await import('../approved-human-surface-hold.mjs');
   const { revalidateForMerge } = await import('../../merge-ai-prs.mjs');
   const facts = { hold: true, queueOwnsFreshness: true };
-  const pr = { number: 1, title: 'change', body: 'Real description', headRefOid: 'a'.repeat(40),
+  const pr = { baseRefName: 'main', number: 1, title: 'change', body: 'Real description', headRefOid: 'a'.repeat(40),
     labels: ['ready-to-merge', 'review:accepted'], commits: [], mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND',
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
-  expect(revalidateForMerge(retain(pr, facts)).decision).toBe('merge');
-  expect(revalidateForMerge(pr).decision).toBe('skip');
+  expect(revalidateForMerge(retain(pr, facts), { defaultBranch: 'main' }).decision).toBe('merge');
+  expect(revalidateForMerge(pr, { defaultBranch: 'main' }).decision).toBe('skip');
   const red = { ...pr, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
-  expect(revalidateForMerge(retain(red, facts)).decision).toBe('skip');
+  expect(revalidateForMerge(retain(red, facts), { defaultBranch: 'main' }).decision).toBe('skip');
   for (const change of [{ mergeable: 'CONFLICTING' }, { reviewDecision: 'CHANGES_REQUESTED' }, { mergeStateStatus: 'BLOCKED' }, { mergeStateStatus: 'DIRTY' }]) {
     const blocked = { ...pr, ...change }; expect(retain(blocked, facts)).toBe(blocked);
   }

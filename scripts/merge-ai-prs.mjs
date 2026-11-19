@@ -131,7 +131,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
-import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold } from './lib/default-branch-cache.mjs';
+import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';// #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
@@ -1025,10 +1025,9 @@ export const prestageFixClaimHeld = (num, { claimKey, readClaim = readLiveFixCla
  * SKIPPED with `base is not <default> (<base>)`, AHEAD of the required-check arm: a prototype base such as
  * `lane/mechanical-dispatcher` runs no CI, so its `test` check can never report and the PR would otherwise sit
  * `checking` forever with no reason. `defaultBranch` is the caller's per-repo resolution (never a literal
- * `'main'`). Runtime callers supply live evidence, or null to fail closed. Omitted evidence is supported
- * only by legacy pure callers that do not perform merge/enqueue IO.
+ * `'main'`). Missing or unreadable default/base branch evidence always fails closed, including pure callers.
  */
-export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = undefined, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
+export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-merge', allowPendingReview = false, defaultBranch = null, blockOnCodeQL = DRAIN_GATE_SETTINGS.drainBlocksOnCodeQL, queueRequiredChecks = null, preparePendingCi = false } = {}) {
   const prestagePendingCi = preparePendingCi && hasLabel(pr, REVIEW_LABELS.accepted) && hasLabel(pr, 'ready-to-merge') && !pr.isDraft
     && prestageCi(pr, prestageRequiredChecks(queueRequiredChecks, requiredCheck)) === 'pending';
   const num = pr?.number;
@@ -1049,7 +1048,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   // can be green and this arm is THE merge guard for it. A `lane/*` base is never a repo's default branch: held even when
   // `defaultBranch` could not be resolved this pass (fail closed), so it lands only after its base merges and the drain
   // retargets it to the default branch.
-  const offDefaultBase = base !== '' && ((typeof defaultBranch === 'string' && defaultBranch !== '' && base !== defaultBranch) || base.startsWith('lane/'));
+  const readableBase = !!base.trim();
+  const offDefaultBase = !readableBase || (validDefaultBranch(defaultBranch) && base !== defaultBranch) || base.startsWith('lane/');
   const state = String(pr?.mergeStateStatus || '').toUpperCase();
   const mergeable = String(pr?.mergeable || '').toUpperCase();
   const landableState = state === 'CLEAN' || state === 'UNSTABLE'; // UNSTABLE = mergeable, only non-required checks red
@@ -1120,9 +1120,10 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
-  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
-  // Runtime callers always supply live evidence or explicit null; omitted evidence is for legacy pure callers.
-  else if (defaultBranch === null) { decision = 'skip'; reason = defaultBranchHold(base, null); }
+  else if (offDefaultBase) { decision = 'skip'; reason = !readableBase
+    ? defaultBranchHold(base, defaultBranch) : `base is not ${defaultBranch || 'the default branch'} (${base})`; }
+  // A missing argument is unreadable evidence, never an opt-out from authorization.
+  else if (!validDefaultBranch(defaultBranch)) { decision = 'skip'; reason = defaultBranchHold(base, null); }
   else if (!testGreen && !prestagePendingCi) {
     decision = 'skip'; reason = `required check "${requiredCheck}" is not green`;
     workflowHoldRepark = canReparkWorkflowHold();
@@ -1178,7 +1179,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
  * @param {{requiredCheck?:string, allowPendingReview?:boolean, defaultBranch?:(string|null), expectedHeadSha?:(string|null)}} [o]
  * @returns {{decision:string, reason:string, headSha?:string}}
  */
-export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendingReview = false, defaultBranch = undefined, expectedHeadSha = undefined, queueRequiredChecks = null } = {}) {
+export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendingReview = false, defaultBranch = null, expectedHeadSha = undefined, queueRequiredChecks = null } = {}) {
   if (!freshPr || freshPr.number == null) {
     return { decision: 'skip', reason: 'could not re-read the PR fresh right before merging — refusing to merge on stale pass-start data' };
   }
@@ -2275,7 +2276,7 @@ export async function readRemoteManifestViaApi({ exec, repo, headRef, apiArgs = 
  * @param {{prsByRepo:Map, readOf:function, repos:Array, requiredCheck?:string, escalationRelief?:object, label?:(string|null), isLocalRepo?:function, localSlug?:(string|null), defaultBranchOf?:function}} o
  * @returns {Array} verdicts (classify + manifest fields attached; NOT yet couple-joined)
  */
-export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => undefined, queueRequiredChecksOf = () => null, preparePendingCi = false } = {}) {
+export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, queueRequiredChecksOf = () => null, preparePendingCi = false } = {}) {
   const verdicts = [];
   const relief = escalationRelief || { prs: [], passWide: false };
   for (const repo of (Array.isArray(repos) ? repos : [])) {
@@ -2283,7 +2284,7 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
     for (const p of prs) {
       const read = (typeof readOf === 'function' ? readOf(repo, p.number) : null) || {};
       p.commits = read.commits || [];
-      const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : undefined });
+      const v = classifyPr(p, { preparePendingCi: preparePendingCi && isLocalRepo(repo), queueRequiredChecks: queueRequiredChecksOf(repo), requiredCheck, allowPendingReview: (relief.prs || []).includes(Number(p.number)) || (relief.passWide && !!label), defaultBranch: typeof defaultBranchOf === 'function' ? defaultBranchOf(repo) : null });
       // #2502 — the tip commit's SHA, threaded onto every emitted verdict and, via the `{...v}` spread used to
       // build `remaining`/`plan.ready`/`plan.deferred`, onto each of the six result buckets a caller (the
       // drain-daemon stuck detector) actually reads: toMerge/merged/skipped/parked/deferred/failed — NOT
@@ -2633,7 +2634,7 @@ const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headS
  * num)` returns the per-PR `{ commits, manifest }` read.
  * @returns {{prsByRepo:Map, verdicts:Array}}
  */
-export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => undefined, queueRequiredChecksOf = () => null } = {}) {
+export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, queueRequiredChecksOf = () => null } = {}) {
   const prsByRepo = narrowPrsByRepo(listings, { onlyPr, onlyRepo, repos, isLocalRepo });
   const verdicts = buildDrainVerdicts({ prsByRepo, readOf, repos, requiredCheck, escalationRelief, label, isLocalRepo, localSlug, defaultBranchOf, queueRequiredChecksOf });
   return { prsByRepo, verdicts };
@@ -2650,7 +2651,7 @@ export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, only
  * Pure.
  * @returns {{prsByRepo:Map, verdicts:Array, carrierHealth:Map, plan:{ready:Array, deferred:Array, staleLandedOpenItems:Array}}}
  */
-export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => undefined, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), strictAbsentHashDependencies = false, overlapContext = null, overlapSkips = null, readyOrder = null } = {}) {
+export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), strictAbsentHashDependencies = false, overlapContext = null, overlapSkips = null, readyOrder = null } = {}) {
   let prsByRepo = null;
   let vs = verdicts;
   if (!Array.isArray(vs)) {

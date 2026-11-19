@@ -29,7 +29,7 @@ export function validateLeanOpenPrs(inventory, maxRows = OPEN_PR_LIST_LIMIT, rep
   if (isDegradedOpenPrListing(rows.length, maxRows)) throw new Error('lean inventory truncated');
   for (const p of rows) {
     if (!/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '') || !Number.isFinite(Date.parse(p.updatedAt))
-      || typeof p.baseRefName !== 'string' || !p.baseRefName || typeof p.isDraft !== 'boolean' || p.state !== 'OPEN') {
+      || typeof p.baseRefName !== 'string' || !p.baseRefName.trim() || typeof p.isDraft !== 'boolean' || p.state !== 'OPEN') {
       throw new Error('lean inventory incomplete');
     }
   }
@@ -74,6 +74,9 @@ function usableSnapshotRow(row, live) {
 }
 
 function requireFullPr(row, number) {
+  if (typeof row?.baseRefName !== 'string' || !row.baseRefName.trim()) {
+    throw new Error(`PR #${number} base branch unreadable — cannot use incomplete full PR evidence`);
+  }
   if (row?.number !== number || !['OPEN', 'CLOSED', 'MERGED'].includes(row.state)
     || !/^[a-f0-9]{40}$/i.test(row.headRefOid ?? '') || !Number.isFinite(Date.parse(row.updatedAt))
     || typeof row.headRefName !== 'string' || !row.headRefName || typeof row.body !== 'string'

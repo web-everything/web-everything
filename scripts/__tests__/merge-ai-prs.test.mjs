@@ -46,8 +46,8 @@ describe('withResolutionBasis — the drain park/skip comment (#2447)', () => {
 
 describe('buildDrainVerdicts — carries the graduatedTo sources the escalation pass derives the basis from (#2447)', () => {
   const green = [{ name: 'test', conclusion: 'SUCCESS' }];
-  const ghPr = (number, body) => ({ number, title: 't', body, headRefName: `lane/${number}-x`, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] });
-  const verdictFor = (pr, manifest) => buildDrainVerdicts({ prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits: [{ oid: 'abc' }], manifest }), repos: [null] })[0];
+  const ghPr = (number, body) => ({ baseRefName: 'main', number, title: 't', body, headRefName: `lane/${number}-x`, statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] });
+  const verdictFor = (pr, manifest) => buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[null, [pr]]]), readOf: () => ({ commits: [{ oid: 'abc' }], manifest }), repos: [null] })[0];
 
   it('attaches the manifest graduatedTo and the body note, which derive the banner for a backlog-only diff', () => {
     const manifest = buildManifest({ item: 2403, repos: [{ repo: 'we', ref: 'lane/2403-x' }], graduatedTo: '6b5874f7' });
@@ -97,7 +97,7 @@ describe('classifyPr — base is not the default branch: held with a named reaso
   it('base is not <default>: a PR on the default branch is unaffected; an unresolved default still holds a lane/* base', () => {
     const onDefault = verdictFor(ghPr(12, 'main'), () => 'main');
     expect(onDefault.decision).toBe('merge');
-    expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main')).reason);
+    expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main'), { defaultBranch: 'main' }).reason);
     // stack.reviewWhileBaseOpen (2026-10-10): a stacked lane PR now runs CI, so its `test` can be green. A failed
     // default-branch read must not let it land into its lane base: a lane/* base is held fail-closed.
     const stacked = verdictFor(ghPr(13, 'lane/mechanical-dispatcher'), () => null);
@@ -134,8 +134,8 @@ describe('fast-drain round listing snapshot', () => {
     expect(live).not.toHaveBeenCalled();
     expect(target).toHaveBeenCalledOnce();
     expect(result[0].headRefOid).toBe('new');
-    expect(classifyPr(old).decision).toBe('merge');
-    expect(classifyPr(result[0])).toMatchObject({ decision: 'skip', reviewHeld: true });
+    expect(classifyPr(old, { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(result[0], { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', reviewHeld: true });
     expect(log).toHaveBeenCalledWith(expect.stringContaining('served-from-snapshot'));
   });
   it.each([
@@ -185,8 +185,8 @@ describe('fast-drain round listing snapshot', () => {
     const { result } = await probe(snap(), { readTarget: async () => ({ ...old, state: 'OPEN', headRefOid: 'moved',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
     }) });
-    expect(classifyPr(old).decision).toBe('merge');
-    expect(classifyPr(result[0])).toMatchObject({ decision: 'skip', reason: 'required check "test" is not green' });
+    expect(classifyPr(old, { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(result[0], { defaultBranch: 'main' })).toMatchObject({ decision: 'skip', reason: 'required check "test" is not green' });
   });
   it('continues with live rows when the snapshot cannot be written', async () => {
     const { result, live, target } = await probe(null, { write: () => { throw new Error('EACCES'); } });

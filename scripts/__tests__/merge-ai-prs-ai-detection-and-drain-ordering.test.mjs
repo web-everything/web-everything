@@ -155,38 +155,38 @@ describe('merge-ai-prs — green gate', () => {
 
 describe('merge-ai-prs — classifyPr verdict', () => {
   it('MERGES an AI PR that is green + mergeable (CLEAN or UNSTABLE)', () => {
-    expect(classifyPr(aiPr({ mergeStateStatus: 'CLEAN' })).decision).toBe('merge');
-    expect(classifyPr(aiPr({ mergeStateStatus: 'UNSTABLE' })).decision).toBe('merge'); // only non-required checks red
+    expect(classifyPr(aiPr({ mergeStateStatus: 'CLEAN' }), { defaultBranch: 'main' }).decision).toBe('merge');
+    expect(classifyPr(aiPr({ mergeStateStatus: 'UNSTABLE' }), { defaultBranch: 'main' }).decision).toBe('merge'); // only non-required checks red
   });
   it('SKIPS a non-AI PR', () => {
-    const v = classifyPr(aiPr({ commits: [claudeCommit(), humanCommit] }));
+    const v = classifyPr(aiPr({ commits: [claudeCommit(), humanCommit] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip'); expect(v.reason).toMatch(/not AI-generated/);
   });
   it('SKIPS when the required check is not green', () => {
-    const v = classifyPr(aiPr({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }));
+    const v = classifyPr(aiPr({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip'); expect(v.reason).toMatch(/not green/);
   });
   it('SKIPS a BEHIND PR (needs rebase — never force-updated by the sweep)', () => {
-    const v = classifyPr(aiPr({ mergeStateStatus: 'BEHIND' }));
+    const v = classifyPr(aiPr({ mergeStateStatus: 'BEHIND' }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip'); expect(v.reason).toMatch(/BEHIND|not landable|merge state/);
   });
   it('SKIPS a not-mergeable PR (conflicts)', () => {
-    const v = classifyPr(aiPr({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }));
+    const v = classifyPr(aiPr({ mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip'); expect(v.reason).toMatch(/not mergeable/);
   });
   // #2324 — refuse to land a PR with an empty/whitespace description (PR #206 landed bodyless).
   it('SKIPS a PR with an empty description', () => {
-    const v = classifyPr(aiPr({ body: '' }));
+    const v = classifyPr(aiPr({ body: '' }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip'); expect(v.reason).toMatch(/empty\/whitespace description/);
   });
   it('SKIPS a PR with a whitespace-only description', () => {
-    expect(classifyPr(aiPr({ body: '   \n\t  ' })).decision).toBe('skip');
+    expect(classifyPr(aiPr({ body: '   \n\t  ' }), { defaultBranch: 'main' }).decision).toBe('skip');
   });
   it('SKIPS a PR with no body field at all', () => {
-    expect(classifyPr(aiPr({ body: undefined })).decision).toBe('skip');
+    expect(classifyPr(aiPr({ body: undefined }), { defaultBranch: 'main' }).decision).toBe('skip');
   });
   it('MERGES a PR with a real description', () => {
-    expect(classifyPr(aiPr({ body: 'fixes the thing because reasons' })).decision).toBe('merge');
+    expect(classifyPr(aiPr({ body: 'fixes the thing because reasons' }), { defaultBranch: 'main' }).decision).toBe('merge');
   });
 });
 
@@ -195,7 +195,7 @@ describe('merge-ai-prs — label-conditional AI gate (#2195, blockedBy #2196)', 
   const mixedCommits = { commits: [claudeCommit(), humanCommit] }; // one hand-authored commit ⇒ NOT every-commit-AI
 
   it('MERGES a labelled MIXED-authorship PR (the label certifies it — #40/#42 no longer skipped)', () => {
-    const v = classifyPr(aiPr({ ...mixedCommits, labels: rtm }));
+    const v = classifyPr(aiPr({ ...mixedCommits, labels: rtm }), { defaultBranch: 'main' });
     expect(v.decision).toBe('merge');
     expect(v.aiGenerated).toBe(false);   // truthfully NOT every-commit-AI…
     expect(v.certifyLabel).toBe(true);   // …but the producer label certifies it
@@ -203,20 +203,20 @@ describe('merge-ai-prs — label-conditional AI gate (#2195, blockedBy #2196)', 
   });
 
   it('SKIPS an UNLABELLED mixed-authorship PR (orphan sweep keeps the strict gate)', () => {
-    const v = classifyPr(aiPr({ ...mixedCommits, labels: [] }));
+    const v = classifyPr(aiPr({ ...mixedCommits, labels: [] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reason).toMatch(/not AI-generated/);
     expect(v.reason).toMatch(/no "ready-to-merge" label/);
   });
 
   it('a labelled PR still SKIPS on a red required check or a conflict (label is not a rubber stamp)', () => {
-    expect(classifyPr(aiPr({ ...mixedCommits, labels: rtm, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] })).decision).toBe('skip');
-    expect(classifyPr(aiPr({ ...mixedCommits, labels: rtm, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' })).decision).toBe('skip');
+    expect(classifyPr(aiPr({ ...mixedCommits, labels: rtm, statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }), { defaultBranch: 'main' }).decision).toBe('skip');
+    expect(classifyPr(aiPr({ ...mixedCommits, labels: rtm, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), { defaultBranch: 'main' }).decision).toBe('skip');
   });
 
   it('MERGES a human-cleared parked PR (review:accepted) even with a non-AI commit and NO ready-to-merge label — the drain-rebase stranding fix (#2196/#2326)', () => {
     // The shape #745 hit: a review:accepted PR whose only non-AI commit is the drain's own `drain: rebase …`.
-    const v = classifyPr(aiPr({ ...mixedCommits, labels: [{ name: REVIEW_LABELS.accepted }] }));
+    const v = classifyPr(aiPr({ ...mixedCommits, labels: [{ name: REVIEW_LABELS.accepted }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('merge');
     expect(v.aiGenerated).toBe(false);  // truthfully NOT every-commit-AI…
     expect(v.certifyLabel).toBe(false); // …and NOT ready-to-merge-labelled…
@@ -225,19 +225,19 @@ describe('merge-ai-prs — label-conditional AI gate (#2195, blockedBy #2196)', 
   });
 
   it('an un-accepted mixed-authorship PR (review:pending, not accepted) still SKIPS — the clear must be a human accept', () => {
-    const v = classifyPr(aiPr({ ...mixedCommits, labels: [{ name: 'review:pending' }] }));
+    const v = classifyPr(aiPr({ ...mixedCommits, labels: [{ name: 'review:pending' }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.humanCleared).toBe(false);
     expect(v.reason).toMatch(/not human-cleared/);
   });
 
   it('a human-cleared PR still SKIPS on a red required check (accept is not a rubber stamp)', () => {
-    const v = classifyPr(aiPr({ ...mixedCommits, labels: [{ name: REVIEW_LABELS.accepted }], statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }));
+    const v = classifyPr(aiPr({ ...mixedCommits, labels: [{ name: REVIEW_LABELS.accepted }], statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
   });
 
   it('trustLabel:null forces the strict every-commit gate even when labelled', () => {
-    const v = classifyPr(aiPr({ ...mixedCommits, labels: rtm }), { trustLabel: null });
+    const v = classifyPr(aiPr({ ...mixedCommits, labels: rtm }), { defaultBranch: 'main', trustLabel: null });
     expect(v.decision).toBe('skip'); expect(v.certifyLabel).toBe(false);
   });
 
@@ -257,50 +257,50 @@ describe('merge-ai-prs — label-conditional AI gate (#2195, blockedBy #2196)', 
 // candidate to actually land.
 describe('merge-ai-prs — revalidateForMerge (bug 1: re-check the merge decision against a FRESH read)', () => {
   it('a fresh read that still classifies "merge" clears the candidate', () => {
-    const r = revalidateForMerge(aiPr(), {});
+    const r = revalidateForMerge(aiPr(), { defaultBranch: 'main',});
     expect(r.decision).toBe('merge');
   });
   it('a fresh read discovering a review:changes label added mid-pass now REFUSES the merge', () => {
     // The exact scenario named by the review: `classifyPr` at plan time saw no hold; a reviewer added
     // `review:changes` while this candidate's turn in the serial cascade was still pending. A stale decision
     // would merge anyway; the fresh re-read must not.
-    const r = revalidateForMerge(aiPr({ labels: [{ name: 'review:changes' }] }), {});
+    const r = revalidateForMerge(aiPr({ labels: [{ name: 'review:changes' }] }), { defaultBranch: 'main',});
     expect(r.decision).toBe('skip');
     expect(r.reviewHeld).toBe(true);
   });
   it('a fresh read discovering CI went red mid-pass now REFUSES the merge', () => {
     const redRollup = { contexts: { nodes: [{ name: 'test', conclusion: 'FAILURE' }] } };
-    const r = revalidateForMerge(aiPr({ statusCheckRollup: redRollup }), {});
+    const r = revalidateForMerge(aiPr({ statusCheckRollup: redRollup }), { defaultBranch: 'main',});
     expect(r.decision).toBe('skip');
   });
   it('a fresh read discovering a push made the PR no longer mergeable now REFUSES the merge', () => {
-    const r = revalidateForMerge(aiPr({ mergeable: 'CONFLICTING' }), {});
+    const r = revalidateForMerge(aiPr({ mergeable: 'CONFLICTING' }), { defaultBranch: 'main',});
     expect(r.decision).toBe('skip');
   });
   // FAIL CLOSED — a `gh` re-read miss must never be read as "still fine, merge it".
   it('a null freshPr (the gh re-read failed) fails CLOSED — never treated as still safe to merge', () => {
-    const r = revalidateForMerge(null, {});
+    const r = revalidateForMerge(null, { defaultBranch: 'main',});
     expect(r.decision).toBe('skip');
     expect(r.reason).toMatch(/could not re-read/i);
   });
   it('a freshPr with no `number` (a malformed/empty gh reply) is treated the same as a read miss', () => {
-    const r = revalidateForMerge({}, {});
+    const r = revalidateForMerge({}, { defaultBranch: 'main',});
     expect(r.decision).toBe('skip');
   });
   it('threads requiredCheck/allowPendingReview/defaultBranch through to classifyPr exactly as the pass-start call does', () => {
     // allowPendingReview lets a relieved review:pending PR through on the fresh read too, mirroring the
     // pass-start relief wiring (escalationRelief) — the fresh re-check must not silently drop that valve.
     const pending = aiPr({ labels: [{ name: 'review:pending' }] });
-    expect(revalidateForMerge(pending, { allowPendingReview: false }).decision).toBe('skip');
-    expect(revalidateForMerge(pending, { allowPendingReview: true }).decision).toBe('merge');
+    expect(revalidateForMerge(pending, { defaultBranch: 'main', allowPendingReview: false }).decision).toBe('skip');
+    expect(revalidateForMerge(pending, { defaultBranch: 'main', allowPendingReview: true }).decision).toBe('merge');
     // requiredCheck: the fixture's rollup is green on `test` only, so a nondefault required check must refuse —
     // dropping the forwarding would fall back to the default `test` and merge.
-    expect(revalidateForMerge(aiPr(), { requiredCheck: 'lint' }).decision).toBe('skip');
-    expect(revalidateForMerge(aiPr(), { requiredCheck: 'lint' }).reason).toMatch(/required check "lint"/);
+    expect(revalidateForMerge(aiPr(), { defaultBranch: 'main', requiredCheck: 'lint' }).decision).toBe('skip');
+    expect(revalidateForMerge(aiPr(), { defaultBranch: 'main', requiredCheck: 'lint' }).reason).toMatch(/required check "lint"/);
     // defaultBranch: a PR based on `main` in a repo whose default branch is `develop` is off-default-base —
     // dropping the forwarding would fall back to `null` (no base check) and merge.
     const onMain = aiPr({ baseRefName: 'main' });
-    expect(revalidateForMerge(onMain, {}).decision).toBe('merge');
+    expect(revalidateForMerge(onMain, { defaultBranch: 'main',}).decision).toBe('merge');
     expect(revalidateForMerge(onMain, { defaultBranch: 'develop' }).decision).toBe('skip');
     expect(revalidateForMerge(onMain, { defaultBranch: 'develop' }).reason).toMatch(/base is not develop/);
   });
@@ -310,28 +310,28 @@ describe('merge-ai-prs — revalidateForMerge (bug 1: re-check the merge decisio
   describe('expectedHeadSha pins the merge to the head the pass-start decision judged', () => {
     const accepted = (headRefOid) => aiPr({ headRefOid, labels: [{ name: 'review:accepted' }] });
     it('same head → merge, and the pinned SHA is returned for --match-head-commit', () => {
-      const r = revalidateForMerge(accepted('aaa111'), { expectedHeadSha: 'aaa111' });
+      const r = revalidateForMerge(accepted('aaa111'), { defaultBranch: 'main', expectedHeadSha: 'aaa111' });
       expect(r.decision).toBe('merge');
       expect(r.headSha).toBe('aaa111');
     });
     it('a push since the pass-start decision (head moved) REFUSES, even with review:accepted still on the PR', () => {
-      const r = revalidateForMerge(accepted('bbb222'), { expectedHeadSha: 'aaa111' });
+      const r = revalidateForMerge(accepted('bbb222'), { defaultBranch: 'main', expectedHeadSha: 'aaa111' });
       expect(r.decision).toBe('skip');
       expect(r.reason).toMatch(/head moved/);
       expect(r.headSha).toBeUndefined();
     });
     it('an unknown judged head (null) fails CLOSED', () => {
-      expect(revalidateForMerge(accepted('aaa111'), { expectedHeadSha: null }).decision).toBe('skip');
+      expect(revalidateForMerge(accepted('aaa111'), { defaultBranch: 'main', expectedHeadSha: null }).decision).toBe('skip');
     });
     it('a fresh read with no headRefOid fails CLOSED', () => {
-      expect(revalidateForMerge(accepted(undefined), { expectedHeadSha: 'aaa111' }).decision).toBe('skip');
+      expect(revalidateForMerge(accepted(undefined), { defaultBranch: 'main', expectedHeadSha: 'aaa111' }).decision).toBe('skip');
     });
     it('the pin never overrides a hold: same head but review:changes still refuses', () => {
-      const r = revalidateForMerge(aiPr({ headRefOid: 'aaa111', labels: [{ name: 'review:changes' }] }), { expectedHeadSha: 'aaa111' });
+      const r = revalidateForMerge(aiPr({ headRefOid: 'aaa111', labels: [{ name: 'review:changes' }] }), { defaultBranch: 'main', expectedHeadSha: 'aaa111' });
       expect(r.decision).toBe('skip');
     });
     it('omitting expectedHeadSha skips the pin (and returns no headSha)', () => {
-      const r = revalidateForMerge(accepted('bbb222'), {});
+      const r = revalidateForMerge(accepted('bbb222'), { defaultBranch: 'main',});
       expect(r.decision).toBe('merge');
       expect(r.headSha).toBeUndefined();
     });
@@ -345,7 +345,7 @@ describe('merge-ai-prs — #2820 hold-integrity: an unsatisfied review hold bloc
   const readyPr = (labels) => aiPr({ labels });
 
   it('SKIPS ready-to-merge + review:changes — the exact WE #956 state (the hold that must hold)', () => {
-    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.changes }]));
+    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.changes }]), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(true);
     expect(v.certifyLabel).toBe(true);            // ready-to-merge IS present — proves the AND, not an OR
@@ -355,7 +355,7 @@ describe('merge-ai-prs — #2820 hold-integrity: an unsatisfied review hold bloc
   });
 
   it('SKIPS review:human + ready-to-merge — a human-only gate is never cleared by ready-to-merge', () => {
-    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.human }]));
+    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.human }]), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(true);
     expect(v.reason).toMatch(/unsatisfied review hold/);
@@ -363,45 +363,45 @@ describe('merge-ai-prs — #2820 hold-integrity: an unsatisfied review hold bloc
   });
 
   it('SKIPS review:pending + ready-to-merge (not relieved) — an owed independent review still holds', () => {
-    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.pending }]));
+    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.pending }]), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(true);
     expect(v.reason).toMatch(/review:pending/);
   });
 
   it('MERGES ready-to-merge + review:accepted — a satisfied review clears the hold', () => {
-    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.accepted }]));
+    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.accepted }]), { defaultBranch: 'main' });
     expect(v.decision).toBe('merge');
     expect(v.reviewHeld).toBe(false);
     expect(v.reason).toMatch(/producer-certified/);
   });
 
   it('MERGES ready-to-merge alone (no review label at all) — unchanged pre-#2820 behaviour', () => {
-    const v = classifyPr(readyPr([rtm]));
+    const v = classifyPr(readyPr([rtm]), { defaultBranch: 'main' });
     expect(v.decision).toBe('merge');
     expect(v.reviewHeld).toBe(false);
   });
 
   it('review:accepted WINS over a coexisting review:changes (matches decideReviewGate: the reviewer verdict wins)', () => {
-    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.changes }, { name: REVIEW_LABELS.accepted }]));
+    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.changes }, { name: REVIEW_LABELS.accepted }]), { defaultBranch: 'main' });
     expect(v.decision).toBe('merge');
     expect(v.reviewHeld).toBe(false);
   });
 
   it('allowPendingReview (the #2423 per-PR relief valve) waives review:pending to a merge…', () => {
-    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.pending }]), { allowPendingReview: true });
+    const v = classifyPr(readyPr([rtm, { name: REVIEW_LABELS.pending }]), { defaultBranch: 'main', allowPendingReview: true });
     expect(v.decision).toBe('merge');
     expect(v.reviewHeld).toBe(false);
   });
 
   it('…but relief NEVER waives review:changes or review:human (still held even when relieved)', () => {
-    expect(classifyPr(readyPr([rtm, { name: REVIEW_LABELS.changes }]), { allowPendingReview: true }).decision).toBe('skip');
-    expect(classifyPr(readyPr([rtm, { name: REVIEW_LABELS.human }]), { allowPendingReview: true }).decision).toBe('skip');
+    expect(classifyPr(readyPr([rtm, { name: REVIEW_LABELS.changes }]), { defaultBranch: 'main', allowPendingReview: true }).decision).toBe('skip');
+    expect(classifyPr(readyPr([rtm, { name: REVIEW_LABELS.human }]), { defaultBranch: 'main', allowPendingReview: true }).decision).toBe('skip');
   });
 
   it('the hold refuses even a certified-via-AI PR carrying review:changes but NO ready-to-merge label', () => {
     // AI-generated (every commit AI ⇒ certified without a label), green, mergeable — only the hold stops it.
-    const v = classifyPr(aiPr({ labels: [{ name: REVIEW_LABELS.changes }] }));
+    const v = classifyPr(aiPr({ labels: [{ name: REVIEW_LABELS.changes }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(true);
     expect(v.reason).toMatch(/unsatisfied review hold/);
@@ -413,7 +413,7 @@ describe('merge-ai-prs — #2820 hold-integrity: an unsatisfied review hold bloc
   // heal). The hold is checked LAST — a hard AND on ready-to-merge still (no held PR ever reaches `merge`), but
   // the more-actionable skip reason wins when several blockers are true at once.
   it('a red-CI PR carrying review:changes is NOT reviewHeld — the CI reason wins over the hold (finding 3)', () => {
-    const v = classifyPr(aiPr({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }], labels: [rtm, { name: REVIEW_LABELS.changes }] }));
+    const v = classifyPr(aiPr({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }], labels: [rtm, { name: REVIEW_LABELS.changes }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(false);                 // NOT the operative blocker → never enters the downstream passes
     expect(v.reason).toMatch(/required check "test" is not green/);
@@ -421,14 +421,14 @@ describe('merge-ai-prs — #2820 hold-integrity: an unsatisfied review hold bloc
   });
 
   it('a CONFLICTING PR carrying review:human is NOT reviewHeld — the mergeability reason wins (finding 3)', () => {
-    const v = classifyPr(aiPr({ mergeable: 'CONFLICTING', labels: [rtm, { name: REVIEW_LABELS.human }] }));
+    const v = classifyPr(aiPr({ mergeable: 'CONFLICTING', labels: [rtm, { name: REVIEW_LABELS.human }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(false);
     expect(v.reason).toMatch(/not mergeable/);
   });
 
   it('a bodyless PR carrying review:pending is NOT reviewHeld — the empty-description reason wins (finding 3)', () => {
-    const v = classifyPr(aiPr({ body: '   ', labels: [rtm, { name: REVIEW_LABELS.pending }] }));
+    const v = classifyPr(aiPr({ body: '   ', labels: [rtm, { name: REVIEW_LABELS.pending }] }), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(false);
     expect(v.reason).toMatch(/empty\/whitespace description/);

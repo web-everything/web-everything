@@ -10,7 +10,7 @@ import { buildManifest, embedManifestInBody } from '../../readiness/lane-manifes
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, leanPageError = false } = {}) {
+  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -18,7 +18,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     const rows = Array.from({ length: rowCount }, (_, i) => {
       const number = i + 7, headRefOid = number.toString(16).padStart(40, '0');
       return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
-        updatedAt: '2026-11-18T00:00:00Z', baseRefName: 'main', isDraft: false,
+        updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', isDraft: false,
         mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
         labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
         body: embedManifestInBody('fixture', buildManifest({ item: number, repos: [{ repo: 'we', ref: `lane/${number}` }] })),

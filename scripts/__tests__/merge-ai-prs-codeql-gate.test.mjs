@@ -33,7 +33,7 @@ describe('drain CodeQL gate (drainBlocksOnCodeQL)', () => {
   });
   it('the knob turns it off (blockOnCodeQL=false) without touching other checks', () => {
     expect(classifyPr(landable(rollup4236), { defaultBranch: 'main', blockOnCodeQL: false }).decision).toBe('merge');
-    expect(classifyPr(landable(rollup4236.map((c) => (c.name === 'test' ? { ...c, conclusion: 'FAILURE' } : c))), { blockOnCodeQL: false }).decision).toBe('skip');
+    expect(classifyPr(landable(rollup4236.map((c) => (c.name === 'test' ? { ...c, conclusion: 'FAILURE' } : c))), { defaultBranch: 'main', blockOnCodeQL: false }).decision).toBe('skip');
   });
   it('only a FAILURE conclusion blocks', () => {
     expect(isCodeQLFailed({ statusCheckRollup: withCodeQL('FAILURE') })).toBe(true);

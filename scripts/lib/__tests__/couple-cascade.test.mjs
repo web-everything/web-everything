@@ -23,7 +23,7 @@ const claude = { authors: [{ name: 'Claude Opus 4.8', email: 'noreply@anthropic.
 const green = [{ name: 'test', conclusion: 'SUCCESS' }];
 const LABELS = [{ name: 'ready-to-merge' }, { name: 'review:accepted' }];
 const REF = 'lane/x5h527v-drain-daemon-bounds';    // the SAME lane ref name in both repos (the common case)
-const ghPr = (number, headRefName, headOid) => ({
+const ghPr = (number, headRefName, headOid) => ({ baseRefName: 'main',
   number, title: 't', body: 'what changed and why', headRefName, headRefOid: headOid,
   statusCheckRollup: green, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: LABELS,
   commits: [{ oid: headOid, ...claude }],
@@ -42,7 +42,7 @@ function incidentPass() {
     [`${PA}::185`, { manifest: null, commits: [claude], degraded: false }],
   ]);
   const openPrContext = reduceOpenPrContext({ listings, reads, reconcileRan: true });
-  const res = planDrainPass({
+  const res = planDrainPass({ defaultBranchOf: () => 'main',
     listings, openPrContext, repos: [WE, PA], readOf: (repo, num) => reads.get(`${repo || 'cwd'}::${num}`),
     requiredCheck: 'test', label: 'ready-to-merge', isLocalRepo, localSlug,
     provenOnMain: new Set(['xr05jjl']),            // #2744 (xr05jjl) merged 18:59Z — the stack parent is proven

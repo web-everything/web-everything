@@ -4826,3 +4826,8 @@ live observation timestamp; a retained branch never receives fresh evidence time
 records never count as complete PR listings. Keep branch-change, failure, and read-order probes.
 The node:test regression and soak also support the existing Vitest runner; run either through
 heavy-admission, with only the affected files.
+
+The shared drain classifier and merge revalidation refuse missing, undefined, null or empty default-branch
+evidence; pure callers have the same closed default. Valid-admission fixtures must supply the verified branch
+explicitly and include a readable PR base. An unreadable base fails closed globally in this shared authorization
+predicate, including full-list fallback; invalid full context rows fall back to full listing before gates.

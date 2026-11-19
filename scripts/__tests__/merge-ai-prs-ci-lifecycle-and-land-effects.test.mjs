@@ -453,31 +453,31 @@ describe('shouldRepollForLabelLag (#2230 — absorb the ready-to-merge index-pro
 
 describe('isRebaseDropCandidate (#2198 — the manifest-wall rescue gate)', () => {
   // classifyPr on a certified+green PR that is CONFLICTING (the classic shared-manifest wall) → skip.
-  const walled = classifyPr(aiPr({ number: 7, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), {});
+  const walled = classifyPr(aiPr({ number: 7, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), { defaultBranch: 'main',});
   it('a certified + green PR walled by the manifest (CONFLICTING/DIRTY) IS a candidate', () => {
     expect(walled.decision).toBe('skip');
     expect(isRebaseDropCandidate(walled)).toBe(true);
   });
   it('a BEHIND (needs-rebase) certified+green PR is a candidate', () => {
-    const behind = classifyPr(aiPr({ number: 8, mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND' }), {});
+    const behind = classifyPr(aiPr({ number: 8, mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND' }), { defaultBranch: 'main',});
     expect(isRebaseDropCandidate(behind)).toBe(true);
   });
   it('a cleanly-mergeable PR is NOT a candidate (decision is merge, nothing to rebuild)', () => {
-    const clean = classifyPr(aiPr({ number: 9 }), {});
+    const clean = classifyPr(aiPr({ number: 9 }), { defaultBranch: 'main',});
     expect(clean.decision).toBe('merge');
     expect(isRebaseDropCandidate(clean)).toBe(false);
   });
   it('a red `test` is NOT a candidate (a real bug, not a manifest artefact)', () => {
-    const red = classifyPr(aiPr({ number: 10, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }), {});
+    const red = classifyPr(aiPr({ baseRefName: 'main', number: 10, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] }), { defaultBranch: 'main',});
     expect(isRebaseDropCandidate(red)).toBe(false);
   });
   it('an un-certified (mixed-authorship, no label) PR is NOT a candidate — never auto-resolve an un-blessed branch', () => {
-    const uncertified = classifyPr({ number: 11, title: 't', commits: [claudeCommit(), humanCommit], statusCheckRollup: greenRollup, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', labels: [] }, {});
+    const uncertified = classifyPr({ baseRefName: 'main', number: 11, title: 't', commits: [claudeCommit(), humanCommit], statusCheckRollup: greenRollup, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', labels: [] }, { defaultBranch: 'main',});
     expect(uncertified.decision).toBe('skip');
     expect(isRebaseDropCandidate(uncertified)).toBe(false);
   });
   it('a BLOCKED/DRAFT state is NOT a candidate (branch-protection / human concern, not a manifest wall)', () => {
-    const blocked = classifyPr(aiPr({ number: 12, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED' }), {});
+    const blocked = classifyPr(aiPr({ number: 12, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED' }), { defaultBranch: 'main',});
     expect(isRebaseDropCandidate(blocked)).toBe(false);
   });
 });
@@ -547,10 +547,10 @@ describe('#3350 — the rebase livelock is documented where the precondition liv
   // The standing coverage is the '#2198' block above (a red `test` is NOT a candidate / a BEHIND certified+green
   // PR IS one); this restates it as the livelock's two ends so the block reads on its own.
   it('a certified BEHIND PR is NOT a candidate while `test` re-runs, and IS one once green', () => {
-    const rerunning = classifyPr(aiPr({ number: 3350, mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND', statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null }] }), {});
+    const rerunning = classifyPr(aiPr({ baseRefName: 'main', number: 3350, mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND', statusCheckRollup: [{ name: 'test', status: 'IN_PROGRESS', conclusion: null }] }), { defaultBranch: 'main',});
     expect(rerunning.testGreen).toBe(false);
     expect(isRebaseDropCandidate(rerunning)).toBe(false);
-    const green = classifyPr(aiPr({ number: 3350, mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND' }), {});
+    const green = classifyPr(aiPr({ number: 3350, mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND' }), { defaultBranch: 'main',});
     expect(green.testGreen).toBe(true);
     expect(isRebaseDropCandidate(green)).toBe(true);
   });
@@ -640,16 +640,16 @@ describe('needsManifestStripBeforeMerge (#2183 — first-lander manifest-leak fi
   // PR of a batch carried its `.lane-manifest.json` onto main (observed: #79). A clean PR that still carries
   // the manifest must be rebuilt-to-drop it BEFORE merge, conflict or not.
   it('a cleanly-mergeable PR that STILL carries the manifest needs stripping (the leak case)', () => {
-    const clean = classifyPr(aiPr({ number: 20 }), {});
+    const clean = classifyPr(aiPr({ number: 20 }), { defaultBranch: 'main',});
     expect(clean.decision).toBe('merge');
     expect(needsManifestStripBeforeMerge({ ...clean, hasManifest: true })).toBe(true);
   });
   it('a cleanly-mergeable PR with NO manifest (orphan /pr PR) merges directly — no rebuild', () => {
-    const clean = classifyPr(aiPr({ number: 21 }), {});
+    const clean = classifyPr(aiPr({ number: 21 }), { defaultBranch: 'main',});
     expect(needsManifestStripBeforeMerge({ ...clean, hasManifest: false })).toBe(false);
   });
   it('a SKIPPED (conflicting) manifest-carrier is left to isRebaseDropCandidate, not this predicate', () => {
-    const walled = classifyPr(aiPr({ number: 22, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), {});
+    const walled = classifyPr(aiPr({ number: 22, mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' }), { defaultBranch: 'main',});
     expect(walled.decision).toBe('skip');
     expect(needsManifestStripBeforeMerge({ ...walled, hasManifest: true })).toBe(false);
   });

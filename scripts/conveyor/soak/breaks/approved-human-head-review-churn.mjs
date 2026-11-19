@@ -70,7 +70,7 @@ export default {
             throw Error(`unexpected git command: ${args}`);
           } });
       };
-      const pr = { number: 5354, title: 'workflow change', body: 'Approved workflow change', headRefOid: HEAD,
+      const pr = { baseRefName: 'main', number: 5354, title: 'workflow change', body: 'Approved workflow change', headRefOid: HEAD,
         labels: ['ready-to-merge', 'review:accepted'], commits: [], mergeable: 'MERGEABLE', mergeStateStatus: 'BEHIND',
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
       let rebuilds = 0;
@@ -85,7 +85,7 @@ export default {
             rerun: id => reruns.push(id) } });
         check(result.ok && result.action === 'rerun' && !result.newCommit, `tick ${tick}: freshness moved the head instead of rerunning`);
         const retained = retainApprovedHumanQueueHead(pr, { hold, queueOwnsFreshness: true });
-        check(revalidateForMerge(retained).decision === 'merge', `tick ${tick}: the queue cannot test the retained head`);
+        check(revalidateForMerge(retained, { defaultBranch: 'main' }).decision === 'merge', `tick ${tick}: the queue cannot test the retained head`);
         check(retained.headRefOid === HEAD && pr.mergeStateStatus === 'BEHIND', `tick ${tick}: retention mutated the original PR`);
       }
       check(rebuilds === 0 && reruns.join(',') === '1,2,3', 'freshness must rerun each stale pass without rebuilding');
@@ -104,7 +104,7 @@ export default {
           rerun: id => reruns.push(id) } });
       check(!raced.ok && raced.action === 'head-moved' && reruns.length === beforeRace, 'a concurrent push was rerun without a new proof');
       const red = { ...pr, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] };
-      check(revalidateForMerge(retainApprovedHumanQueueHead(red, { hold: true, queueOwnsFreshness: true })).decision === 'skip', 'queue retention bypassed a red required check');
+      check(revalidateForMerge(retainApprovedHumanQueueHead(red, { hold: true, queueOwnsFreshness: true }), { defaultBranch: 'main' }).decision === 'skip', 'queue retention bypassed a red required check');
 
       for (const mode of ['identical', 'whitespace', 'changed', 'unreadable', 'restamp-failed', 'off', 'red-team-pending', 'gate-with-hold']) {
         const calls = [];

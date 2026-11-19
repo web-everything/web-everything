@@ -14,7 +14,7 @@ import { OPEN_PR_LIST_LIMIT } from '../lib/no-search-backed-pr-list.mjs';
 import { runFastDrainContextCli } from './fixtures/fast-drain-context-cli.mjs';
 
 process.env.WE_UNDER_TEST = '1';
-const { planLabelDrain, revalidateForMerge } = await import('../merge-ai-prs.mjs');
+const { planLabelDrain, revalidateForMerge, classifyPr, buildDrainVerdicts, prepareDrainVerdicts, planDrainPass } = await import('../merge-ai-prs.mjs');
 const repo = 'fixture/repo', other = 'fixture/frontierui';
 const manifest = (item, blockedBy = [], stackParents = []) => ({ item, blockedBy, stackParents, repos: [] });
 const pr = (number, extra = {}) => ({
@@ -66,7 +66,7 @@ test('no-edge target reaches queue admission without full pages or a context re-
   const queued = [];
   for (const candidate of plan(rows).ready) {
     const target = rows.get(repo)[0];
-    const gate = revalidateForMerge(target, { expectedHeadSha: candidate.headSha });
+    const gate = revalidateForMerge(target, { defaultBranch: 'main', expectedHeadSha: candidate.headSha });
     if (gate.decision === 'merge') queued.push(candidate.num);
   }
   assert.deepEqual(queued, [7]);
@@ -125,7 +125,7 @@ test('a target changed between its first full read and the lean inventory is rea
 test('a head moved after the context read defers at the existing head pin and is not enqueued', async () => {
   const { rows } = await run();
   const target = rows.get(repo)[0];
-  const gate = revalidateForMerge({ ...target, headRefOid: 'f'.repeat(40) }, { expectedHeadSha: target.headRefOid });
+  const gate = revalidateForMerge({ ...target, headRefOid: 'f'.repeat(40) }, { defaultBranch: 'main', expectedHeadSha: target.headRefOid });
   const queued = gate.decision === 'merge' ? [7] : [];
   assert.deepEqual(queued, []);
   assert.equal(gate.decision, 'skip');
@@ -401,4 +401,71 @@ test('real CLI falls back when the second lean GraphQL page fails', () => {
   assert.equal(live.leanListings, 2);
   assert.ok(live.fullListings > 0);
   assert.match(live.stderr, /fast-drain: context fell back to full listing.*fixture lean page error/);
+});
+
+test('revalidateForMerge refuses a green develop PR when default-branch evidence is omitted', () => {
+  const v = revalidateForMerge(pr(7, { baseRefName: 'develop' }));
+  assert.equal(v.decision, 'skip');
+  assert.match(v.reason, /default branch unresolved live.*deferring merge\/enqueue/);
+});
+
+for (const branch of [undefined, null, '', '  ', 42, {}]) {
+  test(`missing or unreadable default branch ${JSON.stringify(branch)} cannot authorize classification or revalidation`, () => {
+    for (const gate of [classifyPr, revalidateForMerge]) {
+      const v = gate(pr(7), { defaultBranch: branch });
+      assert.equal(v.decision, 'skip');
+      assert.match(v.reason, /default branch unresolved live/);
+    }
+  });
+}
+
+test('drain verdict, preparation and planning siblings fail closed when defaultBranchOf is omitted', () => {
+  const options = { repos: [repo], readOf: () => ({ commits: [], manifest: null }),
+    isLocalRepo: () => true, localSlug: repo, listings: [{ repo, prs: [pr(7)], rows: [pr(7)] }] };
+  const [v] = buildDrainVerdicts({ ...options, prsByRepo: new Map([[repo, [pr(7)]]]) });
+  for (const verdict of [v, prepareDrainVerdicts(options).verdicts[0], planDrainPass(options).verdicts[0]]) {
+    assert.equal(verdict.decision, 'skip');
+    assert.match(verdict.reason, /default branch unresolved live/);
+  }
+});
+
+for (const base of [undefined, null, '', ' \t ', 42, {}]) {
+  test(`target base ${JSON.stringify(base)} cannot authorize merge with verified default main`, async () => {
+    const target = pr(7, { baseRefName: base });
+    for (const gate of [classifyPr, revalidateForMerge]) {
+      const v = gate(target, { defaultBranch: 'main' });
+      assert.equal(v.decision, 'skip');
+      assert.match(v.reason, /PR base branch unreadable.*deferring merge\/enqueue/);
+    }
+    const { calls } = await run({ readFull: () => target });
+    assert.equal(calls.fullPages, 1);
+    assert.match(calls.log[0], /PR #7 base branch unreadable/);
+  });
+  test(`context full row with base ${JSON.stringify(base)} falls back to full listing`, async () => {
+    const { calls } = await run({ snapshot: [pr(7), pr(8, { rowsComplete: false })],
+      readFull: (_repo, n) => pr(n, n === 8 ? { baseRefName: base } : {}) });
+    assert.deepEqual(calls.full, [[repo, 7], [repo, 8]]);
+    assert.equal(calls.fullPages, 1);
+    assert.equal(calls.contextRelists, 1);
+    assert.match(calls.log[0], /PR #8 base branch unreadable/);
+  });
+}
+
+test('a completely absent target base field fails closed', () => {
+  const target = pr(7); delete target.baseRefName;
+  const v = revalidateForMerge(target, { defaultBranch: 'main' });
+  assert.equal(v.decision, 'skip');
+  assert.match(v.reason, /PR base branch unreadable/);
+});
+
+test('real fast drain with a null target base defers after both snapshot and live listing paths', () => {
+  for (const killSwitch of [false, true]) {
+    const run = runFastDrainContextCli({ targetBaseRefName: null, killSwitch });
+    assert.equal(run.status, 0, run.stderr);
+    const result = JSON.parse(run.stdout);
+    assert.deepEqual(result.toMerge, []);
+    assert.deepEqual(result.enqueueOutcomes ?? [], []);
+    assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
+    if (!killSwitch) assert.match(run.stderr, /fast-drain: context fell back to full listing.*base branch unreadable/);
+  }
 });

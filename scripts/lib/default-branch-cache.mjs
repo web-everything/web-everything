@@ -86,5 +86,6 @@ export function createLiveDefaultBranchReader({ readLive, map = new Map(), write
 
 export function defaultBranchHold(base, liveBranch) {
   if (!validDefaultBranch(liveBranch)) return 'default branch unresolved live — deferring merge/enqueue; retry in a new drain process';
+  if (typeof base !== 'string' || !base.trim()) return 'PR base branch unreadable — deferring merge/enqueue; retry with a complete live PR read';
   return base === liveBranch ? null : `base is not ${liveBranch} (${base || 'unreadable'})`;
 }

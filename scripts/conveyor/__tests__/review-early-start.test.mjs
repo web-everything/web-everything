@@ -58,10 +58,10 @@ describe('early review never grants landing permission', () => {
       expect(reviewCiGate({ headSha, checks, requiredChecks: ['test'] }).allowed).toBe(false);
       expect(pollVerdict({ state: 'CLEAN', checkStatus: checks[0].conclusion ? 'failed' : 'pending',
         requiredCount: 1, labelWhenGreen: true })).not.toBe('label');
-      expect(classifyPr(accepted, { requiredCheck: 'test', queueRequiredChecks: ['test'] }).decision).toBe('skip');
+      expect(classifyPr(accepted, { defaultBranch: 'main', requiredCheck: 'test', queueRequiredChecks: ['test'] }).decision).toBe('skip');
       expect(shouldLabelOnGreen({ ...accepted, labels: [{ name: 'review:accepted' }] }, { requiredCheck: 'test' })).toBe(false);
     }
-    expect(classifyPr(pr([row('completed', 'success')]), { requiredCheck: 'test' }).decision).toBe('merge');
+    expect(classifyPr(pr([row('completed', 'success')]), { defaultBranch: 'main', requiredCheck: 'test' }).decision).toBe('merge');
     expect(shouldLabelOnGreen({ ...pr([row('completed', 'success')]), labels: [{ name: 'review:accepted' }] },
       { requiredCheck: 'test' })).toBe(true);
     expect(reviewCiGate({ headSha, checks: [{ ...row('completed', 'success'), head_sha: 'b'.repeat(40) }],

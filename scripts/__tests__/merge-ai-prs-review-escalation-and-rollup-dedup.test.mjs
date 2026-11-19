@@ -253,22 +253,22 @@ describe('#x9xqexm — a re-score never REMOVES review:accepted (superseding #24
     // the bulk of the queue. No sanctioned writer makes this pair: `--to=accepted` and `--to=clear-human` both
     // REMOVE `pending` as they add `accepted`. So the pair means "a re-score found this accept stale" and the
     // non-scoring path must read it that way.
-    const v = classifyPr(bare([REVIEW_LABELS.accepted, REVIEW_LABELS.pending]));
+    const v = classifyPr(bare([REVIEW_LABELS.accepted, REVIEW_LABELS.pending]), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(true);
     expect(v.reason).toMatch(/unsatisfied review hold/);
   });
 
   it('the bare sweep REFUSES a stale re-park pair [accepted, human] — the gate-self shape', () => {
-    const v = classifyPr(bare([REVIEW_LABELS.accepted, REVIEW_LABELS.human]));
+    const v = classifyPr(bare([REVIEW_LABELS.accepted, REVIEW_LABELS.human]), { defaultBranch: 'main' });
     expect(v.decision).toBe('skip');
     expect(v.reviewHeld).toBe(true);
   });
 
   it('…and still MERGES a clean [accepted] — refusing the pairs costs no legitimate land', () => {
-    expect(classifyPr(bare([REVIEW_LABELS.accepted])).decision).toBe('merge');
+    expect(classifyPr(bare([REVIEW_LABELS.accepted]), { defaultBranch: 'main' }).decision).toBe('merge');
     // #2974 stays exactly as ratified: the reviewer verdict wins over a stale bounce.
-    expect(classifyPr(bare([REVIEW_LABELS.accepted, REVIEW_LABELS.changes])).decision).toBe('merge');
+    expect(classifyPr(bare([REVIEW_LABELS.accepted, REVIEW_LABELS.changes]), { defaultBranch: 'main' }).decision).toBe('merge');
   });
 
   // ── ROUND-2 MINOR 5: the #2832 interaction, resolved rather than inherited. ───────────────────────────────
