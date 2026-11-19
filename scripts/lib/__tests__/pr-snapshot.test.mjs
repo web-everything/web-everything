@@ -143,6 +143,19 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(viewCalls(calls)).toHaveLength(1);
     expect(SNAPSHOT_FIELDS).toContain('comments');
   });
+  it('cacheOnly + ignoreDirty serves an old, dirty-marked snapshot without any gh call (drain listing seed)', () => {
+    const { exec, calls } = fakeExec();
+    const fields = 'number,updatedAt,headRefOid,body,files';
+    readSharedOpenPrs(opts({ fields, exec }));
+    const before = calls.length;
+    markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
+    clock += 3 * 60 * 60_000;
+    const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: 6 * 60 * 60_000 });
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty mark still refuses a plain cache read
+    const rows = readSharedOpenPrs({ ...seedOpts, ignoreDirty: true });
+    expect(rows).toHaveLength(14);
+    expect(calls.length).toBe(before);
+  });
   it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
     const { exec, calls } = fakeExec();
     const fieldSets = [

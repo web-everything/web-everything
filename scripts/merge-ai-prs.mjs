@@ -133,6 +133,7 @@ import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSett
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
+const DRAIN_SEED_MAX_AGE_MS = 6 * 60 * 60_000; // listing seed: any snapshot this young; rows are re-verified against the live listing
 // #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
 // beside `latestRequiredCheck`) for why `collapseRollupToLatestPerName`/`rollupRowKind` now live in their own
 // dependency-free `./lib/rollup-collapse.mjs` rather than here.
@@ -5717,7 +5718,9 @@ async function runCli() {
           // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
           let seed = snapshotSeed || [];
           if (!snapshotSeed) {
-            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' })) || []; } catch { seed = []; }
+            // Cache-only: the seed is checked against the live page row (updatedAt + head SHA) before use, so an old
+            // snapshot is safe. A fresh-or-refresh read here ran a second full paged listing (60-200 s) inside the pass.
+            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true, ignoreDirty: true, ttlMs: DRAIN_SEED_MAX_AGE_MS })) || []; } catch { seed = []; }
           }
           listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
