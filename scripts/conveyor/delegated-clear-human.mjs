@@ -1,176 +1,324 @@
 #!/usr/bin/env node
 /**
- * @file delegated-clear-human.mjs — R130 delegated clear-human pass.
- *
- * Standing delegation R11 lets the agent clear `review:human` on a PR that meets the operator's criteria. This
- * pass finds those PRs and records the clearance through the sanctioned CLI (`review-set-label.mjs
- * --to=clear-human`), never by editing a label. Mode `delegatedClearHuman.mode` = off | shadow | on, default
- * shadow: shadow appends a `would-approve` daemon event and changes nothing.
- *
- * Eligible = review:human held, advisory:accepted or review:accepted present, red-team:clear on the CURRENT head,
- * the NET diff scores humanRequired=false, every check passes apart from the review hold (`merge-gate`), and the
- * live head still equals the evaluated head at write time. Every unreadable input fails closed.
- *
- * WIRING (not done here, outside this file's scope): register in skills-src/conveyor/runner.mjs beside
- * `advisory-label-sweep` (pass-name list, skip list and `runRepo` call), as `conveyor/delegated-clear-human.mjs sweep`.
+ * Auto clear-human: fresh, head-pinned seven-clause evaluation. Ships off.
+ * The conveyor runner supplies --prs-file; the snapshot only nominates candidates.
+ * Shadow reports exclusions and approvals plus one tick; on clears at most one PR
+ * through the sanctioned pinned writer. Replay substitutes review:human and never writes.
  */
-import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { PLATFORM_PREFERENCES_PATH } from '../lib/merge-delivery-policy.mjs';
+import { readFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { readDeclaredSettings } from '../lib/settings-files.mjs';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
-import { hasReviewLabel, REVIEW_LABELS, scoreEscalation } from '../lib/review-escalation.mjs';
+import { handoffHome } from '../lib/handoff-path.mjs';
+import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { scoreEscalation } from '../lib/review-escalation.mjs';
+import { latestAdvisory, trustedAdvisoryComments, advisoryCoversHead } from '../lib/advisory-labels.mjs';
+import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, readRedTeamPublicationHold } from '../lib/drain-red-team-evidence.mjs';
+import { planRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
+import { isSecurityClassFinding } from '../lib/jury-core.mjs';
+import { getRequiredStatusChecks, readRequiredStatusChecksDetailed } from '../lib/required-status-checks.mjs';
+import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
+import { workflowEditHold } from '../lib/merge-queue-enqueue.mjs';
+import { refreshMergeGateAfterRestamp } from '../lib/merge-gate-refresh.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 
-export const R11_REASON = 'Standing delegation R11 (operator chalbert, Claude Code chat 2026-10-21 21:50 ET): "Ok, I allow you to approve any of those until this is changed"';
 export const MODES = Object.freeze(['off', 'shadow', 'on']);
-const ACTOR = 'chalbert';
-const OK_CONCLUSIONS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
-/** The review hold itself: the one failing check this pass is allowed to look past. */
-const REVIEW_HOLD_CHECK = /^(merge-gate|review-gate)$/i;
+export const BLOCKERS = Object.freeze(['red-team:blocked', 'size:over-cap', 'status:at-round-limit', 'review:changes',
+  'status:sent-back-red-team', 'advisory:changes', 'advisory:ruling-needed']);
+const SHA = /^[a-f0-9]{40}$/i;
+const names = labels => labels.map(l => typeof l === 'string' ? l : l?.name);
+const ignoredCheck = name => ['merge-gate', 'review-gate'].includes(name);
 
-/** standard (shadow) < platform < repo < env; invalid layers are ignored and reported. */
-export function resolveDelegatedClearHumanMode({ env = {}, platform = {}, repo = {} } = {}) {
-  let result = { value: 'shadow', source: 'standard' };
-  const ignored = [];
-  for (const [source, raw] of [['platform', platform?.delegatedClearHuman?.mode], ['repo', repo?.delegatedClearHuman?.mode],
-    ['env', env?.WE_DELEGATED_CLEAR_HUMAN_MODE]]) {
-    if (raw === undefined) continue;
-    if (!MODES.includes(raw)) { ignored.push({ source, reason: `invalid delegatedClearHuman.mode: expected ${MODES.join('|')}` }); continue; }
-    result = { value: raw, source };
+/** New key wins over the legacy alias across all layers. Invalid explicitly disables. */
+export function resolveDelegatedClearHumanMode({ env = {}, platform = {}, repo = {}, log = () => {} } = {}) {
+  const hasNew = platform?.orchestrator?.autoClearHuman !== undefined || repo?.orchestrator?.autoClearHuman !== undefined
+    || env.WE_AUTO_CLEAR_HUMAN !== undefined;
+  const leaf = layer => hasNew ? layer?.orchestrator?.autoClearHuman : layer?.delegatedClearHuman?.mode;
+  const safe = value => value === undefined ? undefined : MODES.includes(value) ? value : 'off';
+  const resolved = cascadePolicy('orchestrator', { autoClearHuman: safe(leaf(repo)) }, {
+    standard: { autoClearHuman: 'off' }, platform: { autoClearHuman: safe(leaf(platform)) },
+    envValues: { autoClearHuman: safe(hasNew ? env.WE_AUTO_CLEAR_HUMAN : env.WE_DELEGATED_CLEAR_HUMAN_MODE) },
+    operatorOverride: {}, env, log,
+  });
+  return { value: resolved.value.autoClearHuman, source: resolved.sources.autoClearHuman };
+}
+
+export function loadDelegatedClearHumanMode({ env = process.env, readDeclared = readDeclaredSettings,
+  readPlatform = readPlatformPreferences, log = console.error } = {}) {
+  try {
+    const declared = readDeclared();
+    const platform = readPlatform({ env });
+    if (declared.errors?.length || platform.errors?.length) return { value: 'off', source: 'unreadable' };
+    return resolveDelegatedClearHumanMode({ env, platform: platform.prefs, repo: declared.settings, log });
+  } catch { return { value: 'off', source: 'unreadable' }; }
+}
+
+/** Latest timestamp per name; unordered contradictory duplicates are unreadable. */
+export function latestCheckRows(rows) {
+  if (!Array.isArray(rows)) throw Error('checks unreadable');
+  const byName = new Map();
+  for (const row of rows) {
+    const name = row?.name ?? row?.context;
+    if (typeof name !== 'string' || !name) throw Error('check name unreadable');
+    const old = byName.get(name);
+    if (!old) { byName.set(name, row); continue; }
+    const time = r => Date.parse(r.startedAt ?? r.started_at ?? r.createdAt ?? r.created_at ?? r.completedAt ?? r.completed_at);
+    const a = time(old), b = time(row);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || a === b) throw Error('check order unreadable');
+    if (b > a) byName.set(name, row);
   }
-  return ignored.length ? { ...result, ignored } : result;
+  return [...byName.values()];
 }
 
-const names = (labels) => (labels || []).map((l) => (typeof l === 'string' ? l : l?.name));
-
-function checksPass(rollup) {
-  if (!Array.isArray(rollup) || rollup.length === 0) return { ok: false, why: 'no check rollup' };
-  for (const c of rollup) {
-    const name = c?.name || c?.context || '';
-    if (REVIEW_HOLD_CHECK.test(name)) continue;
-    const verdict = String(c?.conclusion || c?.state || '').toUpperCase();
-    if (!OK_CONCLUSIONS.has(verdict) && verdict !== 'SUCCESS') return { ok: false, why: `check ${name || '?'} is ${verdict || 'pending'}` };
+/** All IO is injected. No mutation; each missing/throwing reader is a refusal. */
+export function evaluateEligibility(candidate, readers = {}) {
+  const failed = [], evidence = { head: candidate?.headRefOid ?? null, replay: candidate?.replay === true };
+  const reject = reason => { if (!failed.includes(reason)) failed.push(reason); };
+  const read = (name, fn) => { try { const value = fn(); if (value === undefined) throw Error('missing'); return value; }
+    catch { reject(`unreadable-${name}`); return null; } };
+  const head = evidence.head;
+  if (!SHA.test(head ?? '')) reject('head-unpinned');
+  const pr = read('pr', () => readers.readPr(candidate, head));
+  if (!evidence.replay && pr?.headRefOid !== head) reject('head-moved');
+  let labels = Array.isArray(pr?.labels) ? names(pr.labels) : null;
+  if (!labels || labels.some(l => typeof l !== 'string')) { reject('unreadable-labels'); labels = []; }
+  evidence.originalLabels = [...labels];
+  if (evidence.replay) {
+    labels = labels.map(l => l === 'review:accepted' ? 'review:human' : l);
+    if (!labels.includes('review:human')) labels.push('review:human');
+    // A clear strips these two labels, so a replay at the clear head models them as present; the advisory ruling,
+    // head coverage and red-team evidence clauses below are still decided from the comments and run records.
+    evidence.replaySynthesizedLabels = [];
+    for (const l of ['advisory:accepted', 'red-team:clear']) if (!labels.includes(l)) { labels.push(l); evidence.replaySynthesizedLabels.push(l); }
   }
-  return { ok: true };
+  evidence.labels = labels;
+  if (!labels.includes('review:human')) reject('review-human');
+  for (const label of BLOCKERS) if (labels.includes(label)) reject(label);
+  const comments = read('comments', () => readers.readComments(candidate, head));
+  if (!Array.isArray(comments)) reject('unreadable-comments');
+  const trusted = trustedAdvisoryComments(comments);
+  const advisory = latestAdvisory(trusted);
+  const basis = trusted[advisory?.index]?.body?.match(/^Net basis: `([a-f0-9]+\.\.[a-f0-9]+)`/im)?.[1];
+  evidence.advisory = advisory ? { ...advisory, basis: basis ?? null } : null;
+  if (!labels.includes('advisory:accepted')) reject('advisory-label');
+  if (advisory?.outcome !== 'accept') reject('advisory-ruling');
+  if (!advisoryCoversHead(advisory, head)) reject('advisory-head');
+  const redTeam = read('red-team', () => readers.readRedTeam({ ...pr, number: candidate.number, labels, comments }, head));
+  evidence.redTeam = redTeam ? { clear: redTeam.clear, evidence: {
+    ok: redTeam.evidence?.ok, reason: redTeam.evidence?.reason, settledByComment: redTeam.evidence?.settledByComment,
+    inFlight: redTeam.evidence?.inFlight, scheduled: redTeam.evidence?.scheduled, queued: redTeam.evidence?.queued,
+    recorded: redTeam.evidence?.recorded, status: redTeam.evidence?.status?.status, result: redTeam.evidence?.status?.result,
+  } } : null;
+  if (!labels.includes('red-team:clear') || redTeam?.clear !== true || redTeam?.evidence?.ok !== true) reject('red-team');
+  evidence.publicationHold = read('publication-hold', () => readers.readPublicationHold(candidate, head));
+  if (evidence.publicationHold !== null) reject('red-team-publication');
+  const review = read('review', () => readers.readReview(candidate, head));
+  evidence.review = review;
+  if (review?.head !== head || !Array.isArray(review?.findings)) reject('unreadable-review');
+  evidence.securityFindings = Array.isArray(review?.findings) ? review.findings.filter(isSecurityClassFinding) : null;
+  if (evidence.securityFindings?.length) reject('security-finding');
+  const roster = read('required-checks', () => readers.readRequiredChecks(candidate, head));
+  evidence.requiredChecks = roster;
+  const rows = read('checks', () => latestCheckRows(readers.readChecks(candidate, head)));
+  evidence.checkRows = rows;
+  const required = Array.isArray(roster?.checks) ? roster.checks.filter(n => !ignoredCheck(n)) : null;
+  const checks = resolveRequiredChecks({ rows: rows?.filter(r => !ignoredCheck(r.name ?? r.context)),
+    rowsHead: head, rowsComplete: Array.isArray(rows), requiredNames: required, rosterSource: roster?.source, head });
+  evidence.checkResolution = checks;
+  if (checks.state !== 'pass') reject('required-checks');
+  if (rows?.some(r => !ignoredCheck(r.name ?? r.context)
+    && !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(r.conclusion ?? r.state ?? '').toUpperCase()))) reject('other-check');
+  evidence.score = read('score', () => readers.scoreNet(candidate, head));
+  if (evidence.score?.scored !== true) reject('unreadable-score');
+  if (!evidence.score?.signals || typeof evidence.score.signals !== 'object') reject('unreadable-score');
+  if (evidence.score?.signals?.gateSelf?.length) reject('gate-self');
+  const files = read('files', () => readers.readFiles(candidate, head));
+  evidence.files = files;
+  evidence.workflowEdit = workflowEditHold({ files, expectedCount: files?.length });
+  if (evidence.workflowEdit.hold) reject(evidence.workflowEdit.humanOnly ? 'workflow-edit' : 'unreadable-files');
+  evidence.liveHead = read('head', () => readers.readLiveHead(candidate));
+  if (!evidence.replay && evidence.liveHead !== head) reject('head-moved');
+  return { eligible: failed.length === 0, failed, evidence };
 }
 
-/** Pure given its injected readers. Returns `{eligible, failed, evidence}`; any throw or unknown input is a refusal. */
-export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead } = {}) {
-  const failed = [];
-  const labels = pr?.labels || [];
-  const head = typeof pr?.headRefOid === 'string' && /^[0-9a-f]{40}$/i.test(pr.headRefOid) ? pr.headRefOid : null;
-  if (!head) failed.push('head not pinned');
-  if (!hasReviewLabel(labels, REVIEW_LABELS.human)) failed.push('not review:human');
-  const accepted = hasReviewLabel(labels, REVIEW_LABELS.accepted) ? REVIEW_LABELS.accepted
-    : names(labels).includes('advisory:accepted') ? 'advisory:accepted' : null;
-  if (!accepted) failed.push('no review:accepted / advisory:accepted');
-  const checks = checksPass(pr?.statusCheckRollup);
-  if (!checks.ok) failed.push(checks.why);
-  let shape = null;
-  if (head) {
-    try { shape = scoreNet(pr); } catch { shape = null; }
-    if (!shape || shape.scored !== true) failed.push('net diff unscored');
-    else if (shape.humanRequired !== false) failed.push('net diff still humanRequired');
-    let rt = false;
-    try { rt = names(labels).includes('red-team:clear') && !!redTeamClearAtHead(pr, head); } catch { rt = false; }
-    if (!rt) failed.push('red-team:clear not proven on the current head');
-  }
-  return { eligible: failed.length === 0, failed,
-    evidence: { head, accepted, redTeam: 'clear', shape: { humanRequired: false, files: shape?.files ?? null }, checks: 'pass apart from the review hold' } };
+/** S0b: settle local unknowns using the complete PR thread before planning clear. */
+export function redTeamAtHead(pr, head, { repo, readEvidence = readDrainRedTeamEvidence,
+  settle = settleUnknownEvidenceByComment, plan = planRedTeamStatusLabels } = {}) {
+  const raw = readEvidence({ repo, pr: pr.number, head });
+  const settled = settle(raw, pr.comments, pr.number, head, pr.reviews);
+  const evidence = { ...settled, ok: !!settled && settled.ok !== false
+    && (typeof settled.recorded === 'boolean' || settled.ok === true) };
+  const result = plan({ labels: pr.labels, comments: pr.comments, repo, pr: pr.number, head, evidence });
+  return { clear: evidence?.ok === true && (result.add === 'red-team:clear'
+    || (names(pr.labels).includes('red-team:clear') && !result.remove.includes('red-team:clear') && !result.add)),
+    evidence, coveringReview: raw?.loopPayload ?? raw?.settleBounds?.unfinishedHit?.run ?? null };
 }
 
-/**
- * Record the clearance through the sanctioned CLI (argv array, no shell). FAILS CLOSED: `review-set-label.mjs`
- * cannot yet pin `--expect-head` for `--to=clear-human`, so a push between this pass's head read and the CLI's own
- * read could clear a head this pass never evaluated. Until the CLI gains a head pin (follow-up), the live `on`
- * mode refuses here; shadow mode never reaches this writer. Tests inject a pinned writer.
- */
-export async function clearHumanViaCli({ pr, head, reason, actor, repo = null, exec = execFileSync, headPinSupported = false }) {
-  if (!headPinSupported) throw new Error('review-set-label cannot pin the head for clear-human yet; refusing to clear an unpinned head');
-  exec(process.execPath, ['scripts/review-set-label.mjs', String(pr), '--to=clear-human', `--actor=${actor}`, `--reason=${reason}`,
-    `--expect-head=${head}`, ...(repo ? [`--repo=${repo}`] : [])], { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 });
+export async function clearHumanViaCli({ pr, head, reason, actor = 'orchestrator', repo, exec = execFileSyncThrottled }) {
+  if (!SHA.test(head ?? '')) throw Error('head must be pinned');
+  exec(process.execPath, ['scripts/review-set-label.mjs', String(pr), '--to=clear-human', `--actor=${actor}`,
+    '--channel=daemon', `--expect-head=${head}`, `--reason=${reason}`, ...(repo ? [`--repo=${repo}`] : [])],
+  { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, timeout: 120_000 });
 }
 
-/** Reads platform preferences + declared settings + env; an unreadable layer is skipped (default stays shadow). */
-export function loadDelegatedClearHumanMode({ env = process.env, readFile = readFileSync, readDeclared = readDeclaredSettings } = {}) {
-  let platform = {};
-  try { platform = JSON.parse(readFile(PLATFORM_PREFERENCES_PATH, 'utf8')); } catch { platform = {}; }
-  let repo = {};
-  try { repo = readDeclared().settings || {}; } catch { repo = {}; }
-  return resolveDelegatedClearHumanMode({ env, platform, repo });
+/** Persistent bounded per-(repo, PR, head, verdict) event deduplication. Replay bypasses this store. */
+export function createEventEmitter({ repo, home, append = appendDaemonEvent } = {}) {
+  const dir = handoffHome({ home }), path = join(dir, 'delegated-clear-human-events.json');
+  return async event => {
+    if (event.kind === 'delegated-clear-human-tick') return append({ ...event, repo, daemon: 'delegated-clear-human' });
+    mkdirSync(dir, { recursive: true });
+    return withFileLock(`${path}.lock`, () => {
+      let state = {};
+      try { state = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      const key = JSON.stringify([repo, event.pr, event.detail.head, event.kind]);
+      if (state[key]) return false;
+      // appendDaemonEvent is async: reserve before append so concurrent sweeps cannot duplicate.
+      state[key] = Date.now();
+      state = Object.fromEntries(Object.entries(state).slice(-2000));
+      writeJsonAtomic(path, state);
+      return append({ ...event, repo, daemon: 'delegated-clear-human' });
+    });
+  };
 }
 
-export async function runDelegatedClearHuman({ prs = [], mode = 'shadow', scoreNet, redTeamClearAtHead, readLiveHead,
-  emit = (e) => appendDaemonEvent({ kind: e.kind, pr: e.pr, daemon: 'delegated-clear-human', detail: { head: e.head, evidence: e.evidence } }),
-  clearHuman = clearHumanViaCli } = {}) {
-  const out = { mode, wouldApprove: [], cleared: [], headMovedAfterClear: [], refused: [] };
-  // Fail closed: only the three known modes act; anything else (typo, undefined) does nothing.
-  if (mode !== 'shadow' && mode !== 'on') return out;
-  for (const pr of prs) {
-    if (!hasReviewLabel(pr?.labels || [], REVIEW_LABELS.human)) continue;
-    const r = evaluateEligibility(pr, { scoreNet, redTeamClearAtHead });
-    if (!r.eligible) { out.refused.push({ pr: pr.number, failed: r.failed }); continue; }
-    if (mode === 'shadow') {
-      await emit({ kind: 'would-approve', pr: pr.number, head: r.evidence.head, evidence: r.evidence });
-      out.wouldApprove.push(pr.number);
+export async function runDelegatedClearHuman({ prs = [], mode = 'off', replay = false, emitReplay = false,
+  emit = e => appendDaemonEvent({ ...e, daemon: 'delegated-clear-human' }), clearHuman = clearHumanViaCli,
+  refreshGate = refreshMergeGateAfterRestamp, repo, ...readers } = {}) {
+  const out = { mode: MODES.includes(mode) ? mode : 'off', seen: 0, wouldApprove: [], cleared: [], refused: [], results: [] };
+  if (out.mode === 'off' && !replay) return out;
+  const publish = async (kind, pr, evidence) => { if (!replay || emitReplay) await emit({ kind, pr, detail: evidence }); };
+  let attemptedClear = false;
+  for (const candidate of prs) {
+    if (!replay && !names(candidate.labels ?? []).includes('review:human')) continue;
+    out.seen++;
+    const r = evaluateEligibility({ ...candidate, replay }, readers);
+    out.results.push({ pr: candidate.number, ...r });
+    if (!r.eligible) {
+      out.refused.push({ pr: candidate.number, failed: r.failed });
+      for (const reason of r.failed) await publish(`excluded:${reason}`, candidate.number, { ...r.evidence, failed: r.failed });
+      if (r.failed.some(f => ['size:over-cap', 'workflow-edit'].includes(f)))
+        await publish('orchestrator-decision-owed', candidate.number, { ...r.evidence, failed: r.failed });
       continue;
     }
-    let live = null;
-    try { live = readLiveHead(pr); } catch { live = null; }
-    if (live !== r.evidence.head) { out.refused.push({ pr: pr.number, failed: ['live head moved since evaluation'] }); continue; }
-    try { await clearHuman({ pr: pr.number, head: r.evidence.head, reason: R11_REASON, actor: ACTOR }); out.cleared.push(pr.number);
-      // The CLI cannot pin a head for clear-human, so re-read after the write and flag a push that raced it.
-      let after = null;
-      try { after = readLiveHead(pr); } catch { after = null; }
-      if (after !== r.evidence.head) out.headMovedAfterClear.push(pr.number); }
-    catch (e) { out.refused.push({ pr: pr.number, failed: [`clear-human refused: ${String(e?.message || e).split('\n')[0]}`] }); }
+    out.wouldApprove.push(candidate.number);
+    await publish('would-approve', candidate.number, r.evidence);
+    if (out.mode !== 'on' || replay || attemptedClear) continue;
+    try {
+      // Re-read again at the actual write boundary, after event IO.
+      if (readers.readLiveHead(candidate) !== r.evidence.head) throw Error('head-moved');
+      attemptedClear = true;
+      await clearHuman({ pr: candidate.number, head: r.evidence.head, actor: 'orchestrator', repo,
+        reason: `Auto clear-human predicate: ${JSON.stringify(r.evidence)}` });
+      out.cleared.push(candidate.number);
+      await refreshGate({ repo, pr: candidate.number, head: r.evidence.head, restampedAtMs: Date.now() });
+    } catch (e) {
+      const reason = e.message === 'head-moved' ? 'head-moved' : 'writer-refused';
+      out.refused.push({ pr: candidate.number, failed: [reason] });
+      await publish(`excluded:${reason}`, candidate.number, { ...r.evidence, failed: [reason], error: String(e.message) });
+    }
   }
+  if (out.mode === 'shadow' && !replay) await publish('delegated-clear-human-tick', undefined,
+    { reviewHumanSeen: out.seen, wouldApprove: out.wouldApprove.length, excluded: out.refused.length });
   return out;
 }
 
-/** Live readers (impure). The net score mirrors the drain: computeNetDiffSignals -> scoreEscalation. */
-export async function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we') } = {}) {
-  const { computeNetDiffSignals } = await import('../merge-ai-prs.mjs');
-  const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd, maxBuffer: 64 * 1024 * 1024, ...opts });
+/** Bounded live readers. Head and base objects must be locally readable; no branch substitution. */
+export function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we'), maxCalls = 128,
+  exec = execFileSyncThrottled } = {}) {
+  let calls = 0;
+  const run = (cmd, args, opts = {}) => {
+    if (cmd === 'gh' && ++calls > maxCalls) throw Error('tick read budget exhausted; operator may replay the PR');
+    return exec(cmd, args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, ...opts });
+  };
+  const json = args => JSON.parse(run('gh', args));
+  const states = new Map(), redTeams = new Map(), files = new Map(), scores = new Map();
+  const key = pr => `${pr.number}@${pr.headRefOid}`;
+  const diff = (pr, head) => {
+    const k = key(pr);
+    if (files.has(k)) return;
+    const state = states.get(pr.number);
+    if (!SHA.test(head) || !SHA.test(state?.baseRefOid ?? '')) throw Error('diff basis unreadable');
+    const base = String(run('git', ['merge-base', state.baseRefOid, head])).trim();
+    if (!SHA.test(base)) throw Error('merge base unreadable');
+    const paths = String(run('git', ['diff', '--no-renames', '--name-only', '-z', base, head, '--'])).split('\0').filter(Boolean);
+    const numstat = String(run('git', ['diff', '--no-renames', '--numstat', '-z', base, head, '--']));
+    let diffLines = 0;
+    for (const row of numstat.split('\0').filter(Boolean)) {
+      const match = row.match(/^(\d+|-)\t(\d+|-)\t/);
+      if (!match) throw Error('numstat unreadable');
+      diffLines += (match[1] === '-' ? 0 : Number(match[1])) + (match[2] === '-' ? 0 : Number(match[2]));
+    }
+    const diffHunks = String(run('git', ['diff', '--no-renames', '--no-ext-diff', base, head, '--']));
+    const score = scoreEscalation({ changedFiles: paths, humanBasisFiles: paths, diffLines, cumulativeDiffLines: diffLines, diffHunks });
+    files.set(k, paths); scores.set(k, { ...score, scored: true, files: paths.length, diffLines, base, head });
+  };
   return {
-    scoreNet: (pr) => {
-      const sig = computeNetDiffSignals({ exec, rev: pr.headRefName, baseRev: pr.baseRefName, fetchExtraRefs: [pr.headRefName] });
-      if (!sig.scored) return { scored: false };
-      const s = scoreEscalation({ changedFiles: sig.changedFiles, diffLines: sig.diffLines, humanBasisFiles: sig.humanBasisFiles,
-        cumulativeDiffLines: sig.cumulativeDiffLines, diffHunks: sig.diffHunks, basisNarrowed: sig.basisNarrowed !== false });
-      return { scored: true, humanRequired: s.humanRequired === true, files: sig.humanBasisFiles.length };
+    readPr: pr => { const state = json(['pr', 'view', String(pr.number), '--repo', repo, '--json',
+      'number,labels,headRefOid,baseRefOid,reviews']); states.set(pr.number, state); return state; },
+    readComments: pr => readCompletePrComments(pr.number, { repo, exec: run }),
+    readLiveHead: pr => json(['pr', 'view', String(pr.number), '--repo', repo, '--json', 'headRefOid']).headRefOid,
+    readRedTeam: (pr, head) => { const rt = redTeamAtHead(pr, head, { repo }); redTeams.set(pr.number, rt); return rt; },
+    readPublicationHold: (pr, head) => readRedTeamPublicationHold({ repo, pr: pr.number, head }),
+    readReview: (pr, head) => {
+      const payload = redTeams.get(pr.number)?.coveringReview;
+      if (payload?.findings?.read?.netBasis?.rev !== head) throw Error('covering review unreadable');
+      // Finding-bearing seats only: judgeReferralVerifier carries `results`, not `findings`. The two blocking
+      // seats must be present; an absent advisory seat is simply not a source of findings.
+      const seats = ['judge', 'judgeSecurity', 'judgeAdvisory', 'judgeCorrectnessAdvisory']
+        .filter(name => payload.findings[name] !== undefined).map(name => [name, payload.findings[name]]);
+      if (!payload.findings.judge || !payload.findings.judgeSecurity
+        || seats.some(([, seat]) => !Array.isArray(seat?.findings))) throw Error('review findings unreadable');
+      return { head, findings: seats.flatMap(([, seat]) => seat.findings) };
     },
-    redTeamClearAtHead: async () => false, // replaced below (needs repo); see liveRedTeam
-    readLiveHead: (pr) => JSON.parse(execFileSync('gh', ['pr', 'view', String(pr.number), '--repo', repo, '--json', 'headRefOid'], { encoding: 'utf8', maxBuffer: 1024 * 1024 })).headRefOid,
+    readRequiredChecks: () => getRequiredStatusChecks({ repo, readOnly: true,
+      readChecks: options => readRequiredStatusChecksDetailed({ ...options,
+        restGet: path => ({ json: json(['api', path]) }),
+      }),
+    }),
+    readChecks: (_pr, head) => {
+      const readPages = (kind, field) => {
+        const rows = [];
+        for (let page = 1; page <= 10; page++) {
+          const response = json(['api', `repos/${repo}/commits/${head}/${kind}?per_page=100&page=${page}`]);
+          const batch = field ? response?.[field] : response;
+          if (!Array.isArray(batch)) throw Error('check pages unreadable');
+          rows.push(...batch);
+          if (batch.length < 100) {
+            if (field && response.total_count !== rows.length) throw Error('check count incomplete');
+            return rows;
+          }
+        }
+        throw Error('check page cap exceeded; operator must inspect/replay');
+      };
+      return [...readPages('check-runs', 'check_runs'), ...readPages('statuses')];
+    },
+    readFiles: (pr, head) => { diff(pr, head); return files.get(key(pr)); },
+    scoreNet: (pr, head) => { diff(pr, head); return scores.get(key(pr)); },
   };
 }
 
-export async function liveRedTeam({ repo }) {
-  const { readDrainRedTeamEvidence } = await import('../lib/drain-red-team-evidence.mjs');
-  const { planRedTeamStatusLabels } = await import('../lib/red-team-status-labels.mjs');
-  return (pr, head) => {
-    const evidence = readDrainRedTeamEvidence({ repo, pr: pr.number, head });
-    const plan = planRedTeamStatusLabels({ labels: pr.labels, comments: pr.comments, repo, pr: pr.number, head, evidence });
-    const has = names(pr.labels).includes('red-team:clear');
-    return plan.add === 'red-team:clear' || (has && !plan.remove.includes('red-team:clear') && !plan.add);
-  };
-}
-
-async function main(argv) {
-  const prsFile = argv.find((a) => a.startsWith('--prs-file='))?.slice('--prs-file='.length);
-  const repo = argv.find((a) => a.startsWith('--repo='))?.slice('--repo='.length) || ghRepoSlug('we');
-  const modeArg = argv.find((a) => a.startsWith('--mode='))?.slice('--mode='.length);
-  const prs = prsFile ? JSON.parse(readFileSync(prsFile, 'utf8'))
-    : JSON.parse(execFileSync('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json',
-      'number,headRefName,baseRefName,labels,headRefOid,statusCheckRollup,comments'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }));
+export async function main(argv) {
+  const repo = argv.find(a => a.startsWith('--repo='))?.slice(7) || ghRepoSlug('we');
+  const replayArgs = argv.filter(a => a.startsWith('--replay=')).map(a => a.slice(9));
+  const replay = replayArgs.length > 0;
+  const prsFile = argv.find(a => a.startsWith('--prs-file='))?.slice(11);
+  const prs = replay ? replayArgs.map(value => {
+    const match = value.match(/^(\d+)@([a-f0-9]{40})$/i);
+    if (!match || Number(match[1]) < 1) throw Error('replay requires <pr>@<40-hex head>');
+    return { number: Number(match[1]), headRefOid: match[2].toLowerCase() };
+  }) : prsFile ? JSON.parse(readFileSync(prsFile, 'utf8')) : [];
+  if (!replay && !prsFile) throw Error('--prs-file is required for a sweep');
   const resolved = loadDelegatedClearHumanMode();
-  const mode = modeArg || resolved.value;
-  process.stderr.write(`delegatedClearHuman.mode=${mode} (${modeArg ? 'flag' : resolved.source})\n`);
-  const readers = await liveReaders({ repo });
-  readers.redTeamClearAtHead = await liveRedTeam({ repo });
-  const out = await runDelegatedClearHuman({ prs, mode, ...readers });
+  const requested = argv.find(a => a.startsWith('--mode='))?.slice(7);
+  const mode = requested === undefined ? resolved.value : MODES.includes(requested) ? requested : 'off';
+  process.stderr.write(`orchestrator.autoClearHuman=${mode} (${requested === undefined ? resolved.source : 'flag'})\n`);
+  const emit = replay ? e => appendDaemonEvent({ ...e, repo, daemon: 'delegated-clear-human' }) : createEventEmitter({ repo });
+  const out = await runDelegatedClearHuman({ prs, mode, repo, replay, emitReplay: argv.includes('--emit'), emit, ...liveReaders({ repo }) });
   process.stdout.write(`${JSON.stringify(out)}\n`);
 }
-
-if (import.meta.url === `file://${process.argv[1]}`) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`${e?.message || e}\n`); process.exit(1); });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+  main(process.argv.slice(2)).catch(e => { process.stderr.write(`${String(e.message).replace(/[\p{Cc}\p{Cf}]/gu, ' ')}\n`); process.exitCode = 1; });

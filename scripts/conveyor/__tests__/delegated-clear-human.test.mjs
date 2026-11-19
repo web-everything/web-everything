@@ -1,123 +1,238 @@
-import { describe, expect, it } from 'vitest';
-import {
-  clearHumanViaCli, R11_REASON, resolveDelegatedClearHumanMode, evaluateEligibility, runDelegatedClearHuman,
-} from '../delegated-clear-human.mjs';
-
-const HEAD = 'a'.repeat(40);
-const pr = (over = {}) => ({
-  number: 7, headRefOid: HEAD, headRefName: 'lane/x', baseRefName: 'main',
-  labels: ['review:human', 'advisory:accepted', 'red-team:clear'].map((name) => ({ name })),
-  statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' }],
-  ...over,
-});
+// @vitest-environment node
+import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { BLOCKERS, clearHumanViaCli, createEventEmitter, resolveDelegatedClearHumanMode, loadDelegatedClearHumanMode,
+  evaluateEligibility, runDelegatedClearHuman, redTeamAtHead, liveReaders, main } from '../delegated-clear-human.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+const HEAD = 'a'.repeat(40), OTHER = 'b'.repeat(40);
+const labels = ['review:human', 'advisory:accepted', 'red-team:clear'];
+const pr = (over = {}) => ({ number: 7, headRefOid: HEAD, labels, ...over });
+const advisory = (head = HEAD, outcome = 'accept') => ({ author: { login: 'web-everything' },
+  body: `**Verdict:** accept\n**Advisory outcome:** ${outcome}\nNet basis: \`${OTHER}..${head}\`` });
+const row = (name = 'test', conclusion = 'SUCCESS', startedAt = '2026-11-19T12:00:00Z') =>
+  ({ name, status: 'COMPLETED', conclusion, head_sha: HEAD, startedAt });
 const deps = (over = {}) => ({
-  scoreNet: () => ({ scored: true, humanRequired: false, files: 3 }),
-  redTeamClearAtHead: () => true,
-  readLiveHead: () => HEAD,
-  ...over,
+  readPr: p => p, readComments: () => [advisory()],
+  readRedTeam: () => ({ clear: true, evidence: { ok: true } }), readPublicationHold: () => null,
+  readReview: () => ({ head: HEAD, findings: [] }),
+  readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source: 'live' }),
+  readChecks: () => [row(), row('merge-gate', 'FAILURE')],
+  scoreNet: () => ({ scored: true, signals: {}, files: 3, diffLines: 10 }),
+  readFiles: () => ['src/a.mjs'], readLiveHead: () => HEAD, ...over,
 });
+const evaluate = (over = {}, p = pr()) => evaluateEligibility(p, deps(over));
+const sweep = (over = {}) => runDelegatedClearHuman({ prs: [pr()], mode: 'shadow', ...deps(),
+  emit: async () => {}, clearHuman: async () => {}, refreshGate: async () => {}, ...over });
 
 describe('mode setting', () => {
-  it('defaults to shadow and reports the source', () => {
-    expect(resolveDelegatedClearHumanMode({})).toMatchObject({ value: 'shadow', source: 'standard' });
+  it('ships off in the declared feature file', () => {
+    expect(JSON.parse(readFileSync(new URL('../../settings/auto-clear-human.json', import.meta.url))).orchestrator.autoClearHuman).toBe('off');
+    expect(resolveDelegatedClearHumanMode()).toMatchObject({ value: 'off', source: 'standard' });
   });
-  it('cascades platform < repo < env and ignores invalid values', () => {
-    const r = resolveDelegatedClearHumanMode({
-      platform: { delegatedClearHuman: { mode: 'on' } },
-      repo: { delegatedClearHuman: { mode: 'bogus' } },
-      env: { WE_DELEGATED_CLEAR_HUMAN_MODE: 'off' },
-    });
-    expect(r.value).toBe('off');
-    expect(r.source).toBe('env');
-    expect(r.ignored.length).toBe(1);
+  it.each(['off', 'shadow', 'on'])('resolves %s with provenance', mode => {
+    expect(resolveDelegatedClearHumanMode({ repo: { orchestrator: { autoClearHuman: mode } } })).toEqual({ value: mode, source: 'tool' });
   });
-});
-
-describe('evaluateEligibility', () => {
-  it('is eligible when every condition holds (merge-gate review hold is ignored)', () => {
-    const r = evaluateEligibility(pr(), deps());
-    expect(r.eligible).toBe(true);
-    expect(r.evidence.head).toBe(HEAD);
+  it('cascades platform, tool and environment through policy-cascade', () => {
+    expect(resolveDelegatedClearHumanMode({ platform: { orchestrator: { autoClearHuman: 'on' } },
+      repo: { orchestrator: { autoClearHuman: 'shadow' } }, env: { WE_AUTO_CLEAR_HUMAN: 'off' } })).toEqual({ value: 'off', source: 'env' });
   });
-  it.each([
-    ['no acceptance label', pr({ labels: [{ name: 'review:human' }, { name: 'red-team:clear' }] })],
-    ['red-team:clear missing', pr({ labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }] })],
-    ['a failing required check', pr({ statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }] })],
-    ['empty check rollup (fail closed)', pr({ statusCheckRollup: [] })],
-    ['not human-held', pr({ labels: [{ name: 'advisory:accepted' }, { name: 'red-team:clear' }] })],
-    ['no head', pr({ headRefOid: null })],
-  ])('refuses: %s', (_n, p) => {
-    expect(evaluateEligibility(p, deps()).eligible).toBe(false);
+  it.each(['invalid', null, 1])('invalid new or legacy mode %s disables instead of inheriting on', value => {
+    for (const repo of [{ orchestrator: { autoClearHuman: value } }, { delegatedClearHuman: { mode: value } }])
+      expect(resolveDelegatedClearHumanMode({ platform: { delegatedClearHuman: { mode: 'on' } }, repo }).value).toBe('off');
   });
-  it('ignores the review-gate hold check too', () => {
-    const p = pr({ statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'review-gate', conclusion: 'FAILURE' }] });
-    expect(evaluateEligibility(p, deps()).eligible).toBe(true);
+  it('aliases legacy mode; the new key wins even over a legacy env value', () => {
+    expect(resolveDelegatedClearHumanMode({ repo: { delegatedClearHuman: { mode: 'shadow' } } }).value).toBe('shadow');
+    expect(resolveDelegatedClearHumanMode({ repo: { orchestrator: { autoClearHuman: 'off' }, delegatedClearHuman: { mode: 'on' } },
+      env: { WE_DELEGATED_CLEAR_HUMAN_MODE: 'on' } }).value).toBe('off');
   });
-  it('refuses when the net diff still scores humanRequired', () => {
-    expect(evaluateEligibility(pr(), deps({ scoreNet: () => ({ scored: true, humanRequired: true }) })).eligible).toBe(false);
-  });
-  it('refuses when the net diff is unscored or the score throws', () => {
-    expect(evaluateEligibility(pr(), deps({ scoreNet: () => ({ scored: false }) })).eligible).toBe(false);
-    expect(evaluateEligibility(pr(), deps({ scoreNet: () => { throw new Error('x'); } })).eligible).toBe(false);
-  });
-  it('refuses when red-team is not clear on the current head', () => {
-    expect(evaluateEligibility(pr(), deps({ redTeamClearAtHead: () => false })).eligible).toBe(false);
+  it('unreadable declared settings disable', () => {
+    expect(loadDelegatedClearHumanMode({ readDeclared: () => ({ errors: ['bad'] }), readPlatform: () => ({ prefs: {} }) }).value).toBe('off');
   });
 });
 
-describe('runDelegatedClearHuman', () => {
-  it('quotes R11 verbatim', () => {
-    expect(R11_REASON).toBe('Standing delegation R11 (operator chalbert, Claude Code chat 2026-10-21 21:50 ET): "Ok, I allow you to approve any of those until this is changed"');
+describe('seven-clause predicate', () => {
+  it('accepts complete evidence and records every fact', () => {
+    const r = evaluate();
+    expect(r.failed).toEqual([]);
+    expect(r.evidence).toMatchObject({ head: HEAD, labels, advisory: { head: HEAD, basis: `${OTHER}..${HEAD}` }, redTeam: { evidence: { ok: true } },
+      publicationHold: null, securityFindings: [], requiredChecks: { checks: ['test', 'merge-gate'] },
+      checkRows: expect.any(Array), score: { files: 3, diffLines: 10 }, workflowEdit: { hold: false }, liveHead: HEAD });
   });
-  it('shadow appends would-approve and changes nothing', async () => {
-    const events = []; const calls = [];
-    const out = await runDelegatedClearHuman({ prs: [pr()], mode: 'shadow', ...deps(),
-      emit: async (e) => { events.push(e); }, clearHuman: async (a) => { calls.push(a); } });
-    expect(calls).toEqual([]);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ kind: 'would-approve', pr: 7, head: HEAD });
-    expect(events[0].evidence).toBeTruthy();
-    expect(out.wouldApprove).toEqual([7]);
+  it.each(BLOCKERS)('refuses blocker label %s', label => {
+    expect(evaluate({}, pr({ labels: [...labels, label] })).failed).toContain(label);
   });
-  it('off does nothing', async () => {
-    const events = []; const calls = [];
-    await runDelegatedClearHuman({ prs: [pr()], mode: 'off', ...deps(), emit: async (e) => events.push(e), clearHuman: async (a) => calls.push(a) });
-    expect(events).toEqual([]); expect(calls).toEqual([]);
+  it('requires review:human', () => expect(evaluate({}, pr({ labels: labels.slice(1) })).failed).toContain('review-human'));
+  it('requires advisory:accepted even with review:accepted', () => {
+    expect(evaluate({}, pr({ labels: ['review:human', 'review:accepted', 'red-team:clear'] })).failed).toContain('advisory-label');
   });
-  it('on clears through the CLI with R11 as the reason, never by label edit', async () => {
-    const calls = [];
-    const out = await runDelegatedClearHuman({ prs: [pr()], mode: 'on', ...deps(), emit: async () => {}, clearHuman: async (a) => { calls.push(a); } });
-    expect(calls).toEqual([{ pr: 7, head: HEAD, reason: R11_REASON, actor: 'chalbert' }]);
-    expect(out.cleared).toEqual([7]);
+  it('requires an accept ruling', () => expect(evaluate({ readComments: () => [advisory(HEAD, 'changes')] }).failed).toContain('advisory-ruling'));
+  it('rejects an older advisory basis', () => expect(evaluate({ readComments: () => [advisory(OTHER)] }).failed).toContain('advisory-head'));
+  it('rejects a forged advisory', () => expect(evaluate({ readComments: () => [{ ...advisory(), author: { login: 'attacker' } }] }).eligible).toBe(false));
+  it('requires the latest advisory to accept', () => expect(evaluate({ readComments: () => [advisory(), advisory(HEAD, 'changes')] }).eligible).toBe(false));
+  it('requires red-team label and settled clear evidence', () => {
+    expect(evaluate({}, pr({ labels: labels.slice(0, 2) })).failed).toContain('red-team');
+    expect(evaluate({ readRedTeam: () => ({ clear: false, evidence: { ok: true } }) }).failed).toContain('red-team');
+    expect(evaluate({ readRedTeam: () => ({ clear: true, evidence: { ok: false } }) }).failed).toContain('red-team');
   });
-  it('an unknown mode never reaches the write path', async () => {
-    const calls = []; const events = [];
-    for (const mode of ['bogus', undefined, 'ON']) {
-      await runDelegatedClearHuman({ prs: [pr()], mode, ...deps(), emit: async (e) => events.push(e), clearHuman: async (a) => calls.push(a) });
+  it('refuses a publication hold', () => expect(evaluate({ readPublicationHold: () => 'unpublished' }).failed).toContain('red-team-publication'));
+  it.each(['security', '', ' /correctness'])('refuses security-class lens %s including empty', category => {
+    expect(evaluate({ readReview: () => ({ head: HEAD, findings: [{ category }] }) }).failed).toContain('security-finding');
+  });
+  it('refuses a review from another head or unreadable findings', () => {
+    expect(evaluate({ readReview: () => ({ head: OTHER, findings: [] }) }).failed).toContain('unreadable-review');
+    expect(evaluate({ readReview: () => ({ head: HEAD }) }).failed).toContain('unreadable-review');
+  });
+  it.each(['test', 'smoke'])('each required check %s must be present and successful', name => {
+    for (const rows of [[row(), row('smoke')].filter(r => r.name !== name),
+      [row(), row('smoke')].map(r => r.name === name ? { ...r, conclusion: 'FAILURE' } : r)]) {
+      expect(evaluate({ readRequiredChecks: () => ({ checks: ['test', 'smoke'], source: 'live' }), readChecks: () => rows }).eligible).toBe(false);
     }
-    expect(calls).toEqual([]);
   });
-  it('the default CLI writer refuses until review-set-label can pin the head (fail closed)', async () => {
-    const calls = [];
-    await expect(clearHumanViaCli({ pr: 7, head: HEAD, reason: R11_REASON, actor: 'chalbert', exec: (...a) => calls.push(a) })).rejects.toThrow(/pin/);
-    expect(calls).toEqual([]);
+  it.each(['FAILURE', 'NEUTRAL', 'SKIPPED', ''])('required test conclusion %s refuses', conclusion => {
+    expect(evaluate({ readChecks: () => [row('test', conclusion)] }).failed).toContain('required-checks');
   });
-  it('flags a head that moved right after the clear', async () => {
-    let reads = 0;
-    const out = await runDelegatedClearHuman({ prs: [pr()], mode: 'on', ...deps({ readLiveHead: () => (reads++ === 0 ? HEAD : 'b'.repeat(40)) }),
-      emit: async () => {}, clearHuman: async () => {} });
-    expect(out.cleared).toEqual([7]);
-    expect(out.headMovedAfterClear).toEqual([7]);
+  it('refuses an unknown roster or empty rows', () => {
+    expect(evaluate({ readRequiredChecks: () => ({ checks: ['test'], source: 'fallback' }) }).eligible).toBe(false);
+    expect(evaluate({ readChecks: () => [] }).eligible).toBe(false);
   });
-  it('on refuses when the live head moved since evaluation', async () => {
-    const calls = [];
-    const out = await runDelegatedClearHuman({ prs: [pr()], mode: 'on', ...deps({ readLiveHead: () => 'b'.repeat(40) }), emit: async () => {}, clearHuman: async (a) => calls.push(a) });
-    expect(calls).toEqual([]);
-    expect(out.cleared).toEqual([]);
+  it('rejects non-required failing checks but ignores merge-gate and review-gate', () => {
+    expect(evaluate({ readChecks: () => [row(), row('advisory', 'FAILURE')] }).failed).toContain('other-check');
+    expect(evaluate({ readChecks: () => [row(), row('merge-gate', 'FAILURE'), row('review-gate', 'FAILURE')] }).eligible).toBe(true);
   });
-  it('ineligible PRs produce no event and no clear', async () => {
-    const events = [];
-    await runDelegatedClearHuman({ prs: [pr({ statusCheckRollup: [] })], mode: 'on', ...deps(), emit: async (e) => events.push(e), clearHuman: async () => { throw new Error('no'); } });
-    expect(events).toEqual([]);
+  it.each([['FAILURE', 'SUCCESS', true], ['SUCCESS', 'FAILURE', false]])('latest row wins over old %s then %s', (old, latest, ok) => {
+    expect(evaluate({ readChecks: () => [row('test', latest, '2026-11-19T13:00:00Z'), row('test', old)] }).eligible).toBe(ok);
+  });
+  it('unordered duplicate rows fail closed', () => expect(evaluate({ readChecks: () => [row(), row('test', 'FAILURE')] }).eligible).toBe(false));
+  it('foreign-head checks refuse', () => expect(evaluate({ readChecks: () => [{ ...row(), head_sha: OTHER }] }).eligible).toBe(false));
+  it('gateSelf refuses', () => expect(evaluate({ scoreNet: () => ({ scored: true, signals: { gateSelf: ['gate.mjs'] } }) }).failed).toContain('gate-self'));
+  it('workflow edit refuses', () => expect(evaluate({ readFiles: () => ['.github/workflows/ci.yml'] }).failed).toContain('workflow-edit'));
+  it('head re-read must match H', () => expect(evaluate({ readLiveHead: () => OTHER }).failed).toContain('head-moved'));
+  it('fresh PR head must match H', () => expect(evaluate({ readPr: () => pr({ headRefOid: OTHER }) }).failed).toContain('head-moved'));
+  it('malformed head refuses', () => expect(evaluate({}, pr({ headRefOid: 'abc' })).failed).toContain('head-unpinned'));
+  it.each(Object.keys(deps()))('unreadable %s fails closed', name => {
+    expect(evaluate({ [name]: () => { throw Error('unreadable'); } }).eligible).toBe(false);
+    expect(evaluate({ [name]: () => undefined }).eligible).toBe(false);
+  });
+});
+
+describe('settled red-team evidence', () => {
+  it('settles unknown evidence by the PR comments before planning clear (real settlement helper)', () => {
+    const now = Date.parse('2026-11-19T12:00:00Z');
+    const comment = { author: { login: 'web-everything' }, createdAt: new Date(now).toISOString(),
+      body: renderRedTeamComment({ pr: 7, rev: HEAD, findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) };
+    const raw = { ok: false, reason: 'review-unfinished', settleBounds: { unfinishedUndecided: true,
+      unfinishedStartedAt: now - 3600e3, unfinishedActiveAt: now - 3 * 3600e3, evaluatedAt: now,
+      completeHeadRead: () => ({ complete: true, blocked: false }) } };
+    const plan = vi.fn(({ evidence }) => ({ add: evidence.ok ? 'red-team:clear' : 'red-team:pending', remove: [] }));
+    const options = { repo: 'o/r', readEvidence: () => raw, plan };
+    expect(redTeamAtHead({ ...pr(), comments: [comment] }, HEAD, options)).toMatchObject({ clear: true, evidence: { settledByComment: 'review-unfinished' } });
+    expect(redTeamAtHead({ ...pr(), comments: [] }, HEAD, options).clear).toBe(false);
+    expect(plan.mock.calls[0][0].evidence.ok).toBe(true);
+  });
+});
+
+describe('sweep and writer', () => {
+  it('shadow writes nothing and emits would-approve plus a tick', async () => {
+    const emit = vi.fn(), clearHuman = vi.fn(), refreshGate = vi.fn();
+    const out = await sweep({ emit, clearHuman, refreshGate });
+    expect(clearHuman).not.toHaveBeenCalled(); expect(refreshGate).not.toHaveBeenCalled();
+    expect(out.wouldApprove).toEqual([7]);
+    expect(emit.mock.calls.map(([e]) => e.kind)).toEqual(['would-approve', 'delegated-clear-human-tick']);
+    expect(emit.mock.calls[1][0].detail).toEqual({ reviewHumanSeen: 1, wouldApprove: 1, excluded: 0 });
+  });
+  it('shadow exclusion and an empty sweep still emit one tick', async () => {
+    const emit = vi.fn(); await sweep({ emit, readFiles: () => null });
+    expect(emit.mock.calls.filter(([e]) => e.kind === 'delegated-clear-human-tick')).toHaveLength(1);
+    emit.mockClear(); await sweep({ emit, prs: [] }); expect(emit).toHaveBeenCalledOnce();
+  });
+  it.each(['off', 'invalid'])('%s writes and emits nothing', async mode => {
+    const emit = vi.fn(), clearHuman = vi.fn(); await sweep({ mode, emit, clearHuman });
+    expect(emit).not.toHaveBeenCalled(); expect(clearHuman).not.toHaveBeenCalled();
+  });
+  it.each(['size:over-cap', 'workflow-edit'])('%s emits decision-owed with all facts', async reason => {
+    const emit = vi.fn();
+    await sweep({ emit, ...(reason === 'workflow-edit' ? { readFiles: () => ['.github/workflows/ci.yml'] } : { prs: [pr({ labels: [...labels, reason] })] }) });
+    expect(emit.mock.calls.map(([e]) => e.kind)).toContain(`excluded:${reason}`);
+    expect(emit.mock.calls.find(([e]) => e.kind === 'orchestrator-decision-owed')[0].detail).toMatchObject({ head: HEAD, score: { files: 3 }, failed: [reason] });
+  });
+  it('on writes at most one pinned clearance then refreshes its gate', async () => {
+    const clearHuman = vi.fn(), refreshGate = vi.fn();
+    const out = await sweep({ mode: 'on', prs: [pr(), pr({ number: 8 })], clearHuman, refreshGate });
+    expect(clearHuman).toHaveBeenCalledOnce(); expect(out.cleared).toEqual([7]);
+    expect(clearHuman.mock.calls[0][0]).toMatchObject({ pr: 7, head: HEAD, actor: 'orchestrator', reason: expect.stringContaining('checkRows') });
+    expect(refreshGate).toHaveBeenCalledWith(expect.objectContaining({ pr: 7, head: HEAD }));
+  });
+  it('a refused writer consumes the one-clear attempt budget', async () => {
+    const clearHuman = vi.fn(() => { throw Error('posting identity refused'); });
+    await sweep({ mode: 'on', prs: [pr(), pr({ number: 8 })], clearHuman });
+    expect(clearHuman).toHaveBeenCalledOnce();
+  });
+  it('a push during event IO refuses at the write boundary', async () => {
+    const clearHuman = vi.fn(); let moved = false;
+    const out = await sweep({ mode: 'on', clearHuman, emit: () => { moved = true; }, readLiveHead: () => moved ? OTHER : HEAD });
+    expect(out.refused[0].failed).toContain('head-moved'); expect(clearHuman).not.toHaveBeenCalled();
+  });
+  it('CLI uses sanctioned argv with expect-head, orchestrator and daemon', async () => {
+    const exec = vi.fn(); await clearHumanViaCli({ pr: 7, head: HEAD, reason: 'facts $(inert)', repo: 'o/r', exec });
+    expect(exec.mock.calls[0][1]).toEqual(['scripts/review-set-label.mjs', '7', '--to=clear-human', '--actor=orchestrator',
+      '--channel=daemon', `--expect-head=${HEAD}`, '--reason=facts $(inert)', '--repo=o/r']);
+  });
+  it.each(['off', 'shadow', 'on'])('replay in %s never writes; substitutes human label and exposes every fact', async mode => {
+    const clearHuman = vi.fn(), emit = vi.fn();
+    const out = await sweep({ mode, replay: true, prs: [pr({ labels: ['review:accepted', ...labels.slice(1)] })],
+      readPr: p => ({ ...p, headRefOid: OTHER }), readLiveHead: () => OTHER, emit, clearHuman });
+    expect(out.wouldApprove).toEqual([7]); expect(clearHuman).not.toHaveBeenCalled(); expect(emit).not.toHaveBeenCalled();
+    expect(out.results[0].evidence).toMatchObject({ replay: true, head: HEAD, labels, originalLabels: ['review:accepted', ...labels.slice(1)] });
+  });
+  it('replay emits only with explicit emitReplay', async () => {
+    const emit = vi.fn(); await sweep({ replay: true, emitReplay: true, emit });
+    expect(emit).toHaveBeenCalledOnce(); expect(emit.mock.calls[0][0].detail.replay).toBe(true);
+  });
+  it('dedupes per PR, head, verdict while retaining every tick', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'clear-human-events-'));
+    try {
+      const append = vi.fn(); const emit = createEventEmitter({ repo: 'o/r', home, append });
+      const event = { kind: 'excluded:workflow-edit', pr: 7, detail: { head: HEAD } };
+      await emit(event); await emit(event);
+      await emit({ ...event, detail: { head: OTHER } });
+      await emit({ kind: 'delegated-clear-human-tick', detail: {} });
+      await emit({ kind: 'delegated-clear-human-tick', detail: {} });
+      expect(append).toHaveBeenCalledTimes(4);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+  it('live reader budget exhaustion fails closed', () => {
+    const exec = vi.fn(() => JSON.stringify({ headRefOid: HEAD }));
+    const readers = liveReaders({ repo: 'o/r', maxCalls: 1, exec });
+    expect(readers.readLiveHead(pr())).toBe(HEAD);
+    expect(() => readers.readLiveHead(pr())).toThrow(/budget exhausted/); expect(exec).toHaveBeenCalledOnce();
+  });
+  it('live check reader exhausts pages and refuses oversized inputs with an operator fallback', () => {
+    const readers = liveReaders({ repo: 'o/r', exec: () => JSON.stringify({ check_runs: Array.from({ length: 100 }, () => row()), total_count: 1001 }) });
+    expect(() => readers.readChecks(pr(), HEAD)).toThrow(/page cap exceeded; operator/);
+  });
+  it('live check reader pins the API to H and refuses an incomplete count', () => {
+    const exec = vi.fn(() => JSON.stringify({ check_runs: [row()], total_count: 2 }));
+    expect(() => liveReaders({ repo: 'o/r', exec }).readChecks(pr(), HEAD)).toThrow(/incomplete/);
+    expect(exec.mock.calls[0][1][1]).toContain(`/commits/${HEAD}/check-runs`);
+  });
+  it('live diff reads H and base objects without substituting a branch or fetching', () => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: HEAD, baseRefOid: OTHER });
+      if (args[0] === 'merge-base') return OTHER;
+      if (args.includes('--name-only')) return 'src/a.mjs\0';
+      if (args.includes('--numstat')) return '1\t0\tsrc/a.mjs\0';
+      return 'diff --git a/src/a.mjs b/src/a.mjs\n';
+    });
+    const readers = liveReaders({ repo: 'o/r', exec }); readers.readPr(pr());
+    expect(readers.readFiles(pr(), HEAD)).toEqual(['src/a.mjs']);
+    expect(readers.scoreNet(pr(), HEAD)).toMatchObject({ scored: true, head: HEAD, files: 1, diffLines: 1 });
+    for (const [, args] of exec.mock.calls.filter(([cmd]) => cmd === 'git')) {
+      expect(args).toContain(HEAD); expect(args).not.toContain('fetch');
+    }
+  });
+  it('malformed replay argument refuses before reading live inputs', async () => {
+    await expect(main(['--repo=o/r', '--replay=7@abc'])).rejects.toThrow(/40-hex/);
   });
 });

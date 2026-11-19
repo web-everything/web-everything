@@ -1,0 +1,4 @@
+{
+  "$comment": "Auto clear-human (scripts/conveyor/delegated-clear-human.mjs): orchestrator.autoClearHuman off|shadow|on, standard off. Resolves standard → platform → tool → environment (WE_AUTO_CLEAR_HUMAN), logging effective source. Legacy delegatedClearHuman.mode / WE_DELEGATED_CLEAR_HUMAN_MODE are aliases only when the new key is absent. Invalid values disable. Ships off; enabling is a separate operator decision. Shadow emits exclusions, approvals and a sweep tick without clearing. On clears at most one pinned head per tick. Replay never writes PR state and emits events only with --emit. Oversize/workflow exclusions owe an orchestrator decision; unreadable evidence requires operator inspection/replay.",
+  "orchestrator": { "autoClearHuman": "off" }
+}
