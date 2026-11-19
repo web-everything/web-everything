@@ -1521,8 +1521,8 @@ it('an unscopable default request refuses before stamping a runnable marker', ()
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, outputLines = 148 } = {}) {
-    const files = truncated ? Array.from({ length: 21 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, tooMany = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, retrySkipped = false, passingNamesake = false, outputLines = 148 } = {}) {
+    const files = (truncated || tooMany) ? Array.from({ length: truncated ? 21 : 4 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
     const stdout = ` Test Files  ${files.length} failed\n Tests  ${files.length} failed\n Duration  5.1s\n`;
@@ -1548,7 +1548,7 @@ it('first attempt times out', async () => {
     if (guardExcluded) writeFileSync(join(dir, 'excluded.test.mjs'), '// guard vitest config excludes\n');
     mkdirSync(join(dir, 'tmp'));
     if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
-    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'vitest run', 'check:standards': 'true' } }));
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': 'true' } }));
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
     // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
@@ -1563,18 +1563,36 @@ if (${live} && args[0] === 'vitest') {
   const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(args[1] === 'related' ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
   process.exit(result.status ?? 2);
 }
-if (args[0] === 'vitest' && args[1] === 'related') {
+if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('--maxWorkers=1')) {
+  const files = args.filter(a => a.startsWith('./') && a.endsWith('.test.mjs')).map(a => a.slice(2));
+  const report = args.find(a => a.startsWith('--outputFile.json='));
+  writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: files.map(file => ({
+    name: process.cwd() + '/' + file, status: 'passed', assertionResults: [{ fullName: file.includes('conformance') ? 'scans changed files' : file === 'guard.test.mjs' ? 'repo-wide guard' : 'case ' + ${JSON.stringify(files)}.indexOf(file), status: ${retryExit} ? 'failed' : ${retrySkipped} ? 'pending' : 'passed' }, ...(${passingNamesake} ? [{ fullName: 'case ' + ${JSON.stringify(files)}.indexOf(file), status: 'passed' }] : [])]
+  })) }));
+  if (${retryExit}) {
+    writeAllSync(2, ${JSON.stringify(stderr)});
+    writeAllSync(1, ${JSON.stringify(stdout)});
+  }
+  process.exit(${retryExit});
+}
+if ((args[0] === 'vitest' && args[1] === 'related') || (args[0] === 'run' && args[1] === 'test:unit')) {
   writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
   writeAllSync(2, ${JSON.stringify(stderr)});
   writeAllSync(1, ${JSON.stringify(stdout)});
   process.exit(1);
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('conformance'))) {
-  if (${scanExit}) writeAllSync(2, ' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\n');
+  if (${scanExit}) {
+    writeAllSync(2, ' FAIL  scripts/lib/__tests__/review-policy.conformance.test.mjs > scans changed files\\nAssertionError: scanner found invalid policy\\n');
+    writeAllSync(1, ' Test Files  1 failed\\n Tests  1 failed\\n Duration  1.0s\\n');
+  }
   process.exit(${scanExit});
 }
 if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
-  if (${guardExit}) writeAllSync(2, ' FAIL  guard.test.mjs > repo-wide guard\\n');
+  if (${guardExit}) {
+    writeAllSync(2, ' FAIL  guard.test.mjs > repo-wide guard\\nAssertionError: guard rejected change\\n');
+    writeAllSync(1, ' Test Files  1 failed\\n Tests  1 failed\\n Duration  1.0s\\n');
+  }
   const report = args.find(a => a.startsWith('--outputFile.json='));
   if (report && ${guardReport}) {
     const names = args.filter(a => a.endsWith('.test.mjs') && !a.includes('excluded')).map(a => process.cwd() + '/' + a);
@@ -1595,12 +1613,12 @@ process.exit(${standardsExit});
       cap: 1, fastSlots: 1, fastScale: { maxSlots: 1 }, remote: { enabled: false },
     } }));
     // Keep fixture infrastructure out of the change's own edited set.
-    writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\n*.attempt\n');
+    writeFileSync(join(dir, '.gitignore'), 'calls.jsonl\npool/\ncoordination/\n*.attempt\n');
     execFileSync('git', ['add', '.'], { cwd: dir });
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...gateScrubbedEnv(), PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
+    const env = { ...gateScrubbedEnv(), WE_VERIFY_RETRY_FAILED: '0', WE_COORDINATION_ROOT: join(dir, 'coordination'), PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
       expect(result.error, result.stderr).toBeUndefined();
@@ -1613,6 +1631,123 @@ process.exit(${standardsExit});
     }
     return { files, invoke, calls: () => readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) };
   }
+
+  it('retryFailed: an edited flaky file becomes green-with-flakes, persists audit, and logs host telemetry', () => {
+    const f = fixture({ edited: true, mixed: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stderr).toContain('green-with-flakes');
+    const flakes = f.files.map(file => ({ file, phase: 'vitest' }));
+    expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green', flakes });
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ status: 'green', flakes });
+    expect(f.invoke(['check']).json).toMatchObject({ flakes });
+    const rows = readFileSync(join(dir, 'coordination/.operations/test-flakes.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ file: f.files[0], test: 'case 0', sha: headSha(), host: expect.any(String), load: expect.any(Number), at: expect.any(String) });
+    expect(f.calls()[1].held).toHaveLength(1);
+    expect(f.calls()[1].args).toEqual(expect.arrayContaining(['--maxWorkers=1', '--testTimeout=15000', ...f.files.map(file => `./${file}`)]));
+  });
+
+  it.each([
+    ['vitest', {}], ['scan', { scan: true, scanExit: 1 }], ['guard', { guard: true, guardExit: 1 }],
+  ])('isolatedRetry=off disables retryFailed in %s', (phase, options) => {
+    const f = fixture(options);
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_VERIFY_ISOLATED_RETRY: 'off' });
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.outcomes[phase].result).toBe('fail');
+    expect(f.calls().some(c => c.args.includes('--maxWorkers=1'))).toBe(false);
+  });
+
+  it.each([
+    ['vitest', { mixed: true }], ['scan', { scan: true, scanExit: 1 }], ['guard', { guard: true, guardExit: 1 }],
+  ])('isolatedRetry=timeouts refuses retryFailed assertion failures in %s', (phase, options) => {
+    const f = fixture(options);
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_VERIFY_ISOLATED_RETRY: 'timeouts' });
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.outcomes[phase].result).toBe('fail');
+    expect(f.calls().filter(c => c.args.includes('--maxWorkers=1'))).toHaveLength(phase === 'vitest' ? 0 : 1);
+  });
+
+  it('isolatedRetry=timeouts permits retryFailed timeout recovery in edited files', () => {
+    const f = fixture({ edited: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_VERIFY_ISOLATED_RETRY: 'timeouts' });
+    expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green' });
+    expect(f.calls().filter(c => c.args.includes('--maxWorkers=1'))).toHaveLength(1);
+  });
+
+  it.each([['vitest', {}], ['scan', { scan: true, scanExit: 1 }], ['guard', { guard: true, guardExit: 1 }]])(
+    'retryFailed recovers %s using only its failed files', (phase, options) => {
+      const f = fixture(options);
+      const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+      expect(r.code, r.stderr).toBe(0);
+      expect(r.json.flakes.some(f => f.phase === phase)).toBe(true);
+      expect(r.json.phases.outcomes[phase].result).toBe('pass');
+      if (phase === 'scan') {
+        expect(r.stderr).toContain('review-policy.conformance.test.mjs > scans changed files: AssertionError: scanner found invalid policy');
+        expect(f.calls().filter(c => c.args.includes('--maxWorkers=1')).at(-1).args.filter(a => a.startsWith('./'))).toEqual(['./scripts/lib/__tests__/review-policy.conformance.test.mjs']);
+      }
+    });
+
+  it('retryFailed recovers the recognized full-unit default and still runs standards', () => {
+    const f = fixture({ edited: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_BUILD_FINAL_GATE: 'full' });
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green' });
+    expect(f.calls()[0].args).toEqual(['run', 'test:unit']);
+    expect(f.calls().at(-1).args).toEqual(['run', 'check:standards']);
+  });
+
+  it('retryFailed never clears a standards red after full-unit flake recovery', () => {
+    const f = fixture({ standardsExit: 1 });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_BUILD_FINAL_GATE: 'full' });
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.outcomes.standards.result).toBe('fail');
+  });
+
+  it('retryFailed accepts a real Vitest execution report after flaky timeout recovery', () => {
+    const f = fixture({ live: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.json.flakes).toHaveLength(2);
+  }, 15000);
+
+  it('retryFailed cannot clear a red guard whose original inventory omitted another declared guard', () => {
+    const f = fixture({ guard: true, guardExit: 1, guardExcluded: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.alwaysRun.missing).toEqual(['excluded.test.mjs']);
+    expect(f.calls().filter(c => c.args.includes('./guard.test.mjs'))).toHaveLength(0);
+  });
+
+  it('retryFailed leaves more than three failed files red and names the operator fallback', () => {
+    const f = fixture({ tooMany: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.json.status).toBe('red');
+    expect(r.stderr).toContain('within the three-file cap; fix the failures or run a fresh verify');
+    expect(f.calls().some(c => c.args.includes('--maxWorkers=1'))).toBe(false);
+  });
+
+  it('retryFailed keeps consistently failing files red after exactly N isolated attempts', () => {
+    const f = fixture({ edited: true, retryExit: 1 });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '2' });
+    expect(r.json).toMatchObject({ status: 'red', isolatedRetry: 'still-red' });
+    expect(f.calls().filter(c => c.args.includes('--maxWorkers=1'))).toHaveLength(2);
+    expect(existsSync(join(dir, 'coordination/.operations/test-flakes.jsonl'))).toBe(false);
+  });
+
+  it('retryFailed refuses a nominal green whose failing assertions were skipped', () => {
+    const f = fixture({ edited: true, retrySkipped: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.json).toMatchObject({ status: 'red', isolatedRetry: 'still-red' });
+    expect(r.json.flakes).toBeUndefined();
+  });
+
+  it('retryFailed keeps a skipped original plus a passing namesake red', () => {
+    const f = fixture({ edited: true, retrySkipped: true, passingNamesake: true });
+    const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1' });
+    expect(r.json).toMatchObject({ status: 'red', isolatedRetry: 'still-red' });
+    expect(r.json.flakes).toBeUndefined();
+  });
 
   it('drains phase output larger than a pipe buffer before the terminal JSON verdict', () => {
     const outputLines = 24000;
