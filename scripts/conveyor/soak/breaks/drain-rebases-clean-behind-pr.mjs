@@ -15,7 +15,7 @@ const mk = (o = {}) => ({ decision: 'skip', reason, state: 'BEHIND', mergeable: 
 const rebase = () => 'REBASE';
 const run = (v) => { const out = m.routeRebaseBeforeEnqueue(v, { setting: 'conflict-only', mergeStrategy: { queueOwnsFreshness: () => true },
   manifestFree: () => true, reclassifiesMerge: () => true, rebase }); return { out: out === null ? null : out === rebase ? 'REBASE' : 'OTHER', decision: v.decision }; };
-console.log(JSON.stringify({ clean: run(mk()), conflicting: run(mk({ mergeable: 'CONFLICTING' })) }));
+console.log(JSON.stringify({ seam: typeof m.routeRebaseBeforeEnqueue === 'function' && typeof m.readFreshQueueRollup === 'function', clean: run(mk()), conflicting: run(mk({ mergeable: 'CONFLICTING' })) }));
 `;
 
 function probe(root) {
@@ -29,7 +29,9 @@ export default {
   title: 'The drain rebases and force-pushes a cleanly mergeable BEHIND PR instead of enqueueing its existing head',
   card: 'drain skips the rebase for a clean BEHIND PR (R1070 merge-queue optimisation)',
   fixedBy: { sha: 'pending', where: 'lane/drain-skip-rebase-clean', paths: ['scripts/merge-ai-prs.mjs'] },
-  fixPresent(root) { const p = probe(root); return !!p && p.clean?.out === null; },
+  // Presence = the routing seam exists (checked by behaviour of the export, not by the outcome under test), so a
+  // regression of the routing stays a real failure instead of flipping the harness to expected-fail.
+  fixPresent(root) { const p = probe(root); return !!p && p.seam === true; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const p = probe(root);

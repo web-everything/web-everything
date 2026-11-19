@@ -1457,7 +1457,7 @@ export async function readFreshQueueRollup(pr, { repo, exec = execFileP } = {}) 
   let after = null, total = null;
   try {
     for (let page = 0; page < 10; page += 1) {
-      const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){object(oid:${JSON.stringify(pr.headRefOid)}){...on Commit{oid statusCheckRollup{contexts(first:100${after ? `,after:${JSON.stringify(after)}` : ''}){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ...on CheckRun{name status conclusion detailsUrl databaseId} ...on StatusContext{context state targetUrl}}}}}}}}`;
+      const query = `query($owner:String!,$name:String!){repository(owner:$owner,name:$name){object(oid:${JSON.stringify(pr.headRefOid)}){...on Commit{oid statusCheckRollup{contexts(first:100${after ? `,after:${JSON.stringify(after)}` : ''}){totalCount pageInfo{hasNextPage endCursor} nodes{__typename ...on CheckRun{name status conclusion detailsUrl databaseId startedAt completedAt} ...on StatusContext{context state targetUrl}}}}}}}}`;
       const { stdout } = await exec('gh', ['api', 'graphql', '-F', `owner=${owner}`, '-F', `name=${name}`, '-f', `query=${query}`],
         { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       const data = JSON.parse(stdout);
@@ -1468,7 +1468,8 @@ export async function readFreshQueueRollup(pr, { repo, exec = execFileP } = {}) 
         || typeof connection.pageInfo?.hasNextPage !== 'boolean') return unresolved;
       if (total !== null && total !== connection.totalCount) return unresolved;
       total = connection.totalCount;
-      rows.push(...connection.nodes);
+      // The latest-per-name reducer orders runs by `id`/`completedAt`; keep them so a stale success cannot mask a newer failure.
+      rows.push(...connection.nodes.map(n => (n?.__typename === 'CheckRun' && n.databaseId != null ? { ...n, id: n.databaseId } : n)));
       if (!connection.pageInfo.hasNextPage) return rows.length === total
         ? { ...pr, statusCheckRollup: rows, rowsComplete: true } : unresolved;
       after = connection.pageInfo.endCursor;
