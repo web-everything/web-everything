@@ -2015,3 +2015,13 @@ exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9)
     expect(bad.error?.code).toBe('ETIMEDOUT');
   });
 });
+
+describe('warm-install with an unconfirmed uid sweep',()=>{
+  it('does not publish the dependency cache and leaves the worker lock held',async()=>{
+    runner=createRunner({testRoot:root,testPath:join(root,'bin')+':/usr/bin:/bin',testWorkerExec:async()=>({code:0,stdout:'',stderr:'',uidUnconfirmed:true})});
+    await expect(runner.warmInstall(work,request.manifest)).rejects.toThrow('uid cleanup unconfirmed during install');
+    const names=await readdir(join(root,'cache'),{recursive:true}).catch(()=>[]);
+    expect(names.filter(name=>name.endsWith('dependencies.tar'))).toEqual([]);
+    await stat(join(root,'receipts','worker-active'));
+  });
+});

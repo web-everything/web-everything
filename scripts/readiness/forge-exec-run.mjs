@@ -1375,7 +1375,14 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
     }
     return true;
   }
-  async function installDependencies(request,work,temp,command) {
+  async function installDependencies(request,work,temp,rawCommand) {
+    // Every install path (run and warm-install): a command whose uid sweep was unconfirmed may leave workers alive,
+    // so its result must never reach the reusable dependency cache. The slot is already fenced by the caller.
+    const command=async(...args)=>{
+      const value=await rawCommand(...args);
+      if(value?.uidUnconfirmed===true)throw new Error('uid cleanup unconfirmed during install; slot fenced');
+      return value;
+    };
     let result;
       // npm accepts some manifest changes without lock changes. Key the entire
       // validated snapshot, including workspace manifests and local dependency
