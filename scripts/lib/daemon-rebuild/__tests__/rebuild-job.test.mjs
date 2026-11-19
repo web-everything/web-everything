@@ -17,6 +17,7 @@ import * as forceAdopt from '../../daemon-force-adopt.mjs';
 import * as overlayAdoption from '../../overlay-adoption.mjs';
 import * as preparation from '../prepare.mjs';
 import * as stateIO from '../state.mjs';
+import * as cloneLocks from '../../daemon-clone-lock.mjs';
 import { matchReadyCandidate } from '../adopt.mjs';
 
 let root;
@@ -534,29 +535,42 @@ it('exact ready matching consults fresh audit evidence for each recorded tip', (
   expect(result.adopt).toBeNull();
 });
 
-it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'clean', 'interrupted', 'up-to-date'].map(kind => [source, kind])))(
-  '%s %s admission uses one exact strict snapshot through real preparation and never rereads state', async (launchedBy, kind) => {
+it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'hold', 'lease', 'unreadable', 'clean', 'interrupted', 'up-to-date'].map(kind => [source, kind])))(
+  '%s %s preparation reads strict state under the lock and preserves evidence arriving after admission', async (launchedBy, kind) => {
     const env = { WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
       WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_AUTO_REBASE: '0' };
-    writeRebuildState(root, ['clean', 'up-to-date'].includes(kind) ? {} : {
-      rejected: { inputsKey: kind !== 'backoff' ? 'inputs' : 'older', reason: 'failed', at: stamp,
-        ...(kind === 'backoff' ? { harnessBroken: true, retryAt: new Date(2000).toISOString() } : {}) },
-      ...(kind === 'interrupted' ? { inProgress: { pid: 1, host: 'other-host', startedAt: new Date(-3600000).toISOString(),
-        prevHead: 'head', target: 'head', inputsKey: 'inputs', mainSha: 'main', applied: [], verified: true } } : {}),
-      ...(kind === 'backoff' ? { held: { reason: 'smoke-harness-broken', since: stamp, updatedAt: stamp,
-        retryAt: null, attempts: 1 } } : {}),
-    }, env);
-    const file = rebuildStatePath(root, env), bytes = readFileSync(file, 'utf8');
-    const snapshot = readRebuildStateStrict(root, env);
-    const persistedRejection = structuredClone(snapshot.rejected);
-    const readState = vi.fn(() => {
-      if (readState.mock.calls.length > 1) throw new Error('second strict read forbidden');
-      return snapshot;
+    writeRebuildState(root, {}, env);
+    const file = rebuildStatePath(root, env);
+    const strictRead = stateIO.readRebuildStateStrict;
+    const readState = vi.spyOn(stateIO, 'readRebuildStateStrict').mockImplementation((...args) => {
+      expect(cloneLocks.inspectCloneLock(root, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: 1000 }).writerLive)
+        .toBe(readState.mock.calls.length > 1);
+      return strictRead(...args);
+    });
+    let bytes, persistedRejection;
+    const withWriteLock = cloneLocks.withWriteLock;
+    vi.spyOn(cloneLocks, 'withWriteLock').mockImplementation((...args) => {
+      // A sibling publishes new evidence after the early strict read, before we acquire the lock.
+      expect(readState).toHaveBeenCalledOnce();
+      const state = ['sticky', 'backoff', 'interrupted'].includes(kind) ? {
+        rejected: { inputsKey: kind !== 'backoff' ? 'inputs' : 'older', reason: 'failed', at: stamp,
+          ...(kind === 'backoff' ? { harnessBroken: true, retryAt: new Date(2000).toISOString() } : {}) },
+        ...(kind === 'interrupted' ? { inProgress: { pid: 1, host: 'other-host', startedAt: new Date(-3600000).toISOString(),
+          prevHead: 'head', target: 'head', inputsKey: 'inputs', mainSha: 'main', applied: [], verified: true } } : {}),
+        ...(kind === 'backoff' ? { held: { reason: 'smoke-harness-broken', since: stamp, updatedAt: stamp,
+          retryAt: null, attempts: 1 } } : {}),
+      } : kind === 'hold' ? { held: { reason: 'smoke-env-timeout', since: stamp, updatedAt: stamp,
+        retryAt: new Date(2000).toISOString(), attempts: 1 } }
+        : kind === 'lease' ? { building: { ...completeState().building, host: 'other-host', startedAt: stamp } } : {};
+      writeRebuildState(root, state, env);
+      persistedRejection = JSON.parse(readFileSync(file, 'utf8')).rejected;
+      if (kind === 'unreadable') writeFileSync(file, '{new-unreadable-state');
+      bytes = readFileSync(file, 'utf8');
+      return withWriteLock(...args);
     });
     const legacyRead = vi.spyOn(stateIO, 'readRebuildState').mockImplementation(() => { throw new Error('legacy read forbidden'); });
-    const prepare = vi.spyOn(preparation, 'prepareRebuild');
     vi.spyOn(planner, 'planRebuild').mockImplementation(async () => {
-      // Evidence arriving after strict admission is owned by the next tick.
+      // Ready cleanup remains owned by the next normal tick.
       if (kind === 'up-to-date') writeFileSync(readyCandidatePath(root, env), '{new-unreadable-evidence');
       return { ok: true, upToDate: kind === 'up-to-date', finalSha: kind === 'up-to-date' ? 'head' : 'target',
         mainSha: 'main', inputsKey: 'inputs', applied: [], decisions: [], alerts: [] };
@@ -572,15 +586,17 @@ it.each(['early', 'recovery'].flatMap(source => ['sticky', 'backoff', 'clean', '
     });
     const actualJob = rebuildJob.rebuildCloneAsJob;
     const store = createJobStore(join(root, 'jobs'));
-    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockImplementation(options => actualJob({ ...options, store, readState,
+    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockImplementation(options => actualJob({ ...options, store,
       codeSha: 'a'.repeat(40), reattach: async () => ({}), evict() {},
       settings: { minIntervalMs: 0, minIntervalJitterPct: 0 } }));
     const result = await rebuildClone({ root, env, run, asJob: true, launchOnly: true, launchedBy,
       versions: null, now: () => 1000, lockOpts: { waitMs: 0 }, log: { error() {} }, emitEvent: vi.fn() });
     expect(result.reason).toBe(['sticky', 'interrupted'].includes(kind) ? 'still-rejected' : kind === 'backoff'
-      ? 'smoke-harness-broken-backoff' : kind === 'up-to-date' ? 'up-to-date' : 'rebuild-job-started');
-    expect(readState).toHaveBeenCalledOnce(); expect(legacyRead).not.toHaveBeenCalled();
-    expect(prepare.mock.calls[0][0].admissionEvidence.state).toBe(snapshot);
+      ? 'smoke-harness-broken-backoff' : kind === 'hold' ? 'smoke-env-timeout-backoff'
+        : kind === 'lease' ? 'rebuild-in-progress' : kind === 'unreadable' ? 'state-unreadable'
+          : kind === 'up-to-date' ? 'up-to-date' : 'rebuild-job-started');
+    expect(readState).toHaveBeenCalledTimes(2); expect(legacyRead).not.toHaveBeenCalled();
+    if (kind === 'unreadable') expect(run).not.toHaveBeenCalled();
     if (kind === 'interrupted') {
       const persisted = JSON.parse(readFileSync(file, 'utf8'));
       expect(persisted.inProgress).toBeNull();

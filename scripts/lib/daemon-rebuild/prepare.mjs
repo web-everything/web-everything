@@ -6,7 +6,7 @@ import { timeoutRetryAt, resolveRecovery } from './recovery.mjs';
 
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import {
-  alertsFilePath, readRebuildState, writeRebuildState, readReadyCandidate,
+  alertsFilePath, readRebuildState, readRebuildStateStrict, writeRebuildState, readReadyCandidate,
 } from './state.mjs';
 import { mkdirSync, appendFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -136,7 +136,14 @@ export async function prepareRebuild({
     detail: 'Deferred to the next daemon tick holding the normal clone write lock.',
   });
 
-  const state = admissionEvidence ? admissionEvidence.state : readRebuildState(root, stEnv);
+  // Admission's pre-lock read is only an early refusal filter. All checks and writes
+  // use fresh evidence read under the clone write lock held by this phase.
+  let state;
+  try {
+    state = admissionEvidence ? readRebuildStateStrict(root, stEnv) : readRebuildState(root, stEnv);
+  } catch {
+    return { terminal: true, result: { moved: false, reason: 'state-unreadable' }, alerts: alertsList };
+  }
   const writeState = () => writeRebuildState(root, state, stEnv);
   // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
   // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.

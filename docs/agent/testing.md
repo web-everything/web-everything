@@ -5175,10 +5175,14 @@ The job fixture injects EACCES/EIO and corrupt JSON, and a recursive table delet
 every required field, asserting refusal, untouched bytes and no job. Historical incomplete files
 are deliberately refused until operator repair; the legacy reader retains its compatibility behavior
 for ordinary tick consumers. Producers write explicit policy defaults rather than admission
-inventing them. The strict reader returns the exact parsed snapshot; launch-only preparation receives
-that object through `admissionEvidence`, including the ready snapshot. Missing handoff refuses.
-The early/recovery sticky/backoff/clean tests drive real preparation, assert object identity, and
-make every second strict or legacy rebuild-state read throw. Between-tick admission never takes
+inventing them. The pre-lock strict state read is an early refusal filter only. Launch-only
+preparation re-reads and validates state under the clone write lock, using that locked snapshot
+for every check and read-modify-write; an unreadable locked read refuses as `state-unreadable`.
+The ready snapshot still passes through `admissionEvidence`; missing handoff refuses.
+The early/recovery race tests publish rejection, hold, lease or corrupt state between admission
+and lock acquisition, assert the second strict read holds the lock, and verify newer evidence
+survives refusal and interrupted-rebuild bookkeeping. Clean admission remains covered.
+Between-tick admission never takes
 a transient build lease, avoiding a second read-modify-write during lease release. An up-to-date
 ready-only probe also leaves ready cleanup to the next tick: the fixture plants corrupt ready evidence
 during planning and asserts that the indirect cleanup reader neither rereads nor deletes it.
