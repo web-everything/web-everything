@@ -4937,7 +4937,7 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 `scripts/lib/same-content-carry.mjs` owns the history classifier shared by waiver and verdict carries.
 Use real temporary Git histories to verify mechanical main merges, conflict resolutions and JIT backlog renames;
 only waivers may allow test-only edits. A history proof never substitutes for finding coverage or later-verdict guards.
-Keep readiness candidates separate from history-based negative-evidence vetoes: an old NOT WEAKENED ready record must not authorize a test-only successor through either readyEvidence or makeAuditedTipGate.
+Keep readiness candidates separate from history-based negative-evidence vetoes: neither an old NOT WEAKENED nor an old WEAKENED ready record may authorize a test-only successor. Test-only waiver carry needs live-SHA green tests and a live-SHA canonical audit with its own findings and verdict, including through the daemon and open-pr gates. Reject deleted test paths and net-removal test diffs (including merge resolutions); require a fresh audit/review instead. Only clean main merges and JIT renames may carry evidence through history. Match findings as a multiset: each live finding consumes one ruled finding, preserving file paths while stripping line/column locations.
 Normalize colon-delimited line references only on recognized source paths; preserve endpoint ports and other numeric finding content, and test that changing a port refuses waiver admission.
 The node:test cases run through a small Vitest adapter so the host heavy-admission queue remains the test entry point.
 The soak break probes behavior in a temporary repository, including a real hunk-offset fingerprint change.

@@ -34,7 +34,7 @@ export function sameContentRepo(kind = 'clean') {
       git('checkout', '-q', 'lane');
       try { git('merge', '--no-edit', 'main'); } catch (e) {
         if (!kind.startsWith('conflict-')) throw e;
-        write(kind === 'conflict-test' ? 'scripts/ci/test-timings.json' : 'conflict.js', 'hand resolved\n');
+        write(kind === 'conflict-test' ? 'scripts/ci/test-timings.json' : 'conflict.js', kind === 'conflict-test' ? 'resolved test\n'.repeat(8) : 'hand resolved\n');
         commit('resolved merge');
       }
       to = git('rev-parse', 'HEAD');

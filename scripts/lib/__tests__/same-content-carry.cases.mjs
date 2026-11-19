@@ -212,8 +212,10 @@ test('newer negative ordinary readiness still vetoes a history-carried waiver', 
   const entry = { ref, sha: f.from, ruling: 'R12', findings: ['code.js issue'] };
   const ruled = { ref, sha: f.from, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: entry.findings };
   const negative = { ref, sha: f.to, tests: 'red', audit: 'NOT WEAKENED', fingerprint: 'b'.repeat(64) };
-  assert.ok(readyEvidence([ruled], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }));
-  assert.equal(readyEvidence([ruled, negative], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }), null);
+  const liveReady = { ...ruled, sha: to };
+  assert.equal(readyEvidence([ruled], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }), null);
+  assert.ok(readyEvidence([liveReady], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }));
+  assert.equal(readyEvidence([liveReady, negative], { branch: ref, sha: to }, [entry], 'c'.repeat(64), { sameContent }), null);
 });
 
 test('acceptance mismatch without injected IO stays settled and never invokes history dependencies', () => {
@@ -284,4 +286,108 @@ test('unreadable or oversized accepted fingerprint preserves the settled refusal
     assert.equal(calls, 1); assert.equal(historyCalls, 0); assert.equal(result.action, 'review-owed');
     assert.equal(result.retryable, undefined); assert.match(result.reason, /^net diff changed since the accept/);
   }
+});
+
+
+// Audit round 1: evidence is always fresh after any test edit, including merge resolutions.
+for (const kind of ['test', 'conflict-test']) test(`${kind}: old WEAKENED tests and audits never authorize the successor`, t => {
+  const f = fixture(t, kind), ref = 'lane/example', sameContent = createSameContentProof(f);
+  const fp = 'c'.repeat(64);
+  const entry = { ref, sha: f.from, ruling: 'R12', findings: ['code.js:12 issue'] };
+  const old = { ref, sha: f.from, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: entry.findings, fingerprint: fp };
+  const live = { ...old, sha: f.to };
+  assert.equal(readyEvidence([old], { branch: ref, sha: f.to }, [entry], fp, { sameContent }), null);
+  const gate = readyEvidence([live], { branch: ref, sha: f.to }, [entry], fp, { sameContent });
+  assert.ok(gate);
+  const audit = { head: f.from, base: f.root, verdict: 'WEAKENED', findings: entry.findings,
+    questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z', fingerprint: fp };
+  for (const verdict of ['WEAKENED', 'NOT WEAKENED']) {
+    const prior = { ...audit, verdict, findings: verdict === 'WEAKENED' ? entry.findings : [] };
+    assert.equal(canonicalAuditEvidence([prior], f.to, () => true, fp, { sameContent, ruledWeakened: gate }).ok, false);
+  }
+  assert.equal(canonicalAuditEvidence([{ ...audit, head: f.to }], f.to, () => true, fp,
+    { sameContent, ruledWeakened: gate }).ok, true);
+  // The carried waiver's proof alone must also prevent fingerprint fallback.
+  assert.equal(canonicalAuditEvidence([{ ...audit, verdict: 'NOT WEAKENED', findings: [] }], f.to, () => true, fp,
+    { ruledWeakened: gate }).ok, false);
+  f.write('ready.jsonl', JSON.stringify(old));
+  f.write('platform.json', JSON.stringify({ prototypeLoad: { ruledWeakened: [entry] } }));
+  const env = { ...f.env, HOME: f.repo, WE_FIX_READY_PATH: join(f.repo, 'ready.jsonl'),
+    WE_PLATFORM_PREFERENCES_FILE: join(f.repo, 'platform.json'), WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
+  let calls = 0;
+  assert.equal(makeAuditedTipGate(env, { repo: f.repo, canonicalAudit() { calls++; return { ok: true }; } })(ref, f.to), false);
+  assert.equal(calls, 0);
+  f.write('ready.jsonl', JSON.stringify(live));
+  for (const ok of [false, true]) {
+    assert.equal(makeAuditedTipGate(env, { repo: f.repo, canonicalAudit() { return { ok }; } })(ref, f.to), ok);
+  }
+});
+
+for (const change of ['delete', 'net-removal', 'merge-net-removal']) test(`waiver refuses test ${change} with a fresh-audit fallback`, t => {
+  const f = fixture(t, 'test');
+  let from = f.to;
+  if (change === 'delete') f.git('rm', 'sample.test.mjs');
+  else if (change === 'net-removal') {
+    f.write('sample.test.mjs', 'assert one\nassert two\nassert three\n');
+    from = f.commit('assertions');
+    f.write('sample.test.mjs', 'assert one\n');
+  } else {
+    f.git('checkout', '-q', 'main');
+    f.write('main.txt', 'main change\n');
+    const main = f.commit('main advance');
+    f.git('update-ref', 'refs/remotes/origin/main', main);
+    f.git('checkout', '-q', 'lane');
+    f.git('merge', '--no-commit', 'main');
+    f.write('sample.test.mjs', '');
+  }
+  const to = f.commit(change);
+  const result = classify(f, { from, to, allowTestOnly: true });
+  assert.equal(result.carries, false);
+  assert.match(result.reason, /re-audit\/re-review the current head/);
+});
+
+test('finding multiset consumes distinct rulings and preserves source paths', t => {
+  const ruled = ['src/a.js:12 issue'];
+  const live = ['src/a.js:30 issue', 'src/a.js:40 issue'];
+  assert.equal(findingsSubset(live, ruled), false);
+  assert.equal(findingsSubset(live, [...ruled, 'src/a.js:20 issue']), true);
+  assert.equal(findingsSubset(['src/b.js:30 issue'], ruled), false);
+  const f = fixture(t, 'test');
+  const accepted = waiver(f, { findings: live, ruledFindings: [...ruled, 'src/a.js:20 issue'] });
+  assert.equal(accepted.result.ok, true);
+  assert.equal(waiver(f, { findings: live, ruledFindings: ruled }).gate, null);
+  assert.equal(canonicalAuditEvidence([accepted.audit], f.to, () => true, null, {
+    ruledWeakened: { ...accepted.gate, ruledWeakened: { ruling: 'R12', findings: ruled } },
+    sameContent: createSameContentProof(f),
+  }).ok, false);
+});
+
+import { createPrLandRunner } from '../../operations/open-pr-io.mjs';
+test('open-pr requires a fresh canonical audit after test edits; only its findings receive the carried waiver', t => {
+  const f = fixture(t, 'test'), ref = 'lane/example';
+  const path = join(f.repo, 'audits.jsonl'), fp = 'c'.repeat(64);
+  const entry = { ref, sha: f.from, ruling: 'R12', findings: ['code.js:12 issue'] };
+  const old = { head: f.from, base: f.root, questionHash: QUESTION_HASH, at: '2026-11-01T00:00:00Z',
+    verdict: 'WEAKENED', findings: entry.findings, fingerprint: fp };
+  let records = [old], published = 0;
+  const check = () => checkCanonicalAuditForOpen({ repo: f.repo, ref, sha: f.to,
+    env: { ...f.env, HOME: f.repo, WE_PLATFORM_PREFERENCES_FILE: join(f.repo, 'prefs.json') },
+    readFile(file) {
+      if (String(file).endsWith('/settings/prototype-load.json')) return JSON.stringify({ auditRecordPath: path, ruledWeakened: [entry] });
+      if (file === path) return records.map(r => JSON.stringify(r)).join('\n');
+      throw Object.assign(Error('missing fixture file'), { code: 'ENOENT' });
+    }, fetchMain() {}, liveFingerprint: () => fp, recordCarry() {}, warn() {},
+  });
+  const run = createPrLandRunner({ cwd: f.repo, env: f.env, canonicalAudit: check, prePrReview: () => ({ action: 'pass' }),
+    prepGate: () => ({ ok: true }), readPrepBody: () => '', spawn() { published++; return { status: 0, stdout: '{"pr":7}' }; } });
+  const open = () => run({ argv: [`--ref=${ref}`, `--sha=${f.to}`] });
+  assert.equal(open().outcome, 'refused');
+  assert.equal(published, 0);
+  records = [old, { ...old, head: f.to, findings: ['code.js:50 issue'], at: '2026-11-02T00:00:00Z' }];
+  assert.equal(open().outcome, 'opened');
+  records[1] = { ...records[1], findings: ['code.js:50 issue', 'code.js:60 issue'] };
+  assert.equal(open().outcome, 'refused');
+  records[1] = { ...records[1], findings: ['other.js:50 issue'] };
+  assert.equal(open().outcome, 'refused');
+  assert.equal(published, 1);
 });

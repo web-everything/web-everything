@@ -1,4 +1,4 @@
-import { findingsSubset } from '../lib/same-content-carry.mjs';
+import { findingsSubset, evidenceHistoryCarry, testOnlyHistory } from '../lib/same-content-carry.mjs';
 export { normalizeFinding } from '../lib/same-content-carry.mjs';
 /**
  * @file Declared prototype admission and pure evidence decisions.
@@ -80,8 +80,10 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
   // Shas compare case-insensitively (validSha accepts either case): an upper-case --sha must still find its own records.
   const live = lowerSha(input.sha);
   const list = (Array.isArray(records) ? records : []).map((r) => (r && typeof r === 'object' ? { ...r, sha: lowerSha(r.sha) } : r));
-  const moved = (from) => validSha(from) && lowerSha(from) !== live && sameContent(lowerSha(from), live)?.carries === true;
-  const carries = (r) => validSha(r.sha) && (carriesAcross(r.fingerprint, liveFp) || (r.audit === 'WEAKENED' && moved(r.sha)));
+  const proof = from => validSha(from) && lowerSha(from) !== live ? sameContent(lowerSha(from), live) : null;
+  const moved = from => proof(from)?.carries === true;
+  const carries = r => validSha(r.sha) && !testOnlyHistory(proof(r.sha))
+    && (carriesAcross(r.fingerprint, liveFp) || (r.audit === 'WEAKENED' && evidenceHistoryCarry(proof(r.sha))));
   // The allowlist entry binds to the record by its exact sha, or (carry) by holding the live fingerprint itself.
   const binds = (e, r) => (lowerSha(e.sha) === r.sha || r.sha === live) && moved(e.sha) || lowerSha(e.sha) === r.sha && r.sha === live || validSha(e.sha) && validSha(r.sha) && carriesAcross(e.fingerprint, liveFp) && carriesAcross(r.fingerprint, liveFp);
   const judge = (r) => {
@@ -91,6 +93,7 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
       && Array.isArray(r.auditDisclosed) && r.auditDisclosed.length > 0 && r.auditDisclosed.every((f) => typeof f === 'string' && f.trim())
       && Array.isArray(ruledWeakened) && ruledWeakened.find((e) => e && e.ref === r.ref && binds(e, r) && e.ruling === r.auditRuling
         && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim())
+        && (!testOnlyHistory(proof(e.sha)) || r.sha === live)
         && (moved(e.sha) ? findingsSubset(r.auditDisclosed, e.findings)
           : e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
     return match ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: moved(match.sha) ? match.findings : r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) }, ...(moved(match.sha) ? { sameContentCarry: { from: lowerSha(match.sha), to: live, ruling: match.ruling, matched: r.auditDisclosed, commits: sameContent(lowerSha(match.sha), live).commits } } : {}) } : null;
@@ -147,7 +150,11 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   //  - a carried head's latest WEAKENED blocks unless the live head has a NEWER verdict of its own (a fresh re-audit).
   // Shas compare case-insensitively (validSha accepts either case), so the live head always finds its own verdicts.
   sha = lowerSha(sha);
-  const moved = from => validSha(from) && from !== sha && auditOptions.sameContent?.(from, sha)?.carries === true;
+  const proof = from => validSha(from) && from !== sha ? auditOptions.sameContent?.(from, sha) : null;
+  const moved = from => evidenceHistoryCarry(proof(from));
+  const liveEvidenceOnly = testOnlyHistory(auditOptions.ruledWeakened?.sameContentCarry);
+  const evidenceCarries = record => !liveEvidenceOnly && !testOnlyHistory(proof(record.head))
+    && (carriesAcross(record.fingerprint, liveFp) || (record.verdict === 'WEAKENED' && moved(record.head)));
   // Copy a record only when lower-casing changes it, so the returned evidence keeps the caller's record identity.
   const original = new Map();
   const list = (Array.isArray(records) ? records : []).map((r) => {
@@ -161,7 +168,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const own = decisions(sha);
   // Only string heads carry (main #6353): a non-string head that stringifies to a sha never aliases a real one, and
   // findAudit refuses non-string head/base, so a non-string base never decides either.
-  const carriedHeads = new Set(list.filter((r) => typeof r?.head === 'string' && r.head !== sha && validSha(r.head) && (carriesAcross(r.fingerprint, liveFp) || (r.verdict === 'WEAKENED' && moved(r.head)))).map((r) => r.head));
+  const carriedHeads = new Set(list.filter((r) => typeof r?.head === 'string' && r.head !== sha && validSha(r.head) && evidenceCarries(r)).map((r) => r.head));
   const carried = [...carriedHeads].flatMap(decisions);
   // Only an own verdict that could itself pass (its base is in main) is a re-audit that supersedes a carried WEAKENED:
   // a newer audit of a narrow, uncovered base never hides it behind an older covered pass.
@@ -171,6 +178,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
   const ruled = (record) => {
     const gate = auditOptions.ruledWeakened;
     return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
+      // A test edit carries only the ruling; both readiness and audit must be live-sha evidence.
+      && (!liveEvidenceOnly || (record.head === sha && lowerSha(gate.record.sha) === sha))
       // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
       // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
       && (record.head === lowerSha(gate.record.sha) || (gate.sameContentCarry && (record.head === sha || moved(record.head)))
@@ -212,7 +221,7 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     if (carriedWeak.some((d) => !(Date.parse(text(d.record.at)) < ownAt))) return { ok: false, reason: 'weakened' };
   }
   // A pass counts only when covers(base) proves its base is in main; a carried pass must itself hold the fingerprint.
-  const passes = own.length ? own : carried.filter((d) => carriesAcross(d.record.fingerprint, liveFp) || (moved(d.record.head) && ruled(d.record)));
+  const passes = own.length ? own : carried.filter((d) => !testOnlyHistory(proof(d.record.head)) && (carriesAcross(d.record.fingerprint, liveFp) || (moved(d.record.head) && ruled(d.record))));
   let pass = null;
   for (const { base, record } of passes) {
     // A current-question record for this head+base (usable or not) blocks a PRIOR-question pass, even when carry

@@ -90,7 +90,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   let evidence;
   try {
     const fp = liveFingerprint(records);
-    evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
+    evidence = canonicalAuditEvidence(records, fullSha, covers, fp, { sameContent });
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
         if (entry.ref !== ref || !validSha(entry.sha) || (entry.sha.toLowerCase() !== fullSha && !sameContent(entry.sha.toLowerCase(), fullSha).carries)
