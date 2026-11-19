@@ -24,7 +24,7 @@ export async function probeRebuildRecovery({ timeout = false, legacy = false, co
     }
     const invoke = () => rebuildCloneAsJob({ root, env, store: corrupt ? { ...store, list: () => ({ records: [], corrupt: ['unreadable'] }) } : store,
       now: () => clock, recoverySettings, settings: { minIntervalMs: 0, minIntervalJitterPct: 0 },
-      adopt: async () => ({ reason: timeout ? (clock < 2_400_000 ? 'smoke-env-timeout-backoff' : 'needs-build') : 'still-rejected' }),
+      adopt: async () => ({ reason: timeout ? (clock < 2_400_000 ? 'smoke-env-timeout-backoff' : 'needs-build') : 'up-to-date' }),
       codeSha: 'b'.repeat(40), reattach: async () => {}, evict: () => {}, log: { error() {} } });
     const before = timeout ? await invoke() : null;
     if (timeout) clock += 600_000;

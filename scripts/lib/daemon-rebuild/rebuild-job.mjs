@@ -245,21 +245,22 @@ export async function rebuildCloneAsJob({
   // 3. Adopt-only: a ready candidate (or a skip-unrelated move) is adopted here, fast, under the existing rules.
   const r = launchOnly ? { reason: 'needs-build' } : await adopt();
   const recover = !launchOnly && !r?.moved && !r?.adopted
-    && ['needs-build', 'still-rejected', 'up-to-date'].includes(r?.reason)
+    // A still-rejected plan would hit the same sticky guard in the ready-only child.
+    && ['needs-build', 'up-to-date'].includes(r?.reason)
     && recoveryDue({ state: readState(root, env), pending: readPending(root, { env }), nowMs: now(), settings: recoverySettings });
   if (r?.reason !== 'needs-build' && !recover) {
     housekeeping();
     return { ...r, finishedJobs };
   }
 
-  // 4. A build is due. Space builds by `minIntervalMs` after one that did not record a ready candidate (a
+  // 4. A build is due. Space all recovery launches, and ordinary builds after one without a ready candidate (a
   //    transient hold writes no reject record; without this the job would re-smoke back to back).
   const last = mine().filter((x) => TERMINAL_JOB_STATUSES.includes(x.job.status))
     .sort((a, b) => Date.parse(b.job.finishedAt || 0) - Date.parse(a.job.finishedAt || 0))[0];
   const lastRes = last ? readResult(store.dir, last.id) : null;
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (!recover && last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
+  if (last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],

@@ -6,8 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
-import { readRebuildState, writeRebuildState } from '../daemon-rebuild/state.mjs';
-import { envTimeoutRetry, recoveryDue, timeoutRetryAt } from '../daemon-rebuild/recovery.mjs';
+import { readRebuildState, writeRebuildState, readReadyCandidate } from '../daemon-rebuild/state.mjs';
+import { envTimeoutRetry, recoveryDue, timeoutRetryAt, resolveRecovery } from '../daemon-rebuild/recovery.mjs';
+import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import { rebuildCloneAsJob, REBUILD_JOB_KIND, RESULT_SUFFIX } from '../daemon-rebuild/rebuild-job.mjs';
+import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
+import { markSucceeded } from '../daemon-jobs.mjs';
+import { OVERLAY_ADOPTION_TTL_MS, OVERLAY_ADOPTION_OVERDUE_MS } from '../overlay-adoption.mjs';
 import * as edgeFetch from '../daemon-rebuild/edge-fetch.mjs';
 import * as planner from '../daemon-rebuild/plan.mjs';
 import * as candidate from '../daemon-rebuild/candidate.mjs';
@@ -120,9 +125,91 @@ describe('environment-timeout recovery deadlines', () => {
     expect((await f.prepare(12000)).terminal).toBe(false);
   });
 
+  it('the real ready-only child path reaches smoke again after an env-timeout with unchanged inputs', async () => {
+    const f = fixture(null);
+    vi.spyOn(locks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(candidate, 'materializeCandidate').mockReturnValue({ ok: true, path: f.root });
+    vi.spyOn(candidate, 'removeCandidate').mockImplementation(() => {});
+    const runSmoke = vi.fn()
+      .mockResolvedValueOnce({ verdict: 'env-timeout', smoke: { results: [{ name: 'lane-pool-list', ok: false, ms: 120000 }] } })
+      .mockResolvedValueOnce({ verdict: 'pass', smoke: { results: [] } });
+    const child = nowMs => rebuildClone({ root: f.root, env: f.env, run: f.run, log: { error() {} },
+      now: () => nowMs, readyOnly: true, asJob: false, mainOnly: true, versions: null, runSmoke,
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: () => {}, match: () => false } });
+    expect((await child(1000)).reason).toBe('smoke-env-timeout');
+    expect(readRebuildState(f.root, f.env).rejected).toBeNull();
+    expect((await child(1999)).reason).toBe('smoke-env-timeout-backoff');
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(await child(2000)).toMatchObject({ reason: 'ready-recorded', readyRecorded: true, target: f.plan.finalSha });
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+    expect(readReadyCandidate(f.root, f.env).adopt.inputsKey).toBe(f.plan.inputsKey);
+  });
+
   it('legacy attempts start at one and successive retry delays cap at the configured maximum', () => {
     const first = envTimeoutRetry({ reason: 'smoke-env-timeout', since: at(100) }, 1000, settings);
     expect(first).toEqual({ attempts: 1, retryAt: at(2000) });
     expect(envTimeoutRetry({ reason: 'smoke-env-timeout', attempts: 30 }, 1000, settings)).toEqual({ attempts: 31, retryAt: at(5000) });
+  });
+});
+
+describe('overdue recovery launch bounds', () => {
+  function queueFixture() {
+    const root = mkdtempSync(join(tmpdir(), 'recovery-queue-'));
+    dirs.push(root);
+    const store = createJobStore(join(root, 'jobs'));
+    mkdirSync(store.dir);
+    let clock = 2_000_000;
+    const invoke = (reason = 'up-to-date', extra = {}) => rebuildCloneAsJob({ root, env: {}, store,
+      codeSha: 'a'.repeat(40), now: () => clock, recoverySettings: settings,
+      settings: { minIntervalMs: 60000, minIntervalJitterPct: 0 },
+      readState: () => ({}), readPending: () => [{ at: at(0) }],
+      adopt: async () => ({ reason, plan: { finalSha: 'a'.repeat(40), inputsKey: 'unchanged' } }),
+      reattach: async () => {}, evict: () => {}, log: { error() {} }, ...extra });
+    return { root, store, invoke, advance: ms => { clock += ms; } };
+  }
+
+  it.each([false, true])('spaces overdue recovery across completed jobs and store reloads (readyRecorded=%s)', async readyRecorded => {
+    const f = queueFixture();
+    expect((await f.invoke()).reason).toBe('rebuild-job-started');
+    const rec = f.store.list().records[0];
+    f.store.update(rec.id, r => markSucceeded(r, { at: at(2_000_000) }));
+    writeFileSync(join(f.store.dir, `${rec.id}${RESULT_SUFFIX}`), JSON.stringify({ readyRecorded }));
+    f.advance(59999);
+    expect(await f.invoke('up-to-date', { store: createJobStore(f.store.dir) })).toMatchObject({ reason: 'rebuild-job-spaced', retryInMs: 1 });
+    expect(f.store.list().records).toHaveLength(1);
+    f.advance(1);
+    expect((await f.invoke()).reason).toBe('rebuild-job-started');
+    expect(f.store.list().records).toHaveLength(2);
+  });
+
+  it('does not launch unchanged sticky-rejected inputs even after the interval expires', async () => {
+    const f = queueFixture();
+    const rec = enqueueJob({ store: f.store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40),
+      input: { root: f.root, target: 'a'.repeat(40) }, now: 1000 });
+    f.store.update(rec.id, r => markSucceeded(r, { at: at(1000) }));
+    writeFileSync(join(f.store.dir, `${rec.id}${RESULT_SUFFIX}`), JSON.stringify({ reason: 'still-rejected' }));
+    expect((await f.invoke('still-rejected')).reason).toBe('still-rejected');
+    expect((await f.invoke('still-rejected')).reason).toBe('still-rejected');
+    expect(f.store.list().records).toHaveLength(1);
+    expect((await f.invoke('needs-build', { adopt: async () => ({ reason: 'needs-build',
+      plan: { finalSha: 'b'.repeat(40), inputsKey: 'changed' } }) })).reason).toBe('rebuild-job-started');
+  });
+});
+
+describe('recovery setting retention bound', () => {
+  it.each([OVERLAY_ADOPTION_TTL_MS, OVERLAY_ADOPTION_TTL_MS + 1])('rejects overlayOverdueMs=%s and logs the default source', value => {
+    const log = vi.fn();
+    const resolved = resolveRecovery({ tool: { overlayOverdueMs: value }, log,
+      env: { WE_PLATFORM_PREFERENCES_FILE: join(tmpdir(), 'absent-recovery-preferences.json'), WE_POLICY_CASCADE_LOG: '1',
+        WE_DAEMON_RECOVERY_OVERLAY_OVERDUE_MS: String(value) } });
+    expect(resolved.overlayOverdueMs).toBe(OVERLAY_ADOPTION_OVERDUE_MS);
+    expect(log.mock.calls.flat().join('\n')).toContain(`overlayOverdueMs=${OVERLAY_ADOPTION_OVERDUE_MS} (standard)`);
+    expect(log.mock.calls.flat().join('\n')).toContain('ignored invalid:');
+    expect(recoveryDue({ state: {}, pending: [{ at: at(0) }], nowMs: resolved.overlayOverdueMs, settings: resolved })).toBe(true);
+  });
+
+  it('accepts the last millisecond before retention expiry', () => {
+    const resolved = resolveRecovery({ tool: { overlayOverdueMs: OVERLAY_ADOPTION_TTL_MS - 1 }, env: {} });
+    expect(resolved.overlayOverdueMs).toBe(OVERLAY_ADOPTION_TTL_MS - 1);
   });
 });

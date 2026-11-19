@@ -4823,9 +4823,13 @@ opts in an entry such as `health-watch.mjs`. `WE_DAEMON_REBUILD_EARLY_LAUNCH=0|1
 `WE_DAEMON_REBUILD_EARLY_DEBOUNCE_MS` overrides the trailing debounce. Missing or oversized event
 history defers to tick-start. The watcher only queues a job; ready candidates still adopt at tick boundaries.
 
-Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (node:test, also
-selectable by Vitest) and the `rebuild-held-recovery` soak break. Environment timeout
+Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
+and the `rebuild-held-recovery` soak break. Environment timeout
 backoff lives on `state.held`, leaving candidate rejection semantics intact. Legacy holds
 without a deadline derive one from `updatedAt`/`since`; invalid timestamps stay held for
 operator repair. Recovery settings use the shared policy cascade and the detached job
 queue retains its in-flight guard before considering any recovery trigger.
+Recovery uses the existing rebuild minimum interval (including jitter), even after a ready-recorded
+job; a `still-rejected` adopt-only result never launches recovery. The overdue threshold must be
+strictly below retention expiry. The unit fixture drives the real ready-only rebuild through a
+timeout and a later passing smoke on unchanged inputs; the soak fixture checks queueing only.

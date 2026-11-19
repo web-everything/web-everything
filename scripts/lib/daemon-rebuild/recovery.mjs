@@ -11,7 +11,8 @@ export function resolveRecovery({ env = process.env, log = console.error, tool }
   const envValues = Object.fromEntries(Object.keys(standard).map(k => [k, env[`WE_DAEMON_RECOVERY_${k.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`]])
     .filter(([, v]) => v !== undefined).map(([k, v]) => [k, Number(v)]));
   return cascadePolicy('recovery', tool, { env, log, standard, envValues,
-    valid: Object.fromEntries(Object.keys(standard).map(k => [k, v => Number.isSafeInteger(v) && v > 0 && v <= OVERLAY_ADOPTION_TTL_MS])) }).value;
+    valid: Object.fromEntries(Object.keys(standard).map(k => [k, v => Number.isSafeInteger(v) && v > 0
+      && (k === 'overlayOverdueMs' ? v < OVERLAY_ADOPTION_TTL_MS : v <= OVERLAY_ADOPTION_TTL_MS)])) }).value;
 }
 
 export function envTimeoutRetry(held, nowMs, settings) {
