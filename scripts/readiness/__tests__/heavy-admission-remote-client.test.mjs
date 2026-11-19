@@ -949,13 +949,14 @@ describe('remote client override', () => {
     const clientPath = join(f.root, `unsafe\n\x1b\x7f${'x'.repeat(4096)}`, 'remote-exec.mjs');
     f.policy.settings.remote.clientPath = clientPath;
     const formatted = formatAdmissionPolicy(f.policy);
-    const displayPath = clientPath.replace(/[^\x20-\x7e]/g, '?').slice(0, 1024);
+    const displayPath = clientPath.replace(/[^\x20-\x7e]/g, '?').slice(0, 960);
     expect(formatted).toContain(`remote.clientPath=${displayPath} (platform)`);
     expect(formatted).toMatch(/^[\x20-\x7e\u00b7]+$/);
     // Bound the displayed path independently of the policy's growing set of named settings.
     const pathless = formatAdmissionPolicy({ ...f.policy, settings: { ...f.policy.settings,
       remote: { ...f.policy.settings.remote, clientPath: '' } } });
     expect(pathless.length).toBeLessThan(1000);
+    expect(formatted.length).toBeLessThan(2000);
     expect(formatted).toBe(pathless.replace('remote.clientPath= (platform)', `remote.clientPath=${displayPath} (platform)`));
     const fs = { realpathSync: () => {
       if (kind === 'unreadable') throw new Error(`read\n\x1b failed: ${clientPath}`);
