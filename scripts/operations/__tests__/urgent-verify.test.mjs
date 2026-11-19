@@ -470,7 +470,10 @@ describe('urgent-verify blocker fixes', () => {
 });
 
 // Isolation: urgent-verify runs in its own detached worktree (real temp git repos, doubles only for the steps).
-import { mkdtempSync, writeFileSync, readdirSync, existsSync, realpathSync } from 'node:fs';
+import { afterAll } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, realpathSync, rmSync } from 'node:fs';
+const tempParents = []; // os.tmpdir() is the hermetic per-run root; still remove what we make (tmp-leak budget)
+afterAll(() => { for (const p of tempParents.splice(0)) rmSync(p, { recursive: true, force: true }); });
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join as pjoin } from 'node:path';
@@ -478,6 +481,7 @@ import { join as pjoin } from 'node:path';
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1' } }).trim();
 function tempRepo() {
   const parent = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-iso-'))), repo = pjoin(parent, 'repo');
+  tempParents.push(parent);
   execFileSync('mkdir', [repo]);
   git(repo, 'init', '-q'); git(repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git');
   writeFileSync(pjoin(repo, '.gitignore'), 'node_modules/\ncoverage/\ncoverage-shards/\n'); writeFileSync(pjoin(repo, 'a.txt'), 'a');
@@ -507,7 +511,21 @@ describe('urgent-verify isolated worktree', () => {
     await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
     await urgentVerify({ sha: t.head }, isoDeps(t, () => { throw new Error('boom'); }));
     expect(leftovers(t.parent)).toEqual([]);
-    expect(git(t.repo, 'worktree', 'list').split('\n')).toHaveLength(1);
+    expect(git(t.repo, 'status', '--porcelain')).toBe('');
+  });
+  it('the isolated checkout is a standalone repo, not a linked worktree of the caller', async () => {
+    const t = tempRepo(); let gitDir;
+    await urgentVerify({ sha: t.head }, isoDeps(t, dir => { gitDir = git(dir, 'rev-parse', '--absolute-git-dir'); }));
+    expect(gitDir).toMatch(/\.urgent-verify-[^/]+\/\.git$/);
+    expect(gitDir.startsWith(pjoin(t.repo, '.git'))).toBe(false);
+  });
+  it('refuses, with a clear error, when a system tool is missing instead of falling back to checkout bins', async () => {
+    const t = tempRepo(); mkdirSync(pjoin(t.repo, 'node_modules/.bin'), { recursive: true });
+    for (const tool of ['git', 'node', 'npm', 'sh']) writeFileSync(pjoin(t.repo, 'node_modules/.bin', tool), '#!/bin/sh\n', { mode: 0o755 });
+    const deps = createUrgentDeps({ isolated: true, cwd: t.repo, home: pjoin(t.parent, 'home'), env: { PATH: pjoin(t.parent, 'empty') } });
+    const r = await urgentVerify({ sha: t.head }, deps);
+    expect(r).toMatchObject({ ok: false, detail: expect.stringMatching(/required system tool "git" not found.*refusing/) });
+    expect(leftovers(t.parent)).toEqual([]);
   });
   it('a dirty caller checkout before the run does not matter either', async () => {
     const t = tempRepo(); writeFileSync(pjoin(t.repo, 'dirt.md'), 'x'); writeFileSync(pjoin(t.repo, 'a.txt'), 'changed');
@@ -520,7 +538,7 @@ describe('urgent-verify isolated worktree', () => {
   });
   it('prunes a dead run leftover on start', async () => {
     const t = tempRepo(), dead = pjoin(t.parent, `.urgent-verify-${t.head.slice(0, 12)}-2147483646`);
-    git(t.repo, 'worktree', 'add', '--detach', dead, t.head);
+    mkdirSync(dead); writeFileSync(pjoin(dead, 'stale'), 'x');
     await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
     expect(existsSync(dead)).toBe(false);
   });

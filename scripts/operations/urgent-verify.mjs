@@ -38,21 +38,34 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   };
   let gates;
   const heavy = (args, dir = cwd) => run(process.execPath, [dir === cwd ? 'scripts/readiness/heavy-admission.mjs' : join(cwd, 'scripts/readiness/heavy-admission.mjs'), 'run', '--wait-ms=60000', '--', ...args], dir);
-  // Every step runs in a private detached worktree pinned to the sha, so other writers in the caller's
-  // checkout cannot change the verdict. Sibling of the caller so ../frontierui still resolves.
+  // Every step runs in a private checkout pinned to the sha, so other writers in the caller's checkout
+  // cannot change the verdict. It is a standalone repo (own .git dir, objects borrowed read-only via
+  // alternates), NOT a linked worktree: a linked worktree's gitdir lives inside the caller's .git, which
+  // repo tests (and the hermetic guard) treat as live lane access. Sibling of the caller so ../frontierui resolves.
   const isolate = isolated ? sha => {
+    // No fallback to checkout bins: the admission wrapper's PATH ends with them, so a missing system tool
+    // would silently resolve to a checkout-supplied replacement. Refuse up front instead.
+    for (const tool of ['git', 'node', 'npm', 'sh']) {
+      if (!systemPath.split(delimiter).some(d => d && fs.existsSync(join(d, tool))))
+        throw new Error(`required system tool "${tool}" not found on the system PATH; refusing to fall back to checkout node_modules/.bin`);
+    }
     const parent = dirname(cwd);
     for (const name of fs.readdirSync(parent)) { // prune leftovers of dead runs
       const m = name.startsWith(worktreePrefix) && name.match(/-(\d+)$/);
-      if (m && !pidAlive(Number(m[1]))) { try { run('git', ['worktree', 'remove', '--force', join(parent, name)]); } catch { /* pruned below */ } }
+      if (m && !pidAlive(Number(m[1]))) fs.rmSync(join(parent, name), { recursive: true, force: true });
     }
-    try { run('git', ['worktree', 'prune']); } catch { /* best effort */ }
     const dir = join(parent, `${worktreePrefix}${sha.slice(0, 12)}-${process.pid}`);
-    run('git', ['worktree', 'add', '--detach', dir, sha]);
-    const cleanup = () => { try { run('git', ['worktree', 'remove', '--force', dir]); } catch (e) { console.error(`urgent-verify: worktree cleanup failed: ${e.message}`); } };
+    const cleanup = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { console.error(`urgent-verify: checkout cleanup failed: ${e.message}`); } };
     try {
+      const origin = run('git', ['remote', 'get-url', 'origin']).trim();
+      const objects = join(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim(), 'objects');
+      cleanup();
+      run('git', ['init', '-q', dir]);
+      run('git', ['remote', 'add', 'origin', origin], dir);
+      fs.writeFileSync(join(dir, '.git/objects/info/alternates'), `${objects}\n`);
+      run('git', ['checkout', '-q', '--detach', sha], dir);
       const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env, isolated: false });
-      if (scoped.head() !== sha) throw new Error('worktree not at requested sha');
+      if (scoped.head() !== sha) throw new Error('isolated checkout not at requested sha');
       return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
     } catch (e) { cleanup(); throw e; }
   } : undefined;
