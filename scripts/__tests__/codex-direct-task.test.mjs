@@ -1123,7 +1123,8 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('spawns codex with the exact argv buildCodexDirectTaskArgv would produce, writes the task to stdin, and logs raw stdout to the log file', async () => {
+  it('spawns codex with the exact built argv and launcher-owned PATH, writes the task to stdin, and logs raw stdout to the log file', async () => {
+    vi.stubEnv('PATH', '/ambient-attacker:/usr/bin:/bin');
     const dir = mkdtempSync(join(tmpdir(), 'we-codex-direct-test-'));
     const logFile = join(dir, 'events.jsonl');
     const stdout = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.completed","usage":{}}\n';
@@ -1133,7 +1134,15 @@ describe('runCodexDirectExec / codexDirectTask — the orchestrator, over an inj
       const r = await runCodexDirectExec({ dir, task: 'do the thing', outputSchemaFile, logFile, stream: false, spawnFn: fn });
       expect(seen.cli).toBe(FAKE_CODEX_BINARY);
       expect(seen.opts.shell).toBe(false);
-      expect(seen.argv).toEqual(buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile, outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') }));
+      const expectedArgv = buildCodexDirectTaskArgv({ cwd: dir, outputSchemaFile,
+        outputLastMessageFile: join(dir, '.git', 'codex-direct-task-last-message.txt') });
+      const expectedPath = buildAgentPath({ parentPaths: [process.env.PATH], home: userInfo().homedir,
+        pathPrefix: CODEX_SHIM_DIR, nodePath: process.execPath, binary: FAKE_CODEX_BINARY });
+      const pathIndex = expectedArgv.findIndex(arg => arg.startsWith('shell_environment_policy.set.PATH='));
+      expect(pathIndex).toBeGreaterThan(0);
+      expectedArgv[pathIndex] = `shell_environment_policy.set.PATH=${JSON.stringify(expectedPath)}`;
+      expect(seen.argv).toEqual(expectedArgv);
+      expect(seen.opts.env.PATH).toBe(expectedPath);
       expect(seen.stdin).toContain('do the thing');
       expect(seen.stdin).toMatch(/do not run `git commit`/);
       expect(r.stdout).toBe(stdout);

@@ -4864,3 +4864,19 @@ Test shell/spawn equality, ambient shim retention, arbitrary directory removal, 
 mutation without executing Codex.
 The launcher and registry regressions run with agent-launch-structure.test.mjs and
 codex-direct-task.test.mjs through host heavy-admission, never a bare test runner.
+
+### Hermetic launcher environment fixtures (SEC1 S1 round-5 repair)
+
+Vitest 1.x `vi.stubEnv(name, undefined)` sets the literal string `"undefined"`;
+it does not delete the variable. That string enables presence-based daemon/test
+markers and is an invalid absolute lock root. Use the shared
+`scripts/__tests__/fixtures/agent-launch-env.mjs` helper: register restoration with
+`vi.stubEnv` before deleting the key, then restore with `vi.unstubAllEnvs()`.
+Launcher projection suites clear every registry restriction before each case and
+set any ambient identity, limit or root that the case needs. Keep production
+ambient precedence, path validation and tighter-limit selection intact.
+
+Pure Codex argv construction precedes binary resolution. Orchestrator argv
+expectations must account explicitly for the launcher's final PATH, including the
+resolved agent directory, and assert that shell PATH equals spawn PATH. Stub the
+ambient PATH in those fixtures so host shim installation does not choose the result.

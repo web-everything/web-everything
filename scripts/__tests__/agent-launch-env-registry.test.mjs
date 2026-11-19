@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { buildAgentInvocation } from '../lib/agent-launch.mjs';
+import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const registry = JSON.parse(readFileSync(join(root, 'scripts/lib/agent-launch-env-registry.json'), 'utf8'));
@@ -57,6 +58,7 @@ function validRule(rule) {
   }
   return true;
 }
+beforeEach(() => clearRestrictiveEnv(registry));
 afterEach(() => vi.unstubAllEnvs());
 
 describe('agent environment registry drift', () => {
@@ -137,7 +139,7 @@ const childEnv = inheritEnv => buildAgentInvocation({ agent: 'claude', cwd: root
   { resolveBinary: () => process.execPath }).options.env;
 describe('exhaustive restrictive registry projection', () => {
   it.each(restrictions)('%s cannot be relaxed by the bag', (name, rule) => {
-    vi.stubEnv(name, undefined);
+    clearEnv(name);
     const parent = rule.value ? '/parent/shared' : rule.restrictiveValues?.[0]
       ?? (rule.restrictivePrefixes ? rule.restrictivePrefixes[0] + 'parent' : rule.tighterThan
         ? String(rule.tighterThan.minimum ?? (rule.tighterThan.default > 1 ? 1 : rule.tighterThan.default)) : 'parent-identity');
@@ -167,7 +169,7 @@ describe('exhaustive restrictive registry projection', () => {
         expect(childEnv({ [name]: other })[name]).toBe(parent);
       }
     }
-    vi.stubEnv(name, undefined);
+    clearEnv(name);
     // Presence-only identities accept arbitrary nonblank values; predicates reject unknown values.
     for (const value of (numeric || rule.restrictiveValues || rule.restrictivePrefixes ? relaxing : relaxing.slice(0, 2))) {
       expect(childEnv({ [name]: value }), value).not.toHaveProperty(name);
@@ -183,7 +185,7 @@ describe('exhaustive restrictive registry projection', () => {
     ['WE_HEAVY_ADMISSION_CONTAINER_MEMORY', '1024k', '1048576'],
     ['WE_HEAVY_ADMISSION_CONTAINER_MEMORY', '1g', '1073741824'],
   ])('keeps the tighter quantity for %s=%s', (name, value, expected) => {
-    vi.stubEnv(name, undefined);
+    clearEnv(name);
     expect(childEnv({ [name]: value })[name]).toBe(expected);
     vi.stubEnv(name, value);
     expect(childEnv({ [name]: 'unlimited' })[name]).toBe(expected);

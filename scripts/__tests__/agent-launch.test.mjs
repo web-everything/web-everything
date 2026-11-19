@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { userInfo, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -8,6 +8,7 @@ import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary, bui
 import { defaultShimDir, checkoutShimDir, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
+import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 
 const SID = '12345678-1234-4234-8234-123456789abc';
 const cwd = process.cwd();
@@ -23,6 +24,10 @@ function refused(descriptor, reason) {
   expect(io.spawn).not.toHaveBeenCalled();
   expect(io.resolveBinary).not.toHaveBeenCalled();
 }
+beforeEach(() => {
+  clearRestrictiveEnv(registry);
+  vi.stubEnv('PATH', fixedPath());
+});
 afterEach(() => vi.unstubAllEnvs());
 
 describe('closed grammar rejection: the PR #7022 attack classes', () => {
@@ -262,7 +267,7 @@ describe('three-class environment boundary', () => {
   it('every value-gated restriction survives a blank or relaxing bag, and relaxing values stay dropped', () => {
     for (const [name, rule] of Object.entries(registry).filter(([, r]) => r.restrictiveValues)) {
       for (const value of rule.restrictiveValues) {
-        vi.stubEnv(name, undefined);
+        clearEnv(name);
         expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env[name], name).toBe(value);
         vi.stubEnv(name, value);
         for (const relaxed of ['', ' \t ', 'sec1-unknown-relaxation']) {
@@ -271,7 +276,7 @@ describe('three-class environment boundary', () => {
       }
       vi.stubEnv(name, 'sec1-unknown-relaxation');
       expect(buildAgentInvocation({ ...base(), inheritEnv: { [name]: 'sec1-unknown-relaxation' } }, seam()).options.env, name).not.toHaveProperty(name);
-      vi.stubEnv(name, undefined);
+      clearEnv(name);
     }
   });
   it('retains every restrictive ambient variable even when the caller bag omits them', () => {
@@ -311,7 +316,7 @@ describe('three-class environment boundary', () => {
       if (!bad.includes('\0')) {
         vi.stubEnv('LANE_POOL_ROOT', bad);
         refused({ ...base(), inheritEnv: { LANE_POOL_ROOT: '/safe' } }, /LANE_POOL_ROOT/);
-        vi.stubEnv('LANE_POOL_ROOT', undefined);
+        clearEnv('LANE_POOL_ROOT');
       }
     }
   });
@@ -341,7 +346,7 @@ describe('three-class environment boundary', () => {
     const env = { LANE_POOL_ROOT: '/caller/pool', VITEST: 'caller-vitest', WE_UNDER_TEST: 'caller-test', WE_GH_DAEMON_CALLER: 'caller-daemon' };
     const d = buildCodexDirectTaskDescriptor({ cwd, env, model: 'gpt-5.6-sol', effort: 'high' });
     expect(d.inheritEnv).toBe(env);
-    for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) vi.stubEnv(name, undefined);
+    for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) clearEnv(name);
     expect(buildAgentInvocation(d, seam()).options.env).toMatchObject(env);
   });
 });
@@ -428,7 +433,7 @@ describe('value-gated auth vars forward only their tightening values', () => {
 describe('value-gated restrictions reach exact-string consumers', () => {
   it('canonicalizes enabling values and keeps ambient policy when the bag supplies another tightening mode', () => {
     const names = ['WE_HEAVY_ADMISSION_CONTAINER', 'WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES'];
-    for (const name of names) vi.stubEnv(name, undefined);
+    for (const name of names) clearEnv(name);
     const envOf = inheritEnv => buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
     expect(envOf(Object.fromEntries(names.map(n => [n, ' 1 '])))).toMatchObject(Object.fromEntries(names.map(n => [n, '1'])));
     for (const name of names) vi.stubEnv(name, '1');
@@ -451,14 +456,17 @@ describe('value-gated restrictions reach exact-string consumers', () => {
 describe('registry identity predicates match the gh shim daemon reader', () => {
   it.each(['', ' ', '\t\n', 'com.we.', 'com.we.worker', 'com.plateau.worker', 'com.apple.worker',
     'com.we', 'COM.WE.worker', ' com.we.worker', 'interactive', 'false', '0'])('projects %j without changing daemon detection', value => {
-    for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) vi.stubEnv(name, undefined);
+    for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) {
+      clearEnv(name);
+      expect(process.env).not.toHaveProperty(name);
+    }
     for (const name of ['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME']) {
       const projected = buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env;
       // Empty-is-absent is the boundary contract, even for a truthy whitespace presence marker.
       expect(isDaemonCaller(projected)).toBe(isDaemonCaller({ [name]: value.trim() ? value : '' }));
       vi.stubEnv(name, name === 'XPC_SERVICE_NAME' ? 'com.we.parent' : 'parent');
       expect(isDaemonCaller(buildAgentInvocation({ ...base(), inheritEnv: { [name]: value } }, seam()).options.env)).toBe(true);
-      vi.stubEnv(name, undefined);
+      clearEnv(name);
     }
   });
 });
