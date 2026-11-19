@@ -60,8 +60,20 @@ const EMPTY_STATE = Object.freeze({
  *   unverified:{head:string, prevHead:string}|null, building:object|null, smokePassed:Array<{key:string, tree:string, passedAt:string}>|null}}
  */
 export function readRebuildState(root, env = process.env) {
+  return readState(root, env, false);
+}
+
+/** Launch admission: only ENOENT means empty; unreadable/corrupt evidence throws for refusal. */
+export function readRebuildStateStrict(root, env = process.env, read = readFileSync) {
+  return readState(root, env, true, read);
+}
+
+function readState(root, env, strict, read = readFileSync) {
   try {
-    const parsed = JSON.parse(readFileSync(rebuildStatePath(root, env), 'utf8'));
+    const parsed = JSON.parse(read(rebuildStatePath(root, env), 'utf8'));
+    if (strict && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) {
+      throw new Error('Invalid rebuild state object');
+    }
     return {
       adopted: parsed?.adopted ?? null,
       rejected: parsed?.rejected ?? null,
@@ -75,7 +87,8 @@ export function readRebuildState(root, env = process.env) {
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
     };
-  } catch {
+  } catch (error) {
+    if (strict && error?.code !== 'ENOENT') throw error;
     return { ...EMPTY_STATE };
   }
 }

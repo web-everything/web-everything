@@ -4953,6 +4953,9 @@ history defers to tick-start. The declared self-sync rebuild path must resolve t
 `launchOnly` must run the shared adopt-only preparation with `readyOnly: true` before queuing, so sticky
 rejections and smoke retry/backoff refusals still apply. `daemon-rebuild/__tests__/rebuild-job.test.mjs`
 checks persisted refusal state through real preparation with controlled Git IO, including clean admission.
+Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is empty state.
+The job fixture injects EACCES/EIO and corrupt JSON, asserting refusal without a queued job;
+the legacy fail-open reader remains unchanged for other consumers. Repair unreadable state before retrying.
 
 Timed rebuild recovery is covered by `daemon-rebuild-recovery.test.mjs` (Vitest)
 and the `rebuild-held-recovery` soak break. Environment timeout

@@ -1,11 +1,11 @@
 /** Rebuild herd spacing: stable identity, bounded additive jitter, and historical settings. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadRebuildAsJobSettings, rebuildJobInterval, rebuildCloneAsJob, REBUILD_JOB_KIND } from '../rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../../daemon-jobs-runtime.mjs';
-import { writeReadyCandidate, readReadyCandidate, writeRebuildState } from '../state.mjs';
+import { writeReadyCandidate, readReadyCandidate, writeRebuildState, readRebuildState, readRebuildStateStrict, rebuildStatePath } from '../state.mjs';
 import { markSucceeded } from '../../daemon-jobs.mjs';
 import { rebuildClone } from '../rebuild.mjs';
 import * as planner from '../plan.mjs';
@@ -105,6 +105,41 @@ it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job 
   expect(store.list().records).toHaveLength(1);
   expect(reattach).toHaveBeenCalledTimes(1); // a non-adopting ready record must not suppress job recovery
   expect(adopt).toHaveBeenCalledTimes(1);
+});
+
+it.each([true, false])('launchOnly=%s refuses unreadable state and permits only clean absence for early/recovery jobs', async launchOnly => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  const file = rebuildStatePath(root, env);
+  for (const failure of ['EACCES', 'EIO', 'corrupt', 'null', 'array', 'ENOENT']) {
+    writeRebuildState(root, { held: { reason: 'smoke-env-timeout', retryAt: new Date(9_000_000).toISOString() },
+      rejected: { inputsKey: 'unchanged' } }, env);
+    if (failure === 'corrupt') writeFileSync(file, '{broken');
+    if (failure === 'null') writeFileSync(file, 'null');
+    if (failure === 'array') writeFileSync(file, '[]');
+    if (failure === 'ENOENT') rmSync(file);
+    const read = (path, ...args) => {
+      if (path === file && ['EACCES', 'EIO'].includes(failure)) throw Object.assign(new Error(failure), { code: failure });
+      return readFileSync(path, ...args);
+    };
+    const readState = (root, env) => readRebuildStateStrict(root, env, read);
+    const store = createJobStore(join(root, `jobs-${failure}`));
+    const adopt = vi.fn(async () => ({ reason: launchOnly ? 'needs-build' : 'up-to-date' }));
+    const reattach = vi.fn(async () => ({}));
+    const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, launchOnly, readState,
+      readPending: () => [{ at: new Date(0).toISOString() }], now: () => 2_000_000,
+      recoverySettings: { envTimeoutBaseMs: 1000, envTimeoutMaxMs: 4000, overlayOverdueMs: 900000 },
+      codeSha: 'a'.repeat(40), settings: { minIntervalMs: 0, minIntervalJitterPct: 0 },
+      log: { error() {} }, evict: () => ({}) });
+    const absent = failure === 'ENOENT';
+    expect(result.reason, failure).toBe(absent ? 'rebuild-job-started' : 'state-unreadable');
+    expect(store.list().records, failure).toHaveLength(absent ? 1 : 0);
+    expect(reattach, failure).toHaveBeenCalledTimes(absent ? 1 : 0);
+    expect(adopt, failure).toHaveBeenCalledTimes(launchOnly && !absent ? 0 : 1);
+    // Legacy consumers still receive empty state on every read/parse failure.
+    if (!['EACCES', 'EIO'].includes(failure)) expect(readRebuildState(root, env)).toMatchObject({ held: null, rejected: null });
+    if (absent) expect(readRebuildStateStrict(root, env)).toEqual(readRebuildState(root, env));
+    else expect(() => readState(root, env)).toThrow();
+  }
 });
 
 it.each([

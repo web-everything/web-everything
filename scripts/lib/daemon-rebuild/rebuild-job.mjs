@@ -42,7 +42,7 @@ import { cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { readPendingAdoptions } from '../overlay-adoption.mjs';
 import { recoveryDue, resolveRecovery } from './recovery.mjs';
-import { readRebuildState, readReadyCandidate, alertsFilePath } from './state.mjs';
+import { readRebuildStateStrict, readReadyCandidate, alertsFilePath } from './state.mjs';
 import { processStartMs } from './lease.mjs';
 import { readGit } from '../proc-read.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
@@ -180,10 +180,15 @@ export async function rebuildCloneAsJob({
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
   launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
-  readState = readRebuildState, readPending = readPendingAdoptions,
+  readState = readRebuildStateStrict, readPending = readPendingAdoptions,
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
+  // Refuse before preparation or reattach can erase evidence or launch an existing job.
+  if (launchOnly) {
+    try { readState(root, env); }
+    catch { return { moved: false, reason: 'state-unreadable' }; }
+  }
   mkdirSync(store.dir, { recursive: true });
   if (store.list().corrupt?.length) return { moved: false, reason: 'rebuild-job-running', unknownJobState: true };
   const kind = REBUILD_JOB_KIND.kind;
@@ -251,10 +256,15 @@ export async function rebuildCloneAsJob({
   }
   // Between ticks, use the same admission checks without adopting or repairing the live tree.
   r ??= await adopt(launchOnly ? { readyOnly: true } : undefined);
-  const recover = !launchOnly && !r?.moved && !r?.adopted
+  let recover = false;
+  if (!launchOnly && !r?.moved && !r?.adopted
     // Sticky rejections must still wait for changed inputs or operator intervention.
-    && ['needs-build', 'up-to-date'].includes(r?.reason)
-    && recoveryDue({ state: readState(root, env), pending: readPending(root, { env }), nowMs: now(), settings: recoverySettings });
+    && ['needs-build', 'up-to-date'].includes(r?.reason)) {
+    let state;
+    try { state = readState(root, env); }
+    catch { return { moved: false, reason: 'state-unreadable', finishedJobs }; }
+    recover = recoveryDue({ state, pending: readPending(root, { env }), nowMs: now(), settings: recoverySettings });
+  }
   if (r?.moved || r?.adopted) {
     housekeeping();
     return { ...r, finishedJobs };
