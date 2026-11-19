@@ -3,7 +3,7 @@
  * Claude re-checks its claims; a confirmed break is a miss for the accepting seat and the builder. No real codex,
  * agy, claude, git or GitHub process: every effect is a fake.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,6 +26,7 @@ import { REVIEW_SEAT_DISPATCH_KIND } from '../../lib/provider-routing.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { resolveOperationRoute } from '../../lib/dispatch-routing-policy-io.mjs';
+import { DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePolicyRoute } from '../../lib/dispatch-routing-policy.mjs';
 
 vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => ({
   ...await importOriginal(),
@@ -61,8 +62,7 @@ function fakeIo(over = {}) {
   const trials = [];
   const ledgerBox = {};
   const io = {
-    // Historical cases pin the old route; R1077 cases below explicitly exercise the new default.
-    readSeatSettings: () => ({ tool: { redTeam: { routeByBuilder: false } }, platform: {} }),
+    readSeatSettings: () => ({ tool: {}, platform: {} }),
     now: () => NOW,
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: (l) => calls.push(['log', l]),
@@ -82,7 +82,7 @@ function fakeIo(over = {}) {
     makeScratch: (o) => { calls.push(['scratch', o]); return '/tmp/x00g3tt-scratch'; },
     removeScratch: (d) => calls.push(['rm', d]),
     writeFile: (p, t) => calls.push(['write', p, t]),
-    readHeadMessage: () => 'fix: guard\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n',
+    readHeadMessage: (_dir, rev) => rev ? '' : 'fix: guard\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n',
     runSeat: async (o) => { calls.push(['seat', o]); return { report: report(o.provider, answer([BREAK])) }; },
     runRecheck: async (o) => { calls.push(['recheck', o]); return { checks: [{ index: 0, confirmed: true, reason: 'the diff divides by n with no zero check' }] }; },
     logTrial: (row) => { trials.push(row); return row; },
@@ -995,11 +995,12 @@ describe('security classification policy transitions', () => {
 
 
 describe('R1077 builder company routing', () => {
+  beforeEach(() => resolveOperationRoute.mockImplementation(resolvePolicyRoute));
   const input = body => ({ pr: 5, repo: REPO, lanePath: '/lane', read: payload('accept', body).findings.read, env: {} });
-  const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6-astra' : 'claude-sonnet-5-5', taskType: 'bugfix' });
-  const policyIo = over => fakeIo({ readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
+  const marker = provider => buildDelegationMarker({ provider, model: provider === 'codex' ? 'gpt-6.1-sol' : 'claude-sonnet-5-5', taskType: 'bugfix' });
+  const policyIo = over => fakeIo({ readRoutingPolicy: () => structuredClone(DEFAULT_ROUTING_POLICY), readSeatSettings: () => ({ tool: {}, platform: {} }), ...over });
 
-  it.each([['codex', 'codex', 'sol'], ['claude', 'codex', 'sol'], ['agy-claude', 'codex', 'sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
+  it.each([['codex', 'codex', 'gpt-6.1-sol'], ['claude', 'codex', 'gpt-6.1-sol'], ['agy-claude', 'codex', 'gpt-6.1-sol']])('routes %s builders to %s/%s', async (builder, provider, model) => {
     const { io, calls } = policyIo();
     expect((await speculateRedTeam(input(marker(builder)), io)).status).toBe('speculated');
     expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider, model });
@@ -1015,7 +1016,7 @@ describe('R1077 builder company routing', () => {
     const { io, calls } = policyIo({ readHeadMessage: vi.fn(() => 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>') });
     await speculateRedTeam(input('no marker'), io);
     expect(io.readHeadMessage).toHaveBeenCalledWith('/lane', REV);
-    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'sol' });
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
   });
 
   it.each(['codex', 'claude'])('falls back and logs when the cross-company provider for %s is capped', async builder => {
@@ -1044,12 +1045,16 @@ describe('R1077 builder company routing', () => {
       readSeatSettings: () => ({ tool: { seatDailyCaps: { 'agy-gemini': 0 } }, platform: {} }),
     } : {});
     if (source === 'routing') {
-      io.readRoutingPolicy = () => ({ operations: { 'review-seat:red-team': { disabledProviders: ['agy-gemini'] } } });
+      io.readRoutingPolicy = () => {
+        const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+        policy.operations['review-seat:red-team'].disabledProviders = ['agy-gemini'];
+        return policy;
+      };
     }
     const args = input(marker('codex'));
     if (source === 'environment') args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '0';
     expect((await speculateRedTeam(args, io)).status).toBe('speculated');
-    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'sol' });
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
     expect(calls.some(c => c[0] === 'log' && /same-vendor codex fallback accepted/.test(c[1]))).toBe(true);
   });
 
@@ -1096,7 +1101,12 @@ describe('R1077 builder company routing', () => {
     const { io, calls } = policyIo({ readHeadMessage: () => '',
       readSeatSettings: () => ({ tool: { redTeam: { routeByBuilder: enabled } }, platform: {} }),
     });
-    resolveOperationRoute.mockImplementationOnce(() => { throw new Error('routing policy: review-seat: no available route'); });
+    io.readRoutingPolicy = () => {
+      const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+      policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'astra', effort: 'high',
+        fallback: [{ provider: 'agy-gemini', model: 'flash', effort: 'medium' }] };
+      return policy;
+    };
     const args = input('no marker');
     args.env.WE_REVIEW_SEAT_CAP_CODEX = '0';
     args.env.WE_REVIEW_SEAT_CAP_AGY_GEMINI = '20';

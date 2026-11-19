@@ -1862,7 +1862,8 @@ export async function speculateRedTeam({
     const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
     const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
       : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
-    const builderProviders = preferred ? [preferred, preferred === 'codex' ? 'agy-gemini' : 'codex'] : null;
+    const operatorKeys = (io.readRoutingPolicy ?? readRoutingPolicy).operatorKeys?.() ?? [];
+    const operatorRoute = ['review-seat:red-team', 'review-seat', '*'].some(key => operatorKeys.includes(key));
     const providers = rosterForKey('review-seat:red-team');
     const capped = new Set();
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry, readSeatSettings)]));
@@ -1894,30 +1895,31 @@ export async function speculateRedTeam({
       const candidates = available.filter(p => p !== 'agy-claude' || emergency);
       if (!candidates.length) break;
       let routeError = null;
-      try { configuredRoute = builderProviders ? null : resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available: candidates, policy: routingPolicy }); }
-      catch (error) { configuredRoute = null; routeError = error; }
       try {
-        if (!builderProviders) configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available: candidates,
-          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy });
-        // A valid overlay can supply a route even when the default chain is exhausted.
-        // Exhausted caps may fall back outside that chain to keep the owed seat running.
-        if (routeError && !configuredRoute) {
-          if (!['codex', 'agy-gemini'].some(p => capped.has(p))
-            || !routeError.message.endsWith(': no available route')) throw routeError;
-          const chosen = candidates[0];
-          configuredRoute = { provider: chosen, ...RED_TEAM_MODELS[chosen] };
-          io.log(`red team: routing unavailable (${routeError.message}); fallback to ${chosen}`);
+        configuredRoute = resolveOperationRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key, available: candidates, policy: routingPolicy });
+      } catch (error) { configuredRoute = null; routeError = error; }
+      try {
+        if (preferred && !operatorRoute && !routeError) {
+          // Prefer a builder-independent vendor only within the resolved chain (or inherited roster).
+          const chain = configuredRoute;
+          const routes = chain ? [chain, ...(chain.fallback ?? [])] : [];
+          const chosen = candidates.includes(preferred) && (!chain || routes.some(route => route.provider === preferred))
+            ? preferred : chain?.provider ?? candidates[0];
+          if (chosen) {
+            const defaults = routes.find(route => route.provider === chosen);
+            configuredRoute = validateAiSeatRoute({ operation: 'review-seat', taskType: RED_TEAM_SEAT.key,
+              available: candidates, policy: routingPolicy, operatorKeys,
+              aiRouting: { provider: chosen, model: defaults?.model ?? RED_TEAM_MODELS[chosen].model,
+                effort: defaults?.effort ?? resolveOperationEffort('review-seat', chosen, RED_TEAM_SEAT.key, routingPolicy) } });
+          }
         }
+        configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available: candidates,
+          operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy, operatorKeys });
+        if (routeError && !configuredRoute) throw routeError;
       } catch (error) { lastReason = error.message; break; }
-      if (builderProviders) {
-        const chosen = [...builderProviders, 'agy-claude'].find(p => candidates.includes(p));
-        if (!chosen) break;
-        configuredRoute = { provider: chosen, model: chosen === 'codex' ? 'sol' : RED_TEAM_MODELS[chosen].model, effort: 'high' };
-        if (chosen !== preferred) io.log(`red team: builder route ${preferred} unavailable (${unavailable.join('; ') || lastReason}); fallback to ${chosen}`);
-      }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
-      if (!builderProviders && deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
+      if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
       if (pick.provider === 'agy-claude') io.log('red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
       if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');
       let reservation;
@@ -1937,8 +1939,11 @@ export async function speculateRedTeam({
         available = available.filter((x) => x !== pick.provider);
       }
     }
-    if (!callId) return { status: 'skipped', ...(deferredByCap ? { deferredByCap: true } : {}),
-      reason: `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}` };
+    if (!callId) {
+      const reason = `${lastReason ?? 'no provider available'}${unavailable.length ? ` (${unavailable.join('; ')})` : ''}`;
+      io.log(`red team skipped: ${reason}`);
+      return { status: 'skipped', ...(deferredByCap ? { deferredByCap: true } : {}), reason };
+    }
     const { model: defaultModel, effort: defaultEffort } = RED_TEAM_MODELS[provider];
     const effort = configuredRoute?.effort ?? resolveOperationEffort("review-seat", provider, RED_TEAM_SEAT.key);
     const model = configuredRoute?.model ?? defaultModel;

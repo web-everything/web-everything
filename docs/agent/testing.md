@@ -4788,3 +4788,11 @@ Never choose agy-claude by default: only exhaustion of both ordinary providers' 
 permits the logged emergency route. Exhausting even the emergency budget retains the
 existing cap hold. Tests cover emergency selection, all budgets exhausted, and missing
 CLIs with ordinary budget left (no emergency).
+
+R1077 audit: builder preference stays within the resolved policy chain or inherited
+red-team roster; operator routing overrides win, and policy model/effort validation
+still runs. Exhausting an explicit chain refuses dispatch rather than inventing a
+route. `ai-routing-red-team-sites.test.mjs` retains the cap/quota refusal cases and
+covers builder policy models, efforts, operator precedence and disabled fallbacks.
+Explicit settings zero defeats `enabledProviders`; unreadable or malformed seat
+settings warn and use repo defaults, including Gemini's disabled default.
