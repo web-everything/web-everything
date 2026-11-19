@@ -1,3 +1,5 @@
+import { HEAD, workflowRow, workflowEvidence } from '../soak/fixtures/workflow-edit-protection.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -4836,4 +4838,20 @@ describe('R359 early start shadow refusal diagnostics (xtxt36v / xrz0ezn)', () =
     expect(off.refusals[0]).not.toHaveProperty('earlyStartShadow');
     expect(off.dispatch).toEqual(baseline.dispatch);
   });
+});
+
+
+it('admits PR 7106 workflow-edit protection on review:pending without a ci-heal', () => {
+  const evidence = workflowEvidence();
+  const prs = excusePrMergeGateHolds([pr1563({ number: 7106, headRefOid: HEAD,
+    labels: lbl('review:pending'), comments: [], statusCheckRollup: [workflowRow,
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] })], {
+    repo: 'owner/repo', mergeGateSetting: 'on',
+    readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
+      runGh: argv => argv[1].endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }),
+  });
+  const plan = planReconcile({ prs, requiredChecks: ['test', 'merge-gate'], now: NOW, agents: [],
+    advisoryReviewOnHumanHandoff: 'on' });
+  expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', prNumber: 7106 }));
+  expect(plan.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
 });

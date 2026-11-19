@@ -4804,6 +4804,14 @@ retired during planning must reject its omission and preserve HEAD.
 Run this file and `daemon-rebuild-events.test.mjs` through heavy admission. This adoption
 rule does not reset overlay main-sync parking or add retries for parked overlays.
 
+
+## Workflow-protection review admission
+
+The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged
+planner together using a rollup with `detailsUrl` and no check id. Workflow protection needs
+head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
+step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
+negative cases, rather than matching planner source text.
 ## Owed CI rerun execution
 
 The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
