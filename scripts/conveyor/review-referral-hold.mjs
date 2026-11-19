@@ -216,6 +216,15 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
       const errors = validateRunRecord(run).errors.filter(error => !error.startsWith('invalid run id '));
       if (errors.length) throw new Error(errors.join('; '));
       if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
+      // The verdict payload must be well formed: the pipeline always writes pendingReferrals (an array) on a
+      // needs-human verdict, so a missing or non-array list means the record is unreadable, never evidence.
+      const payload = run.verdict ?? run.findings?.referralVerdict;
+      if (payload && typeof payload === 'object') {
+        for (const key of ['pendingReferrals', 'blockedReferrals']) {
+          if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new Error(`verdict ${key} is not a list`);
+        }
+        if (payload.verdict === VERDICTS.NEEDS_HUMAN && !Array.isArray(payload.pendingReferrals)) throw new Error('needs-human verdict without pendingReferrals');
+      }
       // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
       const evidence = reviewRunEvidence(run, { requireVerdict: true });
       reportInvalidRunEntry(path);

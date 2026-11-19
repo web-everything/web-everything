@@ -12,7 +12,7 @@ export function probe(checkout) {
   const dir = mkdtempSync(join(tmpdir(), 'run-store-stray-'));
   try {
     const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
-      import { writeFileSync } from 'node:fs';
+      import { readFileSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { pathToFileURL } from 'node:url';
       import { deepStrictEqual, ok } from 'node:assert';
@@ -66,6 +66,18 @@ export function probe(checkout) {
           for (const row of expected) deepStrictEqual(rows.find(r => r.id === row.id), row);
         }
       }
+      const missingPending = { ...noVerdict, id: 'review-pr-missing pending', verdict: { verdict: 'needs-human' } };
+      writeFileSync(join(dir, 'review-pr-no verdict.json'), JSON.stringify(missingPending));
+      const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
+      ok(!rows.some(row => row.id === missingPending.id), 'needs-human without pendingReferrals must be unreadable');
+      const hold = decideReferralHold({ number: 101, headRefOid: head, comments: [],
+        labels: [{ name: 'review:human' }] }, rows, { repo: 'test/repo', now: Date.parse('2026-10-01T00:02:00Z') });
+      ok(hold?.persistenceFailed, 'an unreadable verdict payload must retain the persistence-failure hold');
+      process.once('beforeExit', () => {
+        const events = readFileSync(process.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\\n').map(line => JSON.parse(line));
+        ok(events.some(event => event.kind === 'run-store-invalid-entry' && event.detail?.severity === 'high'
+          && event.detail.path === join(dir, 'review-pr-no verdict.json')), 'an unreadable verdict payload must emit a HIGH alert');
+      });
     `, checkout, dir], {
       encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
       env: { ...process.env, WE_UNDER_TEST: '1', WE_DAEMON_EVENTS: join(dir, 'events.jsonl') },

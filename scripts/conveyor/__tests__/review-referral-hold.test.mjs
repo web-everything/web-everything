@@ -339,6 +339,7 @@ describe('attempted mandatory referrals', () => {
     ['invalid pending', r => { r.pending = {}; }],
     ['invalid telemetry', r => { r.telemetry = {}; }],
     ['invalid step timing', r => { delete r.stepTimings[0].stepIndex; }],
+    ['needs-human without pendingReferrals', r => { r.findings.referralVerdict = r.verdict = { verdict: 'needs-human' }; }],
   ])('a newer misnamed record with %s cannot clear a persistence-failure hold', (_, corrupt) => {
     const dir = temp();
     const failed = run({ failure: true });
