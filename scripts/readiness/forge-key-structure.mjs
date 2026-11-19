@@ -59,6 +59,28 @@ function derFinding(bytes,tick) {
 }
 
 // Scan every top-level member occurrence (duplicates included); a parsed object keeps only the last one.
+// Index of the first character at or after `index` that is not whitespace or a JS comment; -1 when a comment is
+// unterminated. Linear and deterministic (no regex alternation over comment bodies, so no ReDoS).
+function afterTrivia(text,index) {
+  for(let i=index;i<text.length;) {
+    const code=text.charCodeAt(i);
+    if(code===32||(code>=9&&code<=13)||code===160||code===0xfeff||code===0x2028||code===0x2029||(code>=0x2000&&code<=0x200a)||code===0x1680||code===0x202f||code===0x205f||code===0x3000) {i++;continue;}
+    if(code===47&&text[i+1]==='/') {
+      const lf=text.indexOf('\n',i+2),cr=text.indexOf('\r',i+2);
+      const end=lf===-1?cr:cr===-1?lf:Math.min(lf,cr);
+      if(end===-1)return -1;
+      i=end+1;continue;
+    }
+    if(code===47&&text[i+1]==='*') {
+      const end=text.indexOf('*/',i+2);
+      if(end===-1)return -1;
+      i=end+2;continue;
+    }
+    return i;
+  }
+  return text.length;
+}
+
 function jwkFinding(bytes) {
   const text=bytes.toString('utf8');
   if(!text.trimStart().startsWith('{'))return false;
@@ -69,7 +91,11 @@ function jwkFinding(bytes) {
     if(token[0]==='/')continue;
     if(token==='{'||token==='[') {
       // RFC 7518 6.3.2.7: `oth` (other primes: r, d, t) is private multiprime RSA material even without a top-level d.
-      if(depth===1&&key==='oth'&&!/^\s*(?:\/\/[^\r\n]*[\r\n]|\/\*[\s\S]*?\*\/\s*)*[\]}]/.test(text.slice(match.index+1)))priv=true;
+      if(depth===1&&key==='oth') {
+        const next=afterTrivia(text,match.index+1);
+        // empty container is not private material; an unterminated comment is treated as non-empty (conservative)
+        if(next===-1||(text[next]!==']'&&text[next]!=='}'))priv=true;
+      }
       depth++;
     }
     else if(token==='}'||token===']')depth--;
@@ -140,7 +166,6 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
   if(/kty|\\u/i.test(text)) {
-    const opens=/(?:\s|\/\/[^\r\n]*[\r\n]|\/\*[\s\S]*?\*\/)*"/y;
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
@@ -148,8 +173,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       if(visited.has(at))continue;
       // A JWK object opens with a quoted member name (after optional whitespace or comments).
       // No lookahead bound: whitespace or comments of any length between the brace and the name must not hide it.
-      opens.lastIndex=at+1;
-      if(!opens.test(text))continue;
+      if(text[afterTrivia(text,at+1)]!=='"')continue;
       tick();
       const limit=Math.min(text.length,at+65536);
       let depth=0,closed=false;

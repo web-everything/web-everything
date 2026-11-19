@@ -75,13 +75,25 @@ describe('Forge key structure slice 1',()=>{
     expect(finding).toBeTruthy();
     expect(()=>manifestEntry(path,Buffer.from(text),false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
   });
+  it('comment scanning is linear (CodeQL js/redos on the brace and oth lookaheads)',()=>{
+    const quote='"';
+    const hostile='/*'+'*/'.repeat(40000)+' tail';
+    for(const text of ['x {'+hostile,'x '+quote+' {'+hostile+' kty',quote+'kty'+quote+': {'+quote+'oth'+quote+': ['+hostile]) {
+      const started=Date.now();
+      keyStructureFinding(Buffer.from(text));
+      expect(Date.now()-started).toBeLessThan(5000);
+    }
+    // comments before the first member name and inside an empty oth still behave
+    blocked(Buffer.from('say '+quote+' {/* c */ // d\n'+quote+'kty'+quote+':'+quote+'oct'+quote+','+quote+'k'+quote+':'+quote+'YQ'+quote+'}'));
+    expect(keyStructureFinding(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB'}).slice(0,-1)+',"oth":/* none */[ // x\n]}'))).toBeFalsy();
+  });
   it('blocks AES-encrypted PKCS#8 DER in every view (audit #7076)',()=>{
     const encrypted=generateKeyPairSync('ed25519').privateKey.export({format:'der',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'pw'});
     for(const encode of Object.values(views))blocked(Buffer.from(encode(encrypted)));
   });
   it('blocks RSA multiprime oth private members without a top-level d (red-team #7076)',()=>{
     blocked(Buffer.from(JSON.stringify({kty:'RSA',oth:[{r:'a',d:'b',t:'c'}]})));
-    blocked(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[{r:'a',d:'b',t:'c'}]}).replace('[','/* x */[')));
+    blocked(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[{r:'a',d:'b',t:'c'}]}).replace(/\[/g,'/* x */[')));
     expect(keyStructureFinding(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[]})))).toBeFalsy();
   });
   it('blocks a JWK after stray double quotes or an unclosed string (red-team #7076)',()=>{
