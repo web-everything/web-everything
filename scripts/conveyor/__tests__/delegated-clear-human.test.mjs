@@ -5,20 +5,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BLOCKERS, clearHumanViaCli, createEventEmitter, resolveDelegatedClearHumanMode, loadDelegatedClearHumanMode,
   evaluateEligibility, runDelegatedClearHuman, redTeamAtHead, liveReaders, main } from '../delegated-clear-human.mjs';
+import { formatPrResult } from '../../lib/merge-gate-verdict.mjs';
+import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 const HEAD = 'a'.repeat(40), OTHER = 'b'.repeat(40);
 const labels = ['review:human', 'advisory:accepted', 'red-team:clear'];
-const pr = (over = {}) => ({ number: 7, headRefOid: HEAD, labels, ...over });
+const pr = (over = {}) => ({ number: 7, headRefOid: HEAD, baseRefName: 'main', labels, ...over });
 const advisory = (head = HEAD, outcome = 'accept') => ({ author: { login: 'web-everything' },
   body: `**Verdict:** accept\n**Advisory outcome:** ${outcome}\nNet basis: \`${OTHER}..${head}\`` });
 const row = (name = 'test', conclusion = 'SUCCESS', startedAt = '2026-11-19T12:00:00Z') =>
   ({ name, status: 'COMPLETED', conclusion, head_sha: HEAD, startedAt, app: { id: 1, slug: 'ci' } });
+const humanHoldSummary = (over = {}) => formatPrResult({ num: 7, ok: false,
+  results: GATE_IDS.map(id => ({ id, status: id === 'review-acceptance' ? 'hold' : 'pass',
+    reason: id === 'review-acceptance' ? 'park: human-gated (review:human) — only a human may clear it' : 'clear',
+    ...over[id] })) });
+const gateRow = (name = 'merge-gate', summary = humanHoldSummary()) =>
+  ({ ...row(name, 'FAILURE'), output: { summary } });
 const deps = (over = {}) => ({
   readPr: p => p, readComments: () => [advisory()],
   readRedTeam: () => ({ clear: true, evidence: { ok: true } }), readPublicationHold: () => null,
   readReview: () => ({ head: HEAD, findings: [] }),
   readRequiredChecks: () => ({ checks: ['test', 'merge-gate'], source: 'live' }),
-  readChecks: () => [row(), row('merge-gate', 'FAILURE')],
+  readChecks: () => [row(), gateRow()],
   scoreNet: () => ({ scored: true, humanRequired: false, signals: {}, files: 3, diffLines: 10 }),
   readFiles: () => ['src/a.mjs'], readLiveHead: () => HEAD, ...over,
 });
@@ -97,9 +105,9 @@ describe('seven-clause predicate', () => {
     expect(evaluate({ readRequiredChecks: () => ({ checks: ['test'], source: 'fallback' }) }).eligible).toBe(false);
     expect(evaluate({ readChecks: () => [] }).eligible).toBe(false);
   });
-  it('rejects non-required failing checks but ignores merge-gate and review-gate', () => {
+  it('rejects non-required failing checks but excuses proven plain human-review holds', () => {
     expect(evaluate({ readChecks: () => [row(), row('advisory', 'FAILURE')] }).failed).toContain('other-check');
-    expect(evaluate({ readChecks: () => [row(), row('merge-gate', 'FAILURE'), row('review-gate', 'FAILURE')] }).eligible).toBe(true);
+    expect(evaluate({ readChecks: () => [row(), gateRow(), gateRow('review-gate')] }).eligible).toBe(true);
   });
   it.each([['FAILURE', 'SUCCESS', true], ['SUCCESS', 'FAILURE', false]])('same-identity later attempt supersedes %s with %s', (old, latest, ok) => {
     const rows = [
@@ -118,7 +126,7 @@ describe('seven-clause predicate', () => {
     ];
     const result = evaluate({ readChecks: () => rows });
     expect(result.failed).toContain('required-checks');
-    expect(result.failed).toContain('other-check');
+    expect(result.failed).not.toContain('other-check'); // Required rows are decided only by resolveRequiredChecks.
     expect(result.evidence.checkRows).toEqual(rows);
   });
   it('timestamps alone cannot supersede a failing required attempt', () => {
@@ -126,9 +134,24 @@ describe('seven-clause predicate', () => {
       row('test', 'SUCCESS', '2026-11-19T13:00:00Z')] });
     expect(result.failed).toContain('required-checks');
   });
-  it('same-identity later success supersedes an optional failure', () => {
-    expect(evaluate({ readChecks: () => [row(), row('optional', 'FAILURE'),
-      row('optional', 'SUCCESS', '2026-11-19T13:00:00Z')] }).eligible).toBe(true);
+  it('a later success from a separate run cannot hide an optional failure', () => {
+    expect(evaluate({ readChecks: () => [row(), { ...row('optional', 'FAILURE'), run_id: 20 },
+      { ...row('optional', 'SUCCESS', '2026-11-19T13:00:00Z'), run_id: 21 }] }).failed).toContain('other-check');
+  });
+  it.each(['stack/parent', undefined, ''])('refuses non-main or unreadable base %j', baseRefName => {
+    expect(evaluate({}, pr({ baseRefName })).failed).toContain('base-not-main');
+  });
+  it('refuses the mechanical-hold label even with a plain human-review summary', () => {
+    expect(evaluate({}, pr({ labels: [...labels, 'review:held-mechanical'] })).failed).toContain('merge-gate-other-hold');
+  });
+  it.each(['merge-gate', 'review-gate'])('refuses %s test-gaming and unreadable or other holds', name => {
+    for (const summary of [undefined, 'unreadable', humanHoldSummary().split('\n').slice(0, 3).join('\n'),
+      humanHoldSummary({ 'test-gaming': { status: 'hold', reason: 'test-gaming suspected' } }),
+      humanHoldSummary({ 'review-acceptance': { status: 'hold', reason: 'review:held-mechanical' } }),
+      humanHoldSummary({ 'manifest-baseline': { status: 'fail-closed', reason: 'unreadable' } })]) {
+      const gate = summary === undefined ? row(name, 'FAILURE') : gateRow(name, summary);
+      expect(evaluate({ readChecks: () => [row(), gate] }).failed).toContain('merge-gate-other-hold');
+    }
   });
   it.each([undefined, { id: 1, slug: 'ci' }])('ambiguous optional producer identity refuses (%j)', app => {
     const result = evaluate({ readChecks: () => [row(), { ...row('optional', 'FAILURE'), app: undefined },
@@ -255,9 +278,9 @@ describe('sweep and writer', () => {
     expect(() => liveReaders({ repo: 'o/r', exec }).readChecks(pr(), HEAD)).toThrow(/incomplete/);
     expect(exec.mock.calls[0][1][1]).toContain(`/commits/${HEAD}/check-runs`);
   });
-  it('live diff reads H and base objects without substituting a branch or fetching', () => {
+  it('live diff scores against main rather than the PR chosen base', () => {
     const exec = vi.fn((_cmd, args) => {
-      if (args[0] === 'pr') return JSON.stringify({ headRefOid: HEAD, baseRefOid: OTHER });
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: HEAD, baseRefOid: OTHER, baseRefName: 'main' });
       if (args[0] === 'merge-base') return OTHER;
       if (args.includes('--name-only')) return 'src/a.mjs\0';
       if (args.includes('--numstat')) return '1\t0\tsrc/a.mjs\0';
@@ -265,6 +288,7 @@ describe('sweep and writer', () => {
     });
     const readers = liveReaders({ repo: 'o/r', exec }); readers.readPr(pr());
     expect(readers.readFiles(pr(), HEAD)).toEqual(['src/a.mjs']);
+    expect(exec).toHaveBeenCalledWith('git', ['merge-base', 'origin/main', HEAD], expect.any(Object));
     expect(readers.scoreNet(pr(), HEAD)).toMatchObject({ scored: true, head: HEAD, files: 1, diffLines: 1 });
     for (const [, args] of exec.mock.calls.filter(([cmd]) => cmd === 'git')) {
       expect(args).toContain(HEAD); expect(args).not.toContain('fetch');

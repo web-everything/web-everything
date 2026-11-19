@@ -21,6 +21,7 @@ import { readDrainRedTeamEvidence, settleUnknownEvidenceByComment, readRedTeamPu
 import { planRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { isSecurityClassFinding } from '../lib/jury-core.mjs';
 import { getRequiredStatusChecks, readRequiredStatusChecksDetailed } from '../lib/required-status-checks.mjs';
+import { parsePrResultTable, humanReviewOnlyHold } from '../lib/merge-gate-verdict.mjs';
 import { resolveRequiredChecks } from '../lib/check-state-predicate.mjs';
 import { workflowEditHold } from '../lib/merge-queue-enqueue.mjs';
 import { refreshMergeGateAfterRestamp } from '../lib/merge-gate-refresh.mjs';
@@ -32,6 +33,22 @@ export const BLOCKERS = Object.freeze(['red-team:blocked', 'size:over-cap', 'sta
 const SHA = /^[a-f0-9]{40}$/i;
 const names = labels => labels.map(l => typeof l === 'string' ? l : l?.name);
 const ignoredCheck = name => ['merge-gate', 'review-gate'].includes(name);
+const successfulCheck = row => ['SUCCESS', 'NEUTRAL', 'SKIPPED']
+  .includes(String(row?.conclusion ?? row?.state ?? '').toUpperCase());
+
+// The general human-hold helper also excuses test-gaming, which automation must never clear.
+function plainHumanReviewHold(row, number) {
+  const texts = [row?.output?.summary, row?.output?.text].filter(t => typeof t === 'string' && t.trim());
+  if (!texts.length) return false;
+  return texts.every(text => {
+    const parsed = parsePrResultTable(text, number);
+    if (parsed.error || parsed.ok || !humanReviewOnlyHold(parsed.results).only) return false;
+    if (/review:held-mechanical/.test(text)) return false;
+    if (parsed.results.some(r => r.id === 'test-gaming' && r.status !== 'pass')) return false;
+    return parsed.results.some(r => r.id === 'review-acceptance' && r.status === 'hold'
+      && r.reason === 'park: human-gated (review:human) — only a human may clear it');
+  });
+}
 
 /** New key wins over the legacy alias across all layers. Invalid explicitly disables. */
 export function resolveDelegatedClearHumanMode({ env = {}, platform = {}, repo = {}, log = () => {} } = {}) {
@@ -96,6 +113,7 @@ export function evaluateEligibility(candidate, readers = {}) {
   if (!SHA.test(head ?? '')) reject('head-unpinned');
   const pr = read('pr', () => readers.readPr(candidate, head));
   if (!evidence.replay && pr?.headRefOid !== head) reject('head-moved');
+  if (pr?.baseRefName !== 'main') reject('base-not-main');
   let labels = Array.isArray(pr?.labels) ? names(pr.labels) : null;
   if (!labels || labels.some(l => typeof l !== 'string')) { reject('unreadable-labels'); labels = []; }
   evidence.originalLabels = [...labels];
@@ -108,6 +126,7 @@ export function evaluateEligibility(candidate, readers = {}) {
     for (const l of ['advisory:accepted', 'red-team:clear']) if (!labels.includes(l)) { labels.push(l); evidence.replaySynthesizedLabels.push(l); }
   }
   evidence.labels = labels;
+  if (labels.includes('review:held-mechanical')) reject('merge-gate-other-hold');
   if (!labels.includes('review:human')) reject('review-human');
   for (const label of BLOCKERS) if (labels.includes(label)) reject(label);
   const comments = read('comments', () => readers.readComments(candidate, head));
@@ -141,14 +160,26 @@ export function evaluateEligibility(candidate, readers = {}) {
     return raw;
   });
   evidence.checkRows = rows;
+  // Only the CURRENT row per gate name decides: rerun history (old failed/cancelled runs) is not the live hold.
+  // An unreadable timestamp or a current non-success row that is not the plain human-review hold refuses.
+  if (rows) {
+    const rowTime = r => Date.parse(r.completed_at ?? r.completedAt ?? r.started_at ?? r.startedAt ?? r.created_at ?? r.createdAt);
+    const current = new Map();
+    for (const r of rows.filter(r => ignoredCheck(r?.name ?? r?.context))) {
+      const name = r?.name ?? r?.context, old = current.get(name);
+      if (!old || !(rowTime(old) >= rowTime(r))) current.set(name, r);
+    }
+    if ([...current.values()].some(r => !Number.isFinite(rowTime(r)) && !successfulCheck(r)
+      || !successfulCheck(r) && (r?.head_sha !== head || !plainHumanReviewHold(r, candidate.number)))) reject('merge-gate-other-hold');
+  }
   const required = Array.isArray(roster?.checks) ? roster.checks.filter(n => !ignoredCheck(n)) : null;
   const checks = resolveRequiredChecks({ rows: rows?.filter(r => !ignoredCheck(r?.name ?? r?.context)),
     rowsHead: head, rowsComplete: Array.isArray(rows), requiredNames: required, rosterSource: roster?.source, head });
   evidence.checkResolution = checks;
   if (checks.state !== 'pass') reject('required-checks');
-  const latestRows = read('check-identities', () => latestCheckRows(rows?.filter(r => !ignoredCheck(r?.name ?? r?.context))));
-  if (latestRows?.some(r => !ignoredCheck(r.name ?? r.context)
-    && !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(String(r.conclusion ?? r.state ?? '').toUpperCase()))) reject('other-check');
+  read('check-identities', () => latestCheckRows(rows?.filter(r => !ignoredCheck(r?.name ?? r?.context))));
+  if (rows?.some(r => !ignoredCheck(r?.name ?? r?.context) && !required?.includes(r?.name ?? r?.context)
+    && (r?.head_sha != null && r.head_sha !== head || !successfulCheck(r)))) reject('other-check');
   evidence.score = read('score', () => readers.scoreNet(candidate, head));
   if (evidence.score?.scored !== true) reject('unreadable-score');
   if (!evidence.score?.signals || typeof evidence.score.signals !== 'object') reject('unreadable-score');
@@ -244,7 +275,7 @@ export async function runDelegatedClearHuman({ prs = [], mode = 'off', replay = 
   return out;
 }
 
-/** Bounded live readers. Head and base objects must be locally readable; no branch substitution. */
+/** Bounded live readers. Head and main objects must be locally readable. */
 export function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we'), maxCalls = 128,
   exec = execFileSyncThrottled } = {}) {
   let calls = 0;
@@ -259,8 +290,8 @@ export function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we'), maxC
     const k = key(pr);
     if (files.has(k)) return;
     const state = states.get(pr.number);
-    if (!SHA.test(head) || !SHA.test(state?.baseRefOid ?? '')) throw Error('diff basis unreadable');
-    const base = String(run('git', ['merge-base', state.baseRefOid, head])).trim();
+    if (!SHA.test(head) || state?.baseRefName !== 'main') throw Error('diff basis unreadable: base must be main');
+    const base = String(run('git', ['merge-base', 'origin/main', head])).trim();
     if (!SHA.test(base)) throw Error('merge base unreadable');
     const paths = String(run('git', ['diff', '--no-renames', '--name-only', '-z', base, head, '--'])).split('\0').filter(Boolean);
     const numstat = String(run('git', ['diff', '--no-renames', '--numstat', '-z', base, head, '--']));
@@ -276,7 +307,7 @@ export function liveReaders({ cwd = process.cwd(), repo = ghRepoSlug('we'), maxC
   };
   return {
     readPr: pr => { const state = json(['pr', 'view', String(pr.number), '--repo', repo, '--json',
-      'number,labels,headRefOid,baseRefOid,reviews']); states.set(pr.number, state); return state; },
+      'number,labels,headRefOid,baseRefOid,baseRefName,reviews']); states.set(pr.number, state); return state; },
     readComments: pr => readCompletePrComments(pr.number, { repo, exec: run }),
     readLiveHead: pr => json(['pr', 'view', String(pr.number), '--repo', repo, '--json', 'headRefOid']).headRefOid,
     readRedTeam: (pr, head) => { const rt = redTeamAtHead(pr, head, { repo }); redTeams.set(pr.number, rt); return rt; },
