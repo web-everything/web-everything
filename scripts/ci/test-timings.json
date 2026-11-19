@@ -2020,6 +2020,7 @@
   "scripts/conveyor/soak/breaks/redteam-pending-label-never-settles.soak.test.mjs": 2.02,
   "scripts/conveyor/soak/breaks/review-churn-never-skips-changed-code.soak.test.mjs": 0.86,
   "scripts/conveyor/soak/breaks/review-hold-red-draft-deadlock.soak.test.mjs": 1.36,
+  "scripts/conveyor/soak/breaks/review-label-body-child-cwd.soak.test.mjs": 3.4,
   "scripts/conveyor/soak/breaks/runner-shutdown-abandons-passes.soak.test.mjs": 0.85,
   "scripts/conveyor/soak/breaks/runner-snapshot-blocks-deadlines.soak.test.mjs": 0.26,
   "scripts/conveyor/soak/breaks/scratch-tests-forge-command.soak.test.mjs": 0.15,
