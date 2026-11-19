@@ -1,7 +1,7 @@
 #!/bin/bash
 # Creates (idempotently; run only on Forge):
 # - system user/group forge-exec (legacy) and forge-exec-1..FORGE_EXEC_SLOTS
-#   (default 8), each slot user with its own group and no shared membership;
+#   (per-host forge-slots.json), each slot user with its own group and no shared membership;
 # - /srv/forge-exec ops:ops 0755, legacy .cache root:forge-exec 0700;
 # - /srv/forge-exec/slot-K ops:forge-exec-K 0710 (worker traverse only);
 #   run containers stay operator-owned, only work/sibling trees are handed over;
@@ -40,7 +40,13 @@
 # - installs python3, rsync and nftables if missing. Never prunes active slot locks.
 set -euo pipefail
 
-FORGE_EXEC_SLOTS=${FORGE_EXEC_SLOTS:-8}
+# Flat deployments must copy forge-slots.{json,mjs,sh} beside this script,
+# along with the existing runtime siblings. In a checkout JSON lives in ../settings.
+slots_explicit=${FORGE_EXEC_SLOTS+x}
+if [[ "$slots_explicit" != x ]]; then
+  FORGE_EXEC_SLOTS=$(bash "$(dirname -- "$0")/forge-slots.sh")
+  echo "forge-setup: FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS (forge-slots.json host/default setting)" >&2
+fi
 if [[ ! "$FORGE_EXEC_SLOTS" =~ ^[1-9][0-9]*$ ]] || (( FORGE_EXEC_SLOTS > 128 )); then
   echo 'forge-setup: FORGE_EXEC_SLOTS must be 1..128' >&2
   exit 1
@@ -48,8 +54,12 @@ fi
 export FORGE_EXEC_SLOTS
 for existing in /srv/forge-exec/slot-*; do
   if [[ "$existing" =~ /slot-([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] > FORGE_EXEC_SLOTS )); then
-    echo 'forge-setup: cannot shrink an installed pool; retain its slot count and inspect reservations' >&2
-    exit 1
+    if [[ "$slots_explicit" == x ]]; then
+      echo 'forge-setup: cannot shrink an installed pool; retain its slot count and inspect reservations' >&2
+      exit 1
+    fi
+    FORGE_EXEC_SLOTS=${BASH_REMATCH[1]}
+    echo "forge-setup: setting lower than installed pool; keeping $FORGE_EXEC_SLOTS installed slots; inspect reservations before manual retirement" >&2
   fi
 done
 if ! id forge-exec >/dev/null 2>&1; then
@@ -428,6 +438,7 @@ ExecStart=/usr/bin/env node /usr/local/libexec/forge-exec-sweep.mjs --apply
 Nice=19
 IOSchedulingClass=idle
 SWEEP_SERVICE
+printf 'Environment=FORGE_EXEC_SLOTS=%s\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service
 cat > /etc/systemd/system/forge-exec-sweep.timer <<'SWEEP_TIMER'
 [Unit]
 Description=Check Forge execution retention every 30 minutes
@@ -446,6 +457,17 @@ systemctl enable --now forge-exec-sweep.timer
 if ! command -v nft >/dev/null 2>&1; then
   apt-get install -y nftables
 fi
+# Install the same JSON and reader for standalone egress invocations.
+slot_source=$(dirname -- "$0")
+slot_settings="$slot_source/forge-slots.json"
+if [[ ! -e "$slot_settings" ]]; then slot_settings="$slot_source/../settings/forge-slots.json"; fi
+for slot_file in forge-slots.mjs forge-slots.sh forge-slots.json; do
+  slot_pending=$(mktemp /usr/local/libexec/.forge-slots.XXXXXX)
+  slot_input="$slot_source/$slot_file"
+  if [[ "$slot_file" == forge-slots.json ]]; then slot_input="$slot_settings"; fi
+  install -o root -g root -m 0644 "$slot_input" "$slot_pending"
+  mv -f -- "$slot_pending" "/usr/local/libexec/$slot_file"
+done
 egress_pending=$(mktemp /usr/local/libexec/.forge-egress.XXXXXX)
 install -o root -g root -m 0755 "$(dirname -- "$0")/forge-egress.sh" "$egress_pending"
 mv -f -- "$egress_pending" /usr/local/libexec/forge-egress.sh
