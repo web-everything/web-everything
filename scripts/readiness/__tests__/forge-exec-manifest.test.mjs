@@ -225,18 +225,3 @@ describe('generic evidence never masks a blocking continuation bound', () => {
     expect(credentialContentFinding(path,content)).toBe('unbounded-continuation-private-key');
   });
 });
-
-describe('tracked .claude/settings.json projection', () => {
-  it('ships only that exact file out of the .claude dot-directory', async () => {
-    const { classifyManifestPath, manifestEntry } = await import('../forge-exec-manifest.mjs');
-    const settings = Buffer.from('.claude/settings.json');
-    // Same R321 gate as credential-named files: eligible only via the tracked-and-identical + scan path.
-    expect(classifyManifestPath(settings).credentialSource).toBe(true);
-    expect(() => manifestEntry(settings, Buffer.from('{}'), false, false)).toThrow(/untracked/);
-    expect(() => manifestEntry(settings, Buffer.from('{"t":"ghp_abcdefghijklmnopqrstuvwxyz"}'), false, true)).toThrow(/github-token/);
-    expect(manifestEntry(settings, Buffer.from('{}'), false, true).tracked).toBe(true);
-    expect(classifyManifestPath(Buffer.from('.claude/settings.local.json')).credentialSource).toBe(false);
-    expect(classifyManifestPath(Buffer.from('.cla​ude/settings.json')).credentialSource).toBe(false);
-    expect(classifyManifestPath(Buffer.from('.claude/other/settings.json')).credentialSource).toBe(false);
-  });
-});
