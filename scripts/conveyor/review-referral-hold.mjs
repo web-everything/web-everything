@@ -12,7 +12,7 @@ import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { isValidRunId, resolveRunsDir, reportInvalidRunEntry, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
 import { validateRunRecord } from '../operations/run-record.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
-  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
+  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable, VERDICTS } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -52,7 +52,7 @@ const hash = value => createHash('sha256').update(JSON.stringify(value)).digest(
 
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
  * A run suspended at human confirmation has completed its panel, although the operation is pending.
- * Misnamed-record recovery requires a verdict as well as completion timing. */
+ * Misnamed-record recovery requires a recognized review verdict as well as completion timing. */
 export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
@@ -120,7 +120,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
       });
   } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
-  if (!Number.isFinite(completedAt) || (requireVerdict && typeof verdict?.verdict !== 'string')) {
+  if (!Number.isFinite(completedAt) || (requireVerdict && !Object.values(VERDICTS).includes(verdict?.verdict))) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,

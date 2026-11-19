@@ -38,7 +38,6 @@ export function probe(checkout) {
         findings: { ...valid.findings, referralVerdict: undefined },
         stepTimings: valid.stepTimings.map(t => ({ ...t,
           startedAt: '2026-10-01T00:01:00Z', finishedAt: '2026-10-01T00:01:01Z' })) };
-      writeFileSync(join(dir, 'review-pr-no verdict.json'), JSON.stringify(noVerdict));
       const malformed = { ...misnamed, id: 'review-pr-invalid structure', cursor: -1, effects: {} };
       writeFileSync(join(dir, 'review-pr-invalid structure.json'), JSON.stringify(malformed));
       writeFileSync(join(dir, 'review-pr-unparseable name.json'), '{');
@@ -46,17 +45,26 @@ export function probe(checkout) {
       ok(expected.every(row => row?.pr));
       ok(expected[0].parked && !expected[1].parked && expected[1].completedAt);
       deepStrictEqual(expected.map(row => row.pr), [valid.input.pr, misnamed.input.pr]);
-      for (let pass = 0; pass < 2; pass++) {
-        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
-        ok(Array.isArray(rows) && rows.length === 3, 'all three records must retain evidence');
-        const incomplete = rows.find(row => row.id === noVerdict.id);
-        ok(incomplete?.incomplete && incomplete.completedAt === null, 'advise timing without a verdict must remain incomplete');
-        const hold = decideReferralHold({ number: 101, headRefOid: head, comments: [],
-          labels: [{ name: 'review:human' }] }, rows, { repo: 'test/repo', now: Date.parse('2026-10-01T00:02:00Z') });
-        ok(hold?.persistenceFailed && hold.retryAt === Date.parse('2026-10-01T00:00:02Z') + REFERRAL_RETRY_MS[0],
-          'a newer misnamed record without a verdict must retain the persistence-failure hold');
-        ok(!rows.some(row => row.id === malformed.id), 'structurally invalid misnamed records must not project evidence');
-        for (const row of expected) deepStrictEqual(rows.find(r => r.id === row.id), row);
+      for (const value of [undefined, '', 'unknown-verdict', completed.verdict]) {
+        const candidate = { ...noVerdict, verdict: value === undefined ? undefined : { verdict: value, pendingReferrals: [] } };
+        writeFileSync(join(dir, 'review-pr-no verdict.json'), JSON.stringify(candidate));
+        for (let pass = 0; pass < 2; pass++) {
+          const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
+          ok(Array.isArray(rows) && rows.length === 3, 'all three records must retain evidence');
+          const recovered = rows.find(row => row.id === noVerdict.id);
+          const hold = decideReferralHold({ number: 101, headRefOid: head, comments: [],
+            labels: [{ name: 'review:human' }] }, rows, { repo: 'test/repo', now: Date.parse('2026-10-01T00:02:00Z') });
+          if (value === completed.verdict) {
+            ok(recovered && !recovered.incomplete && recovered.completedAt, 'a recognized verdict must complete the misnamed record');
+            deepStrictEqual(hold, null, 'a newer misnamed record with a real verdict supersedes the persistence-failure hold');
+          } else {
+            ok(recovered?.incomplete && recovered.completedAt === null, 'advise timing without a recognized verdict must remain incomplete');
+            ok(hold?.persistenceFailed && hold.retryAt === Date.parse('2026-10-01T00:00:02Z') + REFERRAL_RETRY_MS[0],
+              'a newer misnamed record with a missing, empty or unknown verdict must retain the persistence-failure hold');
+          }
+          ok(!rows.some(row => row.id === malformed.id), 'structurally invalid misnamed records must not project evidence');
+          for (const row of expected) deepStrictEqual(rows.find(r => r.id === row.id), row);
+        }
       }
     `, checkout, dir], {
       encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,

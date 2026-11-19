@@ -8,7 +8,7 @@ import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listRunIds, newRunRecord, runPath, tryReadRun, writeRun } from '../../operations/run-store.mjs';
-import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
+import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord, VERDICTS } from '../../lib/jury-core.mjs';
 import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
@@ -281,15 +281,18 @@ describe('attempted mandatory referrals', () => {
     } finally { alert.mockRestore(); }
   });
 
-  it.each(['none', 'run', 'referral'])('requires a verdict before a newer misnamed record can supersede a persistence-failure hold (%s)', source => {
+  it.each([
+    ['none', undefined],
+    ...['run', 'referral'].flatMap(source => ['', 'unknown-verdict', ...Object.values(VERDICTS)].map(value => [source, value])),
+  ])('requires a recognized verdict before a newer misnamed record can supersede a persistence-failure hold (%s: %s)', (source, value) => {
     const dir = temp();
     const failed = run({ failure: true });
     const newer = { ...run({ time: at + 1 }), id: 'review-pr-no verdict' };
     delete newer.verdict;
     delete newer.findings.referralVerdict;
     newer.pending = null;
-    if (source === 'run') newer.verdict = { verdict: 'accept', pendingReferrals: [] };
-    if (source === 'referral') newer.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
+    if (source === 'run') newer.verdict = { verdict: value, pendingReferrals: [] };
+    if (source === 'referral') newer.findings.referralVerdict = { verdict: value, pendingReferrals: [] };
     writeRun(failed, dir);
     writeFileSync(join(dir, `${newer.id}.json`), JSON.stringify(newer));
     const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
@@ -297,7 +300,7 @@ describe('attempted mandatory referrals', () => {
       for (const persist of [false, true]) {
         const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
         const recovered = rows.find(row => row.id === newer.id);
-        if (source === 'none') {
+        if (!Object.values(VERDICTS).includes(value)) {
           expect(recovered).toMatchObject({ misnamed: true, incomplete: true, completedAt: null, pending: ['review-incomplete'] });
           expect(hold(pr(), rows)).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
           expect(findResumableParkedRun(pr(), rows, { repo })).toEqual({ id: failed.id, head });
