@@ -319,6 +319,9 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs',
   // The missing-run push reservation is an exclusive-create (`wx`) hold: a race in it double-pushes a recovery.
   'scripts/conveyor/missing-run-push.mjs',
+  // The agy confined build (R1062 S7): its transcript is an exclusive-create (O_EXCL|O_NOFOLLOW) file the sandboxed worker must not
+  // pre-plant or replace; a race in either module weakens the confinement.
+  'scripts/lib/agy-confined-build.mjs', 'scripts/gemini-direct-task.mjs', 'scripts/settings/agy-build.json',
   // The AGY usage reader writes its record through an exclusive-create (`wx`) temp file before the rename.
   'scripts/operations/agy-usage-reader.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
