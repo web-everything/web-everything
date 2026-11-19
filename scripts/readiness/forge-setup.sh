@@ -104,10 +104,24 @@ for k in range(1, int(sys.argv[1]) + 1):
 slot_uids=($slot_uid_plan)
 # Missing units are normal on first install. Stop the timer, then synchronously
 # finish any existing refresh. Never stop the service: sshd Requires= it.
+restore_egress_timer=false
+sudoers_pending=''
+cleanup_setup() {
+  local status=$?
+  if [[ -n "$sudoers_pending" ]]; then rm -f -- "$sudoers_pending" || true; fi
+  if [[ "$restore_egress_timer" == true ]]; then
+    systemctl start forge-exec-egress.timer || echo 'forge-setup: failed to restore forge-exec-egress.timer; restart it manually' >&2
+  fi
+  exit "$status"
+}
+trap cleanup_setup EXIT
 for unit in forge-exec-egress.timer forge-exec-egress.service; do
   load_state=$(systemctl show -p LoadState --value "$unit") || { [[ "$load_state" == not-found ]] || exit 1; }
   if [[ "$load_state" != not-found ]]; then
-    if [[ "$unit" == *.timer ]]; then systemctl stop "$unit";
+    if [[ "$unit" == *.timer ]]; then
+      active_state=$(systemctl show -p ActiveState --value "$unit")
+      [[ "$active_state" != active ]] || restore_egress_timer=true
+      systemctl stop "$unit"
     else systemctl start "$unit"; fi
   fi
 done
@@ -209,7 +223,6 @@ finally:
 DIRECTORIES
 # Explicit Runas list: never grant a wildcard worker identity or arbitrary commands.
 sudoers_pending=$(mktemp /etc/sudoers.d/.forge-exec.XXXXXXXX)
-trap 'rm -f -- "$sudoers_pending"' EXIT
 {
   printf 'ops ALL=('
   for ((k=1; k<=FORGE_EXEC_SLOTS; k++)); do
@@ -224,7 +237,7 @@ visudo -cf "$sudoers_pending"
 chown root:root "$sudoers_pending"
 chmod 440 "$sudoers_pending"
 mv -f -- "$sudoers_pending" /etc/sudoers.d/forge-exec
-trap - EXIT
+sudoers_pending=''
 if ! command -v rsync >/dev/null 2>&1; then
   apt-get install -y rsync
 fi
@@ -565,4 +578,5 @@ systemctl daemon-reload
 systemctl enable forge-exec-egress.service
 systemctl start forge-exec-egress.service
 systemctl enable --now forge-exec-egress.timer
+restore_egress_timer=false
 printf 'forge-setup: ok\n'

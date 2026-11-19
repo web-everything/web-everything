@@ -125,6 +125,48 @@ describe('Forge slot settings', () => {
     if (failure === 'success') expect(events[1]).toContain('--uid 999');
     expect(events.some(line => line.includes('sudoers'))).toBe(false);
   });
+  it.each([
+    ['active', 'stop', false],
+    ['active', 'service', false],
+    ['active', 'sudoers', false],
+    ['active', 'later', false],
+    ['active', 'later', true],
+    ['active', 'enable', false],
+    ['inactive', 'later', false],
+    ['not-found', 'later', false],
+    ['active', 'success', false],
+    ['inactive', 'success', false],
+  ])('setup restores timer state without masking errors: %s / %s / restart failure=%s', (state, stage, restartFails) => {
+    const dir = fixture(), log = join(dir, 'log'), pending = join(dir, 'sudoers-pending');
+    const fake = (name, body) => writeFileSync(join(dir, name), '#!/bin/bash\n' + body + '\n', {mode: 0o755});
+    fake('systemctl', `echo "$*" >> "$LOG"
+if [[ "$1" == show ]]; then
+  if [[ "$3" == LoadState && "$STATE" != not-found ]]; then echo loaded; else echo "$STATE"; fi
+elif [[ "$1" == stop && "$STAGE" == stop ]] ||
+     [[ "$1 $2" == 'start forge-exec-egress.service' && "$STAGE" == service ]] ||
+     [[ "$1" == enable && "$STAGE" == enable ]]; then exit 37
+elif [[ "$1 $2" == 'start forge-exec-egress.timer' && "$RESTART_FAILS" == true ]]; then exit 9
+fi`);
+    fake('mktemp', 'touch "$PENDING"; printf "%s\\n" "$PENDING"');
+    fake('visudo', '[[ "$STAGE" != sudoers ]] || exit 37');
+    fake('chown', 'exit 0');
+    const timer = setup.slice(setup.indexOf('# Missing units are normal'), setup.indexOf('if ! command -v nft'));
+    const sudoers = setup.slice(setup.indexOf('sudoers_pending=$(mktemp'), setup.indexOf('if ! command -v rsync'))
+      .replace('/etc/sudoers.d/forge-exec', join(dir, 'sudoers'));
+    const success = setup.slice(setup.lastIndexOf('systemctl enable --now forge-exec-egress.timer'));
+    writeFileSync(join(dir, 'forge-setup.sh'), `set -euo pipefail\nFORGE_EXEC_SLOTS=1\n${timer}\n${sudoers}\n[[ "$STAGE" != later ]] || exit 37\n${success}`);
+    const result = spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
+      encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+      env: {PATH: dir + ':' + process.env.PATH, LOG: log, PENDING: pending, STATE: state, STAGE: stage, RESTART_FAILS: String(restartFails)},
+    });
+    expect(result.status, result.stderr).toBe(stage === 'success' ? 0 : 37);
+    const events = readFileSync(log, 'utf8').trim().split('\n');
+    expect(events.includes('start forge-exec-egress.timer')).toBe(state === 'active' && stage !== 'success');
+    expect(events.includes('enable --now forge-exec-egress.timer')).toBe(['success', 'enable'].includes(stage));
+    expect(events.includes('stop forge-exec-egress.service')).toBe(false);
+    expect(result.stderr.includes('restart it manually')).toBe(restartFails);
+    expect(() => readFileSync(pending)).toThrow();
+  });
   it('setup passes its effective count into both sweep and egress units', () => {
     expect(setup).toContain('Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS');
     expect(setup).toContain(`printf 'Environment=FORGE_EXEC_SLOTS=%s\\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service`);
