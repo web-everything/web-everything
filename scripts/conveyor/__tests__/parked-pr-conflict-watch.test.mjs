@@ -2116,6 +2116,170 @@ prFileContract({
 });
 
 
+// #7183: the drain moved the head at 22:22:19Z; the watch bounced an old conflict read ten seconds later.
+const CONFLICT_HEAD_7183 = '39e2b10f'.padEnd(40, '0');
+const REBASED_HEAD_7183 = 'c7c88378'.padEnd(40, '0');
+const CONFLICT_NOW_7183 = Date.parse('2026-09-27T22:22:29Z');
+
+// Mirrors the existing expired-grace fixture below, with every IO port used by this branch injected.
+function acceptedConflict7183(overrides = {}) {
+  const repo = 'web-everything/web-everything';
+  const pr = {
+    number: 7183, headRefName: 'lane/7183', baseRefName: 'main', headRefOid: CONFLICT_HEAD_7183,
+    mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY',
+    labels: ['review:accepted', 'ready-to-merge', CONFLICT_LABEL].map((name) => ({ name })),
+  };
+  const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+  const options = {
+    repo, listPrs: () => [pr], provider, sameLineConflict: 'stand-down', now: CONFLICT_NOW_7183,
+    inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
+    labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, labelRemovedAtMs: () => 0,
+    listPrFiles: () => [{ path: 'scripts/x.mjs' }], listPrComments: () => [],
+    computeConflictDisposition: () => null, computeConflictingPaths: () => null,
+    postFinding: vi.fn(), postStandDown: vi.fn(), postSupersedeComment: vi.fn(),
+    readPrLive: vi.fn(() => ({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' })),
+    drainRebaseEvidence: vi.fn(() => null), revertBounce: vi.fn(), log: vi.fn(),
+    conflictWatchSettings: { drainGraceMinutes: 15 },
+    ...overrides,
+  };
+  return { pr, options, run: () => watchParkedPrConflicts(options) };
+}
+
+describe('stale conflict read', () => {
+  it('holds and logs when the live head moved even though GitHub still reports CONFLICTING', () => {
+    const fixture = acceptedConflict7183({
+      readPrLive: vi.fn(() => ({ headRefOid: REBASED_HEAD_7183, mergeable: 'CONFLICTING' })),
+    });
+    const [entry] = fixture.run();
+    expect(fixture.options.postFinding).not.toHaveBeenCalled();
+    expect(entry?.routedTo).toContain('conflict-cleared-before-bounce');
+    expect(fixture.options.readPrLive).toHaveBeenCalledWith({ pr: fixture.pr, repo: fixture.options.repo });
+    expect(fixture.options.log).toHaveBeenCalled();
+  });
+
+  it.each(['MERGEABLE', 'UNKNOWN'])('holds when the same live head is %s', (mergeable) => {
+    const fixture = acceptedConflict7183({
+      readPrLive: vi.fn(() => ({ headRefOid: CONFLICT_HEAD_7183, mergeable })),
+    });
+    fixture.run();
+    expect(fixture.options.postFinding).not.toHaveBeenCalled();
+    expect(fixture.options.readPrLive).toHaveBeenCalled();
+  });
+
+  it.each(['null', 'throws'])('fails closed when the live read %s', (failure) => {
+    const fixture = acceptedConflict7183({ readPrLive: vi.fn(() => {
+      if (failure === 'throws') throw new Error('live PR read unavailable');
+      return null;
+    }) });
+    expect(() => fixture.run()).not.toThrow();
+    expect(fixture.options.postFinding).not.toHaveBeenCalled();
+    expect(fixture.options.readPrLive).toHaveBeenCalled();
+  });
+
+  it('bounces a freshly confirmed CONFLICTING head and passes the judged head to postFinding', () => {
+    const fixture = acceptedConflict7183();
+    const [entry] = fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(1);
+    expect(fixture.options.postFinding).toHaveBeenCalledWith({
+      pr: fixture.pr, repo: fixture.options.repo, headRefOid: CONFLICT_HEAD_7183,
+    });
+    expect(entry?.routedTo).toContain('reconcile-finding');
+  });
+});
+
+describe('drain owns accepted conflicts', () => {
+  it('holds for a drain rebase ten seconds before injected now, independent of the wall clock', () => {
+    const wallClock = vi.spyOn(Date, 'now').mockReturnValue(CONFLICT_NOW_7183 + 24 * 60 * 60 * 1000);
+    try {
+      const fixture = acceptedConflict7183({ drainRebaseEvidence: vi.fn(() => ({
+        atMs: Date.parse('2026-09-27T22:22:19Z'), by: 'drain',
+      })) });
+      fixture.run();
+      expect(fixture.options.postFinding).not.toHaveBeenCalled();
+      expect(fixture.options.drainRebaseEvidence).toHaveBeenCalledWith({ pr: fixture.pr, repo: fixture.options.repo });
+    } finally { wallClock.mockRestore(); }
+  });
+
+  it('bounces the same still-CONFLICTING head after the configured 15-minute drain window', () => {
+    const atMs = CONFLICT_NOW_7183 - 10_000;
+    const fixture = acceptedConflict7183({
+      drainRebaseEvidence: vi.fn(() => ({ atMs, by: 'drain' })),
+    });
+    fixture.run();
+    expect(fixture.options.postFinding).not.toHaveBeenCalled();
+    fixture.options.now = atMs + 15 * 60_000 + 1;
+    fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(1);
+    expect(fixture.options.postFinding).toHaveBeenCalledWith(expect.objectContaining({ headRefOid: CONFLICT_HEAD_7183 }));
+  });
+
+  it.each([
+    ['absent evidence', null],
+    ['null timestamp', { atMs: null, by: 'drain' }],
+    ['NaN timestamp', { atMs: NaN, by: 'drain' }],
+    ['another actor', { atMs: CONFLICT_NOW_7183 - 10_000, by: 'fix-agent' }],
+  ])('preserves the bounce for %s rather than treating it as a recent drain rebase', (_, evidence) => {
+    const fixture = acceptedConflict7183({ drainRebaseEvidence: vi.fn(() => evidence) });
+    fixture.run();
+    expect(fixture.options.drainRebaseEvidence).toHaveBeenCalledWith({ pr: fixture.pr, repo: fixture.options.repo });
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('bounce head-bound', () => {
+  it('passes the judged 40-hex head and brackets the bounce write with fresh reads', () => {
+    const order = [];
+    const fixture = acceptedConflict7183({
+      readPrLive: vi.fn(() => {
+        order.push('read');
+        return { headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' };
+      }),
+      postFinding: vi.fn(() => { order.push('write'); }),
+    });
+    fixture.run();
+    expect(CONFLICT_HEAD_7183).toMatch(/^[a-f0-9]{40}$/);
+    expect(order).toEqual(['read', 'write', 'read']);
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(1);
+    expect(fixture.options.postFinding).toHaveBeenCalledWith(expect.objectContaining({ headRefOid: CONFLICT_HEAD_7183 }));
+    expect(fixture.options.revertBounce).not.toHaveBeenCalled();
+  });
+
+  it('reverts its own bounce when the post-write read sees a moved head and reports the race', () => {
+    const order = [];
+    const fixture = acceptedConflict7183({
+      readPrLive: vi.fn()
+        .mockImplementationOnce(() => { order.push('read-before'); return { headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' }; })
+        .mockImplementationOnce(() => { order.push('read-after'); return { headRefOid: REBASED_HEAD_7183, mergeable: 'CONFLICTING' }; }),
+      postFinding: vi.fn(() => { order.push('write'); }),
+      revertBounce: vi.fn(() => { order.push('revert'); }),
+    });
+    const [entry] = fixture.run();
+    expect(fixture.options.revertBounce).toHaveBeenCalledTimes(1);
+    expect(fixture.options.revertBounce).toHaveBeenCalledWith({
+      pr: fixture.pr, repo: fixture.options.repo, headRefOid: CONFLICT_HEAD_7183,
+    });
+    expect(order).toEqual(['read-before', 'write', 'read-after', 'revert']);
+    expect(Boolean(entry?.error) || entry?.routedTo?.includes('bounce-reverted-head-moved')).toBe(true);
+  });
+
+  it('writes no dedupe marker on revert and leaves a later confirmed conflict eligible to bounce', () => {
+    const fixture = acceptedConflict7183({
+      readPrLive: vi.fn()
+        .mockReturnValueOnce({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' })
+        .mockReturnValueOnce({ headRefOid: REBASED_HEAD_7183, mergeable: 'CONFLICTING' })
+        .mockReturnValue({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' }),
+    });
+    fixture.run();
+    expect(fixture.options.revertBounce).toHaveBeenCalledTimes(1);
+    expect(fixture.options.provider.postComment).not.toHaveBeenCalled();
+    expect(fixture.options.provider.setLabels).not.toHaveBeenCalled();
+    fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(2);
+    expect(fixture.options.revertBounce).toHaveBeenCalledTimes(1);
+    expect(fixture.options.readPrLive).toHaveBeenCalledTimes(4);
+  });
+});
+
 // ── x832e2v — APPROVED/queued PRs that drift into a conflict (live 2026-09-23: #2503, #2505, #2514, #2515) ──────
 describe('approved PRs that drift into a conflict (x832e2v)', () => {
   const L = (...n) => n.map((name) => ({ name }));
