@@ -1079,7 +1079,8 @@ describe('prototype-load', () => {
       ...Array.from({ length: MAX_RELATED_TARGETS }, (_, i) => [`passing-${i}.test.mjs`, "import './x';"]),
     ]);
     const reverse = buildReverseImportGraph({ files: [...sources.keys()], readFile: (file) => sources.get(file) });
-    const selection = selectRelatedTests({ changedFiles: ['x'], reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
+    // Construct bounded local evidence independently of the test runner's CI environment.
+    const selection = selectRelatedTests({ env: {}, changedFiles: ['x'], reverse, maxTests: MAX_RELATED_TARGETS, maxDepth: 2 });
     expect(selection.status).toBe('selection-truncated');
     expect(selection.tests).toHaveLength(MAX_RELATED_TARGETS);
     expect(selection.tests).not.toContain('omitted.test.mjs');
