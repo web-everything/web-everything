@@ -1,0 +1,22 @@
+[
+  "scripts/conveyor/claude-auth-health.mjs",
+  "scripts/conveyor/driver-watchdog.mjs",
+  "scripts/conveyor/health-watch.mjs",
+  "scripts/conveyor/liveness-sweep.mjs",
+  "scripts/conveyor/orphan-claim-release.mjs",
+  "scripts/conveyor/pool-exhaustion.mjs",
+  "scripts/conveyor/reconcile-pass.mjs",
+  "scripts/conveyor/session-reaper.mjs",
+  "scripts/conveyor/session-watchdog.mjs",
+  "scripts/lane-whois.mjs",
+  "scripts/lib/claude-sessions.mjs",
+  "scripts/lib/lane-salvage.mjs",
+  "scripts/lib/pr-state-io.mjs",
+  "scripts/lib/review-precedents-io.mjs",
+  "scripts/operations/dispatch-abort.mjs",
+  "scripts/operations/dispatch-lane-io.mjs",
+  "scripts/operations/explore-io.mjs",
+  "scripts/operations/maintenance-io.mjs",
+  "scripts/operations/operator-controls-io.mjs",
+  "scripts/operator/dispatch.mjs"
+]

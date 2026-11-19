@@ -3556,6 +3556,15 @@ unavailable exclusion, and queue a cooperating writer through the same exclusion
 
 ### Security condition test shape
 
+The S1 agent-launch boundary builds argv from a plain-data snapshot, not caller argv/options.
+Keep the fourteen attack classes named in `scripts/__tests__/agent-launch.test.mjs`;
+inject `io.spawn`/`io.resolveBinary` only as trusted test IO. The literal-call scanner is
+a migration tripwire, not a security boundary. Direct-task resume fixtures must use UUIDs.
+Pair injected direct-task `spawnFn` with `resolveBinaryFn` (including repair turns);
+CLI preloads must also supply binary-lookup evidence. Never require an installed agent
+or add a CLI/env override for fixtures. Test lookup with explicit temporary directories
+through `findAgentBinary`; production retains its private fixed installation list.
+
 Every new bypass-widening condition needs one negative test per conjunct. Security
 checks must not be hidden behind `!testRoot` guards; inject identity, ownership,
 and other system evidence so hermetic tests exercise the production checks.

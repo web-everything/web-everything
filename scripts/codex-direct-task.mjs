@@ -112,6 +112,7 @@ import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } fro
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
+import { buildAgentArgs, launchAgent } from './lib/agent-launch.mjs';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
   mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, rmSync, openSync, closeSync, renameSync,
@@ -207,8 +208,8 @@ export {
  * @param {{ephemeral?: boolean}} [opts]
  */
 export function assertResumeThreadId(resumeThreadId, { ephemeral = false } = {}) {
-  if (typeof resumeThreadId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(resumeThreadId)) {
-    throw new TypeError('codex-direct-task: `resumeThreadId` must be a session id or thread name');
+  if (typeof resumeThreadId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resumeThreadId) || resumeThreadId.length !== 36) {
+    throw new TypeError('codex-direct-task: `resumeThreadId` must be a UUID');
   }
   if (ephemeral) throw new TypeError('codex-direct-task: cannot resume an ephemeral task');
 }
@@ -253,7 +254,7 @@ export function codexShimPath(env = process.env) {
   return [CODEX_SHIM_DIR, ...rest].join(':');
 }
 
-export function buildCodexDirectTaskArgv({
+export function buildCodexDirectTaskDescriptor({
   cwd,
   outputLastMessageFile,
   outputSchemaFile,
@@ -274,36 +275,36 @@ export function buildCodexDirectTaskArgv({
   ({ model, effort } = route);
   // #4194 — REVIEW MODE runs Codex under its own `read-only` sandbox: a review seat reads the checkout and reports
   // findings; it must never edit anything. Every other caller keeps `workspace-write`, unchanged.
-  const argv = ['exec', '--json', '-s', review ? 'read-only' : 'workspace-write', '--skip-git-repo-check', '-C', cwd];
+  const descriptor = { agent: 'codex', cwd, sandbox: review ? 'read-only' : 'workspace-write', processGroup: true, config: {} };
   if (outputSchemaFile !== undefined) {
     if (typeof outputSchemaFile !== 'string' || !outputSchemaFile.trim()) {
       throw new TypeError('codex-direct-task: `outputSchemaFile` must be a non-empty path when given');
     }
     // `exec resume` does not support --output-schema; validate the option on every path.
-    if (resumeThreadId === undefined) argv.push('--output-schema', outputSchemaFile);
+    if (resumeThreadId === undefined) descriptor.outputSchemaFile = outputSchemaFile;
   }
   if (outputLastMessageFile) {
     if (typeof outputLastMessageFile !== 'string' || !outputLastMessageFile.trim()) {
       throw new TypeError('codex-direct-task: `outputLastMessageFile` must be a non-empty path when given');
     }
-    argv.push('-o', outputLastMessageFile);
+    descriptor.outputLastMessageFile = outputLastMessageFile;
   }
-  if (ephemeral) argv.push('--ephemeral');
+  descriptor.ephemeral = ephemeral;
   for (const dir of addDirs) {
     if (typeof dir !== 'string' || !dir.trim()) {
       throw new TypeError('codex-direct-task: every entry in `addDirs` must be a non-empty path');
     }
-    argv.push('--add-dir', dir);
   }
+  descriptor.addDirs = addDirs;
   // #3635 Fork 1 — UNCONDITIONAL: `-m` and effort are always emitted from the task route.
   // Never rely on the CLI implicit default for either axis.
-  argv.push('-m', assertCodexModel(model, 'codex-direct-task'));
+  descriptor.model = assertCodexModel(model, 'codex-direct-task');
   if (effort !== undefined) {
     const mapped = Object.hasOwn(CODEX_EFFORT_MAP, effort) ? CODEX_EFFORT_MAP[effort] : undefined;
     if (!mapped) {
       throw new TypeError(`codex-direct-task: \`effort\` must be one of ${Object.keys(CODEX_EFFORT_MAP).join('|')}, got ${JSON.stringify(effort)}`);
     }
-    argv.push('-c', `model_reasoning_effort=${mapped}`);
+    descriptor.config.model_reasoning_effort = mapped;
   }
   // #4665 — grant only the edit job's bookkeeping/fixture roots, never the whole lane pool.
   // JSON string/array encoding is also valid TOML for these paths; argv is passed without a shell.
@@ -311,13 +312,15 @@ export function buildCodexDirectTaskArgv({
     if (!Array.isArray(writableRoots) || writableRoots.some((p) => typeof p !== 'string' || !p.trim())) {
       throw new TypeError('codex-direct-task: `writableRoots` must contain non-empty paths');
     }
-    argv.push('-c', 'sandbox_workspace_write.network_access=true');
-    if (writableRoots.length) argv.push('-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(writableRoots)}`);
+    descriptor.config['sandbox_workspace_write.network_access'] = true;
+    if (writableRoots.length) descriptor.config['sandbox_workspace_write.writable_roots'] = writableRoots;
     // R650: shim dir first on the shell PATH so bare vitest/playwright/npx-vitest refuse (heavy-admission bypass).
-    argv.push('-c', `shell_environment_policy.set.PATH=${JSON.stringify(codexShimPath(env))}`);
+    descriptor.config['shell_environment_policy.set.PATH'] = codexShimPath(env);
+    descriptor.pathPrefix = CODEX_SHIM_DIR;
     if (tempRoot) {
+      descriptor.tempRoot = tempRoot;
       for (const name of ['TMPDIR', 'TMP', 'TEMP']) {
-        argv.push('-c', `shell_environment_policy.set.${name}=${JSON.stringify(tempRoot)}`);
+        descriptor.config[`shell_environment_policy.set.${name}`] = tempRoot;
       }
     }
   }
@@ -325,10 +328,15 @@ export function buildCodexDirectTaskArgv({
   // Reuse all routed configuration and grants rather than inheriting the user's defaults.
   if (resumeThreadId !== undefined) {
     assertResumeThreadId(resumeThreadId, { ephemeral });
-    argv.push('resume', resumeThreadId, '-');
+    descriptor.resumeThreadId = resumeThreadId;
   }
   // Everything rides stdin, closed via `.end()`.
-  return argv;
+  return descriptor;
+}
+
+/** Compatibility projection; the launch site consumes the structured descriptor directly. */
+export function buildCodexDirectTaskArgv(options) {
+  return buildAgentArgs(buildCodexDirectTaskDescriptor(options));
 }
 
 /**
@@ -1037,6 +1045,7 @@ export function runGate({ dir, mode, execFn = defaultExecFn, asyncExecFn, env = 
  * @param {string} opts.logFile
  * @param {boolean} [opts.stream]
  * @param {Function} [opts.spawnFn]
+ * @param {Function} [opts.resolveBinaryFn] - trusted test seam; production uses fixed binary lookup.
  * @param {string} [opts.cli]
  * @returns {Promise<{stdout: string, stderr: string, code: number|null, timedOut: boolean, argv: string[]}>}
  */
@@ -1051,6 +1060,7 @@ export async function runCodexDirectExec({
   logFile,
   stream = true,
   spawnFn = nodeSpawn,
+  resolveBinaryFn,
   cli = CODEX_CLI,
   gitDir = join(dir, '.git'),
   writableRoots = [],
@@ -1067,7 +1077,8 @@ export async function runCodexDirectExec({
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, review ? `codex-self-review-${randomUUID()}-last-message.txt` : 'codex-direct-task-last-message.txt');
   route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
-  const argv = buildCodexDirectTaskArgv({ env, route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
+  const descriptor = buildCodexDirectTaskDescriptor({ env, route, cwd: dir, outputLastMessageFile, outputSchemaFile, model, effort, ephemeral, review, writableRoots, tempRoot, resumeThreadId });
+  const argv = buildAgentArgs(descriptor);
   const prompt = buildCodexPrompt(task, { review, policy });
   writeFileSync(logFile, '', { flag: resumeThreadId ? 'a' : 'w' });
   // A resumed turn that emits no final file must not reuse an earlier completion report.
@@ -1076,8 +1087,8 @@ export async function runCodexDirectExec({
   return new Promise((resolvePromise, reject) => {
     let child;
     try {
-      child = spawnFn(cli, argv, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
-        env: review ? env : { ...env, PATH: codexShimPath(env), ...(tempRoot ? { TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot } : {}) } });
+      if (cli !== CODEX_CLI) throw new TypeError('codex-direct-task: cli must be codex');
+      child = launchAgent(descriptor, { spawn: spawnFn, resolveBinary: resolveBinaryFn });
     } catch (e) {
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
@@ -1199,6 +1210,7 @@ export async function runCodexDirectExec({
  * @param {NodeJS.ProcessEnv} [opts.env] - for `resolveCodexHome`. Default `process.env`.
  * @param {Function} [opts.execFn]
  * @param {Function} [opts.spawnFn]
+ * @param {Function} [opts.resolveBinaryFn] - trusted test seam; production uses fixed binary lookup.
  * @param {(prefix: string) => string} [opts.mkTempDir]
  * @param {(path: string) => boolean} [opts.existsFn]
  * @param {Function} [opts.readQuotaFn] - injectable, default `readRolloutQuota`.
@@ -1265,6 +1277,7 @@ async function runCodexDirectTask({
   execFn = defaultExecFn,
   gateExecFn,
   spawnFn = nodeSpawn,
+  resolveBinaryFn,
   mkTempDir = (prefix) => mkdtempSync(prefix),
   existsFn = existsSync,
   selfReviewFn,
@@ -1342,7 +1355,7 @@ async function runCodexDirectTask({
   const heavyLockRoot = review ? undefined : resolve(admissionLockRoot(resolve(targetDir), env));
   const writableRoots = review ? [] : [gitDir, heavyLockRoot, join(dirname(heavyLockRoot), 'remote'), tempRoot];
   const run = await withCodexUsage({ model, effort, taskKind: usageTaskKind ?? taskKind ?? (review ? 'review' : 'worker'), caller, repo, pr, card, cwd: targetDir }, () => runCodexDirectExec({
-    dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
+    dir: targetDir, task, outputSchemaFile, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, resolveBinaryFn, review,
     gitDir, writableRoots, tempRoot, env, policy: briefPolicy, resumeThreadId,
   }), { env });
   const events = parseJsonlEvents(run.stdout);
@@ -1359,7 +1372,7 @@ async function runCodexDirectTask({
       if (!summary.threadId) throw new Error('self-review requires the original builder session');
       const fixed = await withCodexUsage({ model, effort, taskKind: 'fix', caller, repo, pr, card, cwd: targetDir },
         () => runCodexDirectExec({ dir: targetDir, task: prompt, route, model, effort,
-          timeoutMs, logFile: resolvedLogFile, stream, spawnFn, gitDir, writableRoots, tempRoot, env,
+          timeoutMs, logFile: resolvedLogFile, stream, spawnFn, resolveBinaryFn, gitDir, writableRoots, tempRoot, env,
           policy: briefPolicy, resumeThreadId: summary.threadId }), { env });
       if (fixed.code !== 0 || fixed.timedOut) throw new Error('self-review builder failed');
       events.push(...parseJsonlEvents(fixed.stdout));
