@@ -145,8 +145,7 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
-import { boundedPlatformText } from '../lib/platform-preferences-io.mjs';
-import { constants, openSync, closeSync, readSync, fstatSync, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
 import { hostname, homedir, userInfo, loadavg, cpus, constants as osConstants } from 'node:os';
@@ -422,41 +421,16 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
 
 const admissionPolicyCache = new Map();
 const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
-function withoutCachedClientPath(platform) {
-  if (!admissionObject(platform?.remote)) return platform;
-  const { clientPath, ...remote } = platform.remote;
-  return { ...platform, remote };
-}
-function readPersistedPlatformBlock(cachePath) {
-  const fd = openSync(cachePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const info = fstatSync(fd);
-    if (!info.isFile() || info.uid !== process.getuid() || (info.mode & 0o022)) throw Error('untrusted platform cache');
-    // The cache is a small block, not the full platform preferences bag.
-    return JSON.parse(boundedPlatformText(cachePath, { openSync: () => fd, readSync, closeSync: () => {} }, 256 * 1024));
-  } finally { closeSync(fd); }
-}
-// Bound and bind persisted evidence to its source, including env-selected private pools.
-function persistPlatformBlock(path, platform, cachePath) {
-  let temp;
-  try {
-    mkdirSync(dirname(cachePath), { recursive: true });
-    temp = `${cachePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    writeFileSync(temp, JSON.stringify({ path, at: Date.now(), heavyAdmission: withoutCachedClientPath(platform) ?? null }), { flag: 'wx', mode: 0o600 });
-    renameSync(temp, cachePath);
-  } catch { try { unlinkSync(cachePath); } catch { /* never leave an older permissive cache behind a failed refresh */ } }
-  finally { if (temp) try { unlinkSync(temp); } catch { /* renamed or unavailable */ } }
-}
+// The host platform bag grew past 256 KiB on 2026-11-19 and every fresh process then read the standard layer
+// (remote.enabled=false); the bound is a sanity limit, not a policy limit.
+const PLATFORM_FILE_MAX_BYTES = 4 * 1024 * 1024;
 /**
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
- * remote client code. ENOENT clears in-process last-good and ignores persisted evidence. Other failed reads keep the last
- * good value (in-process first, then source-bound `<lockRoot>/platform-last-good.json`) and is not cached,
- * so a torn write is retried by the next caller instead of pinning the standard. Successful parses persist
- * only the heavyAdmission block without remote.clientPath, atomically and best effort. Cached client paths
- * are never reused; executable selection requires a successful host-file read.
+ * remote client code. A read that fails keeps the last
+ * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
   let platform; let tool; let path; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
@@ -469,36 +443,23 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     path = envSelected ? env.WE_PLATFORM_PREFERENCES : join(home ?? realHomeDir(), '.claude', 'platform-preferences.json');
   }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const cachePath = path ? join(dirname(path), '.heavy-admission-last-good.json') : undefined;
-  const key = JSON.stringify([path, cachePath, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, envSelected, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
   if (path) try {
-    const file = JSON.parse(boundedPlatformText(path));
-    if (!admissionObject(file)) throw new Error('expected a platform object');
-    if (Object.hasOwn(file, 'heavyAdmission')) platform = file.heavyAdmission;
-    if (platform !== undefined && !admissionObject(platform)) throw new Error('expected a heavyAdmission object');
-    platformLastGood.set(path, withoutCachedClientPath(platform));
-    persistPlatformBlock(path, platform, cachePath);
+    if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    if (admissionObject(file) && Object.hasOwn(file, 'heavyAdmission')) platform = file.heavyAdmission;
+    platformLastGood.set(path, platform);
   } catch (e) {
-    readFailed = true;
-    let reused = false;
-    if (e?.code === 'ENOENT') {
-      platformLastGood.delete(path);
-    } else if (platformLastGood.has(path)) {
-      platform = platformLastGood.get(path);
-      reused = true;
-    } else try {
-      const saved = readPersistedPlatformBlock(cachePath);
-      if (saved.path === path && Number.isFinite(saved.at) && Date.now() - saved.at >= 0 && Date.now() - saved.at <= 30 * 60_000 && (saved.heavyAdmission === null || admissionObject(saved.heavyAdmission))) {
-        platform = withoutCachedClientPath(saved.heavyAdmission) ?? undefined;
-        reused = true;
-      }
-    } catch { /* No usable persisted evidence: resolve the standard layer. */ }
-    if (e?.code !== 'ENOENT' || reused) errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}${reused ? '; last-good used' : ''}`);
+    if (e?.code !== 'ENOENT') {
+      readFailed = true;
+      errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`);
+      if (platformLastGood.has(path)) platform = platformLastGood.get(path);
+    } else platformLastGood.delete(path);
   }
-  // Environment-selected files cannot select executable client code either.
+  // Strip after last-good fallback, without changing the block cached for host-file readers.
   if (envSelected && platform?.remote?.clientPath !== undefined) {
     const { clientPath, ...remote } = platform.remote;
     platform = { ...platform, remote };
