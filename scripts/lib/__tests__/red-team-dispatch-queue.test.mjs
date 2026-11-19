@@ -1587,3 +1587,37 @@ describe('live red-team queue reconciliation', () => {
     expect(f.logs.filter(line => line.includes('live PR unreadable'))).toHaveLength(2);
   });
 });
+
+
+describe('shared drain admission', () => {
+  it('honors persisted retryAt in the planner path too, then admits at expiry', () => {
+    const f = fixture();
+    const retryAt = Date.parse('2026-11-09T12:00:01Z');
+    f.files.set(f.file, JSON.stringify([{ key: `${repo}#1`, repo, pr: 1, head: head(1),
+      enqueuedAt: retryAt - 1000, attempts: 1, retryAt }]));
+    const queue = f.open();
+    const run = vi.fn(started);
+    runWithRedTeamQueue({ queue, ...inputs([1]), run });
+    expect(run.mock.calls[0][0].plan.refusals).toEqual([]);
+    expect(queue.entries()).toHaveLength(1);
+    f.advance();
+    runWithRedTeamQueue({ queue, ...inputs([1]), run });
+    expect(run.mock.calls[1][0].plan.refusals.map(row => row.prNumber)).toEqual([1]);
+    expect(f.open().entries()).toEqual([]);
+  });
+
+  it('orders a batch by enqueuedAt and turns ready planner skips into runnable admissions', () => {
+    const f = fixture({ readLivePr: ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr), isDraft: false }) });
+    f.files.set(f.file, JSON.stringify([1, 2, 3].map(pr => ({ key: `${repo}#${pr}`, repo, pr, head: head(pr),
+      enqueuedAt: 100 - pr, attempts: 1, blocked: 'planner-skip' }))));
+    const queue = f.open();
+    const run = vi.fn(started);
+    runWithRedTeamQueue({ queue, ...inputs([1, 2, 3]),
+      rawPrs: inputs([1, 2, 3]).rawPrs.map(pr => ({ ...pr, isDraft: false })),
+      capacity: { ...capacity(2), startsCeiling: 2, budget: { live: 0, max: 2, left: 2 } },
+      floor: { minConcurrent: 2, idlePct: 10 }, drain: true, run });
+    expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([3, 2]);
+    expect(queue.entries().map(entry => entry.pr)).toEqual([1]);
+    expect(queue.entries()[0].blocked).toBeUndefined();
+  });
+});

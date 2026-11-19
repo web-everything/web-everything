@@ -23,23 +23,37 @@ export default {
     const violations = [];
     try {
       const { drainRedTeamQueue } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
-      const { createRedTeamDispatchQueue } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-dispatch-queue.mjs')).href);
+      const { createRedTeamDispatchQueue, runWithRedTeamQueue } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/red-team-dispatch-queue.mjs')).href);
+      const { runRedTeamOnSkip } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-red-team-on-skip.mjs')).href);
       const now = 100_000_000, repo = 'example/project', head = 'a'.repeat(40);
       let stored = JSON.stringify([1, 2, 3].map(pr => ({ key: `${repo}#${pr}`, repo, pr, head,
         enqueuedAt: now - pr * 120 * 60_000, attempts: 2, blocked: 'planner-skip' })));
-      const queue = createRedTeamDispatchQueue({ file: 'memory', readFile: () => stored,
+      const queue = createRedTeamDispatchQueue({ file: 'memory', readFile: () => stored, now: () => now,
         writeFile: (_path, value) => { stored = value; }, rename: () => {}, unlink: () => {} });
       const starts = [], alerts = [];
-      const options = { queue, now: () => now, readLivePr: () => ({ state: 'OPEN', isDraft: false, headRefOid: head }),
-        capacity: { minConcurrent: 3, inFlight: 2, lanes: 10, remainingStarts: 10 },
-        alert: event => alerts.push(event), runRecovery: ({ plan }) => {
-          starts.push(plan.refusals[0].prNumber);
-          return { dispatched: [{ prNumber: starts.at(-1) }] };
-        } };
+      const capacity = () => ({ lanes: 10, remainingStarts: 10, startsCeiling: 10,
+        budget: { live: 2, max: 10, left: 8 } });
+      const options = { queue, now: () => now,
+        readPrs: () => [1, 2, 3].map(number => ({ number, headRefOid: head, isDraft: false, labels: [], comments: [] })),
+        capacity: capacity(), alert: event => alerts.push(event),
+        runQueue: input => runWithRedTeamQueue({ ...input, queue,
+          floor: { minConcurrent: 3, idlePct: 10 }, readCpuIdlePct: () => 100,
+          readLivePr: () => ({ state: 'OPEN', isDraft: false, headRefOid: head }),
+          readNetFiles: () => ({ ok: false }),
+          run: options => runRedTeamOnSkip({ ...options, now: () => now,
+            setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
+            readEvidence: () => ({ recorded: false, loopPayload: { verdict: { verdict: 'accept' },
+              findings: { read: { netBasis: { rev: head } } } } }),
+            readStatus: () => null, readWitness: null, readReviewRuns: () => [], syncLabels: () => {},
+            dispatch: ({ pr }) => { starts.push(pr); return { jobPid: 1000 + pr }; },
+          }),
+        }),
+      };
       await drainRedTeamQueue(options);
       if (JSON.stringify(starts) !== '[3]') violations.push('oldest skipped entry did not start alone within capacity');
       if (queue.entries().length !== 2) violations.push('dispatch did not settle the shared queue');
-      await drainRedTeamQueue({ ...options, capacity: { ...options.capacity, inFlight: 3 } });
+      await drainRedTeamQueue({ ...options, capacity: { ...capacity(), budget: { live: 3, max: 10, left: 7 } } });
+      if (JSON.stringify(starts) !== '[3]') violations.push('full floor dispatched an extra job');
       if (alerts.length !== 3) violations.push('age alerts missing or repeated for a key/head');
     } catch (error) { violations.push(`scenario failed: ${error.message}`); }
     return { violations };

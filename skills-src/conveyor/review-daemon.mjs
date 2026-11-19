@@ -1456,43 +1456,7 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 let redTeamDispatchQueue;
 const redTeamGateRetryHistory = new Map();
 let lastRedTeamQueueFloorLine;
-/** Separate interval pass: never depends on the review planner producing refusal rows. */
-export function cliRedTeamQueueDrain({ log = console } = {}) {
-  if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
-  const note = line => log.error(line);
-  redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: note });
-  const floor = loadRedTeamQueueFloor({ log: note });
-  const settings = loadRedTeamQueueDrainSettings({ log: note });
-  const budget = liveReviewRoundBudget();
-  const host = defaultReviewHostAdmission({ log: note });
-  const paused = planClaudeAuthDispatchGate().paused;
-  let lanes = 0;
-  try {
-    // Recovery lanes are a host-wide pool shared by the queued repositories.
-    const repos = [...new Set(redTeamDispatchQueue.entries().map(e => e.repo))];
-    lanes = repos.length ? Math.min(...repos.map(repo => defaultRecoveryLaneNumbers({ repo }).length)) : 0;
-  } catch { /* Unknown lanes hold admission. */ }
-  const provider = createGhProvider();
-  return drainRedTeamQueue({ queue: redTeamDispatchQueue, readLivePr: readLiveRedTeamPr, log: note,
-    capacity: { minConcurrent: floor.minConcurrent,
-      // All live review rounds conservatively bound red teams too; never infer free seats from unknown ps.
-      inFlight: budget.live, lanes, budget, alertAfterMin: settings.alertAfterMin,
-      remainingStarts: !paused && host.admitted ? host.maxPerTick : 0 },
-    runRecovery: options => {
-      const row = options.plan.refusals[0];
-      const raw = provider.readPrState(options.repo, row.prNumber);
-      if (raw?.state !== 'OPEN' || raw.headRefOid !== row.headSha) {
-        throw new Error('live recovery PR/head unreadable; retry next interval');
-      }
-      const comments = readCompletePrComments(row.prNumber, { repo: options.repo });
-      const rawPrs = [{ ...raw, number: row.prNumber, comments }];
-      return runRedTeamOnSkip({ ...options, rawPrs, dispatch: d => dispatchReviewJob(d) });
-    },
-  });
-}
-
-export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
-  const factsProvider = withFactsLabels(createGhProvider());
+function cachedQueuePrReader(readLivePr) {
   const livePrs = new Map();
   const readQueuePr = args => {
     const key = `${args.repo}#${args.pr}`;
@@ -1501,6 +1465,84 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     }
     return livePrs.get(key);
   };
+  return { read: readQueuePr, clear: () => livePrs.clear() };
+}
+
+/** Both the planner and timer use this single queue-run path. */
+export function cliRunRedTeamQueue(o, { log = console, readLivePr = readLiveRedTeamPr } = {}) {
+  let rawPrs = o.rawPrs;
+  try {
+    ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
+      rawPrs, log: line => log.error(line) }));
+  } catch { /* Label repair must never block red-team recovery. */ }
+  try {
+    runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
+      history: redTeamGateRetryHistory, log: line => log.error(line) });
+  } catch { /* Gate catch-up must never block the capacity queue. */ }
+  const options = { ...o, rawPrs,
+    dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
+  // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
+  const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
+  const queueWord = String(queueSetting ?? '').trim().toLowerCase();
+  // Same words the other boolean env settings accept; an unrecognised value fails open to the default (on), logged.
+  const queueOff = ['off', '0', 'false', 'no'].includes(queueWord);
+  if (queueWord && !queueOff && !['on', '1', 'true', 'yes'].includes(queueWord)) {
+    options.log(`review-daemon: red-team queue ignoring unrecognised WE_RED_TEAM_DISPATCH_QUEUE value (expected on/off/1/0/true/false); queue stays on`);
+  }
+  if (queueOff) {
+    options.log('review-daemon: red-team queue off (source: env WE_RED_TEAM_DISPATCH_QUEUE); recovery runs directly');
+    return runRedTeamOnSkip(options);
+  }
+  if (!redTeamDispatchQueue) {
+    options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
+    redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
+  }
+  // Reload operator policy every tick; retain only the diagnostic, never admission evidence.
+  let floor = null;
+  let floorLine;
+  try {
+    floor = loadRedTeamQueueFloor({ log: line => {
+      if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
+      else options.log(line);
+    } });
+  } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+  if (floorLine !== lastRedTeamQueueFloorLine) {
+    if (floorLine !== undefined) {
+      try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
+    }
+    lastRedTeamQueueFloorLine = floorLine;
+  }
+  return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
+    floor, readLivePr, readCpuIdlePct: () => sampleHost().idlePct });
+}
+
+/** Separate interval pass: never depends on the review planner producing refusal rows. */
+export function cliRedTeamQueueDrain({ log = console } = {}) {
+  if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+  const note = line => log.error(line);
+  redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: note });
+  const settings = loadRedTeamQueueDrainSettings({ log: note });
+  const budget = liveReviewRoundBudget();
+  const host = defaultReviewHostAdmission({ log: note });
+  const paused = planClaudeAuthDispatchGate().paused;
+  let lanes = 0;
+  try {
+    const repos = [...new Set(redTeamDispatchQueue.entries().map(e => e.repo))];
+    lanes = repos.length ? Math.min(...repos.map(repo => defaultRecoveryLaneNumbers({ repo }).length)) : 0;
+  } catch { /* Unknown lanes hold admission. */ }
+  const starts = !paused && host.admitted ? host.maxPerTick : 0;
+  const queuePrs = cachedQueuePrReader(readLiveRedTeamPr);
+  return drainRedTeamQueue({ queue: redTeamDispatchQueue, log: note, readPrs: defaultReadPrs,
+    alertAfterMin: settings.alertAfterMin,
+    capacity: { lanes, budget, remainingStarts: starts, startsCeiling: starts,
+      take: () => host.take?.(1) },
+    runQueue: options => cliRunRedTeamQueue(options, { log, readLivePr: queuePrs.read }),
+  });
+}
+
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
+  const factsProvider = withFactsLabels(createGhProvider());
+  const queuePrs = cachedQueuePrReader(readLivePr);
   return {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
@@ -1509,58 +1551,13 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget(listCommands ? { listCommands } : {}),
     reconcileRedTeamQueue: () => {
-      livePrs.clear();
+      queuePrs.clear();
       if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
       // Maintenance evicts terminal PRs and re-keys changed live heads.
-      redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
+      redTeamDispatchQueue.reconcile({ readLivePr: queuePrs.read });
     },
-    redTeamOnSkip: o => {
-      let rawPrs = o.rawPrs;
-      try {
-        ({ rawPrs } = syncResultOnHeadLabels({ repo: o.repo, refusals: o.plan?.refusals,
-          rawPrs, log: line => log.error(line) }));
-      } catch { /* Label repair must never block red-team recovery. */ }
-      try {
-        runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
-          history: redTeamGateRetryHistory, log: line => log.error(line) });
-      } catch { /* Gate catch-up must never block the capacity queue. */ }
-      const options = { ...o, rawPrs,
-        dispatch: d => dispatchReviewJob(d), log: line => log.error(line) };
-      // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
-      const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
-      const queueWord = String(queueSetting ?? '').trim().toLowerCase();
-      // Same words the other boolean env settings accept; an unrecognised value fails open to the default (on), logged.
-      const queueOff = ['off', '0', 'false', 'no'].includes(queueWord);
-      if (queueWord && !queueOff && !['on', '1', 'true', 'yes'].includes(queueWord)) {
-        options.log(`review-daemon: red-team queue ignoring unrecognised WE_RED_TEAM_DISPATCH_QUEUE value (expected on/off/1/0/true/false); queue stays on`);
-      }
-      if (queueOff) {
-        options.log('review-daemon: red-team queue off (source: env WE_RED_TEAM_DISPATCH_QUEUE); recovery runs directly');
-        return runRedTeamOnSkip(options);
-      }
-      if (!redTeamDispatchQueue) {
-        options.log(`review-daemon: red-team queue on (source: ${queueSetting === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`);
-        redTeamDispatchQueue = createRedTeamDispatchQueue({ log: options.log });
-      }
-      // Reload operator policy every tick; retain only the diagnostic, never admission evidence.
-      let floor = null;
-      let floorLine;
-      try {
-        floor = loadRedTeamQueueFloor({ log: line => {
-          if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
-          else options.log(line);
-        } });
-      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
-      if (floorLine !== lastRedTeamQueueFloorLine) {
-        if (floorLine !== undefined) {
-          try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
-        }
-        lastRedTeamQueueFloorLine = floorLine;
-      }
-      return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
-        floor, readLivePr: readQueuePr, readCpuIdlePct: () => sampleHost().idlePct });
-    },
+    redTeamOnSkip: o => cliRunRedTeamQueue(o, { log, readLivePr: queuePrs.read }),
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
     refreshScopeBloat: refreshScopeBloatedPr,
     postRefreshMarker: defaultPostRebaseComment,

@@ -214,27 +214,25 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    // Drain admission is head-bound and uses the same settlement ledger as planner admission.
-    admitDrain(entry, at) {
-      const current = entries.find(e => e.key === entry.key && e.head === entry.head);
-      if (!current || waiting.has(entry.key) || (current.retryAt ?? 0) > at) return [];
-      if (current.blocked === 'planner-skip') {
-        delete current.blocked;
-        changed(`unblocked ${entry.key}: independent drain`);
-      }
-      admissions.set(entry.repo, [{ ...current }]);
-      return [{ ...current }];
-    },
     noteDrain(entry, patch) {
       const current = entries.find(e => e.key === entry.key && e.head === entry.head);
       if (current) { Object.assign(current, patch); changed(`drain metadata ${entry.key}`); }
     },
-    admit(repo, count, { allowProbes = true } = {}) {
+    admit(repo, count, { allowProbes = true, drain = false, drainPr, readyPrs } = {}) {
       const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Least-recently-probed heads get the next bounded turn without using a runnable slot.
       // Missing turns get one-time legacy catch-up; newly blocked entries always carry a turn.
-      const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key));
+      const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key)
+        && (entry.retryAt ?? 0) <= now()
+        && (!drain || live.get(entry.key)?.isDraft === false && readyPrs?.has(entry.pr) && (drainPr == null || entry.pr === drainPr)));
+      if (drain) {
+        mine.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
+        for (const entry of mine) if (entry.blocked === 'planner-skip') {
+          delete entry.blocked;
+          changed(`unblocked ${entry.key}: drain retry`);
+        }
+      }
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
       const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
         .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, MAX_PROBES);
@@ -255,7 +253,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       }
       return copy(admitted);
     },
-    settle(repo, { dispatched = [], rows = [], notStarted = [] } = {}) {
+    settle(repo, { dispatched = [], rows = [], notStarted = [] } = {}, { drain = false } = {}) {
       const inputFailure = rows.find(row => row.prNumber == null && row.action === 'skip');
       // Only admitted rows may settle: held-out PRs are deliberately absent from planner output.
       for (const admitted of admissions.get(repo) ?? []) {
@@ -287,6 +285,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
             entries.push(entry);
             changed(`requeue ${entry.key}: ${failure.reason}`);
           } else changed(`hold ${entry.key}: attempt ${entry.attempts}/${limit}: ${failure.reason}`);
+          if (drain) {
+            entry.retryAt = now() + 60_000 * 2 ** Math.min(entry.attempts, 3);
+            changed(`retry cooldown ${entry.key}`);
+          }
         } else if (!row) remove(entry, 'absent from rows (not owed)');
       }
       admissions.delete(repo);
@@ -365,7 +367,7 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  floor, readCpuIdlePct, readLivePr, drain = false, drainPr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const transaction = transactions.get(queue)?.();
   try {
     const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
@@ -404,7 +406,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     for (const entry of cardOnlyCandidates) {
       const key = `${repo}#${entry.pr}`, livePr = liveEvidence.get(key);
       const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head);
-      if (current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
+      if (!drain && current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
       else candidates.push(entry);
     }
     if (floor?.minConcurrent > 0 && typeof readCpuIdlePct === 'function') {
@@ -412,16 +414,33 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
       try { cpuIdlePct = readCpuIdlePct(); } catch { /* An unreadable sample leaves capacity unchanged. */ }
       applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log });
     }
+    if (drain) {
+      // The timer uses the planner's live budget: reservations made by earlier repositories
+      // count toward the floor too. Unknown evidence holds dispatch until the next interval.
+      const budget = capacity?.budget;
+      const valid = value => Number.isSafeInteger(value) && value >= 0;
+      const minimum = floor?.minConcurrent;
+      const room = valid(minimum) && minimum <= (operatorFloors.has(floor) ? RED_TEAM_QUEUE_MIN_CONCURRENT_MAX : RED_TEAM_QUEUE_MIN_CONCURRENT_CAP)
+        && valid(budget?.live) && valid(budget?.max) && valid(budget?.left)
+        ? Math.max(0, minimum - Math.max(budget.live, budget.max - budget.left)) : 0;
+      if (capacity) {
+        capacity.remainingStarts = Math.min(redTeamQueueAdmitCount(capacity), room);
+        // Floor raises on subsequent calls cannot reopen these seats.
+        capacity.startsCeiling = Math.min(capacity.startsCeiling ?? 0, room);
+      }
+      if (!room) note(log, 'drain has no readable floor capacity; retained for next interval; inspect host/lane/queue limits if persistent');
+    }
     queue.sync(repo, candidates);
     // Exhausted but readable capacity: the runner refuses ("no review capacity left") before any retry is spent,
     // so everything passes through and worker-free settlement (clear/carry/label) is not delayed. Unreadable
     // capacity still admits nothing (fail closed).
     const bound = redTeamQueueAdmitCount(capacity);
     const finite = value => typeof value === 'number' && !Number.isNaN(value);
-    const exhausted = bound === 0 && capacity && finite(capacity.lanes)
+    const exhausted = !drain && bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity), drain, drainPr,
+      readyPrs: drain ? new Set(rawPrs?.filter(pr => pr.isDraft === false).map(pr => Number(pr.number))) : undefined });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
@@ -439,7 +458,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
       row.kind === 'already-reviewed-head' && allowed.has(Number(row.prNumber)) ? queuedRows[index++] : row) },
     rawPrs: held.size ? rawPrs?.filter(pr => !held.has(Number(pr.number))) : rawPrs, capacity, log, ...rest };
     const finish = result => {
-      queue.settle(repo, result);
+      queue.settle(repo, result, { drain });
       transaction?.commit();
       return result;
     };

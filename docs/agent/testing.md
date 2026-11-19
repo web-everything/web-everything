@@ -4934,7 +4934,11 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Independent red-team queue drain
 
-`red-team-queue-drain.test.mjs` injects live PR evidence, recovery, clock, alerts, and in-memory persistence.
-Keep the planner out of these fixtures: the drain must retry `planner-skip` entries on its own interval,
-preserve age on head changes, and retain unknown live PRs without dispatching. Retry cooldown and alert
-deduplication must survive a queue restart. The soak break detects the fix by executing that behavior.
+`red-team-queue-drain.test.mjs` exercises the shared `runWithRedTeamQueue` transaction and real
+`runRedTeamOnSkip` with injected live PRs, dispatch, clock, alerts, and in-memory persistence.
+Keep the planner out of these fixtures: the timer synthesizes every queued candidate, retries
+`planner-skip` entries in age order after `retryAt`, and retains drafts and unknown evidence.
+The shared admission uses the same live-review budget as the planner, bounded by the queue floor
+minus in-flight rounds. A failed post-dispatch persist must repair on the next (even empty) drain
+without offering the started head again. Alert marks follow successful delivery and survive restart.
+The soak break executes this shared path; retain its test-timings entry.

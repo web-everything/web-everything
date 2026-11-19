@@ -40,3 +40,42 @@ describe('review daemon independent queue timer', () => {
     expect(drain).toHaveBeenCalledTimes(1);
   });
 });
+
+
+it('timer uses the planner queue runner, fresh PR reader, shared live budget, and cached head evidence', async () => {
+  const drainSource = source.slice(source.indexOf('export function cliRedTeamQueueDrain('),
+    source.indexOf('export function cliReviewTickOpts(')).replace('export ', '');
+  const cacheSource = source.slice(source.indexOf('function cachedQueuePrReader('),
+    source.indexOf('/** Both the planner and timer'));
+  const queue = { entries: () => [{ repo: 'example/one' }, { repo: 'example/two' }] };
+  const budget = { live: 2, max: 6, left: 4 };
+  const host = { admitted: true, maxPerTick: 2, take: vi.fn() };
+  const readPrs = vi.fn(), readLivePr = vi.fn(() => ({ state: 'OPEN', isDraft: false }));
+  const sharedRun = vi.fn((options, { readLivePr }) => {
+    const key = { repo: 'example/one', pr: 1 };
+    readLivePr(key); readLivePr(key);
+    return { dispatched: [] };
+  });
+  const drain = vi.fn(options => {
+    expect(options.readPrs).toBe(readPrs);
+    expect(options.capacity.budget).toBe(budget);
+    expect(options.capacity).toMatchObject({ lanes: 3, remainingStarts: 2, startsCeiling: 2 });
+    expect(options.alertAfterMin).toBe(60);
+    options.capacity.take();
+    return options.runQueue({ repo: 'example/one', drain: true });
+  });
+  const make = new Function('redTeamDispatchQueue', 'createRedTeamDispatchQueue',
+    'loadRedTeamQueueDrainSettings', 'liveReviewRoundBudget', 'defaultReviewHostAdmission',
+    'planClaudeAuthDispatchGate', 'defaultRecoveryLaneNumbers', 'readLiveRedTeamPr',
+    'drainRedTeamQueue', 'defaultReadPrs', 'cliRunRedTeamQueue', 'process',
+    `${cacheSource}\nreturn (${drainSource});`);
+  const tick = make(queue, vi.fn(), () => ({ alertAfterMin: 60 }), () => budget, () => host,
+    () => ({ paused: false }), ({ repo }) => repo === 'example/one' ? [1, 2, 3] : [1, 2, 3, 4],
+    readLivePr, drain, readPrs, sharedRun, { env: {} });
+  const log = { error: vi.fn() };
+  await tick({ log });
+  expect(sharedRun).toHaveBeenCalledWith({ repo: 'example/one', drain: true },
+    { log, readLivePr: expect.any(Function) });
+  expect(readLivePr).toHaveBeenCalledTimes(1);
+  expect(host.take).toHaveBeenCalledWith(1);
+});
