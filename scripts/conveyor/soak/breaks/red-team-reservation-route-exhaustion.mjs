@@ -11,10 +11,10 @@ export default {
   card: 'red-team reservation route exhaustion',
   fixedBy: { sha: 'working-tree', where: 'current tree', paths: ['scripts/operations/review-extra-seats.mjs', 'scripts/operations/review-job.mjs'] },
   fixPresent(root) {
-    // The harness needs a synchronous predicate. Exercise the same hermetic behavior
-    // in a bounded child rather than infer presence from a source-code substring.
+    // Presence = the capability exists in the tree (the launcher helper is exported). The behaviour is
+    // judged by run(), so a regression of the behaviour FAILS the green test instead of flipping to expected-fail.
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
-      `const {default:b}=await import(${JSON.stringify(pathToFileURL(join(root, MODULE)).href)}); const r=await b.run({sourceRoot:${JSON.stringify(root)}}); process.exitCode=b.judge(r).length?1:0;`],
+      `const m=await import(${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/review-seat-caps.mjs')).href)}); process.exitCode=typeof m.reviewSeatLaunchEnv==='function'?0:1;`],
     { cwd: root, env: process.env, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 });
     return probe.status === 0;
   },

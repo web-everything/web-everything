@@ -311,6 +311,8 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     }
     expect(speculativeEnv).toMatchObject({ ...env, PATH: 'shim' });
     expect(reviewSeatLaunchEnv({})).not.toHaveProperty('WE_REVIEW_SEAT_CAP_AGY_GEMINI');
+    // A garbage inherited cap never displaces a valid overlay cap.
+    expect(reviewSeatLaunchEnv({ WE_REVIEW_SEAT_CAP_CODEX: 'garbage' }, { WE_REVIEW_SEAT_CAP_CODEX: '0' }).WE_REVIEW_SEAT_CAP_CODEX).toBe('0');
   });
 
   it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('advisory CI waiver: %s', state => {

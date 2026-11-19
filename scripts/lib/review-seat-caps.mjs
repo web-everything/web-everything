@@ -19,7 +19,10 @@ export const PROVIDER_CAP_ENV = Object.freeze({
 export function reviewSeatLaunchEnv(env, overlay = {}) {
   const child = { ...env, ...overlay };
   for (const key of [DAILY_CAP_ENV, ...Object.values(PROVIDER_CAP_ENV)]) {
-    if (env?.[key] !== undefined) child[key] = env[key];
+    // Only a valid operator cap is inherited; a garbage value must not displace a good overlay cap.
+    const raw = env?.[key];
+    const n = Number(raw);
+    if (raw !== undefined && raw !== '' && Number.isInteger(n) && n >= 0) child[key] = raw;
   }
   return child;
 }
