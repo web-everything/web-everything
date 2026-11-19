@@ -70,3 +70,32 @@ for (const injector of element.injectors()) console.log(injector.providers); // 
 const r = registry.parse('expr'); console.log(r.success, r.expressions, r.remaining); // parser
 ```
 Subclass `CustomAttribute` and log in `connectedCallback`/`disconnectedCallback` to trace lifecycle.
+
+## Capacity routing and reset calendar
+
+Build-only `routing.builder=auto` uses `routing.capacity` through the declared settings
+reader and policy-cascade (standard → platform → tool; environment selects the builder).
+Explicit builders retain their existing behavior. No provider is invoked to probe usage.
+`node scripts/operations/run.mjs capacity-calendar [--json]` shows observations, all build-kind
+scores, plan labels and burn windows. Decisions go to `capacity-decisions.jsonl` under the
+shared conveyor state root (`WE_CAPACITY_LEDGER` overrides it); burn receipts dedupe monitor
+events per provider/reset. Telemetry failures never interrupt dispatch.
+
+Defaults: `staleHours=6`, `exhaustedPercent=98`, `urgencyWeight=4`,
+`urgencyHorizonHours=24`, `reservePercent=10`, `reserveReleaseHours=6`,
+`targetPercent=95`, `paceTolerance=10`, `aheadPenalty=0.7`, `behindBoost=1.2`,
+`burnWindowHours=4`, `burnUnusedPercent=40`. `enabled` defaults true only in auto.
+`allowed` maps kind to providers (default Codex/Claude); `tiers` maps provider to number
+and `kindMinTier` maps kind to minimum (both default 0). `longKinds=[]` opts kinds into
+remaining-capacity weighting; `criticalKinds` defaults critical/security/audit/audit-full
+(and kinds containing those words retain reserve access). `allowUnknownEmergency=false`
+gates agy-claude, which also requires explicit kind allowlisting and all scored alternatives
+to be excluded. Unknown usage never scores. `calendar` maps provider to `daily`/`weekly`
+rules, e.g. `{ "claude": { "weekly": "Thu 14:00 America/New_York" } }`. Calendars
+supply reset times only, never usage. Invalid/stale/oversized usage files remain unknown.
+
+The highest usage window binds scoring and urgency. Every window retains its reserve
+until its release time; critical work can consume it. Linear pace uses 5h/7d/1d lengths;
+Codex window_minutes takes precedence. No eligible provider refuses with an operator-visible
+wait-for-reset/clear-hold message; all readers unknown preserves threshold routing and the
+configured repair chain. Audit/review seats do not use this chooser.

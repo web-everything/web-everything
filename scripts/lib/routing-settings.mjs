@@ -1,6 +1,9 @@
 /** Who writes code: routing.builder (claude | codex | auto). Audits and review seats stay on routing.auditProvider. */
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readCodexQuota } from './codex-usage-ledger.mjs';
+import { CAPACITY_DEFAULTS, chooseBuilder } from './provider-capacity.mjs';
+import { observeCapacity, recordCapacityDecision } from './provider-capacity-io.mjs';
+import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
 export const BUILDERS = Object.freeze(['claude', 'codex', 'auto']);
 /** Dispatch kinds whose code-writing may move off Codex. Review, red-team and audit seats are never in this list. */
@@ -20,15 +23,35 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
   if (Number.isFinite(file.autoClaudeAbovePercent) && file.autoClaudeAbovePercent >= 0 && file.autoClaudeAbovePercent <= 100) out.autoClaudeAbovePercent = file.autoClaudeAbovePercent;
   const raw = typeof env?.WE_ROUTING_BUILDER === 'string' ? env.WE_ROUTING_BUILDER.trim() : '';
   if (raw) { out.builder = BUILDERS.includes(raw) ? raw : 'claude'; out.source = 'env'; }
+  const capacity = cascadePolicy('routing.capacity', file.capacity, {
+    standard: { ...CAPACITY_DEFAULTS, enabled: out.builder === 'auto' }, env,
+    platform: readPlatformPreferences({ env }).prefs.routing?.capacity ?? {},
+    valid: Object.fromEntries(Object.entries({ ...CAPACITY_DEFAULTS, enabled: true }).map(([key, value]) => [key,
+      typeof value === 'number' ? v => Number.isFinite(v) && v >= 0 && (!['urgencyHorizonHours', 'staleHours'].includes(key) || v > 0)
+        : typeof value === 'boolean' ? v => typeof v === 'boolean'
+          : Array.isArray(value) ? v => Array.isArray(v) && v.every(x => typeof x === 'string')
+            : key === 'allowed' ? v => Array.isArray(v) && v.every(x => typeof x === 'string')
+              : key === 'calendar' ? v => typeof v === 'string'
+                : v => Number.isFinite(v) && v >= 0,
+    ])),
+  });
+  out.capacity = capacity.value;
+  out.capacitySources = capacity.sources;
   return out;
 }
 
-/** The effective builder: 'claude' or 'codex'. `auto` reads the newest Codex quota reading; unknown keeps codex. */
-export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota } = {}) {
+/** Explicit builders are unchanged; auto scores capacity and retains the threshold fallback when all usage is unknown. */
+export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota, kind = 'build', capacity, now = Date.now(), records, record = recordCapacityDecision } = {}) {
   const s = resolveRoutingSettings({ env, ...(repo ? { repo } : {}), ...(declared ? { declared } : {}) });
   if (s.builder !== 'auto') return { builder: s.builder, source: s.source, settings: s };
-  const q = quota(env);
+  let q;
+  try { q = quota(env); } catch { q = null; }
   const used = Number.isFinite(q?.used_percent) ? q.used_percent : null;
   // Unreadable quota is not "below threshold": the quota-safe direction is claude.
-  return { builder: used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude', source: 'auto', usedPercent: used, settings: s };
+  const fallback = used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude';
+  if (!s.capacity.enabled) return { builder: fallback, source: 'auto', usedPercent: used, settings: s };
+  const capacities = capacity ?? observeCapacity({ env, now, settings: s.capacity, quota: () => q, records });
+  const decision = chooseBuilder({ kind, capacities, settings: { ...s.capacity, now }, fallback });
+  try { record(decision, { env, now, kind, capacities, settings: s.capacity }); } catch { /* best effort */ }
+  return { builder: decision.provider, source: 'auto', usedPercent: used, settings: s, capacities, decision };
 }

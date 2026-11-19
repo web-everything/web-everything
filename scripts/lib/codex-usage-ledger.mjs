@@ -63,7 +63,9 @@ export function readCodexQuota(env = process.env) {
         try { e = JSON.parse(line); } catch { continue; }
         const limits = e?.type === 'event_msg' && e.payload?.type === 'token_count' ? e.payload.rate_limits : null;
         if (limits?.limit_id === 'codex' && Number.isFinite(limits.primary?.used_percent)) {
-          return { used_percent: limits.primary.used_percent, resets_at: limits.primary.resets_at ?? null };
+          return { used_percent: limits.primary.used_percent, resets_at: limits.primary.resets_at ?? null,
+            ...(limits.primary.window_minutes ? { window_minutes: limits.primary.window_minutes } : {}),
+            ...(limits.secondary ? { secondary: limits.secondary } : {}) };
         }
       }
     }

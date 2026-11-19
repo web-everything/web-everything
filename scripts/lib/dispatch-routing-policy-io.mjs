@@ -1,7 +1,7 @@
 /** The only filesystem boundary for routing policy: reload, retain last-good, and forward snapshots. */
 import { readFileSync } from 'node:fs';
 import { ROUTING_POLICY_PATH, trustedSnapshot } from './dispatch-routing-policy-source.mjs';
-import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort } from './dispatch-routing-policy.mjs';
+import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, resolveOperationRoute as resolvePureRoute, resolvePolicyModel as resolvePureModel, operationEffort, defaultPolicyModel } from './dispatch-routing-policy.mjs';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
@@ -86,7 +86,11 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   }
   // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
   // Resolve the builder once, so an `auto` quota reading cannot change between the refusal and the hold.
-  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder() : null;
+  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity }) : null;
+  if (builder?.decision?.provider === null) return { outcome: 'refused', refusal: 'no eligible capacity; wait for quota reset or clear provider hold', auditTrail: [] };
+  for (const input of builder?.decision?.inputs ?? []) {
+    if (['held', 'exhausted'].includes(input.label)) availability[input.provider.startsWith('agy-') ? 'antigravity' : input.provider] = `capacity: ${input.label}`;
+  }
   const claudeBuilds = builder?.builder === 'claude';
   // Only the marker kinds read deliveryAgent (dispatch-contracts ignores it elsewhere), so only they count as explicit.
   const explicitCodex = MARKER_KINDS.includes(dispatch?.kind) && String(dispatch?.deliveryAgent ?? '').trim().toLowerCase() === 'codex';
@@ -103,7 +107,19 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     ? (availability.claude || options.ciHealAvailability?.claude || providerQuotaHold(records, 'claude', options.now ?? Date.now()) || null)
     : null;
   const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
-  return decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy: options.routingPolicy ?? readRoutingPolicy() });
+  let routingPolicy = options.routingPolicy ?? readRoutingPolicy();
+  if (builder?.decision?.reason === 'capacity-score' || builder?.decision?.reason === 'unknown-emergency') {
+    const provider = builder.builder;
+    const entry = { provider, model: defaultPolicyModel(provider), effort: 'medium',
+      fallback: provider === 'claude' || availability.claude ? [] : [{ provider: 'claude', model: 'sonnet', effort: 'medium' }] };
+    // Only this build operation is projected; the existing critical-work gate still rules the route.
+    routingPolicy = { ...routingPolicy, smallPrepare: undefined, operations: { ...routingPolicy.operations,
+      [dispatch.kind]: entry,
+      ...(['prepare', 'prepare-item'].includes(dispatch.kind) ? { 'prepare-decision': entry } : {}),
+      ...Object.fromEntries(Object.keys(routingPolicy.operations).filter(k => k.startsWith(`${dispatch.kind}:`)).map(k => [k, entry])),
+    } };
+  }
+  return decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy });
 }
 export function routingPolicyEnv() {
   return { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) };
