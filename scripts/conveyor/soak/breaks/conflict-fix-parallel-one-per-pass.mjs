@@ -6,7 +6,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 // Run the target tree's real dispatcher, with every dispatch/claim/GitHub/lane IO seam injected.
 const PROBE = `
-  const { runReconcileFixDispatch } = await import(process.argv[1]);
+  // argv[1] is '-' for a stdin script; the target module URL follows it.
+  const { runReconcileFixDispatch } = await import(process.argv[2]);
   const rows = [1, 2, 3, 4, 5, 6].map(prNumber => ({
     kind: 'fix', prNumber, headRefName: 'conflict-' + prNumber, isConflict: true, baseRefName: 'main',
   }));
