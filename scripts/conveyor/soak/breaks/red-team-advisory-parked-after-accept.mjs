@@ -27,7 +27,7 @@ export default {
     const { readRecoveryWitness } = await import(pathToFileURL(join(sourceRoot, SOURCE)).href);
     const dir = mkdtempSync(join(tmpdir(), 'soak-red-team-advisory-'));
     try {
-      const runsDir = join(dir, 'runs'), repo = 'web-everything/web-everything', pr = 7151, head = 'a'.repeat(40);
+      const runsDir = join(dir, 'runs'), repo = 'example/soak-repo', pr = 7151, head = 'a'.repeat(40);
       const accepted = { ...newRunRecord({ id: 'review-pr-accepted', op: 'review-pr', input: { repo, pr } }),
         verdict: { verdict: 'accept', humanRequired: false }, findings: { read: { netBasis: { rev: head } } },
         pending: null, effects: [{ key: 'record-label', type: 'review.label-swap', stepIndex: 1, index: 0, status: 'applied' }],
