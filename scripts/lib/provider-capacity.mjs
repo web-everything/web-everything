@@ -4,7 +4,7 @@ import defaults from '../settings/provider-capacity.json' with { type: 'json' };
 export const PROVIDER_DEFAULTS = defaults.providerCapacity;
 export const PROVIDERS = PROVIDER_DEFAULTS.providers.map(p => p.id);
 export const CAPACITY_DEFAULTS = {
-  staleHours: 6, exhaustedPercent: 98, urgencyWeight: 4, urgencyHorizonHours: 24,
+  staleHours: 6, rateLookbackHours: 24, exhaustedPercent: 98, urgencyWeight: 4, urgencyHorizonHours: 24,
   reserveReleaseHours: 6, fixedTargetPercent: 100, paceTolerance: 10,
   aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 24, burnUnusedPercent: 40,
   longKinds: [], resetAtPercent: 95, maxBurnBoost: 3,
@@ -57,7 +57,12 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       if (seed && seedAt <= now && (!raw || !Number.isFinite(at) || at < seedAt)) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
       else if (liveUsable) {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
-          add('five_hour', raw); add('weekly', raw?.secondary);
+          const name = (w, fallback) => w?.window_minutes > 0
+            ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
+              ?? ({ 10080: 'weekly', 300: 'five_hour' })[w.window_minutes] ?? `${w.window_minutes}_minutes`
+            : fallback;
+          add(name(raw, def.readers?.find(r => r.window)?.window ?? 'five_hour'), raw);
+          add(name(raw?.secondary, 'weekly'), raw?.secondary);
         } else {
           add('five_hour', raw?.five_hour); add('seven_day', raw?.seven_day);
           for (const w of raw?.windows ?? []) add(w.name, w);
@@ -135,7 +140,7 @@ export function planLine(capacities, settings = {}, now = Date.now()) {
     const hours = w ? Math.max(0, (w.resetsAt - now) / HOUR) : null;
     const reset = !w ? 'unknown' : hours <= 24 ? `in ${Math.round(hours * 10) / 10}h` :
       new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }).format(w.resetsAt);
-    const label = burns.some(b => b.provider === cap.provider) ? 'burn' : input.label;
-    return `${cap.provider}: ${w?.usedPercent ?? 'unknown'}% used, resets ${reset} -> ${label}`;
+    const label = burns.some(b => b.provider === cap.provider && b.account === (cap.account ?? null)) ? 'burn' : input.label;
+    return `${cap.account && cap.account !== cap.provider && !cap.quotaOf ? cap.account : cap.provider}: ${w?.usedPercent ?? 'unknown'}% used, resets ${reset} -> ${label}`;
   }).join('; ');
 }

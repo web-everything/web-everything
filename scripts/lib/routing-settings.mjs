@@ -27,7 +27,7 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
     standard: { ...CAPACITY_DEFAULTS, enabled: out.builder === 'auto' }, env,
     platform: readPlatformPreferences({ env }).prefs.routing?.capacity ?? {},
     valid: Object.fromEntries(Object.entries({ ...CAPACITY_DEFAULTS, enabled: true }).map(([key, value]) => [key,
-      typeof value === 'number' ? v => Number.isFinite(v) && v >= 0 && (!['urgencyHorizonHours', 'staleHours'].includes(key) || v > 0)
+      typeof value === 'number' ? v => Number.isFinite(v) && v >= 0 && (!['urgencyHorizonHours', 'staleHours', 'rateLookbackHours'].includes(key) || v > 0)
         : typeof value === 'boolean' ? v => typeof v === 'boolean'
           : Array.isArray(value) ? v => Array.isArray(v) && v.every(x => typeof x === 'string')
             : key === 'workingHours' ? () => true : v => v === null || typeof v === 'object' || typeof v === 'number' || typeof v === 'string',

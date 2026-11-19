@@ -45,11 +45,10 @@ export function renderCalendar(report) {
   }).concat(report.plan, `burn windows: ${JSON.stringify(report.burns)}`, `needs operator input: ${(report.needsOperatorInput ?? []).join('; ') || 'none'}`, ...(report.horizon ? [renderHorizon(report.horizon)] : [])).join('\n');
 }
 export function renderHorizon(horizon) {
-  return ['14-day horizon: date | provider/account | available % | expected demand %', ...horizon.days.flatMap(day => day.entries.map(e => `${day.date} | ${e.provider}/${e.account ?? '-'} | ${e.available ?? 'unknown'} | ${e.expectedDemand ?? 'unknown'}`)), ...horizon.recommendations.map(r => `${r.date}: ${r.command}`)].join('\n');
+  return ['14-day horizon: date | provider/account | available % | expected demand %', ...horizon.days.flatMap(day => day.entries.map(e => `${day.date} | ${e.provider}/${e.account ?? '-'} | ${e.available ?? 'unknown'} | ${e.expectedDemand ?? 'unknown'}`)), ...horizon.recommendations.map(r => `${r.date}: ${r.command}`), ...(horizon.needsOperatorInput ?? []).map(message => `needs operator input: ${message}`)].join('\n');
 }
 export const capacityCalendarOperation = () => op('capacity-calendar', { input: {
   horizon: { type: 'boolean', required: false, default: false },
-  json: { type: 'boolean', required: false, default: false },
 }, verdictFrom: 'read',
   read: compute({ reads: ['input.horizon'], fn: ({ input }) => capacityCalendar({ horizon: input?.horizon ?? false }) }),
 });

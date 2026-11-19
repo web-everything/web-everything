@@ -3,10 +3,10 @@ import { readFileSync, statSync, mkdirSync, appendFileSync, openSync, closeSync,
 import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { daemonConveyorStateRoot } from './daemon-last-good.mjs';
-import { readCodexQuota } from './codex-usage-ledger.mjs';
+import { readCodexQuota, readCodexBurnRate } from './codex-usage-ledger.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
-import { readProviderCapacity, burnWindows, PROVIDER_DEFAULTS } from './provider-capacity.mjs';
+import { readProviderCapacity, burnWindows, bindingWindow, PROVIDER_DEFAULTS } from './provider-capacity.mjs';
 
 function jsonFile(path) {
   try {
@@ -64,7 +64,9 @@ export function observeCapacity({ env = process.env, now = Date.now(), settings 
     hold: (p, at) => providerQuotaHold(records, p.startsWith('agy-') ? 'antigravity' : p, at),
   } });
   const rates = recentCapacityRates(env.WE_CAPACITY_LEDGER || join(daemonConveyorStateRoot(env), 'capacity-decisions.jsonl'), now);
-  return capacities.map(c => ({ ...c, currentRatePerHour: rates.get(`${c.quotaOf ?? c.provider}/${c.account ?? ''}`) ?? null }));
+  return capacities.map(c => ({ ...c, currentRatePerHour: (c.quotaOf ?? c.provider) === 'codex'
+    ? readCodexBurnRate({ env, now, lookbackHours: settings.rateLookbackHours ?? 24, window: bindingWindow(c) })
+    : rates.get(`${c.quotaOf ?? c.provider}/${c.account ?? ''}`) ?? null }));
 }
 
 export function recordCapacityDecision(decision, { env = process.env, now = Date.now(), kind = 'build', capacities = [], settings = {},

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { planCapacity, planHorizon, workingSlot, resetSlot, HOUR } from './capacity-planner.mjs';
 import { chooseBuilder, readProviderCapacity, PROVIDER_DEFAULTS, scoreProvider, burnWindows } from './provider-capacity.mjs';
 import { resolveRoutingSettings } from './routing-settings.mjs';
-import { capacityCalendar, renderCalendar, capacityCalendarOperation } from '../operations/capacity-calendar.mjs';
+import { capacityCalendar, renderCalendar, renderHorizon, capacityCalendarOperation } from '../operations/capacity-calendar.mjs';
 import { validateInput } from '../operations/registry.mjs';
 const now = Date.parse('2026-11-19T15:00:00Z'); // Thursday 10am ET
 const bucket = (count, hours) => ({ count, expiresAt: new Date(now + hours * HOUR).toISOString() });
@@ -99,18 +99,18 @@ describe('accounts, config and horizon', () => {
   });
   it('banked inventory can still shortfall when the next reset waits through the weekend', () => {
     const c = cap('fixed', 100, { bankedResets: [bucket(3, 200)] });
-    const h = planHorizon({ capacities: [c], now, days: 2, demandPerDay: 100 });
+    // Start Friday: the second ET calendar day is Saturday and its reset waits until Monday.
+    const h = planHorizon({ capacities: [c], now: now + 24 * HOUR, days: 2, demandPerDay: 100 });
     expect(h.days[0].entries[0].shortfall).toBe(false);
     expect(h.days[1].entries[0]).toMatchObject({ shortfall: true, bankedConsumed: [], expectedDemand: 100 });
   });
   it('calendar flags are optional, default false, and accept explicit booleans only', () => {
     const { input } = capacityCalendarOperation();
     expect(input.horizon).toMatchObject({ type: 'boolean', required: false, default: false });
-    expect(input.json).toMatchObject({ type: 'boolean', required: false, default: false });
-    expect(validateInput(input, {})).toMatchObject({ ok: true, value: { horizon: false, json: false } });
-    expect(validateInput(input, { horizon: true, json: true })).toMatchObject({ ok: true, value: { horizon: true, json: true } });
+    expect(input).not.toHaveProperty('json');
+    expect(validateInput(input, {})).toMatchObject({ ok: true, value: { horizon: false } });
+    expect(validateInput(input, { horizon: true })).toMatchObject({ ok: true, value: { horizon: true } });
     expect(validateInput(input, { horizon: 'true' }).ok).toBe(false);
-    expect(validateInput(input, { json: 'true' }).ok).toBe(false);
   });
   it('unassigned Claude file stays unknown for both; assigned account alone is known', () => {
     const providers = PROVIDER_DEFAULTS.providers;
@@ -141,4 +141,53 @@ describe('accounts, config and horizon', () => {
     const s = resolveRoutingSettings({ repo: { providerCapacity: { providers } }, env: {} });
     expect(s.capacity.providers).toEqual(providers); expect(s.providerCapacitySources.providers).toBe('tool');
   });
+});
+
+it('banked deadline pace overrides an ahead weekly curve and drives boosts and pullWork', () => {
+  const c = cap('restartOnReset', 28, { bankedResets: [bucket(1, 278), bucket(1, 302), bucket(1, 566)], currentRatePerHour: 0.1 });
+  c.windows[0].resetsAt = now + 140 * HOUR;
+  const p = plan(c);
+  expect(p.requiredRatePerHour).toBeCloseTo(272 / 302);
+  expect(p).toMatchObject({ pace: 'behind', pacingAction: 'burn', onTrack: false, burnAggressively: true });
+  expect(scoreProvider(c, 'fix', { now }).paceFactor).toBe(4.8);
+  expect(burnWindows([c], { now })[0].pullWork).toEqual(['audits', 'red-teams', 'backlog-builds']);
+  expect(plan({ ...c, currentRatePerHour: p.requiredRatePerHour })).toMatchObject({ pace: 'on', onTrack: true, scoreBoost: 0 });
+  expect(plan({ ...c, currentRatePerHour: 2 })).toMatchObject({ pace: 'ahead', pacingAction: 'slow', onTrack: true });
+  expect(plan({ ...c, currentRatePerHour: null })).toMatchObject({ pace: 'unknown', onTrack: null });
+});
+it('horizon assigns the Wednesday 03:49 ET reset to Wednesday, not Tuesday', () => {
+  const c = cap('restartOnReset', 28);
+  c.windows[0].resetsAt = Date.parse('2026-11-25T03:49:00-05:00');
+  const h = planHorizon({ capacities: [c], now });
+  expect(h.days.find(d => d.date === '2026-11-24').entries[0].available).toBe(72);
+  expect(h.days.find(d => d.date === '2026-11-25').entries[0].available).toBe(100);
+});
+it('horizon projects observed-rate banked resets on their working day, earliest expiry first', () => {
+  const c = cap('restartOnReset', 35, { currentRatePerHour: 10, bankedResets: [bucket(1, 300), bucket(1, 200)] });
+  const late = Date.parse('2026-11-19T18:00:00-05:00');
+  const p = planCapacity(c, {}, { now: late });
+  const h = planHorizon({ capacities: [c], now: late });
+  const entries = h.days.flatMap(d => d.entries[0].bankedConsumed.map(b => ({ date: d.date, ...b })));
+  expect(entries.map(b => b.at)).toEqual(p.resetPlan);
+  expect(entries[0]).toMatchObject({ date: '2026-11-20', expiresAt: bucket(1, 200).expiresAt });
+  expect(h.days[1].entries[0].available).toBeGreaterThan(100);
+  expect(h.days[1].entries[0].expectedDemand).toBeNull();
+});
+it('horizon uses the configured timezone and DST midnight boundaries; invalid timezone requests correction', () => {
+  const c = cap('fixed', 90); c.windows[0].resetsAt = Date.parse('2026-11-02T04:30:00Z');
+  const h = planHorizon({ capacities: [c], now: Date.parse('2026-11-01T04:00:00Z'), days: 2 });
+  expect(h.days[0]).toMatchObject({ date: '2026-11-01', entries: [{ available: 100 }] });
+  const west = planHorizon({ capacities: [c], now: Date.parse('2026-11-02T06:00:00Z'), config: { workingHours: { tz: 'America/Los_Angeles' } } });
+  expect(west.days[0].date).toBe('2026-11-01');
+  const invalid = planHorizon({ capacities: [c], config: { workingHours: { tz: 'invalid' } } });
+  expect(invalid.needsOperatorInput).toEqual(['invalid workingHours.tz; correct the calendar timezone']);
+  expect(renderHorizon(invalid)).toContain('needs operator input: invalid workingHours.tz; correct the calendar timezone');
+});
+
+it('rate lookback resolves through the capacity cascade with source and refuses zero', () => {
+  expect(resolveRoutingSettings({ repo: {}, env: {} }).capacity.rateLookbackHours).toBe(24);
+  const s = resolveRoutingSettings({ repo: { routing: { capacity: { rateLookbackHours: 12 } } }, env: {} });
+  expect(s.capacity.rateLookbackHours).toBe(12);
+  expect(s.capacitySources.rateLookbackHours).toBe('tool');
+  expect(resolveRoutingSettings({ repo: { routing: { capacity: { rateLookbackHours: 0 } } }, env: {} }).capacity.rateLookbackHours).toBe(24);
 });

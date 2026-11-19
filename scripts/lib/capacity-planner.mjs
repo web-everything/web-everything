@@ -87,11 +87,33 @@ export function planCapacity(cap, config = {}, { now = cap.now ?? Date.now(), qu
   const boost = burnAggressively ? Math.min(config.maxBurnBoost ?? 3, requiredRatePerHour / Math.max(currentRatePerHour, 0.01) - 1) : 0;
   const canReset = w && used >= threshold && queuedDemand > 0 && bankedCount > 0;
   const open = workClock(config.workingHours ?? WORKING_HOURS)(now);
-  return { ...fixed, action: bankedCount ? canReset && open ? 'reset-now' : 'hold-reset' : 'pace',
-    pacingAction: fixed.action, resetPlan, resetChoices, burnAggressively, scoreBoost: boost,
+  const bankPace = requiredRatePerHour === null || !finite(currentRatePerHour) ? 'unknown'
+    : currentRatePerHour < requiredRatePerHour ? 'behind'
+      : currentRatePerHour > requiredRatePerHour * (1 + tolerance / 100) ? 'ahead' : 'on';
+  return { ...fixed, pace: bankedCount ? bankPace : fixed.pace, action: bankedCount ? canReset && open ? 'reset-now' : 'hold-reset' : 'pace',
+    pacingAction: bankedCount ? bankPace === 'behind' ? 'burn' : bankPace === 'ahead' ? 'slow' : 'normal' : fixed.action, resetPlan, resetChoices, burnAggressively, scoreBoost: boost,
     resetValue: w ? used / 100 : null, bankedCount, earliestExpiry: buckets[0]?.expiresAt ?? null, requiredRatePerHour, currentRatePerHour, onTrack,
     ...(incomplete ? { needsOperatorInput: 'reset inventory exceeds 1000; correct or split inventory' } : {}),
     ...(burnAggressively ? { pullWork: ['audits', 'red-teams', 'backlog-builds'] } : {}) };
+}
+
+/** Zoned midnight boundaries, found independently so DST days may have 23 or 25 hours. */
+function horizonBoundaries(now, days, tz) {
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+  const date = t => {
+    const p = Object.fromEntries(fmt.formatToParts(t).map(p => [p.type, p.value]));
+    return `${p.year}-${p.month}-${p.day}`;
+  };
+  const first = date(now), base = Date.parse(`${first}T00:00:00Z`);
+  return Array.from({ length: days + 1 }, (_, i) => {
+    const label = iso(base + i * 24 * HOUR).slice(0, 10);
+    let lo = base + i * 24 * HOUR - 36 * HOUR, hi = lo + 72 * HOUR;
+    while (hi - lo > 1) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (date(mid) < label) lo = mid; else hi = mid;
+    }
+    return { date: label, at: hi };
+  });
 }
 
 /** Daily inventory forecast; each quota is counted once (model aliases share it). Future grants are never read.
@@ -99,15 +121,18 @@ export function planCapacity(cap, config = {}, { now = cap.now ?? Date.now(), qu
 export function planHorizon({ capacities, config = {}, demandPerDay = config.expectedDemandPerDay, days = 14, now = Date.now() }) {
   if (!Number.isInteger(days) || days < 1 || days > 90) return { days: [], recommendations: [], needsOperatorInput: ['horizon must be 1..90 days'] };
   const unique = capacities.filter(c => c.active !== false && !c.quotaOf);
-  const rows = Array.from({ length: days }, (_, i) => ({ date: iso(now + i * 24 * HOUR).slice(0, 10), entries: [] }));
+  let boundaries;
+  try { boundaries = horizonBoundaries(now, days, (config.workingHours ?? WORKING_HOURS).tz); }
+  catch { return { days: [], recommendations: [], needsOperatorInput: ['invalid workingHours.tz; correct the calendar timezone'] }; }
+  const rows = boundaries.slice(0, -1).map(b => ({ date: b.date, entries: [] }));
   for (const cap of unique) {
     const w = plannerWindow(cap), demand = typeof demandPerDay === 'number' ? demandPerDay
       : demandPerDay?.[cap.account] ?? demandPerDay?.[cap.provider] ?? null;
-    const rate = finite(demand) && demand >= 0 ? demand / 24 : null;
+    const rate = finite(demand) && demand >= 0 ? demand / 24 : cap.currentRatePerHour ?? null;
     const bankPlan = planCapacity({ ...cap, windowModel: 'restartOnReset' }, config, { now, queuedDemand: 1, demandRatePerHour: rate });
     const events = bankPlan.resetChoices?.filter(c => c.at && time(c.at) < time(c.expiresAt ?? Infinity))
       .map(c => ({ at: time(c.at), type: 'banked', expiresAt: c.expiresAt, forfeitPercent: c.forfeitPercent })) ?? [];
-    const endHorizon = now + days * 24 * HOUR;
+    const endHorizon = boundaries[days].at;
     if (w && finite(w.lengthHours) && w.lengthHours > 0) {
       for (let at = time(w.resetsAt), n = 0; at < endHorizon && n < 1000; at += w.lengthHours * HOUR, n++) {
         if (at >= now) events.push({ at, type: 'scheduled' });
@@ -116,7 +141,7 @@ export function planHorizon({ capacities, config = {}, demandPerDay = config.exp
     events.sort((a, b) => a.at - b.at);
     let stock = w ? 100 - w.usedPercent : null, cursor = now, eventIndex = 0;
     for (let i = 0; i < days; i++) {
-      const start = now + i * 24 * HOUR, end = start + 24 * HOUR, scheduled = [];
+      const end = boundaries[i + 1].at, scheduled = [];
       let supply = stock, consumed = 0;
       const consume = at => {
         if (stock !== null && rate !== null) {
@@ -139,14 +164,14 @@ export function planHorizon({ capacities, config = {}, demandPerDay = config.exp
       }
       rows[i].entries.push({ provider: cap.provider, account: cap.account ?? null, available: supply,
         expectedDemand: demand, bankedConsumed: scheduled,
-        shortfall: supply === null || rate === null ? null : cap.windowModel === 'rolling' ? demand > supply : consumed + 1e-8 < demand });
+        shortfall: supply === null || rate === null || !finite(demand) ? null : cap.windowModel === 'rolling' ? demand > supply : consumed + 1e-8 < demand * (end - Math.max(now, boundaries[i].at)) / (24 * HOUR) });
     }
   }
   const recommendations = [];
   for (const inactive of capacities.filter(c => c.active === false && !c.quotaOf)) {
     let consecutive = 0;
     for (let i = 0; i < days; i++) {
-      const start = now + i * 24 * HOUR, rule = config.workingHours ?? WORKING_HOURS;
+      const start = Math.max(now, boundaries[i].at), rule = config.workingHours ?? WORKING_HOURS;
       let weekday;
       try { weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(new Intl.DateTimeFormat('en-US', { timeZone: rule.tz, weekday: 'short' }).format(start)); } catch { continue; }
       if (!rule.days?.includes(weekday)) continue;

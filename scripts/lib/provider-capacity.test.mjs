@@ -111,3 +111,29 @@ test('Codex live reader preserves primary shape and returns secondary', () => {
     assert.equal(result.used_percent, 27); assert.deepEqual(result.secondary, secondary);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('Codex window labels follow window_minutes and matching configured windows', () => {
+  for (const [minutes, name] of [[10080, 'weekly'], [300, 'five_hour']]) {
+    const cs = readProviderCapacity({ now, settings: { providers }, readers: { codex: () => ({ at: now, used_percent: 28, resets_at: now + 140 * hour, window_minutes: minutes }) } });
+    assert.equal(cs[0].windows[0].name, name);
+    assert.equal(cs[0].windows[0].lengthHours, minutes / 60);
+    assert.match(renderCalendar(capacityCalendar({ capacities: cs, settings: {}, now })), new RegExp(`${name}: 28%`));
+  }
+});
+test('plan line distinguishes Claude accounts and never transfers one account burn to another', () => {
+  const line = planLine([cap('claude', 27, 2, { account: 'claude-a' }), cap('claude', 20, 120, { account: 'claude-b' })], {}, now);
+  assert.match(line, /^claude-a: .* -> burn; claude-b: .* -> normal$/);
+});
+test('observed Codex ledger rate reaches calendar on-track and aliases with configured lookback', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'capacity-rate-'));
+  try {
+    const env = { HOME: dir, CONVEYOR_STATE_ROOT: dir, WE_CODEX_USAGE_LEDGER: join(dir, 'usage') };
+    writeFileSync(env.WE_CODEX_USAGE_LEDGER, [18, 8].map((h, i) => JSON.stringify({ at: new Date(now - h * hour).toISOString(), quota: { after_used_percent: 20 + i * 5 } })).join('\n'));
+    const observe = settings => observeCapacity({ env, now, records: [], quota: () => ({ at: now, used_percent: 28, window_minutes: 10080, resets_at: now + 140 * hour }), settings });
+    const cs = observe({});
+    assert.equal(cs[0].currentRatePerHour, 0.5);
+    assert.equal(cs.find(c => c.provider === 'codex-alt').currentRatePerHour, 0.5);
+    assert.equal(capacityCalendar({ capacities: cs, now, settings: {} }).providers[0].planner.onTrack, false);
+    assert.equal(observe({ rateLookbackHours: 12 })[0].currentRatePerHour, null);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

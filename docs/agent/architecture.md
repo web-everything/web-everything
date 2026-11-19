@@ -87,8 +87,12 @@ The pure `scripts/lib/capacity-planner.mjs` handles fixed-window end-of-window b
 rates and restart-on-reset inventories. Each manual reset restores a full window and forfeits the
 remainder. Banked resets on hand are authoritative: grant cadence is informational and never enters
 planning. Expiry deadlines use cumulative current remainder plus banked capacity, earliest expiry
-first; the tightest deadline sets the required rate. A bounded recent decision-ledger slope supplies
-the current routed usage rate, or it remains unknown. Shortfalls boost routing up to `maxBurnBoost`
+first; the tightest deadline sets the required rate. With banked resets, pace and score pressure
+compare current rate against this required rate, rather than the plain window curve. Codex uses
+a bounded usage-ledger slope over `routing.capacity.rateLookbackHours` (default 24); at least
+two observations in the current window are required. Drops in usage or changed reset timestamps
+start a new window, including in historical rows without reset metadata. Other providers use
+the recent decision-ledger slope. Unknown rates remain unknown. Shortfalls boost routing up to `maxBurnBoost`
 (default 3) and emit a deduped burn event requesting queued audits, red teams and backlog builds.
 This event requests work; it does not change audit/review provider selection.
 
@@ -102,6 +106,9 @@ require operator correction rather than generating an unbounded plan.
 `node scripts/operations/run.mjs capacity-calendar [--json] [--horizon]` shows observations,
 planner actions, rate pressure, reset choices, missing operator inputs and a 14-day forecast.
 `expectedDemandPerDay` is percent-of-window units per account/provider (null means unknown).
+Horizon days run midnight-to-midnight in `workingHours.tz`, including DST transitions. Banked
+resets contribute capacity on their planner-selected working day, earliest expiry first; absent
+forecast demand, the observed burn rate projects reset timing while expected demand stays unknown.
 Inactive accounts never route or contribute capacity; sustained shortfall on three working days
 (`activateAfterShortfallDays`) recommends activation. Banked inventory alone does not guarantee
 demand coverage: working-hour deferrals can cause a shortfall before the next reset. Inventory-only
