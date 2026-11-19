@@ -27,6 +27,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 import { prioritizeMainFix } from '../lib/merge-queue-hook.mjs';
 
 const REPO = 'example/web';
@@ -314,6 +315,8 @@ process.exit(0);
 `;
 const cliGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
+const pinned = (${pinnedLeafGitFixture})(a, JSON.parse(require('node:fs').readFileSync(process.env.UNKNOWN_FIXTURE, 'utf8')).prs);
+if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-unknown.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);

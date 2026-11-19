@@ -635,7 +635,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
   // producer at all, so the mis-mapping the review caught is not expressible here.
   it('#2890: derives the net-diff signals from the ONE shared function, and cannot hand-roll them', () => {
     expect(src).toMatch(/import \{ computeNetDiffSignals, recordParkVerdict \} from '\.\/merge-ai-prs\.mjs'/);
-    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, remote: REMOTE, base: BASE, baseRev, rev: refSha \}\)/);
+    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, basis, baseRev \}\)/);
     // The raw producers are deliberately OUT of scope in this file.
     expect(src).not.toMatch(/\bcomputeNetDiffText\b\s*[,}]/);
     expect(src).not.toMatch(/\bresolveNetDiffBasis\b\s*[,}]/);
@@ -1071,7 +1071,7 @@ describe('applyLabelWithRetry — a park label is retried before it is reported 
 describe('R502 ready-on-open allowlist wiring', () => {
   it('reads the guard-config allowlist from the base branch, never the PR checkout', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/gitC\(\['show', `\$\{REMOTE\}\/\$\{BASE\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
+    expect(src).toMatch(/pinnedGit\(diffExec, \['show', `\$\{getDiffBasis\(\)\.baseSha\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
     expect(src).not.toMatch(/readSettings\(\)\.prLandReady/);
   });
 });

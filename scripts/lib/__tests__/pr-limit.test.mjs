@@ -11,6 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isCardOnlyDiff } from '../../ci-card-only.mjs';
+import { readPinnedDiff } from '../pinned-diff-basis.mjs';
 import {
   PR_LIMIT_DEFAULTS, PR_LIMIT_ENV, resolvePrLimit,
   EXEMPT_PATH_PREFIXES, isExemptPath, isExemptChangeset,
@@ -1093,13 +1094,18 @@ describe('pr-land card-only open exemption — the changed-file list keeps both 
     expect(isCardOnlyDiff(list())).toBe(true); // the hole: the default list shows only backlog/foo.md
     expect(list('--no-renames').sort()).toEqual(['backlog/foo.md', 'scripts/foo.mjs']);
     expect(isCardOnlyDiff(list('--no-renames'))).toBe(false);
+    // Exercise the shared boundary now used by pr-land, including repo-local rename config.
+    git('config', 'diff.renames', 'true');
+    const basis = { ok: true, baseSha: base, mergeBaseSha: base, headSha: git('rev-parse', 'HEAD').trim() };
+    const pinned = readPinnedDiff((cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir }),
+      basis, ['--name-only']).split('\n').filter(Boolean);
+    expect(pinned.sort()).toEqual(['backlog/foo.md', 'scripts/foo.mjs']);
+    expect(isCardOnlyDiff(pinned)).toBe(false);
   });
 
-  it('pr-land builds the open-limit changed-file list with --no-renames (source-level pin)', () => {
+  it('pr-land builds the open-limit changed-file list through the pinned rename-safe boundary (source-level pin)', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    const m = src.match(/changedFilesForLimit = gitC\((\[[^\]]*\])\)/);
-    expect(m, 'changedFilesForLimit git invocation not found').not.toBeNull();
-    expect(m[1]).toContain("'--no-renames'");
+    expect(src).toMatch(/changedFilesForLimit = readPinnedDiff\(diffExec, getDiffBasis\(\), \['--name-only'\]\)/);
   });
 });
 
