@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 /**
  * @file scripts/conveyor/verify-dispatch.mjs
  * @description The CONVEYOR VERIFY DISPATCH pass (#3105). Picks up a lane's `request`-stamped `.lane-verify`
@@ -303,7 +304,7 @@ export function resolveSupersedePolicy(env = process.env, fileConfig = loadVerif
 const HERE = dirname(fileURLToPath(import.meta.url));
 const VERIFY_LANE_CLI = join(HERE, '..', 'verify-lane.mjs');
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
-const POOL_ROOT = expandHome(process.env.LANE_POOL_ROOT) || join(homedir(), 'workspace', '.lanes');
+const POOL_ROOT = defaultPoolRoot(join(homedir(), 'workspace', 'web-everything'));
 
 const log = (m) => process.stderr.write(m + '\n');
 

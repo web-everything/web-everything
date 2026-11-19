@@ -1,3 +1,4 @@
+import { defaultPoolRoot } from './lane-pool-paths.mjs';
 /**
  * @file scripts/lib/daemon-clone-registry.mjs
  * @description #xpt9fvd — the shared "is this path a DAEMON clone?" test both `guard-lane.mjs` (PreToolUse
@@ -107,14 +108,21 @@ export function daemonCloneForLabel(label) {
  * @param {string} workspace
  * @returns {boolean}
  */
-export function isPoolLaneRealpath(real, workspace) {
+export function isPoolLaneRealpath(real, workspace, env = process.env) {
   if (!real) return false;
-  const pool = path.join(realpathOrResolve(workspace), '.lanes');
+  const pool = realpathOrResolve(defaultPoolRoot(path.join(workspace, 'web-everything'), env));
   const rel = path.relative(pool, String(real));
   if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
   if (!rel) return true; // the `.lanes` root itself
   const parts = rel.split(SEP);
   return parts.length < 2 || /^lane-\d+$/.test(parts[1]);
+}
+
+/** Resolve registered names, relocating only those explicitly relative to the pool. */
+export function resolveDaemonCloneSeed(rel, workspace, env = process.env) {
+  return rel.startsWith(`.lanes${SEP}`)
+    ? path.join(defaultPoolRoot(path.join(workspace, 'web-everything'), env), rel.slice(7))
+    : path.join(workspace, rel);
 }
 
 function realpathOrResolve(p) {
@@ -126,8 +134,8 @@ function overlayDirOf(env = process.env) {
     || path.join(homedir(), '.claude', 'daemon-overlays');
 }
 
-function seedRoots(workspace) {
-  return DAEMON_CLONE_SEED.map((rel) => realpathOrResolve(path.join(workspace, rel)));
+function seedRoots(workspace, env = process.env) {
+  return DAEMON_CLONE_SEED.map((rel) => realpathOrResolve(resolveDaemonCloneSeed(rel, workspace, env)));
 }
 
 /**
@@ -142,11 +150,11 @@ function seedRoots(workspace) {
  * @param {string} workspace
  * @returns {{live:boolean, reason?:string}}
  */
-export function classifyOverlayRecord(record, workspace) {
+export function classifyOverlayRecord(record, workspace, env = process.env) {
   if (!record || typeof record.clone !== 'string' || !record.clone) return { live: false, reason: 'no clone path' };
   const real = realpathOrResolve(record.clone);
-  if (isDaemonCloneRealpath(real, seedRoots(workspace))) return { live: true };
-  if (isPoolLaneRealpath(real, workspace)) return { live: false, reason: `path is in the lane pool (${path.join(realpathOrResolve(workspace), '.lanes')}/<repo>/lane-<N>, or the lane pool root / <repo> dir); a pool lane is never a daemon clone` };
+  if (isDaemonCloneRealpath(real, seedRoots(workspace, env))) return { live: true };
+  if (isPoolLaneRealpath(real, workspace, env)) return { live: false, reason: `path is in the lane pool (${path.join(realpathOrResolve(workspace), '.lanes')}/<repo>/lane-<N>, or the lane pool root / <repo> dir); a pool lane is never a daemon clone` };
   if (!Array.isArray(record.overlays) || record.overlays.length === 0) return { live: false, reason: 'empty overlay list and not a known daemon clone' };
   return { live: true };
 }
@@ -170,7 +178,7 @@ function readRecords(env) {
 /** Clones recorded by LIVE overlay-state records only (see `classifyOverlayRecord`). Fail-open, additive. */
 function overlayRegisteredClones(workspace, env = process.env) {
   return readRecords(env)
-    .filter(({ record }) => classifyOverlayRecord(record, workspace).live)
+    .filter(({ record }) => classifyOverlayRecord(record, workspace, env).live)
     .map(({ record }) => record.clone);
 }
 
@@ -182,7 +190,7 @@ function overlayRegisteredClones(workspace, env = process.env) {
 export function pruneStaleOverlayRecords(workspace, { env = process.env, log = (m) => process.stderr.write(`${m}\n`) } = {}) {
   const dropped = [];
   for (const { file, record } of readRecords(env)) {
-    const c = classifyOverlayRecord(record, workspace);
+    const c = classifyOverlayRecord(record, workspace, env);
     if (c.live) continue;
     try {
       unlinkSync(file);
@@ -204,7 +212,7 @@ export function pruneStaleOverlayRecords(workspace, { env = process.env, log = (
  * @returns {string[]} deduped, realpath'd (or resolved) daemon clone roots
  */
 export function daemonCloneRoots(workspace, { env = process.env } = {}) {
-  const seeded = DAEMON_CLONE_SEED.map((rel) => path.join(workspace, rel));
+  const seeded = DAEMON_CLONE_SEED.map((rel) => resolveDaemonCloneSeed(rel, workspace, env));
   const discovered = overlayRegisteredClones(workspace, env);
   const all = seeded.concat(discovered).map(realpathOrResolve);
   return Array.from(new Set(all));

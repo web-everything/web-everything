@@ -818,7 +818,7 @@ export function ghThrottleLockRoot(_checkoutRoot, env = process.env) {
   const override = expand(String(env[GH_THROTTLE_LOCK_ROOT_ENV] || '').trim());
   if (override) return resolve(override);
   if (env.LANE_POOL_ROOT) return join(defaultPoolRoot(home, env), SUBDIR);
-  return join(home, 'workspace', '.lanes', SUBDIR);
+  return join(defaultPoolRoot(join(home, 'workspace', 'web-everything'), env), SUBDIR);
 }
 
 let failOpenWarned = false;

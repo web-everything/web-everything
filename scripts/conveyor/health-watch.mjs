@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { checkFseventsdRss } from '../lib/fseventsd-rss.mjs';
 /**
  * @file scripts/conveyor/health-watch.mjs
  * @description #4077 (health daemon slice 1, ruling #4065) — the IO SHELL of the health watch. Runs the probes,
@@ -1156,6 +1157,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     const failed = (e) => { probeErrors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; };
     try { const value = fn(); return value?.then ? value.catch(failed) : value; } catch (e) { return failed(e); }
   };
+  // Fixture ticks never write the host admission signal or event stream.
+  if (deps.fseventsd || (!flags['state-root'] && !flags['dry-run'])) {
+    probes.fseventsd = await attempt('fseventsd', () => checkFseventsdRss(deps.fseventsd));
+  }
   const sweepAllowed = flags['tmp-sweep-root'] || (!flags['state-root'] && !flags['dry-run']);
   // Both daily stamps come from state.json, so they go through `cadenceDue`: a future one must not park the sweep.
   const sweepDue = config.tmpSweepEnabled && (prev.tmpSweep?.complete === false
@@ -1334,7 +1339,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (!flags['lock-root']) {
     probes.externalRuns = attempt('externalRuns', () => probeExternalRuns({
       runsDir: process.env.OPERATION_RUNS_DIR || join(workspaceOf(REPO_ROOT), '.operations', 'coordination', 'build-dispatch-runs'),
-      lanesRoot: process.env.LANE_POOL_ROOT || join(workspaceOf(REPO_ROOT), '.lanes'), nowMs: now }));
+      lanesRoot: defaultPoolRoot(REPO_ROOT), nowMs: now }));
   }
   // Card xu1nixv — main's own CI workflow runs (read by workflow, never across all workflows) and its ONE owner per
   // broken commit, every tick (main red is the priority). The result is the `main-ci-red` smell's probe. A fixture

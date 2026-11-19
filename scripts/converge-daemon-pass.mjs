@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 /**
  * converge-daemon-pass.mjs — ONE scheduled pass of the converge daemon (#2572, ruling R7 of 2026-08-08).
  *
@@ -65,7 +66,7 @@ export function resolvePassConfig(env = process.env, home = homedir()) {
     const v = env[name];
     return v && v.trim() ? resolve(v.trim()) : fallback;
   };
-  const clone = pick('CONVERGE_DAEMON_CLONE', join(home, ...DEFAULT_CLONE_REL));
+  const clone = pick('CONVERGE_DAEMON_CLONE', join(defaultPoolRoot(join(home, 'workspace', 'web-everything'), env), ...DEFAULT_CLONE_REL.slice(2)));
   const primary = pick('CONVERGE_DAEMON_PRIMARY', join(home, ...DEFAULT_PRIMARY_REL));
   const stateRoot = pick('CONVERGE_DAEMON_STATE_ROOT', join(home, ...DEFAULT_STATE_ROOT_REL));
   // The ledger the shadow fold reads. Defaults to the PRIMARY tree's `.conveyor/jury` — the tree the #2639

@@ -1,0 +1,3 @@
+{
+  "_doc": "Optional churn-volume paths: lanes.root (LANE_POOL_ROOT), heavy.tmpRoot (WE_HEAVY_TMP_ROOT). Unset paths preserve existing defaults. health.fseventsd.warnMb/throttleMb default to 1024/2048; WE_FSEVENTSD_WARN_MB/WE_FSEVENTSD_THROTTLE_MB override. Cascade: standard, platform preferences, this tool file, environment."
+}

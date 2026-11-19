@@ -4748,3 +4748,6 @@ export function findUnmanagedKeepAlives(files) {
   }
   return findings;
 }
+
+// Executable invocation rule shared with the deterministic scoped lint tests.
+export { findVitestWatchInvocations, vitestWatchCommands } from './lib/vitest-watch-lint.mjs';

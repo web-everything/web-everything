@@ -1,3 +1,4 @@
+import { readHeavyTmpRoot } from './scripts/lib/lanes-volume-settings.mjs';
 // Run-scoped temp root for every vitest run — see scripts/lib/test-tmp-root.mjs for the leak it stops and
 // the WE_TMP_LEAK_* policy knobs. Runs in the main vitest process BEFORE workers spawn; vitest builds the
 // worker env from `process.env` at run time, so the TMPDIR set here reaches every worker and spawned child.
@@ -14,7 +15,7 @@ import {
 } from './scripts/lib/test-tmp-root.mjs';
 
 export default function setup() {
-  const baseTmp = tmpdir();
+  const baseTmp = readHeavyTmpRoot();
   sweepStaleRunRoots({ baseTmp });
   const root = createRunTmpRoot({ baseTmp });
   const saved = {

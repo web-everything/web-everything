@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { findVitestWatchInvocations, vitestWatchCommands } from './lib/vitest-watch-lint.mjs';
 import { validateRaisedBy } from './check-standards-rules.mjs';
 import { isTerminalStatus } from './lib/backlog-status.cjs';
 import { relatedReportRefs } from './lib/related-report.cjs';
@@ -3277,6 +3278,28 @@ mark("19b. Unmanaged keep-alive children (keep-alive leak fix, 2026-10-20)");
 // session dirtied (per its claim-time baseline, #949 Fork 2-A) BLOCKS; a concurrent/pre-existing red is
 // printed as a non-failing note. A path-less finding can't be proven foreign, so it stays blocking
 // (fail-safe). The DEFAULT no-flag run is untouched — whole-repo-strict (CI / close-out unchanged).
+// Vitest must always terminate: lint package commands and actual process invocation sites.
+try {
+  const scripts = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).scripts;
+  if (!scripts || typeof scripts !== 'object') throw Error('package scripts unreadable');
+  for (const [name, command] of Object.entries(scripts)) {
+    for (const reason of vitestWatchCommands(command)) err(`package.json scripts.${name}: vitest requires run/--run/--watch=false (${reason})`, { kind: 'vitest-watch', file: 'package.json' });
+  }
+  const visit = dir => {
+    for (const entry of readdirSync(join(ROOT, dir), { withFileTypes: true })) {
+      const file = `${dir}/${entry.name}`;
+      if (entry.name === '__tests__' || entry.name === 'node_modules') continue;
+      if (entry.isDirectory()) visit(file);
+      else if (/\.(?:mjs|sh)$/.test(file) && !/\.(?:test|spec)\.mjs$/.test(file)) {
+        for (const hit of findVitestWatchInvocations(readFileSync(join(ROOT, file), 'utf8'), file)) {
+          err(`${file}:${hit.line}: vitest requires run/--run/--watch=false (${hit.reason})`, { kind: 'vitest-watch', file });
+        }
+      }
+    }
+  };
+  visit('scripts');
+} catch (error) { err(`vitest invocation lint incomplete: ${error.message}`, { kind: 'vitest-watch' }); }
+
 const scopeArg = process.argv.find((a) => a.startsWith('--scope=') || a.startsWith('--mine='));
 const scopeSession = scopeArg ? scopeArg.split('=').slice(1).join('=') : null;
 let externalErrors = []; // errors attributed to other sessions under --scope (printed, non-blocking)

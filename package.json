@@ -26,7 +26,7 @@
     "check:cold-start": "node scripts/dev/check-cold-start.mjs",
     "start": "npm run dev",
     "clean": "rm -rf _site",
-    "test": "vitest",
+    "test": "vitest run",
     "test:bun:scripts": "npx --yes bun@1.4.2 test --isolate --preload ./bun-test.preload.ts scripts/__tests__",
     "test:unit": "node scripts/readiness/heavy-admission.mjs run -- vitest run",
     "test:integration:vitest": "node scripts/readiness/heavy-admission.mjs run -- vitest run --config vitest.integration.config.ts",

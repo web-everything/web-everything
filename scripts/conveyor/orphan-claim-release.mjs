@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 /**
  * @file scripts/conveyor/orphan-claim-release.mjs
  * @description THE ORPHANED-CLAIM RELEASE PASS (WE #3913, epic #3383). Finds backlog cards stuck `status: active`
@@ -252,7 +253,7 @@ export function renderPrBody(applied, { minAgeHours = 48 } = {}) {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..', '..');
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
-const POOL_ROOT = expandHome(process.env.LANE_POOL_ROOT) || join(homedir(), 'workspace', '.lanes');
+const POOL_ROOT = defaultPoolRoot(join(homedir(), 'workspace', 'web-everything'));
 const log = (m) => process.stderr.write(m + '\n');
 
 function readCards(root) {

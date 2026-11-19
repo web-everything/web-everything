@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readLanesRoot } from './lanes-volume-settings.mjs';
 /**
  * @file scripts/lib/gh-app-shim.mjs
  * @description #x8mpubm — GET THE APP TOKEN INTO A DISPATCHED SESSION, FOR REAL. The coordinator's live
@@ -611,7 +612,7 @@ function runDirect(argv, env, fallbackReason) {
     const expand = (p) => p.startsWith('~') ? join(home, p.slice(1)) : p;
     const override = String(env.WE_GH_THROTTLE_LOCK_ROOT || '').trim();
     const root = override ? resolve(expand(override))
-      : join(env.LANE_POOL_ROOT ? resolve(expand(env.LANE_POOL_ROOT)) : join(home, 'workspace', '.lanes'), '.admission', 'gh');
+      : join(env.LANE_POOL_ROOT ? resolve(expand(env.LANE_POOL_ROOT)) : (${JSON.stringify(readLanesRoot())} || join(home, 'workspace', '.lanes')), '.admission', 'gh');
     mkdirSync(root, { recursive: true });
     appendFileSync(join(root, 'calls.jsonl'), JSON.stringify(entry) + '\\n', 'utf8');
   } catch {

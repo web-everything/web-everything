@@ -1,3 +1,4 @@
+import { resolveDaemonCloneSeed } from './daemon-clone-registry.mjs';
 /**
  * @file lane-git-diet.mjs
  * @description Keep lane clones' `.git` small: stop the default fetch from pulling `ops/*` transport branches,
@@ -114,7 +115,7 @@ export function resolveDietDaemonClone(name, workspace) {
   if (typeof name !== 'string' || isAbsolute(name) || name.includes('..') || !DAEMON_CLONE_SEED.includes(name)) {
     throw new Error(`unregistered daemon clone name: ${JSON.stringify(name)}`);
   }
-  return join(workspace, name);
+  return resolveDaemonCloneSeed(name, workspace);
 }
 
 /**

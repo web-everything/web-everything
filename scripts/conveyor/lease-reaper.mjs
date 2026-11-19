@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 /**
  * @file scripts/conveyor/lease-reaper.mjs
  * @description The CONVEYOR LEASE REAPER (WE #2667, epic #2612). Walks every lane pool and RECLAIMS an orphan
@@ -1243,7 +1244,7 @@ export function applyLaneHold({ reap, keep }, { nowMs, check = checkLaneHold } =
 const HERE = dirname(fileURLToPath(import.meta.url));
 const LANE_POOL_CLI = join(HERE, '..', 'lane-pool.mjs');
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
-const POOL_ROOT = expandHome(process.env.LANE_POOL_ROOT) || join(homedir(), 'workspace', '.lanes');
+const POOL_ROOT = defaultPoolRoot(join(homedir(), 'workspace', 'web-everything'));
 
 // #4370 fork 4 — every reaper log line carries an ISO timestamp (the 2026-09-28 lane-18 reap could only be
 // placed in time by line number).

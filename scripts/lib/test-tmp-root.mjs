@@ -1,3 +1,4 @@
+import { readHeavyTmpRoot } from './lanes-volume-settings.mjs';
 // Run-scoped temp root for vitest runs (tmp-leak fix, 2026-10-04).
 //
 // Live-caught on the operator's Mac: `$TMPDIR` held 1,217,982 entries and a plain `ls -f` of it took 2m39s,
@@ -74,7 +75,7 @@ export function sweepStaleRunRoots({ baseTmp, uid, isAlive = isPidAlive, now = D
   return removed;
 }
 
-export function createRunTmpRoot({ baseTmp, pid = process.pid, uid }) {
+export function createRunTmpRoot({ baseTmp = readHeavyTmpRoot(), pid = process.pid, uid }) {
   // macOS temp paths commonly use /var's symlink alias. Allocate beneath the
   // canonical base so descriptor-relative no-follow guards can inspect fixtures.
   const parent = join(realpathSync(baseTmp), runRootParentName(uid));

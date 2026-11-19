@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 /**
  * @file lane-git-diet.mjs
  * @description One-time, idempotent cleanup of bloated lane `.git` dirs (see `./lib/lane-git-diet.mjs` for why; rules in `./lib/lane-git-diet-cleanup.mjs`).
@@ -99,7 +100,7 @@ const APPLY = flags.apply === true;
 const POOL = typeof flags.pool === 'string' ? flags.pool : 'web-everything';
 if (!CLEANUP_POOLS.includes(POOL)) { process.stderr.write(`--pool must be one of ${CLEANUP_POOLS.join(', ')}\n`); usageExit(); }
 const real = (p) => { try { return realpathSync(p); } catch (err) { if (['ENOENT', 'ENOTDIR'].includes(err.code)) return null; throw err; } };
-const POOL_ROOT = DAEMON_DIR ? join(resolve(flags['scan-root'] || join(homedir(), 'workspace')), '.lanes') : real(typeof flags['pool-root'] === 'string' ? flags['pool-root'] : join(homedir(), 'workspace', '.lanes'));
+const POOL_ROOT = DAEMON_DIR ? defaultPoolRoot(join(resolve(flags['scan-root'] || join(homedir(), 'workspace')), 'web-everything')) : real(typeof flags['pool-root'] === 'string' ? flags['pool-root'] : defaultPoolRoot(join(homedir(), 'workspace', 'web-everything')));
 const SCAN_ROOT = real(typeof flags['scan-root'] === 'string' ? flags['scan-root'] : join(homedir(), 'workspace'));
 if (!POOL_ROOT || !SCAN_ROOT) { process.stderr.write('pool root / scan root does not exist\n'); usageExit(); }
 // Git records no back-pointer from a store to the repos borrowing it, so a borrower outside every scanned root is

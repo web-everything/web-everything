@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { workspaceFor } from './lane-pool-paths.mjs';
+import { defaultPoolRoot } from './lane-pool-paths.mjs';
 import { memoryFreePct, memoryAvailableMb } from './memory-available.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
@@ -97,7 +97,7 @@ function defaultHeavySlots(checkoutRoot = repoRoot()) {
   return { held: status.heldCount, cap };
 }
 function defaultCountLanes(checkoutRoot = repoRoot()) {
-  const pool = join(workspaceFor(checkoutRoot), '.lanes');
+  const pool = defaultPoolRoot(checkoutRoot);
   return readdirSync(pool, { withFileTypes: true }).filter(d => d.isDirectory()).reduce((sum, d) =>
     sum + readdirSync(join(pool, d.name), { withFileTypes: true }).filter(l => l.isDirectory() && l.name.startsWith('lane-')).length, 0);
 }

@@ -98,7 +98,7 @@ export function executionArgv(argv) {
   const options=argv.slice(argv[0] === 'npm' ? 4 : 3);
   return ['node','node_modules/vitest/vitest.mjs',argv[0] === 'npx' ? argv[2] : 'run',
     ...(argv[2] === 'test:integration:vitest' ? ['--config','vitest.integration.config.ts'] : []),
-    ...(argv[2] === 'test:coverage' ? ['--coverage'] : []),...options];
+    ...(argv[2] === 'test:coverage' ? ['--coverage'] : []),'--watch=false',...options];
 }
 
 export function easternTimestamp(ms) {

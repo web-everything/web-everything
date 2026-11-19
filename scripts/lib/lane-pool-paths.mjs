@@ -1,3 +1,4 @@
+import { readLanesRoot } from './lanes-volume-settings.mjs';
 /**
  * @file scripts/lib/lane-pool-paths.mjs
  *
@@ -76,9 +77,9 @@ export function workspaceFor(path) {
  * @param {object} env - environment bag; reads `LANE_POOL_ROOT` and `HOME`.
  * @returns {string} the pool root.
  */
-export function defaultPoolRoot(checkoutRoot = process.cwd(), env = process.env) {
+export function defaultPoolRoot(checkoutRoot = process.cwd(), env = process.env, settings = {}) {
   const home = env.HOME || homedir();
-  return expandHome(env.LANE_POOL_ROOT, home) || join(workspaceFor(checkoutRoot), '.lanes');
+  return expandHome(env.LANE_POOL_ROOT, home) || readLanesRoot({ ...settings, env }) || join(workspaceFor(checkoutRoot), '.lanes');
 }
 
 /**

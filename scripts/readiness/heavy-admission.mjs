@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readFseventsdSignal } from '../lib/fseventsd-rss.mjs';
+import { readHeavyTmpRoot, readVolumeSettings } from '../lib/lanes-volume-settings.mjs';
 /**
  * @file scripts/readiness/heavy-admission.mjs
  * @description THE HEAVY-COMMAND ADMISSION QUEUE (#3461, ratified by #3456) — a capacity semaphore, distinct
@@ -2394,7 +2396,7 @@ export async function acquireSlotBlocking({
   policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot,
   hostAdmission = (o) => env[ADMISSION_HELD_ENV] === '1'
     ? { admitted: true, reason: 'host admission already held' } : hostLoadAdmission(o),
-  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, location = null, ...seams
+  interactive = !!process.stdin.isTTY, waitMs = 0, waitSource = 'standard', random = Math.random, location = null, readFsevents = readFseventsdSignal, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
   // heavy-run-wait — a wait budget applies only to a caller that would otherwise defer; anything else is unchanged.
@@ -2453,6 +2455,18 @@ export async function acquireSlotBlocking({
   try {
     for (;;) {
       let attempt = now();
+      const fsevents = readFsevents();
+      if (fsevents.throttled && env[ADMISSION_HELD_ENV] !== '1') {
+        const waitedMs = attempt - startedAt;
+        const limit = budgetMs || (Number.isFinite(ceilingMs) && ceilingMs > 0 ? ceilingMs : DEFAULT_ADMISSION_CEILING_MS);
+        const reason = fsevents.reason || `fseventsd RSS throttle (${fsevents.rssMb ?? 'unknown'} MB); waiting for health-watch recovery`;
+        if ((canDefer && budgetMs === 0) || waitedMs >= limit) {
+          log(`heavy-command admission deferred: ${reason}\n`);
+          return { ok: false, slot: null, deferred: true, timedOut: false, waitedMs, reason };
+        }
+        await sleep(Math.min(pollMs, limit - waitedMs));
+        continue;
+      }
       const host = hostLoadBypassed ? { admitted: true } : hostAdmission({ env, interactive, log: (m) => {
         if (!hostPolicyLogged) { log(`${m}\n`); hostPolicyLogged = true; }
       } });
@@ -3001,10 +3015,14 @@ export async function runUnderAdmission({
   if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
+  if (readVolumeSettings({ env }).value['heavy.tmpRoot']) {
+    const root = readHeavyTmpRoot({ env });
+    Object.assign(childEnv, { TMPDIR: root, TMP: root, TEMP: root });
+  }
   if (bypass) {
     let exitCode = 0;
     try {
-      const bypassOpts = { cwd, stdio: 'inherit', env: bypass === 'held' ? env : childEnv };
+      const bypassOpts = { cwd, stdio: 'inherit', env: bypass === 'held' ? { ...env, ...(childEnv.TMPDIR ? { TMPDIR: childEnv.TMPDIR, TMP: childEnv.TMP, TEMP: childEnv.TEMP } : {}) } : childEnv };
       if (runCeilingMs > 0) await execWithRunCeiling(command, bypassOpts, runCeilingMs, exec);
       else exec(command, bypassOpts);
     } catch (e) {
