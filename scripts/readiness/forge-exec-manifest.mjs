@@ -240,23 +240,25 @@ const ordinaryViewFinding=text=>pemPrivateBlock(text)?'private-key-block':ordina
 // Same three views as the credential-named scan: raw, escapes decoded (`ghp_`), backslashes dropped.
 const ordinaryTextFinding=text=>ordinaryViewFinding(text)
   ??(text.includes('\\')?ordinaryViewFinding(decodeEscapes(text))??ordinaryViewFinding(text.replace(/\\/g,'')):null);
+// Gzip hides any content from every other view: decompress (bounded) and scan the result too. A stream that
+// claims gzip but cannot be decompressed within the bound is refused. Applies to the file and to decoded candidates.
+function gzipLayerFinding(content,layers) {
+  if(!(content.length>2&&content[0]===0x1f&&content[1]===0x8b))return null;
+  if(layers>=3)return 'nested-compressed-content';
+  let inner;
+  try {inner=gunzipSync(content,{maxOutputLength:CONTENT_SCAN_MAX_BYTES*4});} catch {return 'unreadable-compressed-content';}
+  return ordinaryBufferFinding(inner,layers+1);
+}
 export function ordinaryBufferFinding(content,layers=0) {
-  // Gzip hides any content from every other view: decompress (bounded) and scan the result too. A stream that
-  // claims gzip but cannot be decompressed within the bound is refused.
-  if(content.length>2&&content[0]===0x1f&&content[1]===0x8b) {
-    if(layers>=3)return 'nested-compressed-content';
-    let inner;
-    try {inner=gunzipSync(content,{maxOutputLength:CONTENT_SCAN_MAX_BYTES*4});} catch {return 'unreadable-compressed-content';}
-    const finding=ordinaryBufferFinding(inner,layers+1);
-    if(finding)return finding;
-  }
+  const compressed=gzipLayerFinding(content,layers);
+  if(compressed)return compressed;
   for(const encoding of ['latin1','utf8','utf16le']) {
     const finding=ordinaryTextFinding(content.toString(encoding));
     if(finding)return finding;
   }
   const swapped=Buffer.from(content.subarray(0,content.length-content.length%2)).swap16();
   // Decoded candidates (base64, percent, hex, UTF-16 alignments) get the token and PEM checks as well.
-  const decoded=bytes=>bytes===content?null:ordinaryTextFinding(bytes.toString('latin1'))??ordinaryTextFinding(bytes.toString('utf8'))
+  const decoded=bytes=>bytes===content?null:gzipLayerFinding(bytes,layers+1)??ordinaryTextFinding(bytes.toString('latin1'))??ordinaryTextFinding(bytes.toString('utf8'))
     ??ordinaryTextFinding(bytes.toString('utf16le'));
   return ordinaryTextFinding(swapped.toString('utf16le'))??keyStructureFinding(content,decoded);
 }

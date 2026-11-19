@@ -78,6 +78,12 @@ describe('Forge scans all manifest content',()=>{
     ])for(const tracked of [true,false])
       expect(()=>admit('docs/notes.md',bytes,tracked),name).toThrow(/content-detected credential/);
   });
+  it('refuses encrypted PKCS#8 DER (raw, base64) and base64-wrapped gzip keys at ordinary paths',()=>{
+    const der=privateKey.export({format:'der',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'x'});
+    const gz=gzipSync(Buffer.from(material.PEM));
+    for(const tracked of [true,false])for(const bytes of [der,Buffer.from(der.toString('base64')),Buffer.from(gz.toString('base64')),Buffer.from(gz.toString('hex'))])
+      refused('docs/notes.md',bytes,tracked,'content-detected credential');
+  });
   it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
     const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);
     for(const tracked of [true,false])refused('a.png',png,tracked,'content-detected credential');

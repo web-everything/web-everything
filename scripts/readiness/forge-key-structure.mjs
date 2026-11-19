@@ -34,6 +34,13 @@ function derFinding(bytes,tick) {
     if(!sequence)continue;
     const fields=children(sequence);
     if(!fields||fields.length<2)continue;
+    // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): AlgorithmIdentifier with a PKCS#5/PKCS#12 encryption OID, then
+    // the encrypted OCTET STRING. Decryptable with a passphrase, so it is key material.
+    if(fields.length===2&&fields[0].tag===48&&nonempty(fields[1],4)) {
+      const algorithm=children(fields[0]);
+      if(algorithm?.length&&nonempty(algorithm[0],6)
+        &&/^2a864886f70d01(?:05|0c)/.test(bytes.subarray(algorithm[0].start,algorithm[0].end).toString('hex')))return true;
+    }
     const version=fields[0];
     if(version.tag!==2||version.end-version.start!==1)continue;
     const value=bytes[version.start];
