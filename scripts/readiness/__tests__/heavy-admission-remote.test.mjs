@@ -1,7 +1,8 @@
 // @vitest-environment node
 /** Contract tests for the pending remote admission exports; all execution and load IO is injected. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { execSync, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { readdirSync, mkdtempSync, mkdirSync, chmodSync, writeFileSync, existsSync, rmSync, readFileSync, utimesSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -21,7 +22,7 @@ vi.mock('node:fs', async (importOriginal) => {
   return {...actual, mkdtempSync:vi.fn(actual.mkdtempSync)};
 });
 vi.mock('node:child_process', async (importOriginal) => ({
-  ...await importOriginal(), execSync: vi.fn(),
+  ...await importOriginal(), spawn: vi.fn(),
 }));
 vi.mock('../../lib/host-load.mjs', async (importOriginal) => ({
   ...await importOriginal(), hostLoadAdmission: vi.fn(() => ({ admitted: true })),
@@ -30,6 +31,28 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
   ...await importOriginal(), execContainerized: vi.fn(),
   containerCliAvailable: vi.fn(() => true), containerImageAvailable: vi.fn(() => true),
 }));
+
+// Selected-file runs also spawn a timeout watchdog. Count only shell launches as local execution.
+function mockShellSpawn(onSpawn = () => {}) {
+  const shellSpawn = vi.fn(() => {
+    onSpawn();
+    const child = new EventEmitter();
+    child.pid = 123456;
+    queueMicrotask(() => {
+      child.emit('exit', 17, null);
+      child.emit('close', 17, null);
+    });
+    return child;
+  });
+  vi.mocked(spawn).mockImplementation((file, args, options) => {
+    if (file === '/bin/sh') return shellSpawn(file, args, options);
+    // Stub the detached watchdog without launching a real process.
+    expect(file).toBe(process.execPath);
+    expect(args[0]).toBe('-e');
+    return { unref: vi.fn(), kill: vi.fn() };
+  });
+  return shellSpawn;
+}
 
 // Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
@@ -184,26 +207,25 @@ describe('remote admission policy', () => {
       WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '',
       WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl') })) vi.stubEnv(key, value);
     const remoteExec = vi.fn(async () => adaptLegacyRemoteResult({ mode: 'fallback', reason }));
-    vi.mocked(execSync).mockImplementation(() => {
+    const localExec = mockShellSpawn(() => {
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(1);
       expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toHaveLength(0);
       expect(existsSync(join(remoteRoot, 'slot-0.unconfirmed'))).toBe(false);
-      throw Object.assign(new Error('local command exit'), { status: 17 });
     });
     try {
       await expect(main(['run', `--repo=${root}`, '--', ...argv], { remoteExec, readTelemetry: healthyRead }))
         .rejects.toBe(exited);
       expect(remoteExec).toHaveBeenCalledTimes(1);
-      expect(execSync).toHaveBeenCalledTimes(1);
-      expect(execSync).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
-        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+      expect(localExec).toHaveBeenCalledTimes(1);
+      expect(localExec).toHaveBeenCalledWith('/bin/sh', ['-c', argv.map(shellQuoteWord).join(' ')], expect.objectContaining({
+        cwd: root, stdio: 'inherit', env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
       }));
       expect(exit).toHaveBeenCalledWith(17);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'local-fallback', exitCode: 17 });
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining(`fallback: ${reason}`));
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
     } finally {
-      vi.mocked(execSync).mockReset(); exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs();
+      vi.mocked(spawn).mockReset(); exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs();
     }
   });
 
@@ -221,22 +243,22 @@ describe('remote admission policy', () => {
       CI:'',WE_HEAVY_ADMISSION:'on',WE_HEAVY_ADMISSION_HELD:'1',WE_FORGE_GATE_DISPATCH:'1',
       WE_HEAVY_ADMISSION_CONTAINER:'',WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES:'',
       WE_VERIFY_REMOTE_REPORT:join(root,'verify-report.jsonl')}))vi.stubEnv(key,value);
-    vi.mocked(execSync).mockImplementation(()=>{throw Object.assign(new Error('local command exit'),{status:17});});
+    const localExec = mockShellSpawn();
     try {
       await expect(main(['run',`--repo=${root}`,'--',...command],{
         readTelemetry:healthyRead,
         remoteExec:async options=>adaptLegacyRemoteResult(await runRemote({...options,exec:transport,fs:{mkdtemp:stage}})),
       })).rejects.toBe(exited);
-      expect(execSync).toHaveBeenCalledTimes(1);
-      expect(execSync).toHaveBeenCalledWith(command.map(shellQuoteWord).join(' '),expect.objectContaining({cwd:root}));
+      expect(localExec).toHaveBeenCalledTimes(1);
+      expect(localExec).toHaveBeenCalledWith('/bin/sh',['-c',command.map(shellQuoteWord).join(' ')],expect.objectContaining({cwd:root,stdio:'inherit'}));
       expect(exit).toHaveBeenCalledWith(17);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'local-fallback', exitCode: 17 });
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('command-not-allowed'));
       expect(stderr).toHaveBeenCalledWith(expect.stringContaining('falling back to local admission'));
-      expect(vi.mocked(execSync).mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
+      expect(localExec.mock.calls[0][2].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(transport).not.toHaveBeenCalled();expect(stage).not.toHaveBeenCalled();
     }finally{
-      vi.mocked(execSync).mockReset();exit.mockRestore();stderr.mockRestore();vi.unstubAllEnvs();
+      vi.mocked(spawn).mockReset();exit.mockRestore();stderr.mockRestore();vi.unstubAllEnvs();
       rmSync(root,{recursive:true,force:true});
     }
   });
@@ -331,20 +353,24 @@ describe('remote admission policy', () => {
     for (const [key, value] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs,
       CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_CONTAINER: '',
       WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl'), ...env })) vi.stubEnv(key, value);
-    const localExec = flags.includes('--container') ? execContainerized : execSync;
-    vi.mocked(localExec).mockImplementation(() => {
+    const useContainer = flags.includes('--container');
+    const onLocalExec = () => {
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(acquiresSlot ? 1 : 0);
-      throw Object.assign(new Error('local command exit'), { status: 17 });
-    });
+      if (useContainer) throw Object.assign(new Error('local command exit'), { status: 17 });
+    };
+    const localExec = useContainer
+      ? vi.mocked(execContainerized).mockImplementation(onLocalExec)
+      : mockShellSpawn(onLocalExec);
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' }));
       await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).not.toHaveBeenCalled();
       expect(localExec).toHaveBeenCalledTimes(1);
-      expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
-        cwd: root, env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
+      const command = argv.map(shellQuoteWord).join(' ');
+      expect(localExec).toHaveBeenCalledWith(...(useContainer ? [command] : ['/bin/sh', ['-c', command]]), expect.objectContaining({
+        cwd: root, stdio: 'inherit', env: expect.objectContaining({ WE_HEAVY_ADMISSION_HELD: '1' }),
       }));
-      expect(localExec.mock.calls[0][1].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
+      expect(localExec.mock.calls[0][useContainer ? 1 : 2].env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
       expect(exit).toHaveBeenCalledWith(17);
       // A consumed Forge handoff must preserve the first local verdict even on a bypass.
       if (reportsLocalCompletion) {
@@ -356,7 +382,7 @@ describe('remote admission policy', () => {
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
       if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
     } finally {
-      vi.mocked(execSync).mockReset(); vi.mocked(execContainerized).mockReset();
+      vi.mocked(spawn).mockReset(); vi.mocked(execContainerized).mockReset();
       exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
     }
   });
