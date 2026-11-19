@@ -9,6 +9,7 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
  * `dispatchFix` composition was mirrored from.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
 import { spawnSync } from 'node:child_process';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
@@ -1896,6 +1897,53 @@ describe('runReconcileFixDispatch — item-less PRs (#xmtbdgs multi-repo slice 6
 
 describe('filterFixesByInFlightScope (#4295)', () => {
   const fx = (pr, scope, itemNum = null) => ({ pr, itemNum, scope });
+  it('strips only prose strings while preserving other entries and missing scopes', () => {
+    const object = { repo: 'we', path: 'docs/agent/testing.md' };
+    expect(Object.isFrozen(FIX_OVERLAP_PROSE_GLOBS)).toBe(true);
+    expect(stripProseScope(['we:docs/agent/testing.md', 'backlog/x.md', 'other:backlog/nested/x.md',
+      'we:scripts/x.mjs', 'docs/x.mjs', 'README.md', object, null])).toEqual([
+      'we:scripts/x.mjs', 'docs/x.mjs', 'README.md', object, null,
+    ]);
+    expect(stripProseScope(undefined)).toBeUndefined();
+    expect(stripProseScope(['docs/agent/testing.md', 'we:backlog/x.md'])).toEqual([]);
+  });
+  it.each(['', 'we:'])('accepts PRs sharing only prose (%s prefix), preserving dispatch scopes', (prefix) => {
+    const scope = [`${prefix}docs/agent/testing.md`, `${prefix}backlog/x.md`];
+    const queue = [fx(1, scope), fx(2, [...scope])];
+    const result = filterFixesByInFlightScope(queue);
+    expect(result.planned).toEqual(queue);
+    expect(result.planned[0]).toBe(queue[0]);
+    expect(result.refusals).toEqual([]);
+    expect(result.ranks.map(r => r.blocks)).toEqual([0, 0]);
+    expect(scope).toEqual([`${prefix}docs/agent/testing.md`, `${prefix}backlog/x.md`]);
+  });
+  it('ignores prose in overlapScope while preserving the original scopes', () => {
+    const queue = [1, 2].map(pr => ({ ...fx(pr, ['we:scripts/shared.mjs']),
+      overlapScope: ['we:docs/agent/testing.md', 'we:backlog/x.md'] }));
+    const result = filterFixesByInFlightScope(queue);
+    expect(result.planned).toEqual(queue);
+    expect(result.refusals).toEqual([]);
+  });
+  it.each(['build', 'fix'])('ignores prose on both sides of a live %s claim', (kind) => {
+    for (const [scope, held] of [
+      [['we:docs/'], ['we:docs/agent/testing.md']],
+      [['we:backlog/x.md'], ['we:backlog/']],
+    ]) {
+      const claim = { meta: { num: '9', pr: 9, scope: held } };
+      const result = filterFixesByInFlightScope([fx(1, scope)],
+        kind === 'build' ? [claim] : [], kind === 'fix' ? [claim] : []);
+      expect(result.planned.map(p => p.pr)).toEqual([1]);
+      expect(result.refusals).toEqual([]);
+      expect(claim.meta.scope).toBe(held);
+    }
+  });
+  it('still refuses PRs sharing an mjs file alongside prose', () => {
+    const scope = ['we:docs/agent/testing.md', 'we:backlog/x.md', 'we:scripts/shared.mjs'];
+    const result = filterFixesByInFlightScope([fx(1, scope), fx(2, scope)]);
+    expect(result.planned.map(p => p.pr)).toEqual([1]);
+    expect(result.refusals).toEqual([expect.objectContaining({ pr: 2, kind: 'scope-overlap' })]);
+    expect(result.refusals[0].why).toContain('we:scripts/shared.mjs');
+  });
   it('ranks urgent PRs first and admits them past live scope claims', () => {
     const queue = [fx(1, ['we:a/x']), fx(2, ['we:b/y']), fx(3, ['we:a/x'])];
     const claims = [{ meta: { pr: 9, scope: ['we:a/'] } }];
@@ -1981,7 +2029,11 @@ describe('actual PR ownership and unblock ranking (2026-10-01)', () => {
     expect(planned[0].overlapScope).toEqual([`we:${card}`]);
     expect(filterFixesByInFlightScope(planned).planned.map((p) => p.pr)).toEqual([3311, 3336]);
     const sameCard = { ...fix(3340, [`we:${card}`]), waitingSince: undefined };
-    expect(filterFixesByInFlightScope([planned[0], sameCard]).refusals[0].pr).toBe(3340);
+    const sharedCard = filterFixesByInFlightScope([planned[0], sameCard]);
+    expect(sharedCard.refusals).toEqual([]);
+    expect(sharedCard.planned).toEqual([planned[0], sameCard]);
+    expect(sharedCard.planned[0].scope).toEqual([`we:${testFile}`]);
+    expect(sharedCard.planned[0].overlapScope).toEqual([`we:${card}`]);
   });
 
   it.each([true, false])('refreshes an old live claim from actual files (snapshot=%s)', (snapshot) => {
@@ -2473,5 +2525,56 @@ describe('fix pass PR metadata snapshot', () => {
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(1);
     expect(() => createFixPassPrReader({ exec })(7)).toThrow('unreadable PR');
     expect(exec.mock.calls.filter(([, args]) => args[1] === 'view')).toHaveLength(2);
+  });
+});
+
+
+describe('conflict-fix deadline exemption', () => {
+  const row = (prNumber, extra = {}) => ({ kind: 'fix', prNumber, headRefName: `fix-${prNumber}`, ...extra });
+  const mechanical = pr => row(pr, { isConflict: true, conflictFixMechanical: true, baseRefName: 'main' });
+  const run = (rows, extra = {}) => {
+    let time = 10;
+    return runReconcileFixDispatch({
+      root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: rows, refusals: [] }),
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: pr => [`src/${pr}.ts`],
+      pickFreeLanes: () => [1, 2, 3, 4, 5, 6], listBuildClaims: () => [], listFixClaims: () => [],
+      priorityShadow: null, tryResumeRound: null, tryResume: () => ({ resumed: false }),
+      fixSettings: { conflictFixExemptPerPass: 3 },
+      dispatch: entry => { time++; return { pr: entry.pr }; }, ...extra,
+    });
+  };
+  it('dispatches two proven conflicts after the deadline, scanning past a non-exempt PR', () => {
+    expect(run([row(1), row(2), mechanical(3), mechanical(4)]))
+      .toMatchObject({ handled: 3, dispatched: [{ pr: 1 }, { pr: 3 }, { pr: 4 }], deferred: [2], nextCursor: 2 });
+  });
+  it('honours cap three even when more proven conflicts are planned', () => {
+    expect(run([row(1), ...[2, 3, 4, 5, 6].map(mechanical)]))
+      .toMatchObject({ dispatched: [{ pr: 1 }, { pr: 2 }, { pr: 3 }, { pr: 4 }], deferred: [5, 6] });
+  });
+  it.each([0, undefined, -1, '3', 1.5])('disables exemptions for zero or invalid runtime cap %j', cap => {
+    expect(run([row(1), mechanical(2)], { fixSettings: { conflictFixExemptPerPass: cap } }))
+      .toMatchObject({ dispatched: [{ pr: 1 }], deferred: [2] });
+  });
+  it('defers a non-mechanical conflict and refuses a label-only exemption', () => {
+    expect(run([row(1), row(2, { isConflict: true }), row(3, { labels: [CONFLICT_LABEL], conflictFixMechanical: true })]))
+      .toMatchObject({ dispatched: [{ pr: 1 }], deferred: [2, 3] });
+  });
+  it('keeps the launch throttle guard on exempt entries after the deadline', () => {
+    const tryAdmit = vi.fn().mockReturnValueOnce({ admit: true }).mockReturnValue({ admit: false, kind: 'host-load', why: 'busy' });
+    expect(run([row(1), mechanical(2)], { dispatchThrottle: { tryAdmit } }))
+      .toMatchObject({ dispatched: [{ pr: 1 }], deferred: [], refusals: [expect.objectContaining({ pr: 2, kind: 'host-load' })] });
+    expect(tryAdmit).toHaveBeenCalledTimes(2);
+  });
+  it('keeps the live dispatch claim refusal on an exempt entry', () => {
+    let time = 10;
+    const dispatch = vi.fn(entry => {
+      time++;
+      return entry.pr === 2 ? { held: true, reason: 'claimed', heldBy: 'live-session' } : { pr: entry.pr };
+    });
+    const result = run([row(1), mechanical(2)], { now: () => time, dispatch });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(result.dispatched).toEqual([{ pr: 1 }]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 2, kind: 'held' }));
   });
 });

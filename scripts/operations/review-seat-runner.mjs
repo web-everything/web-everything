@@ -1,3 +1,4 @@
+import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 /**
  * review-seat-runner.mjs — RUN ONE REVIEW SEAT ON THE PROVIDER ITS SETTING NAMES (card 84, review half).
  *
@@ -23,6 +24,7 @@
  */
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
 import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
+import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } from '../lib/review-seat-caps.mjs';
 import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
@@ -51,6 +53,30 @@ export async function runSeatWithProvider(request, {
   }
   const model = directive.model;
   const runAgy = async (runModel = model) => {
+    // Both switches apply to Carbon shadows. The daemon plist sets AGY_GEMINI=0 today;
+    // enabling Carbon shadows is an explicit operator step: set that cap above 0.
+    const carbonShadow = directive.mode === 'shadow' && /carbon/i.test(String(runModel));
+    if (carbonShadow) {
+      const cap = resolveCarbonShadowCap();
+      const raw = process.env[CARBON_SHADOW_CAP_ENV];
+      const source = raw !== undefined && raw.trim() !== '' && Number.isSafeInteger(Number(raw)) && Number(raw) >= 0 ? 'env' : raw === undefined || raw.trim() === '' ? 'default' : 'invalid env (off)';
+      logReviewSeat(log, `review-seat: ${CARBON_SHADOW_CAP_ENV}=${cap} (${source})`);
+      if (cap === 0) {
+        const reason = 'carbon shadow seat off';
+        logReviewSeat(log, `review-seat: agy shadow skipped: ${reason}`);
+        return { status: 'skipped', reasons: [reason] };
+      }
+    }
+    if (/gemini|carbon/i.test(String(runModel)) && resolveProviderCap('agy-gemini') <= 0) {
+      const reason = 'agy-gemini seat cap 0';
+      logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
+      return { status: 'skipped', reasons: [reason] };
+    }
+    if (directive.mode !== 'shadow' && !carbonNonShadowAllowed(runModel, { log })) {
+      const reason = 'Carbon not promoted — non-shadow seat refused';
+      logReviewSeat(log, `review-seat: agy skipped: ${reason}`);
+      return { status: 'skipped', reasons: [reason] };
+    }
     if (directive.mode === 'shadow' && directive.dailyCap !== undefined) {
       const admission = reserveSession({ dailyCap: directive.dailyCap, now: now() });
       if (!admission.allowed) {

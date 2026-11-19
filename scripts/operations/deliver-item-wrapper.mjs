@@ -439,6 +439,11 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
       );
     }
 
+    if (locus.profile?.capabilities.build === 'none') {
+      terminalOutcome = 'unsupported-locus';
+      throw new Error(`deliver-item-wrapper: ${locus.profile.key} build capability is none; delivery is unsupported until a build path is enabled.`);
+    }
+
     // ---- 0. Telemetry (#3383) — the root `dispatch` span for this whole delivery, and the ambient recorder
     // every shared helper below (`acquireLane`, `runVerifyOperation`) emits its own spans into. The trace id is
     // DERIVED from the item, so this delivery, a later fix dispatch against its PR, and the review that lands

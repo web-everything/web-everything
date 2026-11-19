@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   revalidateForMerge, isTransientUnknownMergeability, resolveUnknownMergeabilityRetry, revalidateWithUnknownRetry,
   UNKNOWN_MERGEABILITY_RETRY, UNKNOWN_MERGEABILITY_RETRY_ENV,
+  triggerMergeabilityRecompute, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE, classifyPr,
 } from '../merge-ai-prs.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'drain-unknown-mergeability-skips-2026-10-09.json'), 'utf8'));
@@ -29,6 +30,59 @@ const pr = (over = {}) => ({
   ...over,
 });
 const opts = { requiredCheck: 'test', defaultBranch: 'main', expectedHeadSha: HEAD };
+
+describe('triggerMergeabilityRecompute', () => {
+  it.each(['UNKNOWN', null, undefined, ''])('recomputes %s once, logs once, and preserves PR facts', async mergeable => {
+    const candidate = Object.freeze(pr({ state: 'OPEN', mergeable }));
+    const before = structuredClone(candidate);
+    const calls = [], logs = [];
+    await triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/r', [candidate, candidate]]]),
+      recompute: async payload => { calls.push(payload); return pr(); }, log: line => logs.push(line),
+    });
+    expect(calls).toEqual([{ repo: 'o/r', num: 4602 }]);
+    expect(logs).toEqual(['mergeable-unknown-recompute o/r#4602']);
+    expect(candidate).toEqual(before);
+    expect(classifyPr(candidate, opts).decision).toBe('skip');
+    expect(classifyPr(pr({ state: 'OPEN' }), opts).decision).toBe('merge');
+  });
+
+  it('never triggers for MERGEABLE, CONFLICTING, CLOSED or MERGED candidates', async () => {
+    const calls = [], logs = [];
+    await triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/r', [pr(), pr({ mergeable: 'CONFLICTING' }),
+        pr({ state: 'CLOSED', mergeable: 'UNKNOWN' }), pr({ state: 'MERGED', mergeable: null })]]]),
+      recompute: payload => calls.push(payload), log: line => logs.push(line),
+    });
+    expect(calls).toEqual([]);
+    expect(logs).toEqual([]);
+  });
+
+  it.each([0, 2, UNKNOWN_MERGEABILITY_MAX_RECOMPUTE])('honors the shared per-pass cap of %s across repositories', async max => {
+    const calls = [], logs = [];
+    const rows = Array.from({ length: 15 }, (_, number) => pr({ number, mergeable: 'UNKNOWN' }));
+    await triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/r', rows.slice(0, 1)], ['o/s', rows.slice(1)]]),
+      recompute: payload => calls.push(payload), log: line => logs.push(line),
+      ...(max === UNKNOWN_MERGEABILITY_MAX_RECOMPUTE ? {} : { max }),
+    });
+    expect(UNKNOWN_MERGEABILITY_MAX_RECOMPUTE).toBe(10);
+    expect(calls).toHaveLength(max);
+    expect(logs).toHaveLength(max);
+    expect(calls.map(call => call.num)).toEqual(rows.slice(0, max).map(row => row.number));
+  });
+
+  it('swallows recompute failures without retrying, continues, and strips repository control characters from logs', async () => {
+    const calls = [], logs = [];
+    await expect(triggerMergeabilityRecompute({
+      prsByRepo: new Map([['o/\nr\x1b\x7f\x9f', [pr({ mergeable: 'UNKNOWN' }), pr({ number: 7, mergeable: null })]]]),
+      recompute: payload => { calls.push(payload); throw new Error('unavailable'); },
+      log: line => logs.push(line),
+    })).resolves.toBeUndefined();
+    expect(calls).toEqual([{ repo: 'o/\nr\x1b\x7f\x9f', num: 4602 }, { repo: 'o/\nr\x1b\x7f\x9f', num: 7 }]);
+    expect(logs).toEqual(['mergeable-unknown-recompute o/r#4602', 'mergeable-unknown-recompute o/r#7']);
+  });
+});
 
 describe('tonight\'s skip records', () => {
   it('every revalidationAborted record is the transient UNKNOWN shape the retry targets', () => {
@@ -221,11 +275,15 @@ describe('runCli wiring', () => {
   });
   it('runCli routes its context read and its ci-lifecycle writes through those two seams', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-    const run = src.slice(src.indexOf('async function runCli('));
+    const run = src.slice(src.indexOf('async function main('));
     const seam = run.indexOf('await repollThenCollectContext({');
     expect(seam).toBeGreaterThan(0);
-    expect(run.indexOf('collectContext(liveListingsByRepo)')).toBeGreaterThan(seam);
-    expect(run.indexOf('collectContext(liveListingsByRepo)')).toBe(run.lastIndexOf('collectContext(liveListingsByRepo)'));
+    const trigger = run.indexOf('await triggerMergeabilityRecompute({', seam);
+    expect(trigger).toBeGreaterThan(seam);
+    expect(run.indexOf('await repollUnknownListings({', seam)).toBeGreaterThan(trigger);
+    expect(run.slice(trigger, run.indexOf('await repollUnknownListings({', seam))).toContain("execFileP('gh', ['api', `repos/${slug}/pulls/${num}`]");
+    expect(run.indexOf('collectContext(liveListingsByRepo, readLiveRowsByRepo)')).toBeGreaterThan(seam);
+    expect(run.indexOf('collectContext(liveListingsByRepo, readLiveRowsByRepo)')).toBe(run.lastIndexOf('collectContext(liveListingsByRepo, readLiveRowsByRepo)'));
     expect(run).toContain('applyCiLifecycleLabelPlan({ plan, pr: p.number');
     expect(run).not.toMatch(/'--add-label', add\]/);
   });

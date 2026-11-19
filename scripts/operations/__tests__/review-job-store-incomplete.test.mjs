@@ -38,3 +38,10 @@ it('merging preserves incomplete evidence from every population', () => {
   expect(listAgentsWithReviewJobs({ listAgents: () => listing('agents'), listJobs: () => listing('jobs'),
     listWrapped: () => listing('wrapped') }).incomplete).toEqual(['agents', 'jobs', 'wrapped']);
 });
+
+it('the diagnostics subdirectory is not a live-job record or incomplete listing', () => {
+  readdirSync.mockReturnValueOnce(['diagnostics']);
+  const rows = listReviewJobAgents({ dir: 'fixture' });
+  expect(rows).toEqual([]);
+  expect(rows).not.toHaveProperty('incomplete');
+});

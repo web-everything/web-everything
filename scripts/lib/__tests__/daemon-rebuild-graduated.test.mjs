@@ -207,7 +207,10 @@ describe('overlayGraduated pr-merged auto-drops', () => {
     expect(args.plan.finalSha).not.toBe(ready.adopt.finalSha);
     expect(args.treeOf(args.plan.finalSha)).not.toBe(ready.tree);
     expect(match).toEqual({ adopt: ready.adopt, dropRefs: [], match: 'superseded' });
-    expect(leftForMain.mock.results.map(({ value }) => value)).toEqual([true, true]);
+    expect(args.liveApplied).toEqual([applied, applied]);
+    // The same live ref/sha is proved once even when both Git history and adopted state record it.
+    expect(leftForMain.mock.calls).toEqual([[applied, ready.adopt.finalSha]]);
+    expect(leftForMain.mock.results.map(({ value }) => value)).toEqual([true]);
   });
 });
 

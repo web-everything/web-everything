@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
+import { PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 import { buildManifest, embedManifestInBody, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { fetchPrReadsCached, prReadCacheIdentity, reduceOpenPrContext, planDrainPass } from '../../merge-ai-prs.mjs';
 import {
@@ -251,10 +252,10 @@ describe('snapshot fast drain CLI dependency context', () => {
       mkdirSync(bin);
       mkdirSync(snapshots);
       mkdirSync(join(dir, 'backlog'));
-      writeFileSync(join(snapshots, 'fixture__repo.json'), JSON.stringify({ v: 1, repo,
+      writeFileSync(join(snapshots, 'fixture__repo.json'), JSON.stringify({ v: PR_SNAPSHOT_VERSION, repo,
         fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: snapshot.length, prs: snapshot }));
       for (const name of ['frontierui', 'plateau-app']) {
-        writeFileSync(join(snapshots, `fixture__${name}.json`), JSON.stringify({ v: 1, repo: `fixture/${name}`,
+        writeFileSync(join(snapshots, `fixture__${name}.json`), JSON.stringify({ v: PR_SNAPSHOT_VERSION, repo: `fixture/${name}`,
           fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: 0, prs: [] }));
       }
       writeFileSync(join(dir, 'fixture.json'), JSON.stringify({ live, target, failPage, extraLive }));

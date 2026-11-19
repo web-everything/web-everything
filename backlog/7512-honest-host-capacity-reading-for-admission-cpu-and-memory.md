@@ -12,7 +12,7 @@ tags: []
 
 # Honest host capacity reading for admission (cpu and memory)
 
-Delivered by PR #6111 (R258; R280 retro card). macOS load average (~50 on 12 cores) counts IO and lock waiters and throttled work while the CPU was idle. New host-capacity reader reports CPU idle, memory pressure, swap, compressor, heavy queue and Forge, with a headroom verdict and admitNewWorkers. Core: we:scripts/readiness/host-capacity.mjs.
+Delivered by PR #6111 (R258; R280 retro card). macOS load average (~50 against the host core count) counts IO and lock waiters and throttled work while the CPU was idle. New host-capacity reader reports CPU idle, memory pressure, swap, compressor, heavy queue and Forge, with a headroom verdict and admitNewWorkers. Core: we:scripts/readiness/host-capacity.mjs.
 
 ## Acceptance
 

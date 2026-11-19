@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,9 @@ import { runSeatWithProvider } from '../../operations/review-seat-runner.mjs';
 const resolve = (options = {}) => resolveReviewSeatSafeguards({
   env: {}, platform: {}, readFile: () => '{}', log: () => {}, ...options,
 });
+// Exercise daily-budget and quota admission with non-Carbon Gemini explicitly enabled.
+beforeEach(() => vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5'));
+afterEach(() => vi.unstubAllEnvs());
 describe('high-care shadow admission', () => {
   const settings = loadReviewSeatSettings({ safeguards: resolve({ env: { WE_REVIEW_SHADOW_AGY_ENABLED: 'true' } }), log: () => {} });
   it.each(['scripts/lib/review-seat-provider.mjs', 'scripts/lib/gate-config.mjs'])('seats an earned high-care PR: %s', (file) => {
@@ -65,6 +68,22 @@ describe('daily session cap', () => {
       expect(result.summary).toBe('Claude judged');
       expect(result.skipped).toBeUndefined();
     } else expect(result.skipped).toBeDefined();
+  });
+  it('Carbon shadow off skips before reserving daily budget or launching a fallback', async () => {
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_CARBON_SHADOW', '0');
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_AGY_GEMINI', '5');
+    const reserveSession = vi.fn(), agyJuror = vi.fn();
+    const result = await runSeatWithProvider({ lens: 'correctness', seatProvider: {
+      mode: 'shadow', model: 'gemini-4-carbon-high', fallbackModel: 'opus', dailyCap: 10,
+    } }, {
+      cwd: '.', unwrap: x => x, wrap: value => value,
+      claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
+      reserveSession, agyJuror, appendRow: () => true, log: () => {},
+    });
+    expect(result.summary).toBe('Claude judged');
+    expect(result.shadow).toMatchObject({ status: 'skipped', reasons: ['carbon shadow seat off'] });
+    expect(reserveSession).not.toHaveBeenCalled();
+    expect(agyJuror).not.toHaveBeenCalled();
   });
   it('refuses admission when the budget store is unavailable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'shadow-budget-unavailable-'));

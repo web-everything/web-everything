@@ -12,6 +12,9 @@
 #   and forge-exec-sweep.mjs;
 # - /etc/forge-exec/limits.json root:root 0644 (created only if absent),
 #   persistent parent/slot systemd slices with live resource ceilings;
+# - /etc/tmpfiles.d/forge-tmp.conf: /tmp retention 2d;
+#   /etc/systemd/journald.conf.d/forge-journal.conf: journal cap 2G;
+#   rollback: remove both files and restart systemd-journald;
 # - /etc/sudoers.d/forge-exec root:root 0440 with these exact forms:
 #   ops ALL=(forge-exec-1,...,forge-exec-N) NOPASSWD: /usr/bin/rsync
 #   ops ALL=(root) NOPASSWD: /usr/local/libexec/forge-exec-run.mjs
@@ -335,6 +338,17 @@ finally:
 LIMITS
 /usr/local/libexec/forge-exec-limits.mjs apply
 systemctl daemon-reload
+install -d -m 0755 /etc/tmpfiles.d /etc/systemd/journald.conf.d
+cat > /etc/tmpfiles.d/forge-tmp.conf <<'TMPFILES'
+D /tmp 1777 root root 2d
+TMPFILES
+cat > /etc/systemd/journald.conf.d/forge-journal.conf <<'JOURNAL'
+[Journal]
+SystemMaxUse=2G
+JOURNAL
+chown root:root /etc/tmpfiles.d/forge-tmp.conf /etc/systemd/journald.conf.d/forge-journal.conf
+chmod 0644 /etc/tmpfiles.d/forge-tmp.conf /etc/systemd/journald.conf.d/forge-journal.conf
+systemctl restart systemd-journald
 # Ops owns the public bare repository. No remote configuration or credentials
 # are copied from the Mac; each tick supplies the public HTTPS URL explicitly.
 sudo -n -u ops env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c credential.helper= init --bare /srv/forge-base/repo.git
