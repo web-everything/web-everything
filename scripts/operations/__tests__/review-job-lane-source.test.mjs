@@ -144,8 +144,9 @@ describe('review-job lane source pass-through', () => {
   });
 
   it('real CLI exits 2 with exactly one error line for an invalid source', () => {
+    // Dependency deprecation warnings vary by Node version; assert the CLI's own diagnostic.
     const result = spawnSync(process.execPath, ['scripts/operations/review-job.mjs', 'run', '--pr=10', `--repo=${repo}`, '--origin=bad remote'],
-      { encoding: 'utf8', timeout: 30_000, env: { PATH: '' } });
+      { encoding: 'utf8', timeout: 30_000, env: { PATH: '', NODE_NO_WARNINGS: '1' } });
     expect(result.status).toBe(2);
     expect(result.stdout).toBe('');
     expect(result.stderr).toBe('review-job: error: --origin must be a URL or scp-style git remote\n');

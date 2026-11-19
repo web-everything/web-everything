@@ -63,7 +63,6 @@ import { pidIdentity } from '../lib/pid-alive.mjs';
  */
 
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
-import { filterRunFileNames } from '../operations/run-store.mjs';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -541,6 +540,29 @@ export function defaultDriverLease({
       ? `the live runner lease belongs to a different checkout (${res.cwd}) — this one is not driving`
       : `a live runner lease (${status.owner}${match === null ? `, checkout unresolved: ${res.status}` : ''})`,
   };
+}
+
+// Keep this observer independent of run-store's operations/dispatch graph. The grammar and
+// bounded warnings intentionally match filterRunFileNames; the watchdog suite pins that parity.
+const warnedRunNames = new Set();
+let runNameWarningsCapped = false;
+function filterRunFileNames(names) {
+  return names.filter(name => {
+    const id = name.endsWith('.json') ? name.slice(0, -5) : '';
+    if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\s\S])/.test(id) && !id.endsWith('.abandoned')) return true;
+    if (warnedRunNames.has(name)) return false;
+    if (warnedRunNames.size >= 1000) {
+      if (!runNameWarningsCapped) {
+        runNameWarningsCapped = true;
+        console.warn('operations: invalid run filename warning limit reached; further names skipped; inspect the runs directory');
+      }
+      return false;
+    }
+    warnedRunNames.add(name);
+    const safe = name.slice(0, 160).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ');
+    console.warn(`operations: skipping invalid run filename ${JSON.stringify(safe)}; inspect the runs directory`);
+    return false;
+  });
 }
 
 /**

@@ -324,6 +324,9 @@ it.each([1, 2, 3, 4, 5, 6, 7, 8, 9])('A3 / matrix %s: persisted dead job settles
   if (row !== 7) expect(comments).toHaveLength(1);
 });
 it('A4: every job CLI flag is named', () => {
+  // --origin / --reference and their REVIEW_JOB_LANE_ORIGIN / REVIEW_JOB_LANE_REFERENCE
+  // defaults, explicit precedence, forwarding and invalid-input refusals are exercised in
+  // review-job-lane-source.test.mjs (both foreground CLI and detached dispatch).
   const source = readFileSync(new URL('../review-job.mjs', import.meta.url), 'utf8');
   const tests = readFileSync(new URL('./review-recovery-witness.test.mjs', import.meta.url), 'utf8');
   for (const [, flag] of source.matchAll(/flag\('([^']+)'\)/g)) expect(tests).toContain(`--${flag}`);

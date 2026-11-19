@@ -18,7 +18,7 @@
  * NOTHING IS STARTED. No runner, no supervisor, no watchdog process, no `claude`, no real `git reset`. Every
  * process and filesystem boundary is injected; the only real fs is a throwaway tmpdir for the marker round-trip.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -36,6 +36,7 @@ import {
 import { DEFAULT_RENAG_MS } from '../branch-sync.mjs';
 import { driverModeFor, parseDriverMode, readDriverMode, writeDriverMode, DRIVER_MODES } from '../driver-mode.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
+import { filterRunFileNames } from '../../operations/run-store.mjs';
 
 const NOW = Date.parse('2026-09-12T18:00:00.000Z');
 const MIN = 60_000;
@@ -222,6 +223,35 @@ describe('runTouchesScope — a run counts as progress only if it is THIS driver
 
 describe('newestScopedRun — bounded by age and by count', () => {
   const mk = (n) => Array.from({ length: n }, (_, i) => `run-${i}.json`);
+
+  it('keeps filename selection and bounded warning output aligned with run-store without importing its graph', () => {
+    const names = ['review-pr-1.json', 'A._-9.json', `${'a'.repeat(128)}.json`,
+      `${'a'.repeat(129)}.json`, 'review-pr-1.abandoned.json', '.json', '..json',
+      '../escape.json', 'invalid\n\u001b\u2028.json', `${'x'.repeat(200)}\n.json`];
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const expected = filterRunFileNames(names);
+      const warnings = warn.mock.calls.map(([message]) => message);
+      warn.mockClear();
+      const seen = [];
+      const scan = () => newestScopedRun({ checkout: '/drv', queueKeys: new Set(), nowMs: NOW, lookbackMs: MIN,
+        readDir: () => names, stat: path => { seen.push(path); return NOW; }, read: () => null });
+      expect(scan()).toBeNull();
+      expect(seen).toEqual(expected.map(name => join('/drv/.operations/runs', name)));
+      expect(warn.mock.calls.map(([message]) => message)).toEqual(warnings);
+      warn.mockClear();
+      scan();
+      expect(warn).not.toHaveBeenCalled();
+      const oversized = Array.from({ length: 1001 }, (_, i) => `watchdog-invalid-${i}.metadata`);
+      expect(filterRunFileNames(oversized)).toEqual([]);
+      const cappedWarnings = warn.mock.calls.map(([message]) => message);
+      warn.mockClear();
+      expect(newestScopedRun({ checkout: '/drv', queueKeys: new Set(), nowMs: NOW, lookbackMs: MIN,
+        readDir: () => oversized, stat: () => { throw Error('invalid filename reached stat'); } })).toBeNull();
+      expect(warn.mock.calls.map(([message]) => message)).toEqual(cappedWarnings);
+      expect(cappedWarnings.at(-1)).toBe('operations: invalid run filename warning limit reached; further names skipped; inspect the runs directory');
+    } finally { warn.mockRestore(); }
+  });
 
   it('returns the newest in-scope record', () => {
     const got = newestScopedRun({

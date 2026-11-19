@@ -1,5 +1,12 @@
 # Testing — Three-Tier Strategy
 
+## Watchdog run filename parity
+
+Keep the watchdog independent of `run-store.mjs` and its operations graph. Its filename
+filter has a parity case in `driver-watchdog.test.mjs` against the store's filter, including
+legacy tombstones, identifier bounds, sanitized warnings, deduplication and the warning cap.
+When changing that grammar, update both filters and run this case; keep the whole-graph assertion intact.
+
 ## Review PR fetch isolation (R37)
 
 Review PR transport runs in a fresh temporary bare repository with empty global/system
