@@ -1387,7 +1387,7 @@ export function decideDispatchRoute(dispatch = {}, options = {}) {
     criticalWork: criticalWorkVerdict({ filesTouched: dispatch.cardPath ? [dispatch.cardPath] : dispatch.scopePaths, risk: dispatch.risk, tags: dispatch.tags }),
     criticalMisses: criticalMissesFor(options.scorecards ?? [], dispatch.kind === 'prepare-item' ? 'prepare' : dispatch.kind),
   });
-  const gateClosed = (roleGate && !roleGate.open) || record.auditTrail?.some(row => row.criterion === 'critical-work-gate' && row.result === 'claude-only');
+  const gateClosed = !(dispatch.kind === 'fix' && options.capacityTierSelected === true) && ((roleGate && !roleGate.open) || record.auditTrail?.some(row => row.criterion === 'critical-work-gate' && row.result === 'claude-only'));
   try {
     // Critical-miss vetoes are scored per taskType and apply to EVERY routed operation, gated or not
     // (prepare-item is role-path: no record.taskType, scored as 'prepare').

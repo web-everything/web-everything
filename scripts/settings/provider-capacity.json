@@ -1,0 +1,203 @@
+{
+  "$comment": "Provider/account quota contracts and operator-maintained observations. Unknown values require operator input. quotaOf shares observations, never adds quota. Override providerCapacity through policy-cascade; arrays replace as a whole. No future grants enter planning.",
+  "providerCapacity": {
+    "providers": [
+      {
+        "id": "codex",
+        "launcher": "codex",
+        "tier": 3,
+        "allowedKinds": [
+          "prepare",
+          "prepare-item",
+          "prepare-complex",
+          "prepare-card",
+          "takeover",
+          "design",
+          "fix",
+          "ci-heal",
+          "build",
+          "worker",
+          "doc-fix",
+          "prevention-card"
+        ],
+        "windowModel": "restartOnReset",
+        "windows": [
+          {
+            "name": "weekly",
+            "lengthHours": 168
+          }
+        ],
+        "capacityUnit": "percent-of-window",
+        "readers": [
+          {
+            "type": "codex-rollout",
+            "window": "weekly"
+          }
+        ],
+        "reservePercent": 10,
+        "model": "gpt-6.1-sol",
+        "accounts": [
+          {
+            "id": "codex",
+            "operatorReading": {
+              "usedPercent": 27,
+              "asOf": "2026-11-19T07:31:00-05:00",
+              "resetsAt": "2026-11-25T03:49:00-05:00"
+            },
+            "bankedResets": [
+              {
+                "count": 1,
+                "expiresAt": "2026-11-30T23:59:00-05:00"
+              },
+              {
+                "count": 1,
+                "expiresAt": "2026-12-01T23:59:00-05:00"
+              },
+              {
+                "count": 1,
+                "expiresAt": "2026-12-12T23:59:00-05:00"
+              }
+            ],
+            "credits": 0,
+            "bankedResetsAsOf": "2026-11-19T07:31:00-05:00"
+          }
+        ]
+      },
+      {
+        "id": "codex-alt",
+        "launcher": "codex",
+        "tier": 3,
+        "allowedKinds": [
+          "prepare",
+          "prepare-item",
+          "prepare-complex",
+          "prepare-card",
+          "takeover",
+          "design",
+          "fix",
+          "ci-heal",
+          "build",
+          "worker",
+          "doc-fix",
+          "prevention-card"
+        ],
+        "windowModel": "restartOnReset",
+        "windows": [
+          {
+            "name": "weekly",
+            "lengthHours": 168
+          }
+        ],
+        "capacityUnit": "percent-of-window",
+        "readers": [],
+        "reservePercent": 10,
+        "quotaOf": "codex",
+        "model": "gpt-6-astra"
+      },
+      {
+        "id": "claude",
+        "launcher": "claude",
+        "tier": 3,
+        "allowedKinds": [
+          "prepare",
+          "prepare-item",
+          "prepare-complex",
+          "prepare-card",
+          "takeover",
+          "design",
+          "fix",
+          "ci-heal",
+          "build",
+          "worker",
+          "doc-fix",
+          "prevention-card"
+        ],
+        "windowModel": "fixed",
+        "windows": [
+          {
+            "name": "weekly",
+            "lengthHours": null
+          }
+        ],
+        "capacityUnit": "percent-of-window",
+        "readers": [
+          {
+            "type": "plateau-usage-file",
+            "file": "claude-usage.json"
+          }
+        ],
+        "reservePercent": 10,
+        "model": "claude-opus-5-5",
+        "accounts": [
+          {
+            "id": "claude-a",
+            "bankedResets": [
+              {
+                "count": 1,
+                "expiresAt": "2026-12-10T23:59:00-05:00"
+              }
+            ],
+            "resetSchedule": null
+          },
+          {
+            "id": "claude-b",
+            "bankedResets": [],
+            "resetSchedule": null
+          }
+        ]
+      },
+      {
+        "id": "agy-gemini",
+        "launcher": "antigravity",
+        "tier": 2,
+        "allowedKinds": [],
+        "windowModel": "rolling",
+        "windows": [
+          {
+            "name": "weekly",
+            "lengthHours": null
+          }
+        ],
+        "capacityUnit": "percent-of-window",
+        "readers": [
+          {
+            "type": "plateau-usage-file",
+            "file": "agy-usage.json"
+          }
+        ],
+        "reservePercent": 10,
+        "model": "gemini-4-argon-high",
+        "manualResets": {
+          "count": null,
+          "expiresAt": null
+        }
+      },
+      {
+        "id": "agy-claude",
+        "launcher": "antigravity",
+        "tier": 2,
+        "allowedKinds": [],
+        "windowModel": "fixed",
+        "windows": [
+          {
+            "name": "weekly",
+            "lengthHours": null
+          }
+        ],
+        "capacityUnit": "percent-of-window",
+        "readers": [],
+        "reservePercent": 10,
+        "model": "claude-sonnet-5-5-high",
+        "emergencyOnly": true,
+        "manualResets": {
+          "count": null,
+          "expiresAt": null
+        }
+      }
+    ],
+    "minimumTiers": {
+      "fix:critical-work": 3,
+      "fix:ruling-escalation-stronger": 2
+    }
+  }
+}

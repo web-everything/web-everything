@@ -5,8 +5,10 @@ import { validateRoutingPolicy, applyRoutingOverrides, DEFAULT_ROUTING_POLICY, r
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
 import { decideDispatchRoute, MARKER_KINDS } from './dispatch-contracts.mjs';
-import { BUILD_KINDS, effectiveBuilder } from './routing-settings.mjs';
+import { BUILD_KINDS, effectiveBuilder, resolveRoutingSettings } from './routing-settings.mjs';
 import { providerQuotaHold } from './provider-quota-hold.mjs';
+import { chooseBuilder } from './provider-capacity.mjs';
+import { observeCapacity } from './provider-capacity-io.mjs';
 import { resolveRoutingOverrideRoute } from './dispatch-routing-override-route.mjs';
 function initialPolicy(env) {
   return trustedSnapshot(env.WE_DISPATCH_ROUTING_SNAPSHOT) ?? DEFAULT_ROUTING_POLICY;
@@ -62,6 +64,17 @@ export const readRoutingPolicy = createRoutingPolicyReader();
 
 export function resolveOperationRoute(options = {}, { readPolicy = readRoutingPolicy } = {}) {
   const policy = options.policy ?? readPolicy();
+  const key = `${options.operation}:${options.taskType}`;
+  const settings = resolveRoutingSettings({ env: options.env ?? process.env }).capacity;
+  if (settings.minimumTiers?.[key] !== undefined && policy.operations[key]?.inherit) {
+    const now = options.now ?? Date.now();
+    const capacities = (options.capacity ?? observeCapacity({ env: options.env ?? process.env, now, settings }))
+      .filter(c => !options.available || options.available.includes(c.launcher ?? c.provider));
+    const decision = chooseBuilder({ kind: options.operation, capacities, settings: { ...settings, routeKey: key, now }, fallback: null });
+    if (!decision.provider) throw new Error('no eligible capacity meeting minimum tier; wait for quota reset or supply operator readings');
+    return { provider: decision.launcher === 'antigravity' ? decision.provider : decision.launcher ?? decision.provider,
+      model: decision.model, account: decision.account, effort: 'high', fallback: [], source: 'capacity-score' };
+  }
   return resolvePureRoute({ ...options, policy,
     operatorKeys: options.operatorKeys ?? (options.policy === undefined ? readPolicy.operatorKeys() : undefined) });
 }
@@ -86,7 +99,10 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   }
   // routing.builder=claude: Codex is held for build kinds only; audit and review seats still use it.
   // Resolve the builder once, so an `auto` quota reading cannot change between the refusal and the hold.
-  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity }) : null;
+  const taskType = dispatch.kind === 'fix' ? dispatch.takeover ? 'takeover' : dispatch.rulingNotAddressed ? 'ruling-not-addressed'
+    : dispatch.taskType : dispatch.taskType;
+  const routeKey = taskType ? `${dispatch.kind}:${taskType}` : dispatch.kind;
+  const builder = BUILD_KINDS.includes(dispatch?.kind) ? effectiveBuilder({ kind: dispatch.kind, env: options.env ?? process.env, now: options.now ?? Date.now(), records, capacity: options.capacity, routeKey, queuedDemand: options.queuedDemand ?? options.queuedDispatches?.filter(d => BUILD_KINDS.includes(d.kind)).length ?? 1, demandRatePerHour: options.demandRatePerHour }) : null;
   if (builder?.decision?.provider === null) return { outcome: 'refused', refusal: 'no eligible capacity; wait for quota reset or clear provider hold', auditTrail: [] };
   for (const input of builder?.decision?.inputs ?? []) {
     if (['held', 'exhausted'].includes(input.label)) availability[input.provider.startsWith('agy-') ? 'antigravity' : input.provider] = `capacity: ${input.label}`;
@@ -109,17 +125,22 @@ export function resolveDispatchRoute(dispatch, options = {}) {
   const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
   let routingPolicy = options.routingPolicy ?? readRoutingPolicy();
   if (builder?.decision?.reason === 'capacity-score' || builder?.decision?.reason === 'unknown-emergency') {
-    const provider = builder.builder;
-    const entry = { provider, model: defaultPolicyModel(provider), effort: 'medium',
+    const provider = builder.decision.launcher === 'codex' ? 'codex' : builder.builder;
+    const entry = { provider, model: builder.decision.model ?? defaultPolicyModel(provider), effort: 'medium',
       fallback: provider === 'claude' || availability.claude ? [] : [{ provider: 'claude', model: 'sonnet', effort: 'medium' }] };
     // Only this build operation is projected; the existing critical-work gate still rules the route.
     routingPolicy = { ...routingPolicy, smallPrepare: undefined, operations: { ...routingPolicy.operations,
       [dispatch.kind]: entry,
       ...(['prepare', 'prepare-item'].includes(dispatch.kind) ? { 'prepare-decision': entry } : {}),
-      ...Object.fromEntries(Object.keys(routingPolicy.operations).filter(k => k.startsWith(`${dispatch.kind}:`)).map(k => [k, entry])),
+      ...Object.fromEntries(Object.keys(routingPolicy.operations).filter(k => k.startsWith(`${dispatch.kind}:`) && routingPolicy.operations[k].inherit).map(k => [k, entry])),
     } };
   }
-  return decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy });
+  // A verified minimum tier replaces the Claude-only critical gate for these two build routes only.
+  const tierSelected = builder?.decision?.reason === 'capacity-score' && builder.settings.capacity.minimumTiers?.[routeKey] !== undefined;
+  if (taskType && ['takeover', 'ruling-not-addressed'].includes(taskType)) routingPolicy = { ...routingPolicy, operations: { ...routingPolicy.operations, fix: routingPolicy.operations[`fix:${taskType}`] } };
+  const result = decideDispatchRoute(dispatch, { ...options, availability, ciHealNativeFallback, routingPolicy, capacityTierSelected: tierSelected });
+  // Launchers that support account selection can consume this field; current launchers ignore it.
+  return { ...result, ...(builder?.account ? { account: builder.account } : {}) };
 }
 export function routingPolicyEnv() {
   return { WE_DISPATCH_ROUTING_SNAPSHOT: JSON.stringify(readRoutingPolicy()) };

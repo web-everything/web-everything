@@ -1,9 +1,9 @@
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readProviderCapacity, scoreProvider, chooseBuilder, burnWindows, planLine, calendarReset } from './provider-capacity.mjs';
+import { PROVIDER_DEFAULTS, readProviderCapacity, scoreProvider, chooseBuilder, burnWindows, planLine, calendarReset } from './provider-capacity.mjs';
 import { effectiveBuilder } from './routing-settings.mjs';
 import { resolveFixExecutorChain, pickChainRung } from './fix-executor-chain.mjs';
 import { recordCapacityDecision, observeCapacity } from './provider-capacity-io.mjs';
@@ -13,6 +13,7 @@ import { capacityCalendar, renderCalendar } from '../operations/capacity-calenda
 const now = Date.parse('2026-11-19T12:00:00Z'), hour = 3600000;
 const cap = (provider, used, hours, extra = {}) => ({ provider, windows: used === null ? [] : [{ name: 'seven_day', usedPercent: used,
   resetsAt: now + hours * hour, source: 'live', lengthHours: 168 }], known: used !== null, held: false, health: 1, now, ...extra });
+const providers = PROVIDER_DEFAULTS.providers.map(p => ({ ...p, accounts: undefined, operatorReading: undefined }));
 const choose = (capacities, settings = {}, kind = 'fix') => chooseBuilder({ kind, capacities, settings: { ...settings, now }, fallback: 'claude' });
 const repo = { routing: { builder: 'auto' } };
 const chain = capacities => resolveFixExecutorChain({ repo, platform: {}, env: {}, capacity: capacities, now, quota: () => null, record: () => {} }).value;
@@ -32,11 +33,11 @@ test('exhausted and held providers are excluded from the first and escalation ru
 });
 test('tier minimum excludes lower-tier provider and unknown usage never beats known', () => {
   const cs = [cap('codex', 27, 2), cap('claude', 10, 120)];
-  assert.equal(choose(cs, { tiers: { codex: 1, claude: 3 }, kindMinTier: { fix: 2 } }).provider, 'claude');
+  assert.equal(choose(cs, { providers: providers.map(p => ({ ...p, tier: p.id === 'codex' ? 1 : 3 })), minimumTiers: { fix: 2 } }).provider, 'claude');
   assert.equal(choose([cap('codex', null), cap('claude', 90, 2)]).provider, 'claude');
 });
 test('all readers failing preserves historical threshold fallback and repair chain', () => {
-  const capacity = readProviderCapacity({ now, readers: { codex: () => { throw Error(); } } });
+  const capacity = readProviderCapacity({ settings: { providers }, now, readers: { codex: () => { throw Error(); } } });
   const out = effectiveBuilder({ repo, env: {}, capacity, now, quota: () => null, record: () => {} });
   assert.equal(out.builder, 'claude'); assert.equal(out.decision.reason, 'all-readers-unknown');
   assert.deepEqual(chain(capacity), ['codex', 'codex-alt', 'claude']);
@@ -63,9 +64,10 @@ test('pace ahead penalizes and behind boosts; long work prefers remaining absolu
 test('stale, expired, malformed usage and configured resets remain unknown; tightest live window binds', () => {
   const readers = { codex: () => ({ used_percent: 27, resets_at: (now + 2 * hour) / 1000, secondary: { used_percent: 80, resets_at: (now + 100 * hour) / 1000 } }),
     claude: () => ({ at: new Date(now - 7 * hour).toISOString(), five_hour: { used_percentage: 5, resets_at: new Date(now + hour).toISOString() } }) };
-  const cs = readProviderCapacity({ now, readers, settings: { calendar: { claude: { weekly: 'Thu 14:00 America/New_York' } } } });
+  const cs = readProviderCapacity({ now, readers, settings: { providers, calendar: { claude: { weekly: 'Thu 14:00 America/New_York' } } } });
   assert.equal(cs[0].windows.length, 2); assert.equal(scoreProvider(cs[0], 'fix').usedPercent, 80);
-  assert.equal(cs[1].known, false); assert.equal(cs[1].windows[0].source, 'configured');
+  const claude = cs.find(c => c.provider === 'claude');
+  assert.equal(claude.known, false); assert.equal(claude.windows[0].source, 'configured');
   assert.equal(calendarReset('Thu 14:00 America/New_York', now), Date.parse('2026-11-19T19:00:00Z'));
   assert.equal(calendarReset('99:00 Invalid/Zone', now), null);
   const expired = readProviderCapacity({ now, readers: { codex: () => ({ used_percent: 0, resets_at: now / 1000 }) } });
@@ -74,8 +76,8 @@ test('stale, expired, malformed usage and configured resets remain unknown; tigh
 test('agy requires allowlisting; unknown emergency requires explicit opt-in and no scored alternative', () => {
   const cs = [cap('codex', 98, 2), cap('agy-gemini', 5, 1), cap('agy-claude', null)];
   assert.equal(choose(cs).provider, null);
-  assert.equal(choose(cs, { allowed: { fix: ['agy-gemini'] } }).provider, 'agy-gemini');
-  const settings = { allowed: { fix: ['agy-claude'] }, allowUnknownEmergency: true };
+  assert.equal(choose(cs, { providers: providers.map(p => ({ ...p, allowedKinds: p.id === 'agy-gemini' ? ['fix'] : [] })) }).provider, 'agy-gemini');
+  const settings = { providers: providers.map(p => ({ ...p, allowedKinds: p.id === 'agy-claude' ? ['fix'] : [] })), allowUnknownEmergency: true };
   assert.equal(choose(cs, settings).provider, 'agy-claude');
   assert.equal(choose(cs, { ...settings, allowUnknownEmergency: false }).provider, null);
 });
@@ -96,7 +98,7 @@ test('plan line, calendar scores, burn detection, durable dedupe and never-throw
     assert.doesNotThrow(() => recordCapacityDecision(decision, { ...opts, append: () => { throw Error(); } }));
     mkdirSync(join(dir, '.plateau'));
     const file = join(dir, '.plateau', 'claude-usage.json'); writeFileSync(file, ' '.repeat(2 * 1024 * 1024 + 1));
-    assert.equal(observeCapacity({ env: { HOME: dir, CONVEYOR_STATE_ROOT: dir }, now, quota: () => null, records: [] })[1].known, false);
+    assert.equal(observeCapacity({ env: { HOME: dir, CONVEYOR_STATE_ROOT: dir }, now, quota: () => null, records: [] }).find(c => c.provider === 'claude').known, false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 test('Codex live reader preserves primary shape and returns secondary', () => {

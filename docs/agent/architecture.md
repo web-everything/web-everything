@@ -73,29 +73,41 @@ Subclass `CustomAttribute` and log in `connectedCallback`/`disconnectedCallback`
 
 ## Capacity routing and reset calendar
 
-Build-only `routing.builder=auto` uses `routing.capacity` through the declared settings
-reader and policy-cascade (standard → platform → tool; environment selects the builder).
-Explicit builders retain their existing behavior. No provider is invoked to probe usage.
-`node scripts/operations/run.mjs capacity-calendar [--json]` shows observations, all build-kind
-scores, plan labels and burn windows. Decisions go to `capacity-decisions.jsonl` under the
-shared conveyor state root (`WE_CAPACITY_LEDGER` overrides it); burn receipts dedupe monitor
-events per provider/reset. Telemetry failures never interrupt dispatch.
+Build-only `routing.builder=auto` scores accounts independently. Audit and review seats retain their
+own routing. `scripts/settings/provider-capacity.json` owns provider/model tiers, launchers, allowed
+build kinds, reserves, readers, window models and account inventories. Add a model as one entry;
+`quotaOf` aliases share observations and never add horizon capacity. Override `providerCapacity`
+through the shared declared reader and policy-cascade (standard → platform → tool → environment;
+operator preferences use the platform layer). Arrays replace as a whole. Effective values and sources
+use the normal cascade log. `routing.capacity` owns global pacing weights, working hours, reset
+thresholds and demand assumptions. Unknown readings never score; unknown horizons require operator
+input. All-readers-unknown preserves the historical builder threshold only for an eligible fallback.
 
-Defaults: `staleHours=6`, `exhaustedPercent=98`, `urgencyWeight=4`,
-`urgencyHorizonHours=24`, `reservePercent=10`, `reserveReleaseHours=6`,
-`targetPercent=95`, `paceTolerance=10`, `aheadPenalty=0.7`, `behindBoost=1.2`,
-`burnWindowHours=4`, `burnUnusedPercent=40`. `enabled` defaults true only in auto.
-`allowed` maps kind to providers (default Codex/Claude); `tiers` maps provider to number
-and `kindMinTier` maps kind to minimum (both default 0). `longKinds=[]` opts kinds into
-remaining-capacity weighting; `criticalKinds` defaults critical/security/audit/audit-full
-(and kinds containing those words retain reserve access). `allowUnknownEmergency=false`
-gates agy-claude, which also requires explicit kind allowlisting and all scored alternatives
-to be excluded. Unknown usage never scores. `calendar` maps provider to `daily`/`weekly`
-rules, e.g. `{ "claude": { "weekly": "Thu 14:00 America/New_York" } }`. Calendars
-supply reset times only, never usage. Invalid/stale/oversized usage files remain unknown.
+The pure `scripts/lib/capacity-planner.mjs` handles fixed-window end-of-window burn, rolling usage
+rates and restart-on-reset inventories. Each manual reset restores a full window and forfeits the
+remainder. Banked resets on hand are authoritative: grant cadence is informational and never enters
+planning. Expiry deadlines use cumulative current remainder plus banked capacity, earliest expiry
+first; the tightest deadline sets the required rate. A bounded recent decision-ledger slope supplies
+the current routed usage rate, or it remains unknown. Shortfalls boost routing up to `maxBurnBoost`
+(default 3) and emit a deduped burn event requesting queued audits, red teams and backlog builds.
+This event requests work; it does not change audit/review provider selection.
 
-The highest usage window binds scoring and urgency. Every window retains its reserve
-until its release time; critical work can consume it. Linear pace uses 5h/7d/1d lengths;
-Codex window_minutes takes precedence. No eligible provider refuses with an operator-visible
-wait-for-reset/clear-hold message; all readers unknown preserves threshold routing and the
-configured repair chain. Audit/review seats do not use this chooser.
+`routing.capacity.workingHours` defaults to 09:00–20:00 America/New_York, weekdays 1–5.
+Recommendations compare previous-slot forfeiture against the banked expiry loss from throttling
+until the next slot; both costs appear in the calendar. Reset alerts require queued demand and
+`resetAtPercent` (default 95), and occur only in working hours. Receipts dedupe by account/window
+and event type. Telemetry failures never interrupt dispatch. Oversized inventories (>1000 resets)
+require operator correction rather than generating an unbounded plan.
+
+`node scripts/operations/run.mjs capacity-calendar [--json] [--horizon]` shows observations,
+planner actions, rate pressure, reset choices, missing operator inputs and a 14-day forecast.
+`expectedDemandPerDay` is percent-of-window units per account/provider (null means unknown).
+Inactive accounts never route or contribute capacity; sustained shortfall on three working days
+(`activateAfterShortfallDays`) recommends activation. The shared Claude usage file maps only to
+`routing.capacity.claudeUsageAccount`; null leaves both accounts unknown. Route results carry
+`account` for a future account-selecting launcher; current callers may ignore it.
+
+`fix:critical-work` and `fix:ruling-escalation-stronger` inherit capacity selection with minimum tiers
+3 and 2 respectively. Explicit takeover and ruling-not-addressed routes remain Claude policy data.
+Unknown eligible capacity refuses with an operator-visible wait/reset/readings fallback.
+

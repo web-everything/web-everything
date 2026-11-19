@@ -1,10 +1,15 @@
 /** Pure capacity arithmetic. All observations and clocks are supplied by the caller; times are epoch ms. */
-export const PROVIDERS = ['codex', 'claude', 'agy-gemini', 'agy-claude'];
+import { planCapacity } from './capacity-planner.mjs';
+import defaults from '../settings/provider-capacity.json' with { type: 'json' };
+export const PROVIDER_DEFAULTS = defaults.providerCapacity;
+export const PROVIDERS = PROVIDER_DEFAULTS.providers.map(p => p.id);
 export const CAPACITY_DEFAULTS = {
   staleHours: 6, exhaustedPercent: 98, urgencyWeight: 4, urgencyHorizonHours: 24,
-  reservePercent: 10, reserveReleaseHours: 6, targetPercent: 95, paceTolerance: 10,
-  aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 4, burnUnusedPercent: 40,
-  calendar: {}, tiers: {}, kindMinTier: {}, allowed: {}, longKinds: [],
+  reserveReleaseHours: 6, fixedTargetPercent: 100, paceTolerance: 10,
+  aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 24, burnUnusedPercent: 40,
+  longKinds: [], resetAtPercent: 95, maxBurnBoost: 3,
+  workingHours: { start: '09:00', end: '20:00', tz: 'America/New_York', days: [1, 2, 3, 4, 5] },
+  claudeUsageAccount: null, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
   criticalKinds: ['critical', 'security', 'audit', 'audit-full'], allowUnknownEmergency: false,
 };
 const HOUR = 3600000;
@@ -28,34 +33,46 @@ export function calendarReset(rule, now) {
   return null;
 }
 
+/** Expand models into account observations; aliases inherit the owner's readings and inventory. */
 export function readProviderCapacity({ env = {}, now = Date.now(), readers = {}, settings = {} } = {}) {
-  const s = options(settings);
-  return PROVIDERS.map(provider => {
-    let raw;
-    try { raw = readers[provider]?.(env); } catch { /* unknown */ }
-    const windows = [];
-    const add = (name, w) => {
-      const usedPercent = w?.used_percent ?? w?.used_percentage;
-      const resetsAt = epoch(w?.resets_at);
-      if (typeof usedPercent === 'number' && usedPercent >= 0 && usedPercent <= 100 && resetsAt > now) {
-        windows.push({ name, usedPercent, resetsAt, source: 'live', lengthHours: w.window_minutes / 60 || lengths[name] });
+  const s = options(settings), providers = settings.providers ?? PROVIDER_DEFAULTS.providers;
+  return providers.flatMap(entry => {
+    const owner = providers.find(p => p.id === entry.quotaOf) ?? entry;
+    return (owner.accounts ?? [{ id: owner.id }]).map(account => {
+      const def = { ...owner, ...entry, ...account }, windows = [];
+      let raw;
+      try { raw = readers[account.id]?.(env) ?? readers[owner.id]?.(env); } catch { /* unknown */ }
+      // The shared Claude file cannot identify an account. Never attribute it to both accounts.
+      if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
+      const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
+      const seed = def.operatorReading, seedAt = epoch(seed?.asOf);
+      const liveUsable = owner.readers?.some(r => r.type === 'codex-rollout') || (at <= now && now - at <= s.staleHours * HOUR);
+      const add = (name, w, source = 'live') => {
+        const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
+        const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
+        const configured = def.windows?.find(x => x.name === name || (['weekly', 'seven_day'].includes(name) && ['weekly', 'seven_day'].includes(x.name)));
+        if (typeof usedPercent === 'number' && usedPercent >= 0 && usedPercent <= 100 && resetsAt > now) windows.push({ name, usedPercent, resetsAt, source,
+          lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
+      };
+      if (seed && seedAt <= now && (!raw || !Number.isFinite(at) || at < seedAt)) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
+      else if (liveUsable) {
+        if (owner.readers?.some(r => r.type === 'codex-rollout')) {
+          add('five_hour', raw); add('weekly', raw?.secondary);
+        } else {
+          add('five_hour', raw?.five_hour); add('seven_day', raw?.seven_day);
+          for (const w of raw?.windows ?? []) add(w.name, w);
+          for (const spec of def.readers ?? []) if (spec.window) add(spec.window, raw);
+        }
       }
-    };
-    if (provider === 'codex') { add('five_hour', raw); add('seven_day', raw?.secondary); }
-    else if (provider !== 'agy-claude') {
-      const at = epoch(raw?.at ?? raw?.mtime);
-      if (at <= now && now - at <= s.staleHours * HOUR) {
-        add('five_hour', raw?.five_hour); add('seven_day', raw?.seven_day);
+      if (!windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
+        const resetsAt = calendarReset(rule, now);
+        if (resetsAt) windows.push({ name, usedPercent: null, resetsAt, source: 'configured', lengthHours: lengths[name] ?? null });
       }
-    }
-    if (!windows.length) for (const [name, rule] of Object.entries(s.calendar[provider] ?? {})) {
-      const resetsAt = calendarReset(rule, now);
-      if (resetsAt) windows.push({ name, usedPercent: null, resetsAt, source: 'configured', lengthHours: lengths[name] });
-    }
-    let held = false;
-    try { held = Boolean(readers.hold?.(provider, now)); } catch { held = true; }
-    // Scorecards have model/rubric-specific quality scores, no cheap provider error-rate reader.
-    return { provider, windows, held, health: held ? 0 : 1, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
+      let held = false;
+      try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
+      return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
+        known: windows.some(w => Number.isFinite(w.usedPercent)), now };
+    });
   });
 }
 
@@ -64,40 +81,50 @@ export function scoreProvider(cap, kind, settings = {}) {
   const w = bindingWindow(cap), hoursToReset = w ? Math.max(0, (w.resetsAt - now) / HOUR) : null;
   const critical = s.criticalKinds.includes(kind) || /security|critical|audit/.test(kind);
   const reserved = cap.windows.filter(w => Number.isFinite(w.usedPercent)).map(w =>
-    w.usedPercent + (!critical && (w.resetsAt - now) / HOUR > s.reserveReleaseHours ? s.reservePercent : 0));
+    w.usedPercent + (!critical && (w.resetsAt - now) / HOUR > s.reserveReleaseHours ? (cap.reservePercent ?? 10) : 0));
   const usedPercent = w?.usedPercent ?? null, effectiveUsed = reserved.length ? Math.max(...reserved) : null;
   const spare = effectiveUsed === null ? null : Math.max(0, 1 - effectiveUsed / 100);
   const urgency = hoursToReset === null ? 1 : 1 + s.urgencyWeight * Math.max(0, 1 - hoursToReset / s.urgencyHorizonHours);
-  const fit = (s.tiers[cap.provider] ?? 0) >= (s.kindMinTier[kind] ?? 0) ? 1 : 0;
-  const expected = w ? s.targetPercent * Math.max(0, 1 - hoursToReset / (w.lengthHours || lengths[w.name] || 5)) : null;
-  const pace = w ? usedPercent - expected : null;
-  const paceFactor = pace > s.paceTolerance ? s.aheadPenalty : pace < -s.paceTolerance ? s.behindBoost : 1;
-  const label = cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
-    : !fit ? 'tier-excluded' : effectiveUsed >= 100 ? 'reserve-only' : pace > s.paceTolerance ? 'ahead' : pace < -s.paceTolerance ? 'behind' : 'normal';
-  const excluded = ['held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
+  const def = (settings.providers ?? PROVIDER_DEFAULTS.providers).find(p => p.id === cap.provider);
+  const minimumTier = settings.minimumTiers?.[settings.routeKey ?? kind] ?? PROVIDER_DEFAULTS.minimumTiers[settings.routeKey ?? kind] ?? 0;
+  const fit = (cap.tier ?? def?.tier ?? 0) >= minimumTier ? 1 : 0;
+  const planner = planCapacity(cap, s, { now, queuedDemand: settings.queuedDemand ?? 0, demandRatePerHour: settings.demandRatePerHour });
+  const pace = planner.pace;
+  const burn = planner.action === 'burn' || planner.pacingAction === 'burn' || planner.burnAggressively;
+  const paceFactor = (pace === 'ahead' ? s.aheadPenalty : burn || pace === 'behind' ? s.behindBoost : 1) * (1 + (planner.scoreBoost ?? 0));
+  const label = cap.active === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
+    : !fit ? 'tier-excluded' : effectiveUsed >= 100 ? 'reserve-only' : pace === 'ahead' ? 'ahead' : pace === 'behind' ? 'behind' : 'normal';
+  const excluded = ['inactive', 'held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
   const remaining = spare * hoursToReset;
-  return { provider: cap.provider, usedPercent, effectiveUsed, resetsAt: w?.resetsAt ?? null,
+  return { provider: cap.provider, account: cap.account ?? null, planner, model: cap.model ?? def?.model, launcher: cap.launcher ?? def?.launcher, usedPercent, effectiveUsed, resetsAt: w?.resetsAt ?? null,
     spare, urgency, health: cap.health, fit, pace, paceFactor, remaining, label,
     score: excluded ? null : spare * urgency * cap.health * fit * paceFactor * (s.longKinds.includes(kind) ? remaining : 1) };
 }
 
 export function chooseBuilder({ kind = 'build', capacities, settings = {}, fallback }) {
-  const s = options(settings), allowed = s.allowed[kind] ?? ['codex', 'claude'];
-  const inputs = capacities.map(cap => ({ ...scoreProvider(cap, kind, settings), allowed: allowed.includes(cap.provider) }));
-  const ranked = inputs.filter(i => i.allowed && i.provider !== 'agy-claude' && i.score !== null).sort((a, b) => b.score - a.score);
-  if (ranked.length) return { provider: ranked[0].provider, reason: 'capacity-score', inputs };
-  const emergency = inputs.find(i => i.provider === 'agy-claude' && i.allowed && i.label === 'unknown' && i.fit);
-  if (emergency && s.allowUnknownEmergency) return { provider: emergency.provider, reason: 'unknown-emergency', inputs };
-  if (!capacities.some(c => c.known) && !capacities.some(c => c.held)) return { provider: fallback, reason: 'all-readers-unknown', inputs };
+  const s = options(settings);
+  const inputs = capacities.map(cap => {
+    const def = (settings.providers ?? PROVIDER_DEFAULTS.providers).find(p => p.id === cap.provider);
+    return { ...scoreProvider(cap, kind, settings), allowed: cap.active !== false && (cap.allowedKinds ?? def?.allowedKinds ?? []).includes(kind), emergencyOnly: cap.emergencyOnly ?? def?.emergencyOnly };
+  });
+  const ranked = inputs.filter(i => i.allowed && !i.emergencyOnly && i.score !== null).sort((a, b) => b.score - a.score);
+  if (ranked.length) return { provider: ranked[0].provider, account: ranked[0].account, model: ranked[0].model, launcher: ranked[0].launcher, reason: 'capacity-score', inputs };
+  const emergency = inputs.find(i => i.emergencyOnly && i.allowed && i.label === 'unknown' && i.fit);
+  if (emergency && s.allowUnknownEmergency) return { provider: emergency.provider, account: emergency.account, reason: 'unknown-emergency', inputs };
+  if (!capacities.some(c => c.known) && !capacities.some(c => c.held) && inputs.some(i => i.provider === fallback && i.allowed && i.fit && i.label === 'unknown')) return { provider: fallback, reason: 'all-readers-unknown', inputs };
   return { provider: null, reason: 'no-eligible-capacity', inputs };
 }
 
 export function burnWindows(capacities, settings = {}) {
-  const s = options(settings);
   return capacities.flatMap(cap => {
     const w = bindingWindow(cap), now = settings.now ?? cap.now ?? Date.now();
-    return !cap.held && w && w.resetsAt > now && w.resetsAt - now <= s.burnWindowHours * HOUR && 100 - w.usedPercent > s.burnUnusedPercent
-      ? [{ provider: cap.provider, usedPercent: w.usedPercent, resetsAt: w.resetsAt }] : [];
+    const planner = planCapacity(cap, options(settings), { now, queuedDemand: settings.queuedDemand ?? 0, demandRatePerHour: settings.demandRatePerHour });
+    if (cap.active === false || cap.held || !w || w.resetsAt <= now) return [];
+    const detail = { provider: cap.provider, account: cap.account ?? null, usedPercent: w.usedPercent, resetsAt: w.resetsAt };
+    return [
+      ...(planner.burnAggressively || planner.action === 'burn' || planner.pacingAction === 'burn' ? [{ ...detail, kind: 'capacity-burn-window', ...(planner.pullWork ? { pullWork: planner.pullWork } : {}) }] : []),
+      ...(planner.action === 'reset-now' ? [{ ...detail, kind: 'capacity-reset-recommended', resetsLeft: planner.bankedCount }] : []),
+    ];
   });
 }
 

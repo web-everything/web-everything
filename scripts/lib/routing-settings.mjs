@@ -1,7 +1,7 @@
 /** Who writes code: routing.builder (claude | codex | auto). Audits and review seats stay on routing.auditProvider. */
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readCodexQuota } from './codex-usage-ledger.mjs';
-import { CAPACITY_DEFAULTS, chooseBuilder } from './provider-capacity.mjs';
+import { CAPACITY_DEFAULTS, PROVIDER_DEFAULTS, chooseBuilder } from './provider-capacity.mjs';
 import { observeCapacity, recordCapacityDecision } from './provider-capacity-io.mjs';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
@@ -30,18 +30,25 @@ export function resolveRoutingSettings({ env = process.env, repo, declared } = {
       typeof value === 'number' ? v => Number.isFinite(v) && v >= 0 && (!['urgencyHorizonHours', 'staleHours'].includes(key) || v > 0)
         : typeof value === 'boolean' ? v => typeof v === 'boolean'
           : Array.isArray(value) ? v => Array.isArray(v) && v.every(x => typeof x === 'string')
-            : key === 'allowed' ? v => Array.isArray(v) && v.every(x => typeof x === 'string')
-              : key === 'calendar' ? v => typeof v === 'string'
-                : v => Number.isFinite(v) && v >= 0,
+            : key === 'workingHours' ? () => true : v => v === null || typeof v === 'object' || typeof v === 'number' || typeof v === 'string',
     ])),
   });
-  out.capacity = capacity.value;
+  const providers = cascadePolicy('providerCapacity', read.settings?.providerCapacity, {
+    standard: PROVIDER_DEFAULTS, platform: readPlatformPreferences({ env }).prefs.providerCapacity ?? {}, env,
+    valid: { providers: value => Array.isArray(value) && value.length <= 100 && new Set(value.map(p => p?.id)).size === value.length
+      && value.every(p => p && /^[a-z][a-z0-9-]*$/.test(p.id) && typeof p.launcher === 'string' && Number.isFinite(p.tier)
+        && ['fixed', 'restartOnReset', 'rolling'].includes(p.windowModel) && Array.isArray(p.allowedKinds)
+        && Array.isArray(p.windows) && Array.isArray(p.readers) && (!p.accounts || (Array.isArray(p.accounts) && p.accounts.length <= 100))),
+      minimumTiers: v => Number.isFinite(v) && v >= 0 },
+  });
+  out.capacity = { ...capacity.value, ...providers.value };
+  out.providerCapacitySources = providers.sources;
   out.capacitySources = capacity.sources;
   return out;
 }
 
 /** Explicit builders are unchanged; auto scores capacity and retains the threshold fallback when all usage is unknown. */
-export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota, kind = 'build', capacity, now = Date.now(), records, record = recordCapacityDecision } = {}) {
+export function effectiveBuilder({ env = process.env, repo, declared, quota = readCodexQuota, kind = 'build', capacity, now = Date.now(), records, routeKey, queuedDemand = 0, demandRatePerHour, record = recordCapacityDecision } = {}) {
   const s = resolveRoutingSettings({ env, ...(repo ? { repo } : {}), ...(declared ? { declared } : {}) });
   if (s.builder !== 'auto') return { builder: s.builder, source: s.source, settings: s };
   let q;
@@ -50,8 +57,9 @@ export function effectiveBuilder({ env = process.env, repo, declared, quota = re
   // Unreadable quota is not "below threshold": the quota-safe direction is claude.
   const fallback = used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude';
   if (!s.capacity.enabled) return { builder: fallback, source: 'auto', usedPercent: used, settings: s };
+  const planning = { ...s.capacity, routeKey, queuedDemand, demandRatePerHour };
   const capacities = capacity ?? observeCapacity({ env, now, settings: s.capacity, quota: () => q, records });
-  const decision = chooseBuilder({ kind, capacities, settings: { ...s.capacity, now }, fallback });
-  try { record(decision, { env, now, kind, capacities, settings: s.capacity }); } catch { /* best effort */ }
-  return { builder: decision.provider, source: 'auto', usedPercent: used, settings: s, capacities, decision };
+  const decision = chooseBuilder({ kind, capacities, settings: { ...planning, now }, fallback });
+  try { record(decision, { env, now, kind, capacities, settings: planning }); } catch { /* best effort */ }
+  return { builder: decision.provider, account: decision.account, source: 'auto', usedPercent: used, settings: s, capacities, decision };
 }
