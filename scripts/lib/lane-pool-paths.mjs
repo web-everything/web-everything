@@ -78,8 +78,7 @@ export function workspaceFor(path) {
  * @returns {string} the pool root.
  */
 export function defaultPoolRoot(checkoutRoot = process.cwd(), env = process.env, settings = {}) {
-  const home = env.HOME || homedir();
-  return expandHome(env.LANE_POOL_ROOT, home) || readLanesRoot({ ...settings, env }) || join(workspaceFor(checkoutRoot), '.lanes');
+  return readLanesRoot({ ...settings, env }) || join(workspaceFor(checkoutRoot), '.lanes');
 }
 
 /**
@@ -155,4 +154,19 @@ export function referenceArgs(referencePath, isShallow) {
  */
 export function checkoutRootFor({ cwdTopLevel, scriptCheckout, cwd }) {
   return cwdTopLevel || scriptCheckout || cwd;
+}
+
+/** Primary checkouts stay in the home workspace when the configured pool is external.
+ * Preserve checkout-derived workspaces (including VM layouts) for the default pool.
+ * Settings faults must not disable primary protection: use the raw env root, if any.
+ */
+export function primaryWorkspaceFor(checkoutRoot, env = process.env, settings = {}) {
+  const workspace = workspaceFor(checkoutRoot);
+  const home = env.HOME || homedir();
+  let pool = expandHome(env.LANE_POOL_ROOT, home);
+  try { pool = readLanesRoot({ ...settings, env }); } catch { /* retain primary protection */ }
+  if (pool && String(checkoutRoot).startsWith(pool.replace(/\/$/, '') + sep)) {
+    return join(home, 'workspace');
+  }
+  return workspace;
 }

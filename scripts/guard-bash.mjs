@@ -167,6 +167,7 @@
  * (guard-bash.test.mjs), and the whole table is differentially fuzzed against `origin/main` across the
  * three cwd/lease contexts.
  */
+import { primaryWorkspaceFor } from './lib/lane-pool-paths.mjs';
 import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, realpathSync, appendFileSync, mkdirSync } from 'node:fs';
 import { DECLARED_HOMES } from './operations/declared-homes.mjs';
@@ -5575,8 +5576,7 @@ if (IS_CLI) {
     const cwd = rp(resolveEffectiveCwd(cmd, ev.cwd || process.cwd()));
     effectiveCwd = cwd;
     const weRoot = hookRoot(import.meta.url);
-    const laneIndex = process.env.WE_HOOK_ROOT ? weRoot.indexOf(`${sep}.lanes${sep}`) : -1;
-    const workspace = laneIndex >= 0 ? weRoot.slice(0, laneIndex) : dirname(weRoot);
+    const workspace = primaryWorkspaceFor(weRoot);
     const primaries = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'].map((r) => rp(join(workspace, r)));
     primaryCwd = isPrimaryCwd(cwd, primaries);
     // #xpt9fvd — the daemon-clone registry (seed ∪ every clone the overlay state dir has recorded), computed

@@ -366,7 +366,7 @@ describe('resolveReal + decision through the user-level memory symlink', () => {
 // has. Three times on 2026-09-26 a worker hand-edited/copied files INSIDE wev-review-daemon (caught +
 // reverted each time); a dirty daemon clone BLOCKS that daemon's own rebuild until a person notices.
 describe('laneGuardDecision — DAEMON CLONE protection (#xpt9fvd)', () => {
-  const daemonRoots = daemonCloneRoots(WORKSPACE);
+  const daemonRoots = daemonCloneRoots(WORKSPACE, { env: {} });
 
   it('DENIES an Edit/Write into a daemon clone (wev-review-daemon)', () => {
     const msg = laneGuardDecision(p('wev-review-daemon', 'notes.md'), WE_ROOT, { daemonCloneRoots: daemonRoots });
@@ -459,15 +459,15 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
       writeFileSync(path.join(overlayDir, `${n}.json`), JSON.stringify({ clone: lane, overlays }));
     }
     expect(daemonCloneRoots(ws, { env: { WE_DAEMON_OVERLAY_DIR: overlayDir } })).not.toContain(lane);
-    expect(classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws).live).toBe(false);
+    expect(classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws, {}).live).toBe(false);
   });
 
   it('the drain daemon seed clone under .lanes stays protected; a real overlay clone stays protected', () => {
     const ws = path.join(root, 'ws116b');
     const drain = path.join(ws, '.lanes', 'we-drain-daemon', 'lane-1');
     mkdirSync(drain, { recursive: true });
-    expect(classifyOverlayRecord({ clone: drain, overlays: [] }, ws).live).toBe(true);
-    expect(classifyOverlayRecord({ clone: fakeClone, overlays: [{ ref: 'a' }] }, ws).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: drain, overlays: [] }, ws, {}).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: fakeClone, overlays: [{ ref: 'a' }] }, ws, {}).live).toBe(true);
   });
 
   // 2026-10-09 live bug: the drain's CODE clone (`.lanes/we-drain-daemon/code`, the clone the drain daemon
@@ -477,8 +477,8 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
     const ws = path.join(root, 'ws-drain-code');
     const code = path.join(ws, '.lanes', 'we-drain-daemon', 'code');
     mkdirSync(code, { recursive: true });
-    expect(classifyOverlayRecord({ clone: code, overlays: [] }, ws).live).toBe(true);
-    expect(classifyOverlayRecord({ clone: code, overlays: [{ ref: 'lane/drain-gh-enqueue', pr: 4717 }] }, ws).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: code, overlays: [] }, ws, {}).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: code, overlays: [{ ref: 'lane/drain-gh-enqueue', pr: 4717 }] }, ws, {}).live).toBe(true);
     expect(daemonCloneRoots(ws, { env: { WE_DAEMON_OVERLAY_DIR: path.join(root, 'none') } })).toContain(realpathSync(code));
     const dir = path.join(root, 'prune-drain-code');
     mkdirSync(dir, { recursive: true });
@@ -491,19 +491,19 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
     const ws = path.join(root, 'ws-pool-shape');
     const other = path.join(ws, '.lanes', 'some-daemon', 'code');
     mkdirSync(other, { recursive: true });
-    expect(classifyOverlayRecord({ clone: other, overlays: [{ ref: 'a' }] }, ws).live).toBe(true);
-    expect(classifyOverlayRecord({ clone: other, overlays: [] }, ws).live).toBe(false); // empty list: still stale
+    expect(classifyOverlayRecord({ clone: other, overlays: [{ ref: 'a' }] }, ws, {}).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: other, overlays: [] }, ws, {}).live).toBe(false); // empty list: still stale
     for (const parent of [path.join(ws, '.lanes'), path.join(ws, '.lanes', 'web-everything')]) {
-      const c = classifyOverlayRecord({ clone: parent, overlays: [{ ref: 'a' }] }, ws);
+      const c = classifyOverlayRecord({ clone: parent, overlays: [{ ref: 'a' }] }, ws, {});
       expect(c.live, parent).toBe(false);
       expect(c.reason).toMatch(/lane pool/);
     }
     for (const repo of ['web-everything', 'frontierui', 'plateau-app']) {
       const lane = path.join(ws, '.lanes', repo, 'lane-12');
-      const c = classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws);
+      const c = classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws, {});
       expect(c.live, repo).toBe(false);
       expect(c.reason).toMatch(/pool lane/);
-      expect(classifyOverlayRecord({ clone: path.join(lane, 'sub'), overlays: [{ ref: 'a' }] }, ws).live).toBe(false);
+      expect(classifyOverlayRecord({ clone: path.join(lane, 'sub'), overlays: [{ ref: 'a' }] }, ws, {}).live).toBe(false);
     }
   });
 

@@ -98,6 +98,18 @@ export function daemonCloneForLabel(label) {
     ? DAEMON_CLONE_BY_LABEL[label] : null;
 }
 
+let warnedPoolFallback = false;
+function guardPoolRoot(workspace, env) {
+  try { return defaultPoolRoot(path.join(workspace, 'web-everything'), env); }
+  catch (error) {
+    if (!warnedPoolFallback) {
+      warnedPoolFallback = true;
+      console.error(`daemon-clone registry: invalid volume settings; using default .lanes pool: ${error.message}`);
+    }
+    return path.join(workspace, '.lanes');
+  }
+}
+
 /**
  * PURE: is `real` a POOL LANE (or inside one), or a pool PARENT dir that contains lanes? Refused: a numbered lane
  * `<workspace>/.lanes/<repo>/lane-<N>` (same `lane-\d+` shape `lane-pool-scan.mjs#laneIndicesIn` uses) and the
@@ -110,7 +122,7 @@ export function daemonCloneForLabel(label) {
  */
 export function isPoolLaneRealpath(real, workspace, env = process.env) {
   if (!real) return false;
-  const pool = realpathOrResolve(defaultPoolRoot(path.join(workspace, 'web-everything'), env));
+  const pool = realpathOrResolve(guardPoolRoot(workspace, env));
   const rel = path.relative(pool, String(real));
   if (rel.startsWith('..') || path.isAbsolute(rel)) return false;
   if (!rel) return true; // the `.lanes` root itself
@@ -121,7 +133,7 @@ export function isPoolLaneRealpath(real, workspace, env = process.env) {
 /** Resolve registered names, relocating only those explicitly relative to the pool. */
 export function resolveDaemonCloneSeed(rel, workspace, env = process.env) {
   return rel.startsWith(`.lanes${SEP}`)
-    ? path.join(defaultPoolRoot(path.join(workspace, 'web-everything'), env), rel.slice(7))
+    ? path.join(guardPoolRoot(workspace, env), rel.slice(7))
     : path.join(workspace, rel);
 }
 

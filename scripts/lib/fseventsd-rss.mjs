@@ -33,11 +33,23 @@ export function nextFseventsdState(rssMb, { warnMb, throttleMb }, previous = {})
   return { rssMb: known ? rssMb : null, warnMb, throttleMb, throttled,
     level: !known ? 'unknown' : throttled ? 'throttle' : rssMb >= warnMb ? 'warn' : 'clear' };
 }
-/** Missing signal preserves existing admission; corrupt/unreadable state refuses new grants. */
-export function readFseventsdSignal({ path = fseventsdStatePath(), read = boundedText } = {}) {
+// Fresh evidence has a fixed three-minute lifetime, independent of settings;
+// stale CLEAR is ignored (it cannot attest recovery). Stale THROTTLED is held
+// for at most 15 minutes, then ignored with a diagnostic so a dead monitor cannot
+// wedge admission forever. Missing/invalid/future timestamps are ignored too.
+export const FSEVENTSD_SIGNAL_MAX_AGE_MS = 3 * 60_000;
+export const FSEVENTSD_THROTTLE_MAX_AGE_MS = 15 * 60_000;
+/** Absent/stale signals are ignored; corrupt/unreadable state refuses new grants. */
+export function readFseventsdSignal({ path = fseventsdStatePath(), read = boundedText, now = Date.now, log = console.error } = {}) {
   try {
     const state = JSON.parse(read(path));
     if (typeof state.throttled !== 'boolean') throw Error('invalid fseventsd signal');
+    const sampled = typeof state.sampledAt === 'string' ? Date.parse(state.sampledAt) : NaN;
+    const age = now() - sampled;
+    if (!Number.isFinite(age) || age < 0 || age > (state.throttled ? FSEVENTSD_THROTTLE_MAX_AGE_MS : FSEVENTSD_SIGNAL_MAX_AGE_MS)) {
+      log('fseventsd RSS signal ignored: stale/invalid sampledAt; health-watch must refresh it');
+      return { throttled: false, level: 'unknown', ignored: true, reason: 'stale fseventsd signal' };
+    }
     return state;
   } catch (error) {
     if (error.code === 'ENOENT') return { throttled: false, level: 'clear' };

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import path from 'node:path';
 import { DAEMON_CLONE_SEED, daemonCloneRoots, isDaemonCloneRealpath } from '../daemon-clone-registry.mjs';
 import * as registry from '../daemon-clone-registry.mjs';
@@ -73,4 +73,19 @@ describe('wev-pass-readers daemon clone', () => {
     expect(DAEMON_CLONE_SEED).toContain(path.join('.lanes', 'we-drain-daemon', 'lane-1'));
     expect(DAEMON_CLONE_SEED).toContain(path.join('.lanes', 'we-drain-daemon', 'code'));
   });
+});
+
+it('invalid RSS settings preserve default daemon seeds and log the fallback only once', () => {
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const env = { WE_FSEVENTSD_WARN_MB: 'invalid', WE_DAEMON_OVERLAY_DIR: '/nonexistent-overlay-dir' };
+    for (let i = 0; i < 2; i++) {
+      const roots = daemonCloneRoots(WORKSPACE, { env });
+      expect(roots).toContain(path.join(WORKSPACE, '.lanes', 'we-drain-daemon', 'code'));
+      expect(isDaemonCloneRealpath(path.join(WORKSPACE, '.lanes', 'we-drain-daemon', 'code', 'file'), roots)).toBe(true);
+      expect(registry.isPoolLaneRealpath(path.join(WORKSPACE, '.lanes', 'web-everything', 'lane-1'), WORKSPACE, env)).toBe(true);
+    }
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('using default .lanes pool'));
+  } finally { log.mockRestore(); }
 });

@@ -3826,7 +3826,7 @@ describe('guard-bash — DAEMON CLONE write protection (#xpt9fvd)', () => {
   });
 
   it('daemonCloneRoots derives the real seed + registry union (sanity check, not a CLI test)', () => {
-    const real = daemonCloneRoots('/ws');
+    const real = daemonCloneRoots('/ws', { env: {} });
     expect(real).toContain('/ws/wev-review-daemon');
     expect(real).toContain('/ws/wev-merge-daemon');
     expect(real).toContain('/ws/wev-health-watch');

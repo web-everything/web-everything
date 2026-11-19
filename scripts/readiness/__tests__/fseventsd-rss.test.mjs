@@ -63,3 +63,30 @@ it('mandatory calls also defer at their ceiling instead of bypassing the throttl
     now: () => clock, sleep: async ms => { clock += ms; }, readFsevents: () => ({ throttled: true }), log: () => {} });
   expect(result).toMatchObject({ ok: false, deferred: true, waitedMs: 20 });
 });
+
+it.each([false, true])('ignores missing, invalid and future timestamps (throttled=%s)', throttled => {
+  const now = () => Date.parse('2026-11-19T12:00:00Z');
+  for (const sampledAt of [undefined, null, 123, 'invalid', '2099-01-01T00:00:00Z']) {
+    const log = vi.fn();
+    expect(readFseventsdSignal({ read: () => JSON.stringify({ throttled, sampledAt }), now, log })).toMatchObject({ throttled: false, ignored: true });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('health-watch must refresh'));
+  }
+});
+it('accepts clear evidence for three minutes and ignores decades-old clear evidence', () => {
+  const clock = Date.parse('2026-11-19T12:00:00Z');
+  const read = age => () => JSON.stringify({ throttled: false, level: 'clear', sampledAt: new Date(clock - age).toISOString() });
+  expect(readFseventsdSignal({ read: read(180_000), now: () => clock }).level).toBe('clear');
+  for (const age of [180_001, 30 * 365 * 24 * 60 * 60_000]) {
+    expect(readFseventsdSignal({ read: read(age), now: () => clock, log: () => {} })).toMatchObject({ throttled: false, ignored: true, level: 'unknown' });
+  }
+});
+it('retains stale throttle up to fifteen minutes then ignores it with a diagnostic', () => {
+  const clock = Date.parse('2026-11-19T12:00:00Z'), log = vi.fn();
+  const read = age => () => JSON.stringify({ throttled: true, sampledAt: new Date(clock - age).toISOString() });
+  for (const age of [0, 180_001, 900_000]) {
+    expect(readFseventsdSignal({ read: read(age), now: () => clock, log }).throttled).toBe(true);
+  }
+  expect(log).not.toHaveBeenCalled();
+  expect(readFseventsdSignal({ read: read(900_001), now: () => clock, log })).toMatchObject({ throttled: false, ignored: true });
+  expect(log).toHaveBeenCalledTimes(1);
+});

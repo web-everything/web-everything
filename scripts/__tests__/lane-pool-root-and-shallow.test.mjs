@@ -97,8 +97,8 @@ describe('defaultPoolRoot — derived from the checkout, never from $HOME', () =
   it('LANE_POOL_ROOT still wins, and still expands ~', () => {
     expect(defaultPoolRoot('/home/user/web-everything', { LANE_POOL_ROOT: '/custom/.lanes' }))
       .toBe('/custom/.lanes');
-    expect(defaultPoolRoot('/anywhere', { HOME: '/root', LANE_POOL_ROOT: '~/pool' }))
-      .toBe(join('/root', 'pool'));
+    expect(defaultPoolRoot('/anywhere', { HOME: '/root', LANE_POOL_ROOT: '~/pool/.lanes' }))
+      .toBe(join('/root', 'pool', '.lanes'));
   });
 
   it('never returns a path under $HOME merely because $HOME exists', () => {

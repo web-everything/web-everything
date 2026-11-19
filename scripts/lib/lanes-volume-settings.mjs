@@ -1,7 +1,7 @@
 /** Churn-volume settings: standard → platform → tool → environment. */
 import { accessSync, constants, mkdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, normalize, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade } from './policy-cascade.mjs';
 import { boundedText } from './host-overload-settings.mjs';
@@ -12,7 +12,7 @@ const logged = new Set();
 function once(message) { if (!logged.has(message)) { logged.add(message); stderr(message); } }
 const pathValue = value => value === '' || (typeof value === 'string' && (isAbsolute(value) || value.startsWith('~/')));
 const leaves = {
-  'lanes.root': ['', 'LANE_POOL_ROOT', pathValue],
+  'lanes.root': ['', 'LANE_POOL_ROOT', v => pathValue(v) && (v === '' || basename(normalize(v)) === '.lanes')],
   'heavy.tmpRoot': ['', 'WE_HEAVY_TMP_ROOT', pathValue],
   'health.fseventsd.warnMb': [1024, 'WE_FSEVENTSD_WARN_MB', v => Number.isFinite(v) && v > 0],
   'health.fseventsd.throttleMb': [2048, 'WE_FSEVENTSD_THROTTLE_MB', v => Number.isFinite(v) && v > 0],
@@ -55,7 +55,8 @@ export function readVolumeSettings({ env = process.env, prefs, tool, log = once 
 /** Optional pool root; the caller supplies its existing workspace-derived default. */
 export function readLanesRoot(options = {}) {
   const value = readVolumeSettings(options).value['lanes.root'];
-  return value.startsWith('~/') ? join(options.env?.HOME || process.env.HOME || homedir(), value.slice(2)) : value;
+  if (!value) return '';
+  return normalize(value.startsWith('~/') ? join(options.env?.HOME || process.env.HOME || homedir(), value.slice(2)) : value);
 }
 /** Ensure an optional TMPDIR is usable; failure falls back and warns once per process. */
 export function readHeavyTmpRoot(options = {}) {

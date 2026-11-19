@@ -46,14 +46,14 @@ mdutil -i off "${MOUNT}"
 
 # The operator's account owns the tree so lanes and temp need no further sudo.
 OWNER="${SUDO_USER:-$(stat -f %Su /dev/console)}"
-mkdir -p "${MOUNT}/lanes" "${MOUNT}/tmp"
-chown -R "${OWNER}" "${MOUNT}/lanes" "${MOUNT}/tmp"
+mkdir -p "${MOUNT}/.lanes" "${MOUNT}/tmp"
+chown -R "${OWNER}" "${MOUNT}/.lanes" "${MOUNT}/tmp"
 
 cat <<EOF
 
 Done. Set these platform settings (then move/provision lanes under the new root):
 
-  lanes.root     = ${MOUNT}/lanes
+  lanes.root     = ${MOUNT}/.lanes
   heavy.tmpRoot  = ${MOUNT}/tmp
 
 Optional safety net thresholds (defaults shown):

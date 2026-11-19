@@ -83,6 +83,7 @@
  * Protocol: reads the PreToolUse event JSON on stdin, denies via exit code 2 + a stderr message (mirrors
  * scripts/backlog-guard.mjs). Fail-OPEN on any internal error — a guard bug must never wedge the agent.
  */
+import { primaryWorkspaceFor } from './lib/lane-pool-paths.mjs';
 import { hookRoot } from './lib/hook-root.mjs';
 import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
@@ -101,41 +102,9 @@ import { daemonCloneRoots, isDaemonCloneRealpath } from './lib/daemon-clone-regi
 const PRIMARY_REPOS = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'];
 const SEP = path.sep;
 
-/**
- * The WORKSPACE root — the shared parent every primary checkout and the `.lanes/` pool sit under. Pure.
- *
- * WHY IT IS NOT JUST `dirname(weRoot)`, and this was a live hole rather than a hypothetical. The hook is
- * configured as `node scripts/guard-lane.mjs`, resolved against the CURRENT DIRECTORY — so when a session's cwd
- * is a lane, the LANE'S copy of this script runs. `dirname` then made `workspace` the lane pool
- * (`<workspace>/.lanes/web-everything`), the primary list became paths that do not exist
- * (`…/.lanes/web-everything/webeverything/`), nothing matched, and an edit to the real shared checkout was
- * ALLOWED. The guard protected only the checkout it happened to be launched from — which, when launched from a
- * lane, is the one tree that never needed protecting.
- *
- * Demonstrated on 2026-08-11: with cwd in a lane, a Write to `webeverything/conformance-vectors/intl.vectors.ts`
- * went through with no deny.
- *
- * A lane always lives at `<workspace>/.lanes/<pool>/lane-N`, so splitting on the `.lanes` segment recovers the
- * true root wherever the script is running from.
- *
- * KNOWN, ACCEPTED RESIDUAL (#2305): a lane directory that is ITSELF a symlink resolving outside `.lanes/`
- * reopens this exact hole one layer up. `weRoot` is derived from `fileURLToPath(import.meta.url)`, and Node
- * realpaths an ES module's main entry when it loads it — so if `<workspace>/.lanes/<pool>/lane-N` were a
- * symlink to, say, `/elsewhere/lane-N`, the script would load as `/elsewhere/lane-N/scripts/guard-lane.mjs`,
- * the `.lanes` segment is gone before this function ever sees the string, and the `dirname` fallback picks
- * `/elsewhere` as the workspace — the wrong primaries, same failure shape as the bug this function fixes.
- * NOT REACHABLE TODAY: every lane this guard can run inside is produced by `lane-pool.mjs`'s `cloneLane`
- * (`git clone --reference … dest`), which always materializes `dest` as a real directory — `git clone` has no
- * code path that leaves a symlink in its place, and no other producer of a `.lanes/<pool>/lane-N` path exists.
- * So the gap is real in this pure function but has no live trigger under the current lane-provisioning story.
- * Revisit if that ever changes (a lane provisioner that symlinks, or a hand-made symlinked lane) — the fix
- * would be resolving each PATH SEGMENT up to (not including) the file, rather than the whole module URL, so a
- * symlinked leaf cannot erase an interior `.lanes` segment.
- */
-export function workspaceRootOf(weRoot) {
-  const s = String(weRoot || '');
-  const i = s.indexOf(`${SEP}.lanes${SEP}`);
-  return i >= 0 ? s.slice(0, i) : path.dirname(s);
+/** Resolve the primary workspace independently of an external lane pool. */
+export function workspaceRootOf(weRoot, env = process.env, settings = {}) {
+  return primaryWorkspaceFor(weRoot, env, settings);
 }
 
 /**

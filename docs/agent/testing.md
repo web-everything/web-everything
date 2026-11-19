@@ -5076,3 +5076,20 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+
+## External pool guards and watch lint
+
+Configured `lanes.root` (including `LANE_POOL_ROOT`) must end in `.lanes` so every
+lane matcher retains lease and staleness checks. A guard running in a configured
+external pool resolves primary checkouts under the home workspace, independently
+of the volume's parent. `guards-external-pool.test.mjs` drives both real hooks;
+its Git shim supplies only the read-only behind-count probe.
+Daemon seed discovery falls back to the workspace's default `.lanes` pool on
+invalid volume settings and logs once, preserving guard protection.
+
+RSS clear signals expire after three minutes. Throttled evidence survives up to
+fifteen minutes; expired, missing-timestamp, invalid-timestamp and future signals
+are ignored with a refresh diagnostic. Corrupt/unreadable JSON still holds admission.
+Watch lint resolves lexical symbols and refuses mutated/escaped argv and unresolved
+process calls; keep shadowing, mutation-before and mutation-after cases covered.
