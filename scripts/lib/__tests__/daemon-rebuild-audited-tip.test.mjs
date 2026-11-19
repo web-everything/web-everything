@@ -1000,4 +1000,4 @@ it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; all
   expect(matchReadyCandidate(args).adopt).toBeTruthy();
   expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
     .toBe('ready-audit-revoked');
-});
+}, 180_000); // six real rebuild checks over real git fixtures: far slower than the default under host load
