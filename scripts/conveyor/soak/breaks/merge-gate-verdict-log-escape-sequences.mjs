@@ -1,5 +1,5 @@
 /**
- * Live 2026-11-19: gh 2.104 refuses `gh api .../logs` when the log carries terminal escapes unless given
+ * Live 2026-11-19: gh 2.104 refuses a raw job-log read when the log carries terminal escapes unless given
  * --allow-escape-sequences. readMergeGateVerdict swallowed that error, so no merge-gate row was ever annotated
  * as a review hold; review-pending PRs with only review-gate/merge-gate red read as a real CI red and sat behind
  * a ci-heal escalation. Fix presence is decided by behaviour: a gh stand-in that refuses the log read without
