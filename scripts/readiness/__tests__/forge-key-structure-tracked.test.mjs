@@ -38,6 +38,17 @@ describe('Forge key structure tracked fixture sources',()=>{
       expect(credentialBufferFinding(content)).toBeNull();
     }
   });
+  it.each(['DER','JWK','UTF-16LE','UTF-16BE'])('still detects embedded %s in 1 MiB binary views',format=>{
+    const ceiling=1024*1024;
+    const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
+    const jwk=JSON.stringify({['k'+'ty']:'oct',k:'a'});
+    const payload={DER:Buffer.from([48,6,2,1,1,4,1,7]),JWK:Buffer.from(jwk),
+      'UTF-16LE':Buffer.from(jwk,'utf16le'),'UTF-16BE':Buffer.from(jwk,'utf16le').swap16()}[format];
+    const content=Buffer.from(binary);
+    payload.copy(content,ceiling/2);
+    expect(keyStructureFinding(content)).toBe('private-key-structure');
+    expect(credentialBufferFinding(content)).toBe('private-key-structure');
+  });
   it.each(fixtures)('adds no finding over ordinary tracked fixture source %s',file=>{
     const content=readFileSync(file);
     expect(keyStructureFinding(content)).toBeNull();

@@ -140,10 +140,12 @@ function jwkFinding(bytes) {
 
 // Syntax that can yield another supported representation; byte detection precedes this filter.
 function encodedText(text) {
-  return (text.includes('{')&&text.includes('}')&&/["']/.test(text))
-    ||(text.includes('[')&&text.includes(']'))
-    ||(text.includes('"')&&text.includes('\\'))
-    ||(text.match(/[\[{]/g)?.length??0)>=64
+  // Require a plausible representation prefix, rather than unrelated punctuation
+  // anywhere in a binary/UTF-16 view. Detectors have already visited its bytes.
+  return /\{\s*(?:["'/]|[A-Za-z_$]|\\u[\da-f]{4})/.test(text)
+    ||/\[\s*(?:[\[\]{"'/\d-]|true\b|false\b|null\b)/.test(text)
+    ||/\\(?:["'\\/bfnrtv0]|u[\da-f]{4}|x[\da-f]{2})/i.test(text)
+    ||/[\[{](?:\s*[\[{]){63}/.test(text)
     ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
     ||/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)
     // Lenient base64 ignores every non-alphabet character (whitespace and punctuation alike), so the gate does too.
@@ -312,8 +314,11 @@ export function keyStructureFinding(buffer) {
   const add=(bytes,depth,options={})=>{
     tick();
     if(bytes.length>LIMITS.bytes)throw EXHAUSTED;
-    const identity=bytes.toString('base64')+':'+(options.comments!==false)+':'+(options.utf16!==false);
+    const identity=bytes.toString('base64')+':'+(options.comments!==false)+':'+(options.utf16!==false)+':'+(options.expand!==false);
     if(!bytes.length||seen.has(identity))return;
+    // Repeated terminal/container views consume work only once too. Keep the
+    // expansion mode distinct so detection-only visits cannot suppress decoding.
+    seen.add(identity);
     if((total+=bytes.length)>LIMITS.bytes)throw EXHAUSTED;
     // Every decoded view reaches the byte detectors, including views with no more encodings.
     if(bytes.includes(Buffer.from(['openssh','key','v1'].join('-')+'\0'))
@@ -329,7 +334,7 @@ export function keyStructureFinding(buffer) {
     // retain/redecode them as candidates, but still scan them above for embedded DER/JWKs.
     if(!encodedText(text)&&!(options.utf16!==false&&bytes.includes(0)))return;
     if(depth>LIMITS.depth||queue.length>=LIMITS.candidates)throw EXHAUSTED;
-    seen.add(identity);queue.push({bytes,depth,options});
+    queue.push({bytes,depth,options});
   };
   try {
     add(buffer,0);
