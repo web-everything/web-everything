@@ -61,6 +61,14 @@ function processAlive(pid) {
   }
 }
 
+/** A routine waiter older than this is never overtaken by a priority caller (bounded unfairness: it competes by ticket). */
+export const PRIORITY_OVERTAKE_AGE_MS = 10 * 60_000;
+/** Queue order: priority callers and aged routine waiters first (by ticket), then the other routine waiters (by ticket). */
+const waiterOrder = (nowMs) => {
+  const front = (e) => e.priority === true || nowMs - e.at > PRIORITY_OVERTAKE_AGE_MS;
+  return (a, b) => (front(b) - front(a)) || a.ticket - b.ticket;
+};
+
 function readState(path) {
   let state;
   try { state = JSON.parse(readFileSync(path, 'utf8')); }
@@ -167,7 +175,7 @@ export async function acquireSmokeSlot({
       const state = readState(path);
       state.holders = state.holders.filter(e => isAlive(e.pid));
       state.waiters = state.waiters.filter(e => isAlive(e.pid) && now() - e.at <= maxWait + 60_000)
-        .sort((a, b) => (b.priority === true) - (a.priority === true) || a.ticket - b.ticket);
+        .sort(waiterOrder(now()));
       const result = update(state);
       const temporary = join(lock, temporaryFile);
       fs.writeFileSync(temporary, JSON.stringify(state));
@@ -241,9 +249,8 @@ export async function acquireSmokeSlot({
           if (!positive(state.nextTicket + 1)) throw new Error('daemon-live-smoke: slot tickets exhausted; inspect state before retrying');
           mine = state.nextTicket++;
           const entry = { pid, ticket: mine, at: now(), id, ...(priority ? { priority: true } : {}) };
-          const firstRoutine = state.waiters.findIndex(e => e.priority !== true);
-          if (priority && firstRoutine >= 0) state.waiters.splice(firstRoutine, 0, entry);
-          else state.waiters.push(entry);
+          state.waiters.push(entry);
+          state.waiters.sort(waiterOrder(now()));
         }
         const index = state.waiters.findIndex(e => e.id === id);
         if (index < 0) throw new Error('daemon-live-smoke: own smoke ticket missing');

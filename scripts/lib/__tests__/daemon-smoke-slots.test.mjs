@@ -200,6 +200,20 @@ describe('daemon smoke slots', () => {
     expect(order).toEqual(['urgent13', 'urgent14', 'routine12']);
   });
 
+  it('a routine waiter older than the overtake age is not overtaken by a later priority caller', async () => {
+    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' };
+    let t = 1_000;
+    const now = () => t;
+    await acquire(11, { env, now });
+    const routine = acquire(12, { env, now });
+    await wake();
+    t += 11 * 60_000; // the routine waiter has now waited past the overtake age
+    const urgent = acquire(13, { env, now, priority: true });
+    await wake();
+    expect(state().waiters.map(e => e.pid)).toEqual([12, 13]);
+    routine.catch(() => {}); urgent.catch(() => {});
+  });
+
   it('a priority caller still times out like any other waiter', async () => {
     const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1000' };
     await acquire(11, { env });
