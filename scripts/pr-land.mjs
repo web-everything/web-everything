@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { resolvePinnedDiffBasis, requireScoredNetDiff, readPinnedDiff, pinnedGit } from './lib/pinned-diff-basis.mjs';
 /**
  * pr-land.mjs — the `/pr` PRODUCER: open a self-approved PR, wait for green, label it, and hand the merge to
  * the drain (#2138 Fork 5, #2153; #2290).
@@ -80,6 +79,7 @@ import { resolvePinnedDiffBasis, requireScoredNetDiff, readPinnedDiff, pinnedGit
  * state, which auto-retries with backoff and resume-opens the PR once infra recovers (nothing is stranded; the
  * drain stays the sole writer to main). A non-zero exit means `main` was left UNTOUCHED.
  */
+import { resolvePinnedDiffBasis, requireScoredNetDiff, readPinnedDiff, pinnedGit } from './lib/pinned-diff-basis.mjs';
 import { checkCanonicalAuditForOpen } from './operations/canonical-audit-gate.mjs';
 import { defaultShimDir, resolveOrgAwareShimDir, pathWithOrgAwareShim } from './lib/gh-app-shim.mjs';
 import { publicationTitle, readMainCard } from './operations/machine-pr-title.mjs';

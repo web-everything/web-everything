@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
+import { pinnedLeafGitFixture } from '../../__tests__/fixtures/pinned-leaf-git-fixture.mjs';
 
 import {
   DRAIN_FOLLOWUP_KIND, ensureDepsLink, followupWorktreeLayout, handOffDrainFollowup, resolveDrainFollowupSetting,
@@ -53,6 +54,10 @@ const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
 const a = process.argv.slice(2);
+const prs = JSON.parse(fs.readFileSync(process.env.FU_FIXTURE, 'utf8'));
+if (process.env.FU_FAIL_PINNED_FETCH && a[0] === '-c' && a.includes('fetch')) process.exit(1);
+const pinned = (${pinnedLeafGitFixture})(a, prs);
+if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-fu.git\\n');
 if (a[0] === 'diff') process.exit(1);
 if (a[0] === 'rev-parse' && a[1] === '--git-dir') process.stdout.write('.git\\n');
@@ -76,10 +81,10 @@ function runCli({ env: extraEnv = {} } = {}) {
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([3001].map((number) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
-      commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.FU_HOME; syncBuiltinESMExports();");
@@ -99,6 +104,16 @@ function runCli({ env: extraEnv = {} } = {}) {
 }
 
 describe('x4y74wj — the drain hands its post-merge follow-up to a detached job', () => {
+  it('an unreadable pinned basis holds the PR and never schedules a follow-up', () => {
+    const { result, jobs } = runCli({ env: { FU_FAIL_PINNED_FETCH: '1' } });
+    expect(result.merged).toEqual([]);
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 3001, reason: expect.stringContaining('net diff unscored') }),
+    ]));
+    expect(jobs).toEqual([]);
+    expect(result.followupJob?.handedOff).not.toBe(true);
+  }, 30000);
+
   it('switch ON (built-in default): one drain-followup job carrying the landed set; no inline numbering or regen', () => {
     const { result, stderr, jobs } = runCli();
     expect(result.merged.map((m) => m.num)).toEqual([3001]);

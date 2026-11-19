@@ -4721,6 +4721,9 @@ Real-drain CLI fixtures must model that pinned boundary too: full head commit ID
 Git's leading `-c key=value` options, distinct base/head identities, matching tracking-ref
 and FETCH_HEAD reads, and numstat plus content for the declared PR files. A shim that
 returns empty output for a pinned command correctly causes a hold, not a merge attempt.
+Use the shared `pinnedLeafGitFixture` in post-merge follow-up CLI shims too, with the same
+full SHA in the listed head and commit tip. Keep the follow-up's worktree shim separate;
+a failed pinned fetch must hold the PR before either a job or inline follow-up can run.
 Keep the merge-failure-isolation regression proving an unreadable diff holds only that PR
 while a scored peer lands and the pass exits successfully. Preserve original argv in fixture
 logs so shadow/off comparisons still detect extra GitHub calls.
