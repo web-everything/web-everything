@@ -11,7 +11,7 @@ import { getThisHost } from '../../lib/daemon-host-guard.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { pidIdentity } from '../../lib/pid-alive.mjs';
 import {
-  parseGateArgs, runGate, isEntrypoint, POLL_MS,
+  parseGateArgs, daemonIdentity, runGate, isEntrypoint, POLL_MS,
 } from '../daemon-host-gate.mjs';
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
@@ -353,6 +353,34 @@ describe('wrapper shutdown', () => {
     expect(settled).toBe(false);
     deny = false;
     h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
+  });
+});
+
+describe('cleanup state is keyed by daemon identity', () => {
+  it('derives one identity from the daemon script, not its checkout path or flags', () => {
+    expect(daemonIdentity({ cmd: 'node', args: ['/a/checkout/scripts/d.mjs', '--x'] }))
+      .toBe(daemonIdentity({ cmd: 'node', args: ['/b/other/scripts/d.mjs', '--y', '1'] }));
+    expect(daemonIdentity({ cmd: 'node', args: ['d.mjs'] })).not.toBe(daemonIdentity({ cmd: 'node', args: ['e.mjs'] }));
+    expect(daemonIdentity({ cmd: 'node', args: ['d.mjs'], daemon: 'role-x' })).toBe('role-x');
+    expect(parseGateArgs(['--daemon=role-x', '--', 'node', 'd.mjs']).daemon).toBe('role-x');
+  });
+
+  it('same daemon from a different checkout or flag is blocked by the previous group before any new spawn', async () => {
+    const owners = [{ host: HOST_A, version: 'file' }];
+    const first = harness({ owners });
+    const second = harness({ owners });
+    delete first.deps.markerPath;
+    delete second.deps.markerPath;
+    second.deps.markerFs = first.deps.markerFs;
+    const run = runGate({ cmd: 'node', args: ['/a/checkout/scripts/d.mjs', '--x'] }, first.deps);
+    await new Promise(setImmediate);
+    expect(first.spawns).toHaveLength(1);
+    const blocked = await runGate({ cmd: 'node', args: ['/b/other/scripts/d.mjs', '--y'] }, second.deps);
+    expect(blocked).toBe(1);
+    expect(second.spawns).toHaveLength(0);
+    expect(second.logs.join('\n')).toContain('refusing to spawn');
+    first.children[0].emit('exit', 0, null);
     expect(await run).toBe(0);
   });
 });

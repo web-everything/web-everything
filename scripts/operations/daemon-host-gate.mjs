@@ -17,7 +17,7 @@ import * as nodeFs from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as timerSleep } from 'node:timers/promises';
 import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
@@ -31,7 +31,20 @@ export function parseGateArgs(argv) {
   const at = argv.indexOf('--');
   if (at === -1) return null;
   const [cmd, ...args] = argv.slice(at + 1);
-  return cmd ? { cmd, args } : null;
+  if (!cmd) return null;
+  const named = argv.slice(0, at).find((word) => word.startsWith('--daemon='));
+  const daemon = named ? named.slice('--daemon='.length) : '';
+  return daemon ? { cmd, args, daemon } : { cmd, args };
+}
+
+/**
+ * Daemon identity for cleanup state: an explicit `--daemon=<name>` (the registry name/role), else the daemon's
+ * script basename (first non-flag .js/.mjs/.cjs/.ts word) or the command basename. Never the checkout path or flags.
+ */
+export function daemonIdentity(parsed) {
+  if (parsed.daemon) return parsed.daemon;
+  const script = parsed.args.find((word) => !word.startsWith('-') && /\.(?:[cm]?js|ts)$/.test(word));
+  return basename(script ?? parsed.cmd);
 }
 
 const describeOwner = (reason) => {
@@ -41,9 +54,9 @@ const describeOwner = (reason) => {
   return 'unreadable';
 };
 
-// Stable across wrapper restarts and checkouts, separate for each daemon command.
+// Stable across wrapper restarts, checkouts and flag changes: one marker and lock per daemon identity.
 function defaultMarkerPath(parsed) {
-  const key = createHash('sha256').update(JSON.stringify([parsed.cmd, parsed.args])).digest('hex');
+  const key = createHash('sha256').update(JSON.stringify([daemonIdentity(parsed)])).digest('hex');
   return join(homedir(), '.web-everything', 'daemon-host-gate', `${key}.json`);
 }
 
