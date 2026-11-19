@@ -1,6 +1,6 @@
 /** Pure adapters from read evidence to fail-closed dispatch eligibility facts. */
 import { known, unread, POPULATIONS } from './dispatch-eligibility.mjs';
-import { liveResultGateState, parseRedTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, parseRedTeamGateMarker, readRedTeamDisposition, GATE_OUTCOMES } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 function isRecord(value) {
@@ -61,6 +61,25 @@ export function redTeamFact(comments, prNumber, head) {
     return named ? bound('send-back') : unread();
   }
   return unread();
+}
+
+/** CI-heal owns required-check failures even when the same PR also owes a gate repair. */
+export function hasRedTeamSentBackLabels(pr, repairKind = 'fix') {
+  const labels = (pr?.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  return repairKind === 'fix' && labels.includes('review:accepted') && labels.includes('red-team:blocked')
+    && !labels.includes('review:changes');
+}
+
+/** Unresolved send-back findings, bound to a trusted, named gate result on this head. */
+export function redTeamSentBackFindings(pr) {
+  if (pr?.commentsComplete !== true || pr?.readFailed || !Array.isArray(pr?.comments)) return [];
+  try {
+    if (redTeamFact(pr.comments, pr.number, pr.headRefOid)?.value?.state !== 'send-back') return [];
+    const disposition = readRedTeamDisposition({ comments: pr.comments, pr: pr.number, head: pr.headRefOid,
+      sealed: null }); // Only sendBack is consumed; do not read filesystem seal evidence in the pure planner.
+    return disposition.outcome === GATE_OUTCOMES.SENT_BACK
+      ? disposition.sendBack.filter(f => f.confirmed === true) : [];
+  } catch { return []; } // Unread evidence never authorizes a fixer.
 }
 
 /**

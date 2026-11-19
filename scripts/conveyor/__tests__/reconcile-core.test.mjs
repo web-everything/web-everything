@@ -1,5 +1,7 @@
 import { HEAD, workflowRow, workflowEvidence } from '../soak/fixtures/workflow-edit-protection.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
+import { buildRedTeamRearmComment } from '../rearm-review.mjs';
+import { decideSetLabel } from '../../review-set-label.mjs';
 /**
  * @file scripts/conveyor/__tests__/reconcile-core.test.mjs
  * @description Pins the resident reconcile pass (WE #3296) — the dispatch and, mostly, its FOUR REFUSALS.
@@ -49,6 +51,7 @@ import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { CI_HEAL_COMMENT_MARKER, buildCiHealComment } from '../ci-heal-mark.mjs';
 import { buildCiHealEscalationComment } from '../ci-heal-escalation-mark.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
+import { RED_TEAM_FIX_COMMENT_MARKER, publishRedTeamFixLaunch, countRedTeamFixComments } from '../red-team-fix-round-count.mjs';
 import {
   ADVISORY_FIX_COMMENT_MARKER, buildAdvisoryFixComment, isLatestAdvisoryFindingAddressed, countCompletedAdvisoryEpisodes,
 } from '../advisory-fix-mark.mjs';
@@ -61,6 +64,8 @@ import { reviewSessionSlug } from '../review-session-slug.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { buildClearedHumanMarker, headEverHumanCleared, parseLatestHumanClearedSha, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { classifyPr } from '../../progress-board.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
+import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -86,6 +91,123 @@ const lbl = (...names) => names.map((name) => ({ name }));
 // These fixtures model a repository whose one required check is gate. Specific CI cases override the set.
 const planReconcile = options => planReconcileCore({ reviewTiming: { startAfter: 'ci-green' }, requiredChecks: ['gate'], ...options });
 const greenRollup = [{ name: 'gate', status: 'completed', conclusion: 'success' }];
+
+describe('accepted head with unresolved red-team send-back (PR #7031)', () => {
+  const head = 'a'.repeat(40);
+  const makePr = () => {
+    const result = { author: AUTOMATION, body: renderRedTeamComment({ pr: 7031, rev: head, provider: 'codex', model: 'm',
+      recheckStatus: 'ok', foldedVerdict: 'changes', findings: [{ summary: 'Confirmed current-head break',
+        category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) };
+    const id = liveResultGateState([result], 7031, head).resultId;
+    return { number: 7031, state: 'OPEN', headRefOid: head, headRefName: 'lane/7031-fix', isDraft: false,
+      labels: lbl('review:accepted', 'ready-to-merge', 'red-team:blocked', 'status:sent-back-red-team'),
+      mergeStateStatus: 'CLEAN', statusCheckRollup: greenRollup, commentsComplete: true,
+      comments: [result, { author: AUTOMATION, body: `${redTeamGateMarker(7031, head, 'sent-back', id)}\nSent back confirmed break #1.` }] };
+  };
+  const plan = (pr, extra = {}) => planReconcile({ prs: [pr], agents: [], now: NOW, ...extra });
+
+  it('dispatches a fix for the trusted named send-back on the accepted current head', () => {
+    const out = plan(makePr());
+    expect(out.dispatch).toHaveLength(1);
+    expect(out.dispatch[0]).toMatchObject({ kind: 'fix', mode: 'red-team-sent-back', phase: 'queued', findings: 1,
+      redTeamSentBack: { head, findings: [expect.objectContaining({ summary: 'Confirmed current-head break' })] } });
+  });
+
+  it.each(['moved head', 'no marker', 'untrusted marker', 'unnamed marker', 'round-cap', 'review:changes',
+    'incomplete comments', 'unknown completeness', 'unread comments', 'draft', 'closed'])(
+    'does not dispatch the accepted-head fix with %s', reason => {
+      const pr = makePr();
+      if (reason === 'moved head') pr.headRefOid = 'b'.repeat(40);
+      if (reason === 'no marker') pr.comments.pop();
+      if (reason === 'untrusted marker') pr.comments[1].author = { login: 'outsider' };
+      if (reason === 'unnamed marker') pr.comments[1].body = redTeamGateMarker(7031, head, 'sent-back');
+      if (reason === 'round-cap') pr.comments.push({ author: AUTOMATION,
+        body: redTeamGateMarker(7031, head, 'round-cap', liveResultGateState(pr.comments, 7031, head).resultId) });
+      if (reason === 'review:changes') pr.labels.push({ name: 'review:changes' });
+      if (reason === 'incomplete comments') pr.commentsComplete = false;
+      if (reason === 'unknown completeness') delete pr.commentsComplete;
+      if (reason === 'unread comments') pr.comments = null;
+      if (reason === 'draft') pr.isDraft = true;
+      if (reason === 'closed') pr.state = 'CLOSED';
+      expect(plan(pr).dispatch.filter(d => d.mode === 'red-team-sent-back')).toEqual([]);
+    });
+
+  it('refuses and escalates at the durable fix cap instead of dispatching', () => {
+    const out = plan(makePr(), { roundCap: 0 });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 0, cap: 0, capKind: 'fix' }));
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+  });
+  it('hands the pushed red-team repair to ordinary review in needs-review, never another accepted-head repair', () => {
+    const pr = makePr();
+    pr.headRefOid = 'b'.repeat(40);
+    pr.comments.push({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER });
+    const handBack = decideSetLabel({ to: 'rearm', currentLabels: pr.labels });
+    expect(handBack.allowed).toBe(true);
+    pr.labels = lbl(...pr.labels.map(l => l.name).filter(l => !handBack.removeLabels.includes(l)), handBack.addLabel);
+    expect(pr.labels).toContainEqual({ name: 'review:pending' });
+    expect(pr.labels).not.toContainEqual({ name: 'review:accepted' });
+    expect(pr.labels).not.toContainEqual({ name: 'ready-to-merge' });
+    const out = plan(pr);
+    expect(out.dispatch.filter(d => d.mode === 'red-team-sent-back')).toEqual([]);
+    expect(out.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', phase: 'needs-review' }));
+  });
+
+  it('an active referral hold blocks the red-team repair dispatch', () => {
+    const pr = makePr();
+    pr.referralHold = { head: pr.headRefOid, episode: 'e', count: 2, why: 'review paused: 2 referrals need a ruling' };
+    expect(plan(pr).dispatch.filter(d => d.mode === 'red-team-sent-back')).toEqual([]);
+  });
+
+  it('one recorded red-team repair increases attempts by one without a rearm', () => {
+    const pr = makePr();
+    expect(plan(pr).dispatch[0].attempts).toBe(0);
+    pr.comments.push({ author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER}\n\nRepair pushed.` });
+    expect(plan(pr).dispatch[0]).toMatchObject({ mode: 'red-team-sent-back', attempts: 1 });
+  });
+  it('charges one shared-cap attempt per red-team dispatch plus its completed hand-back across heads', () => {
+    const pr = makePr();
+    for (let round = 1; round <= 3; round += 1) {
+      pr.comments.push({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER });
+      pr.comments.push({ author: AUTOMATION, body: buildRedTeamRearmComment({ actor: 'fix agent',
+        decision: decideSetLabel({ to: 'rearm', currentLabels: pr.labels }) }) });
+      if (round < 3) expect(plan(pr, { roundCap: 3 }).dispatch[0]).toMatchObject({ attempts: round });
+    }
+    // A later ordinary bounce on a new head retains all three dispatch charges, not six.
+    pr.headRefOid = 'b'.repeat(40);
+    pr.labels = lbl('review:changes');
+    pr.comments.push({ body: '🔁 human review — changes requested\n\nRepair the remaining break.' });
+    expect(plan(pr, { roundCap: 3 }).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3, cap: 3 }));
+  });
+  it.each([3, 4])('refuses cap-exhausted after %i recorded red-team repairs on the same head/result', n => {
+    const pr = makePr();
+    pr.comments.push(...Array.from({ length: n }, () => ({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER })));
+    const out = plan(pr, { roundCap: 3 });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: n, cap: 3, capKind: 'fix' }));
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'round-cap-exhausted', parkToHuman: true }));
+  });
+  it('shares the exhausted red-team repair cap with a later review:changes bounce', () => {
+    const pr = makePr();
+    pr.labels = lbl('review:changes');
+    pr.comments.push({ body: '🔁 human review — changes requested\n\nFix the confirmed break.' },
+      ...Array.from({ length: 3 }, () => ({ author: AUTOMATION, body: RED_TEAM_FIX_COMMENT_MARKER })));
+    const out = plan(pr, { roundCap: 3 });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 3, cap: 3 }));
+  });
+  it('only counts trusted leading round markers, retaining rounds after the head moves', () => {
+    const comments = [
+      { author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER}\nRepair pushed: ${'b'.repeat(40)}` },
+      { author: { login: 'outsider' }, body: RED_TEAM_FIX_COMMENT_MARKER },
+      { body: RED_TEAM_FIX_COMMENT_MARKER },
+      { author: AUTOMATION, body: `Quoted marker: ${RED_TEAM_FIX_COMMENT_MARKER}` },
+      { author: AUTOMATION, body: `${RED_TEAM_FIX_COMMENT_MARKER} forged suffix` },
+    ];
+    expect(countRedTeamFixComments(comments)).toBe(1);
+    expect(countRedTeamFixComments(null)).toBe(0);
+  });
+});
 const pendingRollup = [{ name: 'gate', status: 'in_progress', conclusion: null }];
 const redRollup = [{ name: 'gate', status: 'completed', conclusion: 'failure' }];
 const finding = (text = 'the cap is not derived from the PR; derive it from the comment thread') =>
@@ -481,6 +603,26 @@ describe('case 3 — refusal 2: a PR with nothing to fix never gets a fixer (#32
     expect(plan.dispatch).toHaveLength(1);
     expect(plan.dispatch[0].kind).toBe('review');
     expect(plan.dispatch[0].prNumber).toBe(1576);
+  });
+
+  it.each(['receipt', 'hand-back', 'both'])('red-team %s bookkeeping alone refuses no-findings', kind => {
+    const head = 'a'.repeat(40);
+    const gate = { author: AUTOMATION, body: renderRedTeamComment({ pr: 1563, rev: head,
+      provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+      findings: [{ summary: 'Gate break', category: 'edge-case', impactIfUnfixed: 'broken',
+        file: 'scripts/example.mjs', line: 1, confirmedByRecheck: true }] }) };
+    const receipts = [];
+    const gateComments = [gate, { author: AUTOMATION,
+      body: redTeamGateMarker(1563, head, 'sent-back', liveResultGateState([gate], 1563, head).resultId) }];
+    publishRedTeamFixLaunch({ comments: gateComments, pr: 1563, head, attemptId: 'spent-launch', chargedRounds: 0,
+      publish: body => receipts.push({ author: AUTOMATION, body }) });
+    const handBack = { author: AUTOMATION, body: buildRedTeamRearmComment({ actor: 'fix agent',
+      decision: { rearmFrom: 'review:accepted', keepsHuman: false } }) };
+    const comments = kind === 'receipt' ? receipts : kind === 'hand-back' ? [handBack] : [...receipts, handBack];
+    expect(countFindings(comments)).toBe(0);
+    const plan = planReconcile({ prs: [pr1563({ comments })], agents: [], now: NOW });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'no-findings', findings: 0 }));
   });
 
   it('a BOUNCED PR with zero findings gets NOTHING — the sharper half of the same refusal', () => {

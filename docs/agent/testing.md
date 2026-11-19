@@ -4738,6 +4738,74 @@ a subdirectory beside the live `<slug>.json` records so no valid slug can collid
 are usable only for the ended pid; SIGKILL cannot leave a marker. Keep missing/stale
 marker, redaction, bounded-tail and diagnostic-write-failure regressions in the scoped
 review-job and review-daemon suites.
+## Red-team repair hand-back accounting
+
+`fix-run` hands accepted red-team repairs to the pinned `conveyor/rearm-review.mjs`
+wrapper with `--expect-head` and `--round=red-team`; the public label CLI rejects
+`--to=rearm`. The red-team hand-back uses its own marker because dispatch already
+spent the repair round, even if execution fails. Keep the argv, real CLI parsing,
+shared-cap accounting, and missing/stale conflict-fallback finding cases in
+`fix-run`, `rearm-review`, and `reconcile-core` tests.
+
+A dispatch receipt also spends its launch ID: replay must exit non-zero before any
+repair executor runs, including after failed or no-change repairs. There is no
+crash-restart exemption for executing the repair again. A new execution uses a
+new dispatch and launch ID, consuming another round under the shared cap. Keep the
+failed/no-change/executor-fallback replay refusal and fresh-launch assertions in
+`fix-run.test.mjs`.
+
+An already-pushed repair with pending push debt at the live PR head may finish its
+hand-back using either the spent launch ID or a fresh one. It retains the lane lease
+and HEAD checks, then calls the red-team rearm wrapper without another executor,
+push, or dispatch receipt. `scripts/operations/__tests__/fix-run.test.mjs` covers this
+with `recovers a pushed red-team hand-back without executing or charging again`;
+`does not recover a spent red-team launch with a %s pending marker` rejects missing,
+different-tip, evidence-only, and unknown-kind markers.
+
+### Tick red-team durable floor admission
+
+`tick-core.test.mjs` drives the tick comment-read seam through the shared complete
+reader, then plans with an empty post-restart attempt tally. Repair candidates
+defer with a retry note on read failure, page-cap exhaustion, count mismatch or an
+unset floor; complete reads at zero/below/at cap preserve admission accounting.
+Read every repair candidate completely, including `review:changes` and `red-team:blocked`:
+a failed or truncated read cannot rule out red-team history beyond the visible prefix.
+Record an explicit unknown floor (`null`) on read failure so admission defers even after
+labels change. CI-only floors remain best effort. Persistent deferral asks the operator
+to inspect the full thread; the next tick reads fresh evidence. Keep the ten-page bound
+and the shared 128-call tick budget, including CI-only reads.
+
+## Red-team repair charge transaction
+
+Start tick tests with production `gh pr list` rows through `shapePrs`, without `mode`;
+that field exists only on planned dispatches, never on production PR discovery rows.
+Borrowed launch IDs hash the
+planned repository, PR, head, gate result and charged attempt count. Test replay through
+`fixDetachedProvider` into `runFixCli`, with a mutable trusted thread and executor spy.
+Carry the planned red-team accounting mode on validated `--planned-repair-mode` argv.
+Receipt publication and hand-back selection follow that plan even if labels changed to
+`review:changes` before the first launcher read. Test failed and no-change executions,
+receipt-before-executor ordering, and replay refusal under those changed labels.
+Both receipt writers serialize fresh complete-thread reads, shared-round counting and publication
+under the same per-repository/PR charge lock in the shared coordination root. A busy or unreadable
+lock refuses admission; after a crashed writer an operator must inspect the full thread and remove
+the abandoned lock before retrying. Never reclaim a charge lock merely because time elapsed.
+
+Carry the planner's current-head `roundCommits` through both item and PR-diff planning
+projections. Receipt writers use `sharedRoundAttempts` with mandatory refund evidence
+whenever a trusted ordinary re-arm exists. Re-derive missing or stale evidence with the
+shared commit reader in the target repository; unreadable evidence refuses publication
+with an operator action, never an unrefunded cap recount. Cover three mechanical-only
+rounds at cap 3 through the real planner and each receipt writer. Separately replay an
+accepted, red-team-blocked PR with a failing required check through the real planner
+and `runFixCli`: its ordinary CI-heal must read CI evidence and reach the executor.
+
+The reconcile-to-fix planning projection must preserve `roundCap` on both item-backed and
+PR-diff rows. Cap-1 tests exercise both receipt writers after a competing writer consumes
+the live budget. Spent-launch checks read trusted receipts before selecting repair mode,
+even after labels change to `review:changes`; CI-heal therefore also reads the thread.
+Receipt and hand-back producers are tested as bookkeeping-only threads through the
+planner's existing `no-findings` refusal.
 
 ## Required-check evidence contract (PR1)
 

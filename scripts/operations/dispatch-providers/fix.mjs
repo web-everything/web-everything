@@ -1,3 +1,4 @@
+import { redTeamFixLaunchId } from '../../conveyor/red-team-fix-round-count.mjs';
 /**
  * @file scripts/operations/dispatch-providers/fix.mjs
  * @description THE `fix` LAUNCH KIND'S MECHANICAL DISPATCH PROVIDER (#3640) — copied from the template
@@ -43,6 +44,7 @@
  */
 
 import { normNum } from '../../conveyor/queue-store.mjs';
+import { randomUUID } from 'node:crypto';
 import { notApplied } from '../effect-executor.mjs';
 import {
   DETACHED_HANDLE_PREFIX,
@@ -63,6 +65,14 @@ import { AGY_FIX_CONFINEMENT } from '../agy-fix-provider.mjs';
  *  that lazily imports the wrapper chain reaching this file, so a `fix.mjs -> fix-run.mjs` import deadlocks it
  *  (exit 13, "unsettled top-level await"). */
 export const FIX_RUN_EXECUTORS = Object.freeze(['codex', 'antigravity']);
+
+/** Accounting classification carried on argv, independent of later PR labels. */
+export function validatePlannedRepairMode(mode) {
+  if (!['ordinary', 'red-team-sent-back'].includes(mode)) {
+    throw new TypeError('fix-run: invalid --planned-repair-mode (supported: ordinary|red-team-sent-back)');
+  }
+  return mode;
+}
 /** Availability is conditional on a declared confinement boundary for untrusted PR and CI input. */
 export const FIX_RUN_CONFINEMENT = Object.freeze({
   codex: Object.freeze({ mode: 'sandboxed', boundary: 'workspace' }),
@@ -111,6 +121,14 @@ export function fixDetachedProvider(request, {
   if (!sessionSlug) throw notApplied(`dispatch-lane: refusing a mechanical fix dispatch for PR #${pr} with no session slug`);
 
   const argv = [String(runScript), `--pr=${pr}`, `--session=${sessionSlug}`];
+  argv.push(`--planned-repair-mode=${validatePlannedRepairMode(request.mode === 'red-team-sent-back' ? request.mode : 'ordinary')}`);
+  // Session slugs repeat across dispatches. Preserve this ID on a retry of the same launch;
+  // a fresh dispatch gets its own counted repair, even if no executor makes a commit.
+  const launchId = request.mode === 'red-team-sent-back'
+    ? redTeamFixLaunchId({ repo: request.repo, pr, head: request.head, resultId: request.resultId, attempts: request.attempts })
+    : request.launchId ?? randomUUID();
+  argv.push(`--launch-id=${launchId}`);
+  if (request.roundCap !== undefined) argv.push(`--red-team-round-cap=${request.roundCap}`);
   // The ITEM is optional for a repair (`planFixDispatchWrapper` takes `item: null`, and the brief documents
   // `$FIX_ITEM` as "when known"), so it is passed only when there is one rather than as an empty flag the
   // wrapper would have to re-normalise.
