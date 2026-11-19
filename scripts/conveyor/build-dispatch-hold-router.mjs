@@ -43,6 +43,7 @@ import { randomUUID } from 'node:crypto';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { reserve, releaseLockDir, readLockEntry } from '../readiness/file-locks.mjs';
 import { normNum } from './queue-store.mjs';
+import { assertRuntimeAdmitted, withRuntimeAdmission } from '../lib/runtime-admission.mjs';
 import { DEFAULT_BUILD_DISPATCH_HOLD_MINUTES } from './build-dispatch-claim.mjs';
 
 // ── pure ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -84,7 +85,8 @@ export function planHoldRouting(holds) {
       const num = normNum(h?.num);
       if (!isValidHoldNum(num)) return null;
       const { route, commit } = classifyHoldReason(h?.reason);
-      return { num, route, commit, reason: h?.reason ?? null };
+      return { num, route, commit, reason: h?.reason ?? null,
+        ...(h.groupMembers !== undefined ? { groupMembers: h.groupMembers } : {}) };
     })
     .filter(Boolean);
 }
@@ -206,8 +208,8 @@ export function listHoldFindings({ file = holdFindingsFile() } = {}) {
  * resolved/re-scoped is harmless — a resolved item is never a build candidate regardless of hold state, and
  * a re-scoped/unshaped item is a `prepare` candidate, a code path this daemon's hold-gating never touches.
  *
- * `releaseRoute` DOES run on a DEFINITE failure — `spawnLand` throwing/rejecting (the detached process never
- * even started, e.g. a bad argv or an import failure) or `recordFinding` throwing (the ledger write itself
+ * `releaseRoute` DOES run on a DEFINITE non-spawn — `spawnLand` returning `{spawned:false}` or throwing/rejecting
+ * (the detached process never started, e.g. a bad argv or import failure) or `recordFinding` throwing (the ledger write itself
  * failed) — releasing the just-taken lease so the very NEXT tick can retry promptly, rather than waiting out
  * the whole lease TTL for an attempt that never ran at all. #4465 review round 3 (live correctness finding):
  * this is deliberately narrower than "release on any failure" — `spawnLand` succeeding only means the
@@ -217,15 +219,17 @@ export function listHoldFindings({ file = holdFindingsFile() } = {}) {
  * item's own card for the filed follow-up). A landing that starts but later fails inside the detached
  * process is therefore a KNOWN, ACCEPTED MVP gap: it is not retried inside the lease's lifetime, and the item
  * simply falls back to ordinary build dispatch once the (longer) hold TTL itself lapses.
- * @returns {{num, route, action, error?}[]} one outcome per plan entry.
+ * @returns {{num, route, action, reason?, error?}[]} one outcome per plan entry.
  */
 export async function routeHeldItems({
   plan, reserveRoute = reserveHoldRoute, releaseRoute = releaseHoldRoute, spawnLand = () => ({ spawned: false }),
-  recordFinding = appendHoldFinding,
+  recordFinding = appendHoldFinding, readSettings,
 } = {}) {
   const outcomes = [];
   for (const entry of Array.isArray(plan) ? plan : []) {
     if (!entry?.num) continue;
+    const admission = assertRuntimeAdmitted(entry, 'route', { readSettings });
+    if (!admission.admitted) { outcomes.push({ num: entry.num, route: entry.route, action: 'runtime-refused', reason: admission.reason }); continue; }
     // EVERY route dedups against a still-live lease first (#4465 review round 2 — route 'other' had NO dedup
     // at all: the same held item is re-planned every tick for the whole hold TTL, so a bare
     // `recordFinding` here would append one duplicate ledger entry per tick — ~120 of them over a 240-minute
@@ -246,7 +250,13 @@ export async function routeHeldItems({
     }
     // (a)/(b) — land a card edit through a lane PR.
     try {
-      await spawnLand(entry);
+      const result = await withRuntimeAdmission(entry, 'route', () => spawnLand(entry), { readSettings });
+      if (result?.spawned === false) {
+        try { releaseRoute({ num: entry.num, route: entry.route }); } catch { /* best-effort — the TTL still bounds it */ }
+        outcomes.push({ num: entry.num, route: entry.route, action: 'not-spawned',
+          reason: result.reason === 'runtime-only' ? 'runtime-refused' : (result.reason ?? 'not-spawned') });
+        continue;
+      }
       outcomes.push({ num: entry.num, route: entry.route, action: 'landing-spawned' });
     } catch (e) {
       try { releaseRoute({ num: entry.num, route: entry.route }); } catch { /* best-effort — the TTL still bounds it */ }

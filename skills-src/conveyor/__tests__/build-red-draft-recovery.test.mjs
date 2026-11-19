@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recoverBuilderDrafts, runBuildDispatchTick, cliRecoverBuilderDrafts } from '../build-dispatch-daemon.mjs';
 import { MAX_RESUME_ATTEMPTS } from '../../../scripts/conveyor/build-dispatch-orphan-adopt.mjs';
+import { withRuntimeAdmissionTick } from '../../../scripts/lib/runtime-admission.mjs';
 
 const nowMs = Date.parse('2026-09-30T12:00:00Z');
 const candidate = {
@@ -91,6 +92,30 @@ describe('abandoned builder draft recovery', () => {
     expect(f.effects.escalate).toHaveBeenCalledTimes(2);
     expect(f.effects.dispatch).not.toHaveBeenCalled();
   });
+  it('restores recovery state when runtime admission tightens between reservation and dispatch', async () => {
+    const prior = { attempts: 0, handle: 'pid:previous' };
+    const f = fixture(prior);
+    let settings = { mode: 'lift', ids: [] };
+    const readSettings = vi.fn(() => settings);
+    f.effects.reserve.mockImplementation(() => {
+      settings = { mode: 'only', only: true, ids: [] };
+      return { ok: true };
+    });
+    const result = await withRuntimeAdmissionTick(readSettings, () => f.run());
+    expect(readSettings).toHaveBeenCalledTimes(2);
+    expect(f.effects.reserve).toHaveBeenCalledWith(candidate);
+    expect(f.effects.writeState.mock.calls).toEqual([
+      [candidate.pr, { attempts: 1, pending: true, pendingAt: nowMs }],
+      [candidate.pr, prior],
+    ]);
+    expect(f.effects.readState()).toEqual(prior);
+    expect(f.effects.dispatch).not.toHaveBeenCalled();
+    expect(f.effects.escalate).not.toHaveBeenCalled();
+    expect(f.effects.release).toHaveBeenCalledOnce();
+    expect(f.effects.release).toHaveBeenCalledWith(candidate);
+    expect(result).toHaveLength(0);
+    expect(result.runtimeRefused).toEqual([{ num: candidate.num, kind: 'draft-recovery', reason: 'runtime-only' }]);
+  });
   it('runs recovery before candidate holds and previews it without mutations', async () => {
     const effects = {
       listHolds: () => [{ num: '4502', reason: 'in-flight we#3033 already delivers it' }],
@@ -172,6 +197,37 @@ describe('abandoned builder draft recovery', () => {
       if (kind === 'stale-freeze') expect(io.readFreeze).toHaveBeenCalledOnce();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 60_000);
+  it.each([
+    { ids: ['12'], groupMembers: ['12', '13'], admitted: false },
+    { ids: ['12', '13'], groupMembers: ['12', '13'], admitted: true },
+    { ids: ['12', '13'], groupMembers: null, admitted: false },
+  ])('draft recovery preserves persisted group $groupMembers under allowlist $ids', async ({ ids, groupMembers, admitted }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'builder-group-'));
+    const dispatch = vi.fn(async () => ({ agentId: 'pid:321' }));
+    const row = { type: 'conveyor.dispatch-delivery-agent', handle: 'pid:99999', status: 'applied',
+      payload: { launchKind: 'build', num: '12', groupMembers }, result: { pr: 3033 } };
+    const io = {
+      stateRoot: dir, store: { list: () => ['dispatch-lane-group'], read: () => ({ effects: [row] }) },
+      isPidAlive: () => false, listAgents: () => [],
+      api: path => path.startsWith('pulls/')
+        ? { draft: true, state: 'open', head: { ref: candidate.laneRef, sha: 'abc', repo: { full_name: 'web-everything/web-everything' } } }
+        : path === 'commits/abc' ? { commit: { committer: { date: candidate.headCommittedAt } } }
+        : { check_runs: [{ id: 2, name: 'test', conclusion: 'failure', output: { summary: 'red' } }] },
+      paged: () => [{ annotation_level: 'failure', message: 'AssertionError: grouped build failed' }],
+      freeLanes: () => [8], reserve: () => ({ ok: true }), release: vi.fn(), dispatch,
+      gh: vi.fn(), mergeGateSetting: 'off',
+    };
+    try {
+      await withRuntimeAdmissionTick(() => ({ mode: 'only', only: true, ids }), () => cliRecoverBuilderDrafts({
+        rawOpenPrs: [{ repo: 'we', prs: [{ number: 3033, isDraft: true, headRefName: candidate.laneRef }] }], allowResume: true,
+      }, io));
+      if (!admitted) expect(dispatch).not.toHaveBeenCalled();
+      else {
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ num: '12', groupMembers: ['12', '13'] }));
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   const steps = [
     { conclusion: 'success', started_at: '2026-09-30T01:00:00Z', completed_at: '2026-09-30T01:00:09Z' },
     { conclusion: 'failure', started_at: '2026-09-30T01:00:10Z', completed_at: '2026-09-30T01:00:19Z' },

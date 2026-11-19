@@ -1,14 +1,55 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { readBuildPrioritySettings, filterIdsToRuntimeOnly, extraPrepareSlot } from '../build-queue.mjs';
+import { readBuildPrioritySettings, filterIdsToRuntimeOnly, filterRuntimeCandidates, extraPrepareSlot } from '../build-queue.mjs';
 import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
+import { dispatchPlan } from '../../readiness/dispatch-plan.mjs';
+import { planTick } from '../../conveyor/tick-core.mjs';
 
 const now = Date.parse('2026-11-17T12:00:00Z');
 const record = { ids: ['42', 'xxanl0v'], mode: 'only', setBy: 'operator', at: '2026-11-17T11:00:00Z', ttlHours: 2 };
 const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
 const options = { env: { WE_POLICY_CASCADE_LOG: '0' }, read: () => ({ build: { priority: ['9'] } }), now: () => now };
 const read = (value = record, overrides = {}) => readBuildPrioritySettings({ ...options, readRuntime: () => JSON.stringify(value), ...overrides });
+
+it.each([
+  ['prepare-item', 'story', 'needs-prepare', 'spawnPrepareItems'],
+  ['investigate', 'investigation', 'needs-investigation', 'spawnInvestigations'],
+])('real planner retains an unlisted %s guard across ticks and suppresses redispatch on relisting', (kind, cardKind, reason, spawnKey) => {
+  const queue = [{ num: '8001', kind: cardKind, scope: ['we:src/a.js'], size: 1 }];
+  const guard = { num: '8001', kind, lane: 4, spawnedTick: 0, sawPr: false };
+  const tick = (buildPriority, bookkeeping) => {
+    const plan = dispatchPlan({ queue, buildPriority, freeLanes: [5], preparePolicy: { requirePreparedDate: true } });
+    return { plan, result: planTick({ state: { queue, lanes: [], prs: [] }, plan, freeLanes: [5],
+      bookkeeping, config: { buildPriority }, now }) };
+  };
+  const unlisted = tick(read(), { tick: 1, prepareGuards: [guard] });
+  expect(unlisted.plan).toMatchObject({ launch: [], held: [{ num: '8001', reason: 'runtime-only' }] });
+  expect(unlisted.result.decisions.retireGuards.prepare).toEqual([]);
+  expect(unlisted.result.decisions[spawnKey]).toEqual([]);
+  expect(unlisted.result.nextState.prepareGuards).toContainEqual(expect.objectContaining(guard));
+
+  const restored = tick(read({ ...record, ids: ['8001'] }), unlisted.result.nextState);
+  expect(restored.plan.held).toEqual([{ num: '8001', reason }]);
+  expect(restored.result.decisions.retireGuards.prepare).toEqual([]);
+  expect(restored.result.decisions[spawnKey]).toEqual([]);
+  expect(restored.result.nextState.prepareGuards).toContainEqual(expect.objectContaining(guard));
+});
+
+it('real planner filters before lane assignment and scope overlap, accepting bornAs membership', () => {
+  const queue = [
+    { num: '9', scope: ['we:src/a.js'] },
+    { num: '8001', bornAs: 'xabcdef0', scope: ['we:src/a.js'] },
+  ];
+  expect(dispatchPlan({ queue, freeLanes: [5], buildPriority: read({ ...record, ids: ['xabcdef0'] }) }))
+    .toEqual({ launch: [{ num: '8001', lane: 5 }], held: [{ num: '9', reason: 'runtime-only' }] });
+});
+
+it('real planner holds every item on malformed runtime evidence without assigning a lane', () => {
+  expect(dispatchPlan({ queue: [{ num: '42' }, { num: '9', scope: ['we:src/a.js'] }],
+    freeLanes: [5], buildPriority: read(null) }))
+    .toEqual({ launch: [], held: [{ num: '42', reason: 'runtime-only' }, { num: '9', reason: 'runtime-only' }] });
+});
 
 describe('runtime build priority', () => {
   it('absent runtime deep-equals the previous repo-setting result', () => {
@@ -108,14 +149,57 @@ describe('runtime build priority', () => {
     expect(settings.runtime.warning).not.toContain('private');
   });
 
-  it.each(['7', ''])('valid env %j overrides valid and malformed runtime', value => {
+  it.each(['7', ''])('absent runtime preserves the previous env %j override', value => {
     const env = { ...options.env, WE_BUILD_PRIORITY: value };
-    const expected = { ids: value ? [value] : [], source: 'env' };
-    expect(read(record, { env })).toEqual(expected);
-    expect(read(null, { env })).toEqual(expected);
+    const readRuntime = vi.fn(missing);
+    expect(read(record, { env, readRuntime })).toEqual({ ids: value ? [value] : [], source: 'env' });
+    expect(readRuntime).toHaveBeenCalledOnce();
+  });
+
+  it.each(['', '9999'])('env %j cannot bypass malformed or unreadable runtime evidence', value => {
+    const env = { ...options.env, WE_BUILD_PRIORITY: value };
+    for (const readRuntime of [() => '{', () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }]) {
+      const settings = read(record, { env, readRuntime });
+      expect(settings).toMatchObject({ ids: [], source: 'runtime-malformed', only: true, held: true });
+      expect(filterIdsToRuntimeOnly(['1', '9999'], settings)).toEqual([]);
+      expect(extraPrepareSlot(settings)).toBeNull();
+    }
+  });
+
+  it.each([
+    ['9999', []], ['9999,2,1', ['2', '1']], ['2', ['2']], ['', []],
+  ])('env %j intersects the runtime only-list and cannot admit outside builds or prepares', (value, ids) => {
+    const settings = read({ ...record, ids: ['1', '2'] }, { env: { ...options.env, WE_BUILD_PRIORITY: value } });
+    expect(settings).toMatchObject({ ids, source: 'env', mode: 'only', only: true });
+    expect(filterIdsToRuntimeOnly(['1', '2', '9999'], settings)).toEqual(['1', '2'].filter(id => ids.includes(id)));
+    expect(extraPrepareSlot(settings)).toBe(ids[0] ?? null);
+    expect(settings.runtime.appliedCount).toBe(ids.length);
+    expect(settings.runtime.line).toContain('runtime+env');
+  });
+
+  it('valid env overrides lift ordering after runtime validation without restricting candidates', () => {
+    const settings = read({ ...record, mode: 'lift' }, { env: { ...options.env, WE_BUILD_PRIORITY: '9999' } });
+    expect(settings).toMatchObject({ ids: ['9999'], source: 'env', mode: 'lift', only: false });
+    const candidates = ['1', '9999'];
+    expect(filterIdsToRuntimeOnly(candidates, settings)).toBe(candidates);
+    expect(extraPrepareSlot(settings)).toBeNull();
   });
 
   it('invalid env cannot bypass a malformed runtime hold', () => {
     expect(read(null, { env: { ...options.env, WE_BUILD_PRIORITY: 'bad' } }).held).toBe(true);
   });
+});
+
+it.each([
+  [{ num: '8001', bornAs: 'xabcdef0' }, 'xabcdef0'],
+  [{ num: '#008001' }, '8001'],
+  [{ num: '8001', id: 'xabcdef0-title' }, 'xabcdef0'],
+])('runtime candidate filtering accepts direct priority aliases %j', (row, alias) => {
+  const settings = read({ ...record, ids: [alias] });
+  expect(filterRuntimeCandidates([row], settings)).toEqual([row]);
+  expect(filterRuntimeCandidates([row], { ...settings, held: true })).toEqual([]);
+  expect(filterRuntimeCandidates([row], read(null))).toEqual([]);
+  expect(filterRuntimeCandidates([row], read({ ...record, ids: [alias] }, {
+    env: { ...options.env, WE_BUILD_PRIORITY: '9999' },
+  }))).toEqual([]);
 });

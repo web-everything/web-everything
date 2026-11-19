@@ -355,9 +355,9 @@ export function makeCliMechanicalPasses({
       `⚠ mechanical pass ${path} [${key}] failed (non-fatal): ${summarizeMechanicalPassError(e)}\n`,
     );
     const pending = [];
-    const run = (path, args, key, slug, capture = false) => {
+    const run = (path, args, key, slug, capture = false, passName) => {
       const root = resolve(scriptsDir, '..');
-      const name = path.split('/').pop().replace(/\.mjs$/, '');
+      const name = passName ?? path.split('/').pop().replace(/\.mjs$/, '');
       const perPr = ['review-dispatch', 'review-round-tag', 'review-status-tag'].includes(name);
       const pass = { passName: perPr ? `${name}:${args[0]}` : name,
         repo: slug ?? repos.we?.slug ?? CONSTELLATION_REPOS.we.slug,

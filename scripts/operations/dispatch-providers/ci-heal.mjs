@@ -1,3 +1,4 @@
+import { withRuntimeAdmission } from '../../lib/runtime-admission.mjs';
 /**
  * @file scripts/operations/dispatch-providers/ci-heal.mjs
  * @description THE `ci-heal` LAUNCH KIND'S MECHANICAL DISPATCH PROVIDER (#3642) — copied from
@@ -106,7 +107,9 @@ export function ciHealDetachedProvider(request, {
   // static token) into the wrapper's OWN process env, so a long-lived ci-heal wrapper (and whatever it later
   // spawns) never falls back to a static, expiring `GH_TOKEN` inherited from whoever dispatched it. See
   // `detached-dispatch.mjs#defaultSpawnDetached`'s own docblock for the full mechanism.
-  const child = spawnDetached(argv, { cwd: request?.cwd ?? REPO_ROOT, logPath: logPathFor(sessionSlug), settingsEnv: request?.settingsEnv });
+  const spawnOptions = { cwd: request?.cwd ?? REPO_ROOT, logPath: logPathFor(sessionSlug), settingsEnv: request?.settingsEnv, card: request };
+  const child = withRuntimeAdmission(request, request?.launchKind ?? 'build', () => spawnDetached(argv, spawnOptions));
+  if (child?.outcome === 'runtime-refused') return child;
   const pid = Number(child?.pid);
   if (!Number.isInteger(pid) || pid <= 0) {
     // SAME indeterminate shape as an unparseable `claude --bg` confirmation: something may be running and its

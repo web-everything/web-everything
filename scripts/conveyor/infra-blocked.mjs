@@ -45,33 +45,24 @@ import { join, dirname, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { normNum } from './queue-store.mjs';
+import { backoffMs, retryDecision, toMs, DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_REFUSALS } from './infra-retry-policy.mjs';
+export { backoffMs, retryDecision, DEFAULT_BASE_MS, DEFAULT_FACTOR, DEFAULT_CAP_MS,
+  DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_REFUSALS } from './infra-retry-policy.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // #4348-open-pr-retry addendum — the SAME reason→bucket table `open-pr.mjs`'s own operation already declares
 // (`unverified`/`check-red`/`bad-ref`/… → `refused`; `blocked-on-infra`/`gh-error`/… → `unrun`), reused here
 // rather than re-derived: `resumeOpen` needs the identical "did a guard answer, or did the environment simply
 // fail to run" split, for the identical reason (never let a fixable refusal masquerade as an unresolved outage).
-// Imported from the table's LEAF, never `open-pr.mjs` itself: this module is in the driver-watchdog's pinned
-// import graph, which must not pull in the operation registry (`driver-watchdog.test.mjs`).
+// Import the reason table's leaf rather than the whole open-pr operation.
 import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 
 // ── TUNING (exported so a caller/test can override; the conveyor tick uses the defaults) ──────────────────────
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 
-/** Backoff base: the wait after the FIRST failure before the first retry (30s). */
-export const DEFAULT_BASE_MS = 30_000;
-/** Backoff multiplier per attempt (doubling). */
-export const DEFAULT_FACTOR = 2;
-/** Backoff ceiling: no single wait exceeds 30 min however many attempts have failed. */
-export const DEFAULT_CAP_MS = 30 * 60_000;
-/** Attempt cap: after this many FAILED open attempts, stop auto-retrying and SURFACE to the operator. */
-export const DEFAULT_MAX_ATTEMPTS = 6;
 /** Refusal wait: a FIXED interval between resumes that a guard REFUSED (no doubling — waiting does not fix a
  *  refusal, this only stops a zero-delay loop against git/GitHub). */
 export const DEFAULT_REFUSAL_INTERVAL_MS = 5 * 60_000;
-/** Refusal cap: after this many consecutive refusals (~1h at the interval above), SURFACE to the operator. Its
- *  own budget, separate from {@link DEFAULT_MAX_ATTEMPTS} — see {@link markRefusedAttempt}. */
-export const DEFAULT_MAX_REFUSALS = 12;
 /** Auto re-arm knob: how many times the product may itself lift an entry off the attempt cap once the outage that
  *  burned it has passed (0 disables). Override per pass with `--max-auto-rearms=` or env INFRA_MAX_AUTO_REARMS. */
 export const DEFAULT_MAX_AUTO_REARMS = 2;
@@ -80,13 +71,6 @@ export const DEFAULT_REARM_COOLOFF_MS = 60 * 60_000;
 
 // ── PURE CORE (no fs / clock / gh / network — every input is injected) ────────────────────────────────────────
 
-/** ms since epoch for an ISO string (or a number passed through), NaN-safe → 0. */
-function toMs(iso) {
-  if (iso == null) return 0;
-  if (typeof iso === 'number') return Number.isFinite(iso) ? iso : 0;
-  const t = Date.parse(String(iso));
-  return Number.isNaN(t) ? 0 : t;
-}
 const iso = (ms) => new Date(ms).toISOString();
 
 /**
@@ -167,19 +151,6 @@ export function clusterByCause(members) {
   return out;
 }
 
-/**
- * The backoff wait (ms) BEFORE the retry that follows a given failed attempt. `attempt` is 1-based (1 = the
- * initial failed open): wait = min(cap, base · factor^(attempt-1)). Deterministic (no jitter) so the retry
- * schedule is unit-testable; the conveyor tick's own cadence supplies the real-world spread.
- * @param {number} attempt  the 1-based number of the attempt that just failed
- * @returns {number} ms to wait before the next retry
- */
-export function backoffMs(attempt, { baseMs = DEFAULT_BASE_MS, factor = DEFAULT_FACTOR, capMs = DEFAULT_CAP_MS } = {}) {
-  const n = Math.max(1, Math.floor(Number(attempt) || 1));
-  const raw = baseMs * Math.pow(factor, n - 1);
-  return Math.min(capMs, Math.max(0, raw));
-}
-
 /** `{ autoRearms }` to spread onto a parsed entry — absent/null/0 = unspent; a corrupt counter fails CLOSED as spent. */
 function parseAutoRearms(raw) {
   if (raw == null) return {};
@@ -210,6 +181,7 @@ export function parseInfraStore(text) {
     seen.add(key);
     out.push({
       num: String(e.num),
+      ...(e.groupMembers !== undefined ? { groupMembers: e.groupMembers } : {}),
       ref: e.ref != null ? String(e.ref) : null,
       sha: e.sha != null ? String(e.sha) : null,
       base: e.base != null ? String(e.base) : 'main',
@@ -424,27 +396,6 @@ export function autoRearmUnderLock(num, cause, { now = Date.now(), maxAttempts =
 /** Serialize the store back to `.conveyor/infra-blocked.json` text (a bare JSON array, newline-terminated). */
 export function serializeInfraStore(store) {
   return JSON.stringify(Array.isArray(store) ? store : [], null, 2) + '\n';
-}
-
-/**
- * The retry decision for ONE entry, given the clock. Pure state machine:
- *   • `attempt >= maxAttempts` → **surface** — the attempt cap is hit; STOP auto-retrying and hand to the
- *     operator (never loop a doomed resume forever).
- *   • `refusals >= maxRefusals` → **surface** — a guard kept refusing the resume; same hand-off, own budget.
- *   • `now >= nextRetryAt`     → **retry** — the backoff has elapsed; attempt a resume-open this pass.
- *   • otherwise                → **wait**  — still backing off; `waitMs` is how long remains.
- * @param {{attempt?:number, refusals?:number, nextRetryAt?:string}} entry
- * @param {{now?:number, maxAttempts?:number, maxRefusals?:number}} o
- * @returns {{action:'surface'|'retry'|'wait', reason?:string, waitMs?:number}}
- */
-export function retryDecision(entry, { now = Date.now(), maxAttempts = DEFAULT_MAX_ATTEMPTS, maxRefusals = DEFAULT_MAX_REFUSALS } = {}) {
-  const attempt = Math.max(1, Math.floor(Number(entry?.attempt) || 1));
-  if (attempt >= maxAttempts) return { action: 'surface', reason: 'attempt-cap' };
-  if (Math.floor(Number(entry?.refusals) || 0) >= maxRefusals) return { action: 'surface', reason: 'refusal-cap' };
-  const nowMs = toMs(now) || Number(now) || Date.now();
-  const dueMs = toMs(entry?.nextRetryAt);
-  if (nowMs >= dueMs) return { action: 'retry' };
-  return { action: 'wait', waitMs: dueMs - nowMs };
 }
 
 /**
@@ -694,6 +645,16 @@ function parseArgv(argv) {
   return { flags, pos };
 }
 
+/** Historical infra records retain the dispatch context, which owns the full group. */
+export function infraRecoveryCard(entry, { readContext } = {}) {
+  if (!entry.builderContext) return entry;
+  if (typeof readContext !== 'function') throw new Error('unproven infra recovery identity');
+  const context = readContext({ WE_BUILD_PR_CONTEXT: entry.builderContext });
+  const card = context?.entry?.payload;
+  if (!card || normNum(card.num) !== normNum(entry.num)) throw new Error('unproven infra recovery identity');
+  return { ...entry, ...card };
+}
+
 /**
  * Resume-open the PR for one recorded entry — the ONLY "resume" mechanism, and it NEVER merges: it re-invokes
  * the producer `pr-land --label-on-green` against the ALREADY-PUSHED lane ref (fetched from origin so the tip
@@ -705,7 +666,25 @@ function parseArgv(argv) {
  * {@link markRefusedAttempt} vs {@link markRetryAttempt}. Best-effort — a failure just bumps the attempt (or,
  * for a refusal, does not — see that function's own docblock).
  */
-function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
+export function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null, exec = execFileSync, readSettings, readContext, admission: adapter } = {}) {
+  // Keep this watchdog dependency free of driver policy. Launchers must supply the
+  // shared fresh-read gate; a missing or incomplete adapter requires operator repair.
+  if (typeof adapter?.assertRuntimeAdmitted !== 'function' || typeof adapter?.withRuntimeAdmission !== 'function') {
+    return { ok: false, refused: true, reason: 'runtime admission adapter missing',
+      detail: 'Retry through the build daemon with its runtime admission adapter; entry retained.' };
+  }
+  const { assertRuntimeAdmitted, withRuntimeAdmission } = adapter;
+  try { entry = infraRecoveryCard(entry, { readContext }); }
+  catch { return { ok: false, refused: true, reason: 'unproven infra recovery identity', detail: 'unproven infra recovery identity' }; }
+  // Recheck in the child: tick-local admission does not cross a process boundary.
+  const admission = assertRuntimeAdmitted(entry, 'infra-recovery', { readSettings });
+  if (!admission.admitted) return { ok: false, refused: true, reason: admission.reason, detail: admission.reason };
+  const groupMembers = entry.groupMembers ?? [];
+  if (!Array.isArray(groupMembers)) return { ok: false, refused: true, reason: 'invalid group', detail: 'invalid group' };
+  if (groupMembers.some(member => !assertRuntimeAdmitted({ num: member }, 'infra-recovery', { readSettings }).admitted)) {
+    return { ok: false, refused: true, reason: 'runtime admission refused group', detail: 'runtime admission refused group' };
+  }
+  const readResumeGit = (args, options) => exec('git', args, options);
   const ref = entry?.ref;
   const base = entry?.base || 'main';
   if (!ref) return { ok: false, detail: 'no resumable ref recorded' };
@@ -718,7 +697,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   // The ref is already on origin (it was pushed before the open failed). Fetch its objects so pr-land's push of
   // <sha>:<ref> is a local no-op and the create has a head to point at.
   // #x5n4zn3 — was bare (no timeout): a real network fetch.
-  try { execFileSync('git', ['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
+  try { readResumeGit(['fetch', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`], { cwd, stdio: ['ignore', 'ignore', 'pipe'], timeout: 10 * 60_000, killSignal: 'SIGKILL' }); }
   catch (e) {
     // An OUTAGE during the fetch is an infra failure (the attempt/backoff budget), never a refusal — otherwise
     // the tip check below would read "no ref" and burn the refusal budget under a misleading `bad-ref`. Any
@@ -728,7 +707,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   }
   // PR #2899 review — pin the resume to the RECORDED (verified) sha, and refuse if the ref moved since.
   let tipSha = null;
-  try { tipSha = execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
+  try { tipSha = readResumeGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000, maxBuffer: 256 * 1024 * 1024 }).trim() || null; }
   catch { tipSha = null; }
   const pin = resumeShaDecision({ recordedSha: entry.sha, tipSha, ref });
   if (!pin.ok) return { ok: false, refused: true, reason: pin.reason, detail: pin.detail };
@@ -768,7 +747,9 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
     // #x5n4zn3 — was bare (no timeout). `pr-land.mjs --label-on-green` has its OWN internal wait-for-green
     // deadline (`--timeout-min`, default 15 min) — this outer bound must exceed that, with margin for gh/push
     // overhead, or it would kill a wait pr-land itself would have given up on cleanly moments later.
-    const res = parse(execFileSync('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }));
+    const launched = withRuntimeAdmission(entry, 'infra-recovery', () => exec('node', args, { cwd, env: { ...process.env, WE_BUILD_PR_CONTEXT: entry.builderContext || '' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024, timeout: 20 * 60_000, killSignal: 'SIGKILL' }), { readSettings });
+    if (launched?.outcome === 'runtime-refused') return launched;
+    const res = parse(launched);
     return { ok: true, prNumber: res.pr ?? null, detail: res.detail || 'resume-opened' };
   } catch (e) {
     const res = parse(e.stdout);
@@ -784,7 +765,7 @@ function resumeOpen(entry, { cwd = INFRA_ROOT, localSlug = null } = {}) {
   }
 }
 
-async function main(argv) {
+export async function runInfraBlocked(argv, { admission, readContext } = {}) {
   const { flags, pos } = parseArgv(argv);
   const sub = pos[0] || 'list';
   const path = resolveInfraStorePath();
@@ -888,7 +869,7 @@ async function main(argv) {
       // action === 'retry' → attempt a resume-open (never a local merge). The resume itself is UNLOCKED (it can
       // block for minutes on pr-land's green-wait); only the short store mutation after it takes the lock.
       retried.push(entry.num);
-      const r = resumeOpen(entry, { localSlug });
+      const r = resumeOpen(entry, { localSlug, admission, readContext });
       if (r.skip) { surfaced.push({ num: entry.num, cause: refined, attempt: entry.attempt, reason: 'cross-repo' }); log(`  ⊘ #${entry.num} ${r.detail}`); continue; }
       if (r.ok) { mutateInfraStore((s) => removeInfraBlock(s, entry.num), { path }); resumed.push({ num: entry.num, pr: r.prNumber ?? null }); continue; }
       if (r.refused) {
@@ -912,7 +893,18 @@ async function main(argv) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main(process.argv.slice(2)).then((code) => process.exit(code || 0)).catch((e) => {
+  // Load driver policy only for retry CLI execution. Literal targets keep the
+  // static closure complete; the watchdog imports only infra-retry-policy.mjs.
+  const runCli = async () => {
+    const argv = process.argv.slice(2);
+    if (parseArgv(argv).pos[0] !== 'retry') return runInfraBlocked(argv);
+    const [admission, authorship] = await Promise.all([
+      import('../lib/runtime-admission.mjs'),
+      import('../operations/build-pr-authorship.mjs'),
+    ]);
+    return runInfraBlocked(argv, { admission, readContext: authorship.producerBuildContext });
+  };
+  runCli().then((code) => process.exit(code || 0)).catch((e) => {
     process.stderr.write(`infra-blocked: ${String(e?.message || e)}\n`);
     process.exit(1);
   });

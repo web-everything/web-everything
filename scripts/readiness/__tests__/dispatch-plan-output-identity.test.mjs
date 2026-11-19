@@ -1,7 +1,8 @@
 /**
  * 78c — the plan the dispatch-plan CLI emits is byte-identical (observation fields aside) to the plan the
  * sequential implementation emitted for the same fixture. The golden was captured from the code BEFORE the
- * reads were started concurrently; set UPDATE_GOLDEN=1 only for an intended decision change.
+ * reads were started concurrently, with the intended runtime-only admission trace added by #7090;
+ * set UPDATE_GOLDEN=1 only for an intended decision change.
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -47,7 +48,8 @@ describe('dispatch-plan output identity (78c)', () => {
       const out = JSON.parse(execFileSync('node', [PLAN_CLI, '--json', `--backlog-dir=${f.backlogDir}`, '--free-lanes=1,2,3',
         '--no-ground-truth', '--no-drift-check', '--no-pause-check', '--no-pr-limit-check', '--no-size-check'], {
         cwd: ROOT, timeout: 60000, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-        env: { ...process.env, CONVEYOR_QUEUE_FILE: f.queueFile },
+        env: { ...process.env, CONVEYOR_QUEUE_FILE: f.queueFile,
+          WE_BUILD_PRIORITY: '', WE_BUILD_PRIORITY_RUNTIME_FILE: join(f.root, 'absent-runtime.json') },
       }));
       if (!process.env.UPDATE_GOLDEN) expect(typeof out.timings).toBe('object'); // the new observation field
       delete out.timings;

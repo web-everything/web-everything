@@ -56,31 +56,33 @@ export function resolveBuildPriority({ platform, tool, env } = {}) {
 }
 
 /**
- * IO: standard → platform → tool → runtime → valid env. Never throws; only ENOENT omits runtime.
+ * IO: standard → platform → tool → runtime → valid env, bounded by runtime only-mode ids.
+ * Never throws; only ENOENT omits runtime. Env cannot bypass runtime validation.
  * Runtime JSON contains ids, mode (only|lift), setBy, ISO at, and finite nonnegative ttlHours.
  * Expiry warns but keeps the list; malformed/unreadable evidence holds all new candidates.
  * @param {{env?:object, read?:Function, runtimePath?:string, readRuntime?:Function, now?:Function|number}} options
  * @returns {{ids:string[], source:string, mode?:string, only?:boolean, held?:boolean, runtime?:object}}
  */
 export function readBuildPrioritySettings({ env = process.env, read = readSettings, runtimePath, readRuntime = readFileSync, now = Date.now } = {}) {
-  // A valid explicit environment override wins even over an unreadable runtime layer.
   const envPriority = buildPriorityEnv(env).priority;
-  if (envPriority === undefined || envPriority === null) {
+  { // Always validate the runtime ceiling before applying any environment override.
     try {
       const path = runtimePath ?? env.WE_BUILD_PRIORITY_RUNTIME_FILE ?? join(resolveCoordinationRoot({ env }), 'build-priority.runtime.json');
       const runtime = JSON.parse(readRuntime(path, 'utf8'));
-      const ids = normalizeBuildPriority(runtime?.ids);
+      let ids = normalizeBuildPriority(runtime?.ids);
       const at = typeof runtime?.at === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(runtime.at) ? Date.parse(runtime.at) : NaN;
       if (!ids || !['only', 'lift'].includes(runtime?.mode) || typeof runtime.setBy !== 'string'
           || !Number.isFinite(at) || typeof runtime.ttlHours !== 'number'
           || !Number.isFinite(runtime.ttlHours) || runtime.ttlHours < 0) throw new Error('invalid runtime settings');
+      const hasEnv = envPriority !== undefined && envPriority !== null;
+      if (hasEnv) ids = runtime.mode === 'only' ? envPriority.filter(id => ids.includes(id)) : envPriority;
       const ageMs = (typeof now === 'function' ? now() : now) - at;
       if (!Number.isFinite(ageMs)) throw new Error('invalid runtime clock');
       const hash = createHash('sha256').update(JSON.stringify({ ids, mode: runtime.mode })).digest('hex').slice(0, 12);
       const expired = ageMs > runtime.ttlHours * 60 * 60 * 1000;
-      return { ids, source: 'runtime', mode: runtime.mode, only: runtime.mode === 'only', runtime: {
+      return { ids, source: hasEnv ? 'env' : 'runtime', mode: runtime.mode, only: runtime.mode === 'only', runtime: {
         hash, ageMs, appliedCount: ids.length, expired, setBy: runtime.setBy,
-        line: `${expired ? 'WARNING expired ' : ''}build.priority (runtime): list=${hash} ageMs=${ageMs} applied=${ids.length}${expired ? '; list still applied; refresh runtime settings' : ''}`,
+        line: `${expired ? 'WARNING expired ' : ''}build.priority (${hasEnv ? 'runtime+env' : 'runtime'}): list=${hash} ageMs=${ageMs} applied=${ids.length}${expired ? '; list still applied; refresh runtime settings' : ''}`,
       } };
     } catch (error) {
       if (error?.code !== 'ENOENT') return { ids: [], source: 'runtime-malformed', only: true, held: true,
@@ -107,8 +109,8 @@ export function readBuildPrioritySettings({ env = process.env, read = readSettin
 export function filterIdsToRuntimeOnly(ids, settings) {
   if (settings.held) return [];
   if (!settings.only) return ids;
-  const allowed = new Set(settings.ids);
-  return ids.filter(id => allowed.has(id));
+  const allowed = new Set(settings.ids.map(normalizePriorityNum));
+  return ids.filter(id => allowed.has(normalizePriorityNum(id)));
 }
 
 /** PURE: top id eligible for an extra NEW prepare slot, or null. Never affects in-flight work.
@@ -412,7 +414,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
   return ready;
 }
 
-const normalizePriorityNum = value => String(value).replace(/^0+(?=\d)/, '');
+const normalizePriorityNum = value => String(value).replace(/^#/, '').replace(/^0+(?=\d)/, '');
 function buildPriorityAliases(item) {
   const stem = String(item.id ?? '').split('-')[0];
   return [item.num == null ? null : normalizePriorityNum(item.num), item.bornAs,
@@ -551,3 +553,26 @@ function numOr(v, fallback) { return typeof v === 'number' && !Number.isNaN(v) ?
 function clamp01(v) { return Math.max(0, Math.min(1, v)); }
 function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 function item_dateKey(it) { return String(it.dateOpened ?? ''); }
+
+/** Pure admission: only direct card identity or a validated durable hash can authorize work. */
+export function decideRuntimeAdmission(card, kind, settings = {}) {
+  if (!settings || settings.held) return { admitted: false, reason: 'runtime-malformed' };
+  if (!settings.only && settings.mode !== 'only') return { admitted: true, reason: 'runtime-unrestricted' };
+  if (!Array.isArray(settings.ids)) return { admitted: false, reason: 'runtime-malformed' };
+  const allowed = new Set(settings.ids.map(normalizePriorityNum));
+  const alias = typeof card?.bornAs === 'string' && card.bornAs.startsWith('x')
+    && BUILD_PRIORITY_ID.test(card.bornAs) ? card.bornAs : null;
+  const stem = typeof card?.id === 'string' ? card.id.split('-')[0] : '';
+  const idAlias = /^x[0-9a-z]{6,}$/.test(stem) ? stem : null;
+  const admitted = (card?.num != null && allowed.has(normalizePriorityNum(card.num)))
+    || (alias !== null && allowed.has(normalizePriorityNum(alias)))
+    || (idAlias !== null && allowed.has(idAlias));
+  return { admitted, reason: admitted ? 'runtime-listed' : 'runtime-only' };
+}
+
+/** Pre-assignment selection; plan rows recover direct identity from the candidate metadata. */
+export function filterRuntimeCandidates(rows, settings = {}, candidates = rows) {
+  if (!settings.only && settings.mode !== 'only' && !settings.held) return rows;
+  const byNum = new Map(candidates.map(r => [normalizePriorityNum(r.num), r]));
+  return rows.filter(r => decideRuntimeAdmission({ ...byNum.get(normalizePriorityNum(r.num)), ...r }, 'build', settings).admitted);
+}

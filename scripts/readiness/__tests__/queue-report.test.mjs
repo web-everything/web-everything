@@ -36,6 +36,10 @@ describe('classifyHeld — covers every dispatch-plan.mjs HELD_REASONS token', (
     expect(classifyHeld('dispatch-paused')).toBe('queued-waiting-turn');
   });
 
+  it('runtime-only is queued-waiting-turn while the operator list withholds the item', () => {
+    expect(classifyHeld('runtime-only')).toBe('queued-waiting-turn');
+  });
+
   it('every NOT_READY_REASONS token is not-ready', () => {
     for (const r of NOT_READY_REASONS) expect(classifyHeld(r)).toBe('not-ready');
   });

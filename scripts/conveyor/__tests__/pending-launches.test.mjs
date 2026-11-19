@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startDetachedLaunch, settleLaunches, listPendingLaunches } from '../pending-launches.mjs';
+import { withRuntimeAdmissionTick } from '../../lib/runtime-admission.mjs';
 
 describe('pending-launches (78b non-blocking launch)', () => {
   let root;
@@ -11,6 +12,17 @@ describe('pending-launches (78b non-blocking launch)', () => {
   const fakeSpawn = (pid) => vi.fn(() => ({ pid, unref() {} }));
   const start = (over = {}) => startDetachedLaunch({ root, num: '4131', kind: 'prepare-item', attempt: 'a1', argv: ['x.mjs'], env: {}, cwd: root, spawn: fakeSpawn(777), ...over });
   const readOutcome = (t) => ({ dispatching: t.includes('ok'), reason: t });
+
+  it('rechecks the complete group after log setup and rolls it back on refusal', async () => {
+    const spawn = fakeSpawn(777);
+    const result = await withRuntimeAdmissionTick(() => {
+      expect(readdirSync(root).sort()).toEqual(['4131-prepare-item-a1.err', '4131-prepare-item-a1.out']);
+      return { mode: 'only', ids: ['4131'] };
+    }, async () => start({ spawn, runtimeAdmission: { num: '4131', groupMembers: ['4132'] } }));
+    expect(result).toMatchObject({ outcome: 'runtime-refused', runtimeRefused: [{ num: '4132', kind: 'prepare', reason: 'runtime-only' }] });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(readdirSync(root)).toEqual([]);
+  });
 
   it('non-blocking launch: spawns detached, records the launch and returns without waiting', () => {
     const spawn = fakeSpawn(777);
