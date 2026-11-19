@@ -4863,7 +4863,8 @@ submodule-ignore settings cannot narrow the delta; auditor Git commands ignore r
 Full prompts name `git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text <base>...<head>`.
 The canonical question hash stays stable: hardened full-pass instructions live outside its text.
 Full records store the hardened review marker. The shared net-diff fingerprint helper uses
-`--no-relative --text` plus its existing diff flags and `--end-of-options`; every Git call
+`--no-relative` plus its existing diff flags and `--end-of-options` (never `--text`: the binary
+marker keeps binary replacements of mechanical files such as test-timings.json visible); every Git call
 uses `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1` and a fresh nonexistent graft path.
 Real Git tests pin subdirectory/relative-config invariance. Old fingerprints may fail to
 carry and require a fresh audit; gate consumer selection rules remain unchanged.

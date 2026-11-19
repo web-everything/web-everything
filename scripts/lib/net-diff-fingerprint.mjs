@@ -38,7 +38,7 @@ export function netDiffFingerprint(repo, base, head, { exec = execFileSync } = {
     const fork = run(['merge-base', '--end-of-options', baseSha, headSha]).split('\n')[0].trim();
     if (!/^[0-9a-f]{40,64}$/i.test(fork)) return null;
     // No external driver, no text conversion, and submodule changes stay visible: nothing may hide a change.
-    const bytes = Buffer.from(raw(['diff', '--no-relative', '--text', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options', fork, headSha]) ?? '');
+    const bytes = Buffer.from(raw(['diff', '--no-relative', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options', fork, headSha]) ?? '');
     let text;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } // valid UTF-8 matches R200's value exactly
     catch { text = `\0latin1\n${bytes.toString('latin1')}`; } // invalid bytes stay distinct (a lossy decode would merge 0xFE and 0xFF)

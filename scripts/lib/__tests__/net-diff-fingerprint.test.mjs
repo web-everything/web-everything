@@ -67,7 +67,9 @@ describe('netDiffFingerprint / carriesAcross', () => {
     expect(netDiffFingerprint(dir, 'main', S.A, { exec })).toMatch(/^[0-9a-f]{64}$/);
     expect(calls.map(a => a[3])).toEqual(['rev-parse', 'rev-parse', 'merge-base', 'diff']);
     const diff = calls.find((a) => a.includes('diff'));
-    expect(diff).toEqual(expect.arrayContaining(['--no-relative', '--text', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options']));
+    expect(diff).toEqual(expect.arrayContaining(['--no-relative', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--end-of-options']));
+    // No --text: the binary marker keeps binary replacements of mechanical files visible to the fingerprint.
+    expect(diff).not.toContain('--text');
     expect(existsSync(dirname(graft))).toBe(false);
   });
   it('diff.relative=true from a subdirectory cannot omit changes outside that directory', () => {
@@ -78,12 +80,10 @@ describe('netDiffFingerprint / carriesAcross', () => {
       expect(netDiffFingerprint(join(dir, 'scripts'), S.base, S.A)).toBe(expected);
     } finally { git('config', '--unset', 'diff.relative'); }
   });
-  it('binary attributes and an external diff driver cannot hide changed text', () => {
+  it('an external diff driver cannot hide changed text', () => {
     const expected = netDiffFingerprint(dir, S.base, S.A);
     expect(expected).toMatch(/^[0-9a-f]{64}$/);
-    writeFileSync(join(dir, '.git/info/attributes'), '*.mjs binary\n');
     try {
-      expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected);
       writeFileSync(join(dir, '.git/info/attributes'), '*.mjs diff=hidden\n');
       git('config', 'diff.hidden.command', 'false');
       expect(netDiffFingerprint(dir, S.base, S.A)).toBe(expected);
