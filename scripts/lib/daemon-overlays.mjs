@@ -261,8 +261,8 @@ export function addOverlay(root, {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
   const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
-  // Declared dependencies (refs this overlay needs applied). A registration always records the list, empty when it
-  // declares none; an entry without it (legacy) is "unknown" to the adopt-then-add omission check, never "none".
+  // Declared dependencies (refs this overlay needs applied), recorded only when the caller declares them (an explicit
+  // empty list asserts independence). An entry without it is "unknown" to the adopt-then-add omission check, never "none".
   const deps = Array.isArray(dependsOn) ? [...new Set(dependsOn.filter((b) => isSafeBranchName(b)))] : null;
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
@@ -278,7 +278,7 @@ export function addOverlay(root, {
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
-        dependsOn: deps ?? [],
+        ...(deps ? { dependsOn: deps } : {}), // undeclared stays undeclared: the omission check treats it as unknown
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };

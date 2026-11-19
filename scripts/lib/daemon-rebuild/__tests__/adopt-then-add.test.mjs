@@ -57,7 +57,7 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
 });
 
 describe('addOverlay dependsOn', () => {
-  it('stores a declared list, defaults a new registration to [], and leaves a legacy entry undeclared', async () => {
+  it('stores a declared list (explicit [] asserts independence) and leaves an undeclared entry undeclared', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
@@ -69,7 +69,9 @@ describe('addOverlay dependsOn', () => {
       addOverlay(root, { ref: 'lane/z' }, { env });
       const list = readOverlays(root, { env });
       expect(list.find((o) => o.ref === 'lane/x').dependsOn).toEqual(['lane/y']);
-      expect(list.find((o) => o.ref === 'lane/z').dependsOn).toEqual([]);
+      expect(list.find((o) => o.ref === 'lane/z')).not.toHaveProperty('dependsOn');
+      addOverlay(root, { ref: 'lane/w', dependsOn: [] }, { env });
+      expect(readOverlays(root, { env }).find((o) => o.ref === 'lane/w').dependsOn).toEqual([]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
