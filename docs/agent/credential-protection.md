@@ -4,9 +4,9 @@ An agent reading credentials can copy them into tracked files and leak them thro
 commit/push. Four layers reduce that risk:
 
 - User-level `permissions.deny` blocks Read/Edit/Write on protected paths.
-- The separate PreToolUse hook denies matching Bash and file-tool requests from
-  agents (`agent_id`, `agent_type`, `WE_CONVEYOR_WORKER=1`, or non-empty
-  `WE_DISPATCH_KIND`); operator requests ask.
+- The separate PreToolUse hook denies matching Bash and file-tool requests for
+  EVERY session, with the path and reason. It never returns "ask" (R1083 no-prompt
+  mode); the operator reads their own keys outside Claude.
 - Git hooks run gitleaks on staged content and each actual pushed range. New refs
   scan their reachable history, including older commits. Findings/scanner errors block.
 - GitHub push protection provides a server-side backstop.

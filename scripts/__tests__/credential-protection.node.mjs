@@ -384,7 +384,7 @@ test('hook denies agents and asks operator, with protected path and reason', () 
     assert.equal(output.permissionDecision, 'deny'); assert.match(output.permissionDecisionReason, /\.ssh.*SSH private/);
   }
   assert.equal(credentialHook(input, { ...options, env: { WE_CONVEYOR_WORKER: '1' } }).hookSpecificOutput.permissionDecision, 'deny');
-  assert.equal(credentialHook(input, { ...options, env: {} }).hookSpecificOutput.permissionDecision, 'ask');
+  assert.equal(credentialHook(input, { ...options, env: {} }).hookSpecificOutput.permissionDecision, 'deny');
   assert.equal(credentialHook({ ...input, tool_input: { command: 'ls ~/.ssh' } }, { ...options, env: {} }), null);
   for (const tool of ['Read', 'Edit', 'Write', 'NotebookEdit']) {
     assert.equal(credentialHook({ agent_id: 'a', tool_name: tool, tool_input: { file_path: '/home/operator/.netrc' } }, { ...options, env: {} }).hookSpecificOutput.permissionDecision, 'deny');
@@ -396,7 +396,7 @@ test('hook treats non-empty dispatch kind as an agent, including oversized CLI r
   for (const kind of ['build', '0', ' ']) {
     assert.equal(credentialHook(input, { ...options, env: { WE_DISPATCH_KIND: kind } }).hookSpecificOutput.permissionDecision, 'deny');
   }
-  assert.equal(credentialHook(input, { ...options, env: { WE_DISPATCH_KIND: '' } }).hookSpecificOutput.permissionDecision, 'ask');
+  assert.equal(credentialHook(input, { ...options, env: { WE_DISPATCH_KIND: '' } }).hookSpecificOutput.permissionDecision, 'deny');
   const home = scratch(t);
   for (const padding of ['', 'x'.repeat(1024 * 1024)]) {
     const result = spawnSync(process.execPath, ['scripts/hooks/credential-read-deny.mjs'], {
