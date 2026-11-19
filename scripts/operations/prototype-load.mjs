@@ -94,7 +94,7 @@ export function readyEvidence(records, input, ruledWeakened = [], liveFpSource =
         && (!testOnlyHistory(proof(e.sha)) || r.sha === live)
         && (moved(e.sha) ? findingsSubset(r.auditDisclosed, e.findings)
           : e.findings.length === r.auditDisclosed.length && e.findings.every((f, i) => f === r.auditDisclosed[i])));
-    return match ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: moved(match.sha) ? match.findings : r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) }, ...(moved(match.sha) ? { sameContentCarry: { from: lowerSha(match.sha), to: live, ruling: match.ruling, matched: r.auditDisclosed, commits: sameContent(lowerSha(match.sha), live).commits } } : {}) } : null;
+    return match ? { source: 'ready-record', record: r, ruledWeakened: { ruling: r.auditRuling, findings: r.auditDisclosed, ...(match.layer ? { layer: match.layer } : {}) }, ...(moved(match.sha) ? { sameContentCarry: { from: lowerSha(match.sha), to: live, ruling: match.ruling, matched: r.auditDisclosed, commits: sameContent(lowerSha(match.sha), live).commits } } : {}) } : null;
   };
   // Precedence (R503 red team rounds 1–2). The records file is append-only, so file order is time order:
   //  - per sha, only its LATEST record counts (a superseded WEAKENED or red record never blocks forever);
@@ -172,6 +172,9 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
       && Array.isArray(record.findings)
       && (gate.sameContentCarry ? findingsSubset(record.findings, gate.ruledWeakened.findings)
         : JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings))
+      // Readiness discloses the live audit exactly; a broader ruling cannot substitute other findings.
+      && (!gate.sameContentCarry || !Object.hasOwn(gate.record, 'auditDisclosed')
+        || JSON.stringify(record.findings) === JSON.stringify(gate.record.auditDisclosed))
       && covered(record.base);
   };
   // Unruled own WEAKENED stops before git; a matching ruling still needs canonical base coverage.

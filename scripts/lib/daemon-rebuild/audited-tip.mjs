@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { laneHistoryProofEnv } from '../lane-git-hardening.mjs';
 import { createSameContentProof } from '../same-content-waiver-io.mjs';
 import { checkCanonicalAuditForOpen } from '../../operations/canonical-audit-gate.mjs';
 /** unaudited-tip — fail closed to the adopted head when audit evidence is unavailable. */
@@ -10,10 +12,13 @@ import { mergeRuledWeakened, readyEvidence } from '../../operations/prototype-lo
 
 const TOOL_SETTINGS = new URL('../../settings/prototype-load.json', import.meta.url);
 
-export function makeAuditedTipGate(env = process.env, { repo = process.cwd(), exec, canonicalAudit = checkCanonicalAuditForOpen } = {}) {
+export function makeAuditedTipGate(env = process.env, { repo = process.cwd(), exec = execFileSync, canonicalAudit = checkCanonicalAuditForOpen } = {}) {
   if (resolveOverlayFollowTip(env) === 'follow') return null;
   let snapshot;
-  const sameContent = createSameContentProof({ repo, exec, env });
+  const proofExec = (file, args, options) => exec(file, args, { ...options,
+    env: laneHistoryProofEnv({ ...env, ...options?.env }),
+  });
+  const sameContent = createSameContentProof({ repo, exec: proofExec, env });
   return (ref, sha) => {
     // Snapshot lazily, once per gate, so every decision in a plan sees the same evidence.
     if (snapshot === undefined) {
@@ -37,7 +42,9 @@ export function makeAuditedTipGate(env = process.env, { repo = process.cwd(), ex
     if (typeof ref !== 'string' || typeof sha !== 'string') return false;
     const ready = readyEvidence(snapshot.records, { branch: ref, sha }, snapshot.ruledWeakened, null, { sameContent });
     if (!ready) return false;
-    return !ready.sameContentCarry || canonicalAudit({ repo, ref, sha, env, exec, fetchMain: () => {}, sameContent }).ok === true;
+    if (!ready.sameContentCarry) return true;
+    const audit = canonicalAudit({ repo, ref, sha, env, exec: proofExec, fetchMain: () => {}, sameContent });
+    return audit.ok === true && JSON.stringify(audit.record?.findings) === JSON.stringify(ready.record.auditDisclosed);
   };
 }
 

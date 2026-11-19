@@ -4961,7 +4961,8 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 Use real temporary Git histories to verify mechanical main merges, conflict resolutions and JIT backlog renames;
 only waivers may allow test-only edits. A history proof never substitutes for finding coverage or later-verdict guards.
 Green readiness and tests are per SHA: no predecessor record authorizes a successor, even with matching fingerprints. Waiver rulings alone may follow the history proof or exact net-diff fingerprints; canonical audits carry only by fingerprint. Reject deleted test paths and net-removal test diffs (including merge resolutions); require a fresh audit/review instead. Match findings as an exact-text multiset: each live finding consumes one identical ruled finding, including line/column locations and whitespace.
-Test that a shifted source line or changed endpoint port refuses waiver admission. History Git calls use `laneHistoryProofEnv`; wrapper environments must preserve its replacement, graft and commit-graph protections.
+Test that a shifted source line or changed endpoint port refuses waiver admission. History Git calls use `laneHistoryProofEnv`; proof-specific wrapper environments must preserve its replacement, graft and commit-graph protections.
+Keep generic loader and daemon runners on their ordinary environments; apply hardening only to the executor passed to carry/history proof helpers.
 The node:test cases run through a small Vitest adapter so the host heavy-admission queue remains the test entry point.
 The soak break probes behavior in a temporary repository, including a real hunk-offset fingerprint change.
 
@@ -5151,3 +5152,15 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+
+## Carry disclosure and proof wrapper regressions
+
+Merge caller environments before applying `laneHistoryProofEnv`; never spread caller values after its pins.
+The carry cases plant grafts and hostile commit-graph settings and inspect the actual subprocess options.
+A carried ready record's disclosure must equal the canonical findings in order and multiplicity, while consuming
+distinct findings from the ruling. Keep the ready `[A]`, ruling `[A,B]`, audit `[B]` refusal regression.
+Soak fix presence uses separate clean/conflicting repositories and classifier-only checks. Shipped breaks marked
+`requiresFix` fail when that probe refuses; they never downgrade to expected failures. The harness regression stubs
+broken classifiers and checks both refusal and ordinary test failure registration.
+Proof wrappers in IO factories must use the injected runner; a direct global reader defeats fixture isolation and may attempt live fallback fetches.

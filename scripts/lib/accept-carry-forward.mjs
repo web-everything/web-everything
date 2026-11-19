@@ -1,3 +1,4 @@
+import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
 import { classifyHeadMove, resolveSameDiffCarry } from './same-content-carry.mjs';
 import { netDiffFingerprint } from './net-diff-fingerprint.mjs';
 /**
@@ -449,10 +450,10 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
     // source commit before using that proof; a different recorded diff remains a settled refusal.
     if (typeof exec === 'function' && resolveSameDiffCarry({ env }).value === 'on') {
       const proofExec = (cmd, args, options) => exec(cmd, args, { ...options,
-        env: { ...env, GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
+        env: laneHistoryProofEnv({ ...env, ...options?.env }),
         timeout: 10000, maxBuffer: 8 * 1024 * 1024 });
       try {
-        if (fingerprint(repo, 'origin/main', record.sha, { exec: proofExec }) === accepted) {
+        if (fingerprint(repo, 'origin/main', record.sha, { exec: proofExec, env }) === accepted) {
           const move = classify({ repo, from: record.sha, to: head, allowTestOnly: false, exec: proofExec, env });
           if (move.carries) return { ...base, action: 'carry', commits: move.commits,
             reason: `same content from ${record.sha} to ${head}; commits ${JSON.stringify(move.commits)}` };

@@ -1,3 +1,4 @@
+import { laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
 import { createSameContentProof, recordWaiverCarry } from '../lib/same-content-waiver-io.mjs';
 /** Canonical codex-audit admission shared by every PR producer. No docs-only exemption. */
 import { execFileSync } from 'node:child_process';
@@ -30,7 +31,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   liveFingerprint: liveFingerprintOpt, sameContent: sameContentOpt, recordCarry = recordWaiverCarry, carryLogPath, warn = message => console.warn(message),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
-    env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    env: laneHistoryProofEnv(env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
   })).trim();
   const sameContent = sameContentOpt || createSameContentProof({ repo, exec, env });
   let fullSha;
@@ -82,7 +83,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       fetchMain();
       // fullSha was resolved locally above. A new lane ref need not exist on
       // origin until pr-land publishes it after admission.
-      const fp = netDiffFingerprint(repo, 'origin/main', fullSha, { exec });
+      const fp = netDiffFingerprint(repo, 'origin/main', fullSha, { exec, env });
       if (!fp) throw new Error('empty fingerprint');
       return fp;
     } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }

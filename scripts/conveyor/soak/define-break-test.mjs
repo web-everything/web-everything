@@ -16,9 +16,11 @@ export function defineBreakTest(b) {
   const present = b.fixPresent(REPO_ROOT);
   const title = present
     ? `${b.title} — stays fixed (fix ${b.fixedBy.sha})`
+    : b.requiresFix ? `${b.title} — required fix presence probe failed (fix ${b.fixedBy.sha})`
     : `[EXPECTED-FAIL: fix ${b.fixedBy.sha} (${b.fixedBy.where}) is not in this tree — ${b.card}] ${b.title}`;
   describe(`daemon soak — break ${b.id}`, () => {
-    (present ? it : it.fails)(title, async () => {
+    (present || b.requiresFix ? it : it.fails)(title, async () => {
+      if (b.requiresFix) expect(present, 'required fix presence probe failed').toBe(true);
       const report = await b.run({});
       expect(b.judge(report)).toEqual([]);
     });

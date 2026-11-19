@@ -1,3 +1,4 @@
+import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
 import { classifyHeadMove } from './same-content-carry.mjs';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +13,9 @@ import { informationalProvenance } from './carried-provenance.mjs';
 const HEX = /^[0-9a-f]{40}$/;
 
 /** IO: compare whitespace-sensitive net patches; missing objects get one fetch. Never throws. */
-export function contributionPatchId({ exec, sha, base = 'origin/main' } = {}) {
+export function contributionPatchId({ exec, sha, base = 'origin/main', env = process.env } = {}) {
+  const run = exec;
+  exec = (file, args, options) => run(file, args, { ...options, env: laneHistoryProofEnv({ ...env, ...options?.env }) });
   try {
     if (!ensureCommitReadable({ exec, sha }).ok || !ensureCommitReadable({ exec, sha: base }).ok) return null;
     const git = (args, input) => String(exec('git', args, { encoding: 'utf8', input, maxBuffer: 64 * 1024 * 1024 }));

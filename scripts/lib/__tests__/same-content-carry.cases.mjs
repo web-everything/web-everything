@@ -9,7 +9,7 @@ import { netDiffFingerprint } from '../net-diff-fingerprint.mjs';
 import { readyEvidence, canonicalAuditEvidence } from '../../operations/prototype-load.mjs';
 import { QUESTION_HASH } from '../../operations/codex-audit.mjs';
 import { decideAcceptCarryForward, isKnownMachineBody } from '../accept-carry-forward.mjs';
-import { decideRebaseVerdictCarry } from '../rebase-verdict-carry.mjs';
+import { contributionPatchId, decideRebaseVerdictCarry } from '../rebase-verdict-carry.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 
 function fixture(t, kind) { const f = sameContentRepo(kind); t.after(f.cleanup); return f; }
@@ -131,10 +131,14 @@ test('daemon waiver carry requires canonical subset admission on the correct rep
     let calls = 0;
     const gate = makeAuditedTipGate(env, { repo: f.repo, canonicalAudit(facts) {
       calls++; assert.equal(facts.repo, f.repo); assert.equal(facts.sha, f.to);
-      assert.equal(facts.sameContent(f.from, f.to).carries, true); return { ok };
+      assert.equal(facts.sameContent(f.from, f.to).carries, true); return { ok, record: { findings: ['code.js:12 issue'] } };
     } });
     assert.equal(gate(ref, f.to), ok); assert.equal(calls, 1);
   }
+  const mismatched = makeAuditedTipGate(env, { repo: f.repo, canonicalAudit() {
+    return { ok: true, record: { findings: ['other issue'] } };
+  } });
+  assert.equal(mismatched(ref, f.to), false);
 });
 test('test allowance never hides mixed-path renames, non-test deletions or submodules', t => {
   for (const change of ['rename', 'delete', 'submodule']) {
@@ -311,7 +315,7 @@ for (const kind of ['test', 'conflict-test']) test(`${kind}: old WEAKENED tests 
   assert.equal(calls, 0);
   f.write('ready.jsonl', JSON.stringify(live));
   for (const ok of [false, true]) {
-    assert.equal(makeAuditedTipGate(env, { repo: f.repo, canonicalAudit() { return { ok }; } })(ref, f.to), ok);
+    assert.equal(makeAuditedTipGate(env, { repo: f.repo, canonicalAudit() { return { ok, record: { findings: entry.findings } }; } })(ref, f.to), ok);
   }
 });
 
@@ -439,4 +443,71 @@ for (const kind of ['clean', 'jit']) test(`${kind}: predecessor green never supp
         'c'.repeat(64), { sameContent, ruledWeakened: gate }).ok, false);
     }
   }
+});
+
+
+test('carried ready [A] and ruling [A,B] refuse canonical [B], reordered or duplicated disclosure', t => {
+  const f = fixture(t, 'clean');
+  const w = waiver(f, { findings: ['A'], ruledFindings: ['A', 'B'] });
+  assert.ok(w.gate);
+  assert.deepEqual(w.gate.ruledWeakened.findings, ['A']);
+  for (const findings of [['B'], ['A', 'B'], ['A', 'A'], []]) {
+    assert.equal(canonicalAuditEvidence([{ ...w.audit, findings }], f.to, () => true, null,
+      { ruledWeakened: w.gate }).ok, false);
+  }
+  const both = waiver(f, { findings: ['A', 'B'], ruledFindings: ['A', 'B'] });
+  assert.equal(both.result.ok, true);
+  assert.equal(canonicalAuditEvidence([{ ...both.audit, findings: ['B', 'A'] }], f.to, () => true, null,
+    { ruledWeakened: both.gate }).ok, false);
+  assert.equal(waiver(f, { findings: ['A', 'A'], ruledFindings: ['A', 'B'] }).gate, null);
+});
+
+function assertProofEnv(options) {
+  assert.equal(options.env.GIT_GRAFT_FILE, '/dev/null');
+  assert.equal(options.env.GIT_NO_REPLACE_OBJECTS, '1');
+  assert.equal(options.env.GIT_NO_LAZY_FETCH, '1');
+  assert.equal(options.env.GIT_TERMINAL_PROMPT, '0');
+  const pins = Array.from({ length: Number(options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+    [options.env[`GIT_CONFIG_KEY_${i}`], options.env[`GIT_CONFIG_VALUE_${i}`]]);
+  assert.deepEqual(pins.filter(([key]) => key === 'core.commitGraph').at(-1), ['core.commitGraph', 'false']);
+}
+const hostileHistoryEnv = f => ({ ...f.env, GIT_GRAFT_FILE: join(f.repo, '.git/info/grafts'),
+  GIT_NO_REPLACE_OBJECTS: '0', GIT_NO_LAZY_FETCH: '0', GIT_TERMINAL_PROMPT: '1',
+  GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.commitGraph', GIT_CONFIG_VALUE_0: 'true' });
+
+test('accept proof preserves caller options but refuses a fingerprint forged with grafts', t => {
+  const f = fixture(t, 'clean');
+  const genuine = netDiffFingerprint(f.repo, 'origin/main', f.from);
+  const main = f.git('rev-parse', 'origin/main');
+  f.write('.git/info/grafts', `${f.from} ${main}\n`);
+  // Deliberately read the hostile history without the production helper to construct the forged fingerprint.
+  const forged = normalizeDiffFingerprint(f.git('diff', main, f.from));
+  assert.notEqual(forged, genuine);
+  const calls = [];
+  let classifications = 0;
+  const result = decideAcceptCarryForward({ ...f, env: hostileHistoryEnv(f), setting: 'on',
+    record: { sha: f.from, diff: forged }, headSha: f.to, headDiff: 'b'.repeat(64),
+    exec(file, args, options) { calls.push(options); return realExec(file, args, options); },
+    classify() { classifications++; return { carries: true, commits: [] }; } });
+  assert.equal(result.action, 'review-owed');
+  assert.equal(classifications, 0);
+  assert.ok(calls.length);
+  calls.forEach(assertProofEnv);
+  const accepted = decideAcceptCarryForward({ ...f, env: hostileHistoryEnv(f), setting: 'on',
+    record: { sha: f.from, diff: genuine }, headSha: f.to, headDiff: 'b'.repeat(64),
+    exec(file, args, options) { calls.push(options); return realExec(file, args, options); } });
+  assert.equal(accepted.action, 'carry');
+  calls.forEach(assertProofEnv);
+});
+
+import { normalizeDiffFingerprint } from '../review-escalation.mjs';
+test('adjacent proof runners override hostile caller history settings', t => {
+  const f = fixture(t, 'clean'), env = hostileHistoryEnv(f), calls = [];
+  const real = (file, args, options) => { calls.push(options); return realExec(file, args, { ...options, cwd: f.repo }); };
+  assert.ok(netDiffFingerprint(f.repo, 'origin/main', f.from, { exec: real, env }));
+  assert.ok(contributionPatchId({ exec: real, sha: f.from, env }));
+  const io = createReviewJobIo({ env, log() {}, exec: real });
+  assert.ok(io.contributionPatchId({ sha: f.from, repo: 'web-everything/web-everything' }));
+  assert.ok(calls.length);
+  calls.forEach(assertProofEnv);
 });

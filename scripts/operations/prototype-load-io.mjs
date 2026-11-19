@@ -1,3 +1,4 @@
+import { laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
 import { createSameContentProof, recordWaiverCarry } from '../lib/same-content-waiver-io.mjs';
 /**
  * @file Injected prototype admission transaction.
@@ -240,6 +241,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   carryLogPath, recordCarry = recordWaiverCarry,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
+  // Carry proofs keep their history protections without changing ordinary loader IO.
+  const proofExec = (file, args, options) => exec(file, args, { ...options,
+    env: laneHistoryProofEnv({ ...env, ...options?.env }),
+  });
   const expand = (p) => p.startsWith('~/') ? join(env.HOME, p.slice(2)) : p;
   const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { if (e.code === 'ENOENT') return ''; throw e; } };
   const tool = settings || JSON.parse(read(join(repo, 'scripts/settings/prototype-load.json')));
@@ -341,7 +346,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // tracking refspec also works in single-branch clones. This is read-only
         // remote access, never registration, retirement or publication.
         requireGit('fetch', 'origin', `+refs/heads/${input.branch}:refs/remotes/origin/${input.branch}`);
-        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(gitRepo, b, h, { exec })))('origin/main', input.sha) || null;
+        liveFpMemo = (fingerprint || ((b, h) => netDiffFingerprint(gitRepo, b, h, { exec: proofExec, env })))('origin/main', input.sha) || null;
       } catch { liveFpMemo = null; }
       return liveFpMemo;
     };
@@ -492,7 +497,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       const readyRecords = jsonLines(read(expand(config.readyRecordPath)));
       let readyFp = null;
-      const sameContent = createSameContentProof({ repo: gitRepo, exec, env });
+      const sameContent = createSameContentProof({ repo: gitRepo, exec: proofExec, env });
       out.gate = readyEvidence(readyRecords, input, config.ruledWeakened,
         () => (readyFp = liveFingerprint([...readyRecords, ...(Array.isArray(config.ruledWeakened) ? config.ruledWeakened : [])])), { sameContent });
       // Only evidence about THIS head's code can refuse here (its sha, or the same net diff). A record left by an

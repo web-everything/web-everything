@@ -453,7 +453,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         lanePath: input.carry.lanePath,
         skipPolicy: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
         proveMove: move => proveCardOnlyHeadMove({ ...move,
-          exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv(env) }) }),
+          exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv({ ...env, ...options?.env }) }) }),
         applyLabel: ({ repo, pr }) => {
           provider.ensureLabel(repo, 'red-team:clear', RED_TEAM_STATUS_LABEL_META['red-team:clear']);
           provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
@@ -567,7 +567,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
     proveCardOnlyHeadMove: ({ lanePath, ...move } = {}) => (typeof lanePath === 'string' && lanePath
       ? proveCardOnlyHeadMove({ ...move, cwd: lanePath,
-        exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv(env) }) })
+        exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv({ ...env, ...options?.env }) }) })
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
@@ -584,9 +584,9 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { headSha: view.headRefOid, comments };
     },
     sameContentMove: ({ from, to, repo }) => classifyHeadMove({ from, to, repo: planReviewDispatch({ pr: 1, repo }).laneRepo,
-      env, exec: (f, a, o) => exec(f, a, { ...o, env: { ...env, ...o.env } }) }),
+      env, exec: (f, a, o) => exec(f, a, { ...o, env: laneHistoryProofEnv({ ...env, ...o.env }) }) }),
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
-      exec: (f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }) }),
+      exec: (f, a, o) => exec(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env: laneHistoryProofEnv({ ...env, ...o.env }) }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
       const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
         '--to=restamp', '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`],

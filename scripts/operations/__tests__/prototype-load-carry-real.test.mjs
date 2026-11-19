@@ -34,7 +34,7 @@ describe('prototype-load real R503 candidate fetch', () => {
           at: '2026-11-09T12:00:00Z', verdict: 'NOT WEAKENED', findings: [] }) + '\n');
         const calls = [];
         const exec = (command, args, options) => {
-          calls.push({ command, args });
+          calls.push({ command, args, options });
           if (command === 'node' && args[1] === 'list') return JSON.stringify({ list: [] });
           if (command === 'node' && args[1] === 'add' && args.includes('--check'))
             return JSON.stringify({ check: { ok: true, clean: true, candSha: sha }, wouldRegister: true });
@@ -45,7 +45,9 @@ describe('prototype-load real R503 candidate fetch', () => {
           return execFileSync(command, boundArgs, { ...options, cwd: clone });
         };
         const load = createPrototypeLoader({ ...defaultDeps(), exec,
-          env: { HOME: tmp, TMPDIR: tmp, WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays') },
+          env: { HOME: tmp, TMPDIR: tmp, WE_DAEMON_OVERLAY_DIR: join(tmp, 'overlays'),
+            GIT_GRAFT_FILE: join(tmp, 'forged-grafts'), GIT_NO_REPLACE_OBJECTS: '0',
+            GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.commitGraph', GIT_CONFIG_VALUE_0: 'true' },
           testCheck: async () => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 }),
           settings: { daemons: { control: { clone } }, workspaceRoot: tmp, loaderCli: 'scripts/daemon-overlay.mjs',
             readyRecordPath, auditRecordPath, recordPath, adoption: { timeoutMs: 30, pollMs: 10 } },
@@ -57,6 +59,20 @@ describe('prototype-load real R503 candidate fetch', () => {
         expect(git(['rev-parse', `refs/remotes/origin/${branch}`]).trim()).toBe(sha);
         const fetch = calls.findIndex(({ args }) => args[0] === 'fetch' && args.includes(`+refs/heads/${branch}:refs/remotes/origin/${branch}`));
         const fingerprintRead = calls.findIndex(({ args }) => args.includes('--end-of-options'));
+        // Inspect the actual producer calls, outside any fail-closed production catch.
+        const proofCalls = calls.filter(({ command, args }) => command === 'git' && args[0] === '-C');
+        expect(proofCalls.length).toBeGreaterThan(0);
+        for (const call of proofCalls) {
+          expect(call.options.env.GIT_GRAFT_FILE).toBe('/dev/null');
+          expect(call.options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+          const pins = Array.from({ length: Number(call.options.env.GIT_CONFIG_COUNT) }, (_, i) =>
+            [call.options.env[`GIT_CONFIG_KEY_${i}`], call.options.env[`GIT_CONFIG_VALUE_${i}`]]);
+          expect(pins.filter(([key]) => key === 'core.commitGraph').at(-1)).toEqual(['core.commitGraph', 'false']);
+        }
+        const fetchEnv = calls[fetch]?.options.env;
+        expect(fetchEnv?.GIT_GRAFT_FILE).toBeUndefined();
+        expect(fetchEnv?.GIT_NO_REPLACE_OBJECTS).toBeUndefined();
+        expect(fetchEnv?.GIT_CONFIG_COUNT).toBeUndefined();
         expect(fetch).toBeGreaterThanOrEqual(0);
         expect(fingerprintRead).toBeGreaterThan(fetch);
         expect(calls.some(({ args }) => ['push', 'commit-tree'].includes(args[0]))).toBe(false);
