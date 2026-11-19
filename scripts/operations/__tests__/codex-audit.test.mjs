@@ -603,7 +603,7 @@ describe('R1053 prove mode', () => {
   const reply = (cls = 'B2', status = 'REPRODUCES', relation = 'SAME') => `#1 ${status} ${relation} CLASS=${cls} BASE=x.mjs:2\nQUOTE: return unsafeValue;`;
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
-    Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true }),
+    Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false }),
       preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
       reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
@@ -688,10 +688,11 @@ describe('R1053 prove mode', () => {
       expect(f.deps.readCard).toHaveBeenCalledWith('backlog/debt.md');
     }
   });
-  it('confirmed held card satisfies requireOnMain for D2', async () => {
+  it('requireOnMain refuses D2 without a main card despite held-card confirmation', async () => {
     const f = proof(reply('D2'));
-    expect(await main(ARGS, f.deps)).toBe(0);
-    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+    f.deps.auditPolicy = () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true });
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.deps.fileCard).not.toHaveBeenCalled();
   });
   it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s clears only with expedite and needs-you confirmed', async cls => {
     for (const confirmed of [true, false]) {

@@ -10,6 +10,7 @@ import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 import { cardHash } from './audit-base-repro.mjs';
 import { findingKey } from '../lib/audit-finding-key.mjs';
+import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { FINDING_CLASSES } from './audit-verdict.mjs';
 
 function validPreExisting(f) {
@@ -57,7 +58,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     message: 'cannot resolve the PR source to a full 40-hex sha; resolve it with git rev-parse, then run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' };
   const refuse = (reason, detail) => ({ ok: false, reason, record: null, sha: fullSha,
     message: `${detail}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${fullSha}, then retry opening the PR.` });
-  let records, config;
+  let records, config, policy;
   try {
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
     // these scripts, never <repo>/scripts/settings — a sibling-repo target has none (#7011).
@@ -80,6 +81,8 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     if (!records.every(wellFormedAudit)) {
       return refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
     }
+    policy = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, log: warn });
+    for (const name of ['releaseStage', 'preExistingMode']) warn(`audit.${name}=${policy.value[name]} source=${policy.sources[name]}`);
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
@@ -124,6 +127,11 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     // R994: a fingerprint/veto lookup failure refuses; never fall back to an older exact-head pass.
     if (e?.fingerprintLookup) return refuse('canonical-audit-missing', `cannot verify newer WEAKENED audits for ${fullSha}: ${e.message}`);
     evidence = { ok: false, reason: 'no-record' };
+  }
+  // Apply current policy to the selected evidence, so a fresh clean audit can supersede an exemption.
+  if (evidence.ok && evidence.record?.preExisting?.length
+    && (policy.value.releaseStage === 'prod' || policy.value.preExistingMode === 'block')) {
+    return refuse('canonical-audit-missing', 'saved pre-existing exemption is forbidden by current audit policy');
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
   if (evidence.ok && evidence.record?.head === fullSha) return { ok: true, reason: null, message: '', record: evidence.record, sha: fullSha };

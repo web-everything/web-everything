@@ -13,7 +13,7 @@ const diff = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.m
 const stat = '1\t1\tlib/x.mjs\n';
 const receipt = () => ({ written: true, expedite: true, needsYou: true });
 const options = over => ({ findings: [finding], answers: parseReproAnswer(answer(), 1), baseSha: 'base-sha', headSha: 'head-sha',
-  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+  readBaseFile: () => source, changedLines: parseDiffChangedLines(diff, stat), recheckMax: 6, protectedPaths: [], auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false },
   cardWritten: receipt, ...over });
 const classify = over => classifyPreExisting(options(over));
 
@@ -86,9 +86,13 @@ describe('pre-existing classification', () => {
     expect(classify({ ...opts, auditPolicy: { ...opts.auditPolicy, releaseStage: 'prod' },
       readCard: () => 'mustPayBefore: prod' })[0].blocking).toBe(true);
   });
-  it('a held card satisfies requireOnMain without a main card', () => {
+  it('requireOnMain blocks a held card without a persisted main card', () => {
     expect(classify({ auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
-      answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true })[0].blocking).toBe(false);
+      answers: parseReproAnswer(answer('D2'), 1), cardWritten: () => true })[0])
+      .toMatchObject({ blocking: true, reason: expect.stringContaining('human review required') });
+    expect(classify({ findings: [{ ...finding, card: 'backlog/debt.md' }],
+      auditPolicy: { releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true },
+      readCard: () => '# Persisted main card' })[0].blocking).toBe(false);
   });
   it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('%s requires confirmed expedite and needs-you', cls => {
     const opts = { answers: parseReproAnswer(answer(cls), 1) };
@@ -103,6 +107,23 @@ describe('pre-existing classification', () => {
     expect(symbolRangeAt(source, 7)).toBe(null);
     const answers = parseReproAnswer(answer().replace(':2', ':3'), 1);
     expect(classify({ answers, readBaseFile: () => `\n${source}` })[0].blocking).toBe(false);
+  });
+  it.each(['changed', 'removed', 'unknown'])('nested B2 retains human review for an %s enclosing auth guard', kind => {
+    const base = ['function outer(req) {', '  requireAuth(req);', '  const route = req.route;', '  function inner() {',
+      '    return unsafe();', '  }', '  return inner();', '}'].join('\n');
+    const sourceText = kind === 'removed' ? base.replace('  requireAuth(req);\n', '')
+      : kind === 'unknown' ? base.replace('outer(req)', 'outer(req): Response').replace('requireAuth', 'skipAuth')
+      : base.replace('requireAuth', 'skipAuth');
+    const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
+    const changedLines = parseDiffChangedLines(hdr + (kind === 'removed'
+      ? '@@ -2 +1,0 @@\n-  requireAuth(req);\n'
+      : '@@ -2 +2 @@\n-  requireAuth(req);\n+  skipAuth(req);\n'), `${kind === 'removed' ? 0 : 1}\t1\tlib/x.mjs\n`);
+    const opts = { findings: [{ text: `lib/x.mjs:${kind === 'removed' ? 4 : 5} missing guard`, sourceText }],
+      answers: parseReproAnswer(answer().replace(':2', ':5'), 1), readBaseFile: () => base, changedLines };
+    expect(classify(opts)[0]).toMatchObject({ blocking: true, reason: expect.stringContaining(
+      kind === 'unknown' ? 'unknown symbol extent' : 'symbol touched by the diff') });
+    expect(classify({ ...opts, findings: [{ text: 'lib/x.mjs:5 missing guard', sourceText: base }],
+      changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
   });
   it.each([
     ['regexp', 'const end = /}/;'],

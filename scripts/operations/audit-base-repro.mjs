@@ -1,6 +1,7 @@
 /** @file Pure base-reproduction protocol and fail-closed classification; no worktrees, cards or callers wired. */
 import { createHash } from 'node:crypto';
 import vm from 'node:vm';
+import { parse } from 'acorn';
 import { FINDING_CLASSES, matchesSome, debtCardVerified, productionFindingBlocks } from './audit-verdict.mjs';
 import { GUARD_FLOOR, AUDITOR_FLOOR, REVIEW_AUTH_FLOOR, LOCK_PRIMITIVES, LOCK_HOLDERS, LOCK_USERS } from '../lib/audit-settings.mjs';
 import { findingKey, parseFindingLocation, symbolAt, symbolRangeAt } from '../lib/audit-finding-key.mjs';
@@ -24,6 +25,28 @@ function verifiedRange(source, range) {
     try { new vm.Script(form); return range; } catch { /* Try method shorthand / expression context. */ }
   }
   return null;
+}
+
+/** Find the widest function containing the scanned symbol. Unknown syntax supplies no extent. */
+function enclosingRange(source, range) {
+  if (!range) return null;
+  try {
+    const tree = parse(source, { ecmaVersion: 2020, sourceType: 'module', locations: true });
+    let widest = range;
+    const visit = node => {
+      if (!node || typeof node !== 'object') return;
+      if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type)
+        && node.loc.start.line <= widest.start && node.loc.end.line >= widest.end) {
+        widest = { start: node.loc.start.line, end: node.loc.end.line };
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach(visit);
+        else if (value?.type) visit(value);
+      }
+    };
+    visit(tree);
+    return widest;
+  } catch { return null; }
 }
 
 /** Finding paths belong to WE; preserve explicit loci, URLs and npm scopes. */
@@ -95,11 +118,10 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       if (!PREEXISTING_ELIGIBLE.includes(a.class) || (finding?.class && finding.class !== a.class)) return block('ineligible or conflicting class');
       if (productionFindingBlocks(a.class, auditPolicy.releaseStage)) return block('production finding');
       // Pay-by authority is the persisted card, just as in computeVerdict. The model may name a card but cannot set its date.
-      // D5: the held card is checked below; requireOnMain does not add a second existence check here.
       const body = typeof finding?.card === 'string' && /^backlog\/[A-Za-z0-9._-]+\.md(?![\s\S])/.test(finding.card)
         ? readCard(finding.card) : null;
       if (!debtCardVerified(body, auditPolicy.releaseStage, { requirePayBy: auditPolicy.requirePayBy,
-        requireOnMain: false, now })) return block('debt pay-by policy');
+        requireOnMain: auditPolicy.requireOnMain, now })) return block('debt pay-by policy');
       const text = findingText(finding), location = parseFindingLocation(text);
       if (!location || (finding?.file && finding.file !== location.file) || (finding?.line && finding.line !== location.line)) return block('invalid head location');
       if (isProtectedPath(location.file) !== false) return block('protected path');
@@ -122,12 +144,13 @@ export function classifyPreExisting({ findings, answers, baseSha, headSha, readB
       const headRange = verifiedRange(finding?.sourceText, symbolRangeAt(finding?.sourceText, location.line));
       // This approximate scanner also returns null for unsupported function syntax. Without a
       // known extent, only an unchanged file can prove that a distant guard was not edited.
-      const [hs, he] = headRange ? [headRange.start - 1, headRange.end] : [0, Infinity];
-      const [bs, be] = range ? [range.start, range.end] : [1, Infinity];
+      const headExtent = enclosingRange(finding?.sourceText, headRange), baseExtent = enclosingRange(source, range);
+      const [hs, he] = headExtent ? [headExtent.start - 1, headExtent.end] : [0, Infinity];
+      const [bs, be] = baseExtent ? [baseExtent.start, baseExtent.end] : [1, Infinity];
       const inside = (set, lo, hi) => [...(set ?? [])].some(n => n >= lo && n <= hi);
       if (changedLines.removed?.get(base.path)?.has(base.line) || inside(changedLines.removed?.get(base.path), bs, be)
         || inside(changedLines.deletedAt?.get(location.file), hs, he) || inside(changed, hs, he)) {
-        return block(headRange && range ? 'head or base symbol touched by the diff' : 'unknown symbol extent in a changed file');
+        return block(headExtent && baseExtent ? 'head or base symbol touched by the diff' : 'unknown symbol extent in a changed file');
       }
       const key = findingKey({ file: location.file, symbol, class: a.class });
       const security = a.class.startsWith('B'), receipt = cardWritten(key);
