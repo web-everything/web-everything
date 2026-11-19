@@ -5,34 +5,15 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { listRunIds, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
-import { isRunAbandoned, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
+import { hasRejectingReviewVerdict, isRunAbandoned, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
 import { reviewJobsDir, readJobRecord } from '../operations/review-job-store.mjs';
 import { parseJobHandle } from '../operations/job-record.mjs';
 import { pidIdentity } from './pid-alive.mjs';
-import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { boundedText } from './host-overload-settings.mjs';
+import { resolveReviewRunReaperSettings, stuckReviewThreshold } from './review-run-reaper-settings.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const HOUR = 3600000;
 const active = e => e.status === 'pending' || e.status === 'in-flight';
-
-function settings({ env, log, tool, thresholdMs }) {
-  const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
-  if (p.errors.length) throw Error(p.errors.join('; '));
-  if (tool === undefined) {
-    try { tool = JSON.parse(boundedText(join(ROOT, 'scripts/settings/review-run-reaper.json'))).reviewRunReaper; }
-    catch (e) { if (e.code !== 'ENOENT') throw e; }
-  }
-  const r = resolveCascade({ standard: { abandonAfterHours: 6 }, platform: p.prefs.reviewRunReaper, tool,
-    envValues: { abandonAfterHours: env.WE_REAP_DEAD_REVIEW_RUNS_AFTER_HOURS === undefined ? undefined : Number(env.WE_REAP_DEAD_REVIEW_RUNS_AFTER_HOURS) },
-    valid: { abandonAfterHours: v => typeof v === 'number' && Number.isFinite(v) && v > 0 } });
-  log(formatCascadeSourcesLine('reviewRunReaper', r));
-  if (thresholdMs !== undefined && (!Number.isFinite(thresholdMs) || thresholdMs <= 0)) throw Error('thresholdMs must be positive and finite');
-  const ms = thresholdMs ?? r.value.abandonAfterHours * HOUR;
-  const source = thresholdMs === undefined ? r.sources.abandonAfterHours : 'argument';
-  log(`reviewRunReaper: threshold=${ms / HOUR}h (${source})`);
-  return { thresholdMs: ms, thresholdSource: source };
-}
 
 // Do not use listReviewJobAgents: it suppresses read errors AND deletes dead jobs.
 function readReviewJobs(env) {
@@ -78,25 +59,32 @@ function writerHeld(id, dir, identity) {
  * Unavailable evidence is retried on a later sweep after the operator restores the failing probe/store.
  */
 export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUNS_DIR?.trim() ? resolve(env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir(env)), now = Date.now(), apply = false,
-  log = console.error, thresholdMs, probes = {}, store = {}, tool } = {}) {
-  const result = { ...settings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {} };
+  log = console.error, thresholdMs, onlyIds, probes = {}, store = {}, tool } = {}) {
+  const result = { ...resolveReviewRunReaperSettings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {} };
   const io = { listRunIds, tryReadRun, runPath, isRunRecordTerminal, markRunAbandoned, stat: statSync, ...store };
   const keep = (reason, id) => { (result.kept[reason] ??= []).push(id); };
+  const selected = onlyIds === undefined ? null : new Set(onlyIds);
   const candidates = [];
   for (const id of io.listRunIds(dir)) {
-    // The current shared ID grammar admits dots; ignore our metadata even before it is tightened.
-    if (id.endsWith('.abandoned')) continue;
+    if (selected && !selected.has(id)) continue;
     let record, stat;
     try { record = io.tryReadRun(id, dir); if (!record) throw Error('missing run'); }
     catch { result.scanned++; keep('unreadable', id); continue; }
     if (record.op !== 'review-pr') continue;
     result.scanned++;
+    if (hasRejectingReviewVerdict(record)) {
+      log('reap-dead-review-runs: retaining possibly rejecting review evidence; inspect the full verdict/effect payload before retrying abandonment');
+      keep('rejecting-verdict', id); continue;
+    }
     if (io.isRunRecordTerminal(record)) { keep('terminal', id); continue; }
     if (isRunAbandoned(id, dir)) { keep('abandoned', id); continue; }
+    if (!Array.isArray(record.effects) || record.effects.some(e => !e || typeof e.type !== 'string' || typeof e.status !== 'string')) {
+      keep('unreadable', id); continue;
+    }
     if (record.resumeOf != null || record.resumedAt != null) { keep('resumed-run', id); continue; }
     if (!identityOf(record.input ?? {})) { keep('identity-unreadable', id); continue; }
     const pending = record.pending;
-    if (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of'))) {
+    if (pending && (pending.kind === 'confirm' || Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of'))) {
       keep('suspended-awaiting-answer', id); continue;
     }
     if (pending?.step === 'mandatoryReferrals' || record.effects.some(e => active(e) && e.step === 'mandatoryReferrals')) {
@@ -105,8 +93,16 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     try { stat = io.stat(io.runPath(id, dir)); if (!Number.isFinite(stat.mtimeMs)) throw Error('invalid mtime'); }
     catch { keep('unreadable', id); continue; }
     const ageMs = now - stat.mtimeMs;
-    if (ageMs < result.thresholdMs) { keep('young', id); continue; }
-    candidates.push({ id, record, snapshot: JSON.stringify(record), stat, ageMs });
+    const stuck = pending != null || record.effects.some(active);
+    // A confirm/referral/resumed cursor above still belongs to its existing continuation, even when old.
+    const useStuckThreshold = stuck && thresholdMs === undefined;
+    const deadline = stuckReviewThreshold(record, result);
+    const threshold = useStuckThreshold ? deadline.ms : result.thresholdMs;
+    const thresholdSource = useStuckThreshold ? deadline.source : result.thresholdSource;
+    if (ageMs < threshold) { keep('young', id); continue; }
+    const stuckEffect = stuck ? { pending: pending ?? null,
+      effects: record.effects.map(({ step, type, status, unknownAttempts }) => ({ step, type, status, unknownAttempts })) } : null;
+    candidates.push({ id, record, snapshot: JSON.stringify(record), stat, ageMs, threshold, thresholdSource, stuckEffect });
   }
   if (!candidates.length) return result;
 
@@ -153,6 +149,10 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     if (!Array.isArray(jobs) || jobs.some(j => !j || typeof j !== 'object' || !identityOf(j))) throw Error('unreadable review-job list or review-job pr/repo identity');
     for (const { id, record } of candidates) {
       if (writerHeld(id, dir, identity)) { decisions.set(id, 'live-writer'); continue; }
+      const pid = record.job?.pid;
+      if (pid != null && (!Number.isInteger(pid) || pid <= 0 || identity(pid)?.alive !== false)) {
+        decisions.set(id, 'live-pid'); continue;
+      }
       const matching = jobs.filter(j => identityOf(j) === identityOf(record.input));
       if (matching.some(j => !Number.isInteger(j.pid) || j.pid <= 0 || identity(j.pid)?.alive !== false)) {
         decisions.set(id, 'live-review-job'); continue;
@@ -199,10 +199,13 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     if (changed) { keep('changed-during-sweep', c.id); continue; }
     if (apply !== true) { result.wouldReap.push(c.id); continue; }
     const marked = io.markRunAbandoned({ id: c.id, dir, now, by: 'reap-dead-review-runs',
-      reason: `dead: no live pid/handle/lease/session; unchanged for >= ${result.thresholdMs / HOUR}h`,
+      reason: c.stuckEffect
+        ? `stuck pending/unknown effect or step: pending step ${JSON.stringify(c.record.pending?.step ?? null)}; effects ${JSON.stringify(c.stuckEffect.effects)}; abandoned, effect NOT claimed applied`
+        : `dead: no live pid/handle/lease/session; unchanged for >= ${c.threshold / HOUR}h`,
       // Creation excludes other tombstones, not run writers. Bind to the original version so a writer
       // landing after the final check still wins, even if its mtime precedes sidecar creation.
-      probes: { recordVersion: version(c.stat), ageMs: c.ageMs, thresholdMs: result.thresholdMs, thresholdSource: result.thresholdSource,
+      probes: { recordVersion: version(c.stat), ageMs: c.ageMs, thresholdMs: c.threshold, thresholdSource: c.thresholdSource,
+        ...(c.stuckEffect ? { stuckEffect: c.stuckEffect } : {}),
         reviewJobs: 'dead', handles: 'dead', writers: 'dead', leases: 'absent', sessions: 'absent' } });
     if (marked.written) result.reaped.push(c.id);
     else if (marked.staleUnreplaceable) { // stale sidecar could not be replaced: retry next sweep, keep sweeping others

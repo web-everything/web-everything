@@ -23,7 +23,7 @@ import { constants, copyFileSync, linkSync, lstatSync, mkdirSync, readdirSync, r
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  isRunRecordTerminal, listRunIds, parseRunRecord, runPath, sharedRunsDir, tryReadRun,
+  filterRunFileNames, isRunRecordTerminal, isValidRunId, listRunIds, parseRunRecord, runPath, sharedRunsDir, tryReadRun,
 } from '../operations/run-store.mjs';
 
 // lstat also refuses a dangling symlink at the destination.
@@ -144,6 +144,7 @@ export function archiveClosedReviewRuns({
     for (const name of readdirSync(runsDir)) {
       const match = /^\.(review-pr-.+)\.archiving-\d+-[\da-f-]+$/.exec(name);
       if (!match) continue;
+      if (!isValidRunId(match[1])) { filterRunFileNames([name]); continue; }
       const id = match[1], path = join(runsDir, name);
       result.kept.claimed.push({ id, path });
       claimedIds.add(id);

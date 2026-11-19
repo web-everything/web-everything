@@ -84,7 +84,7 @@ export function migrateLegacyRuns(legacyDir, sharedDir) {
   const skipped = [];
   if (!legacyDir || !existsSync(legacyDir) || resolve(legacyDir) === resolve(sharedDir)) return { moved, skipped };
   let names;
-  try { names = readdirSync(legacyDir).filter((f) => f.endsWith('.json') && isValidRunId(f.slice(0, -5))); } catch { return { moved, skipped }; }
+  try { names = filterRunFileNames(readdirSync(legacyDir)); } catch { return { moved, skipped }; }
   if (!names.length) return { moved, skipped };
   try { mkdirSync(sharedDir, { recursive: true }); } catch { return { moved, skipped: names }; }
   for (const f of names) {
@@ -198,13 +198,34 @@ export function writeRun(record, dir = resolveRunsDir()) {
   return path;
 }
 
-/** Every run id currently on disk (sorted). Temp files and stray names are ignored. */
+const warnedRunNames = new Set();
+const RUN_NAME_WARNING_LIMIT = 1000;
+let runNameWarningsCapped = false;
+
+/** Shared by direct directory readers too: stray metadata must never reach runPath/readRun. */
+export function filterRunFileNames(names) {
+  return names.filter(name => {
+    if (name.endsWith('.json') && isValidRunId(name.slice(0, -5))) return true;
+    if (warnedRunNames.has(name)) return false;
+    if (warnedRunNames.size >= RUN_NAME_WARNING_LIMIT) {
+      if (!runNameWarningsCapped) {
+        runNameWarningsCapped = true;
+        console.warn('operations: invalid run filename warning limit reached; further names skipped; inspect the runs directory');
+      }
+      return false;
+    }
+    warnedRunNames.add(name);
+    const safe = name.slice(0, 160).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ');
+    console.warn(`operations: skipping invalid run filename ${JSON.stringify(safe)}; inspect the runs directory`);
+    return false;
+  });
+}
+
+/** Every run id currently on disk (sorted). Warn once per stray name, then skip it. */
 export function listRunIds(dir = resolveRunsDir()) {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.endsWith('.json'))
+  return filterRunFileNames(readdirSync(dir))
     .map((f) => f.slice(0, -'.json'.length))
-    .filter(isValidRunId)
     .sort();
 }
 

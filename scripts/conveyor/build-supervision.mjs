@@ -16,6 +16,7 @@
  * Every read is bounded: transcripts by a byte-capped tail, run records by mtime window + a file-count cap.
  * A thing that cannot be read is reported as unknown (`null`), never guessed stale.
  */
+import { filterRunFileNames } from '../operations/run-store.mjs';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { tailLines, summarizeEntry, detectBlockedOnChild } from '../../skills-src/inspect-agent-health/agent-health.mjs';
@@ -138,7 +139,7 @@ export function probeExternalRuns({
   isAlive = defaultAlive, ls = readdirSync, stat = statSync, readText = (p) => readFileSync(p, 'utf8'),
 } = {}) {
   let names;
-  try { names = ls(runsDir).filter((n) => n.startsWith('dispatch-lane-') && n.endsWith('.json')); } catch { return []; }
+  try { names = filterRunFileNames(ls(runsDir)).filter((n) => n.startsWith('dispatch-lane-') && n.endsWith('.json')); } catch { return []; }
   const recent = [];
   for (const n of names) {
     try { const m = stat(join(runsDir, n)).mtimeMs; if (nowMs - m <= recordWindowMs) recent.push({ n, m }); } catch { /* raced */ }

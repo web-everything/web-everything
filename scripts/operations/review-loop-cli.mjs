@@ -65,7 +65,7 @@ import {
   cwdFlagValue, driveRun, hasJsonFlag, outcomePayload, parseOperationArgv, renderOutcome, runOperationCli,
 } from './cli-adapter.mjs';
 import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
-import { createFileRunStore, newRunId } from './run-store.mjs';
+import { createFileRunStore, newRunId, sharedRunsDir } from './run-store.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
 import { appendEntry } from '../conveyor/learnings-drop.mjs';
@@ -407,7 +407,7 @@ export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { re
   try {
     const view = readPr({ repo, pr });
     if (!view?.headRefOid) return null;
-    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
+    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo, runsDir: env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
       ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
   } catch { return null; }
 }

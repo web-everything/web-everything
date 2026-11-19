@@ -35,7 +35,7 @@ import { enclosingSymbol, findingHeldVerdict, replayPrRounds } from '../lib/revi
 import { roundBudgetDecision, roundCardsReport } from '../lib/review-loop-policy.mjs';
 import { isValidRoundBudget, ROUND_BUDGET_MAX } from '../lib/review-settings.mjs';
 import { readFixRange } from './review-pr-io.mjs';
-import { sharedRunsDir } from './run-store.mjs';
+import { filterRunFileNames, sharedRunsDir } from './run-store.mjs';
 import { DEFAULT_REPO_KEY, ghRepoSlug } from '../lib/constellation-repos.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -86,7 +86,7 @@ export function roundFactsFromRecord(record) {
 /** Load every `review-pr` record for `repo`, grouped per PR, one round per distinct head, in time order. */
 export function loadRounds({ runsDir, repo }) {
   const byPr = new Map();
-  for (const name of readdirSync(runsDir)) {
+  for (const name of filterRunFileNames(readdirSync(runsDir))) {
     if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
     let record;
     try { record = JSON.parse(readFileSync(join(runsDir, name), 'utf8')); } catch { continue; }

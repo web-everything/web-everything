@@ -40,6 +40,18 @@ it('verified bundle removes originals, emits bytes, and daily stamp rate limits'
   expect(await exists(p)).toBe(false); expect(events[0].bytesFreed).toBe(6);
   expect((await run()).status).toBe('rate-limited');
 });
+it('run enumeration skips legacy tombstones, junk and temporary files while writer exclusion still permits the real record', async () => {
+  const { createRunsWriterExclusion } = await import('../runs-writer-exclusion.mjs');
+  const p = await file(join(runs, 'a.json'));
+  const stray = ['review-pr-x.abandoned.json', 'junk file', 'review-pr-bad!.json', 'review-pr-newline\n.json', 'other.json.123.x.tmp',
+    '.retiring-review-pr-x.abandoned.json.11111111-1111-1111-1111-111111111111',
+    '.retiring-review-pr-bad!.json.11111111-1111-1111-1111-111111111111'];
+  for (const name of stray) await file(join(runs, name));
+  const out = await run({ withSourceWriterExclusion: createRunsWriterExclusion({ isPidAlive: () => false }) });
+  expect(out.errors).toEqual([]); expect(out.filesArchived).toBe(1);
+  expect(await exists(p)).toBe(false);
+  for (const name of stray) expect(await readFile(join(runs, name), 'utf8')).toBe('record');
+});
 it('recent files and dry-run originals are untouched', async () => {
   const p = await file(join(runs, 'recent.json'), new Date(now - 60000));
   const q = await file(join(runs, 'old.json'));

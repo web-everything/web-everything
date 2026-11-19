@@ -1520,7 +1520,7 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     });
   it.each(both)('%s selects the same verdict-bearing newer run once nothing is pending (control)', (_name, reader) => {
     const f = fixture();
-    const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, pending: null, effects: [{ status: 'applied' }], ...started(15_000) }), 20_000);
+    const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, pending: null, effects: [{ type: 'review.label-swap', status: 'applied' }], ...started(15_000) }), 20_000);
     const result = reader({ ...args, now: 20_000 + 60_000 });
     expect(result.ok).not.toBe(false);
     expect((result.newest ?? result.loopPayload).stepTimings).toEqual(started(15_000).stepTimings);
@@ -1617,6 +1617,15 @@ describe('settleUnknownEvidenceByComment: result older than the unfinished revie
   const unknown = o => Object.defineProperty({ ok: false, reason: 'review-unfinished' }, 'settleBounds', { value: bounds(o), enumerable: false });
   const settle = (ev, comments, reviews = []) => settleUnknownEvidenceByComment(ev, comments, pr, head, reviews);
   const review = (state, at, login = 'chalbert') => ({ state, submittedAt: iso(at), author: { login } });
+
+  it('never settles review-abandoned with a trusted result and later operator acceptance', () => {
+    const evidence = { ok: false, reason: 'review-abandoned', settleBounds: bounds() };
+    expect(settle(evidence, [result(), accept()])).toBe(evidence);
+  });
+  it('propagates review-abandoned discovered by the complete same-head read instead of settling older evidence', () => {
+    const evidence = unknown({ completeHeadRead: () => ({ ok: false, reason: 'review-abandoned', complete: true, blocked: true }) });
+    expect(settle(evidence, [result(), accept()])).toEqual({ ok: false, reason: 'review-abandoned' });
+  });
 
   it('holds when a formal COMMENTED review was submitted after the accept (operator hold)', () => {
     expect(settle(unknown(), [result(), accept()], [review('COMMENTED', T + 20 * 60e3)])).toMatchObject({ ok: false });

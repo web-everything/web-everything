@@ -1,4 +1,6 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { hasRejectingReviewVerdict, isRunAbandoned } from './run-abandoned.mjs';
+import { readAbandonedReviewSignal } from './abandoned-review-signal.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -395,7 +397,7 @@ export function resolveReviewRedTeamOnSkip({ env = process.env, log, readFile = 
 const runsDirectory = env => env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
 const strictListRuns = dir => { statSync(dir); return listRunIds(dir); };
 function* reviewRuns({ runsDir, list, read, stat }) {
-  const ids = list(runsDir).filter(id => id.startsWith('review-pr-'));
+  const ids = list(runsDir).filter(id => id.startsWith('review-pr-') && !id.endsWith('.abandoned'));
   if (ids.length > 400) throw Error('run scan capped; inspect stored evidence');
   for (const id of ids) {
     const at = stat(join(runsDir, `${id}.json`)).mtimeMs;
@@ -415,6 +417,7 @@ function* reviewRuns({ runsDir, list, read, stat }) {
         && typeof run.verdict.verdict === 'string' && run.verdict.verdict.trim())))) {
       throw Error('review run identity or evidence unreadable');
     }
+    if (isRunAbandoned(id, runsDir) && !hasRejectingReviewVerdict(run)) continue;
     yield { id, run, at };
   }
 }
@@ -480,7 +483,8 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
-  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
+  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false,
+  readAbandonedSignal = readAbandonedReviewSignal, log = console.error }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -533,6 +537,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       return { ...row, ...decision };
     };
     const failedRead = result => {
+      if (result.reason === 'review-abandoned') {
+        return { ...skip(result.reason), ...readAbandonedSignal({ repo, pr, head, env, now, log }) };
+      }
       if (result.reason === 'review-unfinished') {
         try {
           const runs = readReviewRuns({ repo, pr, head });
@@ -843,6 +850,7 @@ export const carriedCheckPublisher = ({ repo, env = process.env, run = runGhSync
 export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log = () => {}, dryRun = false,
   env = process.env, setting,
   readEvidence = readDrainRedTeamEvidence, readStatus = readRedTeamStatus,
+  readAbandonedSignal = readAbandonedReviewSignal,
   readCarry = key => readRedTeamCarry({ ...key, env }),
   readReviewRuns = isUnderTest() || isUnderTest(env) ? () => [] : readReviewRunEvidence,
   readReviews, readCompleteReviews,
@@ -945,8 +953,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       return { ...rawPr, reviews };
     });
     const planningOptions = { repo, refusals, rawPrs: planningPrs,
-      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, env,
-      now: at, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
+      readEvidence, readStatus, readReviewRuns, readCheckFact, readSeal, readAbandonedSignal, env,
+      now: at, log: note, setting: resolved, lastDispatch: history, proveMove, readCarry, readWitness, headNeverReviewed, readCarriedCheck,
       recoveryOptions: { now: at, probe: recoveryProbe(), deadlineMs: staleRunDeadlineMs(env), env } };
     rows.push(...planRedTeamOnSkip(planningOptions));
     const escalateRow = row => {
@@ -958,11 +966,13 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         }
       } catch (error) { row.settleError = safeErrorText(error); }
     };
-    const holdUnfinishedReview = row => {
-      row.action = 'skip'; row.why = 'review-unfinished'; row.escalate = true;
-      row.escalationContext = UNFINISHED_REVIEW_CONTEXT;
+    const holdUnfinishedReview = (row, fresh) => {
+      row.action = 'skip'; row.why = fresh.why; row.escalate = fresh.escalate === true;
+      if (fresh.awaitingFreshReview) row.awaitingFreshReview = true;
+      if (row.escalate) row.escalationContext = fresh.escalationContext ?? UNFINISHED_REVIEW_CONTEXT;
+      else delete row.escalationContext;
       delete row.settle;
-      escalateRow(row);
+      if (row.escalate) escalateRow(row);
     };
     const freshSettlement = row => {
       const live = provider.readPrState(repo, row.prNumber);
@@ -989,8 +999,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
       const refusal = refusals.find(r => r.kind === 'already-reviewed-head' && Number(r.prNumber) === row.prNumber);
       const [fresh] = planRedTeamOnSkip({ ...planningOptions, refusals: refusal ? [refusal] : [],
         rawPrs: [rawPr], now: now() });
-      if (fresh?.why === 'review-unfinished' && fresh.escalate) {
-        holdUnfinishedReview(row);
+      if (fresh?.why === 'review-abandoned' || fresh?.why === 'review-unfinished' && fresh.escalate) {
+        holdUnfinishedReview(row, fresh);
         return null;
       }
       if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head) {
