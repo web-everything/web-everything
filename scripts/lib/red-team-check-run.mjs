@@ -168,7 +168,8 @@ export function evaluateRedTeamCheckFact({ repo, pr, headSha, checkRuns, appId }
     ? runs.find(run => !isPolicyClearRun(run)) ?? runs[0] : runs[0];
   if (latest.status !== 'completed') return failure('red-team check run in progress or incomplete');
   if (latest.conclusion !== 'success') return failure(`red-team check run failed (${latest.conclusion ?? 'unknown'})`);
-  return { ok: true, reason: 'red-team check run succeeded on head', completedAt: latest.completed_at ?? null };
+  return { ok: true, reason: 'red-team check run succeeded on head', completedAt: latest.completed_at ?? null,
+    liveCheck: isLiveCheckRun(latest) };
 }
 
 /** Title prefix of every run the policy-clear writer posts, so it can tell its own runs from a round's. Only runs
@@ -700,7 +701,8 @@ export function ownsPublicationHold(status, ownsHold, isTrusted = isTrustedMarke
 
 /** Verify a clear against writers that bypass the check lock, including holds buried by our success.
  * Unknown hold ids are concurrent even without readable timestamps; known holds may lack timestamps.
- * Read past that success to the pre-read second; a capped/unreadable history restores a hold for operator inspection. */
+ * Observe the posted success and every known hold's state, reading past them to the pre-read second.
+ * Missing evidence or a capped/unreadable history restores a hold for operator inspection. */
 export function confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted, knownHoldIds, gh, readGh = gh, env = process.env,
   postHold = postRedTeamPublicationHold }) {
   const freshEnv = { ...env, WE_GH_READ_MEMO_DIR: '' };
@@ -714,9 +716,17 @@ export function confirmPublicationHoldClear({ repo, pr, headSha, readAt, posted,
     const { statuses, complete } = readStatusHistory({ repo, headSha, gh: freshGh,
       context: redTeamPublicationContext(pr),
       decisive: status => Date.parse(status.created_at) < since
-        && (!Number.isSafeInteger(success?.id) || status.id < success.id) });
+        && (!Number.isSafeInteger(success?.id) || status.id < success.id)
+        && (!knownHolds || [...knownHolds].every(id => status.id <= id)) });
     if (!complete) throw Error(`statuses incomplete at the ${STATUS_PAGE_CAP}-page bound; operator must inspect publication`);
-    const concurrent = statuses.find(status => status.context === redTeamPublicationContext(pr) && status.state !== 'success'
+    const history = statuses.filter(status => status.context === redTeamPublicationContext(pr));
+    const observedSuccess = history.some(status => status.state === 'success'
+      && (Number.isSafeInteger(success?.id) ? status.id === success.id : Date.parse(status.created_at) > readAt));
+    if (!observedSuccess) throw Error('posted publication success absent from history');
+    if (knownHolds && [...knownHolds].some(id => !history.some(status => status.id === id
+      && ['success', 'failure', 'pending', 'error'].includes(status.state))))
+      throw Error('known publication hold absent or state unreadable in history');
+    const concurrent = history.find(status => status.context === redTeamPublicationContext(pr) && status.state !== 'success'
       && ((knownHolds ? !knownHolds.has(status.id) : !Number.isFinite(Date.parse(status.created_at)))
         || Date.parse(status.created_at) >= since || Date.parse(status.created_at) > Date.parse(success?.created_at)
         || (Number.isSafeInteger(success?.id) && status.id > success.id)));

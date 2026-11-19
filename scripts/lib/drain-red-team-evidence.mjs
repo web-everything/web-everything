@@ -124,6 +124,8 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
         return { ok: false, reason: 'publication marker is not a finished round for this head' };
       const fact = readCheck({ repo, pr, headSha: head });
       if (fact?.ok !== true) return { ok: false, reason: fact?.reason ?? 'red-team check not confirmed ok' };
+      if (fact.liveCheck === true) return { ok: false,
+        reason: 'live-helper success cannot prove the round writer succeeded; left to the live helper to clear' };
       const completedAt = Date.parse(fact.completedAt);
       if (markerStat && (!Number.isFinite(completedAt) || !Number.isFinite(markerStat.mtimeMs) || completedAt < markerStat.mtimeMs))
         return { ok: false, reason: 'red-team check not proven newer than finished marker; operator must inspect publication' };
@@ -166,11 +168,9 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       // A remote-only hold needs its own timestamp; a marker additionally binds the local publication attempt.
       for (const hold of [current, ...holds]) {
         const createdAt = Date.parse(hold.created_at);
-        const threshold = markerStat
-          ? Math.max(markerStat.mtimeMs, hold.created_at === undefined ? 0 : createdAt) : createdAt;
-        // Remote-only: strictly newer, since GitHub timestamps have second precision and an equal time cannot order
-        // two rounds. A marker adds the local ms-precise write time as its own binding.
-        if (!Number.isFinite(completedAt) || !Number.isFinite(threshold) || (markerStat ? completedAt < threshold : completedAt <= threshold))
+        const threshold = markerStat && hold.created_at === undefined ? 0 : createdAt;
+        // Strictly newer than the hold even with a marker: GitHub's equal-second timestamps cannot order rounds.
+        if (!Number.isFinite(completedAt) || !Number.isFinite(threshold) || completedAt <= threshold)
           return { ok: false, reason: 'red-team check not proven newer than publication hold; operator must inspect publication' };
       }
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });

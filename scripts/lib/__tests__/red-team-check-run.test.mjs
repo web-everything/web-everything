@@ -70,7 +70,7 @@ describe('red-team check run contract', () => {
     function statusGh(args, options) {
       if (args.includes('POST')) {
         statuses.unshift({ ...JSON.parse(options.input), id: statusId++, creator: { login: 'web-everything' } });
-        return '{}';
+        return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}';
       }
       if (/\/statuses\?/.test(args[1])) return JSON.stringify(statuses);
       const latest = [...new Map([...statuses].reverse().map(status => [status.context, status])).values()];
@@ -203,7 +203,7 @@ describe('red-team check run contract', () => {
               const statuses = readStatuses();
               statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
               writeFileSync(statusesPath, JSON.stringify(statuses));
-              return '{}';
+              return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}';
             }
             if (/\/statuses\?/.test(args[1])) return JSON.stringify(readStatuses());
             if (/\/status\?/.test(args[1])) {
@@ -665,13 +665,14 @@ describe('red-team check run contract', () => {
         ['a round writer\'s hold is left', { description: 'held: finished round not confirmed published', login: 'web-everything' }, true, false],
         ['an unreadable history is not ok', null, false, false],
       ])('clearLivePublicationHold: %s', (_name, newest, ok, cleared) => {
+        let posted;
         const gh = vi.fn(args => {
-          if (args.includes('POST')) return '{}';
+          if (args.includes('POST')) { posted = { id: 6, state: 'success', context: 'red-team/publication #7' }; return JSON.stringify(posted); }
           if (!newest) throw Error('HTTP 502');
           const history = [{ id: 5, state: 'failure', context: 'red-team/publication #7', description: newest.description,
             creator: { login: newest.login } }, { id: 4, state: 'failure', context: 'red-team/publication #8' }];
           if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: history.map(({ context, state }) => ({ context, state })) });
-          return JSON.stringify(history);
+          return JSON.stringify(posted ? [posted, ...history] : history);
         });
         expect(api.clearLivePublicationHold({ repo: 'o/r', pr: 7, headSha: HEAD, gh })).toMatchObject({ ok, ...(ok ? { cleared } : {}) });
         expect(gh.mock.calls.filter(([args]) => args.includes('POST'))).toHaveLength(cleared ? 1 : 0);
@@ -693,7 +694,9 @@ describe('red-team check run contract', () => {
                 created_at: kind === 'new missing timestamp' ? undefined : kind === 'new invalid timestamp' ? 'invalid'
                   : new Date(['newer-id pending', 'new old timestamp'].includes(kind) ? since - 1000 : since).toISOString(),
                 description: 'held: ' + 'x'.repeat(300) });
-              return JSON.stringify({ id: 11, created_at: new Date(since).toISOString() });
+              const success = { id: 11, context, state: 'success', created_at: new Date(since).toISOString() };
+              history.unshift(success);
+              return JSON.stringify(success);
             }
             return '{}';
           }
@@ -715,6 +718,13 @@ describe('red-team check run contract', () => {
           expect(posts.at(-1).description.length).toBeLessThanOrEqual(140);
         }
         expect(posts.map(post => post.state)).toEqual(['clean', 'known missing timestamp'].includes(kind) ? ['success'] : ['success', 'failure']);
+      });
+      it('confirmPublicationHoldClear restores a failure hold when the re-read history is empty', () => {
+        const postHold = vi.fn(() => ({ ok: true }));
+        expect(api.confirmPublicationHoldClear({ repo: 'o/r', pr: 7, headSha: HEAD, readAt: Date.now(),
+          posted: { status: { id: 11 } }, knownHoldIds: [5], gh: () => '[]', postHold }))
+          .toMatchObject({ ok: false, reason: expect.stringContaining('posted publication success absent') });
+        expect(postHold).toHaveBeenCalledWith(expect.objectContaining({ held: true }));
       });
       it.each([undefined, 'invalid'])('confirmPublicationHoldClear fails closed without known ids and timestamp %s', created_at => {
         const postHold = vi.fn(() => ({ ok: true }));
@@ -751,7 +761,11 @@ describe('red-team check run contract', () => {
           ...Array.from({ length: 120 }, (_, i) => ({ id: 38 - i, state: 'success', context: 'old' })),
         ];
         const gh = vi.fn(args => {
-          if (args.includes('POST')) return '{}';
+          if (args.includes('POST')) {
+            const status = { id: 10_001, state: 'success', context: ctx };
+            history.unshift(status);
+            return JSON.stringify(status);
+          }
           if (/\/status\?/.test(args[1])) return JSON.stringify({ total_count: 2, statuses: [{ context: 'ci/build', state: 'success' }, { context: ctx, state: 'failure' }] });
           const page = Number(/[?&]page=(\d+)/.exec(args[1])?.[1] ?? 1);
           return JSON.stringify(history.slice((page - 1) * 100, page * 100));
@@ -1021,7 +1035,7 @@ describe('red-team check run contract', () => {
         if (failHold) throw Error('HTTP 503');
         statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
         onHold(statuses);
-        return '{}';
+        return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}';
       }
       if (/\/commits\/[a-f0-9]+\/statuses\?/.test(path)) return JSON.stringify(statuses);
       if (/\/commits\/[a-f0-9]+\/status\?/.test(path)) {
@@ -1670,7 +1684,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       // The publication hold (commit statuses): newest first; the combined summary keeps the newest per context.
       if (/^repos\/o\/r\/statuses\//.test(path)) {
         statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
-        return '{}';
+        return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}';
       }
       if (/\/statuses\?/.test(path)) return JSON.stringify(statuses);
       if (/\/status\?/.test(path)) {
@@ -1743,7 +1757,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
           if (options.env?.WE_GITHUB_APP_ROLE !== 'legacy' || options.env?.GH_TOKEN) throw Error('HTTP 403: Resource not accessible by integration');
           if (String(a[1]).includes('/statuses/')) {
             statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
-            return '{}';
+            return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}';
           }
           const id = 100 + runs.length;
           runs.push({ ...JSON.parse(options.input), id, app: { id: Number(WE_APP) } });
@@ -1788,7 +1802,7 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
       const run = vi.fn((a, options = {}) => {
         calls.push({ args: a, env: options.env });
         if (a.includes('POST') && String(a[1]).includes('/check-runs')) throw Error('HTTP 502');
-        if (a.includes('POST')) { statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1 }); return '{}'; }
+        if (a.includes('POST')) { statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1 }); return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}'; }
         if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: statuses.slice(0, 1).length, statuses: statuses.slice(0, 1) });
         return JSON.stringify({ total_count: 0, check_runs: [] });
       });
@@ -1808,7 +1822,11 @@ describe('WE App id resolver and the red-team writer identity (#6535 operator se
         creator: { login: 'web-everything' } }];
       const run = vi.fn((a, options = {}) => {
         calls.push({ args: a, env: options.env });
-        if (a.includes('POST')) return '{}';
+        if (a.includes('POST')) {
+          const status = { id: 6, state: 'success', context: 'red-team/publication #7' };
+          history.unshift(status);
+          return JSON.stringify(status);
+        }
         if (/\/status\?/.test(String(a[1]))) return JSON.stringify({ total_count: 1, statuses: [{ context: 'red-team/publication #7', state: 'failure' }] });
         return JSON.stringify(history);
       });
@@ -2138,7 +2156,7 @@ describe('result recovery uses the drain sealed disposition and trusted check id
       const path = String(args[1] ?? '');
       if (/^repos\/o\/r\/statuses\/[a-f0-9]{40}$/.test(path)) {
         statuses.unshift({ ...JSON.parse(options.input), id: statuses.length + 1, creator: { login: 'web-everything' } });
-        return '{}';
+        return statuses[0].state === 'success' ? JSON.stringify(statuses[0]) : '{}';
       }
       if (/\/commits\/[a-f0-9]+\/statuses\?/.test(path)) return JSON.stringify(statuses);
       if (/\/commits\/[a-f0-9]+\/status\?/.test(path)) {

@@ -14,7 +14,7 @@ import { redTeamOwedFor } from '../review-red-team-policy.mjs';
 import { pidStartTime } from '../pid-alive.mjs';
 import { reviewRunIndexPath } from '../review-run-index.mjs';
 import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.mjs';
-import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
+import { evaluateRedTeamCheckFact, redTeamCheckRunPayload, readRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
 import { RED_TEAM_UNSEALED_HOLD_PREFIX, RED_TEAM_NO_RESULT_HOLD_PREFIX, statusOwesPublication } from '../drain-red-team-evidence.mjs';
 
@@ -1851,7 +1851,11 @@ describe('finished publication hold recovery', () => {
     const readCheck = vi.fn(() => ({ ok: true, completedAt: new Date(1_700_000_001_000).toISOString() }));
     const readComments = vi.fn(() => [cleanResultComment(f)]);
     const readLivePr = vi.fn(() => ({ headRefOid: f.head, labels: [] }));
-    const postHold = vi.fn(() => ({ ok: true }));
+    const postHold = vi.fn(({ held }) => {
+      if (!held) gh.mockReturnValue(JSON.stringify([{ id: 3, context: `red-team/publication #${f.pr}`,
+        state: 'success', created_at: new Date().toISOString() }, ...JSON.parse(gh())]));
+      return { ok: true, status: { id: 3 } };
+    });
     const lock = vi.fn(fn => fn());
     const readStatus = vi.fn(() => ({ total_count: 1, statuses: [{ context: `red-team/publication #${f.pr}`,
       id: 2, created_at: new Date(1_700_000_000_000).toISOString(),
@@ -1859,6 +1863,30 @@ describe('finished publication hold recovery', () => {
     const gh = vi.fn(() => JSON.stringify(readStatus().statuses));
     return { ...f, path, readCheck, readComments, readLivePr, readStatus, postHold, lock, gh };
   }
+  it('leaves live-helper success to its owner and accepts the round writer’s own success', () => {
+    const f = setup();
+    const fixtureApp = 12345;
+    const run = (id, liveCheck, hold) => ({ id, app: { id: fixtureApp }, completed_at: new Date(1_700_000_001_000).toISOString(),
+      ...redTeamCheckRunPayload({ repo: f.repo, pr: f.pr, headSha: f.head, status: 'finished', hold, liveCheck }) });
+    const history = [run(1, false, 'round failed'), run(2, true, null)];
+    f.readCheck.mockImplementation(() => readRedTeamCheckFact({ repo: f.repo, pr: f.pr, headSha: f.head, appId: fixtureApp,
+      gh: () => JSON.stringify({ total_count: history.length, check_runs: history }) }));
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: expect.stringContaining('live helper to clear') });
+    expect(f.postHold).not.toHaveBeenCalled();
+    expect(existsSync(f.path)).toBe(true);
+    history.push(run(3, false, null));
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+    expect(existsSync(f.path)).toBe(false);
+  });
+  it('refuses equal check and hold timestamps with a local marker, then accepts a check one second newer', () => {
+    const f = setup();
+    f.readCheck.mockReturnValue({ ok: true, completedAt: new Date(1_700_000_000_000).toISOString() });
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: expect.stringContaining('newer than publication hold') });
+    expect(f.postHold).not.toHaveBeenCalled();
+    expect(existsSync(f.path)).toBe(true);
+    f.readCheck.mockReturnValue({ ok: true, completedAt: new Date(1_700_000_001_000).toISOString() });
+    expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
+  });
   it.each(['same-second failure', 'newer-id pending', 'new missing timestamp', 'new invalid timestamp', 'unreadable', 'page bound'])('keeps the marker and restores a failure hold after a raced clear: %s', kind => {
     const f = setup();
     const original = f.readStatus().statuses[0];
@@ -1958,9 +1986,11 @@ describe('finished publication hold recovery', () => {
       creator: { login: 'web-everything' } }] });
     expect(readRoundPublicationHold(f)).toBe(true);
     expect(f.readStatus).toHaveBeenCalledTimes(1);
-    f.postHold.mockImplementation(() => {
+    const post = f.postHold.getMockImplementation();
+    f.postHold.mockImplementation(args => {
+      const result = post(args);
       f.readStatus.mockReturnValue({ total_count: 0, statuses: [] });
-      return { ok: true };
+      return result;
     });
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
@@ -2079,7 +2109,7 @@ describe('finished publication hold recovery', () => {
         id: 1, name: 'red-team', head_sha: f.head, external_id: `${f.repo}#${f.pr}`, app: { id: fixtureApp },
         status: 'completed', conclusion: 'success', completed_at: new Date(1_700_000_001_000).toISOString(),
       }] });
-      if (args[1].includes('/statuses?')) return JSON.stringify(f.readStatus().statuses);
+      if (args[1].includes('/statuses?')) return f.gh();
       return JSON.stringify(f.readStatus());
     });
     const comments = vi.spyOn(prComments, 'readCompletePrComments').mockImplementation((_pr, { exec }) => {
@@ -2100,10 +2130,12 @@ describe('finished publication hold recovery', () => {
   it('clears the hold and marker under the lock, then a second call posts nothing', () => {
     const f = setup();
     expect(readFinishedPublicationHold(f)).toBe(true);
-    f.postHold.mockImplementation(() => {
+    const post = f.postHold.getMockImplementation();
+    f.postHold.mockImplementation(args => {
       expect(existsSync(f.path)).toBe(true);
+      const result = post(args);
       f.readStatus.mockReturnValue({ total_count: 0, statuses: [] });
-      return { ok: true };
+      return result;
     });
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
     expect(f.lock).toHaveBeenCalledTimes(1);
@@ -2124,7 +2156,7 @@ describe('finished publication hold recovery', () => {
     expect(existsSync(f.path)).toBe(true);
     expect(f.postHold).not.toHaveBeenCalled();
   });
-  it.each([1_700_000_000_000, 1_700_000_001_000])('accepts fresh success completed at or after the marker (%s)', at => {
+  it.each([1_700_000_001_000, 1_700_000_002_000])('accepts fresh success completed at or after the marker (%s)', at => {
     const f = setup();
     f.readCheck.mockReturnValue({ ok: true, completedAt: new Date(at).toISOString() });
     expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
@@ -2136,11 +2168,13 @@ describe('finished publication hold recovery', () => {
     f.env.GH_TOKEN = 'inherited-token';
     const writerEnv = { WE_GH_ROLE: 'app', WE_GH_APP_ENFORCE: '1' };
     f.gh = undefined;
+    const history = [...f.readStatus().statuses];
     const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(args =>
-      args[1] === 'fixture' ? '{}' : JSON.stringify(f.readStatus().statuses));
+      args[1] === 'fixture' ? '{}' : JSON.stringify(history));
     f.postHold.mockImplementation(({ gh: post }) => {
       post(['api', 'fixture'], { env: writerEnv });
-      return { ok: true };
+      history.unshift({ id: 3, context: `red-team/publication #${f.pr}`, state: 'success' });
+      return { ok: true, status: { id: 3 } };
     });
     try {
       expect(settleFinishedPublicationHold(f)).toEqual({ ok: true });
