@@ -4587,6 +4587,7 @@ review-job and review-daemon suites.
 ordinary paths for both tracked and untracked files. Every admitted file at or below
 `CONTENT_SCAN_MAX_BYTES` gets a byte-safe credential scan, including binaries. Over-cap
 files require local fallback unless their extension is on the explicit binary allowlist;
-those large assets skip the ordinary scan to bound cost. Credential-named sources retain
+those large assets are still scanned (the allowlist only lifts the size cap) and scan-budget
+exhaustion refuses. Credential-named sources retain
 the stricter content scan and tracked-only rule. The soak break decides fix presence by
 calling `manifestEntry` on a generated key at `docs/notes.md`, never by source markers.

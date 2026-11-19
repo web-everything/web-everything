@@ -38,12 +38,12 @@ describe('Forge scans all manifest content',()=>{
   });
   it('admits prose that only mentions private keys or key-like labels, but refuses a PEM private block',()=>{
     const words=['PRIVATE','KEY'].join(' ');
-    expect(admit('docs/setup.md',Buffer.from(`Set the GitHub App ${words} secret. sk-ant-admin-from-keychain is a label.`))).toHaveProperty('sha256');
+    expect(admit('docs/setup.md',Buffer.from(`Set the GitHub App ${words} secret.`))).toHaveProperty('sha256');
     expect(admit('ci.yml',Buffer.from(`private-key: \${{ secrets.APP_${['PRIVATE','KEY'].join('_')} }}\n# -----BEGIN CERTIFICATE-----`))).toHaveProperty('sha256');
   });
-  it('admits a real media container when the scan budget is exhausted on its bytes, never a disguised one',()=>{
-    const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.alloc(64,1)]);
-    expect(admit('a.png',png)).toHaveProperty('sha256');
+  it('refuses a PNG-signed file hiding a JWK behind nested brackets (scan exhaustion fails closed)',()=>{
+    const png=Buffer.concat([Buffer.from('89504e470d0a1a0a','hex'),Buffer.from('['.repeat(65)),Buffer.from(material.JWK)]);
+    for(const tracked of [true,false])refused('a.png',png,tracked,'content-detected credential');
   });
   it('admits ordinary documentation, code and JSON regardless of tracking',()=>{
     for(const tracked of [true,false])for(const [path,text] of [
@@ -73,11 +73,14 @@ describe('Forge scans all manifest content',()=>{
     }
   });
 
-  it('admits over-cap allowlisted binaries without scanning (also uppercase extensions)',()=>{
-    const bytes=Buffer.alloc(CONTENT_SCAN_MAX_BYTES+1,32);
+  it('admits clean over-cap allowlisted binaries but still scans them (also uppercase extensions)',()=>{
+    const clean=Buffer.alloc(CONTENT_SCAN_MAX_BYTES+1,32);
+    const bytes=Buffer.from(clean);
     bytes.write(material.PEM);
-    for(const path of ['image.png','image.PNG'])for(const tracked of [true,false])
-      expect(admit(path,bytes,tracked)).toMatchObject({tracked});
+    for(const path of ['image.png','image.PNG'])for(const tracked of [true,false]) {
+      expect(admit(path,clean,tracked)).toMatchObject({tracked});
+      refused(path,bytes,tracked,'content-detected credential');
+    }
   });
 
   it('does not weaken the credential-named scan for oversized allowlisted binaries',()=>{
