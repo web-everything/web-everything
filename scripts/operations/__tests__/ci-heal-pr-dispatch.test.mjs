@@ -1019,6 +1019,46 @@ describe('CI-heal salvage before agent dispatch', () => {
   const rows = () => Array.from({ length: 3 }, () => ({ v: 1, at: new Date(Date.now() - 1000).toISOString(), repo: 'we',
     pr: entry.prNumber, head: entry.headRefOid, kind: 'ci-heal', build: 'b'.repeat(40), session: 'ci-heal-3895' }));
 
+  it.each([
+    ['unsettled worker', 'heal-unsettled'],
+    ['unconfirmed accounting', 'heal-accounting-owed'],
+    ['loop hold', 'fix-loop-hold'],
+    ['loop park', 'fix-loop-parked'],
+    ['already parked', 'fix-loop-parked'],
+  ])('log-unreadable bounced PR still respects the ci-heal %s guard', async (guard, refusal) => {
+    const plan = planReconcile({ requiredChecks: ['test'], agents: [], prs: [{
+      number: entry.prNumber, state: 'OPEN', headRefName: entry.headRefName, headRefOid: entry.headRefOid,
+      labels: [{ name: 'review:changes' }],
+      comments: [{ body: '🔁 human review — changes requested\n\nFix the failing test.' }],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+      timeoutRetry: { eligible: false, reason: 'log-unreadable' },
+    }] });
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'ci-heal', phase: 'bounced', ciLogEvidenceReason: 'log-unreadable',
+    })]);
+    const evidence = guard === 'loop hold' ? rows()
+      : guard === 'loop park' ? [...rows(), ...rows()].slice(0, 5)
+        : guard === 'already parked' ? [{ ...rows()[0], kind: 'park', reason: 'raw per-head repair session ceiling reached' }] : [];
+    const ledger = loop({ readRows: () => evidence });
+    const postParkComment = vi.fn(), salvage = vi.fn(() => null);
+    const { result, dispatch } = await exercise(salvage, {
+      reconcile: () => plan,
+      pollAttempts: () => guard === 'unsettled worker' ? [{ pr: entry.prNumber, status: 'running' }] : [],
+      flushOwed: () => guard === 'unconfirmed accounting' ? { kept: [{ pr: entry.prNumber }] } : {},
+      fixLoop: ledger, fixConfig: { maxSessions: 3, windowHours: 6, hold: true }, postParkComment,
+    });
+    expect(result.handled).toBe(1);
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({ kind: refusal })]);
+    expect(dispatch).not.toHaveBeenCalled();
+    if (guard === 'unsettled worker' || guard === 'unconfirmed accounting') expect(salvage).not.toHaveBeenCalled();
+    expect(postParkComment).toHaveBeenCalledTimes(guard === 'loop park' ? 1 : 0);
+    if (guard === 'loop park') {
+      expect(ledger.append).toHaveBeenCalledTimes(1);
+      expect(ledger.append).toHaveBeenCalledWith(expect.objectContaining({ kind: 'park' }));
+    } else expect(ledger.append).not.toHaveBeenCalled();
+  });
+
   it('discounts three infrastructure refusals and dispatches on Claude', async () => {
     const ledger = loop({ readRows: rows, readSessionLog: () =>
       Array(3).fill('fix-run: PR #3895 failed (no-finding: none); claim released').join('\n') });
