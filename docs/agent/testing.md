@@ -3592,9 +3592,11 @@ through `findAgentBinary`; production retains its private fixed installation lis
 The launch environment registry classifies literal env reads under `scripts/` and
 `.claude/skills/`; the bounded rg drift test refuses incomplete inventories. Classify
 new names before forwarding them. `inheritEnv` is snapshotted plain string data:
-unknown/drop names stay out, and omitted restrictive identities/isolation markers
-survive from the ambient environment. A value that can relax a guard belongs in
-`drop` even if another value tightens it. Keep locale forwarding exact so an unknown
+unknown/never names stay out. Known ambient values survive verbatim, including plain
+`drop` entries; `drop` governs the caller bag. Value gates still admit only restrictive
+modes, and malformed ambient absolute paths refuse launch. Mark dangerous controls
+`never: true` (only on `drop` rules) to exclude both sources. Keep locale forwarding exact
+so an unknown
 `LC_*_OPTIONS` name cannot pass a broad family rule. The launch tripwire pins counts
 per approved file; adding a site to an already approved file must fail too.
 
@@ -4962,9 +4964,10 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Launcher restriction projection (SEC1 S1 round 5)
 
-An explicit environment bag must not erase parent restrictions. Only the exact empty string
-counts as an absent restrictive marker. Whitespace presence markers survive unchanged, matching
-daemon/test readers; nonempty malformed isolation roots (including whitespace) still refuse.
+An explicit environment bag must not erase parent restrictions. Known ambient values have
+parent parity minus the registry never list; empty and whitespace presence markers survive
+verbatim. Absolute-path entries must remain valid even when the bag overrides them; empty,
+relative and whitespace ambient isolation roots refuse launch. Empty bag markers stay ignored.
 Value-gated restrictions emit canonical trimmed lowercase values so exact-string consumers
 (such as heavy-admission container switches) receive an enabling value. An ambient gated
 restriction wins over a different bag mode because modes may have different strengths.
@@ -4981,12 +4984,17 @@ relaxOnly: true; relaxOnly means no value tightens the unset policy. Prefix pred
 raw case-sensitive values, exactly as the daemon reader does. Restrictive entries default to
 ambient precedence; shared lock roots and identities keep the parent, while LANE_POOL_ROOT
 explicitly uses bag precedence to agree with direct-task writable roots. Numeric restrictions
-retain every valid ambient quantity, even at or above the code default, unless the bag supplies
-a valid smaller quantity. Without a valid ambient limit, a bag quantity must be strictly below
-the evidenced default. Counts emit integers (flooring fractions for integer-only readers);
+retain ambient quantities verbatim, including forms accepted by downstream readers but not
+by the bag parser. A bag replaces an ambient limit only when both parse and the bag is
+strictly smaller. An invalid ambient limit survives and cannot authorize a bag replacement.
+With no ambient value, positive bag limits stay out: code defaults cannot establish
+the effective configured ceiling. The child resolves the same configured policy;
+set a parent env limit before requesting a positive bag tightening. A documented strict
+zero may still pass because no configured ceiling can be stricter than zero. Bag counts
+emit integers (flooring fractions for integer-only readers);
 zero stays invalid unless tighterThan.zeroIsStrict explicitly records a strict zero bound.
-CPU quantities must also satisfy the consumer's >= 1 floor. Byte suffixes
-k/m/g/t use powers of 1024 and emit numeric bytes, so Number-based and Docker readers agree.
+Bag CPU quantities must also satisfy the consumer's >= 1 floor. Byte suffixes
+k/m/g/t in the bag use powers of 1024 and emit numeric bytes, so Number-based and Docker readers agree.
 Consumer floors belong in tighterThan.minimum (CPU reader: 1; call-log reader: 1 MiB). Test all
 restrictive entries, including invalid quantities and malformed roots, from both sources.
 Keep policy-relative guards without a fixed numeric default explicitly unresolved.
@@ -4999,19 +5007,19 @@ both guard-clone origin checks. All use ambient precedence. DIFF_COVERAGE_BASE a
 VERIFY_SCAN_FILES additionally require ambientOnly: true: bag-only comparison bases and
 scan scopes can narrow default verification, so only ambient evidence may set them. Empty
 ambient values do not authorize a bag override. Named regressions reject bag-only HEAD and
-empty scan scopes while retaining parent evidence and whitespace markers. CI stays dropped because it can
-bypass heavy admission; GITHUB_ACTIONS stays dropped because it also enables CI exemptions
-and the read-only-token exception. Guard clone paths, listing bounds, lock waits and timing
-switches remain dropped: they redirect a trusted source or tune an existing check rather than
-enable one. Existing daemon/test identities, roots, exact values and prefix predicates retain
-their classification.
+empty scan scopes while retaining parent evidence and whitespace markers. CI and
+GITHUB_ACTIONS are never rules because they enable admission exemptions. Known ambient
+policy sources, managed-clone markers, repair-session limits, listing bounds, lock waits and
+timing switches survive verbatim. Their plain drop rules still reject caller-bag overrides.
+Existing daemon/test identities, roots, exact values and prefix predicates retain their rules.
 
 The tighterThan zero sweep enables zeroIsStrict only for WE_TMP_LEAK_MAX (default 50;
 any leftover exceeds zero), WE_HEAVY_ADMISSION_FAST_SLOTS (zero extra slots),
 WE_GH_THROTTLE_HEADER_WAIT_CAP_MS (zero header wait) and WE_GH_THROTTLE_RETRY_CAP_MS
 (zero backoff). Hold/per-caller caps use zero to disable enforcement; count/budget/cpu floors
-reject zero; zero container memory is unlimited. Those and the call-log minimum still reject zero.
-Registry tests pin this list and test every numeric rule from both sources. The drift inventory
+reject zero; zero container memory is unlimited. Those and the call-log minimum still reject
+zero from the bag; ambient values are the parent reader's responsibility. Registry tests pin
+this list and test every numeric rule from both sources. The drift inventory
 refuses any otherwise-scanned file over 16 MiB with status 2 and its path; repair/split the
 evidence for human review before treating the inventory as complete. A temp-file regression
 exercises the actual oversized-file failure and the inclusive size boundary.
@@ -5184,3 +5192,38 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+
+## Launcher parent parity and never rules (SEC1 S1 redesign)
+
+Registry lookup is exact name, then trailing-star prefix, then leading-star suffix.
+A restrictive exact rule overrides a dangerous family (notably GIT_ALLOW_PROTOCOL and
+Git hardening predicates). Unknown ambient names remain excluded; the drift inventory
+keeps repository env reads known. Audit affirmative dangerous `why` reasons and exact
+members of never families too: exact precedence must not accidentally reopen a family.
+Never rules cover runtime/shell injection, launcher-owned paths, exec redirects,
+credentials and guard bypasses. Do not classify a restrictive refusal or a reason
+saying a setting does *not* bypass a guard as a bypass. Value-gated controls keep their
+restrictive vocabulary and canonical enabling strings.
+
+The registry suite enumerates every non-never, non-gated entry for verbatim ambient
+parity, every never entry/pattern from both sources, and every exact restriction.
+Named finding regressions preserve bag-only zero leak limits, exponential ambient
+throttle caps, WE_PLATFORM_PREFERENCES_FILE, WE_FIX_LOOP_MAX_SESSIONS,
+WE_DAEMON_MANAGED_CLONE and WE_GUARD_LISTING_MAX_BYTES. Keep all fourteen attack
+classes and all three #7022 escape regressions in the same scoped heavy-admission run.
+
+Executable redirects must be never rules even when their old class was plain drop.
+The registry suite pins an explicit redirect inventory, checks explicit redirect reasons
+against it, and rejects missing rules or missing never markers. Keep
+WE_GH_THROTTLE_GH_BIN in that inventory: the gh shim may set its real binary for its
+own invocation, but neither ambient nor caller-bag values cross the agent boundary.
+
+
+A bag-only numeric value below the code default may still relax a stricter configured
+policy because environment values have higher precedence. Without an ambient ceiling,
+ignore positive bag limits and let the child resolve configured policy. The exception is
+a `zeroIsStrict` zero, which is the minimum possible bound. Preserve the named regression
+that projects bag WE_GH_THROTTLE_CAP=3 with no ambient cap and then resolves configured
+cap 1 through the real reader; it must remain 1. All numeric registry rules also have a
+positive bag-only rejection case, while the zero leak allowance regression stays enabled.

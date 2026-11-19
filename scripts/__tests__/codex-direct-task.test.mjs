@@ -3193,7 +3193,7 @@ describe('detached jobs', () => {
       const { appendFileSync, writeFileSync } = require('node:fs');
       const { spawn } = require('node:child_process');
       const { join } = require('node:path');
-      // Baked in: the agent launcher's env allowlist deliberately drops CODEX_JOBS_DIR from the agent child.
+      // Pin the fixture root independently of environment projection and descendant role.
       const root = ${JSON.stringify(jobsDir)};
       const role = process.argv[2];
       writeFileSync(join(root, role + '.pid'), String(process.pid));

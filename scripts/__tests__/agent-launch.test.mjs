@@ -160,6 +160,8 @@ describe('built invocation positive controls', () => {
     ['output schema', { outputSchemaFile: '/schema with spaces.json' }], ['add-dirs', { addDirs: ['/one', '/two'] }],
   ])('pins the pre-S1 Codex argv tokens for %s', (_label, extra) => {
     vi.stubEnv('PATH', '/arbitrary-ambient');
+    vi.stubEnv('USER', 'parent-user');
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
     const input = { cwd, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high', env: { PATH: '/usr/bin:/bin' }, ...extra };
     const d = buildCodexDirectTaskDescriptor(input);
     const configPath = fixedPath(CODEX_SHIM_DIR);
@@ -172,9 +174,11 @@ describe('built invocation positive controls', () => {
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(process.execPath, expected, expect.objectContaining({ shell: false, detached: true, cwd, stdio: ['pipe', 'pipe', 'pipe'] }));
     expect(isAbsolute(io.spawn.mock.calls[0][0])).toBe(true);
-    // This explicit env bag only supplies PATH (owned by the launcher), so only ambient restrictive names survive.
-    expect(Object.keys(io.spawn.mock.calls[0][2].env).every(k => ['PATH', 'HOME'].includes(k)
-      || registry[k]?.class === 'forward-restrictive' || registry[k]?.restrictiveValues?.includes(io.spawn.mock.calls[0][2].env[k].trim().toLowerCase()))).toBe(true);
+    // A PATH-only caller bag retains known ambient metadata and parent restrictions.
+    const env = io.spawn.mock.calls[0][2].env;
+    expect(env).toMatchObject({ USER: 'parent-user', WE_DAEMON_MANAGED_CLONE: '1' });
+    expect(Object.keys(env).every(k => ['PATH', 'HOME'].includes(k)
+      || (Object.hasOwn(registry, k) && !registry[k].never))).toBe(true);
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
     const tempRoot = '/task "quote" \\ $TMP';
@@ -259,11 +263,19 @@ describe('three-class environment boundary', () => {
     expect(isDaemonCaller({ WE_GH_DAEMON_CALLER: env.WE_GH_DAEMON_CALLER })).toBe(true);
     expect(isUnderTest({ VITEST: env.VITEST })).toBe(true);
     expect(isUnderTest({ WE_UNDER_TEST: env.WE_UNDER_TEST })).toBe(true);
+    clearEnv('LANE_POOL_ROOT');
+    delete markers.LANE_POOL_ROOT;
     for (const key of Object.keys(markers)) vi.stubEnv(key, blank);
     const absent = buildAgentInvocation({ ...base(), inheritEnv: Object.fromEntries(Object.keys(markers).map(k => [k, blank])) }, seam()).options.env;
-    for (const key of Object.keys(markers)) expect(absent).not.toHaveProperty(key);
+    for (const key of Object.keys(markers)) {
+      if (registry[key].restrictiveValues || registry[key].restrictivePrefixes) expect(absent).not.toHaveProperty(key);
+      else expect(absent[key]).toBe('');
+    }
     const ambient = buildAgentInvocation(base(), seam()).options.env;
-    for (const key of Object.keys(markers)) expect(ambient).not.toHaveProperty(key);
+    for (const key of Object.keys(markers)) {
+      if (registry[key].restrictiveValues || registry[key].restrictivePrefixes) expect(ambient).not.toHaveProperty(key);
+      else expect(ambient[key]).toBe('');
+    }
   });
   it.each([' ', '\t'])('preserves whitespace presence markers %j and their daemon/test semantics', marker => {
     for (const name of ['WE_GH_DAEMON_CALLER', 'VITEST', 'WE_UNDER_TEST']) {
@@ -303,21 +315,23 @@ describe('three-class environment boundary', () => {
     for (const [key, value] of Object.entries(restrictive)) vi.stubEnv(key, value);
     expect(buildAgentInvocation({ ...base(), inheritEnv: {} }, seam()).options.env).toMatchObject(restrictive);
   });
-  it('keeps ambient identity and does not inherit ambient neutral metadata for an explicit bag', () => {
+  it('keeps ambient identity and neutral metadata with an explicit bag', () => {
     vi.stubEnv('WE_GH_DAEMON_CALLER', 'host-daemon'); vi.stubEnv('USER', 'host-user');
     const env = buildAgentInvocation({ ...base(), inheritEnv: { WE_GH_DAEMON_CALLER: 'bag-daemon', LC_MESSAGES: 'C' } }, seam()).options.env;
     expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'host-daemon', LC_MESSAGES: 'C' });
-    expect(env).not.toHaveProperty('USER');
+    expect(env.USER).toBe('host-user');
   });
-  it('drops every registered drop name and unknown names from both sources, retaining launcher-owned paths', () => {
-    const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.endsWith('*'));
-    const unknown = ['SEC1_UNKNOWN', 'LC_HOSTILE_OPTIONS', 'LC_HOSTILE_TOKEN', 'CUSTOM_OPTIONS'];
+  it('ignores plain drop rules in the bag and drops unknown names from either source', () => {
+    const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.includes('*'));
+    const unknown = ['SEC1_UNKNOWN', 'SEC1_UNREGISTERED'];
+    for (const key of dropped) clearEnv(key);
     const bag = Object.fromEntries([...dropped, ...unknown].map(key => [key, 'hostile']));
-    for (const [key, value] of Object.entries(bag)) vi.stubEnv(key, value);
-    const ambient = buildAgentInvocation(base(), seam()).options.env;
     const explicit = buildAgentInvocation({ ...base(), inheritEnv: bag }, seam()).options.env;
+    for (const key of [...dropped, ...unknown].filter(key => !['PATH', 'HOME'].includes(key))) expect(explicit, key).not.toHaveProperty(key);
+    for (const key of unknown) vi.stubEnv(key, 'hostile');
+    const ambient = buildAgentInvocation(base(), seam()).options.env;
+    for (const key of unknown) expect(ambient, key).not.toHaveProperty(key);
     for (const env of [ambient, explicit]) {
-      for (const key of [...dropped, ...unknown].filter(key => !['PATH', 'HOME'].includes(key))) expect(env, key).not.toHaveProperty(key);
       expect(env.HOME).toBe(userInfo().homedir);
       expect(env.PATH).toBe(fixedPath());
     }
@@ -525,9 +539,10 @@ describe('final audit: transport allowlist and bag-only limits', () => {
     clearEnv('GIT_ALLOW_PROTOCOL');
     expect(envOf({ GIT_ALLOW_PROTOCOL: 'ext' })).not.toHaveProperty('GIT_ALLOW_PROTOCOL');
   });
-  it('drops a bag-only numeric limit so the child resolves the same configured policy as the parent', () => {
+  it('rejects positive bag-only limits without a configured ceiling while preserving strict zero', () => {
     expect(envOf({ WE_GH_THROTTLE_CAP: '3' })).not.toHaveProperty('WE_GH_THROTTLE_CAP');
     expect(envOf({ WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN: '1' })).not.toHaveProperty('WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN');
+    expect(envOf({ WE_TMP_LEAK_MAX: '0' }).WE_TMP_LEAK_MAX).toBe('0');
     vi.stubEnv('WE_GH_THROTTLE_CAP', '8');
     expect(envOf({ WE_GH_THROTTLE_CAP: '3' }).WE_GH_THROTTLE_CAP).toBe('3');
     expect(envOf({ WE_GH_THROTTLE_CAP: '20' }).WE_GH_THROTTLE_CAP).toBe('8');

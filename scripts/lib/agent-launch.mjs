@@ -4,8 +4,12 @@
  * smuggling, expanded ids, accessors, Proxies, argv0, execPath/execArgv, runtime
  * env, shell env, HOME, mutation/aliasing) shared one root: inspected and executed
  * views differed. No caller argv, unclassified env, binary, or spawn options cross this boundary.
- * Parent restrictions must survive projection: nonempty restrictive markers and only
- * exact gh auth/throttle shim directories under the real account home survive. Other
+ * Environment threat model: known ambient process.env inherits parent parity minus
+ * the registry's never list; value gates and absolute-path validation still apply.
+ * Caller inheritEnv is tighten-only: registry classes, parent precedence, and numeric
+ * ceilings constrain it. A positive bag limit needs an ambient ceiling; a documented
+ * strict zero cannot relax configured policy. Ambient quantities survive verbatim.
+ * Only exact gh auth/throttle shim directories under the real account home survive. Other
  * parent PATH entries cannot select executables; custom shims require pathPrefix.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
  */
@@ -18,6 +22,8 @@ import { fileURLToPath } from 'node:url';
 
 const FIXED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const ENV_REGISTRY = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'agent-launch-env-registry.json'), 'utf8'));
+const ENV_PREFIXES = Object.entries(ENV_REGISTRY).filter(([pattern]) => pattern.endsWith('*'));
+const ENV_SUFFIXES = Object.entries(ENV_REGISTRY).filter(([pattern]) => pattern.startsWith('*'));
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COMMON = ['agent', 'cwd', 'processGroup', 'pathPrefix', 'tempRoot', 'inheritEnv'];
 const CODEX = ['sandbox', 'outputSchemaFile', 'outputLastMessageFile', 'ephemeral', 'addDirs', 'model', 'config', 'resumeThreadId'];
@@ -77,10 +83,11 @@ function paths(value, name) {
   if (!Array.isArray(value)) fail(`${name} must be an array`);
   return value.map(p => absolute(p, name));
 }
-// Exact names take precedence over simple trailing-* prefixes. Unknown names fail closed.
+// Exact > trailing-* prefix > leading-* suffix. Unknown names fail closed.
 function envRule(key) {
   if (Object.hasOwn(ENV_REGISTRY, key)) return ENV_REGISTRY[key];
-  return Object.entries(ENV_REGISTRY).find(([pattern]) => pattern.endsWith('*') && key.startsWith(pattern.slice(0, -1)))?.[1];
+  return ENV_PREFIXES.find(([pattern]) => key.startsWith(pattern.slice(0, -1)))?.[1]
+    ?? ENV_SUFFIXES.find(([pattern]) => key.endsWith(pattern.slice(1)))?.[1];
 }
 function envRecord(env) {
   record(env, 'inheritEnv');
@@ -96,7 +103,7 @@ function quantity(value, { unit, minimum = 0, zeroIsStrict = false }) {
   const n = unit === 'count' ? Math.floor(parsed) : parsed;
   return Number.isFinite(n) && (n > 0 || (zeroIsStrict && n === 0)) && n >= minimum ? n : NaN;
 }
-function classOf(rule, value, ceiling = rule?.tighterThan?.default) {
+function classOf(rule, value, ceiling) {
   if ((rule?.class === 'forward-restrictive' || rule?.restrictiveValues || rule?.restrictivePrefixes || rule?.tighterThan)
     && value === '') return 'drop';
   if (rule?.tighterThan) {
@@ -113,26 +120,34 @@ function inheritedEnv(inherit, ambient) {
   const checked = (rule, value, key) => rule.value === 'absolute-path' ? absolute(value, key)
     : rule.tighterThan ? String(quantity(value, rule.tighterThan))
     : rule.restrictiveValues?.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : value;
-  for (const [key, value] of Object.entries(inherit)) {
-    const rule = envRule(key);
-    // Parent verification selectors are evidence, not caller capabilities.
-    if (rule?.ambientOnly) continue;
-    const parent = rule?.tighterThan ? quantity(ambient[key], rule.tighterThan) : NaN;
-    // A bag limit with no parent env value is dropped: env beats tool settings, so even a value below the code
-    // default could relax a stricter configured policy. The child then resolves the same policy as the parent.
-    if (rule?.tighterThan && !Number.isFinite(parent)) continue;
-    // A valid resolved parent limit is the ceiling, even above the code default.
-    const cls = classOf(rule, value, parent);
-    if (cls === 'forward' || cls === 'forward-restrictive') out[key] = checked(rule, value, key);
-  }
   for (const [key, value] of Object.entries(ambient)) {
     const rule = envRule(key);
-    if (classOf(rule, value, Infinity) !== 'forward-restrictive') continue;
-    // Validate even an overridden ambient root: malformed isolation evidence refuses launch.
-    const parent = checked(rule, value, key);
-    if (!Object.hasOwn(out, key) || (rule.tighterThan
-      ? quantity(parent, rule.tighterThan) < quantity(out[key], rule.tighterThan)
-      : (rule.precedence ?? 'ambient') === 'ambient')) out[key] = parent;
+    if (!rule || rule.never) continue;
+    if (rule.restrictiveValues || rule.restrictivePrefixes) {
+      if (classOf(rule, value) === 'forward-restrictive') out[key] = checked(rule, value, key);
+    } else {
+      // Preserve the parent's reader grammar, including empty and unusual numeric values.
+      out[key] = rule.value === 'absolute-path' ? absolute(value, key) : value;
+    }
+  }
+  for (const [key, value] of Object.entries(inherit)) {
+    const rule = envRule(key);
+    if (!rule || rule.never) continue;
+    // Parent verification selectors are evidence, not caller capabilities.
+    if (rule?.ambientOnly) continue;
+    const hasParent = Object.hasOwn(ambient, key);
+    const ceiling = rule.tighterThan && hasParent ? quantity(ambient[key], rule.tighterThan) : NaN;
+    // Env beats configured policy: a code default cannot authorize a positive bag-only
+    // limit. Ignore it so the child resolves policy; set the parent env to supply a ceiling.
+    // A documented strict zero is the global minimum, independent of configured policy.
+    const strictZero = !hasParent && rule.tighterThan?.zeroIsStrict
+      && quantity(value, rule.tighterThan) === 0;
+    const cls = strictZero ? 'forward-restrictive' : classOf(rule, value, ceiling);
+    if (cls !== 'forward' && cls !== 'forward-restrictive') continue;
+    const candidate = checked(rule, value, key);
+    if (!rule.tighterThan && cls === 'forward-restrictive' && out[key] !== undefined && out[key] !== ''
+      && (rule.precedence ?? 'ambient') === 'ambient') continue;
+    out[key] = candidate;
   }
   return out;
 }
@@ -231,7 +246,7 @@ export function buildAgentInvocation(descriptor, io) {
   argsFrom(d); // Validate the entire snapshot before any IO seam executes.
   // Copy trusted process.env before any IO seam can mutate it; it is not a plain record itself.
   const ambient = snapshot({ ...process.env });
-  const forwarded = inheritedEnv(d.inheritEnv ?? ambient, ambient);
+  const forwarded = inheritedEnv(d.inheritEnv ?? {}, ambient);
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
   catch { fail('cwd must be an existing directory'); }
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
