@@ -5716,10 +5716,10 @@ async function runCli() {
           // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
           let seed = snapshotSeed || [];
           if (!snapshotSeed) {
-            // Cache-only within the snapshot's normal TTL (same age bound as before, so heavy-field staleness is
-            // unchanged); a stale snapshot just gives no seed. The old fresh-or-refresh read ran a second full paged
+            // Cache-only within the snapshot's normal TTL and dirty rules (same bounds as before, so heavy-field
+            // staleness is unchanged); a stale or dirty snapshot just gives no seed. The old fresh-or-refresh read ran a second full paged
             // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
-            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true, ignoreDirty: true })) || []; } catch { seed = []; }
+            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
           listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,

@@ -143,17 +143,19 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     expect(viewCalls(calls)).toHaveLength(1);
     expect(SNAPSHOT_FIELDS).toContain('comments');
   });
-  it('cacheOnly + ignoreDirty serves an old, dirty-marked snapshot without any gh call (drain listing seed)', () => {
+  it('cacheOnly serves a fresh snapshot and refuses a dirty or expired one, with no gh call (drain listing seed)', () => {
     const { exec, calls } = fakeExec();
     const fields = 'number,updatedAt,headRefOid,body,files';
     readSharedOpenPrs(opts({ fields, exec }));
     const before = calls.length;
-    markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
-    clock += 60_000; // past the dirty floor is not needed: the snapshot is inside its TTL, the dirty mark is ignored
     const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: 75_000 });
-    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty mark still refuses a plain cache read
-    const rows = readSharedOpenPrs({ ...seedOpts, ignoreDirty: true });
-    expect(rows).toHaveLength(14);
+    clock += 30_000;
+    expect(readSharedOpenPrs(seedOpts)).toHaveLength(14);
+    markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
+    clock += 20_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty: no seed, never a refresh
+    clock += 60_000;
+    expect(readSharedOpenPrs(seedOpts)).toBeNull(); // expired
     expect(calls.length).toBe(before);
   });
   it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
