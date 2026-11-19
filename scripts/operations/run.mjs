@@ -311,7 +311,8 @@ export const OPERATIONS = Object.freeze({
   // invocation with no `--cwd` is byte-identical to before.
   // `review.seatsByTouchSet` — `securitySeat` is the CALLER's choice, made before the run starts (the review
   // daemon's `review-loop-cli.mjs#chooseSecuritySeat`) or read off a saved run on `--resume` (below); default: seated.
-  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, cardOnlyLight = false, resumeId = null } = {}) => {
+  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true, cardOnlyLight = false, resumeId = null,
+    sinkFactory = createReviewPrSinks } = {}) => {
     // A bad id or torn record falls back to the live roster, so the adapter's own resume read refuses it
     // normally instead of this builder aborting resolveOperation with the root usage.
     let savedRun = null;
@@ -327,7 +328,7 @@ export const OPERATIONS = Object.freeze({
         ...seats,
         readPr: createReviewPrReader(cwd ? { cwd } : {}),
       }),
-      sinks: createReviewPrSinks({ json }),
+      sinks: sinkFactory({ json, ...(cwd ? { cwd } : {}) }),
     };
   },
   // backlog/xzdi27a-* — the sibling of `review-pr` for a BACKLOG CARD instead of a PR diff (no `gh`, no diff,
@@ -863,8 +864,9 @@ export function createCliJudgeFactory({ env = process.env, factory = createDefau
  * Build an isolated registry plus the bindings for ONE named operation. Throws on an unknown name.
  *
  * @param {string} name
- * @param {{json?: boolean, cwd?: string, securitySeat?: boolean, resumeId?: string}} [opts] - passed to the
+ * @param {{json?: boolean, cwd?: string, securitySeat?: boolean, resumeId?: string, sinkFactory?: Function}} [opts] - passed to the
  *   builder before parsing: review-pr uses resumeId to reconstruct its saved roster and json/cwd for its IO.
+ *   sinkFactory lets fixtures inject IO while exercising the production control-value forwarding.
  */
 export function resolveOperation(name, opts = {}) {
   // `Object.hasOwn`, never a bare bracket read: `OPERATIONS['toString']` on a normal-prototype object returns an
