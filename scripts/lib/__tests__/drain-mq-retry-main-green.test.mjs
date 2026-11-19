@@ -39,8 +39,9 @@ function fixture(runs, events = [removal()], mainHead = null) {
     if (endpoint === `repos/${repo}/git/ref/heads/main` && mainHead) return JSON.stringify({ object: { sha: mainHead } });
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {
       return JSON.stringify({ total_count: 1, check_runs: [{
-        id: 21, name: failedName, status: 'completed', conclusion: 'failure',
-        output: { title: 'Runner disconnected', summary: '' },
+        // startup_failure keeps these fixtures on the legacy main-green evidence path.
+        id: 21, name: failedName, status: 'completed', conclusion: 'startup_failure',
+        output: { title: '', summary: '' },
       }] });
     }
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {

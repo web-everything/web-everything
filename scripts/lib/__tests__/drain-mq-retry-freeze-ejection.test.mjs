@@ -83,9 +83,10 @@ describe('same-head MQ ejection caused by a red-main freeze or cancelled shards 
     expect(f.guard().hold).toBe(false);
   });
 
-  it('retries when every failed job is cancelled, even above the 10-job limit', () => {
+  it('holds pure cancellation evidence above the 10-job limit and names manual inspection', () => {
     const f = fixture(Array.from({ length: 14 }, (_, i) => shard(i + 1)));
-    expect(f.guard().hold).toBe(false);
+    expect(f.guard().hold).toBe(true);
+    expect(f.log.mock.calls.some(([line]) => line.includes('10-job limit; operator must inspect failed jobs and enqueue manually'))).toBe(true);
   });
 
   it('retries a freeze ejection even when main looked green at removal', () => {

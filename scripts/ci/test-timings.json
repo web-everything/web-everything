@@ -1032,6 +1032,8 @@
   "scripts/lib/__tests__/drain-red-team-evidence.test.mjs": 15.37,
   "scripts/lib/__tests__/drain-skip-reasons.test.mjs": 0.02,
   "scripts/lib/__tests__/drain-workflow-edit-hold.test.mjs": 0.03,
+  "scripts/lib/__tests__/drain-queue-safety-infra-requeue.test.mjs": 0.1,
+  "scripts/conveyor/soak/breaks/drain-mq-infra-requeue.soak.test.mjs": 0.2,
   "scripts/lib/__tests__/duplicate-bornas-added.test.mjs": 0.01,
   "scripts/lib/__tests__/duplicate-id-tripwire.test.mjs": 0.01,
   "scripts/lib/__tests__/enqueue-catchup-dedupe.test.mjs": 0.06,
