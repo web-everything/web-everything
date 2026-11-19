@@ -69,12 +69,12 @@ function updatePending(root, env, fs, change, { staleMs = 10000, waitMs = 3000 }
 }
 
 /** Record that `ref`@`sha` was registered on `root` and awaits adoption. Replaces an older record for the same ref. */
-export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOString(), loadedBy = null, nonce = randomUUID() }, { env = process.env, fs = nodeFs } = {}) {
+export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOString(), loadedBy = null, nonce = randomUUID(), degradedFastPath }, { env = process.env, fs = nodeFs } = {}) {
   if (!FULL_SHA.test(sha || '') || typeof ref !== 'string' || !Number.isFinite(Date.parse(at))) return false;
   try {
     updatePending(root, env, fs, (list) => [...list.filter((r) => r.ref !== ref
       && Number.isFinite(Date.parse(r.at)) && Date.parse(at) - Date.parse(r.at) < OVERLAY_ADOPTION_TTL_MS)
-      .slice(-(OVERLAY_ADOPTION_MAX_PENDING - 1)), { ref, sha, at, loadedBy, nonce }]);
+      .slice(-(OVERLAY_ADOPTION_MAX_PENDING - 1)), { ref, sha, at, loadedBy, nonce, ...(degradedFastPath ? { degradedFastPath } : {}) }]);
     return true;
   } catch { return false; }
 }
