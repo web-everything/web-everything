@@ -45,14 +45,9 @@ export function readNamedCandidates(runsDir, repo, pr, { list = listRunIds, read
     if (names.includes('archive')) {
       const archiveDir = join(runsDir, 'archive', 'review-pr');
       try {
-        // Historical flat archives have no repo key; legacy ids cannot exclude this PR.
-        if (readdir(archiveDir).some(name => {
-          if (!name.endsWith('.json')) return false;
-          const id = name.slice(0, -5);
-          if (!reviewId(id)) return false;
-          const match = NAME_RE.exec(id);
-          return !match || Number(match[1]) === Number(pr);
-        })) return null;
+        // Flat archives have no verified repo/PR key. Any review filename may
+        // hide this PR's evidence; restore it before proving absence.
+        if (readdir(archiveDir).some(name => name.startsWith('review-pr-') && name.endsWith('.json'))) return null;
       } catch (error) { if (error.code !== 'ENOENT') return null; }
       try {
         if (readdir(join(archiveDir, ...repo.split('/'), String(Number(pr)))).length) return null;

@@ -262,24 +262,27 @@ it('T8 a torn target file is charged and HOLDs despite a valid accept', () => {
   expect(io.ids.length).toBeLessThanOrEqual(2);
 });
 
-it.each(['legacy', 'same-PR named'])('T9 flat %s archived evidence requires restoration and HOLD', kind => {
+it.each(['legacy', 'same-PR named', 'invalid id'])('T9 flat %s archived evidence requires restoration and HOLD', kind => {
   const f = fixture();
   persist(f);
   const archived = record(f, kind === 'legacy' ? { id: 'review-pr-legacy-flat' } : {});
   const directory = join(f.runsDir, 'archive', 'review-pr');
   mkdirSync(directory, { recursive: true });
-  writeFileSync(join(directory, `${archived.id}.json`), JSON.stringify(archived));
+  const filename = kind === 'invalid id' ? 'review-pr-invalid\nname.json' : `${archived.id}.json`;
+  writeFileSync(join(directory, filename), JSON.stringify(archived));
   expect(candidates(f)).toBeNull();
   hold(evidence(f));
 });
 
-it('T9 flat other-N named archived evidence still allows the live review to be found', () => {
-  const f = fixture(), live = persist(f), archived = record(f, { pr: f.pr + 1 });
+it.each(['other PR', 'target PR rejection'])('T9 flat other-N filename with %s payload requires restoration and HOLD', kind => {
+  const f = fixture(); persist(f);
+  const archived = record(f, { id: store.newReviewRunId(f.pr + 1),
+    pr: kind === 'other PR' ? f.pr + 1 : f.pr, verdict: 'reject' });
   const directory = join(f.runsDir, 'archive', 'review-pr');
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, `${archived.id}.json`), JSON.stringify(archived));
-  expect(candidates(f)).toEqual({ ids: [live.id], source: 'names', legacy: 0, mismatch: 0 });
-  found(f, live);
+  expect(candidates(f)).toBeNull();
+  hold(evidence(f));
 });
 
 it('T9 an unreadable flat archive directory gives HOLD', () => {
