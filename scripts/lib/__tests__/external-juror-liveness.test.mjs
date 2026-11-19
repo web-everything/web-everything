@@ -140,7 +140,7 @@ describe('unresponsive advisory skip evidence', () => {
     expect(answer.value.summary).toContain('first-output window 15 ms; cooldown 1000 ms');
     expect(answer.telemetry).toMatchObject({ fallbackDecision: 'skip-provider-unresponsive', firstOutputMs: 15 });
   });
-  it.each(['skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold', 'skip-backend-mismatch', 'skip-model-mismatch'])('skips explicit provider evidence %s', fallbackDecision => {
+  it.each(['skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold', 'skip-backend-mismatch', 'skip-model-mismatch', 'skip-binary-dead'])('skips explicit provider evidence %s', fallbackDecision => {
     const error = agyEvidenceError({ ...evidence, fallbackDecision });
     const judge = createDefaultJudge({ resolveProvider: () => async () => { throw error; }, checkProviderHold: () => null, logGracefulOutcome: () => {} });
     const request = buildReviewAntigravityJudgeRequest({ read: { title: 'fixture', netChangedFiles: [], diffText: 'diff' } });

@@ -923,7 +923,7 @@ export function createDefaultJudge({
         // Missing/malformed output, schema failures and tool denials remain seat failures.
         if (spawnProviderName === 'antigravity' && ![
           'skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold',
-          'skip-backend-mismatch', 'skip-model-mismatch',
+          'skip-backend-mismatch', 'skip-model-mismatch', 'skip-binary-dead',
         ].includes(e?.telemetry?.fallbackDecision)) throw e;
         const reason = `spawn failed — ${String(e?.message ?? e).slice(0, 500)}`;
         logGracefulOutcome(`judge seat crashed, recorded as skipped — ${spawnProviderName}: ${reason}`);
