@@ -389,11 +389,12 @@ export function designTokenSecretFinding(content,{warnings=false}={}) {
 // Pure policy and leaf construction are shared by inventory, warm export and delta.
 export function classifyManifestPath(path) {
   const parts=pathParts(path),names=parts.map(normalizedComponent);
-  // The tracked `.claude/settings.json` (and only it) ships: guard-prep reads it, and a Forge slot without it fails ENOENT.
-  const trackedSettings=names.length===2&&names[0]==='.claude'&&names[1]==='settings.json';
-  const excluded=!trackedSettings&&names.some((name,i)=>excludedComponent(name,i===names.length-1));
-  // Excluded ONLY because of a credential-looking name (see R321 above).
-  const credentialSource=excluded && !names.some((name,i)=>excludedComponent(name,i===names.length-1,true));
+  const excluded=names.some((name,i)=>excludedComponent(name,i===names.length-1));
+  // Excluded ONLY because of a credential-looking name (see R321 above). The raw-byte path `.claude/settings.json`
+  // (guard-prep reads it; a Forge slot without it fails ENOENT) takes the same R321 gate: tracked, identical to
+  // origin/main, and content-scanned. Raw bytes, not normalized names, so look-alike paths never qualify.
+  const credentialSource=excluded && (path.equals(Buffer.from('.claude/settings.json'))
+    || !names.some((name,i)=>excludedComponent(name,i===names.length-1,true)));
   return {parts,names,excluded,credentialSource};
 }
 // Warnings are bounded, scrubbed diagnostics and must never affect dispatch.
