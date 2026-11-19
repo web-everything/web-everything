@@ -4454,6 +4454,11 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     await expect(f.publish()).resolves.toEqual({ ok: true });
     expect(f.runNode).toHaveBeenCalledTimes(1);
   });
+  it.each(['cancelled', 'timed_out', 'action_required'])('still holds when review-gate ended %s', async conclusion => {
+    const f = await run([ok('test'), { ...failed('review-gate'), conclusion }], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
   it('still holds when merge-gate is red without the review-hold annotation', async () => {
     const f = await run([ok('test'), failed('review-gate'), failed('merge-gate')], { requiredChecks: ['test', 'review-gate', 'merge-gate'] });
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });

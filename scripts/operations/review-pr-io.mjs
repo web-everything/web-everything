@@ -1063,7 +1063,9 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
   // review-gate always, merge-gate only when its failure carries the review-hold annotation (never a real hold).
   const annotatedMergeGate = Array.isArray(ci.checks)
     && ci.checks.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
-  const derivedRed = row => ['failure', 'timed_out', 'cancelled', 'action_required'].includes(String(row?.reason).toLowerCase())
+  // Only the plain `failure` conclusion qualifies: timed-out, cancelled and action-required runs are infra or setup
+  // faults, not the gate's by-design red.
+  const derivedRed = row => String(row?.reason).toLowerCase() === 'failure'
     && (row.name === 'review-gate' || (row.name === 'merge-gate' && annotatedMergeGate));
   return Array.isArray(ci.affected) && ci.affected.length > 0
     && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name)

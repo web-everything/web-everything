@@ -226,6 +226,7 @@ describe('settings and row evidence', () => {
       runGh: args => args.at(-1).endsWith('/logs') ? log : job });
     expect(read(colour)).toEqual(read(candidacyWithCodeqlHold));
     expect(read(candidacy + '\u001b]0;x\u0007')).toMatchObject({ error: expect.stringContaining('escape') });
+    expect(read(candidacyWithCodeqlHold.replace(/^(  )(hold)(\s+codeql\s)/m, '$1$2$3\u001b[2K'))).toMatchObject({ error: expect.stringContaining('escape') });
   });
   it('reads and caches immutable job evidence with throttled gh', () => {
     const runGh = vi.fn(args => args.at(-1).endsWith("/logs") ? candidacy : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
