@@ -4729,6 +4729,15 @@ hold gates and include `review-hold-labels` or `review-acceptance`. Candidate-la
 and other incidental holds retain failure. Empty or malformed required rosters always
 return `unknown` with `roster-unavailable`, including persisted options containing the
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
+## Pre-existing audit exemption evidence (R1053)
+
+Keep proof-mode fixtures explicit about `auditPolicy` (`releaseStage`, `requirePayBy`,
+`requireOnMain`); a missing or partial policy must retain findings for human review.
+Pay-by fixtures inject trusted persisted card text through `readCard`, never a date in
+model finding text. A confirmed held card satisfies existence (D5). Security fixtures
+for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
+and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
+stdout/record golden unchanged when changing proof-mode policy.
 
 ## Antigravity binary maintenance
 
