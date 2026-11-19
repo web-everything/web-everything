@@ -120,7 +120,7 @@ export function addedLinesFromPatch(patchText) {
   return result;
 }
 
-export function gatherUiFastLaneEvidence({ cwd, base, head, repo, settings, expectedBase, expectedHead, run = (args, opts) => execFileSync('git', args, opts) }) {
+export function gatherUiFastLaneEvidence({ cwd, base, head, repo, settings, expectedBase, expectedHead, run = (args, opts) => execFileSync('git', args, { ...opts, maxBuffer: 16 * 1024 * 1024 }) }) {
   const opts = { cwd, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
   let stage = 'fetch-failed';
   try {
