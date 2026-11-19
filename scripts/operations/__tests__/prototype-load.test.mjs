@@ -2601,8 +2601,9 @@ describe('canonicalAuditEvidence live fingerprint wiring (R503)', () => {
     const cannedGit = (text) => {
       const seen = [];
       const exec = (cmd, args) => {
-        seen.push(args.slice(2));
-        const verb = args[2];
+        expect(args[2]).toBe('--no-replace-objects');
+        seen.push(args.slice(3));
+        const verb = args[3];
         if (verb === 'rev-parse') return Buffer.from(`${args.at(-1).startsWith('origin/main') ? TREE : SHA}\n`);
         if (verb === 'merge-base') return Buffer.from(`${FORK}\n`);
         if (verb === 'diff') return Buffer.from(text);

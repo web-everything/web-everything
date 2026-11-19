@@ -34,6 +34,12 @@ export function resolveAuditRecordPath(settings, { home, cwd }) {
     : configured === '~' ? home : resolve(cwd, configured);
 }
 
+/** Separate convergence evidence from every full-audit consumer, even for a non-jsonl setting. */
+export function resolveConvergeRecordPath(settings, context) {
+  const path = resolveAuditRecordPath(settings, context);
+  return path.endsWith('.jsonl') ? path.slice(0, -6) + '-converge.jsonl' : path + '-converge.jsonl';
+}
+
 /** The launcher streams JSONL before its final (potentially pretty-printed) JSON report. */
 function readReport(stdout) {
   const text = String(stdout ?? '');
@@ -55,7 +61,48 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
     return result.stdout;
   };
+  const recordPath = () => resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+  const convergeRecordPath = () => resolveConvergeRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
   return {
+    recordPath, convergeRecordPath,
+    readRecords(path) {
+      let contents;
+      try { contents = fs.readFileSync(path, 'utf8'); }
+      catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
+      return contents.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+    },
+    refsPointingAt: head => run('git', ['for-each-ref', `--points-at=${head}`, '--format=%(refname:short)', 'refs/remotes/origin/'], 30_000)
+      .split(/\r?\n/).filter(Boolean).map(ref => ref.replace(/^origin\//, '')),
+    isShallow() {
+      const value = run('git', ['rev-parse', '--is-shallow-repository'], 30_000).trim();
+      if (!['true', 'false'].includes(value)) throw new Error('audit shallow status unavailable');
+      return value === 'true';
+    },
+    remoteMainSha() {
+      const output = run('git', ['ls-remote', 'origin', 'refs/heads/main'], 30_000);
+      const match = /^([0-9a-fA-F]{40})\trefs\/heads\/main\r?\n?$/.exec(output);
+      if (!match || match[0] !== output) throw new Error('audit remote main unavailable');
+      return match[1].toLowerCase();
+    },
+    hasCommit(sha) {
+      run('git', ['--no-replace-objects', 'cat-file', '-e', `${sha}^{commit}`], 30_000,
+        { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' });
+      return true;
+    },
+    isAncestor(prior, head) {
+      // A fresh directory guarantees this graft path does not exist, regardless of repo config.
+      const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-history-'));
+      try {
+        const result = spawnSync('git', ['--no-replace-objects', 'merge-base', '--is-ancestor', prior, head], {
+          cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+          env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: join(scratch, 'no-grafts') },
+        });
+        if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
+        return result.status === 0;
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
+      }
+    },
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
@@ -72,7 +119,8 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
-          { ...process.env, GIT_INDEX_FILE: scratchIndex }));
+          { ...process.env, GIT_INDEX_FILE: scratchIndex, GIT_NO_REPLACE_OBJECTS: '1',
+            GIT_GRAFT_FILE: join(scratch, 'no-grafts') }));
         if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
           throw new Error('Codex failed or returned incomplete evidence');
         }
@@ -81,8 +129,8 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.rmSync(scratch, { recursive: true, force: true });
       }
     },
-    appendRecord(record) {
-      const path = resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+    appendRecord(record, path = recordPath()) {
+      if (record.mode === 'converge') path = convergeRecordPath();
       fs.mkdirSync(dirname(path), { recursive: true });
       fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
     },

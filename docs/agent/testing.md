@@ -4931,3 +4931,65 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Audit convergence evidence (R1081)
+
+Convergence uses every full-ledger record for the ref whose head is an ancestor of the
+requested head; the latest appended qualifying record anchors the delta only with explicit
+`mode: full` and `reviewCommand: hardened-v1` (exported as `REVIEW_COMMAND`).
+A legacy or unknown review command on that latest record exits 2: "latest full audit
+predates hardened review; run a full audit"; never fall back to an older hardened anchor.
+Valid legacy full records still contribute all findings to the re-check union. Converge records
+are write-only and never influence selection. Validate every used record's full mode (or
+absent mode), current canonical question hash, verdict, non-conflicting string findings,
+commit SHAs and timestamp (at most five minutes ahead). A WEAKENED record without findings
+fails closed with exit 3; malformed evidence requires retry or human review of the full diff.
+An unreadable candidate head also fails closed rather than silently excluding its findings.
+Missing anchors, exact-head anchors, no ancestral heads and empty full audits (`base === head`,
+including older union members) require a full audit (exit 2). Independently require
+`isAncestor(record.base, record.head)` for every used record (exit 2 on false). Before any
+ancestry check, reject shallow repositories (exit 2; fetch origin first to unshallow).
+Normalize resolved, recorded and remote-main SHAs to lowercase before convergence comparisons
+and Git calls, including union membership, empty-audit and exact-head refusals and anchor lineage.
+Ancestry and the auditor environment disable replace objects and point `GIT_GRAFT_FILE`
+at a nonexistent scratch path alongside the isolated `GIT_INDEX_FILE`.
+Read main via `git ls-remote origin refs/heads/main`, accepting exactly one 40-hex main line
+(failure or malformed output exits 3). Require that commit locally with `git cat-file -e`
+(exit 2, "fetch origin first"); never trust local `origin/main` for coverage. Require
+`isAncestor(anchor.base, base)`, `isAncestor(base, mainLine)` and
+`isAncestor(anchor.head, head)`. Failed coverage checks exit 2 with
+"converge needs a main-line base covered by the last full audit; run a full audit".
+The anchor's full `anchor.base...anchor.head` review and the `anchor.head..head` delta
+cover all branch-only changes of `base...head` when the requested base is on main and
+covered by the anchor base. Stacked branches whose base is off main use full audits;
+selecting a later anchor alone cannot bridge a gap between B→A and C→D audits.
+
+Every round reviews the unrestricted `git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text --no-renames <anchor.head> <head>` and the
+exact-text deduplicated union of every used record's findings, including previously FIXED
+findings. An older broad audit's findings survive a later audit with a narrower base and
+fewer findings. Cite each source record's timestamp and head inside the untrusted findings
+fence; keep the validated delta command outside it. Every distinct finding needs exactly
+one exact-text FIXED/OPEN disposition; NEW reports delta weakening. Missing, duplicate,
+unknown or unprefixed dispositions and inconsistent verdicts fail closed. Named tests cover
+the narrowed-base union, cross-record deduplication, malformed older members and invalid
+base/head lineage for both anchors and older members, asserting the ancestry calls.
+Keep these paths covered in `codex-audit-converge.test.mjs`; real Git regressions in
+`codex-audit-io-real.test.mjs` cover forward/backward bases, reverted guards, renames and
+`<material>.mjs` remaining in scope even when the requested base advances to head on main.
+Named regressions refuse discontinuous B→A then C→D coverage, off-main requested bases,
+empty anchors and older union records, shallow history, missing local main and failed remote reads.
+Delta assertions pin every protection flag; real Git probes cover binary attributes, replace refs and grafts.
+Subdirectory execution with `diff.relative=true`, external diff drivers, text conversion and
+submodule-ignore settings cannot narrow the delta; auditor Git commands ignore replace refs and grafts.
+Full prompts name `git --no-replace-objects diff --no-relative --no-ext-diff --no-textconv --ignore-submodules=none --text <base>...<head>`.
+The canonical question hash stays stable: hardened full-pass instructions live outside its text.
+Full records store the hardened review marker. The shared net-diff fingerprint helper uses
+`--no-relative` plus its existing diff flags and `--end-of-options` (never `--text`: the binary
+marker keeps binary replacements of mechanical files such as test-timings.json visible); every Git call
+uses `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS=1` and a fresh nonexistent graft path.
+Real Git tests pin subdirectory/relative-config invariance. Old fingerprints may fail to
+carry and require a fresh audit; gate consumer selection rules remain unchanged.
+
+Canonical audit lookup rejects non-full positive records even with the current question hash,
+while current-question negative records still block prior-hash fallback regardless of mode.
+Keep both directions parameterized in `codex-audit-converge.test.mjs`.
