@@ -3420,22 +3420,14 @@ export function planReconcile({
                 : `PR #${prNumber}: ci-heal escalated on head \`${escalation.headSha}\` — ${escalation.reason || 'needs a human judgment call'}; will not re-dispatch until a new push changes this head`,
           });
           if (escalation.outcome === 'needs-human') humanHandoffAdvisory('human-handoff');
-          // Retain the escalation, but let review clear proven derived holds regardless of its outcome.
+          // Retain the escalation and fold the review prerequisite into the same row.
           // A comment claiming CI is irrelevant cannot override a required check's actual result.
-          // merge-gate and review-gate are DERIVED from the review itself and stay red until it lands, so a red
-          // that is only those two (whether or not merge-gate carries the hold annotation) is no CI break.
-          const derivedRollup = Array.isArray(pr.statusCheckRollup)
-            ? pr.statusCheckRollup.map(row => row?.name === 'merge-gate' && !row.mergeGateReviewHold
-              ? { ...row, mergeGateReviewHold: { derived: true } } : row)
-            : pr.statusCheckRollup;
-          const derivedGateOnlyRed = reviewHoldOnlyRed(derivedRollup, requiredChecks, pr.headRefOid);
-          if ((isNotCiBreak || derivedGateOnlyRed) && withPhase.labels.includes('review:pending')) {
-            const markerKey = isNotCiBreak ? 'ciHealNotCiBreak' : 'derivedGateOnlyRed';
-            const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, markerKey);
+          if (isNotCiBreak && withPhase.labels.includes('review:pending')) {
+            const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'ciHealNotCiBreak');
             dispatchReviewRow({
-              pr: isNotCiBreak ? pr : { ...pr, statusCheckRollup: derivedRollup }, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
               refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
-              extra: { [markerKey]: true },
+              extra: { ciHealNotCiBreak: true },
             });
           }
           continue;
