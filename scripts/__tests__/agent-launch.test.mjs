@@ -487,3 +487,49 @@ describe('registry identity predicates match the gh shim daemon reader', () => {
     }
   });
 });
+
+describe('#7022 audit escapes are closed by construction', () => {
+  it('escape 1: a shell with argv0 "-bash" is refused before spawn, as agent and as a field', () => {
+    refused({ agent: 'bash', cwd, argv0: '-bash' }, /agent/);
+    refused({ ...base(), argv0: '-bash' }, /argv0/);
+    refused({ ...claude(), argv0: '-bash' }, /argv0/);
+  });
+  it('escape 2: GIT_SSH and the other git exec-redirect vars never reach the child, from either source', () => {
+    const redirects = ['GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'GIT_EXTERNAL_DIFF',
+      'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'GIT_PAGER', 'GIT_TEMPLATE_DIR', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+      'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
+    const bag = Object.fromEntries(redirects.map(name => [name, '/tmp/evil']));
+    for (const name of redirects) vi.stubEnv(name, '/tmp/evil');
+    const { env } = buildAgentInvocation({ ...base(), inheritEnv: bag }, seam()).options;
+    for (const name of redirects) expect(env, name).not.toHaveProperty(name);
+    for (const name of redirects) expect(registry[name]?.class ?? registry['GIT_*'].class, name).toBe('drop');
+  });
+  it('escape 3: shell argv held in a variable has no way in; the descriptor has no argv and no shell agent', () => {
+    const shellArgv = ['-c', `claude --resume ${SID}`];
+    refused({ agent: 'sh', cwd, args: shellArgv }, /agent/);
+    for (const field of ['args', 'argv', 'command', 'spawnArgs']) refused({ ...base(), [field]: shellArgv }, new RegExp(field));
+    refused({ ...claude(), prompt: shellArgv }, /prompt/);
+    const io = seam(); launchAgent(base(), io);
+    const [file, args, options] = io.spawn.mock.calls[0];
+    expect([file, ...args]).not.toContain('sh');
+    expect(args).not.toContain('-c');
+    expect(options.shell).toBe(false);
+  });
+});
+
+describe('final audit: transport allowlist and bag-only limits', () => {
+  const envOf = inheritEnv => buildAgentInvocation({ ...base(), ...(inheritEnv ? { inheritEnv } : {}) }, seam()).options.env;
+  it('forwards the parent GIT_ALLOW_PROTOCOL and ignores a caller value that could add ext', () => {
+    vi.stubEnv('GIT_ALLOW_PROTOCOL', 'https');
+    expect(envOf({ GIT_ALLOW_PROTOCOL: 'https:ext' }).GIT_ALLOW_PROTOCOL).toBe('https');
+    clearEnv('GIT_ALLOW_PROTOCOL');
+    expect(envOf({ GIT_ALLOW_PROTOCOL: 'ext' })).not.toHaveProperty('GIT_ALLOW_PROTOCOL');
+  });
+  it('drops a bag-only numeric limit so the child resolves the same configured policy as the parent', () => {
+    expect(envOf({ WE_GH_THROTTLE_CAP: '3' })).not.toHaveProperty('WE_GH_THROTTLE_CAP');
+    expect(envOf({ WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN: '1' })).not.toHaveProperty('WE_GH_THROTTLE_WRITE_BUDGET_PER_MIN');
+    vi.stubEnv('WE_GH_THROTTLE_CAP', '8');
+    expect(envOf({ WE_GH_THROTTLE_CAP: '3' }).WE_GH_THROTTLE_CAP).toBe('3');
+    expect(envOf({ WE_GH_THROTTLE_CAP: '20' }).WE_GH_THROTTLE_CAP).toBe('8');
+  });
+});

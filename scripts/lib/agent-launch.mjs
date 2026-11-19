@@ -118,8 +118,11 @@ function inheritedEnv(inherit, ambient) {
     // Parent verification selectors are evidence, not caller capabilities.
     if (rule?.ambientOnly) continue;
     const parent = rule?.tighterThan ? quantity(ambient[key], rule.tighterThan) : NaN;
+    // A bag limit with no parent env value is dropped: env beats tool settings, so even a value below the code
+    // default could relax a stricter configured policy. The child then resolves the same policy as the parent.
+    if (rule?.tighterThan && !Number.isFinite(parent)) continue;
     // A valid resolved parent limit is the ceiling, even above the code default.
-    const cls = classOf(rule, value, Number.isFinite(parent) ? parent : rule?.tighterThan?.default);
+    const cls = classOf(rule, value, parent);
     if (cls === 'forward' || cls === 'forward-restrictive') out[key] = checked(rule, value, key);
   }
   for (const [key, value] of Object.entries(ambient)) {

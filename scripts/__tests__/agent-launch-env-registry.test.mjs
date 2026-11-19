@@ -133,7 +133,7 @@ describe('agent environment registry drift', () => {
     }
     expect(registry.LANE_POOL_ROOT).toMatchObject({ value: 'absolute-path', precedence: 'bag' });
     expect(registry.WE_GH_THROTTLE_LOCK_ROOT).toMatchObject({ value: 'absolute-path', precedence: 'ambient' });
-    for (const name of ['DIFF_COVERAGE_BASE', 'VERIFY_SCAN_FILES']) {
+    for (const name of ['DIFF_COVERAGE_BASE', 'VERIFY_SCAN_FILES', 'GIT_ALLOW_PROTOCOL']) {
       expect(registry[name]).toMatchObject({ class: 'forward-restrictive', precedence: 'ambient', ambientOnly: true });
     }
     expect(validRule({ class: 'drop', why: 'limit', tighterThan: { default: 50, unit: 'count', evidence: 'a:1', zeroIsStrict: true } })).toBe(true);
@@ -195,6 +195,7 @@ describe('exhaustive restrictive registry projection', () => {
   it.each([
     ['DIFF_COVERAGE_BASE', 'sec1-nonexistent-coverage-base', 'HEAD'],
     ['VERIFY_SCAN_FILES', '["parent.mjs"]', '["bag.mjs"]'],
+    ['GIT_ALLOW_PROTOCOL', 'https', 'https:ext'],
     ['WE_DAEMON_OVERLAY_STACK_BASES', '{"topic":"parent"}', '{}'],
     ['FAKE_GH_FIXTURE', 'parent-fixture', 'bag-fixture'],
     ['DELIVERY_SESSION', 'parent-session', 'bag-session'],
@@ -254,8 +255,12 @@ describe('exhaustive restrictive registry projection', () => {
     const relaxing = ['', ' \t\n', 'unknown-relaxation', ...(numeric
       ? [...(numeric.zeroIsStrict ? [] : ['0']), '-1', 'Infinity', 'NaN', 'unlimited', String(numeric.default), String(numeric.default * 2), '1e309', '0x1', '1garbage'] : [])];
     if (hasTightening) {
-      if (rule.ambientOnly) expect(childEnv({ [name]: parent }), 'bag-only selector').not.toHaveProperty(name);
+      if (rule.ambientOnly || numeric) expect(childEnv({ [name]: parent }), 'bag-only restriction without ambient evidence').not.toHaveProperty(name);
       else expect(childEnv({ [name]: parent })[name], 'bag-only restriction').toBe(parent);
+      if (numeric) {
+        vi.stubEnv(name, 'invalid');
+        expect(childEnv({ [name]: parent }), 'invalid ambient cannot authorize a bag limit').not.toHaveProperty(name);
+      }
       vi.stubEnv(name, parent);
       expect(childEnv({})[name], 'omitted bag restriction').toBe(parent);
       for (const value of (rule.value ? [''] : relaxing)) expect(childEnv({ [name]: value })[name], value).toBe(parent);
@@ -293,6 +298,8 @@ describe('exhaustive restrictive registry projection', () => {
     ['WE_HEAVY_ADMISSION_CONTAINER_MEMORY', '1g', '1073741824'],
   ])('keeps the tighter quantity for %s=%s', (name, value, expected) => {
     clearEnv(name);
+    expect(childEnv({ [name]: value })).not.toHaveProperty(name);
+    vi.stubEnv(name, String(registry[name].tighterThan.default));
     expect(childEnv({ [name]: value })[name]).toBe(expected);
     vi.stubEnv(name, value);
     expect(childEnv({ [name]: 'unlimited' })[name]).toBe(expected);
@@ -323,14 +330,18 @@ describe('exhaustive restrictive registry projection', () => {
     }
   });
   it.each([
-    [undefined, '8', undefined], ['8', undefined, '8'], ['8', '20', '8'],
+    [undefined, '8', undefined], [undefined, '3', undefined], ['8', undefined, '8'], ['8', '20', '8'],
     ['8', '3', '3'], ['8', '7', '7'], ['8', '8', '8'], ['8', 'invalid', '8'],
-    ['invalid', '8', undefined], ['invalid', '3', '3'],
+    ['invalid', '8', undefined], ['invalid', '3', undefined],
   ])('respects resolved gh cap: ambient %s, bag %s => %s despite tool cap 10', (parent, bag, expected) => {
-    if (parent !== undefined) vi.stubEnv('WE_GH_THROTTLE_CAP', parent);
+    if (parent === undefined) clearEnv('WE_GH_THROTTLE_CAP');
+    else vi.stubEnv('WE_GH_THROTTLE_CAP', parent);
     const env = childEnv(bag === undefined ? {} : { WE_GH_THROTTLE_CAP: bag });
-    if (expected === undefined) expect(env).not.toHaveProperty('WE_GH_THROTTLE_CAP');
-    else {
+    if (expected === undefined) {
+      expect(env).not.toHaveProperty('WE_GH_THROTTLE_CAP');
+      expect(resolveGhCap(env, { tool: { cap: 10 } })).toBe(10);
+      expect(resolveGhCap(env, { tool: { cap: 1 } })).toBe(1);
+    } else {
       expect(env.WE_GH_THROTTLE_CAP).toBe(expected);
       expect(resolveGhCap(env, { tool: { cap: 10 } })).toBe(Number(expected));
     }
@@ -339,6 +350,8 @@ describe('exhaustive restrictive registry projection', () => {
     expect(resolveTmpLeakPolicy({}).max).toBe(50);
     expect(registry.WE_TMP_LEAK_MAX.tighterThan).toMatchObject({ default: 50, zeroIsStrict: true });
     expect(childEnv({ WE_TMP_LEAK_MAX: '100' })).not.toHaveProperty('WE_TMP_LEAK_MAX');
+    expect(childEnv({ WE_TMP_LEAK_MAX: '0' })).not.toHaveProperty('WE_TMP_LEAK_MAX');
+    vi.stubEnv('WE_TMP_LEAK_MAX', '50');
     const env = childEnv({ WE_TMP_LEAK_MAX: '0', WE_TMP_LEAK_MODE: 'fail' });
     expect(env.WE_TMP_LEAK_MAX).toBe('0');
     const policy = resolveTmpLeakPolicy(env);
@@ -355,20 +368,27 @@ describe('exhaustive restrictive registry projection', () => {
     const strict = rule.tighterThan.zeroIsStrict === true;
     for (const value of ['0', '0.0']) {
       clearEnv(name);
+      expect(childEnv({ [name]: value })).not.toHaveProperty(name);
+      const parent = String(rule.tighterThan.default);
+      vi.stubEnv(name, parent);
       const bag = childEnv({ [name]: value });
+      expect(bag[name]).toBe(strict ? '0' : parent);
       vi.stubEnv(name, value);
       const ambient = childEnv({ [name]: 'unlimited' });
-      for (const env of [bag, ambient]) {
-        if (strict) expect(env[name]).toBe('0');
-        else expect(env).not.toHaveProperty(name);
-      }
+      if (strict) expect(ambient[name]).toBe('0');
+      else expect(ambient).not.toHaveProperty(name);
     }
   });
   it('pins the zero-strict sweep to readers: zero wait/backoff and no extra fast slots, never disabled gh caps', () => {
     expect(Object.keys(registry).filter(name => registry[name].tighterThan?.zeroIsStrict).sort()).toEqual([
       'WE_GH_THROTTLE_HEADER_WAIT_CAP_MS', 'WE_GH_THROTTLE_RETRY_CAP_MS', 'WE_HEAVY_ADMISSION_FAST_SLOTS', 'WE_TMP_LEAK_MAX',
     ]);
-    expect(resolveHeaderWaitCapMs({ WE_GH_THROTTLE_HEADER_WAIT_CAP_MS: '0' })).toBe(0);
+    for (const name of ['WE_GH_THROTTLE_HEADER_WAIT_CAP_MS', 'WE_GH_THROTTLE_RETRY_CAP_MS', 'WE_HEAVY_ADMISSION_FAST_SLOTS']) {
+      expect(childEnv({ [name]: '0' })).not.toHaveProperty(name);
+      vi.stubEnv(name, String(registry[name].tighterThan.default));
+      expect(childEnv({ [name]: '0' })[name]).toBe('0');
+    }
+    expect(resolveHeaderWaitCapMs(childEnv({ WE_GH_THROTTLE_HEADER_WAIT_CAP_MS: '0' }))).toBe(0);
     expect(retryBackoffMs(2, { capMs: Number(childEnv({ WE_GH_THROTTLE_RETRY_CAP_MS: '0' }).WE_GH_THROTTLE_RETRY_CAP_MS) })).toBe(0);
     expect(resolveSlotSpan({ cap: 2, fastSlots: Number(childEnv({ WE_HEAVY_ADMISSION_FAST_SLOTS: '0' }).WE_HEAVY_ADMISSION_FAST_SLOTS) })).toBe(2);
     const policy = loadGhThrottleSettings({ file: {}, env: { WE_GH_THROTTLE_MAX_HOLD_SECONDS: '0', WE_GH_THROTTLE_PER_CALLER_MAX: '0' } }).value;
