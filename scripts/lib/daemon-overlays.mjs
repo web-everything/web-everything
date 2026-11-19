@@ -288,6 +288,7 @@ export function addOverlay(root, {
       if (bases) next.stackBases = bases;
       if (conflictOverride) next.conflictOverride = conflictOverride;
       if (deps) next.dependsOn = deps;
+      else if (dependsOn !== undefined) delete next.dependsOn; // a malformed update voids the old declaration (unknown)
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });

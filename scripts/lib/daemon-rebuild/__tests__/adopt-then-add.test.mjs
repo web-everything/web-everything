@@ -72,6 +72,8 @@ describe('addOverlay dependsOn', () => {
       expect(list.find((o) => o.ref === 'lane/x').dependsOn).toEqual(['lane/y']);
       expect(list.find((o) => o.ref === 'lane/m')).not.toHaveProperty('dependsOn'); // malformed: undeclared, not narrowed
       expect(list.find((o) => o.ref === 'lane/z')).not.toHaveProperty('dependsOn');
+      addOverlay(root, { ref: 'lane/x', dependsOn: ['bad ref!'] }, { env }); // malformed update voids the old declaration
+      expect(readOverlays(root, { env }).find((o) => o.ref === 'lane/x')).not.toHaveProperty('dependsOn');
       addOverlay(root, { ref: 'lane/w', dependsOn: [] }, { env });
       expect(readOverlays(root, { env }).find((o) => o.ref === 'lane/w').dependsOn).toEqual([]);
     } finally { rmSync(root, { recursive: true, force: true }); }
