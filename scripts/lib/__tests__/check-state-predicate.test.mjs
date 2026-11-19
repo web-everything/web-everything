@@ -7,6 +7,8 @@ import {
   summarize,
 } from '../check-state-predicate.mjs';
 
+import { mapGraphqlPr } from '../pr-list-paged.mjs';
+
 // Independent oracle: expectations never come from CHECK_STATE_TABLE.
 const completedOutcomes = {
   success: 'green',
@@ -1029,5 +1031,28 @@ describe('audit: roster and human-hold refusal paths', () => {
       expect(resolveRequiredChecks({ ...evidence, ...options }))
         .toMatchObject({ state, perName: { 'merge-gate': { state } } });
     }
+  });
+});
+
+
+describe('mapped GraphQL check evidence', () => {
+  it.each([
+    ['IN_PROGRESS', null, 'pending'],
+    ['QUEUED', null, 'pending'],
+    ['COMPLETED', 'SUCCESS', 'pass'],
+    ['IN_PROGRESS', 'success', 'unknown'],
+  ])('resolves %s with conclusion %s as %s', (status, conclusion, state) => {
+    const head = 'a'.repeat(40);
+    const pr = mapGraphqlPr({ headRefOid: head, commits: { nodes: [{ commit: {
+      oid: head, statusCheckRollup: { contexts: {
+        pageInfo: { hasNextPage: false }, totalCount: 1,
+        nodes: [{ __typename: 'CheckRun', name: 'test', status, conclusion }],
+      } },
+    } }] } });
+    expect(pr).toMatchObject({ rowsHead: head, rowsComplete: true });
+    const result = resolveRequiredChecks({ rows: pr.statusCheckRollup, rowsHead: pr.rowsHead,
+      rowsComplete: pr.rowsComplete, head: pr.headRefOid, requiredNames: ['test'], rosterSource: 'live' });
+    expect(result.state).toBe(state);
+    if (state === 'pending') expect(result.perName.test.reasons).not.toContain('malformed');
   });
 });

@@ -1839,6 +1839,30 @@ describe('case 5f — conflict-fix dispatch, capped by its OWN durable marker, n
     ...over,
   });
 
+  it.each([
+    ['main', 'main', 'clean', true],
+    ['main', 'main', 'manifest-only', true],
+    ['main', 'lane/stacked-base', 'clean', false],
+    ['main', 'lane/stacked-base', 'manifest-only', false],
+    ['main', 'main', 'real', false],
+    ['main', 'main', 'unsupported', false],
+    ['main', 'main', undefined, false],
+    ['main', 'main', null, false],
+    ['main', undefined, 'clean', false],
+    ['trunk', 'trunk', 'clean', true],
+    ['trunk', 'main', 'manifest-only', false],
+  ])('conflictFixMechanical requires the default base and an allowed disposition (default=%s, base=%s, disposition=%s → %s)',
+    (defaultBranch, baseRefName, conflictDisposition, expected) => {
+      const plan = planReconcile({
+        prs: [prConflict({ baseRefName, conflictDisposition, comments: [finding()] })],
+        agents: [], now: NOW, defaultBranch,
+      });
+      expect(plan.refusals).toEqual([]);
+      expect(plan.dispatch).toEqual([expect.objectContaining({
+        kind: 'fix', prNumber: 2549, isConflict: true, conflictFixMechanical: expected,
+      })]);
+    });
+
   it('a conflict-labelled bounce with zero prior conflict-fix rounds is dispatched `fix`, even though the shared cap is fully spent', () => {
     // Flood the thread with REARM/advisory markers past `NEGOTIATION_ROUND_CAP` — the shared cap this bounce
     // would otherwise be refused on — and confirm it still dispatches, because the conflict-fix cap reads its
