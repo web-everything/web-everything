@@ -13,7 +13,7 @@ import {
 } from './lease.mjs';
 import {
   staleAlertDetail, matchReadyCandidate, readyBuildVerified, finalizeRebuild, dropSuspectOverlays,
-  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
+  overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate, classifyOverlayRemoval,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
 import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
@@ -647,6 +647,25 @@ export async function prepareRebuild({
           const readyMs = Date.parse(ready.at ?? ready.passedAt ?? '');
           return Number.isFinite(retiredMs) && Number.isFinite(readyMs) && retiredMs < readyMs;
         },
+        // Adopt the build that passed, then add: benign removals (merged/no longer wanted) and still-registered overlays the
+        // build omits queue an incremental rebuild instead of discarding the build; safety/unknown removals still discard.
+        // A mainOnly rebuild wants no overlay at all, so a candidate carrying any is never adopted for a removed one.
+        removalSafety: mainOnly ? () => 'unknown' : (ref, sha) => classifyOverlayRemoval({
+          ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
+        }),
+        // Registered NOW (the on-disk registry, not the tick-start snapshot): a removal made during planning is not re-added.
+        readdable: (ref) => {
+          if (!wantedRefs.has(ref) || !registeredRefs.has(ref)) return false;
+          try {
+            const live = readOverlayState(root, { env });
+            return !live.corrupt && live.overlays.some((o) => o?.ref === ref);
+          } catch { return false; }
+        },
+        // null = no declaration recorded (legacy/unknown): the omission check refuses rather than assume "none".
+        dependsOn: (ref) => {
+          const deps = (overlaysBefore || []).find((o) => o?.ref === ref)?.dependsOn;
+          return Array.isArray(deps) && deps.every((d) => typeof d === 'string' && d.trim()) ? deps : null; // malformed = unknown
+        },
         // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
@@ -682,6 +701,7 @@ export async function prepareRebuild({
           target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
           ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
           ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
+          ...(m.rebuildAfter?.length ? { rebuildAfter: m.rebuildAfter } : {}),
         });
         writeState();
         const fin = await finalizeRebuild({

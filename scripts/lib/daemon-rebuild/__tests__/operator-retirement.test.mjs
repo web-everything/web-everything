@@ -197,6 +197,10 @@ describe('operator retirement of a live overlay', () => {
       if (removal === 'operator-retired' || removal === 'retirement-recorded-during-plan') {
         expect(result).toMatchObject({ adopt: { finalSha: candidate }, retired: [ref] });
         expect(finalize).toHaveBeenCalledOnce();
+      } else if (removal === 're-registered') {
+        // Adopt the build that passed, then add: the overlay is registered again, so the next rebuild carries it.
+        expect(result).toMatchObject({ adopt: { finalSha: candidate }, rebuildAfter: [ref] });
+        expect(finalize).toHaveBeenCalledOnce();
       } else {
         refused(result);
         expect(finalize).not.toHaveBeenCalled();
