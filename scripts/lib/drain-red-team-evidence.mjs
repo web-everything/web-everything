@@ -29,7 +29,7 @@ export function pidExistence(pid, kill = (p, s) => process.kill(p, s)) {
   }
 }
 import { redTeamEnabled, redTeamOwedFor, redTeamCardOnly } from './review-red-team-policy.mjs';
-import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead } from './red-team-gate.mjs';
+import { readRedTeamProbes, redTeamForHead, redTeamResultCommentForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
@@ -128,7 +128,7 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
       // Only the review App/bot's own result for THIS head counts (marker pr + rev already matched by the reader);
       // an operator- or foreign-authored comment never releases a merge-gate hold.
       if (!result || result.carriedFrom || !isAutomationAuthored(result.comment)
-        || result.parsed?.pr !== Number(pr) || result.parsed?.rev !== head)
+        || result.parsed?.pr !== Number(pr) || result.parsed?.rev !== head || !isPublishableRedTeamResult(result.parsed))
         return { ok: false, reason: 'no ordinary red-team result on head' };
       const current = latestPublicationStatus(readStatus({ repo, headSha: head, gh: liveGh }), pr);
       if (!current || current.state === 'success') {
@@ -146,7 +146,9 @@ export function settleFinishedPublicationHold({ repo, pr, head, env = process.en
         const createdAt = Date.parse(hold.created_at);
         const threshold = markerStat
           ? Math.max(markerStat.mtimeMs, hold.created_at === undefined ? 0 : createdAt) : createdAt;
-        if (!Number.isFinite(completedAt) || !Number.isFinite(threshold) || completedAt < threshold)
+        // Remote-only: strictly newer, since GitHub timestamps have second precision and an equal time cannot order
+        // two rounds. A marker adds the local ms-precise write time as its own binding.
+        if (!Number.isFinite(completedAt) || !Number.isFinite(threshold) || (markerStat ? completedAt < threshold : completedAt <= threshold))
           return { ok: false, reason: 'red-team check not proven newer than publication hold; operator must inspect publication' };
       }
       const cleared = postHold({ repo, pr, headSha: head, held: false, gh, env });

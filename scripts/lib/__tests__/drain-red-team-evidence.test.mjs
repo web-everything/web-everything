@@ -28,7 +28,7 @@ function fixture() {
     readScorecards: () => [], env: { WE_SHARED_RUNS_DIR: runsDir } };
 }
 const cleanResultComment = f => ({ author: { login: 'web-everything' }, body:
-  `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` });
+  `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found\nThe red team tried to break this change and reported nothing.\nAdvisory only: fixture · recorded verdict \`accept\`.` });
 // Seal at finish (#6535, operator ruling R907): the seat's sealer is the shared publisher in seal-only mode over the
 // exact-head seat row. This one runs it for real over a fixture row and thread.
 const seatRow = (head, findings = []) => ({ rev: head, findings, provider: 'fixture', model: 'fixture', callId: 'c',
@@ -1906,6 +1906,22 @@ describe('finished publication hold recovery', () => {
       expect(settleFinishedPublicationHold(f).ok).toBe(['absent', 'success'].includes(kind));
       expect(f.postHold).not.toHaveBeenCalled();
     });
+  it('refuses an incomplete marker-only result and a check completed in the same second as the hold', () => {
+    const f = setup();
+    f.readComments.mockImplementation(() => [{ author: { login: 'web-everything' }, body:
+      `<!-- we:red-team-advisory pr=${f.pr} rev=${f.head} -->\n### Post-accept red team — no break found` }]);
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false, reason: 'no ordinary red-team result on head' });
+    expect(f.postHold).not.toHaveBeenCalled();
+    f.readComments.mockImplementation(() => [cleanResultComment(f)]);
+    rmSync(f.path);
+    const combined = f.readStatus();
+    combined.statuses[0].description = 'held: queued round not confirmed published';
+    combined.statuses[0].created_at = new Date(1_800_000_001_000).toISOString();
+    f.readStatus.mockReturnValue(combined);
+    expect(settleFinishedPublicationHold(f)).toMatchObject({ ok: false,
+      reason: expect.stringContaining('newer than publication hold') });
+    expect(f.postHold).not.toHaveBeenCalled();
+  });
   it('without a marker refuses a check older than the hold and clears a newer check', () => {
     const f = setup();
     rmSync(f.path);
