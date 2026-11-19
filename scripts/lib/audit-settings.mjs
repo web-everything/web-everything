@@ -317,6 +317,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs',
   // The missing-run push reservation is an exclusive-create (`wx`) hold: a race in it double-pushes a recovery.
   'scripts/conveyor/missing-run-push.mjs',
+  // The AGY usage reader writes its record through an exclusive-create (`wx`) temp file before the rename.
+  'scripts/operations/agy-usage-reader.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
