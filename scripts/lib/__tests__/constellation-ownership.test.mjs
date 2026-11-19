@@ -116,13 +116,24 @@ describe('constellation ownership', () => {
     }
   });
 
-  it('counts a Forge-projected directory as one file and one line', () => {
+  it('counts a Forge-projected directory with index mode 120000 as one file and one line', () => {
     const scratch = mkdtempSync(join(tmpdir(), 'constellation-ownership-'));
     try {
       writeFileSync(join(scratch, 'child.txt'), 'one\ntwo\nthree\n');
       const path = relative(root, scratch);
-      expect(readTracked(path)).toEqual(Buffer.from(path));
-      expect(totals([{ path, destination: 'plateau' }]).plateau).toEqual({ files: 1, lines: 1 });
+      const read = path => readTracked(path, undefined, () => '120000');
+      expect(read(path)).toEqual(Buffer.from(path));
+      expect(totals([{ path, destination: 'plateau' }], read).plateau).toEqual({ files: 1, lines: 1 });
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['100644', undefined])('rejects a directory with non-symlink or missing index mode %s', mode => {
+    const scratch = mkdtempSync(join(tmpdir(), 'constellation-ownership-'));
+    try {
+      const path = relative(root, scratch);
+      expect(() => readTracked(path, undefined, () => mode)).toThrow(`Cannot count non-file: ${path}`);
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
