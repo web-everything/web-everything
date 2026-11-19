@@ -943,7 +943,22 @@ export async function runInfraBlocked(argv, { admission, readContext } = {}) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  runInfraBlocked(process.argv.slice(2)).then((code) => process.exit(code || 0)).catch((e) => {
+  // Load driver policy only for the CLI, never when the watchdog imports the
+  // state/backoff helpers. Non-literal templates keep this CLI-only boundary out
+  // of the watchdog's static graph. Keep the explicit .mjs suffix: Vite otherwise
+  // prepends a query helper before this file's shebang during its web transform.
+  const runCli = async () => {
+    const argv = process.argv.slice(2);
+    if (parseArgv(argv).pos[0] !== 'retry') return runInfraBlocked(argv);
+    const admissionModule = 'runtime-admission';
+    const authorshipModule = 'build-pr-authorship';
+    const [admission, authorship] = await Promise.all([
+      import(/* @vite-ignore */ `../lib/${admissionModule}.mjs`),
+      import(/* @vite-ignore */ `../operations/${authorshipModule}.mjs`),
+    ]);
+    return runInfraBlocked(argv, { admission, readContext: authorship.producerBuildContext });
+  };
+  runCli().then((code) => process.exit(code || 0)).catch((e) => {
     process.stderr.write(`infra-blocked: ${String(e?.message || e)}\n`);
     process.exit(1);
   });

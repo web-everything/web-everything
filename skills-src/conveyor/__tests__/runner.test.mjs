@@ -629,7 +629,7 @@ describe('makeCliMechanicalPasses — invokes the exact set of mechanical passes
     // assertion goes red, which is the whole point (a `grep` for the added line, this PR's own backlog card
     // cited as its only prior check, catches none of that).
     expect(calls.filter((c) => c[0] === 'node').map((c) => c.filter((a) => !a.startsWith('--prs-file=')).join(' '))).toEqual([
-      'node /skills-src/conveyor/build-dispatch-daemon.mjs --infra-retry retry --repo=web-everything/web-everything',
+      'node /scripts/conveyor/infra-blocked.mjs retry --repo=web-everything/web-everything',
       'node /scripts/conveyor/lease-reaper.mjs --repo=web-everything/web-everything',
       'node /scripts/conveyor/session-reaper.mjs --repo=web-everything/web-everything',
       'node /scripts/conveyor/branch-drift.mjs sweep --repo=web-everything/web-everything',
@@ -852,7 +852,7 @@ describe('makeCliMechanicalPasses — skipPasses omits exactly the named pass(es
   it('skipping "lane-pool-health-watch" omits only that one script', async () => {
     const paths = await runWithSkip(new Set(['lane-pool-health-watch']));
     expect(paths).not.toContain('/scripts/conveyor/lane-pool-health-watch.mjs');
-    expect(paths).toContain('/skills-src/conveyor/build-dispatch-daemon.mjs');
+    expect(paths).toContain('/scripts/conveyor/infra-blocked.mjs');
   });
 
   it('skipping "reconcile-pass" drops the WHOLE group — reconcile-pass, review-dispatch, AND review-round-tag — as one unit', async () => {
@@ -875,7 +875,7 @@ describe('makeCliMechanicalPasses — skipPasses omits exactly the named pass(es
       '/scripts/conveyor/lane-pool-health-watch.mjs',
     ]) expect(paths).not.toContain(gone);
     for (const kept of [
-      '/skills-src/conveyor/build-dispatch-daemon.mjs', '/scripts/conveyor/lease-reaper.mjs',
+      '/scripts/conveyor/infra-blocked.mjs', '/scripts/conveyor/lease-reaper.mjs',
       '/scripts/conveyor/session-reaper.mjs', '/scripts/conveyor/branch-drift.mjs',
       '/scripts/conveyor/ci-queue-watch.mjs', '/scripts/conveyor/advisory-label-sweep.mjs',
       '/scripts/conveyor/duplicate-pr-watch.mjs', '/scripts/conveyor/parked-pr-progress-watch.mjs',

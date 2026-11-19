@@ -374,7 +374,7 @@ export function makeCliMechanicalPasses({
       return job;
     };
     // WE-only: retries WE backlog infrastructure holds.
-    if (!skip('infra-blocked')) run('../skills-src/conveyor/build-dispatch-daemon.mjs', ['--infra-retry', 'retry'], 'we', repo, false, 'infra-blocked');
+    if (!skip('infra-blocked')) run('conveyor/infra-blocked.mjs', ['retry'], 'we', repo);
     // WE-only: reaps the WE delivery pool's leases.
     if (!skip('lease-reaper')) run('conveyor/lease-reaper.mjs', [], 'we', repo);
     // WE-only invocation: session ground truth already resolves repo-aware slugs.

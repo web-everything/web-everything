@@ -4748,10 +4748,21 @@ in `build-dispatch-orphan-adopt.test.mjs` prove a later tick sees dead work and 
 ## Infra recovery admission injection and watchdog isolation
 
 `infra-blocked.mjs` belongs to the watchdog's pinned small import closure. Keep runtime
-admission policy imports in the build daemon, which launches its `--infra-retry` child
-entry point and injects the historical context reader and both shared admission functions into `runInfraBlocked` and
-`resumeOpen`. Direct recovery without a complete adapter refuses before subprocess IO;
-retry through the build daemon to restore the policy boundary. Preserve the named
+admission policy imports out of its library import path. The build daemon's `--infra-retry`
+entry injects the historical context reader and both shared admission functions into `runInfraBlocked` and
+`resumeOpen`. The runner retains its historical `infra-blocked.mjs retry` command; that CLI's
+main guard loads the same adapter and context reader through template imports only when running `retry`.
+Keep non-literal template specifiers with an explicit `.mjs` suffix and `@vite-ignore`: Vitest's web
+transform otherwise prepends a query helper before the shebang, causing SSR parsing to fail.
+Literal dynamic imports are followed by the watchdog graph scanner even inside the CLI guard.
+The CLI adapter-load failure regression must exit nonzero without changing recovery state;
+never fall back to recovery without admission.
+These CLI-only imports do not execute on watchdog import; closure tools unable to resolve template
+imports must continue treating that closure as incomplete. Direct library recovery without a
+complete adapter refuses before subprocess IO; retry through either CLI entry to restore the policy boundary.
+`infra-blocked.test.mjs` exercises the actual CLI with absent/lift runtime settings (including exact
+producer argv), an empty allowlist, and malformed settings, with subprocess and network effects stubbed.
+Preserve the named
 `withRuntimeAdmission` callback at the process primitive so the spawn inventory still
 recognizes fresh admission. `infra-blocked.test.mjs` covers absent/partial adapters;
 `runtime-admission.test.mjs` covers injected whole-group and final-read refusals;
