@@ -1,7 +1,7 @@
 import { test, expect } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
 import { requestHotPatch, readHotPatch, recordVerifyResult, recordHotPatchPr, hotPatchPath } from '../hot-patch.mjs';
@@ -115,4 +115,73 @@ test('merged PR closure requires prior linkage verified for the current SHA, inc
       { decisions: [{ ref: 'lane/hot', pr: 42, reason: 'pr-merged' }] }, () => { closed++; }, '', {});
     expect(closed).toBe(expected);
   }
+});
+
+import { classifyHotPatch } from '../hot-patch.mjs';
+import { hotPatchDefaults, neverPatchFloor, resolveHotPatchSettings } from '../hot-patch-settings.mjs';
+
+const root = process.cwd();
+const lib = resolve(root, 'scripts/lib');
+const repoPath = path => relative(root, path).split(sep).join('/');
+const requiredFloor = [
+  'scripts/lib/daemon-live-smoke.mjs',
+  'scripts/lib/daemon-rebuild/audited-tip.mjs',
+  'scripts/lib/daemon-rebuild/evidence-readers.mjs',
+];
+
+test('round3: the immutable module floor is derived from the JSON list', () => {
+  const json = JSON.parse(readFileSync(resolve(lib, 'hot-patch-settings.json'), 'utf8'));
+  expect(neverPatchFloor).toEqual(json.neverPatchPaths);
+  expect(neverPatchFloor).toBe(hotPatchDefaults.neverPatchPaths);
+  expect(Object.isFrozen(neverPatchFloor)).toBe(true);
+  expect(Object.isFrozen(hotPatchDefaults)).toBe(true);
+});
+
+test('round3: gate dependencies belong to the exported JSON floor', () => {
+  for (const path of requiredFloor) {
+    expect(hotPatchDefaults.neverPatchPaths).toContain(path);
+    expect(classifyHotPatch({ files: [path], kind: 'incident' }).ok, path).toBe(false);
+  }
+});
+
+test('round3: settings can extend but cannot remove the JSON floor', () => {
+  const settings = resolveHotPatchSettings({
+    env: { WE_POLICY_CASCADE_LOG: '0' },
+    tool: { neverPatchPaths: ['extra/**'] },
+  });
+  expect(settings.neverPatchPaths).toEqual(expect.arrayContaining([
+    ...hotPatchDefaults.neverPatchPaths, 'extra/**',
+  ]));
+  for (const path of requiredFloor) {
+    expect(classifyHotPatch({ files: [path], kind: 'incident',
+      settings: { ...hotPatchDefaults, neverPatchPaths: [] } }).ok, path).toBe(false);
+  }
+});
+
+// Protect dependencies by default; any exception here must carry a one-line reason.
+const allowedHotPatchable = [];
+
+test('round3: every transitive static relative gate import inside scripts/lib is protected', () => {
+  const pending = [
+    'daemon-rebuild/smoke.mjs', 'daemon-rebuild/prepare.mjs',
+    'daemon-rebuild/adopt.mjs', 'daemon-force-adopt.mjs',
+  ].map(path => resolve(lib, path));
+  const reached = new Set();
+  while (pending.length) {
+    const path = pending.pop();
+    if (reached.has(path)) continue;
+    reached.add(path);
+    // Reading errors deliberately fail the gate rather than silently omitting evidence.
+    const source = readFileSync(path, 'utf8');
+    const imports = /(?:^|[;\n])\s*(?:import\s+(?:(?:[^'";]+?)\s+from\s+)?|export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from\s*)['"]([^'"]+)['"]/g;
+    for (const [, specifier] of source.matchAll(imports)) {
+      if (!specifier.startsWith('.')) continue;
+      const dependency = resolve(dirname(path), specifier);
+      if (dependency.startsWith(lib + sep)) pending.push(dependency);
+    }
+  }
+  const unprotected = [...reached].map(repoPath).filter(path =>
+    !allowedHotPatchable.includes(path) &&
+    classifyHotPatch({ files: [path], kind: 'incident' }).ok);
+  expect(unprotected.sort()).toEqual([]);
 });
