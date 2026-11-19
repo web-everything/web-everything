@@ -343,6 +343,7 @@ export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, need
     pageRetries: paging.pageRetries, maxRows, execOpts });
   if (light.deferred) throw new PrListUnreadableError({ repo, stage: 'page', page: 1,
     cause: new Error('gh deferred the page (low budget)') });
+  assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
   const working = { ...cache };
   const byNumber = new Map(light.rows.map(row => [row.number, row]));
   const maxAgeMs = paging.heavyMaxAgeSeconds * 1000;

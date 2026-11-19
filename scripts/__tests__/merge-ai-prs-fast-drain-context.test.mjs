@@ -395,6 +395,21 @@ test('real CLI accepts a complete two-page lean inventory without heavy listing'
   assert.equal(live.heavyListings, 0);
 });
 
+test('real fast drain does not enqueue when incomplete lean inventory falls back to a full listing short by one row', () => {
+  const live = runFastDrainContextCli({ rowCount: 2, leanIncomplete: true, fullIncomplete: true });
+  assert.equal(live.status, 4, live.stderr);
+  assert.equal(live.leanListings, 1);
+  assert.equal(live.fullListings, 1);
+  assert.match(live.stderr, /fast-drain: context fell back to full listing.*1 unique of 2 open PRs/);
+  const result = JSON.parse(live.stdout);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'gh-error');
+  assert.match(result.detail, /failed \[unreadable\].*1 unique of 2 open PRs/);
+  assert.equal(Object.hasOwn(result, 'toMerge'), false);
+  assert.equal(live.calls.some(a => a[0] === 'pr' && a[1] === 'merge'
+    || a.some(v => v.includes('enqueuePullRequest'))), false);
+});
+
 test('real CLI falls back when the second lean GraphQL page fails', () => {
   const live = runFastDrainContextCli({ rowCount: 101, leanPageError: true });
   assert.equal(live.status, 0, live.stderr);

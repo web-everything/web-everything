@@ -10,7 +10,7 @@ import { buildManifest, embedManifestInBody } from '../../readiness/lane-manifes
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
+  failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main' } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -73,8 +73,9 @@ if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests
     out({data:{repository:{pullRequests:{totalCount:pageRows.length,
       pageInfo:{hasNextPage,endCursor:hasNextPage ? 'lean-'+(offset+size) : null},nodes}}}});
   }
+  const fullRows = process.env.CONTEXT_FULL_INCOMPLETE === '1' ? pageRows.slice(0, -1) : pageRows;
   out({data:{repository:{pullRequests:{totalCount:pageRows.length, pageInfo:{hasNextPage:false,endCursor:null},
-    nodes:pageRows.map(p => ({...p, labels:{nodes:p.labels}, commits:{nodes:[{commit:{oid:p.headRefOid,
+    nodes:fullRows.map(p => ({...p, labels:{nodes:p.labels}, commits:{nodes:[{commit:{oid:p.headRefOid,
       statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false},totalCount:p.statusCheckRollup.length,nodes:p.statusCheckRollup}}}}]}}))}}}});
 }
 out({});
@@ -88,7 +89,8 @@ out({});
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0', CONTEXT_LIVE_BRANCH: liveDefaultBranch,
         WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',
         WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
-        CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0',
+        CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_FULL_INCOMPLETE: fullIncomplete ? '1' : '0',
+        CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0',
         CONTEXT_CALLS: join(dir, 'calls.jsonl'), CONTEXT_ROWS: join(dir, 'rows.json') },
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);

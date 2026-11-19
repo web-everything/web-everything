@@ -4951,7 +4951,11 @@ parser and `assertInventoryComplete` guard; counts must stay stable, unique row 
 fall back to full listing. Number, head and updatedAt must match before snapshot reuse. Missing
 or changed rows and dependency/couple/overlap/card-group components are read fully live.
 Unknown inventories or related evidence fall back to the original full listing with one
-`fast-drain: context fell back to full listing (...)` diagnostic. Both `WE_FAST_DRAIN_CONTEXT=live`
+`fast-drain: context fell back to full listing (...)` diagnostic. The full hydrated listing must
+also call `assertInventoryComplete` before hydration or cache reuse; a short fallback throws into
+the existing list retry/unreadable path and cannot authorize enqueue. Keep the real CLI regression
+where both lean and full pages return one PR against `totalCount: 2`.
+Both `WE_FAST_DRAIN_CONTEXT=live`
 and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch hints use a separate
 in-process map, round metadata, then a host-wide one-hour atomic cache under
 `~/.claude/conveyor/default-branches`. Test processes require an explicit
