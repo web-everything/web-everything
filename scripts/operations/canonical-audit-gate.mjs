@@ -82,7 +82,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
     }
     policy = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, log: warn });
-    for (const name of ['releaseStage', 'preExistingMode']) warn(`audit.${name}=${policy.value[name]} source=${policy.sources[name]}`);
+    for (const name of ['releaseStage', 'preExistingMode', 'preExistingExemptionEnabled']) warn(`audit.${name}=${policy.value[name]} source=${policy.sources[name]}`);
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
@@ -111,13 +111,13 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   let evidence;
   try {
     const fp = liveFingerprint(records);
-    evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
+    evidence = canonicalAuditEvidence(records, fullSha, covers, fp, { auditPolicy: policy.value });
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {
         if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
+        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { auditPolicy: policy.value, ruledWeakened: {
           ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
         } });
         if (waived.ok) { evidence = waived; break; }
@@ -127,6 +127,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     // R994: a fingerprint/veto lookup failure refuses; never fall back to an older exact-head pass.
     if (e?.fingerprintLookup) return refuse('canonical-audit-missing', `cannot verify newer WEAKENED audits for ${fullSha}: ${e.message}`);
     evidence = { ok: false, reason: 'no-record' };
+  }
+  if (evidence.reason === 'pre-existing-exemption-disabled') {
+    return refuse('canonical-audit-missing', 'saved pre-existing exemption is disabled by audit settings');
   }
   // Apply current policy to the selected evidence, so a fresh clean audit can supersede an exemption.
   if (evidence.ok && evidence.record?.preExisting?.length

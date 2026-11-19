@@ -66,7 +66,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (!settings) {
       settings = resolveAuditSettings({ fileRead: fs.readFileSync, ...settingsOptions,
         log: message => process.stderr.write(`${message}\n`) });
-      for (const name of ['preExistingMode', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
+      for (const name of ['preExistingExemptionEnabled', 'preExistingMode', 'baseRecheckMax', 'releaseStage', 'requirePayBy', 'requireOnMain']) process.stderr.write(`audit.${name}=${settings.value[name]} source=${settings.sources[name]}\n`);
     }
     return settings;
   };
@@ -76,6 +76,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       return { releaseStage, requirePayBy, requireOnMain };
     },
     readCard: path => readCardFromMain(path, { run: spawnSync }),
+    preExistingExemptionEnabled: () => auditSettings().value.preExistingExemptionEnabled,
     preExistingMode: () => auditSettings().value.preExistingMode,
     baseRecheckMax: () => auditSettings().value.baseRecheckMax,
     protectedPaths: () => [...auditSettings().value.raceBlockPaths, ...auditSettings().value.guardFloorPaths],

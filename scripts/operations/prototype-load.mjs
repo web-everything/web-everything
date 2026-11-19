@@ -3,6 +3,7 @@
  * WHY (incident 2026-10-22): combined tops repeated tests, reverted main fixes three times,
  * and removed registrations before replacement admission. Keep comparisons explicit and swaps ordered.
  */
+import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { op } from './registry.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from './codex-audit.mjs';
@@ -212,6 +213,11 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     if (record.questionHash !== QUESTION_HASH
       && list.some((r) => r?.head === record.head && r.base === base && r.questionHash === QUESTION_HASH)) continue;
     if (covered(base) && (!pass || Date.parse(text(record.at)) >= Date.parse(text(pass.at)))) pass = record;
+  }
+  // Judge the selected record, so a newer clean audit can replace disabled exemption evidence.
+  // Admission supplies its already-resolved trusted policy; other readers resolve the running checkout.
+  if (pass?.preExisting?.length && (auditOptions.auditPolicy ?? resolveAuditSettings().value).preExistingExemptionEnabled !== true) {
+    return { ok: false, reason: 'pre-existing-exemption-disabled', record: original.get(pass) ?? pass };
   }
   return pass ? { ok: true, record: original.get(pass) ?? pass } : { ok: false, reason: 'no-record' };
 }

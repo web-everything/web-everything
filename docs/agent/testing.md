@@ -4781,6 +4781,14 @@ return `unknown` with `roster-unavailable`, including persisted options containi
 removed `allowEmptyRequiredNames` override and evidence with an observed merge-gate failure.
 ## Pre-existing audit exemption evidence (R1053)
 
+`audit.preExistingExemption.enabled` defaults to `false`, including invalid or unreadable
+settings. Enable it explicitly in trusted settings for exemption fixtures; the environment
+`WE_AUDIT_PREEXISTING_EXEMPTION_ENABLED` may only tighten to `false`.
+With proof mode and exemption disabled, classification and card handling still run,
+but every finding remains `WEAKENED`; the ledger keeps `preExisting: []` and stores
+would-be exemptions as `shadowPreExisting`. Canonical readers reject saved exemptions
+while disabled; re-audit to replace that evidence. Cover both disabled and enabled paths.
+
 Keep proof-mode fixtures explicit about `auditPolicy` (`releaseStage`, `requirePayBy`,
 `requireOnMain`); a missing or partial policy must retain findings for human review.
 Pay-by fixtures inject trusted persisted card text through `readCard`, never a date in

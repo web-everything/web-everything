@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { AUDIT_SETTINGS_PATH } from '../../lib/audit-settings.mjs';
+import { canonicalAuditEvidence } from '../prototype-load.mjs';
 import { cardHash } from '../audit-base-repro.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -238,14 +239,27 @@ describe('R1053 additive audit records', () => {
   it.each([null, 'key', [2]])('rejects malformed findingKeys %j', findingKeys => {
     expect(fixture({ records: [green, { ...scoped, findingKeys }] }).result.message).toContain('malformed record');
   });
+  it('default-off refuses a saved exemption instead of falling back to an older pass', () => {
+    const result = fixture({ records: [green, scoped], audit: { preExisting: { mode: 'prove' } } }).result;
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+    expect(result.message).toContain('saved pre-existing exemption is disabled by audit settings');
+    expect(result.message).toContain('codex-audit --base=origin/main');
+  });
+  it('the shared canonical reader refuses saved exemptions by default, including carried evidence', () => {
+    const fp = 'd'.repeat(64);
+    for (const head of [sha, other]) {
+      expect(canonicalAuditEvidence([{ ...scoped, head, fingerprint: fp }], sha, () => true, fp))
+        .toMatchObject({ ok: false, reason: 'pre-existing-exemption-disabled' });
+    }
+  });
   it('a7 admits mixed old and new records', () => {
-    expect(fixture({ records: [green, scoped], audit: { preExisting: { mode: 'prove' } } }).result).toMatchObject({ ok: true, record: scoped });
+    expect(fixture({ records: [green, scoped], audit: { preExistingExemption: { enabled: true }, preExisting: { mode: 'prove' } } }).result).toMatchObject({ ok: true, record: scoped });
   });
   it.each([
     { releaseStage: 'prod', preExisting: { mode: 'prove' } },
     { releaseStage: 'prerelease', preExisting: { mode: 'block' } },
   ])('rejects saved pre-existing exemptions under current policy %j, including behind an older pass', audit => {
-    const result = fixture({ records: [green, scoped], audit }).result;
+    const result = fixture({ records: [green, scoped], audit: { ...audit, preExistingExemption: { enabled: true } } }).result;
     expect(result.ok).toBe(false);
     expect(result.message).toContain('forbidden by current audit policy');
     expect(result.message).toContain('codex-audit --base=origin/main');

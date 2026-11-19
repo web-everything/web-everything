@@ -198,7 +198,7 @@ export function computeVerdict(findings, options = {}) {
   const releaseStage = trusted.releaseStage === 'prod' && RELEASE_STAGES.includes(stageOption) ? 'prod' : stageOption;
   // `allow` is never trusted: it resolves to block. Proven D2 debt ships only when the trusted mode is `prove` and the
   // caller does not ask for something stricter.
-  const proveD2 = trusted.preExistingMode === 'prove' && (options.preExistingMode ?? 'prove') === 'prove';
+  const proveD2 = trusted.preExistingExemptionEnabled === true && trusted.preExistingMode === 'prove' && (options.preExistingMode ?? 'prove') === 'prove';
   // Card requirements: the trusted value is a floor (PR #6381 judge). The effective value is trusted || caller, so a
   // caller can require a card or a pay-by the trusted settings waive, never waive one they require. Only an omitted
   // caller value defers; any other value that is not exactly `false` (a typo, a string) counts as a request to tighten.

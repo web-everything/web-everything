@@ -239,8 +239,9 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     try {
       const f = adapter(undefined, { settingsOptions: { env: {}, platform: { releaseStage: 'prod' },
         fileRead: () => JSON.stringify({ audit: { releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: true } } }) } });
+      expect(f.deps.preExistingExemptionEnabled()).toBe(false);
       expect(f.deps.auditPolicy()).toEqual({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: true });
-      for (const name of ['releaseStage', 'requirePayBy', 'requireOnMain']) {
+      for (const name of ['preExistingExemptionEnabled', 'releaseStage', 'requirePayBy', 'requireOnMain']) {
         expect(log.mock.calls.flat().join('')).toContain(`audit.${name}=`);
         expect(log.mock.calls.flat().join('')).toMatch(new RegExp(`audit\\.${name}=.* source=`));
       }
@@ -604,12 +605,21 @@ describe('R1053 prove mode', () => {
   function proof(answer = reply()) {
     const f = fixture(`WEAKENED\n${finding}`);
     Object.assign(f.deps, { auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false }),
-      preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
+      preExistingExemptionEnabled: () => true, preExistingMode: () => 'prove', baseRecheckMax: () => 6, protectedPaths: () => [],
       reproOnBase: vi.fn(async () => answer), readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
     return f;
   }
+  it.each([undefined, false, 'true'])('disabled or missing exemption %j retains all findings and records shadow evidence', async enabled => {
+    const f = proof();
+    if (enabled === undefined) delete f.deps.preExistingExemptionEnabled;
+    else f.deps.preExistingExemptionEnabled = () => enabled;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', modelVerdict: 'WEAKENED', findings: [finding],
+      findingKeys: ['x.mjs|X|B2'], preExisting: [], shadowPreExisting: [{ line: finding, key: 'x.mjs|X|B2', relation: 'SAME' }] });
+    expect(f.deps.fileCard).toHaveBeenCalledOnce();
+  });
   it.each([
     ['2026-11-18T17:00:00.000Z', '2026-11-18 12:00'],
     ['2026-11-18T05:00:00.000Z', '2026-11-18 00:00'],
@@ -755,6 +765,15 @@ describe('R1053 prove mode', () => {
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.records[0].findings).toEqual([finding]);
     expect(f.records[0].preExisting).toHaveLength(1);
+  });
+  it('disabled exemption retains both exemptible and blocking findings', async () => {
+    const f = proof(reply() + '\n' + reply().replace('#1', '#2'));
+    f.deps.runCodex = () => `WEAKENED\n${finding}\n${finding}`;
+    f.deps.baseRecheckMax = () => 1;
+    f.deps.preExistingExemptionEnabled = () => false;
+    expect(await main(ARGS, f.deps)).toBe(1);
+    expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', findings: [finding, finding], preExisting: [] });
+    expect(f.records[0].shadowPreExisting).toHaveLength(1);
   });
   it('a6 block mode preserves captured stdout and record bytes', async () => {
     const golden = JSON.parse(realFs.readFileSync(new NodeURL('./fixtures/codex-audit-block.json', import.meta.url), 'utf8'));
