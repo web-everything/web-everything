@@ -1,4 +1,4 @@
-import { decideMemoryFloor } from './memory-available.mjs';
+import { decideMemoryFloor } from './memory-warn-corroboration.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**

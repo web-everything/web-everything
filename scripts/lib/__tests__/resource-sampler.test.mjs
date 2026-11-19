@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decideAdmission } from '../resource-policy.mjs';
-import { decideMemoryFloor } from '../memory-available.mjs';
+import { decideMemoryFloor } from '../memory-warn-corroboration.mjs';
 import { cpuIdlePctFromTimes, parseIoregDiskStats, diskFromDeltas, parsePsCpu, fseventsCpuPct, countAgentSessions, memoryPressureLevel, swapUsedPct, buildSnapshot, createSampler, resourcePaths, writeSnapshot, readSnapshot, appendResourceLog } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'resource-')); roots.push(root); return root; };

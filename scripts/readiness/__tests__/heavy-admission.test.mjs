@@ -1999,11 +1999,20 @@ describe('resolveAdmissionPolicy — the one cascade every process reads (standa
     expect(p.invalid.join('\n').includes(key)).toBe(!ok);
   });
 
-  it('formatAdmissionPolicy names every value with its source (the logged line)', () => {
+  it('formatAdmissionPolicy names logged values with their sources', () => {
     const line = formatAdmissionPolicy(resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_CAP: '4' } }));
     expect(line).toMatch(/cap=2 \(standard\)/);
     expect(line).toMatch(/onTimeout=defer \(standard\)/);
     expect(line).toMatch(/ignored: .*WE_HEAVY_ADMISSION_CAP=4/);
+  });
+
+  it('omits standard warn defaults but logs explicit default-valued overrides with their sources', () => {
+    const baseline = resolveAdmissionPolicy({ env: {} });
+    expect(formatAdmissionPolicy(baseline)).not.toContain('warnMinFreePct=');
+    expect(formatAdmissionPolicy(baseline)).not.toContain('warnSwapGrowthMb=');
+    const explicit = resolveAdmissionPolicy({ platform: { warnMinFreePct: 20, warnSwapGrowthMb: 256 }, env: {} });
+    expect(formatAdmissionPolicy(explicit)).toContain('warnMinFreePct=20 (platform)');
+    expect(formatAdmissionPolicy(explicit)).toContain('warnSwapGrowthMb=256 (platform)');
   });
 });
 

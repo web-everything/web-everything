@@ -5,7 +5,7 @@
  *   average, which read 49–82 while the CPU was 37–46% idle. The IO half (snapshot read, policy-cascade file read,
  *   shadow log) is we:scripts/lib/resource-admission.mjs.
  */
-import { decideMemoryPressure } from './memory-available.mjs';
+import { decideMemoryPressure } from './memory-warn-corroboration.mjs';
 // Calibrated (x9xkupj, slice 2) from 1261 sampler snapshots 2026-10-09 19:27–23:01 ET plus the shadow log:
 // - CPU idle p5/p25/p50/p95 = 11/19/24/49%; load average 11–109 (never ≤ 9, ≤ 15 only 3% of samples). Every shadow
 //   pair was old "hold" (load) vs new "admit" (CPU idle 14–49%). So rebuild-smoke keeps a 5% floor (admits 97%) and

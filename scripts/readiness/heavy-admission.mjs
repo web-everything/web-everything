@@ -168,7 +168,7 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey, readTailBytes } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
-import { decideMemoryPressure, DEFAULT_WARN_MIN_FREE_PCT, DEFAULT_WARN_SWAP_GROWTH_MB } from '../lib/memory-available.mjs';
+import { decideMemoryPressure, DEFAULT_WARN_MIN_FREE_PCT, DEFAULT_WARN_SWAP_GROWTH_MB } from '../lib/memory-warn-corroboration.mjs';
 import {
   classifyCommandKind, refineKind, holderLabel, holdBreakdown, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
@@ -488,7 +488,10 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', 'warnMinFreePct', 'warnSwapGrowthMb', 'priority.mode',
+  // Keep bounded path diagnostics within the log budget; explicit warn settings retain their provenance.
+  const warnLeaves = ['warnMinFreePct', 'warnSwapGrowthMb'].filter(leaf =>
+    settings[leaf] !== ADMISSION_POLICY_STANDARD[leaf] || (sources[leaf] ?? 'standard') !== 'standard');
+  const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', ...warnLeaves, 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => key !== 'clientPath' || settings.remote?.clientPath != null)
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]

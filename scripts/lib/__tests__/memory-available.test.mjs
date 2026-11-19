@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { memoryFreePct, memoryFreePctUnrounded, parseVmStatAvailableBytes, decideMemoryPressure, decideMemoryFloor, memoryAvailableMb } from '../memory-available.mjs';
+import { memoryFreePct, memoryFreePctUnrounded, parseVmStatAvailableBytes, memoryAvailableMb } from '../memory-available.mjs';
+import { decideMemoryPressure, decideMemoryFloor } from '../memory-warn-corroboration.mjs';
 import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
 import * as hostOverloadSettings from '../host-overload-settings.mjs';
 import { createSampler } from '../resource-sampler.mjs';
