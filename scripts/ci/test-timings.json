@@ -871,6 +871,7 @@
   "scripts/lib/__tests__/delivery-policy.test.mjs": 41.81,
   "scripts/lib/__tests__/delivery-priority.replay.test.mjs": 0.01,
   "scripts/lib/__tests__/delivery-priority.test.mjs": 0.01,
+  "scripts/lib/__tests__/delivery-routes.test.mjs": 0.1,
   "scripts/lib/__tests__/describe-spawn-failure.test.mjs": 0.15,
   "scripts/lib/__tests__/design-pixels-adapter.test.mjs": 0.03,
   "scripts/lib/__tests__/diff-branch-coverage.test.mjs": 0.68,
