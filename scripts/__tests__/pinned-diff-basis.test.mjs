@@ -161,8 +161,10 @@ describe('resolvePinnedDiffBasis real Git boundary', () => {
     const basis = resolve(f);
     computeNetDiffSignals({ exec: f.exec, basis });
     for (const { args, opts } of f.calls) {
-      expect(opts.env.GIT_CONFIG_NOSYSTEM).toBe('1');
-      expect(opts.env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
+      // Fetch keeps global/system config so a credential.helper can authenticate; everything else is isolated.
+      const isFetch = args.includes('fetch');
+      expect(opts.env.GIT_CONFIG_NOSYSTEM).toBe(isFetch ? undefined : '1');
+      expect(opts.env.GIT_CONFIG_GLOBAL).toBe(isFetch ? undefined : '/dev/null');
       expect(args.slice(0, 2)).toEqual(['-c', 'core.attributesFile=/dev/null']);
       if (args.includes('diff')) for (const flag of ['--no-textconv', '--no-ext-diff', '--no-renames']) expect(args).toContain(flag);
     }

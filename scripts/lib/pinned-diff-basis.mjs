@@ -12,6 +12,8 @@ export function pinnedGit(exec, args) {
   }
   Object.assign(env, { GIT_NO_REPLACE_OBJECTS: '1', GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0', GIT_ATTR_NOSYSTEM: '1', GIT_GRAFT_FILE: '/dev/null' });
+  // A fetch only writes refs, so it keeps the operator's global/system config (credential.helper); revision and diff stay isolated.
+  if (args[0] === 'fetch') { delete env.GIT_CONFIG_GLOBAL; delete env.GIT_CONFIG_NOSYSTEM; }
   const diff = args[0] === 'diff' ? ['--no-textconv', '--no-ext-diff', '--no-renames', '--no-color', '--unified=3',
     '--src-prefix=a/', '--dst-prefix=b/', '--no-relative', '--submodule=short', '--ignore-submodules=none'] : [];
   // Repo-local diff rendering keys cannot be ignored, so pin every one that changes paths or prefixes.
