@@ -270,8 +270,10 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
       cur.isTool = true;
       cur.name ??= step.tool_name ?? step.tool_info?.name;
       // A later update of the SAME step that names a different tool must not be hidden by keeping only the first name.
-      const updateName = step.tool_name ?? step.tool_info?.name;
-      if (typeof updateName === 'string' && updateName) (cur.names ??= new Set()).add(updateName);
+      // Both name fields count: `tool_name: read_file` must not mask `tool_info.name: run_command` within one update.
+      for (const updateName of [step.tool_name, step.tool_info?.name]) {
+        if (typeof updateName === 'string' && updateName) (cur.names ??= new Set()).add(updateName);
+      }
     }
     if (step.status === 'TOOL_ERROR' || step.state === 'ERROR' || step.tool_info?.error != null) cur.errored = true;
     steps.set(key, cur);

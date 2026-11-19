@@ -150,6 +150,15 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.reasons.join(' ')).toContain('read outside the juror lane');
   });
 
+  it('conflicting names inside ONE update (tool_name read_file, tool_info.name run_command) void', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { tool_name: 'read_file', tool_info: { name: 'run_command', parameters: { AbsolutePath: join(cwd, 'file.txt') } } }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('tool changed mid-step');
+  });
+
   it('a step that names run_command under an unknown step_type is still a tool call and voids', async () => {
     const fx = fixture();
     const out = await fx.run(undefined, (cwd) => [
