@@ -4,6 +4,7 @@
  * Inject the existing primitive so synchronous returns, promises and child handles stay intact.
  */
 import { spawn, spawnSync, exec, execFile, execSync, execFileSync } from 'node:child_process';
+import { types } from 'node:util';
 import { spawnToCompletion } from './spawn-to-completion.mjs';
 import { isAgentLaunchTestPrimitive } from './agent-launch.test-seam.mjs';
 
@@ -11,7 +12,7 @@ import { isAgentLaunchTestPrimitive } from './agent-launch.test-seam.mjs';
 const approvedPrimitives = new Set([spawn, spawnSync, exec, execFile, execSync, execFileSync]);
 
 // Share one policy across Node options, env wrappers and shell assignment words.
-const executionEnvironment = /^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|PATH|SHELLOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*)$/i;
+const executionEnvironment = /^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|PATH|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*)$/i;
 const environmentName = /^[A-Za-z_][A-Za-z0-9_]*$/;
 function rejectExecutionEnvironment(key) {
   if (executionEnvironment.test(key)) {
@@ -29,9 +30,41 @@ function validateAssignment(word) {
 
 // No caller needs Node's fork: its JavaScript module/execArgv grammar is not agent argv.
 // Keep execution-redirection options closed for every remaining primitive, too.
+function snapshotInput(value, ancestors = new Set()) {
+  // Descriptor inspection alone cannot identify a Proxy: its traps can forge descriptors.
+  if (types.isProxy(value)) throw new SyntaxError('Proxy input is unsupported; use plain data and literal argv');
+  if (value === null || typeof value !== 'object') return value;
+  const array = Array.isArray(value), prototype = Object.getPrototypeOf(value);
+  if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array)) {
+    throw new SyntaxError('non-plain input is unsupported; use plain data and literal argv');
+  }
+  if (ancestors.has(value)) throw new SyntaxError('cyclic input is unsupported; use plain data and literal argv');
+  ancestors.add(value);
+  const copy = array ? [] : Object.create(null);
+  let indices = 0, length;
+  for (const key of Reflect.ownKeys(value)) {
+    const property = Object.getOwnPropertyDescriptor(value, key);
+    if (!property || !Object.hasOwn(property, 'value')) {
+      throw new SyntaxError('accessor input is unsupported; use plain data and literal argv');
+    }
+    if (array && key === 'length') { length = property.value; continue; }
+    if (array) {
+      if (typeof key !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= 0xffffffff) {
+        throw new SyntaxError('non-plain array is unsupported; use literal argv without custom properties');
+      }
+      indices++;
+    }
+    Object.defineProperty(copy, key, { value: snapshotInput(property.value, ancestors), enumerable: true });
+  }
+  if (array && indices !== length) throw new SyntaxError('sparse array is unsupported; use dense literal argv');
+  ancestors.delete(value);
+  return Object.freeze(copy);
+}
+
 function snapshotInvocation(args, primitive) {
   const forwarded = [...args];
   const stringCommand = primitive === exec || primitive === execSync;
+  let hasOptions = false;
   // Node supports options in either position, including spawn(file, undefined, options).
   for (let index = 1; index < args.length; index++) {
     const options = args[index];
@@ -40,17 +73,41 @@ function snapshotInvocation(args, primitive) {
       if (index === 1 && !stringCommand) continue;
       throw new SyntaxError('execution options must be an object, never an argv array; use literal argv with spawn or execFile');
     }
+    hasOptions = true;
     const snapshot = { ...options };
     if ('execPath' in options || 'execArgv' in options || (snapshot.shell !== undefined && snapshot.shell !== false)) {
       throw new SyntaxError('execution redirection options are unsupported; omit execPath, execArgv and shell');
     }
     if (snapshot.env != null) {
-      snapshot.env = { ...snapshot.env };
-      for (const key of Object.keys(snapshot.env)) rejectExecutionEnvironment(key);
+      if (typeof snapshot.env !== 'object' || Array.isArray(snapshot.env)) {
+        throw new SyntaxError('environment must be plain data; use literal environment values');
+      }
+      for (const key of Reflect.ownKeys(snapshot.env)) {
+        if (typeof key !== 'string') throw new SyntaxError('environment names must be strings');
+        rejectExecutionEnvironment(key);
+        if (!['string', 'number', 'boolean', 'undefined'].includes(typeof snapshot.env[key]) && snapshot.env[key] !== null) {
+          throw new SyntaxError('environment values must be literal data');
+        }
+      }
+    } else {
+      snapshot.env = inheritedEnvironment();
     }
-    forwarded[index] = snapshot;
+    forwarded[index] = Object.freeze(snapshot);
   }
-  return forwarded;
+  if (!hasOptions && args.length) {
+    const index = stringCommand || !(Array.isArray(args[1]) || typeof args[1] === 'string') ? 1 : 2;
+    // Preserve callbacks and Node's omitted-argv overload while supplying explicit options.
+    if (typeof forwarded[index] === 'function') forwarded.splice(index, 0, Object.freeze({ env: inheritedEnvironment() }));
+    else forwarded[index] = Object.freeze({ env: inheritedEnvironment() });
+  }
+  return Object.freeze(forwarded);
+}
+
+function inheritedEnvironment() {
+  const env = { ...process.env };
+  // Keep the inherited executable lookup path; explicit PATH overrides still refuse.
+  for (const key of Object.keys(env)) if (key.toUpperCase() !== 'PATH' && executionEnvironment.test(key)) delete env[key];
+  return Object.freeze(env);
 }
 
 // Codex CLI help aliases: exec (e), review, resume, fork. Canonicalise before grammar checks.
@@ -327,7 +384,19 @@ function isThenable(value) {
  * The guard is synchronous: a promise is refused rather than accidentally launching before it resolves.
  */
 export function launchAgent(descriptor, primitive, ...args) {
-  const log = typeof descriptor?.log === 'function' ? descriptor.log : (s) => process.stderr.write(s);
+  let log = (s) => process.stderr.write(s);
+  try {
+    descriptor = snapshotInput(descriptor);
+    if (typeof descriptor?.log === 'function') log = descriptor.log;
+    // Check the overload before recursively copying arrays, including array-shaped options.
+    if ((primitive === exec || primitive === execSync) && Array.isArray(args[1])) {
+      throw new SyntaxError('execution options must be an object, never an argv array; use literal argv with spawn or execFile');
+    }
+    args = snapshotInput(args);
+  } catch (cause) {
+    // The original descriptor may itself contain hostile accessors or Proxy traps.
+    refuse(`cannot snapshot launch inputs; use literal argv and plain data; ${cause.message}`, undefined, log, cause);
+  }
   if (!descriptor || typeof descriptor !== 'object') refuse('descriptor is required', descriptor, log);
   if (!descriptor.mode) refuse('mode is required', descriptor, log);
   if (!modes.has(descriptor.mode)) refuse(`unknown mode ${String(descriptor.mode)}`, descriptor, log);
@@ -336,7 +405,6 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (!approvedPrimitives.has(primitive) && !isAgentLaunchTestPrimitive(primitive)) {
     refuse('unapproved primitive identity; use an approved unbound primitive and literal argv', descriptor, log);
   }
-  const callerArgs = args;
   let normalised;
   try { args = snapshotInvocation(args, primitive); normalised = normaliseInvocation(args); }
   catch (cause) {
@@ -348,8 +416,6 @@ export function launchAgent(descriptor, primitive, ...args) {
   if (normalised.some(command => command.interactiveResume) && descriptor.mode !== 'codex-exec-resume') {
     refuse('interactive resume/fork requires codex-exec-resume mode and a matching native resume id', descriptor, log);
   }
-  // Snapshot the validated words before the guard can mutate a captured argv reference.
-  const validatedArgv = Array.isArray(args[1]) ? [...args[1]] : args[1];
   // A resume flag with no value reads as an empty native id: that is a MISSING id, never one an empty/blank
   // descriptor resumeId can "equal". Require plain literal ids: never shell expansions or metacharacters.
   if (((descriptor.resumeId != null || descriptor.mode.endsWith('-resume')) && nativeIds.length === 0)
@@ -360,7 +426,7 @@ export function launchAgent(descriptor, primitive, ...args) {
     if (typeof descriptor.launchGuard !== 'function') refuse('launchGuard must be a function', descriptor, log);
     let allowed;
     try { allowed = descriptor.launchGuard(Object.freeze({
-      command: args[0], argv: Array.isArray(validatedArgv) ? Object.freeze([...validatedArgv]) : validatedArgv,
+      command: args[0], argv: args[1],
     })); } catch (cause) {
       refuse(`launchGuard threw: ${String(cause?.message ?? cause)}`, descriptor, log, cause);
     }
@@ -372,15 +438,7 @@ export function launchAgent(descriptor, primitive, ...args) {
     }
     if (allowed !== true && allowed !== undefined) refuse('launchGuard must return true or undefined', descriptor, log);
   }
-  if (callerArgs.some((arg, i) => arg && typeof arg === 'object' && !Array.isArray(arg) && arg.shell !== args[i]?.shell)
-    || (Array.isArray(validatedArgv) && (args[1].length !== validatedArgv.length
-    || validatedArgv.some((word, i) => word !== args[1][i])))) {
-    refuse('launchGuard changed validated argv; use literal argv and a plain resume id', descriptor, log);
-  }
-  // Guarded calls forward the validated snapshot, even if the guard retained the caller's array.
-  const forwarded = [...args];
-  if ('launchGuard' in descriptor && Array.isArray(validatedArgv)) forwarded[1] = validatedArgv;
-  return primitive(...forwarded);
+  return primitive(...args);
 }
 
 /** Preserve spawnToCompletion's options/result and the injected spawnFn seam at the OS boundary. */

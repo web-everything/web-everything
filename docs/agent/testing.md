@@ -4654,7 +4654,7 @@ R37.24 refuses execution-redirection options (`execPath`, `execArgv`, custom `sh
 R37.26 applies one environment denylist to every approved primitive's `options.env`,
 literal `env` assignments, shell assignment prefixes and `export` / `declare -x` statements:
 `NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
-`PATH`, `SHELLOPTS`, `PS4`, `PROMPT_COMMAND`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_FUNC_*`.
+`PATH`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `PROMPT_COMMAND`, `IFS`, `CDPATH`, `GLOBIGNORE`, `BASH_FUNC_*`.
 Empty assignments are refused too; Node/LD/DYLD names are matched case-insensitively.
 `env` split-string/chdir options and unparseable wrappers refuse with the literal-argv fallback.
 The regression table pairs these refusals with harmless `FOO=bar` assignments, including
@@ -4662,9 +4662,15 @@ The regression table pairs these refusals with harmless `FOO=bar` assignments, i
 The fallback is literal agent argv without these overrides.
 String-command primitives (`exec`, `execSync`) refuse array-shaped options; options in either
 Node argument position are checked, including with omitted argv.
-Option/environment values are snapshotted before guards run, so captured references cannot
-change execution after validation. Tests preserve argv/return identity and option values,
-while requiring independent option/environment objects at execution. R37.25 probes ordinary
+R37.27 always supplies an explicit frozen environment. Absent/null `options.env` inherits a
+one-time copy with loader and shell-startup variables removed (including `BASHOPTS`); inherited
+`PATH` is preserved for executable lookup, while explicit `PATH` overrides still refuse.
+R37.28 snapshots descriptor fields, command, argv and options before validation or guards.
+Only frozen plain data copies reach execution. Reject proxies (before invoking traps), accessors
+(including non-enumerable/symbol properties), non-plain objects/arrays, cycles and sparse arrays;
+the fallback is dense literal argv and plain data. Never inspect caller references after copying.
+Tests preserve argv/option values and return identity, require detached frozen copies, and run
+real harmless Node/shell probes proving inherited startup code and changing argv stay inert. R37.25 probes ordinary
 Node with `VITEST=true` and requires registration refusal before an unchecked closure can run.
 
 Runtime validation checks every shell segment and requires matching literal native resume IDs.

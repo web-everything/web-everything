@@ -81,17 +81,17 @@ exports[`agent launcher tripwire and separate capability snapshot > admits exact
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
-    "fingerprint": "module-sha256-v2:4a3b12dbcc68e5464321cb1b0304d76a88a4d3d46fb0c7f66911e1fe85799f35",
+    "fingerprint": "module-sha256-v2:a17b7d92a6d65613306ff407378f632a1dfbfa79ef92c8b91387160d1937a78d",
     "function": "launchAgent",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:2f934eb0bcceae13644efa6f99ded1b928d936d2b72446107176357808da189e",
+    "moduleFingerprint": "module-sha256-v2:f7909e43373916f4d394201c269c5ae25a29c8ffbc8c25a38fcade26cf95a30a",
   },
   {
     "file": "scripts/lib/agent-launch.mjs",
     "fingerprint": "module-sha256-v2:4db8d1022792a74a662ef204b1775ac870ad6a31248f940bcbeb48415a21d1cc",
     "function": "launchAgentToCompletion",
     "kind": "function",
-    "moduleFingerprint": "module-sha256-v2:2f934eb0bcceae13644efa6f99ded1b928d936d2b72446107176357808da189e",
+    "moduleFingerprint": "module-sha256-v2:f7909e43373916f4d394201c269c5ae25a29c8ffbc8c25a38fcade26cf95a30a",
   },
   {
     "file": "scripts/lib/claude-sessions.mjs",

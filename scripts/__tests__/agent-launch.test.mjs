@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { AGENT_LAUNCH_MODES, AgentLaunchRefusedError, agentResumeId, launchAgent, launchAgentToCompletion } from '../lib/agent-launch.mjs';
 import { findAgentLaunches } from './fixtures/agent-launch-source.mjs';
 import { registerAgentLaunchTestPrimitive } from '../lib/agent-launch.test-seam.mjs';
@@ -20,13 +23,146 @@ const testPrimitive = (...args) => registerAgentLaunchTestPrimitive(vi.fn(...arg
 const SID = '12345678-1234-4234-8234-123456789abc';
 const DENIED_ENVIRONMENT_KEYS = [
   'NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
-  'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'BASH_ENV', 'ENV', 'PATH', 'SHELLOPTS',
+  'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'BASH_ENV', 'ENV', 'PATH', 'SHELLOPTS', 'BASHOPTS',
   'PS4', 'PROMPT_COMMAND', 'IFS', 'CDPATH', 'GLOBIGNORE', 'BASH_FUNC_injected%%',
   'node_options', 'Node_Path', 'node_extra_ca_certs', 'ld_preload', 'DyLd_INSERT_LIBRARIES',
 ];
 
-// Audit probes use the real boundary with an injected primitive, never an actual agent process.
+const inheritedOptions = () => {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (/^(?:NODE_OPTIONS|NODE_PATH|NODE_EXTRA_CA_CERTS|LD_.*|DYLD_.*|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND|IFS|CDPATH|GLOBIGNORE|BASH_FUNC_.*)$/i.test(key)) delete env[key];
+  }
+  return { env };
+};
+
+// Real probes alias Node as a literal agent executable; no agent CLI is started.
+function runRuntimeProbe({ runtimeProbe, primitive = 'spawnSync', variant, field }) {
+  const dir = mkdtempSync(join(tmpdir(), 'r37-runtime-'));
+  const nodeAlias = join(dir, 'claude'), marker = 'BYPASS_EXECUTED';
+  symlinkSync(process.execPath, nodeAlias);
+  const safeScript = `'${nodeAlias}' -e 'console.log("SAFE_EXECUTED")'`;
+  const descriptor = { mode: 'claude-print', resumeId: null, log() {} };
+  const options = { encoding: 'utf8', timeout: 5000, maxBuffer: 4096 };
+  let argv = ['-c', safeScript], command = 'bash', calls = 0;
+  const savedEnvironment = process.env;
+  try {
+    if (runtimeProbe === 'inherited') {
+      process.env = { ...savedEnvironment, BASH_ENV: '/dev/stdin' };
+      options.input = `echo ${marker}\n`;
+      if (variant === 'null-env') options.env = null;
+      if (variant === 'undefined-env') options.env = undefined;
+      const result = launchAgent(descriptor, childProcess.spawnSync, command, argv, options);
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('SAFE_EXECUTED');
+      expect(`${result.stdout}${result.stderr}`).not.toContain(marker);
+      return;
+    }
+    if (runtimeProbe === 'implicit-options') {
+      process.env = { ...savedEnvironment, BASH_ENV: '/dev/stdin',
+        NODE_OPTIONS: '--import=data:text/javascript,console.log%28%27BYPASS_EXECUTED%27%29' };
+      const result = primitive === 'execSync'
+        ? launchAgent(descriptor, childProcess.execSync, safeScript)
+        : launchAgent(descriptor, childProcess.spawnSync, nodeAlias, ['-e', 'console.log("SAFE_EXECUTED")']);
+      const stdout = primitive === 'execSync' ? result.toString() : result.stdout.toString();
+      if (primitive !== 'execSync') expect(result.status).toBe(0);
+      expect(stdout).toContain('SAFE_EXECUTED');
+      expect(stdout).not.toContain(marker);
+      return;
+    }
+    if (runtimeProbe === 'environment-snapshot') {
+      process.env = { ...savedEnvironment, R37_SAFE: 'before' };
+      for (const key of DENIED_ENVIRONMENT_KEYS.filter(key => key !== 'PATH')) process.env[key] = 'untrusted';
+      const before = process.env;
+      descriptor.launchGuard = () => { process.env.R37_SAFE = marker; process.env.BASH_ENV = '/dev/stdin'; return true; };
+      const inspect = testPrimitive((...args) => args);
+      const invocation = primitive === 'exec' || primitive === 'execSync' ? [safeScript]
+        : variant === 'omitted-argv' ? [nodeAlias, undefined, options]
+          : variant === 'no-argv' ? [nodeAlias] : [nodeAlias, ['-e', 'console.log("SAFE_EXECUTED")']];
+      const args = launchAgent(descriptor, inspect, ...invocation);
+      const forwarded = args.at(-1);
+      expect(Object.isFrozen(forwarded)).toBe(true);
+      expect(Object.isFrozen(forwarded.env)).toBe(true);
+      expect(forwarded.env).not.toBe(before);
+      expect(forwarded.env.R37_SAFE).toBe('before');
+      expect(forwarded.env.PATH).toBe(savedEnvironment.PATH);
+      for (const key of DENIED_ENVIRONMENT_KEYS.filter(key => key !== 'PATH')) expect(Object.hasOwn(forwarded.env, key)).toBe(false);
+      expect(JSON.stringify(forwarded)).not.toContain(marker);
+      return;
+    }
+    if (runtimeProbe === 'guard-mutation') {
+      options.env = { R37_SAFE: 'before' };
+      descriptor.launchGuard = () => {
+        argv[1] = `echo ${marker}`;
+        options.shell = true;
+        options.env.BASH_ENV = '/dev/stdin';
+        options.input = `echo ${marker}\n`;
+        Object.defineProperty(descriptor, 'launchGuard', { get() { calls++; return () => false; } });
+        return true;
+      };
+      const result = launchAgent(descriptor, childProcess.spawnSync, command, argv, options);
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('SAFE_EXECUTED');
+      expect(`${result.stdout}${result.stderr}`).not.toContain(marker);
+      expect(calls).toBe(0);
+      return;
+    }
+    const hostile = () => { calls++; return calls === 1 ? safeScript : `echo ${marker}`; };
+    if (variant === 'argv-getter') Object.defineProperty(argv, '1', { get: hostile });
+    if (variant === 'argv-proxy') argv = new Proxy(argv, { get(target, key, receiver) { return key === '1' ? hostile() : Reflect.get(target, key, receiver); } });
+    if (variant === 'revoked-proxy') { const proxy = Proxy.revocable(argv, {}); proxy.revoke(); argv = proxy.proxy; }
+    if (variant === 'iterator-getter') Object.defineProperty(argv, Symbol.iterator, { get: hostile });
+    if (variant === 'sparse-argv') { argv = ['-c', , safeScript]; }
+    if (variant === 'oversized-sparse-argv') argv = new Array(0xffffffff);
+    if (variant === 'array-subclass') argv = new (class extends Array {})(...argv);
+    if (variant === 'options-getter') Object.defineProperty(options, field, { get: hostile });
+    if (variant === 'environment-getter') { options.env = {}; Object.defineProperty(options.env, 'SAFE', { get: hostile }); }
+    if (variant === 'cyclic-options') options.cycle = options;
+    if (variant === 'options-prototype') Object.setPrototypeOf(options, { get shell() { return hostile(); } });
+    if (variant === 'boxed-command') { command = new String(command); command.toString = hostile; }
+    if (variant === 'descriptor-getter') Object.defineProperty(descriptor, field, { get: hostile });
+    const proxyTraps = { get() { calls++; throw Error('Proxy get ran'); }, ownKeys() { calls++; throw Error('Proxy ownKeys ran'); },
+      getPrototypeOf() { calls++; throw Error('Proxy getPrototypeOf ran'); }, getOwnPropertyDescriptor() { calls++; throw Error('Proxy descriptor ran'); } };
+    const suppliedDescriptor = variant === 'descriptor-proxy' ? new Proxy(descriptor, proxyTraps) : descriptor;
+    const suppliedOptions = variant === 'options-proxy' ? new Proxy(options, proxyTraps) : options;
+    if (variant === 'environment-proxy') options.env = new Proxy({}, proxyTraps);
+    let result, error;
+    try { result = launchAgent(suppliedDescriptor, childProcess.spawnSync, command, argv, suppliedOptions); }
+    catch (cause) { error = cause; }
+    expect(`${result?.stdout ?? ''}${result?.stderr ?? ''}`).not.toContain(marker);
+    expect(error).toBeInstanceOf(AgentLaunchRefusedError);
+    expect(error.message).toContain('use literal argv');
+    expect(calls).toBe(0);
+  } finally { process.env = savedEnvironment; rmSync(dir, { recursive: true, force: true }); }
+}
+
+// Audit probes exercise the real boundary with harmless OS commands or injected primitives.
 it.each([
+  ...['absent-env', 'undefined-env', 'null-env'].map(variant => ({
+    name: `R37.27 real spawnSync neutralises inherited BASH_ENV=/dev/stdin (${variant})`, runtimeProbe: 'inherited', variant,
+  })),
+  ...['spawnSync', 'execSync'].map(primitive => ({
+    name: `R37.27 real ${primitive} sanitises inherited loaders with options absent`, runtimeProbe: 'implicit-options', primitive,
+  })),
+  { name: 'R37.28 real spawnSync neutralises captured argv/options/descriptor mutations during the guard', runtimeProbe: 'guard-mutation' },
+  ...['spawn', 'spawnSync', 'exec', 'execFile', 'execSync', 'execFileSync'].map(primitive => ({
+    name: `R37.27 ${primitive} receives frozen inherited environment detached before guard mutation`, runtimeProbe: 'environment-snapshot', primitive,
+  })),
+  ...['omitted-argv', 'no-argv'].map(variant => ({
+    name: `R37.27 sanitised environment covers ${variant} overload`, runtimeProbe: 'environment-snapshot', variant,
+  })),
+  ...['argv-getter', 'argv-proxy', 'revoked-proxy', 'iterator-getter', 'sparse-argv', 'array-subclass',
+    'oversized-sparse-argv', 'environment-getter', 'environment-proxy', 'cyclic-options', 'options-prototype', 'boxed-command', 'descriptor-proxy', 'options-proxy'].map(variant => ({
+    name: `R37.28 real spawnSync refuses ${variant} without evaluating hostile input`, runtimeProbe: 'snapshot', variant,
+  })),
+  ...['mode', 'resumeId', 'log', 'launchGuard'].map(field => ({
+    name: `R37.28 real spawnSync refuses descriptor ${field} accessor`, runtimeProbe: 'snapshot', variant: 'descriptor-getter', field,
+  })),
+  ...['shell', 'env', 'cwd'].map(field => ({
+    name: `R37.28 real spawnSync refuses options ${field} accessor`, runtimeProbe: 'snapshot', variant: 'options-getter', field,
+  })),
   { name: 'R37.24 real fork cannot execute unrelated JavaScript with fresh Codex evidence', realPrimitive: 'fork',
     options: { execPath: process.execPath, execArgv: ['-e', 'process.exit(0)'], stdio: 'ignore' },
     refused: true, reason: 'unapproved primitive identity' },
@@ -159,9 +295,9 @@ it.each([
     argv: ['sh', '-c', `env bash -c 'claude --resume ${SID}'`], resumeId: SID },
   { name: 'R37.3 oversized wrapper chain uses literal argv fallback', command: 'env',
     argv: [...Array(34).fill('env'), 'claude', '-p', 'hello'], refused: true, reason: 'use literal argv' },
-  { name: 'R37.4 captured argv mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutate: true, refused: true },
+  { name: 'R37.4 captured argv mutation is neutralised by snapshot', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutate: true },
   { name: 'R37.4 frozen guard view mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateView: true, refused: true },
-  { name: 'R37.4 shell option mutation', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateShell: true, refused: true },
+  { name: 'R37.4 shell option mutation is neutralised by snapshot', command: 'claude', argv: ['--resume', SID], resumeId: SID, mutateShell: true },
   { name: 'R37.4 observing guard control', command: 'claude', argv: ['--resume', SID], resumeId: SID, guard: true },
   { name: 'R37.5 descriptor id without invocation evidence', resumeId: SID, noArgs: true, refused: true },
   { name: 'R37.5 descriptor id without native resume flag', resumeId: SID, refused: true },
@@ -244,7 +380,9 @@ it.each([
     mode: 'claude-print', argv: ['--system-prompt', '--continue', '--model', '-c'] },
   { name: 'R37.14 Codex -c remains a value option control', argv: ['-c', 'model=fixture', 'exec', '-'] },
 ])('$name', ({ source, command = 'codex', argv = ['exec', '-'], resumeId = null, mode = 'worker-result-probe',
-  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText, realPrimitive, options: suppliedOptions, spoofVitest, omitArgv }) => {
+  refused, mutate, mutateView, mutateShell, shell, guard, reason, opaque, noArgs, closureArg, argvText, realPrimitive, options: suppliedOptions, spoofVitest, omitArgv,
+  runtimeProbe, primitive: probePrimitive, variant, field }) => {
+  if (runtimeProbe) return runRuntimeProbe({ runtimeProbe, primitive: probePrimitive, variant, field });
   if (spoofVitest) {
     const result = childProcess.spawnSync(process.execPath, ['--input-type=module', '-e', `
       import {launchAgent} from './scripts/lib/agent-launch.mjs';
@@ -267,6 +405,7 @@ it.each([
   if (opaque === 'closure') invoke = () => primitive('claude', ['--resume', 'unchecked-id']);
   if (opaque === 'proxy') invoke = new Proxy(primitive, { apply(target) { return target('claude', ['--resume', 'other-id']); } });
   const options = suppliedOptions ?? (shell || mutateShell ? { shell: shell ?? false } : undefined);
+  const expectedOptions = { ...options, env: options?.env ?? inheritedOptions().env };
   const execute = () => {
     if (findings.length) throw new Error('structural launch gate refused');
     return launchAgent({ mode, resumeId, log() {},
@@ -288,7 +427,7 @@ it.each([
     expect(findings).toEqual([]);
     execute();
     expect(primitive).toHaveBeenCalledTimes(1);
-    expect(primitive).toHaveBeenCalledWith(command, original);
+    expect(primitive).toHaveBeenCalledWith(command, original, expectedOptions);
   }
 });
 
@@ -367,7 +506,7 @@ describe('launch refusal', () => {
   it('calls the guard before executing and preserves its thrown cause', () => {
     const order = [], cause = Error('gate closed'), primitive = testPrimitive();
     expect(launchAgent({ mode: 'claude-print', resumeId: undefined, launchGuard: () => { order.push('guard'); } },
-      registerAgentLaunchTestPrimitive((...args) => { order.push('exec'); return args; }), 'claude', ['-p', 'p'])).toEqual(['claude', ['-p', 'p']]);
+      registerAgentLaunchTestPrimitive((...args) => { order.push('exec'); return args; }), 'claude', ['-p', 'p'])).toEqual(['claude', ['-p', 'p'], inheritedOptions()]);
     expect(order).toEqual(['guard', 'exec']);
     try { launchAgent({ mode: 'claude-print', resumeId: null, launchGuard: () => { throw cause; }, log() {} }, primitive, 'claude', ['-p', 'hi']); }
     catch (e) { expect(e).toMatchObject({ cause, code: 'EAGENTLAUNCHREFUSED' }); }
@@ -416,7 +555,7 @@ describe('transparent execution', () => {
   });
 
   it.each(AGENT_LAUNCH_MODES.flatMap(mode => ['spawn', 'exec'].map(kind => [mode, kind])))
-  ('preserves argv identity, option values and return identity for %s via %s', (mode, kind) => {
+  ('preserves argv values, option values and return identity using frozen copies for %s via %s', (mode, kind) => {
     const argv = mode === 'codex-exec-resume' ? ['exec', 'resume', SID, 'literal $() `text`', '\n']
       : mode === 'claude-resume' ? ['--resume', SID, 'literal $() `text`', '\n'] : ['literal $() `text`', '\n'];
     const env = { FOO: 'fixture-value', TOKEN: 'fixture-token' };
@@ -424,7 +563,9 @@ describe('transparent execution', () => {
     const result = {}, io = { [kind]: testPrimitive(() => result) }, primitive = io[kind];
     expect(launchAgent({ mode, resumeId: mode.endsWith('-resume') ? SID : null }, primitive, mode.startsWith('codex') ? 'codex' : 'claude', argv, options)).toBe(result);
     expect(primitive.mock.calls).toEqual([[mode.startsWith('codex') ? 'codex' : 'claude', argv, options]]);
-    expect(primitive.mock.calls[0][1]).toBe(argv);
+    expect(primitive.mock.calls[0][1]).toEqual(argv);
+    expect(primitive.mock.calls[0][1]).not.toBe(argv);
+    expect(Object.isFrozen(primitive.mock.calls[0][1])).toBe(true);
     expect(primitive.mock.calls[0][2]).not.toBe(options);
     expect(primitive.mock.calls[0][2].env).not.toBe(env);
     expect(options.env).toBe(env);
@@ -435,7 +576,7 @@ describe('transparent execution', () => {
     const argv = ['exec', 'resume', SID, '--json', '-'], primitive = testPrimitive();
     launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv);
     expect(primitive).toHaveBeenCalledTimes(1);
-    expect(primitive).toHaveBeenCalledWith('codex', argv);
+    expect(primitive).toHaveBeenCalledWith('codex', argv, inheritedOptions());
     expect(primitive.mock.calls[0][1].filter(value => value === SID)).toHaveLength(1);
   });
   it('preserves errors and promises from injected primitives', () => {
@@ -450,7 +591,9 @@ describe('transparent execution', () => {
     expect(agentResumeId(argv)).toBe(SID);
     const primitive = testPrimitive();
     launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv);
-    expect(primitive.mock.calls[0][1]).toBe(argv);
+    expect(primitive.mock.calls[0][1]).toEqual(argv);
+    expect(primitive.mock.calls[0][1]).not.toBe(argv);
+    expect(Object.isFrozen(primitive.mock.calls[0][1])).toBe(true);
   });
 });
 
@@ -468,7 +611,7 @@ describe('resume validation across execution forms', () => {
     expect(primitive).not.toHaveBeenCalled();
     expect(launchAgent({ mode: 'claude-resume', resumeId: SID, log }, primitive, ...args)).toBeUndefined();
     expect(primitive).toHaveBeenCalledTimes(1);
-    expect(primitive).toHaveBeenCalledWith(...args);
+    expect(primitive).toHaveBeenCalledWith(...args, inheritedOptions());
   });
   it.each([
     ['env', ['sh', '-c', 'claude --resume "unterminated']],
@@ -528,8 +671,9 @@ describe('resume validation across execution forms', () => {
   it.each(launches.map(args => [JSON.stringify(args), args]))('forwards a matching resume launch unchanged for %s', (_label, args) => {
     const result = {}, primitive = testPrimitive(() => result);
     expect(launchAgent({ mode: 'claude-resume', resumeId: SID }, primitive, ...args)).toBe(result);
-    expect(primitive).toHaveBeenCalledWith(...args);
-    if (args.length > 1) expect(primitive.mock.calls[0][1]).toBe(args[1]);
+    expect(primitive).toHaveBeenCalledWith(...args, inheritedOptions());
+    if (args.length > 1) expect(primitive.mock.calls[0][1]).toEqual(args[1]);
+    if (Array.isArray(args[1])) expect(primitive.mock.calls[0][1]).not.toBe(args[1]);
   });
   it.each([
     ['claude', ['--resume', SID, '-r', 'other-id']],
@@ -630,7 +774,8 @@ describe('completion wrapper', () => {
     expect(spawnFn).toHaveBeenCalledTimes(1);
     expect(spawnFn).toHaveBeenCalledWith('claude', argv,
       { cwd: 'fixture-lane', env, stdio: ['ignore', 'pipe', 'pipe'] });
-    expect(spawnFn.mock.calls[0][1]).toBe(argv);
+    expect(spawnFn.mock.calls[0][1]).toEqual(argv);
+    expect(spawnFn.mock.calls[0][1]).not.toBe(argv);
     expect(spawnFn.mock.calls[0][2].env).toEqual(env);
     expect(spawnFn.mock.calls[0][2].env).not.toBe(env);
     expect(child.kill).not.toHaveBeenCalled();
@@ -677,7 +822,7 @@ describe('codex resume id is the positional session id, never an option', () => 
     const result = {}, primitive = testPrimitive(() => result);
     expect(launchAgent({ mode: 'codex-exec-resume', resumeId: SID }, primitive, 'codex', argv)).toBe(result);
     expect(primitive).toHaveBeenCalledTimes(1);
-    expect(primitive).toHaveBeenCalledWith('codex', argv);
+    expect(primitive).toHaveBeenCalledWith('codex', argv, inheritedOptions());
   });
   it.each([
     [], ['exec'], ['exec', '--model', 'resume', SID], ['exec', '--', 'resume', SID],
