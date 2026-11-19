@@ -299,6 +299,7 @@
   "scripts/__tests__/pr-state.test.mjs": 0.01,
   "scripts/__tests__/pr-status.test.mjs": 0.16,
   "scripts/__tests__/pr-workflows-cancel-superseded.test.mjs": 0.15,
+  "scripts/__tests__/prep-block-corpus.test.mjs": 0.2,
   "scripts/__tests__/prep-block.test.mjs": 0.17,
   "scripts/__tests__/priority-order.test.mjs": 0.16,
   "scripts/__tests__/proc-read-migration-74b.test.mjs": 1.93,
