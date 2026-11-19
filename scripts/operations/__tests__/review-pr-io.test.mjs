@@ -19,6 +19,7 @@ import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, symlinkSync, mkdirSync, readFileSync, readdirSync, rmSync, existsSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { checkBodyFileLocation, bodyFileRoots } from '../../review-set-label.mjs';
+import { assertOperatorCliFresh, OPERATOR_CLI_STALE_MARKER, STALE_MAIN_REFUSAL_MARKER } from '../../lib/main-staleness.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -983,6 +984,65 @@ describe('the label sink', () => {
 
   // A child that never started (spawn refused) wrote nothing; one that ran and was killed or exited stays UNKNOWN.
   const gateOk = async () => ({ allowed: true, headSha: 'a'.repeat(40), reason: 'required-checks-successful' });
+  const staleRefusal = () => {
+    try {
+      assertOperatorCliFresh(root, {
+        label: 'review-set-label', skipUnderVitest: false,
+        env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' },
+        run: args => ({ status: 0, stdout: args[0] === 'rev-list' ? '2' : '' }),
+        listBehindFiles: () => ['scripts/review-set-label.mjs'],
+      });
+    } catch (error) { return error.message; }
+    throw new Error('fixture did not reach the stale guard');
+  };
+
+  it('recognises the real operator stale refusal as proven pre-write', () => {
+    expect(isPreWriteRefusal(staleRefusal())).toBe(true);
+  });
+
+  it('records the stale label refusal as failed and resumes only the label with fresh code', async () => {
+    const registry = createRegistry();
+    registry.register(op('stale-label-retry', {
+      record: effectStep({ effects: () => [
+        { type: REVIEW_EFFECTS.WRITE_UP, payload: { bodyFile: payload.bodyFile, body: '# verdict' }, idempotent: true },
+        { type: REVIEW_EFFECTS.LABEL, payload, idempotent: false },
+      ] }),
+    }));
+    const store = createMemoryRunStore();
+    const run = advanceWhileRunning(startRun({ op: 'stale-label-retry', id: 'stale-label', registry }), { registry });
+    const staleNode = vi.fn(() => { throw Object.assign(new Error('exit 1'), { stdout: JSON.stringify({ error: staleRefusal() }) }); });
+    const first = createReviewPrSinks({ root, runStore: store, publishGate: gateOk, runNode: staleNode });
+    const writeUp = vi.fn(first[REVIEW_EFFECTS.WRITE_UP]);
+    first[REVIEW_EFFECTS.WRITE_UP] = writeUp;
+    const halted = await applyPendingEffects(run, { store, sinks: first });
+    expect(halted.error).toMatchObject({ notApplied: true });
+    expect(store.read(run.id).effects.map(e => e.status)).toEqual(['applied', 'failed']);
+    expect(staleNode).toHaveBeenCalledTimes(1);
+
+    const freshNode = vi.fn(() => '{"ok":true,"pr":7,"to":"accepted"}');
+    const resumed = await applyPendingEffects(store.read(run.id), { store, sinks: {
+      ...createReviewPrSinks({ root, runStore: store, publishGate: gateOk, runNode: freshNode }),
+      [REVIEW_EFFECTS.WRITE_UP]: writeUp,
+    } });
+    expect(resumed.run.effects.map(e => e.status)).toEqual(['applied', 'applied']);
+    expect(writeUp).toHaveBeenCalledTimes(1);
+    expect(freshNode).toHaveBeenCalledTimes(1);
+    expect(freshNode.mock.calls[0][0]).toContain('--to=accepted');
+  });
+
+  it.each(['transport', 'missing no-write suffix', 'missing operator marker', 'missing stale marker'])(
+    '%s failure stays UNKNOWN', async kind => {
+      const text = kind === 'transport' ? 'fatal: unable to access'
+        : kind === 'missing no-write suffix' ? staleRefusal().replace('Nothing was changed.', '')
+          : staleRefusal().replace(kind === 'missing operator marker' ? OPERATOR_CLI_STALE_MARKER : STALE_MAIN_REFUSAL_MARKER, '');
+      expect(isPreWriteRefusal(text)).toBe(false);
+      const sinks = createReviewPrSinks({ root, publishGate: gateOk,
+        runNode: () => { throw Object.assign(new Error('exit 1'), { stdout: JSON.stringify({ error: text }) }); } });
+      const error = await sinks[REVIEW_EFFECTS.LABEL](payload, CTX).catch(e => e);
+      expect(error.message).toContain('outcome is UNKNOWN');
+      expect(error.notApplied).toBeUndefined();
+    },
+  );
   it.each(['ENOENT', 'EAGAIN', 'ENOMEM', 'E2BIG'])('a single home that could not be started (%s) is notApplied', async (code) => {
     const sinks = createReviewPrSinks({ root, publishGate: gateOk,
       runNode: () => { throw Object.assign(new Error(`spawnSync node ${code}`), { code, status: null, signal: null }); } });
