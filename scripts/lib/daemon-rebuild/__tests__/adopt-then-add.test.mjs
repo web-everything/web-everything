@@ -2,6 +2,7 @@
  * Fixtures from the review daemon's two discards on 2026-11-18 (17:28 and 18:06 ET). */
 import { describe, expect, it } from 'vitest';
 import { matchReadyCandidate, classifyOverlayRemoval } from '../adopt.mjs';
+import { OPERATOR_LOGINS } from '../../marker-authorship.mjs';
 
 const SHA = (c) => c.repeat(40);
 const seat = 'lane/review-seat-fairness-m1';
@@ -38,9 +39,13 @@ describe('overlay-no-longer-wanted (17:28 ET discard)', () => {
 describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
   const omit = { liveApplied: [{ ref: seat, sha: SHA('b') }], carries: () => false };
   it('adopts then re-adds a still-registered omitted overlay', () => {
-    const m = matchReadyCandidate(args({ ...omit, readdable: (r) => r === seat }));
+    const m = matchReadyCandidate(args({ ...omit, readdable: (r) => r === seat, dependsOn: () => [] }));
     expect(m.adopt).toBeTruthy();
     expect(m.rebuildAfter).toEqual([seat]);
+  });
+  it('refuses when a carried overlay has no recorded dependency declaration (unknown, not none)', () => {
+    expect(matchReadyCandidate(args({ ...omit, readdable: () => true }))).toMatchObject({ adopt: null, omitted: [seat] });
+    expect(matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: () => null }))).toMatchObject({ adopt: null });
   });
   it('refuses when the overlay is not registered any more', () => {
     expect(matchReadyCandidate(args(omit))).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}` });
@@ -48,6 +53,54 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
   it('refuses when a carried overlay declares it a dependency', () => {
     const m = matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: (r) => (r === 'lane/a' ? [seat] : []) }));
     expect(m).toMatchObject({ adopt: null, omitted: [seat] });
+  });
+});
+
+describe('addOverlay dependsOn', () => {
+  it('stores a declared list, defaults a new registration to [], and leaves a legacy entry undeclared', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { addOverlay, readOverlays } = await import('../../daemon-overlays.mjs');
+    const root = mkdtempSync(join(tmpdir(), 'overlay-deps-'));
+    const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    try {
+      addOverlay(root, { ref: 'lane/x', dependsOn: ['lane/y', 'bad ref!', 'lane/y'] }, { env });
+      addOverlay(root, { ref: 'lane/z' }, { env });
+      const list = readOverlays(root, { env });
+      expect(list.find((o) => o.ref === 'lane/x').dependsOn).toEqual(['lane/y']);
+      expect(list.find((o) => o.ref === 'lane/z').dependsOn).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('classifyOverlayRemoval hardening', () => {
+  const tip = SHA('a');
+  const added = { kind: 'added', ref: 'lane/a', at: '2026-11-18T20:00:00Z' };
+  const gone = (e) => ({ kind: 'removed', ref: 'lane/a', reason: 'no longer wanted', tip, at: '2026-11-18T21:00:00Z', ...e });
+  const classify = (events, extra = {}) => classifyOverlayRemoval({ ref: 'lane/a', sha: tip, events, ...extra });
+  it('a manual removed event is benign only with an authenticated actor and recorded source', () => {
+    expect(classify([added, gone()])).toBe('unknown');
+    expect(classify([added, gone({ actor: 'someone-else', source: 'removeRegistration' })])).toBe('unknown');
+    expect(classify([added, gone({ actor: OPERATOR_LOGINS[0], source: 'removeRegistration' })])).toBe('benign');
+    expect(classify([added, gone({ actor: OPERATOR_LOGINS[0] })])).toBe('unknown');
+  });
+  it('a merge drop needs evidence bound to the applied sha', () => {
+    const drop = { kind: 'auto-dropped', ref: 'lane/a', reason: 'pr-merged', tip, at: '2026-11-18T21:00:00Z' };
+    expect(classify([added, drop], { inMain: () => true })).toBe('benign');
+    expect(classify([added, { ...drop, tip: undefined }], { inMain: () => true })).toBe('unknown');
+    expect(classify([added, { ...drop, tip: SHA('9') }], { inMain: () => true })).toBe('unknown');
+    expect(classify([added, drop], { inMain: () => false })).toBe('unknown');
+    const merged = [{ ref: 'lane/a', action: 'remove', reason: 'pr-merged' }];
+    expect(classify([], { decisions: merged, inMain: () => true })).toBe('benign');
+    expect(classify([], { decisions: merged })).toBe('unknown');
+  });
+  it('needs a recorded add with a valid timestamp strictly earlier than the removal', () => {
+    const op = { actor: OPERATOR_LOGINS[0], source: 'removeRegistration' };
+    expect(classify([gone(op)])).toBe('unknown'); // no add recorded
+    expect(classify([{ ...added, at: 'garbage' }, gone(op)])).toBe('unknown');
+    expect(classify([{ ...added, at: '2026-11-18T21:00:00Z' }, gone(op)])).toBe('unknown'); // equal
+    expect(classify([{ ...added, at: undefined }, gone(op)])).toBe('unknown');
   });
 });
 
@@ -59,13 +112,14 @@ describe('classifyOverlayRemoval', () => {
   ];
   const classify = (events) => classifyOverlayRemoval({ ref: 'lane/a', sha: tip, events });
   it('same-tick decisions: merged is benign, closed or gone is unsafe', () => {
-    expect(classifyOverlayRemoval({ ref: 'lane/a', decisions: [{ ref: 'lane/a', action: 'remove', reason: 'pr-merged' }] })).toBe('benign');
+    expect(classifyOverlayRemoval({ ref: 'lane/a', sha: tip, inMain: () => true, decisions: [{ ref: 'lane/a', action: 'remove', reason: 'pr-merged' }] })).toBe('benign');
     expect(classifyOverlayRemoval({ ref: 'lane/a', decisions: [{ ref: 'lane/a', action: 'remove', reason: 'pr-closed' }] })).toBe('unsafe');
     expect(classifyOverlayRemoval({ ref: 'lane/a', decisions: [{ ref: 'lane/a', action: 'remove', reason: 'ref-gone' }] })).toBe('unsafe');
   });
   it('audit trail reasons', () => {
-    expect(classify(ev('removed', 'no longer wanted'))).toBe('benign');
-    expect(classify(ev('auto-dropped', 'pr-merged', { tip: undefined }))).toBe('benign');
+    expect(classify(ev('removed', 'no longer wanted'))).toBe('unknown'); // unauthenticated manual removal
+    expect(classify(ev('auto-retired', 'no longer wanted', { actor: OPERATOR_LOGINS[0] }))).toBe('benign');
+    expect(classify(ev('auto-dropped', 'pr-merged', { tip: undefined }))).toBe('unknown');
     expect(classify(ev('removed', 'smoke failed, rolled back'))).toBe('unsafe');
     expect(classify(ev('removed', 'security unload'))).toBe('unsafe');
     expect(classify(ev('removed', 'not merged'))).toBe('unsafe');

@@ -48,7 +48,7 @@ export function matchReadyCandidate({
   registered = stillWanted, allowFallback = true, rejected = null, nowMs, maxAgeMs,
   liveApplied, carries = () => false, leftForMain = () => false,
   removedForMain = () => false, retiredByOperator = () => false, contentInBuild = () => false, forcedWatch = () => 'missing', auditedTip = null,
-  tipInMain = () => false, removalSafety = () => 'unknown', dependsOn = () => [], readdable = () => false,
+  tipInMain = () => false, removalSafety = () => 'unknown', dependsOn = () => null, readdable = () => false,
 }) {
   if (!ready) return { adopt: null, reason: 'none' };
   // Adopt the build that passed, then add: an applied overlay that has since LEFT the registry for a benign reason
@@ -163,9 +163,10 @@ export function matchReadyCandidate({
   const readd = [];
   const blocked = omitted.filter((a) => {
     if (readdable(a.ref) !== true) return true;
+    // A carried overlay with no recorded declaration is unknown, not independent: refuse (fail closed).
     const needed = applied.some((x) => {
       const deps = dependsOn(x.ref);
-      return Array.isArray(deps) && deps.includes(a.ref);
+      return !Array.isArray(deps) || deps.includes(a.ref);
     });
     if (needed) return true;
     readd.push(a.ref);
@@ -208,11 +209,13 @@ const BENIGN_REMOVAL_RE = /^(pr[- ]?merged|merged|in-main|no longer wanted|not w
  * @param {{ref:string, decisions?:object[], events?:object[]}} o — this tick's plan decisions plus the overlay audit trail
  * @returns {'benign'|'unsafe'|'unknown'}
  */
-export function classifyOverlayRemoval({ ref, sha, decisions = [], events } = {}) {
+export function classifyOverlayRemoval({ ref, sha, decisions = [], events, inMain = () => false } = {}) {
   try {
     const d = decisions.find((x) => x?.ref === ref && x.action === 'remove');
-    if (d) return d.reason === 'pr-merged' || d.reason === 'in-main' ? 'benign' : 'unsafe';
-    if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || !Array.isArray(events)) return 'unknown';
+    const shaOk = /^[a-f0-9]{40}$/.test(sha || '');
+    // A merge drop is benign only when main provably carries the candidate's applied sha (evidence bound to that sha).
+    if (d) return d.reason === 'pr-merged' || d.reason === 'in-main' ? (shaOk && inMain(sha) === true ? 'benign' : 'unknown') : 'unsafe';
+    if (!ref || !shaOk || !Array.isArray(events)) return 'unknown';
     const history = events.filter((e) => e?.ref === ref);
     const last = history.at(-1);
     if (!last || !['removed', 'auto-dropped', 'auto-retired'].includes(last.kind)) return 'unknown';
@@ -220,12 +223,19 @@ export function classifyOverlayRemoval({ ref, sha, decisions = [], events } = {}
     if (!why) return 'unknown';
     if (UNSAFE_REMOVAL_RE.test(why)) return 'unsafe';
     // The trail must be about THIS applied tip, recorded after the ref was added, and (auto-retired) by an authenticated operator.
+    // Same rule as the retirement check: a recorded add with a valid timestamp, strictly earlier than the removal.
     const removedAt = Date.parse(last.at || '');
-    const addedAt = Math.max(0, ...history.filter((e) => e.kind === 'added').map((e) => Date.parse(e.at || '')).filter(Number.isFinite));
-    if (!Number.isFinite(removedAt) || removedAt < addedAt) return 'unknown';
-    if (last.kind === 'auto-dropped') return why === 'pr-merged' || why === 'in-main' ? 'benign' : 'unknown';
+    const adds = history.filter((e) => e.kind === 'added');
+    if (!Number.isFinite(removedAt) || adds.length === 0) return 'unknown';
+    if (!adds.every((e) => typeof e.at === 'string' && Number.isFinite(Date.parse(e.at)) && removedAt > Date.parse(e.at))) return 'unknown';
+    if (last.kind === 'auto-dropped') {
+      return (why === 'pr-merged' || why === 'in-main') && last.tip === sha && inMain(sha) === true ? 'benign' : 'unknown';
+    }
     if (last.tip !== sha) return 'unknown';
-    if (last.kind === 'auto-retired' && !OPERATOR_LOGINS.includes(String(last.actor || '').toLowerCase())) return 'unknown';
+    // Authenticated only: an operator actor (auto-retired) or the sanctioned remove path's recorded actor AND source.
+    const operator = OPERATOR_LOGINS.includes(String(last.actor || '').toLowerCase());
+    if (last.kind === 'auto-retired' && !operator) return 'unknown';
+    if (last.kind === 'removed' && !(operator && typeof last.source === 'string' && last.source.trim())) return 'unknown';
     return BENIGN_REMOVAL_RE.test(why) ? 'benign' : 'unknown';
   } catch { return 'unknown'; }
 }

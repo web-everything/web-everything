@@ -633,13 +633,22 @@ export async function prepareRebuild({
         removedForMain: (ref) => plan.decisions.some((d) => d.ref === ref && d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')),
         // Adopt the build that passed, then add: benign removals (merged/no longer wanted) and still-registered overlays the
         // build omits queue an incremental rebuild instead of discarding the build; safety/unknown removals still discard.
-        removalSafety: (ref, sha) => classifyOverlayRemoval({ ref, sha, decisions: plan.decisions, events: readOverlayEvents() }),
-        readdable: (ref) => wantedRefs.has(ref) && registeredRefs.has(ref),
+        removalSafety: (ref, sha) => classifyOverlayRemoval({
+          ref, sha, decisions: plan.decisions, events: readOverlayEvents(), inMain: (s) => tipInMain(git, plan.mainSha, s),
+        }),
+        // Registered NOW (the on-disk registry, not the tick-start snapshot): a removal made during planning is not re-added.
+        readdable: (ref) => {
+          if (!wantedRefs.has(ref) || !registeredRefs.has(ref)) return false;
+          try {
+            const live = readOverlayState(root, { env });
+            return !live.corrupt && live.overlays.some((o) => o?.ref === ref);
+          } catch { return false; }
+        },
+        // null = no declaration recorded (legacy/unknown): the omission check refuses rather than assume "none".
         dependsOn: (ref) => {
           const deps = (overlaysBefore || []).find((o) => o?.ref === ref)?.dependsOn;
-          return Array.isArray(deps) ? deps : [];
-        },
-        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
+          return Array.isArray(deps) ? deps : null;
+        },        // R508: a forced record is only adoptable while its rollback watch is intact (read under this write lock).
         forcedWatch: (sha) => forcedWatchStatus(root, stEnv, sha),
       });
       if (!m.adopt) {
