@@ -35,7 +35,7 @@ export default {
   async run({ sourceRoot = process.env.SOAK_TREE_ROOT || ROOT, log } = {}) {
     const { planCatchUp } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/enqueue-on-event.mjs')).href);
     const violations = [];
-    for (const reason of ['red-team-pending', 'mq-same-head-failed']) {
+    for (const reason of ['red-team-pending']) {
       for (const run of [101, null]) {
         const plan = probe(planCatchUp, reason, run);
         if (plan.run.length || plan.skippedUnchanged?.[0]?.reason !== reason) {
@@ -43,9 +43,11 @@ export default {
         }
       }
     }
-    for (const reason of ['sent-back', 'bornas-collision']) {
-      if (probe(planCatchUp, reason).run[0]?.num !== 42) {
-        violations.push(`${reason} did not retry after main CI changed`);
+    for (const reason of ['mq-same-head-failed', 'sent-back', 'bornas-collision']) {
+      for (const run of [101, null]) {
+        if (probe(planCatchUp, reason, run).run[0]?.num !== 42) {
+          violations.push(`${reason} did not retry after main CI changed to ${run}`);
+        }
       }
     }
     log?.(`head-scoped decline probe: ${violations.length} violation(s)`);

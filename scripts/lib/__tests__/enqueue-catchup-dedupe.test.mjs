@@ -41,10 +41,10 @@ describe('catch-up decline memory', () => {
     const declines = new Map([[1, decline({ at: now - 31 * 60_000, ttlMs: 30 * 60_000 })]]);
     expect(plan({ prs: fresh, declines }).run.map(p => p.num)).toEqual([1, 2]);
   });
-  it.each(['sent-back', 'bornas-collision'])('re-checks %s when main CI newest completed run changes', reason => {
+  it.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('re-checks %s when main CI newest completed run changes', reason => {
     expect(plan({ mainCiRunId: 101, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
   });
-  describe.each(['red-team-pending', 'mq-same-head-failed'])('%s head-scoped memory', reason => {
+  describe.each(['red-team-pending'])('%s head-scoped memory', reason => {
     it.each([101, undefined, null])('skips across main CI run %s, even without a stored main run', mainCiRunId => {
       for (const storedRun of [100, undefined, null]) {
         expect(plan({ mainCiRunId, declines: new Map([[42, decline({ reason, mainCiRunId: storedRun })]]) }))
@@ -62,9 +62,12 @@ describe('catch-up decline memory', () => {
   it.each(['headRefOid', 'labelsDigest', 'lastCheckCompletedAt', 'checksDigest'])('missing %s evidence fails open', field => {
     expect(plan({ prs: [pr(42, { [field]: null })] }).run).toHaveLength(1);
   });
-  it.each(['sent-back', 'bornas-collision'])('missing main CI evidence fails open for %s', reason => {
-    for (const mainCiRunId of [undefined, null]) {
+  it.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('missing main CI evidence fails open for %s', reason => {
+    for (const mainCiRunId of [undefined, null, 0, -1, 1.5, '100']) {
       expect(plan({ mainCiRunId, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
+    }
+    for (const mainCiRunId of [undefined, null]) {
+      expect(plan({ declines: new Map([[42, decline({ reason, mainCiRunId })]]) }).run).toHaveLength(1);
     }
   });
   it('puts no-hold PRs first, retaining existing order in each partition', () => {
@@ -105,12 +108,12 @@ it('records actual declines and prints skipped-unchanged: #n (reason) in the lis
 
 describe.each(['red-team-pending', 'mq-same-head-failed'])('%s daemon memory', kind => {
   const result = { enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind, reason: 'same head failed' }] };
-  it.each([101, undefined, null])('retains the recorded decline across main CI run %s', async run => {
+  it.each([101, undefined, null])('retains only a main-independent decline across main CI run %s', async run => {
     const d = daemon({ result });
     await d.handle.catchUp(); d.advance(); d.main.run = run;
     await d.handle.catchUp();
-    expect(d.calls()).toBe(1);
-    expect(d.lines.at(-1)).toContain('nothing runnable');
+    expect(d.calls()).toBe(kind === 'red-team-pending' ? 1 : 2);
+    if (kind === 'red-team-pending') expect(d.lines.at(-1)).toContain('nothing runnable');
   });
   it.each([
     'pull_request.labeled(other)@1', 'pull_request.unlabeled(other)@2',
@@ -246,7 +249,7 @@ describe('batched listing change evidence', () => {
   });
   describe.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('%s listing evidence', reason => {
   it.each([
-    { incompleteChecks: true }, { missingStatus: true }, { partialStatus: true }, { statusState: 'FAILURE' }, { conclusion: 'FAILURE' }, { noConclusion: true }, { incompleteRuns: true }, ...(reason === 'mq-same-head-failed' ? [] : [{ incompleteMain: true }, { partialMain: true }]), { wrongHead: true }, { failedBatch: true },
+    { incompleteChecks: true }, { missingStatus: true }, { partialStatus: true }, { statusState: 'FAILURE' }, { conclusion: 'FAILURE' }, { noConclusion: true }, { incompleteRuns: true }, { incompleteMain: true }, { partialMain: true }, { wrongHead: true }, { failedBatch: true },
   ])('fails open on incomplete or unreadable evidence %j', async options => {
     const baseline = await listing();
     const complete = baseline.prs[0];

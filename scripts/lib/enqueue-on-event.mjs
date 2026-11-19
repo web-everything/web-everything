@@ -97,7 +97,8 @@ export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 // Fixed maximum: decline dedupe must never suppress a PR indefinitely.
 export const CATCH_UP_DECLINE_TTL_MS = 60 * 60_000;
 // Declines safe to dedupe: bound to a head/labels/checks snapshot. Everything else retries every catch-up.
-// red-team-pending and mq-same-head-failed survive main CI churn; sent-back and bornas-collision require the same mainCiRunId.
+// Only red-team-pending survives main CI churn; mq-same-head-failed recovery is main-dependent,
+// so it, sent-back and bornas-collision require the same mainCiRunId.
 export const CATCH_UP_DECLINE_DEDUPE_KINDS = Object.freeze(new Set(['mq-same-head-failed', 'red-team-pending', 'sent-back', 'bornas-collision']));
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
@@ -644,7 +645,7 @@ function unchangedDecline(pr, held, now, mainCiRunId) {
     && typeof pr.checksDigest === 'string' && pr.checksDigest && held.checksDigest === pr.checksDigest
     && Number.isFinite(pr.lastCheckCompletedAt) && pr.lastCheckCompletedAt <= held.at
     && Number.isFinite(pr.lastLabelChangedAt) && pr.lastLabelChangedAt <= held.at
-    && (held.reason === 'red-team-pending' || held.reason === 'mq-same-head-failed'
+    && (held.reason === 'red-team-pending'
       || Number.isSafeInteger(mainCiRunId) && mainCiRunId > 0 && held.mainCiRunId === mainCiRunId));
 }
 
