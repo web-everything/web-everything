@@ -24,7 +24,7 @@ import {
   withLedgerLock, isPinnedRev, repoRelativeFindings, readSeatCapUsage,
   applyRecheck, RECHECK_SHAPE, renderRedTeamComment, seatAnswerJsonSchema, preserveSeatRawAnswer, buildRedTeamTask, speculateRedTeam, completeRedTeam, buildRedTeamDiscardRow, createRedTeamIo, releaseSeatCalls,
 } from '../review-extra-seats.mjs';
-import { runReviewJob, summarizeExtraSeats } from '../review-job.mjs';
+import { runReviewJob, settleSpeculativeSeats, summarizeExtraSeats } from '../review-job.mjs';
 import { ADVISORY_JUDGE_LENS, JUDGE_SEATS } from '../review-pr.mjs';
 import {
   selectReviewSeatProvider, reviewSeatTaskType, REVIEW_SEAT_DISPATCH_KIND,
@@ -1972,6 +1972,47 @@ it('seats-speculate CLI writes pass and reservation files before seats-finish ap
     expect(rows[0].claudeVerdict).toBe('changes');
   } finally {
     stdout.mockRestore(); stderr.mockRestore(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it('cancellation mid-batch applies the completed exhaustion published by seats-speculate CLI', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'added-seats-cancel-'));
+  const sink = join(dir, 'read.json');
+  const out = join(dir, 'pass.json');
+  const pending = [];
+  const resetsAt = new Date(NOW + 24 * 60 * 60_000).toISOString();
+  const { io, rows } = fakeSeatIo({ runSeat: ({ provider }) => provider === 'codex'
+    ? Promise.resolve({ report: { quotaState: 'exhausted', quotaUsedPercent: 100, quotaResetsAt: resetsAt } })
+    : new Promise(resolve => pending.push(resolve)) });
+  const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+  let worker;
+  try {
+    writeFileSync(sink, JSON.stringify({ read: LOOP_PAYLOAD.findings.read }));
+    worker = runExtraSeatsCli(['seats-speculate', '--pr=5', `--repo=${REPO}`, '--lane=unused', `--read-sink=${sink}`, `--out=${out}`], { seatsIo: io });
+    // Let the completed call publish while the other provider calls remain unresolved.
+    await new Promise(setImmediate);
+    expect(pending.length).toBeGreaterThan(0);
+    expect(existsSync(out)).toBe(false);
+    const reserved = JSON.parse(readFileSync(`${out}.reserved`, 'utf8'));
+    expect(reserved.calls).toHaveLength(1);
+    expect(reserved.calls[0]).toMatchObject({ provider: 'codex', call: { status: 'quota-exhausted' }, finishedAt: new Date(NOW).toISOString() });
+    expect(rows).toEqual([]);
+    const result = settleSpeculativeSeats({ spec: {}, out: { pr: 5, repo: REPO, outcome: 'parked' } }, {
+      cancelSpeculativeSeats: () => ({ spec: null, reserved }),
+      recordDiscardedSeats: o => recordDiscardedSeats(o, io),
+    });
+    expect(result.status).toBe('discarded');
+    expect(rows.filter(r => r.dispatchKind === 'review-seat-speculative-discard')).toHaveLength(reserved.reservations.length);
+    expect(rows.filter(r => r.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toEqual(reserved.calls[0].seats.map(seat =>
+      expect.objectContaining({ seat: seat.seat, lens: seat.lens, provider: 'codex', discarded: true,
+        status: 'quota-exhausted', quotaResetsAt: resetsAt, scoredAt: reserved.calls[0].finishedAt, seatVerdict: null, findings: [] })));
+    expect(quotaHold(rows, 'codex', NOW + 1)).toContain('quota exhausted');
+    expect(quotaHold(rows, 'codex', NOW + 2 * 60 * 60_000)).toContain(resetsAt);
+  } finally {
+    for (const resolve of pending) resolve({ error: 'cancelled' });
+    await worker;
+    stderr.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

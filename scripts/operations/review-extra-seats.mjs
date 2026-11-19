@@ -668,7 +668,7 @@ export async function runExtraSeats(o = {}, io = createExtraSeatsIo({ env: o.env
 }
 
 /** Calls and reservations only: no scored seat rows before the final loop read is known. */
-export async function speculateExtraSeats({ pr, repo, lanePath, read, env = process.env, routingPolicy = readRoutingPolicy(), onReserved = () => {} } = {}, io = createExtraSeatsIo({ env })) {
+export async function speculateExtraSeats({ pr, repo, lanePath, read, env = process.env, routingPolicy = readRoutingPolicy(), onReserved = () => {}, onProgress = () => {} } = {}, io = createExtraSeatsIo({ env })) {
   const startedAt = io.now();
   try {
     if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: `${EXTRA_SEATS_ENV}=${env[EXTRA_SEATS_ENV]}` };
@@ -810,6 +810,9 @@ export async function speculateExtraSeats({ pr, repo, lanePath, read, env = proc
           startedAt: new Date(t0).toISOString(), finishedAt,
           changedFiles: read.netChangedFiles ?? null,
         });
+        // Publish each completed observation before waiting for the other calls: cancellation must
+        // retain quota exhaustion (and clean probes) even when the final pass never gets written.
+        onProgress({ rev, reservations, calls: callsMade });
       });
       await Promise.all(calls);
     } finally {
@@ -835,7 +838,8 @@ export async function finishExtraSeats({ loopPayload, pass, env = process.env } 
   }
   let seats;
   try {
-    seats = pass.calls.flatMap(call => buildSeatRows({ ...call, claudeFindings: claudeFindingsFromLoop(loopPayload), claudeVerdict: loopPayload?.verdict?.verdict ?? null }));
+    seats = pass.calls.flatMap(call => buildSeatRows({ ...call, claudeFindings: claudeFindingsFromLoop(loopPayload), claudeVerdict: loopPayload?.verdict?.verdict ?? null })
+      .map(row => ({ ...row, scoredAt: call.finishedAt ?? call.startedAt ?? new Date(io.now()).toISOString() })));
   } catch { return { status: 'discarded', reason: 'incomplete added seats pass; comparison rows could not be built' }; }
   let rowsWritten = 0;
   for (const row of seats) {
@@ -849,8 +853,9 @@ export function recordDiscardedSeats({ pr, repo, pass, reserved, reason }, io = 
   const reservations = new Map([...(reserved?.reservations ?? []), ...(pass?.reservations ?? [])].map(r => [r.callId, r]));
   let rowsWritten = 0;
   for (const r of reservations.values()) {
-    const call = pass?.status === 'speculated' ? pass.calls?.find(c => c.callId === r.callId) : null;
-    const completed = call ? { ...call, status: 'speculated', rev: pass.rev, findings: Object.values(call.parsed ?? {}).flatMap(s => s.findings ?? []) } : null;
+    const call = (pass?.status === 'speculated' ? pass.calls?.find(c => c.callId === r.callId) : null)
+      ?? reserved?.calls?.find(c => c.callId === r.callId);
+    const completed = call ? { ...call, status: 'speculated', rev: pass?.rev ?? reserved?.rev, findings: Object.values(call.parsed ?? {}).flatMap(s => s.findings ?? []) } : null;
     const row = buildRedTeamDiscardRow({ pr, repo, pass: completed, reserved: r, reason, now: io.now() });
     try { io.append({ ...row, seat: 'added-seats', lens: null }); rowsWritten += 1; }
     catch (e) { io.log(`added seats: discard spend NOT written — ${e.message}`); }
@@ -2348,7 +2353,8 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo, seat
     // exactly that read, and writes the pass to --out. It never writes a seat row, a comment or a trial: the job
     // finishes the pass only if the review accepts (`red-team-finish`), and otherwise records the spend as discarded.
     // The reservation is written to `<out>.reserved` as soon as it is taken, so a pass killed mid-call is still
-    // accounted for. SIGTERM (the job calling it off) kills the running seat CLI's own process group first.
+    // accounted for. Added-seat completions also update that progress file immediately, preserving quota
+    // observations if the batch is cancelled. SIGTERM kills the running seat CLI's own process group first.
     const outPath = flag('out');
     const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(value)}\n`); renameSync(tmp, path); };
     const waitMs = Number(flag('wait-ms')) > 0 ? Number(flag('wait-ms')) : 45 * 60 * 1000;
@@ -2368,6 +2374,7 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo, seat
         result = await (sub === 'seats-speculate' ? speculateExtraSeats : speculateRedTeam)({
           pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), read: sunk.read, resume: false,
           onReserved: (r) => writeJson(`${outPath}.reserved`, r),
+          onProgress: (r) => writeJson(`${outPath}.reserved`, r),
           onTiming: (r) => writeJson(`${outPath}.reserved`, r),
         }, sub === 'seats-speculate' ? seatsIo : undefined);
       }
