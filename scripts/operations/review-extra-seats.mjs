@@ -667,7 +667,7 @@ export async function runExtraSeats(o = {}, io = createExtraSeatsIo({ env: o.env
   return finishExtraSeats({ ...o, pass }, io);
 }
 
-/** Calls and reservations only: no scored seat rows before the final loop read is known. */
+/** Calls, reservations and live quota observations only: no scored comparisons before the final loop read is known. */
 export async function speculateExtraSeats({ pr, repo, lanePath, read, env = process.env, routingPolicy = readRoutingPolicy(), onReserved = () => {}, onProgress = () => {} } = {}, io = createExtraSeatsIo({ env })) {
   const startedAt = io.now();
   try {
@@ -804,14 +804,20 @@ export async function speculateExtraSeats({ pr, repo, lanePath, read, env = proc
         const parsed = call.status === 'ok' ? repoRelativeFindings(parseSeatAnswer(call.text, group), scratch) : {};
         preserveSeatRawAnswer({ callId, call, parsed, seats: group }, io);
         const quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
-        callsMade.push({
+        const completed = {
           evidence: run?.report ?? {},
           callId, pr, repo, provider, model, effort, seats: group, call, parsed, quota, durationMs: Date.parse(finishedAt) - t0,
           startedAt: new Date(t0).toISOString(), finishedAt,
           changedFiles: read.netChangedFiles ?? null,
-        });
-        // Publish each completed observation before waiting for the other calls: cancellation must
-        // retain quota exhaustion (and clean probes) even when the final pass never gets written.
+        };
+        // Admission reads the live store, not worker progress. Publish quota evidence as soon
+        // as this call completes, before another call or settlement can delay it or be cancelled.
+        for (const row of buildSeatRows({ ...completed, claudeFindings: null })) {
+          try { io.append({ ...row, quotaObservation: true, discarded: true, seatVerdict: null, findings: [], findingsCount: 0, confirmedCount: 0, scoredAt: finishedAt }); }
+          catch (e) { io.log(`added seats: live quota evidence NOT written — ${e.message}`); }
+        }
+        callsMade.push(completed);
+        // Progress retains completed spend details for cancellation accounting.
         onProgress({ rev, reservations, calls: callsMade });
       });
       await Promise.all(calls);
@@ -2350,11 +2356,12 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo, seat
   } else if ((sub === 'red-team-speculate' || sub === 'seats-speculate') && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
     // Speculative evidence workers, started by the review job beside the review loop. Each waits for the
     // loop's `read` (written to --read-sink the moment the read step finishes), runs the first half of the pass on
-    // exactly that read, and writes the pass to --out. It never writes a seat row, a comment or a trial: the job
+    // exactly that read, and writes the pass to --out. Added seats write live unscored quota observations;
+    // neither worker writes scored comparisons, a comment or a trial: the job
     // finishes the pass only if the review accepts (`red-team-finish`), and otherwise records the spend as discarded.
     // The reservation is written to `<out>.reserved` as soon as it is taken, so a pass killed mid-call is still
-    // accounted for. Added-seat completions also update that progress file immediately, preserving quota
-    // observations if the batch is cancelled. SIGTERM kills the running seat CLI's own process group first.
+    // accounted for. Added-seat completions also update that progress file for spend details; quota
+    // observations go straight to the live store. SIGTERM kills the running seat CLI's own process group first.
     const outPath = flag('out');
     const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(value)}\n`); renameSync(tmp, path); };
     const waitMs = Number(flag('wait-ms')) > 0 ? Number(flag('wait-ms')) : 45 * 60 * 1000;

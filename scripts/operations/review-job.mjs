@@ -963,9 +963,7 @@ export function settleSpeculativeSeats({ spec, out, input }, io) {
     return { status: 'discarded', reason, spend };
   };
   try {
-    // Bounce/park discard is specified by the operator; the old sequential policy still decides
-    // whether replacement seats are owed (off/shadow must retain their existing semantics).
-    if (['bounced', 'parked'].includes(out.outcome)) return { ...discard(`review ${out.outcome}`), sequential: Boolean(input) };
+    if (['bounced', 'parked'].includes(out.outcome)) return discard(`review ${out.outcome}`);
     if (out.outcome === BLOCKED_ON_INFRA) return discard(`review ${out.outcome}`);
     if (!input) return discard('no final loop input');
     const sequential = reason => {
@@ -1095,7 +1093,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
   // Settle added evidence after the arc. Discarded calls never alter the verdict;
-  // unstarted calls and bounce/park use the old sequential policy when input is valid.
+  // only unstarted calls may use the old sequential policy when input and live head are valid.
   const concurrentSeats = seatsBox.concurrent ?? null;
   const seatsStartedAt = io.now();
   if (concurrentSeats || (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function')) {

@@ -709,15 +709,18 @@ describe('added seats concurrent evidence', () => {
     expect(kinds(calls).filter(k => k === 'seats-sequential')).toHaveLength(1);
     expect(kinds(calls)).not.toContain('seats-finish');
   });
-  it.each(['off', 'shadow', 'on'])('bounce/park discard retains sequential final-head policy %s', mode => {
+  it.each(['off', 'shadow', 'on'])('bounce/park discards without replacement seats with final-head policy %s', mode => {
     for (const [verdict, stopped] of [['changes', 'complete'], ['needs-human', 'confirm']]) {
       const { io, calls } = seatsIo({ verdict, stopped, extra: { finalHeadSeatsSetting: () => ({ mode }) } });
       const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
-      const skip = mode === 'on' && verdict === 'changes';
-      expect(out.extraSeats.status).toBe(skip ? 'skipped' : 'ran');
+      expect(out.outcome).toBe(verdict === 'changes' ? 'bounced' : 'parked');
+      expect(out.extraSeats).toMatchObject({ status: 'discarded', spend: { status: 'recorded' } });
+      expect(kinds(calls)).toContain('seats-cancel');
       expect(kinds(calls)).toContain('seats-discard');
       expect(kinds(calls)).not.toContain('seats-finish');
-      expect(kinds(calls).includes('seats-sequential')).toBe(!skip);
+      expect(kinds(calls)).not.toContain('seats-sequential');
+      expect(kinds(calls)).not.toContain('seats-await');
+      expect(kinds(calls)).toContain('seats-cleanup');
       expect(calls).toContainEqual(['log', expect.stringContaining('added seats discarded — review')]);
     }
   });

@@ -67,6 +67,8 @@ const VALID_SEAT_FINDING = { summary: 'Real finding', category: 'failing-input',
 function fakeSeatIo(over = {}, ledgerBox = {}) {
   const calls = [];
   const rows = [];
+  // Keep live, unscored quota evidence separate from the settled rows asserted below.
+  const quotaObservations = [];
   const io = {
     now: () => NOW,
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
@@ -78,7 +80,7 @@ function fakeSeatIo(over = {}, ledgerBox = {}) {
       calls.push(['reserve', provider, want, r.callIds.length]);
       return r;
     },
-    append: (row) => { const v = validateScorecard({ v: 1, scoredAt: new Date(NOW).toISOString(), ...row }); if (!v.ok) throw new Error(v.errors.join('; ')); rows.push(row); },
+    append: (row) => { const v = validateScorecard({ v: 1, scoredAt: new Date(NOW).toISOString(), ...row }); if (!v.ok) throw new Error(v.errors.join('; ')); (row.quotaObservation ? quotaObservations : rows).push(row); },
     cliAvailable: () => true,
     makeScratch: (o) => { calls.push(['scratch', o]); return '/tmp/seat-scratch'; },
     removeScratch: (d) => calls.push(['rm', d]),
@@ -98,7 +100,7 @@ function fakeSeatIo(over = {}, ledgerBox = {}) {
     },
     ...over,
   };
-  return { io, calls, rows };
+  return { io, calls, rows, quotaObservations };
 }
 
 describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
@@ -1867,14 +1869,23 @@ it('refuses the Carbon-pinned advisory routes before manual promotion', () => {
 });
 
 describe('split added seats pass', () => {
-  it('reserves before calls, writes no seat rows speculatively, and finishes with actual Claude comparisons', async () => {
-    const { io, calls, rows } = fakeSeatIo();
+  it('reserves before calls, writes live unscored quota observations, and finishes with actual Claude comparisons', async () => {
+    const { io, calls, rows, quotaObservations } = fakeSeatIo();
     const reserved = [];
     const pass = await speculateExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', read: LOOP_PAYLOAD.findings.read, env: {},
       onReserved: r => { expect(calls.filter(c => c[0] === 'seat')).toHaveLength(0); reserved.push(structuredClone(r)); } }, io);
     expect(pass.status).toBe('speculated');
     expect(pass.rev).toBe(LOOP_PAYLOAD.findings.read.netBasis.rev);
     expect(rows).toEqual([]);
+    expect(quotaObservations).toHaveLength(pass.calls.reduce((n, call) => n + call.seats.length, 0));
+    for (const call of pass.calls) {
+      const observations = quotaObservations.filter(row => row.callId === call.callId);
+      expect(observations).toHaveLength(call.seats.length);
+      for (const row of observations) expect(row).toMatchObject({
+        discarded: true, seatVerdict: null, findings: [], findingsCount: 0, confirmedCount: 0,
+        scoredAt: call.finishedAt, quotaUsedPercent: call.quota.usedPercent, quotaResetsAt: call.quota.resetsAt,
+      });
+    }
     expect(reserved.at(-1).reservations.length).toBeGreaterThan(0);
     const expected = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: {} }, fakeSeatIo().io);
     const result = await finishExtraSeats({ pass, loopPayload: LOOP_PAYLOAD, env: {} }, io);
@@ -1975,7 +1986,7 @@ it('seats-speculate CLI writes pass and reservation files before seats-finish ap
   }
 });
 
-it('cancellation mid-batch applies the completed exhaustion published by seats-speculate CLI', async () => {
+it('admission sees completed exhaustion in the live store mid-batch and retains it after cancellation without progress', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'added-seats-cancel-'));
   const sink = join(dir, 'read.json');
   const out = join(dir, 'pass.json');
@@ -1984,6 +1995,9 @@ it('cancellation mid-batch applies the completed exhaustion published by seats-s
   const { io, rows } = fakeSeatIo({ runSeat: ({ provider }) => provider === 'codex'
     ? Promise.resolve({ report: { quotaState: 'exhausted', quotaUsedPercent: 100, quotaResetsAt: resetsAt } })
     : new Promise(resolve => pending.push(resolve)) });
+  const liveStore = createExtraSeatsIo({ storePath: join(dir, 'scorecards.json') });
+  const append = io.append;
+  io.append = row => { liveStore.append(row); append(row); };
   const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
   let worker;
   try {
@@ -1997,17 +2011,22 @@ it('cancellation mid-batch applies the completed exhaustion published by seats-s
     expect(reserved.calls).toHaveLength(1);
     expect(reserved.calls[0]).toMatchObject({ provider: 'codex', call: { status: 'quota-exhausted' }, finishedAt: new Date(NOW).toISOString() });
     expect(rows).toEqual([]);
+    expect(quotaHoldOrProbe(liveStore.readRecords(), 'codex', NOW + 1, {})).toContain('quota exhausted');
+    // Lose worker progress entirely: admission must not depend on its completed-call record.
+    const reservationsOnly = { reservations: reserved.reservations };
     const result = settleSpeculativeSeats({ spec: {}, out: { pr: 5, repo: REPO, outcome: 'parked' } }, {
-      cancelSpeculativeSeats: () => ({ spec: null, reserved }),
+      cancelSpeculativeSeats: () => ({ spec: null, reserved: reservationsOnly }),
       recordDiscardedSeats: o => recordDiscardedSeats(o, io),
     });
     expect(result.status).toBe('discarded');
     expect(rows.filter(r => r.dispatchKind === 'review-seat-speculative-discard')).toHaveLength(reserved.reservations.length);
-    expect(rows.filter(r => r.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toEqual(reserved.calls[0].seats.map(seat =>
+    expect(rows.filter(r => r.dispatchKind === REVIEW_SEAT_DISPATCH_KIND)).toEqual([]);
+    const liveRows = liveStore.readRecords();
+    expect(liveRows.filter(r => r.quotaObservation)).toEqual(reserved.calls[0].seats.map(seat =>
       expect.objectContaining({ seat: seat.seat, lens: seat.lens, provider: 'codex', discarded: true,
         status: 'quota-exhausted', quotaResetsAt: resetsAt, scoredAt: reserved.calls[0].finishedAt, seatVerdict: null, findings: [] })));
-    expect(quotaHold(rows, 'codex', NOW + 1)).toContain('quota exhausted');
-    expect(quotaHold(rows, 'codex', NOW + 2 * 60 * 60_000)).toContain(resetsAt);
+    expect(quotaHoldOrProbe(liveRows, 'codex', NOW + 1, {})).toContain('quota exhausted');
+    expect(quotaHold(liveRows, 'codex', NOW + 2 * 60 * 60_000)).toContain(resetsAt);
   } finally {
     for (const resolve of pending) resolve({ error: 'cancelled' });
     await worker;
