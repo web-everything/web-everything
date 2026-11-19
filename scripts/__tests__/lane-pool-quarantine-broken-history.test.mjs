@@ -153,7 +153,7 @@ it.each(['unreadable branch history', 'output-too-large'])('quarantines persiste
   expect(readFileSync(probes, 'utf8').trim().split('\n')).toHaveLength(2);
   expect(JSON.parse(readFileSync(record, 'utf8')).firstError).toContain(failure);
   expect(existsSync(marker)).toBe(false);
-  if (failure === 'output-too-large') expect(runPool(['status'], '', false).stderr).toContain('probe limits');
+  if (failure === 'output-too-large') expect(runPool(['status'], '', false).stderr).toContain('for real history corruption, inspect/repair history');
 });
 
 it('release still fails closed on unreadable commit evidence and preserves a quarantined lease', () => {
@@ -175,5 +175,31 @@ it('quarantine does not block release under the existing rules', () => {
   expect(result.status, result.stderr).toBe(0);
   expect(result.data.released).toBe(1);
   expect(existsSync(marker)).toBe(false);
+  expect(existsSync(record)).toBe(true);
+});
+
+it.each([
+  ['auto-pick acquire', ['acquire', '--no-reset']],
+  ['explicit acquire', ['acquire', '--lane=1', '--no-reset']],
+  ['reclaim', ['reclaim', '--lane=1', '--dry-run']],
+])('re-probes and auto-releases a recovered host failure through %s', (_name, args) => {
+  quarantine();
+  const saved = JSON.parse(readFileSync(record, 'utf8'));
+  saved.firstError = 'You have not agreed to the Xcode license agreements';
+  saved.reason = 'history unreadable after two probes: exit status 69';
+  writeFileSync(record, JSON.stringify(saved));
+  const result = runPool(args);
+  expect(existsSync(record), result.stderr).toBe(false);
+  expect(result.stderr).not.toContain('QUARANTINED');
+  if (args[0] === 'acquire') {
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.data.lane).toBe(1);
+  }
+});
+it('reclaim refuses a real-history-corruption quarantine even when the clone is currently healthy', () => {
+  quarantine();
+  const result = runPool(['reclaim', '--lane=1', '--dry-run']);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('QUARANTINED');
   expect(existsSync(record)).toBe(true);
 });
