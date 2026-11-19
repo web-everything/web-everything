@@ -1213,9 +1213,10 @@ function abortableSleep(ms, signal) {
   });
 }
 
+// Loaded Forge cancellation can settle minutes after the run timeout; keep polling bounded.
 function resolveTimeoutCancelWaitMs(env) {
   const n = Number((env ?? {}).WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS);
-  return Number.isInteger(n) && n >= 0 ? Math.min(n, 90000) : 30000;
+  return Number.isInteger(n) && n >= 0 ? Math.min(n, 300000) : 180000;
 }
 
 export async function runWithRemoteDecision({

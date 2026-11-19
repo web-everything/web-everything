@@ -1671,7 +1671,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
         const stillPrepared = await lstat(statePath(request.run,'prepared')).catch(e => {if(e.code !== 'ENOENT') throw e;});
         if (stillPrepared) {
           const reason=['git-head-unavailable','diff-coverage-base-unavailable'].includes(error.code) ? error.code
-            : error.code==='forge-draining' ? 'forge-draining' : error.code==='forge-busy' && !(request.argv?.[0]==='npm' && request.argv?.[2]==='test:unit') ? 'forge-busy' : 'snapshot-rejected';
+            : error.code==='forge-draining' ? 'forge-draining' : error.code==='forge-busy' ? 'forge-busy' : 'snapshot-rejected';
           if(reason==='git-head-unavailable')process.stderr.write(`forge-exec-run: ${reason}: ${String(error.cause?.message??error.message).replace(/[\x00-\x1f\x7f-\x9f]/g,'')}\n`);
           if(error.code==='egress-table-absent')process.stderr.write('forge-exec-run: egress-table-absent\n');
           await writeFile(statePath(request.run,'rejected'),JSON.stringify({v:prepared.v,nonce:prepared.nonce,run:prepared.run,phase:'rejected',reason,siblings:!!request.manifest?.siblings,...(request.baseSha!==undefined?{delta:true}:{})}),{flag:'wx',mode:0o600}).catch(async e => {if (e.code !== 'EEXIST') throw e; await state(request,'rejected');});
