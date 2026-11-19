@@ -5,10 +5,10 @@ import { symbolRangeAt } from '../../lib/audit-finding-key.mjs';
 import { AUDITOR_FLOOR } from '../../lib/audit-settings.mjs';
 import { assertPublishableContent } from '../../backlog/guarded-write.mjs';
 import { collectImportClosure } from '../../lib/import-closure.mjs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
 
 it('keeps base-reproduction proof outside held-card filing and CLI loading', () => {
-  const closure = collectImportClosure({ root: fileURLToPath(new URL('../../../', import.meta.url)),
+  const closure = collectImportClosure({ root: fileURLToPath(new NodeURL('../../../', import.meta.url)),
     entries: ['scripts/operations/audit-base-repro.mjs'] });
   expect(closure?.complete).toBe(true);
   expect(closure.files.has('scripts/lib/qualify-bare-basenames.mjs')).toBe(true);
@@ -185,6 +185,18 @@ describe('pre-existing classification', () => {
     expect(symbolRangeAt(sourceText, 3)).toEqual({ symbol: 'serve', start: 1, end: 4 });
     const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:3\nQUOTE: unsafeResponse(req);', 1);
     expect(classify({ findings: [{ text: 'lib/x.mjs:3 unsafe', sourceText }], answers,
+      readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0])
+      .toMatchObject({ blocking: true, reason: expect.stringContaining('base quote outside the finding symbol') });
+  });
+  it.each([
+    'const unrelated = "serve"; function serve(req) {',
+    'const unrelated = "serve"; const serve = req => {',
+    'other() {}, serve(req) {',
+  ])('rejects a compilable snippet starting before the matched header: %s', header => {
+    const sourceText = `${header}\n  unsafeResponse(req);\n}`;
+    expect(symbolRangeAt(sourceText, 2)).toEqual({ symbol: 'serve', start: 1, end: 3 });
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
+    expect(classify({ findings: [{ text: 'lib/x.mjs:2 unsafe', sourceText }], answers,
       readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0])
       .toMatchObject({ blocking: true, reason: expect.stringContaining('base quote outside the finding symbol') });
   });

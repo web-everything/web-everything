@@ -60,6 +60,8 @@ export const AUDITOR_FLOOR = Object.freeze(['scripts/operations/audit-verdict.mj
   'scripts/codex-direct-task.mjs', 'scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
 /** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
 const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
+  // Base proof and the filer share path qualification; changing it changes which findings can be exempted.
+  'scripts/lib/qualify-bare-basenames.mjs',
   // The audit launcher's imports, and the transcript-check settings its policy reads.
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',

@@ -5146,7 +5146,12 @@ Keep distant guard replacement and deletion cases for default-call parameters an
 functions in `audit-base-repro.test.mjs`; an unknown extent requires an unchanged file.
 Verify scanned base and head ranges with the real JS parser: regexp braces can truncate an
 otherwise named function. Keep independent base/head truncation cases and complete function,
-method and arrow controls. Check the serialized held card with the filer's publish guard;
+method and arrow controls. Compilation alone is insufficient: parse the compiled snippet and
+require its first declaration or method to match the scanned symbol. A preceding statement
+containing the symbol name, another declaration, or an earlier object method supplies no extent.
+Keep those cases alongside the plain-function positive control. Use Node's `URL` class for the
+import-closure fixture so Vite cannot rewrite the repository root into an asset URL.
+Check the serialized held card with the filer's publish guard;
 path qualification must happen in the shared card renderer so proof and persisted text agree.
 In `codex-audit.test.mjs`, pass generated cards through the real held-card parser,
 including U+2028/U+2029 finding text. Normalize line separators at serialization while
@@ -5156,6 +5161,37 @@ Keep audit proof dependencies outside held-card filing and CLI loading. Share ba
 qualification through `scripts/lib/qualify-bare-basenames.mjs`; importing the filer from the
 classifier pulls the CLI adapter into review/promotion closures and creates a cycle through
 the audit loader. The import-closure regression in `audit-base-repro.test.mjs` pins this boundary.
+
+The operator's two live examples were replayed against historical classifier and dependency
+sources at `c09208c166`, then against the repaired tree, without reverting guards or changing Git
+state. For the first example, the base source is:
+
+```js
+function serve(req) {
+  unsafeResponse(req);
+  const end = /}/;
+  requireAuth(req);
+}
+```
+
+The head replaces `requireAuth` with `skipAuth` on line 4; SAME/B2 quotes
+`unsafeResponse(req);` on line 2. For the second, use a plain `serve` function containing
+that same quoted call on line 2, with finding text
+`blocks/widget.ts:2 unsafe return; backlog/debt.md`, valid SAME/B2 evidence and a complete
+empty diff. Both probes use real symbol lookup, classification, card serialization and the
+shared publication guard, with confirmed security receipts and a prerelease policy whose
+`requirePayBy` and `requireOnMain` are false.
+
+Observed output (the scanner still reports lines 1–3 for the regexp example):
+
+```text
+c09208c166 serve-regexp: blocking=false
+c09208c166 bare-paths: blocking=false, publishable=false
+repaired serve-regexp: blocking=true (base quote outside the finding symbol; human review required)
+repaired bare-paths: blocking=false, publishable=true
+repaired card finding: we:blocks/widget.ts:2 unsafe return; we:backlog/debt.md
+```
+
 ## Forge sweep partial work
 
 `forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between

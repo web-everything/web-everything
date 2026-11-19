@@ -15,6 +15,21 @@ const protectedPath = (path, extra = []) => matchesSome(path, [...GUARD_FLOOR, .
 const unknown = () => ({ status: 'UNDETERMINED' });
 const findingText = f => typeof f === 'string' ? f : f?.text;
 
+/** Verify the scanner's header, rather than accepting its name in unrelated leading code. */
+function startsWithSymbolHeader(tree, symbol) {
+  const first = tree.body[0];
+  const isFunction = node => ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node?.type);
+  if (isFunction(first)) return first.id?.name === symbol;
+  if (first?.type === 'VariableDeclaration') {
+    const declaration = first.declarations[0];
+    return declaration.id?.name === symbol && isFunction(declaration.init);
+  }
+  const expression = first?.type === 'ExpressionStatement' ? first.expression : null;
+  if (isFunction(expression)) return expression.id?.name === symbol;
+  const method = expression?.type === 'ObjectExpression' ? expression.properties[0] : null;
+  return method?.method === true && method.key?.name === symbol && isFunction(method.value);
+}
+
 /** The approximate scanner's extent is evidence only if the real parser accepts it. Never execute it. */
 function verifiedRange(source, range) {
   if (!range) return null;
@@ -22,7 +37,10 @@ function verifiedRange(source, range) {
   if (!lines[0]?.includes(range.symbol)) return null;
   const snippet = lines.join('\n');
   for (const form of [snippet, `({\n${snippet}\n})`, `(\n${snippet}\n)`]) {
-    try { new vm.Script(form); return range; } catch { /* Try method shorthand / expression context. */ }
+    try {
+      new vm.Script(form);
+      if (startsWithSymbolHeader(parse(form, { ecmaVersion: 2020 }), range.symbol)) return range;
+    } catch { /* Try method shorthand / expression context. */ }
   }
   return null;
 }
