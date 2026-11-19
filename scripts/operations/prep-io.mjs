@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { runGhSync } from '../lib/gh-throttle.mjs';
+import { ghRepoSlug, DEFAULT_REPO_KEY } from '../lib/constellation-repos.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { PREP_DEFAULTS, resolvePrepSettings } from '../lib/prep-settings.mjs';
 import { buildRecord, recordFromCard } from '../lib/prep-record.mjs';
@@ -68,7 +69,7 @@ export function createPrepStore({ storeDir = PREP_DEFAULTS.storeDir, env = proce
 /** PR reader is injectable: fixtures never execute git or gh. No writes to GitHub. */
 export function createPrepIO({ env = process.env, cwd = process.cwd(), settings = loadPrepSettings({ env }),
   store = createPrepStore({ storeDir: settings.config.storeDir, env }), readPR = number => JSON.parse(runGhSync(
-    ['pr', 'view', number, '--json', 'body,files,baseRefOid'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 })) } = {}) {
+    ['pr', 'view', number, '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--json', 'body,files,baseRefOid'], { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 })) } = {}) {
   return {
     readContext(input) {
       try {
