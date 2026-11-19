@@ -15,6 +15,7 @@ import * as laneRepair from '../../lane-repair.mjs';
 import * as rebuildJob from '../rebuild-job.mjs';
 import * as forceAdopt from '../../daemon-force-adopt.mjs';
 import * as overlayAdoption from '../../overlay-adoption.mjs';
+import * as preparation from '../prepare.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'we-job-jitter-')); });
@@ -251,6 +252,79 @@ it.each(['corrupt', 'null', 'missing adopt', 'wrong finalSha', 'EACCES', 'ENOENT
     expect(adopt).toHaveBeenCalledTimes(absent ? 1 : 0);
     if (!absent) { expect(readFileSync(file, 'utf8')).toBe(text); expect(nodeFs.existsSync(store.dir)).toBe(false); }
   });
+
+it.each([
+  ['forced string', { forced: 'true' }], ['forced number', { forced: 1 }], ['forced null', { forced: null }],
+  ['kind', { kind: false }], ['at', { at: 42 }], ['passedAt', { passedAt: false }],
+  ['tree', { tree: [] }], ['prevHead', { prevHead: 42 }], ['forInputsKey', { forInputsKey: false }],
+  ['dropRefs array', { dropRefs: {} }], ['dropRefs record', { dropRefs: [null] }],
+  ['dropRefs ref', { dropRefs: [{ ref: 42 }] }], ['dropRefs sha', { dropRefs: [{ ref: 'lane/x', sha: false }] }],
+  ['dropRefs pr', { dropRefs: [{ ref: 'lane/x', pr: '123' }] }],
+  ['failed', { failed: [] }], ['token', { token: false }], ['pid', { pid: '1' }], ['host', { host: 42 }],
+  ['adopt finalSha', { adopt: { finalSha: 42 } }],
+  ['adopt inputsKey', { adopt: { finalSha: 'target', inputsKey: false } }],
+  ['adopt mainSha', { adopt: { finalSha: 'target', mainSha: [] } }],
+  ['adopt applied', { adopt: { finalSha: 'target', applied: [{ ref: 'lane/x', sha: false }] } }],
+])('wrong ready %s type refuses before adoption or job mutation, preserving evidence', async (_name, patch) => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  writeReadyCandidate(root, { prevHead: 'head', adopt: { finalSha: 'target' }, ...patch }, env);
+  const file = readyCandidatePath(root, env);
+  const original = readFileSync(file, 'utf8');
+  const adopt = vi.fn(); const reattach = vi.fn(); const error = vi.fn();
+  const store = createJobStore(join(root, 'jobs'));
+  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, log: { error } });
+  expect(result.reason).toBe('state-unreadable');
+  expect(adopt).not.toHaveBeenCalled(); expect(reattach).not.toHaveBeenCalled();
+  expect(readFileSync(file, 'utf8')).toBe(original);
+  expect(nodeFs.existsSync(store.dir)).toBe(false);
+  expect(error).toHaveBeenCalledWith(expect.stringContaining('repair persisted evidence'));
+});
+
+it.each([{}, { forced: false }, { forced: true }, {
+  kind: 'fallback', forInputsKey: 'inputs', dropRefs: [{ ref: 'lane/x', sha: 'tip', pr: 123 }, { ref: 'lane/y', pr: null }],
+  failed: '', at: new Date(0).toISOString(), tree: 'tree', token: 'lease', pid: 1, host: 'host',
+  adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [{ ref: 'lane/z', sha: 'tip' }] },
+}])('strict ready reader preserves valid optional and historical fields %j', patch => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+  const ready = { prevHead: 'head', adopt: { finalSha: 'target' }, passedAt: new Date(0).toISOString(), ...patch };
+  writeReadyCandidate(root, ready, env);
+  expect(readReadyCandidateStrict(root, env)).toEqual(ready);
+});
+
+it.each([true, false].flatMap(launchOnly => ['rebuild', 'ready'].map(kind => [launchOnly, kind])))(
+  'launchOnly=%s refuses corrupt %s evidence in stateOpts.env override before preparation', async (launchOnly, kind) => {
+    const env = { WE_DAEMON_STATE_DIR: join(root, 'base-state'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
+    const stateOpts = { env: { WE_DAEMON_STATE_DIR: join(root, 'override-state') } };
+    writeRebuildState(root, {}, env);
+    mkdirSync(stateOpts.env.WE_DAEMON_STATE_DIR);
+    const file = (kind === 'rebuild' ? rebuildStatePath : readyCandidatePath)(root, stateOpts.env);
+    writeFileSync(file, '{broken');
+    const prepare = vi.spyOn(preparation, 'prepareRebuild');
+    const run = vi.fn(); const runSmoke = vi.fn(); const error = vi.fn();
+    const result = await rebuildClone({ root, env, stateOpts, asJob: true, launchOnly, run, runSmoke,
+      log: { error }, emitEvent: vi.fn() });
+    expect(result.reason).toBe('state-unreadable');
+    expect(prepare).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled(); expect(runSmoke).not.toHaveBeenCalled();
+    expect(readFileSync(file, 'utf8')).toBe('{broken');
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('repair persisted evidence'));
+  });
+
+it('job admission and preparation share the same merged state environment', async () => {
+  const env = { WE_DAEMON_STATE_DIR: join(root, 'base-state'), WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks') };
+  const stateOpts = { env: { WE_DAEMON_STATE_DIR: join(root, 'override-state') } };
+  const prepare = vi.spyOn(preparation, 'prepareRebuild').mockResolvedValue({
+    terminal: true, result: { moved: false, reason: 'up-to-date' },
+  });
+  let admittedEnv;
+  vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockImplementation(async ({ env, adopt }) => {
+    admittedEnv = env;
+    return adopt();
+  });
+  await rebuildClone({ root, env, stateOpts, asJob: true, versions: null, log: { error() {} }, emitEvent: vi.fn() });
+  expect(admittedEnv).toEqual({ ...env, ...stateOpts.env });
+  expect(prepare).toHaveBeenCalledOnce();
+  expect(prepare.mock.calls[0][0].stEnv).toBe(admittedEnv);
+});
 
 it.each([true, false].flatMap(launchOnly =>
   ['corrupt', 'object', 'invalid record', 'missing at', 'invalid at', 'invalid overdueSent', 'EACCES', 'ENOENT']

@@ -94,7 +94,7 @@ export function contentContainedInBuild(git, sha, build) {
  * but clone-tree mutations defer to the next normal daemon tick.
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
+  root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck, prBaseChain, prForcePushes, autoRebase = realAutoRebase, readyOnly = false, adoptOnly = false,
 }) {
   // Tests reaching the hold must opt in before launching a detached repair or cleaning up swaps.
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
@@ -104,7 +104,7 @@ export async function prepareRebuild({
   if (process.env.VITEST === 'true' && env?.WE_OVERLAY_STALE === undefined) env = { ...env, WE_OVERLAY_STALE: '0' };
   // Status must not refresh the live index while an excluded spawner may still be reading it.
   if (readyOnly) env = { ...env, GIT_OPTIONAL_LOCKS: '0' };
-  const stEnv = { ...env, ...(stateOpts?.env || {}) };
+  stEnv ??= { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
   const alertsList = [];
   const nowMs = () => now();

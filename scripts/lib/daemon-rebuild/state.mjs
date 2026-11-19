@@ -176,7 +176,12 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   const r = JSON.parse(text);
   if (!fields(r, { prevHead: string, adopt: v => fields(v, { finalSha: string },
-    { inputsKey: string, mainSha: string, applied }) }, { tree: string, passedAt: date })) {
+    { inputsKey: string, mainSha: string, applied }) }, {
+    tree: string, passedAt: date, at: date, kind: string, forced: v => typeof v === 'boolean',
+    forInputsKey: string, dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
+      { ref: string }, { sha: string, pr: v => v === null || positive(v) })),
+    failed: v => typeof v === 'string', token: string, pid: positive, host: string,
+  })) {
     throw new Error('Invalid ready candidate');
   }
   return r;

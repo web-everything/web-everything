@@ -212,16 +212,17 @@ async function rebuildCloneInternal({
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
   asJob, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs,
+  stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
   // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
   // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
-      root, env, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
+      root, env: stEnv, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
       adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
-        dispatchSmoke, admissionWaitMs, ...o, adoptOnly: true, asJob: false,
+        dispatchSmoke, admissionWaitMs, ...o, stEnv, adoptOnly: true, asJob: false,
       }),
     });
   }
@@ -233,7 +234,7 @@ async function rebuildCloneInternal({
     if (adoptOnly) return { moved: false, adopted: false, reason: 'needs-build', alerts: [] };
     // Versioned builds take no clone lease to renew while queued, but their live smoke
     // shares the same host capacity and deadline as an unversioned candidate.
-    const slot = await acquireSmokeSlot({ env: { ...env, ...(stateOpts?.env || {}) }, log, now, sleep });
+    const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep });
     try {
       if (!slot.acquired) return { moved: false, reason: 'smoke-queue-timeout' };
       return await versionedRebuild({ ctx: vctx, log });
@@ -245,7 +246,7 @@ async function rebuildCloneInternal({
   // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
   // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
   const skipDecider = readyOnly ? null : (skipCheck === undefined ? makeSkipCheck({ root, entries, env }) : skipCheck);
-  if (readyOnly && readReadyCandidate(root, { ...env, ...(stateOpts?.env || {}) })) {
+  if (readyOnly && readReadyCandidate(root, stEnv)) {
     return { moved: false, reason: 'ready-pending', alerts: [] };
   }
   const lockRootFromEnv = env && env.WE_DAEMON_CLONE_LOCK_ROOT;
@@ -254,7 +255,7 @@ async function rebuildCloneInternal({
   // rebuild is opportunistic (the next tick retries it), so it now waits at most WE_DAEMON_REBUILD_LOCK_WAIT_MS
   // (default 60s), says so when it starts waiting, and records the give-up.
   const baseWaitMs = Number(env?.[REBUILD_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_LOCK_WAIT_MS;
-  const starvedCount = readRebuildStarvation(root, { ...env, ...(stateOpts?.env || {}) });
+  const starvedCount = readRebuildStarvation(root, stEnv);
   const waitMs = rebuildLockWaitMs({ env, starvedCount, readyOnly });
   if (readyOnly) {
     log.error?.(`daemon-rebuild: detached rebuild job — waiting up to ${Math.round((lockOpts.waitMs ?? waitMs) / 1000)}s for in-flight ticks to drain (writer reservation refuses new reads meanwhile)`);
@@ -275,7 +276,6 @@ async function rebuildCloneInternal({
     ...(sleep ? { sleep } : {}),
     ...lockOpts,
   };
-  const stEnv = { ...env, ...(stateOpts?.env || {}) };
   // fix-rebuild-finalize: once a candidate has passed, the wait for readers is the longer finalize wait — the
   // writer reservation refuses every NEW read slot meanwhile, so this only outlasts ticks already in flight.
   const finalizeWaitMs = Number(env?.[FINALIZE_LOCK_WAIT_ENV]) > 0 ? Number(env[FINALIZE_LOCK_WAIT_ENV]) : DEFAULT_FINALIZE_LOCK_WAIT_MS;
@@ -295,7 +295,7 @@ async function rebuildCloneInternal({
   const prep = await withWriteLock(root, () => {
     prepareEnteredMs = now();
     return prepareRebuild({
-      root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
+      root, env, log, run, prState, stateOpts, stEnv, mainOnly, now, skipCheck: skipDecider, readyOnly, adoptOnly,
     });
   }, readyOnHead ? finalizeLockOpts : admissionLockOpts);
   const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);
