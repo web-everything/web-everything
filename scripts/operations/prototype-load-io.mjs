@@ -521,7 +521,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return ancestor(base, 'origin/main');
       } catch { return false; } };
       const liveFp = liveFingerprint(auditRecords);
-      out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
+      // Degraded fast-path admission never carries an older head's audit across a matching net-diff fingerprint: it needs
+      // the canonical audit of this exact candidate sha, or it refuses (no fingerprint means no carry).
+      out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, out.degradedFastPath ? null : liveFp,
         { ruledWeakened: out.gate }) };
       if (out.degradedFastPath && out.gate?.ruledWeakened?.findings.some(f => /\b(?:security|B[- ]class|R37)\b|(?:^|\s)\[B\]/i.test(f)))
         return stop('no-canonical-audit', { detail: 'security-finding', fallback: 'Fix the security finding and obtain an exact-SHA canonical audit before retrying.' });
@@ -988,7 +990,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       // Pending is the only outcome that delegates its adoption notice to the rebuild path. Do not leave
       // refused/unverifiable loads or a load already adopted during its wait to emit misleading notices.
-      if (out.adoptionEventTracked && (!out.rollback || (out.rollback.retired === true && out.rollback.eventRecorded)) && (out.result !== 'registered-pending' || !out.ok)) {
+      // A degraded load that failed after registration and ran no rollback keeps its pending-adoption tracking, so the
+      // asynchronous smoke-failure rollback can still find it; only a finished rollback or an adopted load clears it.
+      const keepDegradedTracking = Boolean(out.degradedFastPath) && !out.ok && !out.rollback;
+      if (out.adoptionEventTracked && !keepDegradedTracking && (!out.rollback || (out.rollback.retired === true && out.rollback.eventRecorded)) && (out.result !== 'registered-pending' || !out.ok)) {
         clearPendingAdoption(out.clone, pendingAdoption, { env: childEnv, fs });
       }
     }

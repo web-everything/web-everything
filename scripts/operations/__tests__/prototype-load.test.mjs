@@ -164,6 +164,7 @@ function fixture(options = {}) {
         if (args.at(-1) === 'HEAD^{commit}') return options.badHead ? fail(1) : SHA;
         return options.missingCandidate ? fail(1, '', '') : SHA;
       }
+      if (options.probeThrows) throw new Error('probe exploded after registration');
       expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', options.behind ? MERGE : candidateSha, 'HEAD']);
       if (options.missingCandidate && (options.missingForever || sleeps.length === 0)) return fail(128, '', 'Not a valid commit name');
       if (options.adoptionError) return fail(options.adoptionError);
@@ -279,7 +280,7 @@ function fixture(options = {}) {
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { pendingFiles, calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
@@ -3475,6 +3476,20 @@ describe('R1075 degraded daemon admission', () => {
     const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: async () => ({ retired: false, refused: 'registration-changed' }), needsYou });
     expect(await f.run()).toMatchObject({ registered: true, rollback: { retired: false }, needsYou: true });
     expect(needsYou.mock.calls[0][0].error).toContain('unload manually');
+  });
+  it('never carries an older head audit across a matching fingerprint on degraded admission', async () => {
+    const fingerprint = 'a'.repeat(64);
+    const f = degraded({ audits: auditLines([auditRecord({ head: TREE, base: 'e'.repeat(40), fingerprint })]), fingerprint: () => fingerprint });
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('keeps pending-adoption tracking when a degraded load fails after registration without a rollback', async () => {
+    const f = degraded({ probeThrows: true });
+    const out = await f.run();
+    expect(out).toMatchObject({ ok: false, adoptionEventTracked: true });
+    expect(out.rollback).toBeUndefined();
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect([...f.pendingFiles.values()].length).toBeGreaterThan(0);
   });
   it('unwritable pending-adoption storage refuses before registration', async () => {
     const f = degraded({ pendingWriteFails: true });
