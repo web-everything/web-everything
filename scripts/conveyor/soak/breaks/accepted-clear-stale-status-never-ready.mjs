@@ -13,7 +13,7 @@ const bot = { login: 'web-everything' };
 const prState = (head) => ({ number: 7103, headRefOid: head, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [],
   comments: [
     { author: bot, createdAt: '2026-11-18T20:00:00Z', body: `**Verdict:** accept\n**Advisory outcome:** accept\nNet basis: \`${'a'.repeat(12)}..${HEAD}\`` },
-    { author: bot, createdAt: '2026-11-18T20:01:00Z', body: `<!-- we:red-team-gate pr=7103 rev=${HEAD} outcome=clear -->` },
+    { author: bot, createdAt: '2026-11-18T20:01:00Z', body: `<!-- we:red-team-gate pr=7103 rev=${HEAD} outcome=card-queued -->` },
   ] });
 
 export default {

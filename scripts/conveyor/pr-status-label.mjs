@@ -11,7 +11,8 @@ import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
 // Its import-time dependencies have no path back here (including its ruling-ledger load).
 const { evaluatePr, rulingNeededRow } = await import('../operations/operator-queue.mjs');
 import { FALLBACK_REQUIRED_STATUS_CHECKS, withoutImpliedRequiredChecks } from '../lib/required-status-checks.mjs';
-import { redTeamQueueReason } from '../lib/red-team-gate.mjs';
+import { redTeamQueueReason, gateOutcomesForHead } from '../lib/red-team-gate.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { standDownComments } from './stand-down.mjs';
 import { latestUnresolvedStandDown } from './stand-down-answer-core.mjs';
 
@@ -69,7 +70,11 @@ function requiredCiRed(pr, labels, requiredChecks, settings) {
       || ['FAILURE', 'ERROR'].includes(c.state)));
 }
 
-const DECISION_BLOCK_LABELS = ['review:human', 'review:changes', 'review:pending', 'red-team:blocked', 'ci:failed'];
+const DECISION_BLOCK_LABELS = ['review:human', 'review:changes', 'review:pending', 'red-team:blocked', 'ci:failed',
+  'review-status:draft-withdrawn'];
+// A status label already on the PR that is not stale-prone (needs-you, stood-down, escalated…) is a live hold.
+const STALE_PRONE_STATUS = new Set(['sent-back-review', 'at-round-limit', 'awaiting-review', 'awaiting-ci', 'waiting-on-base',
+  'red-team', 'ready-to-merge']);
 
 /**
  * PURE: is the PR ready to merge judged ONLY from its CURRENT decision labels on the live head? Every stale
@@ -84,6 +89,9 @@ export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = FALL
   if (!l.includes('red-team:clear')) return { ready: false, reason: 'red-team-not-clear' };
   const blocker = DECISION_BLOCK_LABELS.find((name) => l.includes(name));
   if (blocker) return { ready: false, reason: `conflicting-label:${blocker}` };
+  const heldBy = l.find((n) => n.startsWith(PR_STATUS_PREFIX) && PR_STATUS_LABEL_RE.test(n)
+    && !STALE_PRONE_STATUS.has(n.slice(PR_STATUS_PREFIX.length)));
+  if (heldBy) return { ready: false, reason: `held-by:${heldBy}` };
   if (pr.isDraft === true) return { ready: false, reason: 'draft' };
   if (pr.mergeable === 'CONFLICTING' || pr.mergeStateStatus === 'DIRTY') return { ready: false, reason: 'conflict' };
   const head = String(pr?.headRefOid ?? '').toLowerCase();
@@ -91,13 +99,21 @@ export function readyFromDecisionLabels({ pr = {}, labels, requiredChecks = FALL
   const trusted = trustedAdvisoryComments(pr?.comments);
   const advisory = parseAdvisories(trusted).find((a) => advisoryCoversHead(a, head));
   if (!advisory || advisory.outcome !== ADVISORY_OUTCOMES.ACCEPT) return { ready: false, reason: 'no-head-accept' };
-  const gateAtHead = trusted.some((c) => String(c?.body ?? '').trimStart().startsWith('<!-- we:red-team-gate')
-    && new RegExp(`^<!-- we:red-team-gate pr=\\d+ rev=${head}[\\s]`).test(String(c.body).trimStart()));
-  if (!gateAtHead) return { ready: false, reason: 'no-head-red-team-evidence' };
+  // Red-team evidence recorded for THIS head: present, and not a send-back / round-cap outcome.
+  const outcomes = gateOutcomesForHead(trusted, pr?.number, head);
+  if (!outcomes.size) return { ready: false, reason: 'no-head-red-team-evidence' };
+  if (outcomes.has('sent-back') || outcomes.has('round-cap')) return { ready: false, reason: 'red-team-not-cleared-at-head' };
   const merged = { ...PR_STATUS_SETTING_DEFAULTS, ...settings };
-  const checks = (requiredChecks ?? FALLBACK_REQUIRED_STATUS_CHECKS)
-    .filter((name) => name !== 'merge-gate' && name !== 'review-gate');
-  if (requiredCiRed({ ...pr, labels: l.map((name) => ({ name })) }, l, checks, merged)) return { ready: false, reason: 'required-check-red' };
+  // Every required check must be present and finished green. The review-gate follows this decision (as in
+  // derivePrStatusLabel); a failing merge-gate counts unless the caller already excused it on the head-bound evidence.
+  const rollup = collapseRollupToLatestPerName(Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : []);
+  const required = withoutImpliedRequiredChecks(requiredChecks ?? FALLBACK_REQUIRED_STATUS_CHECKS, rollup)
+    .filter((name) => !(merged.reviewGateSignal === 'review' && name === 'review-gate'));
+  const green = (c) => (c?.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion))
+    || c?.state === 'SUCCESS';
+  const notGreen = required.find((name) => !green(rollup.find((c) => (c.name ?? c.context) === name)));
+  if (notGreen) return { ready: false, reason: `required-check-not-green:${notGreen}` };
+  if (l.includes('ci:failed') || requiredCiRed({ ...pr, statusCheckRollup: rollup }, l, required, merged)) return { ready: false, reason: 'required-check-red' };
   return { ready: true, reason: null };
 }
 
