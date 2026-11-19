@@ -1,3 +1,4 @@
+import { assertCapability } from '../lib/repo-profile.mjs';
 import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { signalFixDispatch } from '../lib/fix-handoff.mjs';
 /**
@@ -304,7 +305,12 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
       type: EVENT_TYPES.SEND_BACK, repo, pr, at: new Date().toISOString(), source: 'red-team-gate',
       declaredActor: RED_TEAM_GATE_ACTOR, channel: RED_TEAM_GATE_CHANNEL, cause: 'changes',
     })]),
-    fileCard: (input) => spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' }),
+    fileCard: (input) => {
+      // Re-read admission at the effect boundary too: the live gate may find cards absent from the tick snapshot.
+      const refusal = assertCapability(input.repo, 'review');
+      if (refusal) return { ok: false, error: refusal.why };
+      return spawnPreventionLandingJob(input, { sessionPrefix: 'red-team-card' });
+    },
     postComment: ({ repo, pr, body }) => gh(['pr', 'comment', String(pr), `--repo=${repo}`, '--body-file', '-'], body),
     log: (line) => process.stderr.write(`${line}\n`),
   };

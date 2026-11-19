@@ -1,3 +1,4 @@
+import { assertCapability, repoProfile } from './repo-profile.mjs';
 import {
   liveResultGateState, planRedTeamActions, readConfirmedBreaks, readRedTeamDisposition, parseRedTeamGateMarker, redTeamResultCommentForHead,
 } from './red-team-gate.mjs';
@@ -39,7 +40,7 @@ function hasRulingOrRelease(comments, pr, head, resultId, disposition, ignored, 
 
 /** Nominate at most one owed send-back; shared disposition and grant-scope readers verify the supplied evidence. */
 export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.now(), history = new Map(),
-  graceMin = 15, cooldownMin = 10, setting, log = () => {}, readDisposition = readRedTeamDisposition,
+  graceMin = 15, cooldownMin = 10, setting, resolveProfile = repoProfile, log = () => {}, readDisposition = readRedTeamDisposition,
   readGrantScope = ({ repo, pr, head, comments }) => standingRulingScope({ repo, pr: { number: pr, headRefOid: head, comments } }) } = {}) {
   if (!Number.isFinite(now) || !Number.isFinite(graceMin) || graceMin < 15
     || !Number.isFinite(cooldownMin) || cooldownMin < 10) return [];
@@ -72,6 +73,11 @@ export function planGateCatchUp({ repo, refusals = [], rawPrs = [], now = Date.n
       || state.result.findings.some(f => !Array.isArray(disposition.rulings.get(f.index))
         || !['open', 'held'].includes(disposition.dispositions.get(f.index)?.state))) continue;
     if (!plan.sendBack.length || (state.sendBackOutcome && !state.reopened)) continue;
+    // Mixed gates also file cards, which can launch prevention work. Pure send-backs remain safety maintenance.
+    if (plan.card.length) {
+      const refusal = assertCapability(slug, 'review', { resolveProfile });
+      if (refusal) { log(`red-team gate catch-up: ${slug}#${pr} deferred: ${refusal.why}`); continue; }
+    }
     // Use the shared trusted reader: a carried result takes its carry comment's creation time.
     const at = Date.parse(commentCreatedAt(hit?.comment));
     if (!Number.isFinite(at) || now - at < graceMin * 60_000) continue;

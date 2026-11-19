@@ -3284,3 +3284,20 @@ it.each([false, true])('capability-off convert-advisory refuses judge and public
   expect(reconcile).toHaveBeenCalledOnce();
   for (const effect of [convertAdvisory, judge, publish]) expect(effect).not.toHaveBeenCalled();
 });
+
+it('capability-off blocks same-tick draft promotion before ready or replanning', () => {
+  const ready = vi.fn();
+  const promoteDrafts = vi.fn(() => { ready(); return { rows: [{ pr: 91, action: 'promoted' }] }; });
+  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'promote-draft', prNumber: 91 }], refusals: [] }));
+  const notePromotions = vi.fn();
+  runReviewTick({ repo: 'web-everything/web-everything',
+    resolveProfile: () => ({ capabilities: { review: false } }), reconcile, promoteDrafts, notePromotions,
+    holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+  });
+  expect(promoteDrafts).not.toHaveBeenCalled();
+  expect(ready).not.toHaveBeenCalled();
+  expect(reconcile).toHaveBeenCalledOnce();
+  expect(notePromotions).toHaveBeenCalledWith(expect.objectContaining({
+    promotions: [expect.objectContaining({ pr: 91, action: 'skip', why: expect.stringContaining('capability unavailable') })],
+  }));
+});

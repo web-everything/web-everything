@@ -5145,3 +5145,12 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+## Review capability admission at maintenance boundaries
+
+Same-tick draft promotion and mixed send-back/card catch-up can start work before ordinary
+review dispatch. Test their capability refusals independently. Pure overdue send-backs remain
+safety maintenance; denied mixed gates must leave retry history untouched. Keep a second check
+at the live gate's card-launch boundary because it re-reads evidence after the tick snapshot.
+Saved-fix admission precedes lane acquisition and branch verification; retain the final pre-push
+check because verification may outlive a capability change. Refusal must not consume an attempt.

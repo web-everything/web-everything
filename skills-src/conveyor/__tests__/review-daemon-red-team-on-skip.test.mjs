@@ -1,3 +1,5 @@
+import { createRedTeamGateIo } from '../../../scripts/operations/red-team-gate-apply.mjs';
+import * as preventionLanding from '../../../scripts/lib/prevention-landing-job.mjs';
 import { it, expect, vi, afterAll, beforeEach } from 'vitest';
 // The host operator store (~/.claude/operator-overrides.json) outranks env, so a developer's live
 // redTeamQueue override would leak into these fixtures; read a missing store instead (= no overrides).
@@ -62,7 +64,7 @@ it('CLI catches up gates after label repair, before capacity recovery, and survi
     expect(() => production.redTeamOnSkip(input)).not.toThrow();
     expect(order).toEqual(['labels', 'gate', 'capacity']);
     const history = catchUp.mock.calls[0][0].history;
-    expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, log: expect.any(Function) });
+    expect(catchUp).toHaveBeenCalledWith({ repo, refusals, rawPrs: repaired, history, resolveProfile: undefined, log: expect.any(Function) });
     production.redTeamOnSkip(input);
     expect(catchUp.mock.calls[1][0].history).toBe(history);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
@@ -531,4 +533,45 @@ it.each(['on', 'off'])('capability-disabled tick still enforces overdue send-bac
     expect(start).not.toHaveBeenCalled();
     expect(ordinary).not.toHaveBeenCalled();
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it.each(['on', 'off'])('capability-off blocks mixed send-back/card catch-up before gate work (queue %s)', queue => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [9701]);
+  const head = rawPrs[0].headRefOid;
+  rawPrs[0].comments = [{
+    body: `<!-- we:red-team-advisory pr=9701 rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — confirmed break\n2. [**confirmed**] (edge-case, degraded) \`scripts/y.mjs:1\` — degradation`,
+    createdAt: '2026-11-14T16:00:00Z', author: { login: 'web-everything' },
+  }];
+  const realCatchUp = gateCatchUp.runGateCatchUp;
+  const fileCard = vi.fn(), history = new Map();
+  const runGate = vi.fn(() => { fileCard(); return { status: 'applied' }; });
+  vi.spyOn(gateCatchUp, 'runGateCatchUp').mockImplementation(options => realCatchUp({
+    ...options, now: Date.parse('2026-11-14T16:20:00Z'), history,
+    setting: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' },
+    readGrantScope: () => null, runGate,
+  }));
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', queue);
+  const log = vi.fn();
+  try {
+    const production = cliReviewTickOpts({ log: { error: log }, listCommands: () => '' });
+    const input = { repo, plan, rawPrs, resolveProfile: () => ({ capabilities: { review: false } }), paused: true };
+    production.redTeamOnSkip(input);
+    expect(runGate).not.toHaveBeenCalled();
+    expect(fileCard).not.toHaveBeenCalled();
+    expect(history.size).toBe(0);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('capability unavailable'));
+    production.redTeamOnSkip({ ...input, resolveProfile: () => ({ capabilities: { review: true } }) });
+    expect(runGate).toHaveBeenCalledOnce();
+    expect(fileCard).toHaveBeenCalledOnce();
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it('live gate refuses prevention work for an unsupported repo even if the tick snapshot missed its card findings', () => {
+  const start = vi.spyOn(preventionLanding, 'spawnPreventionLandingJob');
+  try {
+    expect(createRedTeamGateIo().fileCard({ repo: 'fixture/capability' }))
+      .toEqual({ ok: false, error: expect.stringContaining('capability unavailable') });
+    expect(start).not.toHaveBeenCalled();
+  } finally { vi.restoreAllMocks(); }
 });

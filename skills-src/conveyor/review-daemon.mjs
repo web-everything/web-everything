@@ -570,7 +570,11 @@ export function runReviewTick({
   let replanError = null;
   if (typeof promoteDrafts === 'function') {
     const out = promoteDraftsThenReplan({
-      plan, rawPrs, repo, promote: promoteDrafts,
+      plan, rawPrs, repo, promote: options => {
+        const refusal = assertCapability(repo, 'review', { resolveProfile });
+        if (refusal) return { rows: options.prNumbers.map(pr => ({ repo, pr, action: 'skip', why: refusal.why })) };
+        return promoteDrafts(options);
+      },
       replan: (prs) => (sharedReads && prs
         ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
         : reconcile({ repo, defaultBranch })),
@@ -1502,7 +1506,9 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
       } catch { /* Label repair must never block red-team recovery. */ }
       try {
         runGateCatchUp({ repo: o.repo, refusals: o.plan?.refusals, rawPrs,
-          history: redTeamGateRetryHistory, log: line => log.error(line) });
+          history: redTeamGateRetryHistory,
+          resolveProfile: o.resolveProfile,
+          log: line => log.error(line) });
       } catch { /* Gate catch-up must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
         dispatch: d => {

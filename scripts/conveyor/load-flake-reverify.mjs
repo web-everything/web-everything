@@ -239,6 +239,8 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
     await post('head-moved', 'The saved alt commit is not a descendant of the PR head, so it can no longer be pushed.');
     return { deferred: 'non-ancestor' };
   }
+  const refused = assertCapability(key, 'fix', { resolveProfile });
+  if (refused) return { deferred: 'unsupported-repo', ...refused };
   // Lease at the saved alt BRANCH (lane-pool resolves origin/<ref>); the head check below pins the exact sha.
   const lane = await io.acquire(hold.alt.branch, pr.number, key);
   try {
@@ -264,8 +266,9 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores, ad
     }
     refusal = await check();
     if (refusal) return refusal;
-    const refused = assertCapability(key, 'fix', { resolveProfile });
-    if (refused) return { deferred: 'unsupported-repo', ...refused };
+    // Verification can outlive a capability change; recheck before publishing the fix.
+    const pushRefused = assertCapability(key, 'fix', { resolveProfile });
+    if (pushRefused) return { deferred: 'unsupported-repo', ...pushRefused };
     await io.push(lane.path, hold.alt.sha, pr.headRefName);
     await post('pushed', config.mode === 'ci'
       ? "Pushed without a local re-verify (WE_LOAD_FLAKE_REVERIFY_MODE=ci); the PR's CI judges it." : '');
