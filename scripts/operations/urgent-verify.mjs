@@ -3,8 +3,8 @@ import { randomBytes } from 'node:crypto';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawn } from 'node:child_process';
 import { hostname, homedir } from 'node:os';
-import { join, dirname, resolve } from 'node:path';
-import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo } from './urgent-verify-marker.mjs';
+import { join, dirname, resolve, delimiter } from 'node:path';
+import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo, canonicalFuiRepo } from './urgent-verify-marker.mjs';
 
 export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env } = {}) {
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'SHELL', 'USER']
@@ -13,9 +13,17 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   for (const marker of ['CI', 'GITHUB_ACTIONS', 'CONTINUOUS_INTEGRATION', 'GITLAB_CI',
     'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'TEAMCITY_VERSION', 'TF_BUILD', 'BUILD_NUMBER']) delete childEnv[marker];
   const fui = resolve(cwd, '../frontierui');
+  // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
+  const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
+  childEnv.PATH = [...binDirs, childEnv.PATH].filter(Boolean).join(delimiter);
   const run = (cmd, args, dir = cwd) => {
     const r = spawnSync(cmd, args, { cwd: dir, env: childEnv, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
-    if (r.error || r.status !== 0) throw new Error('urgent-verify subprocess failed or admission unavailable; inspect output and retry after capacity is available');
+    if (r.error || r.status !== 0) {
+      const tail = String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n');
+      const err = new Error(`urgent-verify subprocess failed or admission unavailable (exit ${r.status ?? r.error?.code ?? 'unknown'}): ${cmd} ${args.join(' ')}`);
+      err.failure = { cmd: [cmd, ...args].join(' ').slice(0, 300), exit: r.status ?? null, error: r.error ? String(r.error.message ?? r.error) : undefined, stderrTail: tail };
+      throw err;
+    }
     return r.stdout;
   };
   let gates;
@@ -37,7 +45,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       return ciUnitPlan(workflow);
     },
     verifyFui: (expected) => {
-      const repo = normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'], fui));
+      const repo = canonicalFuiRepo(normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'], fui)));
       if (repo !== urgentFuiRepo) throw new Error('FUI sibling origin must be frontier-ui/frontierui on github.com');
       if (run('git', ['status', '--porcelain', '--untracked-files=all'], fui) !== '') throw new Error('FUI sibling must exist and be clean');
       if (expected) {
@@ -98,7 +106,7 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
       return { ok: false, detail: 'clean-checkout-at-sha-required', fallback };
     const plan = deps.plan(), startedAt = deps.now(), repo = deps.repo(), steps = [];
     if (!repo) throw new Error('unreadable origin remote');
-    let result = 'green', fuiSha, fuiRepo;
+    let result = 'green', fuiSha, fuiRepo, failure;
     // Stop on failure, including queue exhaustion: no admission polling or retry loop.
     try {
       steps.push('fetch-main-history');
@@ -112,10 +120,15 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps()) {
       if (!deps.clean() || deps.head() !== sha) throw new Error('checkout changed');
       const finalFui = await deps.verifyFui({ sha: fuiSha, repo: fuiRepo });
       if (finalFui.sha !== fuiSha || finalFui.repo !== fuiRepo) throw new Error('FUI sibling changed');
-    } catch { result = 'red'; }
+    } catch (e) {
+      result = 'red';
+      failure = { step: steps.at(-1), message: String(e?.message ?? e), ...(e?.failure ?? {}) };
+      console.error(`urgent-verify RED at step ${failure.step}: ${failure.message}${failure.stderrTail ? `\n${failure.stderrTail}` : ''}`);
+    }
     const marker = { sha, suite: 'full', shards: plan.length, result, startedAt, finishedAt: deps.now(), host: deps.host, repo, steps, fuiSha, fuiRepo };
     marker.sig = urgentSignature(marker, deps.readKey());
-    deps.append(marker);
-    return { ok: result === 'green', marker, ...(result === 'red' ? { fallback } : {}) };
+    // failure detail is diagnostic only: outside the signed fields, so it cannot affect green verification.
+    deps.append(failure ? { ...marker, failure } : marker);
+    return { ok: result === 'green', marker, ...(failure ? { failure } : {}), ...(result === 'red' ? { fallback } : {}) };
   } catch (e) { return { ok: false, detail: String(e.message), fallback }; }
 }
