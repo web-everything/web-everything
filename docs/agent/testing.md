@@ -4848,6 +4848,104 @@ a live target replacing a stale cached target with a different head and red chec
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
 
+
+## Confined Antigravity build adapter (R1062 / S7 / R37)
+
+`agy-confined-build.test.mjs` uses temporary local Git repositories and injected fake agy
+execution; it never launches agy. Admission requires kind, numeric size and literal repo-relative
+file/directory scope prefixes (at most 20 entries). Allowed kinds require size at/below
+`kindMaxSize` (default 3, `WE_AGY_BUILD_KIND_MAX_SIZE`, positive integer); alternatively,
+any kind with size at/below `maxSize` remains admitted (R1062). Missing/nonfinite sizes refuse;
+settings must remain readable, with environment overrides above settings above defaults.
+Keep whole-run rejection cases for mixed scope, Git controls, escaping/new symlinks, modes,
+binary/submodule changes, traversal, Git calls, moved HEAD, changed real lane and incomplete
+or rewritten transcripts. The launcher applies the admitted patch without staging or committing.
+Voided/refused builds advance to another provider; oversized requests need operator review or
+an explicit settings change. The broad dispatch availability gate still requires sandboxed
+providers; production execution remains unavailable even for explicitly scoped launches until
+an enforced filesystem boundary confines native file tools. Clone/transcript checks only detect
+escapes afterward and cannot undo damage. The named outside-write refusal test must assert both
+real-lane and untracked host targets remain unchanged with no worker launched. Only injected fake
+workers exercise patch admission; they are not evidence of production confinement. Run the focused adapter and
+`operations/__tests__/fix-run.test.mjs` fixtures through the host heavy-admission queue.
+
+Slice B supersedes the production-unavailable note above: macOS builds launch through
+`/usr/bin/sandbox-exec` using the operator's real HOME login, exactly as the existing agy review seat does.
+The scrubbed environment retains only PATH, USER, LOGNAME, SHELL, LANG, LC_* and TERM;
+HOME is the real home and TMPDIR/TMP/TEMP point to a launcher-created private temp directory.
+No token or settings are copied and no private HOME is created or deleted.
+Writes are default-denied, with exactly the disposable clone, per-run private temp directory,
+`~/.gemini/antigravity-cli/log` (subpath), and `/dev/null`, `/dev/tty`, `/dev/dtracehelper` granted.
+`AGY_STATE_WRITE_DIRS` names exactly the measured log requirement; extend it only with measured evidence.
+The private temp is made outside the clone, lane and home workspace. The transcript directory is
+outside every write grant; the launcher removes only its own temporary directories after the run.
+Redirected log directories refuse with a provider/operator fallback rather than widening write access.
+
+Read denies retain `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.plateau`, the home workspace and
+`~/workspace/.operations`, including canonical secret targets. There is no home-wide or `/Users`
+read deny, no home read allowlist, and no broad temp/volume read deny. Real-HOME `.gemini`, Keychains
+and `Library/Application Support/antigravity` remain readable for agy's login and state.
+Network remains allowed. Canonical absolute paths, unsafe SBPL characters, writable roots overlapping
+the lane/workspace, unsupported hosts and missing sandbox-exec fail closed; use another provider or
+request operator review. Profiles use private temporary directories and mode 0600. Native file tools
+are permitted; transcript, escape, Git-control and scope checks still gate launcher-owned patch application.
+No agy Git operations are admitted.
+
+`agy-sandbox.test.mjs` asserts the exact grants and scrubbed environment. Its Darwin-only REAL probe
+uses a fake home and temporary directories: clone/temp/log writes succeed; sibling temp, fake-home
+and other `.gemini` writes fail with EPERM; real-HOME login reads succeed and every named secret-root
+read fails with EPERM. It runs system sh/cat/ls without touching real home secrets or launching agy.
+`agy-confined-launcher.test.mjs` checks real HOME preservation, no copied state, private temp cleanup,
+redirected-log refusal, and a REAL fake-home launcher probe for login/log access and other-home write denial.
+The injected build tests separately cover unsupported hosts and missing sandbox-exec without launching a worker.
+The scoped files are agy-sandbox, agy-confined-launcher, agy-confined-build and agy-fix-admission;
+run them only through host heavy-admission. These edits were authored without running tests.
+
+The shared kind-agnostic `isAdmissibleTargetPath` allowlist gates scope admission and every
+tracked/untracked changed path. Only normalized repo-relative documentation (`docs/**` or `.md`/`.mdx`)
+and tests (`**/__tests__/**` or `.test.*`/`.spec.*`) qualify. Refuse `.github/**`, `scripts/settings/**`,
+`backlog/**`, `agent-memory-src/**`, soak/breaks tests, `.real.test.mjs`, JSON/YAML/TOML,
+config names, lockfiles, tsconfig names, and every path the shared critical-work verdict marks critical.
+Traversal, empty/dot/backslash segments, controls, glob characters and `.git` segments at any depth
+refuse. All other paths refuse by default, including source, scripts and enforcement code.
+Every test path must also be inside the item's scope; the item may only narrow the launch scope.
+A single violation voids the whole patch before application. Kind gates and `kindMaxSize`/`maxSize`
+settings remain independent: even a size-1 feature job can change only allowlisted paths.
+Build transcript admission checks
+every tool update against the native-tool allowlist and clone containment regardless of status;
+errored tools cannot bypass it. The juror's separate error exemption does not apply to builds.
+
+## Confined AgY repair admission
+
+Keep repair routing and `fix-run` fixtures on raw item evidence, through the detached-provider argv
+handoff and real AgY adapter. Repair admission retains the R1062 size-1 rule for any kind and
+requires a repo-relative scope contained in the launch/routing scope. An out-of-launch item path refuses the whole repair; missing
+launch evidence and empty or oversized scopes advance to the next provider/operator. The shared
+critical-work verdict is recomputed on effective paths (including directory forms); critical scopes
+refuse. Refusals record an unproductive outcome so the existing provider chain advances. Terminal transcript fixtures use nested `result.status: SUCCESS`.
+
+
+Threat model (R1062 slice S7, R1049): agy is an UNTRUSTED DIFF PRODUCER;
+credential exposure equals the existing agy review seat (real HOME login); writes are confined to the disposable clone, a private temp dir and agy's log dir; only the allowed diff (docs and in-scope tests, allowlist) is kept and goes through review; shells and tools inside the clone are out of scope (R1049).
+The shared documentation/test allowlist is intersected with the launch scope (an item scope may only
+narrow it, with criticality re-checked), before the normal review and audit path. Network stays allowed
+for agy's API; credentials are not protected from the worker. This is the accepted operator ruling (R1062).
+Size-1 jobs of any kind are also admitted by R1062; neither is a confinement claim.
+
+The launcher hashes clone Git redirect/configuration controls with filesystem reads before any
+post-run Git invocation; unreadable or changed controls and a missing Git directory void the run. Clone Git reads
+pin both Git directories and the work tree, disable external diff/textconv and external configuration,
+and never accept clone controls as routing authority. Recheck every tracked and untracked diff path
+against the shared critical-work verdict as well as the allowlist predicate before applying anything.
+Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal
+of critical descendants within an otherwise permitted directory scope.
+
+The confinement depth-1 regression checks static local imports from all four enforcement
+entrypoints, plus the named AgY spawn/juror chain, and requires each module and existing sibling
+test to pass the shared critical verdict. New direct dependencies must be added to the pinned
+critical list; deeper generic infrastructure is intentionally not critical merely by transitive import.
+Scope admission and applied paths use `isAdmissibleTargetPath`; keep the shared table-driven
+admissible/refused cases, tracked/untracked policy-cascade refusal, and out-of-item-scope test refusal.
 ## Drain read-migration fixture imports
 
 Load the drain/adoption graph with static imports during collection in
