@@ -136,8 +136,9 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
  *  clone to the last-good build on a failed check or a crash loop. Never throws; readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
-  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, launchedBy = 'tick-start' } = options;
-  if (!root || readyOnly || launchedBy !== 'tick-start') return;
+  const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, adoptOnly = false, launchOnly, asJob, launchedBy = 'tick-start' } = options;
+  const betweenTicks = !adoptOnly && launchOnly === true && asJob === true && (launchedBy === 'early' || launchedBy === 'recovery');
+  if (!root || readyOnly || betweenTicks) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
     await runForceWatchTick({

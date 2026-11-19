@@ -21,6 +21,7 @@ import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, r
 import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
+import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -123,6 +124,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
 });
@@ -790,16 +792,36 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     return { originDir, cloneDir, env, F };
   };
 
-  it.each(['early', 'recovery'])('between-tick %s launch preserves the force watch; tick-start advances it once', async (launchedBy) => {
+  it.each([
+    ['inline early', { launchedBy: 'early', asJob: false }],
+    ['inline recovery', { launchedBy: 'recovery', asJob: false }],
+    ['inline launchOnly', { launchedBy: 'early', launchOnly: true, asJob: false }],
+    ['missing launchOnly', { launchedBy: 'early', asJob: true }],
+    ['unknown launchedBy', { launchedBy: 'unknown', launchOnly: true, asJob: true }],
+    ['tick-start', { launchedBy: 'tick-start', launchOnly: true, asJob: true }],
+    ['adopt path', { launchedBy: 'early', launchOnly: true, asJob: true, adoptOnly: true }],
+  ])('%s still advances the force watch', async (_name, options) => {
+    const { cloneDir, env } = await forceAdoptF();
+    const watchBefore = readForceWatch(cloneDir, env);
+    const probe = vi.fn(healthy);
+    vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue({ moved: false, reason: 'rebuild-job-running' });
+    await tick(cloneDir, env, { ...options, runSmoke: passing(), forceWatchProbe: probe });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ ticksLeft: watchBefore.ticksLeft - 1 });
+  });
+
+  it.each(['early', 'recovery'])('between-tick %s job launch preserves the force watch; tick-start advances it once', async (launchedBy) => {
     const { cloneDir, env } = await forceAdoptF();
     const watchBefore = readForceWatch(cloneDir, env);
     expect(watchBefore.ticksLeft).toBe(5);
     const probe = vi.fn(healthy);
-    await tick(cloneDir, env, { launchedBy, runSmoke: passing(), forceWatchProbe: probe });
+    const job = vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue({ moved: false, reason: 'rebuild-job-running' });
+    await tick(cloneDir, env, { launchedBy, launchOnly: true, asJob: true, runSmoke: passing(), forceWatchProbe: probe });
+    expect(job).toHaveBeenCalledWith(expect.objectContaining({ launchedBy, launchOnly: true }));
     expect(probe).not.toHaveBeenCalled();
     expect(readForceWatch(cloneDir, env)).toEqual(watchBefore);
 
-    await tick(cloneDir, env, { launchedBy: 'tick-start', runSmoke: passing(), forceWatchProbe: probe });
+    await tick(cloneDir, env, { launchedBy: 'tick-start', asJob: false, runSmoke: passing(), forceWatchProbe: probe });
     expect(probe).toHaveBeenCalledTimes(1);
     expect(readForceWatch(cloneDir, env)).toMatchObject({ ticksLeft: watchBefore.ticksLeft - 1 });
   });
