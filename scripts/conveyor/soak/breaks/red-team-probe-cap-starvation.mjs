@@ -1,0 +1,62 @@
+/** Persisted blocked red-team heads must all get a bounded probe turn. */
+import { spawnSync } from 'node:child_process';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
+const PATH = 'scripts/lib/red-team-dispatch-queue.mjs';
+export default {
+  id: 'red-team-probe-cap-starvation',
+  title: 'ten blocked red-team heads receive probe turns within two default ticks',
+  card: 'red-team probe cap starvation regression',
+  fixedBy: { sha: 'working-tree', where: 'current tree', paths: [PATH] },
+  fixPresent(root) {
+    const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import b from ${JSON.stringify(import.meta.url)}; const r = await b.run({ sourceRoot: ${JSON.stringify(root)} }); process.exit(b.judge(r).length ? 1 : 0);`],
+    { timeout: 15000, maxBuffer: 65536, encoding: 'utf8' });
+    return !probe.error && probe.status === 0;
+  },
+  async run({ sourceRoot = ROOT } = {}) {
+    const violations = [];
+    const check = (ok, message) => { if (!ok) violations.push(message); };
+    const repo = 'example/project', head = 'a'.repeat(40), file = 'queue.json';
+    const files = new Map([[file, JSON.stringify(Array.from({ length: 10 }, (_, i) => ({
+      key: `${repo}#${i + 1}`, repo, pr: i + 1, head, enqueuedAt: 1, attempts: 0,
+      blocked: i % 2 ? 'planner-skip' : 'review-unfinished',
+    })))]]);
+    try {
+      const { createRedTeamDispatchQueue, runWithRedTeamQueue } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
+      const open = () => createRedTeamDispatchQueue({ file,
+        readFile: path => {
+          if (!files.has(path)) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+          return files.get(path);
+        },
+        writeFile: (path, data) => files.set(path, data),
+        rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
+        unlink: path => files.delete(path),
+        readLivePr: () => ({ state: 'OPEN', headRefOid: head }),
+      });
+      const seen = new Set();
+      for (let tick = 0; tick < 2; tick++) {
+        const queue = open();
+        const before = queue.entries();
+        await runWithRedTeamQueue({ queue, repo,
+          plan: { refusals: before.map(entry => ({ prNumber: entry.pr, kind: 'already-reviewed-head', headSha: entry.head })) },
+          rawPrs: before.map(entry => ({ number: entry.pr, state: 'OPEN', headRefOid: entry.head })),
+          capacity: { lanes: 0, remainingStarts: 0 }, readNetFiles: () => ({ ok: false }),
+          run: ({ plan }) => {
+            const ids = plan.refusals.map(row => row.prNumber);
+            check(ids.length > 1 && ids.length <= 6, `tick ${tick}: expected multiple probes bounded at six, got ${ids.length}`);
+            ids.forEach(pr => seen.add(pr));
+            return { rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: 'review-unfinished' })),
+              dispatched: [], notStarted: ids.map(prNumber => ({ prNumber, reason: 'review-unfinished' })) };
+          },
+        });
+        check(open().entries().length === 10, 'blocked entries did not survive restart');
+      }
+      check(seen.size === 10, `only ${seen.size} of ten blocked heads probed within two ticks`);
+    } catch (error) { violations.push(`scenario failed: ${error.stack ?? error}`); }
+    return { violations };
+  },
+  judge: report => report.violations,
+};
