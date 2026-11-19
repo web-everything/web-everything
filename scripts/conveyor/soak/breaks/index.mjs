@@ -56,6 +56,7 @@
  *
  * This file itself stays a thin, EAGER entry point (a top-level `await` builds `BREAKS` once, at import time) —
  * the discovery/validation logic lives in `../registry-discovery.mjs` (generic, no eager directory scan) and
+ * `accepted-red-team-repair-accounting.mjs` registers the #7031 repair-loop replay through discovery.
  * `../breaks-shape.mjs` (the break-specific shape check — deliberately kept OUTSIDE this directory so directory
  * discovery never mistakes it for a break module), both importable on their own for tests that need the logic
  * without triggering a real load of every break module in this directory.

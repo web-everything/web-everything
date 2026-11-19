@@ -69,6 +69,17 @@ export function resolveMechanicalRoundsSetting({
   return out;
 }
 
+/**
+ * The policy value a red-team receipt writer must count with, so it matches the planner's
+ * `review.mechanicalRoundsCountTowardCap`. An unreadable setting counts mechanical rounds (stricter; fail closed).
+ */
+export function receiptCountsMechanicalRounds(load = resolveMechanicalRoundsSetting, env = process.env) {
+  try {
+    const r = load({ env });
+    return typeof r?.value === 'boolean' ? r.value : true;
+  } catch { return true; }
+}
+
 const bodyOf = (c) => (typeof c === 'string' ? c : typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
 const SHA40 = /^[0-9a-f]{40}$/;
