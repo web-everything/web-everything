@@ -38,6 +38,8 @@ export function redTeamOwedFor(loopPayload) {
   const verdict = loopPayload?.verdict;
   if (!verdict || typeof verdict !== 'object') return false;
   if (redTeamRequired(verdict.verdict ?? null)) return true;
+  // A confirm-step accept of a `prevention-outstanding` run is an accepted head too (live #6949).
+  if (verdict.verdict === VERDICTS.PREVENTION_OUTSTANDING && loopPayload?.findings?.confirm === 'accept') return true;
   if (verdict.verdict !== VERDICTS.NEEDS_HUMAN || verdict.humanRequired !== true) return false;
   return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
 }
