@@ -1966,6 +1966,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/owed-ci-rerun-planned-but-never-executed.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
