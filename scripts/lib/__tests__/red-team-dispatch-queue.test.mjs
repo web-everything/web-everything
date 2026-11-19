@@ -706,6 +706,36 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
+  it.each([null, undefined])('unkeyed recovery input failure (%s) persists unmatched heads and retries next drain', async prNumber => {
+    const f = fixture();
+    const run = vi.fn(() => ({
+      rows: [{ ...(prNumber === undefined ? {} : { prNumber }), action: 'skip', why: 'red-team recovery inputs unreadable' }],
+      dispatched: [], notStarted: [],
+    }));
+    const result = await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run, log: f.log });
+    expect(result.dispatched).toEqual([]);
+    expect(f.queue.entries().map(entry => [entry.pr, entry.attempts])).toEqual([[1, 1], [2, 1]]);
+    expect(JSON.parse(f.files.get(f.file))).toEqual(f.queue.entries());
+    const restarted = f.open();
+    expect(restarted.entries()).toEqual(f.queue.entries());
+    run.mockImplementation(started);
+    const retried = await runWithRedTeamQueue({ queue: restarted, ...inputs([1, 2]), run });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(retried.dispatched.map(row => row.prNumber)).toEqual([1, 2]);
+    expect(restarted.entries()).toEqual([]);
+    expect(f.open().entries()).toEqual([]);
+  });
+
+  it('partial recovery input failure retains only unmatched heads and settles completed rows', async () => {
+    const f = fixture();
+    await runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2]), run: () => ({
+      rows: [{ prNumber: 1, action: 'clear' }, { prNumber: null, action: 'skip', why: 'red-team recovery inputs unreadable' }],
+      dispatched: [], notStarted: [],
+    }) });
+    expect(f.queue.entries().map(entry => [entry.pr, entry.attempts])).toEqual([[2, 1]]);
+    expect(f.open().entries()).toEqual(f.queue.entries());
+  });
+
   it('planner skip rows (not in notStarted) count as attempts, rotate, and no longer starve the next PR', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';

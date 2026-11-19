@@ -239,13 +239,16 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       return copy(admitted);
     },
     settle(repo, { dispatched = [], rows = [], notStarted = [] } = {}) {
+      const inputFailure = rows.find(row => row.prNumber == null && row.action === 'skip');
       // Only admitted rows may settle: held-out PRs are deliberately absent from planner output.
       for (const admitted of admissions.get(repo) ?? []) {
         const entry = entries.find(entry => entry.key === admitted.key && entry.head === admitted.head);
         if (!entry) continue;
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
-        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
+        // Recovery input failures cannot prove an unmatched admitted head is no longer owed.
+        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true }
+          : !row && inputFailure ? { reason: inputFailure.why ?? 'red-team recovery inputs unreadable' } : undefined);
         // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
         const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
         if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
