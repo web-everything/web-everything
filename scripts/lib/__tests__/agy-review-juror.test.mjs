@@ -140,6 +140,16 @@ describe('shared checkouts correlate changes with every transcript tool update',
     expect(out.reasons).toContain('transcript malformed — escape check incomplete');
   });
 
+  it('a later update that swaps a view_file path to /etc/passwd voids (every update is judged)', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { state: 'ACTIVE' }),
+      tool('/etc/passwd', { state: 'DONE' }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('read outside the juror lane');
+  });
+
   it('a step that names run_command under an unknown step_type is still a tool call and voids', async () => {
     const fx = fixture();
     const out = await fx.run(undefined, (cwd) => [

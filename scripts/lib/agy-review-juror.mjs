@@ -319,13 +319,17 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
     }
     // A completed READ must stay inside the juror lane or this conversation's brain folder.
     // Every path-like parameter is judged — relative, `~`, URI, array and nested forms included — after following symlinks.
-    if (roots.length && name !== 'finish' && step.params != null) {
-      // Parameters can arrive as a JSON string; one that does not parse, or parses to a bare scalar, cannot be judged: void.
-      let params = step.params;
-      if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = '\0'; } }
-      // A bare array names no key to say what its elements are, so every element is judged as a path.
-      const leaves = typeof params === 'object' ? pathLeaves(params, Array.isArray(params)) : ['\0'];
-      if (leaves.some((leaf) => readsOutside(leaf, roots, cwd))) out.push(`${name} (read outside the juror lane)`);
+    // EVERY update of the step is judged, not just the first: a later update must not swap in an outside path (audit).
+    if (roots.length && name !== 'finish') {
+      for (const updateParams of [step.params, ...step.updates]) {
+        if (updateParams == null) continue;
+        // Parameters can arrive as a JSON string; one that does not parse, or parses to a bare scalar, cannot be judged: void.
+        let params = updateParams;
+        if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = '\0'; } }
+        // A bare array names no key to say what its elements are, so every element is judged as a path.
+        const leaves = typeof params === 'object' ? pathLeaves(params, Array.isArray(params)) : ['\0'];
+        if (leaves.some((leaf) => readsOutside(leaf, roots, cwd))) { out.push(`${name} (read outside the juror lane)`); break; }
+      }
     }
   }
   return out;
