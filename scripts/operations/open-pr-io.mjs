@@ -222,7 +222,8 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
         argv.push(`--title=${assertMachineTitle(batchIds.length ? `prepare: ${batchIds.join(', ')}` : preparePrTitle(item, readMainCard(item, git)))}`, `--sha=${sha}`);
       } catch (e) {
         cleanupBody();
-        collect('prepare', 'prepare-invalid', String(e.message || e));
+        // Legacy shape, kept: a prepare refusal stops before any child runs and its reason IS the message.
+        return { outcome: 'refused', reason: String(e.message || e) };
       }
     }
     let audit;
