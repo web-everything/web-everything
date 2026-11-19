@@ -81,6 +81,9 @@ export function formatTimingsSummary(timings, { total = null, order = null } = {
 /** The canonical step order for `we:scripts/merge-ai-prs.mjs`'s pass summary line — purely cosmetic (the
  *  timings object itself is an unordered map), kept here so the CLI and its tests read the same list. */
 export const PASS_STEP_ORDER = [
+  'setup.opsFetch',
+  'setup.policy',
+  'setup.other',
   'listing',
   'classifyGateReads',
   'rebaseDropManifest',

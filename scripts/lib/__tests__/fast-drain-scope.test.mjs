@@ -189,7 +189,7 @@ describe('legacy manifest revision identity', () => {
 describe('fast drain listing', () => {
   const resolve = (options = {}) => resolveFastDrainListingSetting({ env: {}, tool: {}, platform: {}, ...options });
   it('defaults to snapshot from the standard', () => {
-    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard)' });
+    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', context: 'snapshot', contextSource: 'standard', line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard), context=snapshot (standard)' });
   });
   it('resolves platform, tool and env in cascade order', () => {
     expect(resolve({ platform: { listing: 'live' } })).toMatchObject({ listing: 'live', source: 'platform' });

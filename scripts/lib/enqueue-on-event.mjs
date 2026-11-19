@@ -68,6 +68,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
+import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -790,6 +791,7 @@ export function createEnqueueOnEvent({
   cwd, localSlug, defaultBranch, execFileSyncImpl = execFileSyncThrottled,
   scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
+  writeRoundSnapshot = writeFastDrainRoundDefaultBranch,
   refreshPending = () => {
     try {
       const root = scriptRoot();
@@ -981,6 +983,7 @@ export function createEnqueueOnEvent({
         catchUpRound++;
         clearSnapshot();
         listingSnapshot = join(tmpdir(), `${snapshotPrefix}-${catchUpRound}.json`);
+        writeRoundSnapshot({ path: listingSnapshot, repo: localSlug, defaultBranch, now: now() });
         listedPrs = result.prs;
         catchUpMainCiRunId = result.mainCiRunId;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));

@@ -7,6 +7,7 @@ import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { withWriteLock } from './daemon-clone-lock.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { validDefaultBranch } from './default-branch-cache.mjs';
 
 /** The cwd-repo sentinel must share the full pass's persistent cache namespace. */
 export function shaCacheRepo(repo, localSlug) {
@@ -37,14 +38,16 @@ export function resolveFastDrainListingSetting({ env = process.env, tool, platfo
     try { block = readSettings().settings?.mergeQueue?.fastDrain; } catch { block = undefined; }
   }
   const raw = String(env?.WE_FAST_DRAIN_LISTING ?? '').trim().toLowerCase();
+  const contextRaw = String(env?.WE_FAST_DRAIN_CONTEXT ?? '').trim().toLowerCase();
   const c = cascadePolicy('mergeQueue.fastDrain', block, {
-    env, standard: { listing: 'snapshot' }, envValues: { listing: raw || undefined },
-    valid: { listing: (v) => v === 'snapshot' || v === 'live' },
+    env, standard: { listing: 'snapshot', context: 'snapshot' }, envValues: { listing: raw || undefined, context: contextRaw || undefined },
+    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live' },
     ...(platform !== undefined ? { platform } : {}), log: () => {},
   });
   const listing = c.value.listing, source = c.sources.listing;
-  const line = `fast-drain: mergeQueue.fastDrain.listing=${listing} (${source})${c.invalid.length ? ` · ignored invalid: ${c.invalid.join('; ')}` : ''}`;
-  return { listing, source, line };
+  const context = c.value.context, contextSource = c.sources.context;
+  const line = `fast-drain: mergeQueue.fastDrain.listing=${listing} (${source}), context=${context} (${contextSource})${c.invalid.length ? ` · ignored invalid: ${c.invalid.join('; ')}` : ''}`;
+  return { listing, source, context, contextSource, line };
 }
 
 /** Replace the live target while preserving snapshot context without mutating either input. */
@@ -135,7 +138,7 @@ function roundSnapshotTtl(env) {
 }
 
 /** A round cache is advisory context only: reject incomplete, foreign or expired evidence. */
-export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env = process.env,
+function readFastDrainRoundRecord({ path, repo, now = Date.now(), env = process.env,
   read = (p) => { if (statSync(p).size > 64 * 1024 * 1024) throw new Error('snapshot too large'); return readFileSync(p, 'utf8'); },
 } = {}) {
   const { seconds: ttlSec } = roundSnapshotTtl(env);
@@ -144,14 +147,31 @@ export function readFastDrainRoundSnapshot({ path, repo, now = Date.now(), env =
     if (typeof raw !== 'string' || Buffer.byteLength(raw) > 64 * 1024 * 1024) return null;
     const snap = JSON.parse(raw);
     if (snap?.repo !== repo || typeof snap.writtenAt !== 'number' || !Number.isFinite(snap.writtenAt)
-      || now < snap.writtenAt || now - snap.writtenAt >= ttlSec * 1000 || !Array.isArray(snap.rows)
+      || now < snap.writtenAt || now - snap.writtenAt >= ttlSec * 1000) return null;
+    return snap;
+  } catch { return null; }
+}
+
+export function readFastDrainRoundSnapshot(options) {
+  const snap = readFastDrainRoundRecord(options);
+  if (!Array.isArray(snap?.rows)
       || !snap.rows.every(row => Number.isInteger(row?.number) && row.number > 0
         && typeof row.headRefOid === 'string' && row.headRefOid.length > 0
         && typeof row.baseRefName === 'string' && row.baseRefName.length > 0
         && Array.isArray(row.labels) && row.labels.every(l => typeof l?.name === 'string')
         && Array.isArray(row.statusCheckRollup))) return null;
-    return snap;
-  } catch { return null; }
+  return snap;
+}
+
+/** Parent catch-up writes only branch metadata; it never claims a partial PR set is complete. */
+export function writeFastDrainRoundDefaultBranch({ path, repo, defaultBranch, now = Date.now(), write = writeJsonAtomic }) {
+  if (!validDefaultBranch(defaultBranch)) return false;
+  try { write(path, { repo, writtenAt: now, defaultBranch }); return true; } catch { return false; }
+}
+
+export function readFastDrainRoundDefaultBranch(options) {
+  const name = readFastDrainRoundRecord(options)?.defaultBranch;
+  return validDefaultBranch(name) ? name : null;
 }
 
 /** The shared writer lock waits for readers, but refuses another writer immediately. Wait for that

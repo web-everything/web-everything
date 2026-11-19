@@ -85,6 +85,16 @@ describe('createStepTimer', () => {
 });
 
 describe('formatTimingsSummary', () => {
+  it('includes pre-listing ops, policy and other setup phases before listing in the pass summary', async () => {
+    let clock = 0;
+    const timer = createStepTimer(() => clock);
+    await timer.timeAsync('setup.opsFetch', async () => { clock += 21; });
+    timer.time('setup.policy', () => { clock += 12; });
+    timer.time('setup.other', () => { clock += 1; });
+    timer.time('listing', () => { clock += 2; });
+    expect(formatTimingsSummary(timer.snapshot(), { order: PASS_STEP_ORDER }))
+      .toBe('setup.opsFetch=21ms setup.policy=12ms setup.other=1ms listing=2ms total=36ms');
+  });
   it('renders label=NNNms pairs plus a trailing total, in caller order', () => {
     const line = formatTimingsSummary({ b: 20, a: 10 }, { order: ['a', 'b'] });
     expect(line).toBe('a=10ms b=20ms total=30ms');

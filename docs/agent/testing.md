@@ -4803,3 +4803,18 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Event fast-drain context freshness
+
+Local `--only --from-green-event` context may reuse full shared-snapshot rows only through
+`cacheOnly: true` (normal TTL/dirty rules, even when stale-ok is configured). A lean live
+open inventory owns membership; number, head and updatedAt must match before reuse. Missing
+or changed rows and dependency/couple/overlap/card-group components are read fully live.
+Unknown inventories or related evidence fall back to the original full listing with one
+`fast-drain: context fell back to full listing (...)` diagnostic. Both `WE_FAST_DRAIN_CONTEXT=live`
+and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch resolution uses the in-process map, fresh round metadata, then a host-wide
+one-hour atomic cache under `~/.claude/conveyor/default-branches`, then live GitHub. Test
+processes require an explicit `WE_DEFAULT_BRANCH_CACHE_DIR`. Branch-only parent round records
+never count as complete PR listings. Branch resolution must finish before synchronous fallback pages start; keep that ordering covered by a causal probe.
+The node:test regression and soak also support the existing Vitest runner; run either through
+heavy-admission, with only the affected files.
