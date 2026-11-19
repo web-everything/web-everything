@@ -567,6 +567,21 @@ function relatedSelection({ targets, runGit, readRepoFile, settings, env }) {
       maxDepth: settings.relatedDepth, env });
     const oldTests = testDepths(targets, graphs.imports);
     selection.additionalTests = selection.reachableTests.filter(t => !oldTests.has(t));
+    if (selection.status === 'selection-truncated') {
+      // Static edges may only ADD tests: the import-graph selection is kept first and static-edge tests fill what is left of
+      // the budget, so adding an edge can never push a previously selected test out under the cap.
+      const previous = selectRelatedTests({ changedFiles: targets, reverse: graphs.imports, maxTests: settings.relatedMaxTests,
+        maxDepth: settings.relatedDepth, env });
+      const kept = new Set(previous.tests ?? previous.reachableTests);
+      const depths = testDepths(targets, graphs.reverse);
+      const extras = [...selection.tests].filter(t => !kept.has(t))
+        .sort((a, b) => (depths.get(a) ?? Infinity) - (depths.get(b) ?? Infinity) || (a < b ? -1 : 1));
+      for (const t of extras) if (kept.size < selection.maxTests) kept.add(t);
+      const tests = [...kept].sort();
+      Object.assign(selection, { tests, selectedTestCount: tests.length,
+        droppedCount: selection.reachableTests.filter(t => !kept.has(t)).length,
+        reason: `${selection.reason}; import-graph selection kept first, static-edge tests added within the remaining budget` });
+    }
     if (selection.status === 'selection-truncated'
       && (!selection.tests.length || Buffer.byteLength(selection.tests.join(' '), 'utf8') > 32_000)) {
       return { ...selection, status: 'complete', partial: false, tests: null, reason: `${selection.reason}; list unusable — kept vitest related` };

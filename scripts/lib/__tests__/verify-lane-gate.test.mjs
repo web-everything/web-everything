@@ -1053,6 +1053,18 @@ describe('#5128 — bounded related-test selection', () => {
     expect(describeGate(gate)).toContain('selection-truncated');
   });
 
+  it('keeps the import-graph tests first: a static literal-read edge never pushes a previously selected test out under the cap', () => {
+    const files = { 'scripts/hub.mjs': '', 'scripts/mid.mjs': "import './hub.mjs'", 'scripts/direct.test.mjs': "import './hub.mjs'",
+      'scripts/deep.test.mjs': "import './mid.mjs'", 'scripts/aaa.test.mjs': "import { readFileSync } from 'node:fs'; readFileSync('scripts/hub.mjs')" };
+    const git = fakeGit(['scripts/hub.mjs']);
+    const gate = resolveDefaultGate({ env: TODAY, fileConfig: { relatedMaxTests: 2, relatedDepth: 2 },
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
+      readRepoFile: path => files[path] });
+    expect(gate.decision.selection.status).toBe('selection-truncated');
+    expect(gate.decision.selection.tests).toEqual(['scripts/deep.test.mjs', 'scripts/direct.test.mjs']);
+    expect(gate.decision.selection.droppedCount).toBe(1);
+  });
+
   it.each([1, 2])('keeps plain vitest related with no selection when graph %s has an unreadable source', unreadableGraph => {
     const gate = boundedGate(3, true, unreadableGraph);
     expect(gate.testCommand).toBe("npx vitest related 'scripts/hub.mjs' --run --passWithNoTests");
