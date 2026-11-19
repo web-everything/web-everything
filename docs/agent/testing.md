@@ -4965,3 +4965,9 @@ That reader attests `rowsHead` only after validating the commit identity and exh
 connection; retention consumes that provenance rather than deriving it from `headRefOid`.
 `merge-ai-prs.test.mjs` pins absent/other-head retention refusal alongside the bounded-read cases,
 and `reconcile-core.test.mjs` pins incomplete/other-head refusal even with review-owned red holds.
+
+CI-heal escalation's default reader also hydrates through `readReviewChecks` before judging
+gate-only red. Its transport fixtures serve both paginated REST endpoints, without adding
+provenance to flattened PR facts. Keep default-reader regressions for green tests plus a red
+review gate and incomplete/unreadable responses from either endpoint; the latter must report
+unknown via the existing read warning rather than claim CI is green.

@@ -63,6 +63,7 @@ import { summarize } from '../lib/check-state-predicate.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { HUMAN_REVIEW_HOLD_GATES } from '../lib/merge-gate-verdict.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -468,10 +469,15 @@ export async function checkNeedsHumanEscalable(options = {}) {
 function defaultReadPrChecks({ pr, repo }, { runGh = runGhSync } = {}) {
   const args = ['pr', 'view', String(pr), '--json', 'number,labels,headRefOid,statusCheckRollup,url'];
   if (repo) args.push(`--repo=${repo}`);
-  const raw = runGh(args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  const run = argv => runGh(argv, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  const raw = run(args);
   const parsed = JSON.parse(String(raw || '{}'));
   const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
-  return { ...parsed, slug };
+  if (!(repo ?? slug) || !parsed.headRefOid) throw new Error('missing repository or head for complete check read');
+  // A flattened PR rollup cannot attest completeness. Both paginated check-run
+  // and legacy-status reads must succeed before forwarding head provenance.
+  const rows = readReviewChecks({ repo: repo ?? slug, headSha: parsed.headRefOid, run });
+  return { ...parsed, slug, statusCheckRollup: rows, rowsComplete: rows.rowsComplete, rowsHead: rows.rowsHead };
 }
 
 function classifyPrChecks(parsed, { pr, repo }, {
