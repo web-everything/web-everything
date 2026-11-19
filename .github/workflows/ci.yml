@@ -402,7 +402,10 @@ jobs:
             exit 1
           fi
 
-  # TT3: split the real-git/real-subprocess tier into three parallel integration parts.
+  # TT3: split the real-git/real-subprocess tier into five parallel integration parts.
+  # Run 44443900759 (2026-11-18): sim-scenarios 4.5 min, scan-chain 5.6 min, parallel 9.9 min.
+  # Of parallel's ~945 s per-file time, lane-pool-* used ~771 s, daemon-rebuild* ~97 s,
+  # and the rest ~77 s. Hash lane-pool basenames into two parts to target <= ~6 min each.
   # Each retains its existing pool settings and card-only handling. The shell aggregator's
   # check name `integration` is unchanged, so branch protection needs no change; `test`
   # still requires it. Failed, cancelled or skipped parts fail the aggregator closed.
@@ -413,15 +416,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [scan-chain, sim-scenarios, parallel]
+        group: [scan-chain, sim-scenarios, lane-pool-a, lane-pool-b, parallel]
         include:
           - group: scan-chain
             timeout: 20
           - group: sim-scenarios
             timeout: 20
+          - group: lane-pool-a
+            timeout: 20
+          - group: lane-pool-b
+            timeout: 20
           - group: parallel
             timeout: 20
-    # 2x headroom over the ~10 minute target per part.
+    # Retain 20-minute timeouts for headroom over the ~6 minute target per part.
     timeout-minutes: ${{ matrix.timeout }}
     steps:
       - name: Gate on changes

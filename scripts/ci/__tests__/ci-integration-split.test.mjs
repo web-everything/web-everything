@@ -39,10 +39,11 @@ describe('TT3 integration inventory', () => {
     ]);
   });
 
-  it('keeps scenario/world and every forks-pinned sim file together, with other files parallel', () => {
+  it('keeps scenario/world and every forks-pinned sim file together, with other non-lane-pool files parallel', () => {
     for (const file of files) {
       const name = file.split('/').at(-1);
       if (name.startsWith('sim-')) expect(integrationGroup(file)).toBe('sim-scenarios');
+      else if (name.startsWith('lane-pool-')) expect(['lane-pool-a', 'lane-pool-b']).toContain(integrationGroup(file));
       else if (!/^(stdout-flush|rust-scan-|gate-entrypoint)/.test(name)) expect(integrationGroup(file)).toBe('parallel');
     }
     for (const [file, pool] of config.test.poolMatchGlobs) {
@@ -50,6 +51,28 @@ describe('TT3 integration inventory', () => {
     }
     expect(config.test.pool).toBe('threads');
     expect(config.test.poolOptions.forks.singleFork).toBe(true);
+  });
+
+  it('assigns every current lane-pool file to exactly one of two non-empty lane-pool groups', () => {
+    const laneFiles = files.filter((file) => file.split('/').at(-1).startsWith('lane-pool-'));
+    const groups = ['lane-pool-a', 'lane-pool-b'].map((group) => integrationFilesForGroup(files, group));
+    for (const group of groups) expect(group.length).toBeGreaterThan(0);
+    expect(groups.flat().sort()).toEqual([...laneFiles].sort());
+    for (const file of laneFiles) {
+      expect(integrationGroups.filter((group) => integrationFilesForGroup([file], group).length)).toEqual([integrationGroup(file)]);
+    }
+  });
+
+  it.each([
+    ['lane-pool-acquire-base.test.mjs', 'lane-pool-a'],
+    ['lane-pool-future-a.test.mjs', 'lane-pool-b'],
+    ['lane-pool-future-b.test.mjs', 'lane-pool-a'],
+  ])('stably hashes basename %s independent of directory and inventory order', (name, expected) => {
+    const paths = [name, `scripts/__tests__/${name}`, `other/directory/${name}`];
+    for (const file of paths) expect(integrationGroup(file)).toBe(expected);
+    expect(integrationFilesForGroup([...files, ...paths], expected)).toContain(paths[0]);
+    expect(integrationFilesForGroup([...paths, ...files].reverse(), expected).reverse())
+      .toEqual(integrationFilesForGroup([...paths, ...files], expected));
   });
 
   it.each(['', 'unknown', 'SCAN-CHAIN'])('rejects unknown group %j with an actionable fallback', (group) => {
@@ -91,12 +114,16 @@ describe('TT3 CI integration gate', () => {
     expect(runGate('success', 'success')).toBe(0);
   });
 
-  it('runs exactly three independent groups with at least 1.6x timeout headroom', () => {
+  it('runs exactly five independent groups with at least 1.6x timeout headroom', () => {
     expect(parts.strategy['fail-fast']).toBe(false);
+    expect(integrationGroups).toEqual(['scan-chain', 'sim-scenarios', 'lane-pool-a', 'lane-pool-b', 'parallel']);
     expect(parts.strategy.matrix.group).toEqual(integrationGroups);
     expect(parts.strategy.matrix.include.map((entry) => entry.group)).toEqual(integrationGroups);
     expect(parts['timeout-minutes']).toBe('${{ matrix.timeout }}');
     for (const entry of parts.strategy.matrix.include) expect(entry.timeout).toBeGreaterThanOrEqual(16);
+    for (const entry of parts.strategy.matrix.include.filter((entry) => entry.group.startsWith('lane-pool-'))) {
+      expect(entry.timeout).toBe(20);
+    }
     expect(parts.needs).toBe('changes');
     const step = parts.steps.find((step) => step.run?.includes('npm run test:integration:vitest'));
     expect(step.env.WE_INTEGRATION_GROUP).toBe('${{ matrix.group }}');
