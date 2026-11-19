@@ -123,6 +123,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         || entry.key !== `${entry.repo}#${entry.pr}` || keys.has(entry.key)
         || (entry.blocked !== undefined && !NON_RUNNABLE_REASONS.has(entry.blocked))
         || (entry.lastProbeTurn !== undefined && (!Number.isSafeInteger(entry.lastProbeTurn) || entry.lastProbeTurn < 0))
+        || (entry.retryAt !== undefined && !Number.isFinite(entry.retryAt))
+        || (entry.alertedHead !== undefined && !isRealHead(entry.alertedHead))
         || !Number.isFinite(entry.enqueuedAt) || !Number.isInteger(entry.attempts) || entry.attempts < 0) return false;
       keys.add(entry.key);
       return true;
@@ -185,7 +187,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (pr.headRefOid !== entry.head) {
           // Re-key in place, preserving FIFO position; stale planner rows are deferred until they match.
           entry.head = pr.headRefOid; entry.attempts = 0;
-          delete entry.blocked; delete entry.lastProbeTurn;
+          delete entry.blocked; delete entry.lastProbeTurn; delete entry.retryAt; delete entry.alertedHead;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
         }
       }
@@ -211,6 +213,21 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         entries.push({ key, repo, pr, head: candidate.head, enqueuedAt: now(), attempts: 0 });
         changed(`enqueue ${key}`);
       }
+    },
+    // Drain admission is head-bound and uses the same settlement ledger as planner admission.
+    admitDrain(entry, at) {
+      const current = entries.find(e => e.key === entry.key && e.head === entry.head);
+      if (!current || waiting.has(entry.key) || (current.retryAt ?? 0) > at) return [];
+      if (current.blocked === 'planner-skip') {
+        delete current.blocked;
+        changed(`unblocked ${entry.key}: independent drain`);
+      }
+      admissions.set(entry.repo, [{ ...current }]);
+      return [{ ...current }];
+    },
+    noteDrain(entry, patch) {
+      const current = entries.find(e => e.key === entry.key && e.head === entry.head);
+      if (current) { Object.assign(current, patch); changed(`drain metadata ${entry.key}`); }
     },
     admit(repo, count, { allowProbes = true } = {}) {
       const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either

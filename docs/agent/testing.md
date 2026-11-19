@@ -4931,3 +4931,10 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+## Independent red-team queue drain
+
+`red-team-queue-drain.test.mjs` injects live PR evidence, recovery, clock, alerts, and in-memory persistence.
+Keep the planner out of these fixtures: the drain must retry `planner-skip` entries on its own interval,
+preserve age on head changes, and retain unknown live PRs without dispatching. Retry cooldown and alert
+deduplication must survive a queue restart. The soak break detects the fix by executing that behavior.
