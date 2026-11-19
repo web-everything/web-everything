@@ -5158,6 +5158,7 @@ on the same path as operator and safety-net writes. `setMode` and `setFixPrs` re
 the safety net and operator even with orchestrator authority enabled. The authority settings tests cover closed
 defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
 verifies persisted events and commit messages against a temporary local Git origin.
+
 ## Negative review-run proofs
 
 `headNeverReviewedFromRuns` may bypass its 400-run scan only through
