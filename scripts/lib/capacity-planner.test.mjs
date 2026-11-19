@@ -3,6 +3,7 @@ import { planCapacity, planHorizon, workingSlot, resetSlot, HOUR } from './capac
 import { chooseBuilder, readProviderCapacity, PROVIDER_DEFAULTS, scoreProvider, burnWindows } from './provider-capacity.mjs';
 import { resolveRoutingSettings } from './routing-settings.mjs';
 import { capacityCalendar, renderCalendar, capacityCalendarOperation } from '../operations/capacity-calendar.mjs';
+import { validateInput } from '../operations/registry.mjs';
 const now = Date.parse('2026-11-19T15:00:00Z'); // Thursday 10am ET
 const bucket = (count, hours) => ({ count, expiresAt: new Date(now + hours * HOUR).toISOString() });
 const cap = (model = 'restartOnReset', used = 30, extra = {}) => ({ provider: 'codex', account: 'codex', windowModel: model,
@@ -90,9 +91,26 @@ describe('accounts, config and horizon', () => {
   });
   it('banked capacity prevents shortfall; aliases and future grants never add quota', () => {
     const c = cap('fixed', 100, { bankedResets: [bucket(3, 200)] });
-    const h = planHorizon({ capacities: [c, { ...c, provider: 'codex-alt', quotaOf: 'codex' }], now, days: 2, demandPerDay: 100 });
+    // Isolate inventory from operator availability: the default calendar closes over the weekend.
+    const config = { workingHours: { start: '00:00', end: '24:00', tz: 'America/New_York', days: [0, 1, 2, 3, 4, 5, 6] } };
+    const h = planHorizon({ capacities: [c, { ...c, provider: 'codex-alt', quotaOf: 'codex' }], config, now, days: 2, demandPerDay: 100 });
     expect(h.days[0].entries).toHaveLength(1);
     expect(h.days.every(d => !d.entries[0].shortfall)).toBe(true);
+  });
+  it('banked inventory can still shortfall when the next reset waits through the weekend', () => {
+    const c = cap('fixed', 100, { bankedResets: [bucket(3, 200)] });
+    const h = planHorizon({ capacities: [c], now, days: 2, demandPerDay: 100 });
+    expect(h.days[0].entries[0].shortfall).toBe(false);
+    expect(h.days[1].entries[0]).toMatchObject({ shortfall: true, bankedConsumed: [], expectedDemand: 100 });
+  });
+  it('calendar flags are optional, default false, and accept explicit booleans only', () => {
+    const { input } = capacityCalendarOperation();
+    expect(input.horizon).toMatchObject({ type: 'boolean', required: false, default: false });
+    expect(input.json).toMatchObject({ type: 'boolean', required: false, default: false });
+    expect(validateInput(input, {})).toMatchObject({ ok: true, value: { horizon: false, json: false } });
+    expect(validateInput(input, { horizon: true, json: true })).toMatchObject({ ok: true, value: { horizon: true, json: true } });
+    expect(validateInput(input, { horizon: 'true' }).ok).toBe(false);
+    expect(validateInput(input, { json: 'true' }).ok).toBe(false);
   });
   it('unassigned Claude file stays unknown for both; assigned account alone is known', () => {
     const providers = PROVIDER_DEFAULTS.providers;

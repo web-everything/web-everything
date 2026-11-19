@@ -66,7 +66,7 @@ describe('Codex usage ledger', () => {
     const sessions = join(root, 'sessions', '2026'); mkdirSync(sessions, { recursive: true });
     const event = (id, used, reset) => JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: reset } } } });
     writeFileSync(join(sessions, 'run.jsonl'), `${event('codex', 10, 5)}\n${event('codex', 12, 5)}\n${event('other', 99, 6)}\n`);
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5 });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 12, resets_at: 5, at: null });
     expect(readCodexQuota({ CODEX_HOME: join(root, 'missing') })).toBeNull();
   }));
   it('selects the newest rollout containing a Codex bucket', () => fixture(root => {
@@ -76,7 +76,7 @@ describe('Codex usage ledger', () => {
       writeFileSync(path, JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: id, primary: { used_percent: used, resets_at: 5 } } } }) + '\n');
       utimesSync(path, time, time);
     }
-    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5 });
+    expect(readCodexQuota({ CODEX_HOME: root })).toEqual({ used_percent: 22, resets_at: 5, at: null });
   }));
   it('records successes and failed launches exactly once without altering their result', async () => {
     const rows = []; let time = 100;

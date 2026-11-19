@@ -103,7 +103,9 @@ require operator correction rather than generating an unbounded plan.
 planner actions, rate pressure, reset choices, missing operator inputs and a 14-day forecast.
 `expectedDemandPerDay` is percent-of-window units per account/provider (null means unknown).
 Inactive accounts never route or contribute capacity; sustained shortfall on three working days
-(`activateAfterShortfallDays`) recommends activation. The shared Claude usage file maps only to
+(`activateAfterShortfallDays`) recommends activation. Banked inventory alone does not guarantee
+demand coverage: working-hour deferrals can cause a shortfall before the next reset. Inventory-only
+fixtures must supply continuous working hours. The shared Claude usage file maps only to
 `routing.capacity.claudeUsageAccount`; null leaves both accounts unknown. Route results carry
 `account` for a future account-selecting launcher; current callers may ignore it.
 

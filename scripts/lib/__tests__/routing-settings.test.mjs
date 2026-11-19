@@ -64,7 +64,7 @@ describe('routing settings', () => {
     expect(resolveRoutingSettings({ env: {}, repo: { routing: { builder: 'cluade' } } }).builder).toBe('claude');
   });
   it('auto goes to claude at the threshold; an unknown reading goes to claude', () => {
-    const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } };
+    const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: 70, capacity: { enabled: false } } };
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 90 }) }).builder).toBe('claude');
     expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: 40 }) }).builder).toBe('codex');
     expect(effectiveBuilder({ env: {}, repo, quota: () => null }).builder).toBe('claude');
@@ -72,19 +72,22 @@ describe('routing settings', () => {
   it('a malformed settings file, or unreadable auto quota, resolves to claude', () => {
     const bad = { settings: {}, errors: [{ source: 'settings/routing.json', error: 'Unexpected token' }] };
     expect(resolveRoutingSettings({ env: {}, declared: bad })).toMatchObject({ builder: 'claude', source: 'unreadable-settings' });
-    expect(effectiveBuilder({ env: {}, repo: { routing: { builder: 'auto' } }, quota: () => null }).builder).toBe('claude');
+    expect(effectiveBuilder({ env: {}, repo: { routing: { builder: 'auto', capacity: { enabled: false } } }, quota: () => null }).builder).toBe('claude');
   });
   it('explicit deliveryAgent=codex is refused with a named reason while the reserve is on', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
     const r = resolveDispatchRoute({ kind: 'build', deliveryAgent: 'codex' }, {});
     expect(r.outcome).toBe('refused');
     expect(r.refusal).toMatch(/codexReserveForAudit/);
   });
   it('deliveryAgent is trimmed and lower-cased before the refusal check', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
     for (const agent of [' codex ', 'CODEX', 'Codex\n']) {
       expect(resolveDispatchRoute({ kind: 'build', deliveryAgent: agent }, {}).outcome).toBe('refused');
     }
   });
   it('kind is normalised once: a padded or upper-cased build kind is refused and held exactly like the plain one', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude', codexReserveForAudit: true } } });
     const plain = resolveDispatchRoute({ kind: 'build', ...SCOPED, deliveryAgent: 'codex' }, {});
     expect(plain.outcome).toBe('refused');
     for (const kind of [' build ', 'BUILD', 'build\n', '\tBuild']) {
@@ -99,6 +102,7 @@ describe('routing settings', () => {
     }
   });
   it('the codex hold never strands a ci-heal while native Claude is available; it still refuses when native Claude is held too', () => {
+    settingsDir({ 'routing.json': { routing: { builder: 'claude' } } });
     const dispatch = { kind: 'ci-heal', scopePaths: ['we:scripts/example.mjs'], reason: 'red-ci' };
     const options = { routingPolicy: readRoutingPolicy(), scorecards: [], ciHealAvailability: { 'antigravity-claude': 'quota held' } };
     const r = resolveDispatchRoute(dispatch, options);
@@ -132,7 +136,7 @@ describe('routing settings', () => {
   });
   it('auto routes to claude at, and above, a configured threshold; codex only below it', () => {
     for (const [threshold, used, builder] of [[70, 69, 'codex'], [70, 70, 'claude'], [70, 71, 'claude'], [50, 49, 'codex'], [50, 50, 'claude'], [50, 51, 'claude']]) {
-      const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: threshold } };
+      const repo = { routing: { builder: 'auto', autoClaudeAbovePercent: threshold, capacity: { enabled: false } } };
       expect(effectiveBuilder({ env: {}, repo, quota: () => ({ used_percent: used }) }).builder, `${used}% vs ${threshold}`).toBe(builder);
     }
   });
@@ -159,7 +163,8 @@ describe('routing settings', () => {
     for (const kind of [...HELD_KINDS, ...NON_BUILD_KINDS]) expect(availabilityFor({ kind, ...SCOPED })?.codex, kind).toBeUndefined();
   });
   it('auto builder at dispatch holds codex over the quota threshold or on an unreadable reading, not below it', () => {
-    settingsDir({ 'routing.json': { routing: { builder: 'auto', autoClaudeAbovePercent: 70 } } });
+    // This suite tests the legacy threshold policy; capacity scoring has its own provider-capacity fixtures.
+    settingsDir({ 'routing.json': { routing: { builder: 'auto', autoClaudeAbovePercent: 70, capacity: { enabled: false } } } });
     for (const [quota, held] of [[{ used_percent: 90 }, true], [{ used_percent: 70 }, true], [null, true], [{ used_percent: 40 }, false]]) {
       state.quota = quota;
       const codex = availabilityFor({ kind: 'build', ...SCOPED })?.codex;
