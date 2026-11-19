@@ -9,6 +9,9 @@ import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, digestArgv, digestLock, isTestFile, validateTestNames, pathParts, bytePath, splitPaths, manifestWire, digestManifest, readManifestFile, SIBLING_PATHS, siblingShas, sameSiblingShas } from './forge-exec-run.mjs';
 
+import {trackedTree, validateTrackedFile, validateCoverage, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_COVERAGE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
+export {FORGE_MANIFEST_SIZE_EXCEPTIONS, FORGE_MANIFEST_BINARY_EXTENSIONS} from './forge-manifest-tracked.mjs';
+
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
@@ -386,7 +389,7 @@ async function verifyTrackedLink(cwd, {linkPath,linkOid:oid,targetPath}, fs) {
 }
 
 const manifestRefusal=(code,path)=>Object.assign(new Error(`${code}: use local fallback`),{
-  code,detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
+  code,manifestPath:Buffer.from(path),detail:(Buffer.isBuffer(path)?path.toString('utf8'):String(path)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g,'?')||'.',
 });
 // Walk independently of Git's inventory. Never follow a directory link.
 async function crossCheckManifest({cwd,fs,entries,identities,indexBlobs,trackedLinks,ignoredPaths,exec,head,rootInfo,scoped}) {
@@ -590,9 +593,42 @@ async function siblingPathReferences(config){
   return [...paths];
 }
 
-export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning} = {}) {
+export async function buildManifest(options = {}) {
+  const {manifestMode = 'legacy', trackedOnly = false, env = process.env} = options;
+  // Sibling snapshots retain their established index-based contract and do not shadow.
+  if (trackedOnly) return buildManifestInventory(options);
+  let head = options.head;
+  const tracked = () => buildManifestInventory({...options, manifestMode:'tracked',
+    onTrackedHead:value=>{head=value;}});
+  if (manifestMode === 'tracked') {
+    try { return await tracked(); }
+    catch (error) { await logManifestVerdict({env,mode:'tracked',error,head}); throw error; }
+  }
+  if (manifestMode !== 'legacy') throw manifestRefusal('mode','.');
+  // Shadow only real IO: injected callers must retain the legacy exec/fs call sequence.
+  const shadow = (options.exec === undefined || options.exec === defaultExec)
+    && (options.fs === undefined || options.fs === filesystem) && options.listFiles === undefined
+    && env.FORGE_MANIFEST_SHADOW !== '0';
+  // Never let an unavailable Git probe, shadow verdict or telemetry write change legacy output/refusals.
+  try { return await buildManifestInventory(options); }
+  finally {
+    if (shadow) {
+      let error;
+      try { await buildManifestInventory({...options,manifestMode:'tracked',reuse:undefined,
+        beginSub:noTiming,onWarning:()=>{},onTrackedHead:value=>{head=value;}}); }
+      catch (failure) { error=failure; }
+      await logManifestVerdict({env,mode:'legacy',error,head});
+    }
+  }
+}
+
+async function buildManifestInventory({cwd = process.cwd(), exec = defaultExec, fs = filesystem, listFiles, trackedOnly = false, head, reuse, env=process.env, beginSub=noTiming, onWarning,
+  manifestMode = 'legacy', sizeExceptions = FORGE_MANIFEST_SIZE_EXCEPTIONS, totalCap = FORGE_MANIFEST_TOTAL_CAP, onTrackedHead} = {}) {
   exec=await bindGit({cwd,env,exec});
   if(head!==undefined&&!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head))throw new Error('Invalid Git HEAD');
+  const trackedMode = manifestMode === 'tracked' && !trackedOnly;
+  const tree = trackedMode ? await trackedTree({cwd,exec,head,refuse:manifestRefusal,onHead:onTrackedHead}) : undefined;
+  if (tree) head=tree.head;
   // Neither Git ignores nor Vitest discovery prove that a file is unused:
   // selected tests can import excluded tests, directly or through helpers.
   // Until dependency inclusion is established, retain local fallback.
@@ -608,7 +644,9 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   }
   const walkDone=beginSub('inventory-walk');
   let files;
-  if (listFiles) {
+  if (tree) {
+    files=[...tree.entries.values()].map(entry=>entry.path);
+  } else if (listFiles) {
     const names = await listFiles(cwd);
     if (!Array.isArray(names) || names.some(name => !Buffer.isBuffer(name) && typeof name !== 'string')) throw new Error('Invalid inventory');
     files = names.map(name => Buffer.from(name));
@@ -639,6 +677,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     if (record.subarray(0,6).equals(Buffer.from('120000'))) indexLinks.set(key,indexBlobs.get(key));
     start = i + 1;
   }
+  if (tree) for (const key of indexBlobs.keys())
+    if (!tree.entries.has(key)) throw manifestRefusal('untracked',Buffer.from(key,'base64'));
   // The runner restores HEAD symlinks into its index and cannot prove from the
   // manifest that the client still has them: a link deleted, retargeted or turned
   // into a file here (staged or not) can leave an identical-looking projection.
@@ -654,6 +694,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if(!meta)throw manifestRefusal('head-symlink-changed','HEAD links unreadable');
       if(meta[1]==='120000')throw manifestRefusal('head-symlink-changed',fields[i+1]);
     }
+  }
+  if (tree) for (const [key,oid] of indexLinks) {
+    const entry=tree.entries.get(key);
+    if(entry?.mode!=='120000' || entry.oid!==oid)throw manifestRefusal('dirty',Buffer.from(key,'base64'));
   }
   const trackedLinks=new Map();
   for(const key of indexLinks.keys()) {
@@ -732,6 +776,8 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
   })();
   // Each leaf runs the same per-leaf checks; leaves run concurrently and their
   // results are reassembled in inventory order (see orderedPool).
+  let admittedBytes=0;
+  const admittedSizes=new Map();
   const leaves = await orderedPool(files, MANIFEST_CONCURRENCY, async path => {
     if (trackedLinks.has(path.toString('hex'))) return;
     const {parts,names,excluded:excludedByPolicy,credentialSource}=classifyManifestPath(path);
@@ -755,7 +801,7 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
       if (excludedTest) throw new Error('Excluded test: use local fallback');
       return {excluded:path};
     }
-    if(!listFiles && !trackedOnly && indexBlobs.has(path.toString('base64'))) {
+    if(!trackedMode && !listFiles && !trackedOnly && indexBlobs.has(path.toString('base64'))) {
       const missing=await fs.lstat(bytePath(cwd,path)).then(()=>false,error=>{if(error.code==='ENOENT')return true;throw error;});
       if(missing) {
         let deleted;
@@ -767,18 +813,33 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     let absolute = Buffer.from(cwd), st;
     for (const [i,part] of parts.entries()) {
       absolute = bytePath(absolute,part);
-      st = await inventoryStat(fs,absolute);
+      try { st = await inventoryStat(fs,absolute); }
+      catch(error) { if(tree)throw manifestRefusal('dirty',path); throw error; }
       if (st.isSymbolicLink()) throw manifestRefusal('unshipped-symlink',absolute.subarray(Buffer.byteLength(cwd)+1));
-      if (i === parts.length-1 ? !st.isFile() : !st.isDirectory()) throw new Error('Unsafe inventory component');
+      if (i === parts.length-1 ? !st.isFile() : !st.isDirectory()) throw tree ? manifestRefusal('dirty',path) : new Error('Unsafe inventory component');
     }
     identities.set(path.toString('hex'),st);
-    const previous=!trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
+    const previous=!trackedMode && !trackedOnly && !credentialSource && reuse?.get(path.toString('hex'));
     const executable=!!(st.mode & 0o111), tracked=indexBlobs.has(path.toString('base64'));
     const stable=previous?.stat && ['dev','ino','size','mode','mtimeNs','ctimeNs','mtimeMs','ctimeMs'].every(key=>st[key]===previous.stat[key]);
     if(previous && stable && st.size===previous.size && executable===previous.executable)
       return {entry:{path,sha256:previous.sha256,executable,tracked}};
     const hashDone=beginSub('hashing');
+    const coverageInput=path.equals(Buffer.from('coverage/coverage-final.json'));
+    if (tree) {
+      const cap=coverageInput ? FORGE_MANIFEST_COVERAGE_CAP : FORGE_MANIFEST_FILE_CAP;
+      const blob=tree.entries.get(path.toString('base64'));
+      if (st.size>cap && (coverageInput || !sizeExceptions.some(exception=>Buffer.from(exception.path).equals(path)&&exception.oid===blob?.oid)))
+        throw manifestRefusal('oversize',path);
+    }
     const content = await readManifestFile(absolute,st,fs);
+    if (tree) {
+      if (coverageInput) validateCoverage({content,cwd,tree,refuse:manifestRefusal,path});
+      if (!coverageInput || tree.entries.has(path.toString('base64'))) validateTrackedFile({path,content,st,tree,refuse:manifestRefusal,sizeExceptions});
+      admittedBytes+=content.length;
+      admittedSizes.set(path.toString('hex'),content.length);
+      if (admittedBytes>totalCap) throw manifestRefusal('total-oversize',path);
+    }
     if (publicOid || trackedOnly) {
       publicOid ??= indexBlobs.get(path.toString('base64'));
       if (!publicOid) throw new Error('Sibling index unavailable');
@@ -835,6 +896,10 @@ export async function buildManifest({cwd = process.cwd(), exec = defaultExec, fs
     return leaves;
   }
   for(const link of trackedLinks.values())entries.push(...project(link));
+  if (tree) {
+    const total=entries.reduce((sum,entry)=>sum+(admittedSizes.get((entry.sourcePath??entry.path).toString('hex'))??0),0);
+    if(total>totalCap)throw manifestRefusal('total-oversize','.');
+  }
   if(trackedLinks.size) {
     entries.sort((a,b)=>Buffer.compare(a.path,b.path));
     validateTestNames(entries.map(entry=>entry.path));
@@ -1345,7 +1410,7 @@ export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit,unproven=select
   try{return route({argv,cwd}).local===true||unproven({argv,cwd})===true;}catch{return true;}
 }
 
-async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, manifestMode = 'legacy', onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   let warningCount=0;
   // The credential-warn log is what a later re-tightening reads: never drop a warning silently. With no callback,
   // or when the callback throws, append it to remote-fallbacks.jsonl; a failed write is logged, never fatal.
@@ -1473,7 +1538,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       // Discovery is read-only. Older separately installed wrappers reject this
       // subcommand; their full-ship path retains its existing admission order.
       try {
-        if(disableDelta)throw new Error('Full ship selected');
+        if(disableDelta || manifestMode === 'tracked')throw new Error('Full ship selected');
         delta=await discoverDelta({cwd,exec,fs,env,host,discovery:unwrap(initial[2]),fetchBaseManifest:sha=>ssh('base-manifest',{sha}),head:logicalHead,beginSub,onWarning:reportWarning});
         // Warm-leaf assembly recreates mtimes; coverage freshness needs full ship.
         if (delta.entries.some(entry => entry.path.equals(Buffer.from('coverage/coverage-final.json')))) throw new Error('Coverage inputs require full ship');
@@ -1481,7 +1546,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
         if(delta.manifestMode==='full-scan'){manifestReason=manifestFailure(delta.manifestReason);delta=undefined;}
       } catch(error) {manifestReason=manifestFailure(error);delta=undefined;}
 
-      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning});
+      manifest ??= await buildManifest({cwd,exec,listFiles,fs,head:logicalHead,env,beginSub,onWarning:reportWarning,manifestMode});
       log(`manifest: ${delta ? `git-delta (${delta.changedCount} changed of ${delta.baseCount})` : `full-scan (${manifestReason})`}\n`);
       manifestDone({...(!delta?{manifestReason}:{}),substages:[...substages.values].map(([stage,ms])=>({stage,ms:Math.round(ms)}))});
       // Scanners may skip nonexistent paths. Require the entire requested scope
@@ -1628,14 +1693,14 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
       if (error.code === 'git-bundle-failed') return fallback(error.code,error.detail);
       if (['coverage-report-not-portable','diff-coverage-base-unavailable'].includes(error.code)) return fallback(error.code);
       if (error.code === 'excluded-source-file') return {mode:'not-started', terminated:true, reason:error.code, detail:safeFallbackDetail(error.code,error.detail)};
-      return fallback(['ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
+      return fallback(['untracked','dirty','oversize','total-oversize','binary-type','mode','coverage-invalid','gitlink-unsupported','ignored-test-file','unshipped-test-file','unshipped-symlink','head-symlink-changed','manifest-worktree-mismatch','manifest-walk-limit','unbound-worktree'].includes(error.code) ? error.code : 'copy-failed',error.detail);
     }
     try {
       const runAt=clock(),runDone=begin('forge-run');
@@ -1662,7 +1727,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }

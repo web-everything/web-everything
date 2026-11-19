@@ -4810,3 +4810,28 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+
+## Forge tracked-at-HEAD manifests (S1)
+
+`remote.manifest` defaults to `legacy`; `tracked` binds shipped regular files to the
+pinned HEAD blob and executable mode. Resolve it through the admission policy cascade
+(platform → tool → `WE_HEAVY_ADMISSION_REMOTE_MANIFEST`); the policy log includes its source.
+Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
+Coverage is structure-validated Istanbul JSON, including absolute paths under the checkout;
+it is transported as input, never generated on Forge. Unknown fields or untracked paths
+refuse remote execution. Sibling snapshots keep their existing index-based behavior.
+
+Every tracked refusal and every legacy shadow verdict appends metadata only to
+`~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.
+Shadow evaluation runs only with the real default executor and filesystem and without
+an injected inventory (`listFiles`); injected callers retain the legacy exec/fs call sequence.
+`FORGE_MANIFEST_SHADOW=0` disables the default-on shadow for costly trees. Logging and
+shadow failures never alter legacy admission. Tests must point the log at their temp root.
+`forge-manifest-tracked.test.mjs` exercises local fallback without remote dispatch,
+HEAD hashes, size bounds, binary extensions, coverage structure and setting provenance.
+For the non-UTF-8 refusal-log case, inject the raw Git inventory record: filesystem
+sandboxes may deny creating such filenames before the manifest code can observe them.
+The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a
+temporary Git repository. Run these scoped tests through heavy admission; the soak
+file needs `--config vitest.soak.config.ts`.

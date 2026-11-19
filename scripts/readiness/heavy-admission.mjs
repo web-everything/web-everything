@@ -247,7 +247,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
-  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync',
+  remote: Object.freeze({ enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync', manifest: 'legacy',
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
@@ -284,6 +284,7 @@ const ADMISSION_VALID = {
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.clientPath': (v) => v === null || typeof v === 'string',
+  'remote.manifest': (v) => v === 'tracked' || v === 'legacy',
   'remote.transport': (v) => v === 'rsync' || v === 'git-bundle',
   'remote.bundle.mainMaxAgeMin': (v) => Number.isFinite(v) && v > 0 && v <= 1440,
   'remote.enabled': (v) => typeof v === 'boolean',
@@ -308,15 +309,16 @@ const ADMISSION_ENV = {
   cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
   runWaitMs: 'WE_HEAVY_ADMISSION_RUN_WAIT_MS',
   wholeSuite: 'WE_HEAVY_ADMISSION_WHOLE_SUITE',
+  'remote.manifest': 'WE_HEAVY_ADMISSION_REMOTE_MANIFEST',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
 /** Leaves that shape this caller's execution policy, never shared capacity or queue ordering. */
-const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite']);
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite', 'remote.manifest']);
 /** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
 function parseAdmissionEnv(leaf, raw) {
   const s = String(raw).trim();
   if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
-  if (leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
+  if (leaf === 'remote.manifest' || leaf === 'onTimeout' || leaf === 'priority.mode' || leaf === 'wholeSuite') return s.toLowerCase();
   return s === '' ? NaN : Number(s);
 }
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -1454,7 +1456,7 @@ export async function runWithRemoteDecision({
     });
     const dispatch = () => {
       executionRun = null;
-      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
+      return Promise.resolve(remoteExec({ argv, cwd, env, host, signal: controller.signal, cancelSignal: cancelController.signal, transport: policy.settings.remote.transport, manifestMode: policy.settings.remote.manifest, bundleMainMaxAgeMs: policy.settings.remote.bundle.mainMaxAgeMin * 60_000,
       onWarning: (reason, detail) => recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock}),
       onCapabilities: capabilities => writeRunnerCapabilities({ root: remoteRoot, host, capabilities, clock }), onRun: (run, metadata) => {
         if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
