@@ -1701,7 +1701,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if (tasks.tasksNear) process.stderr.write('forge-exec-run: '+tasks.tasksNote+'\n');
       // Receipts have a closed client schema; diagnostics live only in telemetry.
       const failure=result.code!==0 && (phase==='install'||phase==='supervisor') ? {failureTail:failureTail(result.stderr)} : {};
-      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.code,prewarmed,...failure});
+      await publishTelemetry({runId:request.run,startedAtET,stageMs:{install:installMs,run:runMs},code:result.uidUnconfirmed===true?null:result.code,prewarmed,...failure});
       if(telemetryError)throw telemetryError;
       return result;
       },prepared);
@@ -1761,7 +1761,8 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       const record=await state(request,phase),worker=await workerFor(record,request);
       if(worker.active){
         // A run that kept its verdict with an unconfirmed uid sweep left the lock itself: retry the reap below.
-        fencedRun=await lstat(statePath(request.run,'uid-unconfirmed')).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+        // Claim it atomically: only one finish may retry the reap; a concurrent or later caller keeps the refusal.
+        fencedRun=await rename(statePath(request.run,'uid-unconfirmed'),statePath(request.run,'uid-unconfirmed.finishing')).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
         await mkdir(join(worker.active,'executing'),{mode:0o700}).catch(error=>{if(error.code==='EEXIST'&&fencedRun)return;if(error.code==='EEXIST')throw new Error('Worker execution unconfirmed; operator must stop the reserved UID');throw error;});
         finishingWorker=worker;
       }
@@ -1793,7 +1794,13 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       if(remaining) throw new Error('Run cleanup incomplete; use local fallback and inspect protected run state');
       await rename(statePath(request.run,phase),statePath(request.run,'consumed'));
       await rm(statePath(request.run,'receipt'),{force:true});
-      await rm(statePath(request.run,'uid-unconfirmed'),{force:true});
+      if(fencedRun){
+        // The run published code:null while its uid sweep was unconfirmed; only now may it read as finished.
+        const published=JSON.parse(await readPinned(statePath(request.run,'telemetry')));
+        if(receipt&&Number.isInteger(receipt.code))await publishTelemetry({...published,code:receipt.code});
+        fencedRun=false;
+        await rm(statePath(request.run,'uid-unconfirmed.finishing'),{force:true});
+      }
       const rejected = await readPinned(statePath(request.run,'rejected')).then(bytes => JSON.parse(bytes),error => {if(error.code !== 'ENOENT') throw error;});
       await rm(statePath(request.run,'rejected'),{force:true});
       await rm(join(bases,'active',request.run),{force:true});
@@ -1804,7 +1811,10 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
       // Legacy callers retain their null finish response for non-sibling failures.
       // Never certify rejection once the protected run phase has started.
       return receipt ?? (phase === 'prepared' && (rejected?.siblings||rejected?.delta||['forge-busy','forge-draining','git-head-unavailable','diff-coverage-base-unavailable'].includes(rejected?.reason)) ? {...rejected,started:false} : null) ?? (request.cancel===true ? {v:1,nonce:request.nonce,run:request.run,cancelAck:true} : null);
-      }finally{if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));}
+      }finally{
+        if(fencedRun)await rename(statePath(request.run,'uid-unconfirmed.finishing'),statePath(request.run,'uid-unconfirmed')).catch(()=>{});
+        if(finishingWorker&&settled)await rmdir(join(finishingWorker.active,'executing'));
+      }
       });
     },
   };

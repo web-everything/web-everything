@@ -1995,8 +1995,13 @@ exec(sys.argv[1], {'os':ns,'time':time,'signal':types.SimpleNamespace(SIGKILL=9)
     const second=await runner.prepare({nonce:'c'.repeat(32),label:'abcdef-2'});
     await expect(runner.run({...request,nonce:'c'.repeat(32),run:second.run})).rejects.toThrow(/busy|interrupted|unconfirmed/);
   });
-  it('wires a 120 s cleanup wait and rejects a stuck supervisor without .unsafe',()=>{
-    expect(supervisorSource).toContain('cleanupWaitMs');
-    expect(supervisorSource.indexOf('verdict_path =')).toBeLessThan(supervisorSource.indexOf('uid cleanup unconfirmed'));
+  it('honours the configured wait: a stuck uid fails only after it elapses, and a bad value falls back to the default',()=>{
+    const started=Date.now();
+    const {result}=run('stuck',1500);
+    expect(result.status).not.toBe(0);
+    expect(Date.now()-started).toBeGreaterThanOrEqual(1400);
+    // A non-integer wait must not shorten the deadline: the probe is still waiting at its 3 s limit.
+    const bad=spawnSync('python3',['-I','-c',probe,block(),JSON.stringify({mode:'stuck',status:join(root,'bad-status'),cleanupWaitMs:'1'})],{encoding:'utf8',timeout:3000});
+    expect(bad.error?.code).toBe('ETIMEDOUT');
   });
 });
