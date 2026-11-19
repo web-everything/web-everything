@@ -88,7 +88,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
-import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseShape, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
+import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -668,7 +668,7 @@ async function acquireAdmission(phase, command) {
   if (!phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: true } }).takeLocalSlot) {
     decision = await decidePhaseRemote({ cwd: REPO, env: process.env, argv: command.split(/\s+/) });
     process.stderr.write(`verify-lane: ${decision.remote ? 'remote' : 'local'} admission (${decision.reason})\n`);
-  } else if (decision.reason !== 'raw-command') {
+  } else {
     process.stderr.write(`verify-lane: local admission (${decision.reason})\n`);
   }
   const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
@@ -676,7 +676,7 @@ async function acquireAdmission(phase, command) {
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
   }) : { kind: classifyCommandKind(GATE) };
-  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseShape(command) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
+  recordLocalSlotFallback({ lockRoot: ADMISSION_LOCK_ROOT, reason: decision.reason, detail: decision.reason === 'raw-command' ? localPhaseBypassDetail(command, { lane: laneMatch?.[1], session: process.env.WE_HEAVY_SESSION }) : null, repo: REPO, kind: routing.kind }); // logging only; never throws
   const acquired = await acquireSlotBlocking({
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
