@@ -2183,6 +2183,7 @@
   "scripts/conveyor/soak/breaks/fixer-brief-chains-rearm-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
+  "scripts/conveyor/soak/breaks/review-label-stale-guard-retryable.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
   "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 8.81,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
