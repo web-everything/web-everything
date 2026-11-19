@@ -42,7 +42,10 @@ export function recordEntries({ approvals, requests, rulings, entries, latestAud
       }
       const audit = latestAudit(sha);
       if (!audit || shaKey(audit.head) !== sha) throw Error('no canonical audit');
-      entry = { ...entry, findings: audit.findings, actor: 'record-waivers', quote: ruling, at: now };
+      // The approval covers exactly the findings quoted in the request for this sha; an audit that says anything
+      // else (a replacement finding) is not covered and grants no waiver.
+      if (!Array.isArray(request.findings) || JSON.stringify(request.findings) !== JSON.stringify(audit.findings)) throw Error('audit findings differ from the approved request');
+      entry = { ...entry, findings: request.findings, actor: 'record-waivers', quote: ruling, at: now };
       if (!validateEntry(entry)) throw Error('incomplete canonical findings');
     } catch { counts['skipped-invalid']++; continue; }
     seen.add(identity(entry));

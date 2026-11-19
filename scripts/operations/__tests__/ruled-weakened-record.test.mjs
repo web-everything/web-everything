@@ -8,7 +8,7 @@ import { readStore } from '../ruled-weakened-store.mjs';
 const sha = 'a'.repeat(40), head = 'b'.repeat(40), ref = 'lane/a';
 const FP = 'c'.repeat(64);
 const now = '2026-11-19T12:00:00.000Z';
-const request = { ref, sha, ruling: 'UNTRUSTED', findings: ['worker prose'] };
+const request = { ref, sha, ruling: 'UNTRUSTED', findings: ['Verbatim. ', 'second finding'] };
 const approval = { ref, sha, ruling: 'R123' };
 const audit = { head: sha, findings: ['Verbatim. ', 'second finding'] };
 const options = overrides => ({ approvals: [approval], requests: [request], rulings: '**R123**', entries: [],
@@ -50,6 +50,13 @@ describe('bounded approved waiver selection', () => {
   it('WITHDRAWN applies to the bare ref regardless of request order or sha case', () => {
     expect(recordEntries(options({ requests: [request,
       { ref: `${ref} (description)`, sha: sha.toUpperCase(), ruling: 'WITHDRAWN' }] })).counts.added).toBe(0);
+  });
+  it('an approval for findings A does not cover a sha whose audit says B', () => {
+    const swapped = { head: sha, findings: ['a different, unapproved finding'] };
+    const result = recordEntries(options({ latestAudit: () => swapped }));
+    expect(result.entries).toEqual([]);
+    expect(result.counts['skipped-invalid']).toBe(1);
+    expect(recordEntries(options({ requests: [{ ...request, findings: undefined }] })).counts.added).toBe(0);
   });
   it('missing approval never trusts the request ruling', () => {
     expect(recordEntries(options({ approvals: [], requests: [{ ...request, ruling: 'R123' }] })).counts.added).toBe(0);
