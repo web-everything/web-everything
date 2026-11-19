@@ -5144,6 +5144,13 @@ warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
 ## Between-tick rebuild launch probes
 
+`daemon-rebuild-force-adopt.test.mjs` distinguishes strict readers from between-tick launch
+ownership: only `launchOnly && asJob && !adoptOnly` with early/recovery provenance leaves
+the force watch untouched. Inline strict evidence refusals still probe health and execute
+owed rollback, including refusals during reader validation before preparation. Assert the
+`state-unreadable` result and unchanged unrelated corrupt bytes alongside the rollback;
+between-tick refusal cases preserve the watch bytes and running head even when rollback is owed.
+
 `daemon-rebuild-early-launch.test.mjs` runs with Node's test runner and also registers with Vitest.
 Its hermetic `withSelfSync` probe drives the injected watcher timer between ticks, with real job-store
 queue tests and no Git/network children. `daemon-rebuild-early-timing.test.mjs` advances separate

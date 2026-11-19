@@ -801,7 +801,7 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     ['unknown launchedBy', { launchedBy: 'unknown', launchOnly: true, asJob: true }],
     ['tick-start', { launchedBy: 'tick-start', launchOnly: true, asJob: true }],
     ['adopt path', { launchedBy: 'early', launchOnly: true, asJob: true, adoptOnly: true }],
-  ])('%s preserves strict watch state or advances the legacy watch after refusal', async (_name, options) => {
+  ])('%s probes and advances the watch after refusal outside a between-tick launch', async (_name, options) => {
     const { cloneDir, env } = await forceAdoptF();
     const watchBefore = readForceWatch(cloneDir, env);
     const probe = vi.fn(healthy);
@@ -809,10 +809,8 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue(refusal);
     vi.spyOn(rebuildPrepare, 'prepareRebuild').mockResolvedValue({ terminal: true, result: refusal, alerts: [] });
     expect(await tick(cloneDir, env, { ...options, runSmoke: passing(), forceWatchProbe: probe })).toMatchObject(refusal);
-    const strict = ['early', 'recovery'].includes(options.launchedBy);
-    expect(probe).toHaveBeenCalledTimes(strict ? 0 : 1);
-    if (strict) expect(readForceWatch(cloneDir, env)).toEqual(watchBefore);
-    else expect(readForceWatch(cloneDir, env)).toMatchObject({ ticksLeft: watchBefore.ticksLeft - 1 });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(readForceWatch(cloneDir, env)).toEqual({ ...watchBefore, ticksLeft: watchBefore.ticksLeft - 1, version: watchBefore.version + 1 });
   });
 
   it.each([
@@ -821,7 +819,7 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     ['inline launchOnly', { launchedBy: 'early', launchOnly: true, asJob: false }],
     ['missing launchOnly', { launchedBy: 'recovery', asJob: true }],
     ['adopt-only', { launchedBy: 'early', launchOnly: true, asJob: true, adoptOnly: true }],
-  ])('%s preserves the watch when strict evidence refuses (real preparation)', async (_name, options) => {
+  ])('%s probes and advances the watch when strict evidence refuses (real preparation)', async (_name, options) => {
     const { cloneDir, env } = await forceAdoptF();
     const watchBefore = readForceWatch(cloneDir, env);
     const file = join(env.WE_DAEMON_STATE_DIR, 'overlay-conflict-wake.json');
@@ -829,34 +827,48 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     const probe = vi.fn(healthy);
     expect(await tick(cloneDir, env, { ...options, forceWatchProbe: probe }))
       .toEqual({ moved: false, reason: 'state-unreadable' });
-    expect(probe).not.toHaveBeenCalled();
-    expect(readForceWatch(cloneDir, env)).toEqual(watchBefore);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(readForceWatch(cloneDir, env)).toEqual({ ...watchBefore, ticksLeft: watchBefore.ticksLeft - 1, version: watchBefore.version + 1 });
+    expect(headOf(cloneDir)).toBe(watchBefore.sha);
     expect(readFileSync(file, 'utf8')).toBe('{corrupt');
   });
 
-  it.each(['early', 'recovery'])('inline strict %s defers owed rollback to tick-start when evidence refuses', async (launchedBy) => {
+  it.each(['early', 'recovery'])('inline strict %s executes owed rollback when unrelated evidence refuses', async (launchedBy) => {
     const { cloneDir, env } = await forceAdoptF();
     const watch = readForceWatch(cloneDir, env);
     writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`),
       JSON.stringify({ ...watch, rollbackPending: 'health-failed' }));
     const file = join(env.WE_DAEMON_STATE_DIR, 'overlay-conflict-wake.json');
     writeFileSync(file, '{corrupt');
-    expect(await tick(cloneDir, env, { launchedBy, asJob: false, forceWatchProbe: healthy }))
+    const probe = vi.fn(healthy);
+    expect(watch.lastGood.head).not.toBe(watch.sha);
+    expect(await tick(cloneDir, env, { launchedBy, asJob: false, forceWatchProbe: probe }))
       .toEqual({ moved: false, reason: 'state-unreadable' });
-    expect(headOf(cloneDir)).toBe(watch.sha);
-    expect(readForceWatch(cloneDir, env)).toEqual({ ...watch, rollbackPending: 'health-failed' });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(headOf(cloneDir)).toBe(watch.lastGood.head);
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+    expect(readFileSync(env.WE_DAEMON_EVENTS, 'utf8')).toMatch(/force-adopt-rolled-back/);
     expect(readFileSync(file, 'utf8')).toBe('{corrupt');
   });
 
-  it.each(['early', 'recovery'])('between-tick %s launch refuses corrupt evidence without touching the watch (real preparation)', async (launchedBy) => {
+  it.each([
+    ['early', false], ['recovery', false],
+    ['early', true], ['recovery', true],
+  ])('between-tick %s launch refuses corrupt evidence without touching the watch (owed rollback: %s)', async (launchedBy, owedRollback) => {
     const { cloneDir, env, F } = await forceAdoptF();
-    const watchBefore = readForceWatch(cloneDir, env);
-    writeFileSync(join(env.WE_DAEMON_STATE_DIR, 'overlay-conflict-wake.json'), '{corrupt');
+    const watchBefore = { ...readForceWatch(cloneDir, env), ...(owedRollback ? { rollbackPending: 'health-failed' } : {}) };
+    const watchFile = join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`);
+    writeFileSync(watchFile, JSON.stringify(watchBefore));
+    const watchBytes = readFileSync(watchFile);
+    const file = join(env.WE_DAEMON_STATE_DIR, 'overlay-conflict-wake.json');
+    writeFileSync(file, '{corrupt');
     const probe = vi.fn(healthy);
     expect(await tick(cloneDir, env, { launchedBy, launchOnly: true, asJob: true, forceWatchProbe: probe }))
       .toEqual({ moved: false, reason: 'state-unreadable' });
     expect(probe).not.toHaveBeenCalled();
     expect(readForceWatch(cloneDir, env)).toEqual(watchBefore);
+    expect(readFileSync(watchFile)).toEqual(watchBytes);
+    expect(readFileSync(file, 'utf8')).toBe('{corrupt');
     expect(headOf(cloneDir)).toBe(F);
   });
 

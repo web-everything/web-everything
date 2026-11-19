@@ -93,7 +93,7 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
 }
 
 function isBetweenTickLaunch(options) {
-  return options.launchOnly === true && options.asJob === true
+  return !options.adoptOnly && options.launchOnly === true && options.asJob === true
     && (options.launchedBy === 'early' || options.launchedBy === 'recovery');
 }
 
@@ -114,15 +114,17 @@ function isBetweenTickLaunch(options) {
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const strict = options.launchedBy === 'early' || options.launchedBy === 'recovery';
   if (!strict) return rebuildCloneWithReaders(emitEvent, options, false);
-  // Tick-start owns force-watch health checks and rollback; strict preparation is read-only.
+  // Between-tick launches leave force-watch checks and rollback to the next tick.
   const readers = createRebuildReaders({ strict, read: options.evidenceRead });
   return withRebuildReaders(readers, async () => {
+    const startedAtMs = Date.now();
     try {
       if (readers) readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
       return await rebuildCloneWithReaders(emitEvent, options, strict);
     } catch (error) {
       if (!(error instanceof RebuildEvidenceError)) throw error;
       (options.log ?? console).error?.(error.message);
+      if (!isBetweenTickLaunch(options)) await forceWatch(options, emitEvent, startedAtMs);
       return { moved: false, reason: 'state-unreadable' };
     }
   });
@@ -144,7 +146,7 @@ async function rebuildCloneWithReaders(emitEvent, options, strict) {
   if (result.reason === 'state-unreadable') {
     (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
   }
-  if (strict || (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted)) return result;
+  if ((strict && isBetweenTickLaunch(options)) || (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted)) return result;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -167,13 +169,19 @@ async function rebuildCloneWithReaders(emitEvent, options, strict) {
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
-  if (!strict) await forceWatch(options, emitEvent, startedAtMs);
+  if (!(strict && isBetweenTickLaunch(options))) await forceWatch(options, emitEvent, startedAtMs);
   return result;
 }
 
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
  *  clone to the last-good build on a failed check or a crash loop. Never throws; readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
+  // Watch rollback follows tick-start policy: unrelated strict admission evidence must
+  // not prevent ready cleanup or persistence of an already-owed rollback.
+  return withRebuildReaders(undefined, () => forceWatchAtTick(options, emitEvent, startedAtMs));
+}
+
+async function forceWatchAtTick(options, emitEvent, startedAtMs) {
   const { root, env = process.env, log = console, run = gitRun, stateOpts = {}, now = () => Date.now(), readyOnly = false, adoptOnly = false } = options;
   const betweenTicks = !adoptOnly && isBetweenTickLaunch(options);
   if (!root || readyOnly || betweenTicks) return;
