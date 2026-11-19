@@ -92,6 +92,18 @@ vi.mock('../branch-sync.mjs', async (importOriginal) => ({
 // this file.
 const noopRouting = () => ({ postFinding: () => {}, postStandDown: () => {} });
 
+// Legacy bounce fixtures predate the mandatory head/live-read evidence. Keep those
+// scenario assertions intact while explicitly providing the newly required IO.
+function watchConfirmedHistoricalConflict(options) {
+  const head = 'a'.repeat(40);
+  return watchParkedPrConflicts({
+    readPrLive: () => ({ headRefOid: head, mergeable: 'CONFLICTING' }),
+    drainRebaseEvidence: () => null,
+    ...options,
+    listPrs: args => options.listPrs(args).map(pr => ({ ...pr, headRefOid: head })),
+  });
+}
+
 describe('the real incident that motivated this pass — WE PR #1920, captured live 2026-09-04T23:26Z', () => {
   // The EXACT `gh pr view 1920 --json ...` payload shape observed while diagnosing this gap (before the
   // operator/another session rebased it away mid-investigation) — a real fixture, not a synthetic guess.
@@ -369,7 +381,7 @@ describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)',
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files']);
+      '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files']);
   });
 
   it('appends --repo when given', () => {
@@ -377,7 +389,7 @@ describe('defaultListParkedPrs — argv shape (exec injected, no real gh call)',
     const exec = (cmd, argv) => { capturedArgv = argv; return '[]'; };
     defaultListParkedPrs({ exec, repo: 'o/n' });
     expect(capturedArgv).toEqual(['pr', 'list', '--state', 'open', '--limit', '200',
-      '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
+      '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', '--repo', 'o/n']);
   });
 });
 
@@ -2112,7 +2124,7 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'parked-pr-conflict-watch', load: () => import('../parked-pr-conflict-watch.mjs'),
   reader: 'defaultListParkedPrs', run: 'watchParkedPrConflicts',
-  fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files',
+  fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files',
 });
 
 
@@ -2262,6 +2274,86 @@ describe('bounce head-bound', () => {
     expect(Boolean(entry?.error) || entry?.routedTo?.includes('bounce-reverted-head-moved')).toBe(true);
   });
 
+  it.each([
+    ['same-head MERGEABLE', { headRefOid: CONFLICT_HEAD_7183, mergeable: 'MERGEABLE' }],
+    ['same-head UNKNOWN', { headRefOid: CONFLICT_HEAD_7183, mergeable: 'UNKNOWN' }],
+    ['same-head missing mergeability', { headRefOid: CONFLICT_HEAD_7183 }],
+    ['unreadable null result', null],
+    ['unreadable thrown result', 'throws'],
+  ])('rolls back the bounce for a post-write %s and leaves the conflict retryable', (_, after) => {
+    const fixture = acceptedConflict7183({
+      readPrLive: vi.fn()
+        .mockReturnValueOnce({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' })
+        .mockImplementationOnce(() => {
+          if (after === 'throws') throw new Error('post-write PR read unavailable');
+          return after;
+        })
+        .mockReturnValue({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' }),
+    });
+    const [entry] = fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(1);
+    expect(fixture.options.revertBounce).toHaveBeenCalledTimes(1);
+    expect(fixture.options.revertBounce).toHaveBeenCalledWith({
+      pr: fixture.pr, repo: fixture.options.repo, headRefOid: CONFLICT_HEAD_7183,
+    });
+    expect(entry.routedTo).toContain('bounce-reverted-');
+    expect(fixture.options.log).toHaveBeenCalled();
+    expect(fixture.options.provider.postComment).not.toHaveBeenCalled();
+    expect(fixture.options.provider.setLabels).not.toHaveBeenCalled();
+    fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(2);
+    expect(fixture.options.revertBounce).toHaveBeenCalledTimes(1);
+    expect(fixture.options.readPrLive).toHaveBeenCalledTimes(4);
+  });
+
+  it('invalidates the persisted finding after post-write UNKNOWN and dispatches the next conflicting sweep', () => {
+    const thread = [];
+    const fixture = acceptedConflict7183({
+      listPrComments: () => thread,
+      readPrLive: vi.fn()
+        .mockReturnValueOnce({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' })
+        .mockReturnValueOnce({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'UNKNOWN' })
+        .mockReturnValue({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' }),
+      postFinding: vi.fn(options => defaultPostConflictFinding({ ...options, exec: (_file, argv) => {
+        const bodyFile = argv.find(arg => arg.startsWith('--body-file=')).slice('--body-file='.length);
+        thread.push({ id: `IC_bounce${thread.length}`, body: readFileSync(bodyFile, 'utf8'),
+          createdAt: new Date(CONFLICT_NOW_7183).toISOString(), author: { login: 'web-everything' } });
+      } })),
+    });
+    fixture.options.provider.editComment = vi.fn((_repo, id, body) => {
+      thread.find(comment => comment.id === id).body = body;
+    });
+    fixture.options.revertBounce.mockImplementation(() => {
+      // The durable finding must stop deduplicating before approval labels are restored.
+      expect(hasRecentConflictFindingComment(thread, { now: CONFLICT_NOW_7183 })).toBe(false);
+    });
+    const [entry] = fixture.run();
+    expect(entry.routedTo).toBe('bounce-reverted-conflict-unconfirmed');
+    expect(fixture.options.provider.editComment).toHaveBeenCalledTimes(1);
+    expect(fixture.options.revertBounce).toHaveBeenCalledTimes(1);
+    expect(thread).toHaveLength(1);
+    expect(thread[0].body).toContain('bounce reverted');
+    fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(2);
+    expect(thread).toHaveLength(2);
+    expect(hasRecentConflictFindingComment(thread, { now: CONFLICT_NOW_7183 })).toBe(true);
+    fixture.run();
+    expect(fixture.options.postFinding).toHaveBeenCalledTimes(2); // the successful retry still deduplicates
+  });
+
+  it('retains the bounce with an error when its durable finding cannot be invalidated', () => {
+    const fixture = acceptedConflict7183({
+      postFinding: vi.fn(() => ({ findingToken: '12345678-1234-1234-1234-123456789abc' })),
+      listPrComments: () => [],
+      readPrLive: vi.fn()
+        .mockReturnValueOnce({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'CONFLICTING' })
+        .mockReturnValueOnce({ headRefOid: CONFLICT_HEAD_7183, mergeable: 'UNKNOWN' }),
+    });
+    const [entry] = fixture.run();
+    expect(entry.error).toContain('bounce retained');
+    expect(fixture.options.revertBounce).not.toHaveBeenCalled();
+  });
+
   it('writes no dedupe marker on revert and leaves a later confirmed conflict eligible to bounce', () => {
     const fixture = acceptedConflict7183({
       readPrLive: vi.fn()
@@ -2330,7 +2422,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('already flagged, grace elapsed → bounced to a fix agent (the bounce itself strips the approval)', () => {
     const provider = fakeProvider(); const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
     });
@@ -2356,7 +2448,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       repo: 'o/n', listPrs, provider, postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
     };
-    const [first] = watchParkedPrConflicts({ ...opts, sameLineConflict: 'stand-down' });
+    const [first] = watchConfirmedHistoricalConflict({ ...opts, sameLineConflict: 'stand-down' });
     expect(first.routedTo).toBe('reconcile-finding (after drain grace)');
     expect(routed).toEqual([2514]);
 
@@ -2366,7 +2458,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     const postedComments = [{
       body: buildConflictFindingBody({ num: 2514 }), createdAt: new Date().toISOString(), author: { login: 'web-everything' },
     }];
-    const [second] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [second] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       ...opts, listPrComments: () => postedComments, labelRemovedAtMs: () => 0,
     });
     expect(second.routedTo).toBe('reconcile-finding (after drain grace)'); // routing unchanged
@@ -2451,7 +2543,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('a base of `main` (the ordinary case) is UNCHANGED — still bounces once grace elapses', () => {
     const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', CONFLICT_LABEL) }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
     });
@@ -2462,7 +2554,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
   it('a missing `baseRefName` (unknown) is UNCHANGED — still bounces, the safe pre-#3383 default', () => {
     const routed = [];
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(), postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => QUEUED_CONFLICT_GRACE_MS + 1000, listPrFiles: () => [{ path: 'scripts/x.mjs' }],
     });
@@ -2511,7 +2603,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
       author: { login: 'web-everything' },
     };
     const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', labels: L('review:accepted', CONFLICT_LABEL) }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider: fakeProvider(),
       postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
       labelAgeMs: () => null, // the events API is unreadable on EVERY sweep — not a one-off blip
@@ -2708,7 +2800,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     it('a REAL conflict (computeConflictDisposition → "real") is bounced IMMEDIATELY, even with age 0 / just labelled', () => {
       const provider = fakeProvider(); const routed = [];
       const listPrs = () => [{ number: 2596, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL) }];
-      const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider,
         postFinding: (o) => routed.push(o.pr.number), postStandDown: () => routed.push('sd'),
         computeConflictDisposition: () => 'real',
@@ -2736,7 +2828,7 @@ describe('approved PRs that drift into a conflict (x832e2v)', () => {
     it('a manifest-only conflict still bounces once the grace genuinely elapses (unchanged pre-#xngv3vn behaviour)', () => {
       const routed = [];
       const listPrs = () => [{ number: 2514, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', CONFLICT_LABEL) }];
-      const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+      const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
         repo: 'o/n', listPrs, provider: fakeProvider(),
         postFinding: (o) => routed.push(o.pr.number), postStandDown: () => {},
         computeConflictDisposition: () => 'manifest-only',
@@ -3482,7 +3574,7 @@ describe('watchParkedPrConflicts — the append-only statute exception (#3383)',
       // still queued/approved, still conflicting.
       number: 2505, mergeable: 'CONFLICTING', labels: [{ name: 'review:accepted' }, { name: CONFLICT_LABEL }],
     }];
-    const results = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const results = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number, o.appendOnlyStatute]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3544,7 +3636,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: (o) => routed.push(['stand-down', o.pr.number]),
@@ -3600,7 +3692,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: () => routed.push(['stand-down']),
@@ -3622,7 +3714,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     const listPrs = () => [{
       number: 2773, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
-    const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const [r] = watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n', listPrs, provider,
       postFinding: (o) => routed.push(['finding', o.pr.number]),
       postStandDown: () => routed.push(['stand-down']),
@@ -3717,7 +3809,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     let labels = L('review:accepted', 'ready-to-merge', CONFLICT_LABEL);
     const routed = [];
     let failSupersede = true;
-    const sweep = () => watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const sweep = () => watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n',
       listPrs: () => [{ number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels }],
       provider: fakeProvider(),
@@ -3755,7 +3847,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
     let supersedes = 0;
     const routed = [];
     let failFinding = true;
-    const sweep = () => watchParkedPrConflicts({ sameLineConflict: 'stand-down',
+    const sweep = () => watchConfirmedHistoricalConflict({ sameLineConflict: 'stand-down',
       repo: 'o/n',
       listPrs: () => [{ number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL) }],
       provider: fakeProvider(),

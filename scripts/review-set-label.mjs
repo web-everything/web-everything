@@ -1199,6 +1199,8 @@ export function runReviewLabelCli({
   // #xan09na — opt-in head-bound carry. Legacy drain callers remain a separate migration.
   const expectHeadFlag = argv.find((a) => a === '--expect-head' || a.startsWith('--expect-head='));
   const expectedHead = expectHeadFlag?.slice('--expect-head='.length).toLowerCase();
+  const pinnedChanges = to === 'changes' && expectHeadFlag !== undefined;
+  if (pinnedChanges && !/^[a-f0-9]{40}$/.test(expectedHead || '')) fail('changes requires a full --expect-head');
   // Held item 177 — opt-in PINNED ACCEPT (`--to=accepted --expect-head=<sha> --expect-fingerprint=<sha256>`): the caller
   // compared one commit's net diff to an accepted fingerprint and asks that exact pair, and nothing else, be accepted.
   // The writer re-reads the PR itself, so without the pin a push between the caller's comparison and this read would get
@@ -1414,7 +1416,7 @@ export function runReviewLabelCli({
   if (to === 'rearm' && !prCommentsReadable) refuseRearm('comments unreadable — cannot prove no human clearance');
   if (to === 'rearm' && !/^[0-9a-f]{7,40}$/i.test(headSha.trim())) refuseRearm('head unreadable — cannot prove no human clearance');
 
-  if ((guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((pinnedChanges || guardedRestamp || pinnedAccept || pinnedRearm || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
   if (expectNoReadiness && hasReviewLabel(currentLabels, READY_TO_MERGE_LABEL)) {
     fail('missing review handoff refused: producer readiness appeared after the caller observation', 1);
   }
@@ -1989,7 +1991,7 @@ export function runReviewLabelCli({
   }
   // A pinned accept (held item 177) re-reads the head BEFORE the first durable write too — the shadow ledger row below
   // is a write — so a push after the first read leaves no ledger row and no comment, not only no label.
-  if (pinnedAccept) {
+  if (pinnedAccept || pinnedChanges) {
     let live = null;
     try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
     if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);

@@ -168,7 +168,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
       'number,labels,headRefOid,comments', // advisory / hold sweep
       'number,headRefName,headRefOid,statusCheckRollup', // ci-red-recovery
       'number,headRefName,headRefOid,statusCheckRollup,labels,baseRefName', // missing-run
-      'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', // conflict watch
+      'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', // conflict watch
       'number,headRefName,headRefOid,labels,mergeable,isDraft,comments', // stuck-pr-watch
       'number,title,body,labels,statusCheckRollup,headRefName,headRefOid', // the drain's context listing
       'number,title,headRefName,labels,statusCheckRollup,updatedAt', // health-watch

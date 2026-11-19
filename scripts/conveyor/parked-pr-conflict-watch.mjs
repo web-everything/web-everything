@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { buildConflictFindingBody, defaultPostConflictFinding } from '../lib/conflict-finding.mjs';
+import { buildConflictFindingBody, defaultPostConflictFinding, invalidateConflictFinding } from '../lib/conflict-finding.mjs';
 export { buildConflictFindingBody, defaultPostConflictFinding };
 /**
  * @file scripts/conveyor/parked-pr-conflict-watch.mjs
@@ -171,6 +171,9 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
 import { readInCardGroup, readCardGroupStateUnreadable } from '../lib/card-group.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
+import { readDeliveryIdentity, roleOfBotLogin } from '../lib/github-app-identity.mjs';
 import { loadSameLineConflictSetting } from './conflict-watch-same-line.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
 import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
@@ -1289,6 +1292,48 @@ function classifyStatuteConflict(files, {
   return { isStatuteTier, appendOnlyStatute, reviewHumanFixable };
 }
 
+/** Resolve the declared drain grace through the shared standard/platform/tool/env cascade. */
+export function loadDrainGraceSetting({ env = process.env, read = readSettings, platform, log = line => console.error(`${new Date().toISOString()} ${line}`) } = {}) {
+  return cascadePolicy('conflictWatch', read()?.conflictWatch, {
+    standard: { drainGraceMinutes: 15 }, platform, env, log,
+    envValues: { drainGraceMinutes: env.WE_CONFLICT_WATCH_DRAIN_GRACE_MINUTES === undefined
+      ? undefined : Number(env.WE_CONFLICT_WATCH_DRAIN_GRACE_MINUTES) },
+    valid: { drainGraceMinutes: value => Number.isFinite(value) && value >= 0 },
+  }).value;
+}
+
+const liveReadOptions = repo => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+  env: { ...process.env, GH_REPO: repo, WE_GH_THROTTLE_PERSONAL_ROUTE: '0' },
+  throttle: { personalRoute: false } });
+
+export function defaultReadPrLive({ pr, repo, exec = execFileSyncThrottled }) {
+  return JSON.parse(String(exec('gh', ['pr', 'view', String(pr.number), '--repo', repo,
+    '--json', 'headRefOid,mergeable'], liveReadOptions(repo))));
+}
+
+/** One commit at the live head, not commit-message claims or a locally observed clock. */
+export function defaultDrainRebaseEvidence({ pr, repo, exec = execFileSyncThrottled, identity = readDeliveryIdentity() }) {
+  const live = defaultReadPrLive({ pr, repo, exec });
+  if (!/^[a-f0-9]{40}$/i.test(live?.headRefOid ?? '')) return null;
+  const commit = JSON.parse(String(exec('gh', ['api', `repos/${repo}/commits/${live.headRefOid}`], liveReadOptions(repo))));
+  const isDrain = person => {
+    const role = roleOfBotLogin(person?.login, identity);
+    return role === 'merger' || (role === 'legacy' && !identity?.roles?.merger);
+  };
+  if (!isDrain(commit.author) && !isDrain(commit.committer)) return null;
+  const atMs = Date.parse(commit.commit?.committer?.date ?? '');
+  return Number.isFinite(atMs) ? { by: 'drain', atMs } : null;
+}
+
+export function defaultRevertBounce({ pr, repo, provider = createGhProvider() }) {
+  // Mirror the changes verdict's removals; preserve every unrelated live label.
+  const removed = new Set(['review:pending', 'review:accepted', 'redteam:accepted', 'ready-to-merge', 'advisory:accepted', 'advisory:changes']);
+  const original = (pr.labels ?? []).map(label => typeof label === 'string' ? label : label.name);
+  provider.setLabels(repo, pr.number, { remove: original.includes('review:changes') ? [] : ['review:changes'],
+    add: original.filter(name => removed.has(name)) });
+}
+
 /**
  * The open-PR discovery query. `exec` is injectable so the argv is assertable with no `gh` on PATH. Narrower
  * `--json` than `we:scripts/merge-ai-prs.mjs`'s main listing — this pass never classifies for merge, so it
@@ -1301,12 +1346,12 @@ function classifyStatuteConflict(files, {
 export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
   // `baseRefName` (#3383) — the queued-grace routing below reads it to tell a STACKED PR (base isn't `main`, the
   // drain will never land it regardless of labels) apart from an ordinary conflict against `main`; costs nothing
   // extra since it comes off the same `gh pr list` call this pass already makes.
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files'];
+    '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files'];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', throttle: { deferrable: true } });
@@ -1381,6 +1426,10 @@ export function watchParkedPrConflicts({
   inCardGroupFn = readInCardGroup, // xym8nt4 — open card-group members are the drain grouping's to handle
   cardGroupStateUnreadable = () => readCardGroupStateUnreadable(), // membership unknown → hold (fail closed)
   sameLineConflict = loadSameLineConflictSetting().value,
+  conflictWatchSettings = loadDrainGraceSetting(),
+  readPrLive = defaultReadPrLive, drainRebaseEvidence = defaultDrainRebaseEvidence,
+  revertBounce = options => defaultRevertBounce({ ...options, provider }),
+  log = line => console.error(line),
   postFinding = defaultPostConflictFinding, postStandDown = defaultPostConflictStandDown,
   postRearm = defaultPostConflictRearm,
   postSupersedeComment = defaultPostSupersedeComment,
@@ -1763,6 +1812,45 @@ export function watchParkedPrConflicts({
           priorWatcherStandDown = Boolean(findWatcherStandDownComment(threadComments)) && !isWatcherMarkerAlreadySuperseded(threadComments);
         } catch { priorWatcherStandDown = false; }
 
+        // Keep this check next to the write, after all slower classification reads.
+        const bounce = (extra, beforeWrite = () => {}) => {
+          let evidence = null;
+          try { evidence = drainRebaseEvidence({ pr, repo: resolvedRepo }); } catch { /* no recent proof */ }
+          const grace = conflictWatchSettings?.drainGraceMinutes ?? 15;
+          let reason;
+          if (evidence?.by === 'drain' && Number.isFinite(evidence.atMs)
+            && now >= evidence.atMs && now - evidence.atMs <= grace * 60_000) {
+            reason = 'deferred-to-drain (recent drain rebase)';
+          }
+          let live = null;
+          if (!reason) {
+            try { live = readPrLive({ pr, repo: resolvedRepo }); } catch { /* fail closed */ }
+            if (!/^[a-f0-9]{40}$/i.test(pr.headRefOid ?? '') || live?.headRefOid !== pr.headRefOid
+              || live?.mergeable !== 'CONFLICTING') reason = 'conflict-cleared-before-bounce';
+          }
+          if (reason) {
+            entry.routedTo = reason;
+            log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${reason}`);
+            return false;
+          }
+          const headRefOid = live.headRefOid;
+          beforeWrite();
+          const finding = postFinding({ pr, repo: resolvedRepo, headRefOid, ...extra });
+          let after = null;
+          try { after = readPrLive({ pr, repo: resolvedRepo }); } catch { /* cannot confirm write */ }
+          if (after?.headRefOid !== headRefOid || after?.mergeable !== 'CONFLICTING') {
+            if (finding?.findingToken) invalidateConflictFinding({
+              findingToken: finding.findingToken, pr, repo: resolvedRepo, headRefOid, provider, listPrComments,
+            });
+            revertBounce({ pr, repo: resolvedRepo, headRefOid });
+            entry.routedTo = after?.headRefOid !== headRefOid
+              ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed';
+            log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} ${entry.routedTo}`);
+            return false;
+          }
+          return true;
+        };
+
         if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable && sameLineConflict === 'fixer') {
           let comments = [];
           let commentsRead = false;
@@ -1777,7 +1865,7 @@ export function watchParkedPrConflicts({
             sinceMs = Number.isFinite(removedAt) ? removedAt : -Infinity;
           }
           if (!dryRun && commentsRead && !hasRecentConflictFindingComment(comments, { now, sinceMs })) {
-            postFinding({ pr, repo: resolvedRepo, sameLineConflict: true });
+            if (!bounce({ sameLineConflict: true })) { results.push(entry); continue; }
           }
           entry.routedTo = 'reconcile-finding (same-line conflict → fixer)';
         } else if (isStatuteTier && !appendOnlyStatute && !reviewHumanFixable) {
@@ -1854,11 +1942,8 @@ export function watchParkedPrConflicts({
           // #gh-write-burst — only the finding is skipped when `alreadyBounced`; the supersede needs no guard of its
           // own (`priorWatcherStandDown` already reads false once a supersede is on the thread).
           if (!dryRun) {
-            if (priorWatcherStandDown) postSupersedeComment({ pr, repo: resolvedRepo, provider });
-            if (alreadyBounced) { /* this episode's finding is already on the thread — never re-post */ }
-            else if (isStatuteTier && appendOnlyStatute) postFinding({ pr, repo: resolvedRepo, appendOnlyStatute: true });
-            else if (isStatuteTier) postFinding({ pr, repo: resolvedRepo, reviewHumanFixable: true });
-            else postFinding({ pr, repo: resolvedRepo });
+            if (alreadyBounced) { if (priorWatcherStandDown) postSupersedeComment({ pr, repo: resolvedRepo, provider }); }
+            else if (!bounce(isStatuteTier ? (appendOnlyStatute ? { appendOnlyStatute: true } : { reviewHumanFixable: true }) : {}, () => { if (priorWatcherStandDown) postSupersedeComment({ pr, repo: resolvedRepo, provider }); })) { results.push(entry); continue; }
           }
           if (priorWatcherStandDown) entry.supersededStandDown = true;
           entry.routedTo = (isStatuteTier && appendOnlyStatute)

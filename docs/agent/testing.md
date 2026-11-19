@@ -5183,3 +5183,17 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Accepted-conflict bounce races (#7183)
+
+Queued-conflict fixtures must provide a full snapshot `headRefOid`, a `readPrLive` port
+returning that same conflicting head before and after the write, and explicit drain
+evidence. Missing live evidence holds the PR for the next sweep. Drain grace trusts
+GitHub commit author/committer App identity and API time, never commit-message text.
+The two-head soak break exercises the real watcher decision with all IO injected.
+
+A bounced conflict finding is itself durable deduplication state. Rollback tests
+must persist the real transport body and receipt, invalidate that exact comment
+before restoring approval labels, and run a second conflicting sweep. If comment
+invalidation fails, keep the bounce and surface the error; label-only rollback
+would strand an accepted PR behind the surviving finding.

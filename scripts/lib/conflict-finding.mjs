@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveChildTimeoutMs } from './bounded-child.mjs';
 
 export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null } = {}) {
@@ -78,18 +79,37 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
   ].join('\n');
 }
 
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null }) {
+export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, headRefOid }) {
   const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
-  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict, enqueueRefusal }), 'utf8');
+  const findingToken = headRefOid ? randomUUID() : null;
+  writeFileSync(bodyPath, buildConflictFindingBody({ num: pr?.number, headRefName: pr?.headRefName }, { appendOnlyStatute, reviewHumanFixable, resync, sameLineConflict, enqueueRefusal }) + (findingToken ? `\n\n<!-- conflict-watch-bounce:${findingToken} -->` : ''), 'utf8');
   try {
     const argv = [
       join(dirname(fileURLToPath(import.meta.url)), '..', 'conveyor', 'reconcile-finding.mjs'), String(pr?.number),
       `--body-file=${bodyPath}`, '--agent=parked-pr-conflict-watch', '--channel=the parked-PR conflict watch (#xw0odtv, dispatched per #xu2krte)',
     ];
+    if (headRefOid) argv.push(`--expect-head=${headRefOid}`);
     if (repo) argv.push(`--repo=${repo}`);
     // #x5n4zn3 — was bare (no timeout).
     exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+    return { findingToken };
   } finally {
     try { unlinkSync(bodyPath); } catch { /* best-effort cleanup only */ }
   }
+}
+
+/** Invalidate exactly this transport's finding before restoring approval labels.
+ * Failure retains the bounce and surfaces an error, rather than leaving an accepted
+ * PR suppressed by a finding that still counts for deduplication.
+ */
+export function invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments }) {
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(findingToken ?? '')) throw new Error('conflict finding rollback: invalid receipt');
+  const marker = `<!-- conflict-watch-bounce:${findingToken} -->`;
+  const comments = listPrComments({ number: pr.number, repo });
+  const matches = Array.isArray(comments) ? comments.filter(comment =>
+    isTrustedMarkerAuthor(comment) && typeof comment?.body === 'string' && comment.body.includes(marker)) : [];
+  if (matches.length !== 1 || !matches[0].id) throw new Error('conflict finding rollback: finding unreadable or ambiguous; bounce retained');
+  provider.editComment(repo, matches[0].id,
+    `Conflict-watch bounce reverted for head ${headRefOid}: the post-write read did not confirm the judged conflict.`,
+    { pr: pr.number });
 }
