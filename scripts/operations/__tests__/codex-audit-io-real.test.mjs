@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { URL as NodeURL } from 'node:url';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
+import { main, QUESTION_HASH } from '../codex-audit.mjs';
 
 describe('codex-audit real IO', () => {
   it('resolves a branch and commit SHA to the full 40-hex commit in a real repo', async () => {
@@ -22,51 +23,68 @@ describe('codex-audit real IO', () => {
     });
   });
 
-  it('derives origin refs, checks ancestry and restricts delta paths to the branch net diff', async () => {
+  it('reviews unrestricted real Git delta including reverted guards, renames and <material>.mjs with base at head', async () => {
     await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
+      commit({ 'guard.mjs': 'base guard\n', 'test.mjs': 'guard test\n' });
       const base = head();
-      commit({ 'branch.txt': 'branch change\n' });
+      commit({ 'guard.mjs': 'improved guard\n' });
       const prior = head();
-      git(['branch', 'branch-work', prior]);
-      git(['checkout', '--quiet', '--detach', base]);
-      commit({ 'main-only.txt': 'merged main change\n' });
-      const main = head();
-      git(['checkout', '--quiet', 'branch-work']);
-      git(['merge', '--quiet', '--no-edit', main]);
+      commit({ 'guard.mjs': 'base guard\n', '<material>.mjs': 'new unchecked path\n' });
+      git(['mv', 'test.mjs', 'relocated.mjs']);
+      git(['commit', '--quiet', '-m', 'relocate guard test']);
       const current = head();
       git(['update-ref', 'refs/remotes/origin/lane/audit', current]);
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
       expect(deps.refsPointingAt(current)).toContain('lane/audit');
       expect(deps.isAncestor(prior, current)).toBe(true);
       expect(deps.isAncestor(current, prior)).toBe(false);
-      expect(deps.deltaPaths([base, prior], [main, current])).toEqual(['branch.txt']);
-      // The actual range contains the main change, but the path filter excludes it.
-      const delta = git(['diff', '--no-renames', prior, current, '--', ...deps.deltaPaths([base, prior], [main, current])]);
-      expect(String(delta).trim()).toBe('');
+      let reviewed = false;
+      const code = await main([`--base=${current}`, `--head=${current}`, '--converge'], {
+        ...deps,
+        readRecords: () => [{ at: '2026-11-17T00:00:00Z', base, head: prior, ref: 'lane/audit',
+          questionHash: QUESTION_HASH, verdict: 'WEAKENED', findings: ['guard.mjs:1 gap'] }],
+        now: () => '2026-11-18T00:00:00Z', appendRecord: () => {}, stdout: () => {}, stderr: () => {},
+        runCodex: prompt => {
+          const command = prompt.split('\n').find(line => line.startsWith('git diff '));
+          expect(command).toBe(`git diff --no-renames ${prior} ${current}`);
+          const delta = String(git(command.split(' ').slice(1)));
+          expect(delta).toContain('<material>.mjs');
+          expect(delta).toContain('-improved guard');
+          expect(delta).toContain('deleted file mode');
+          expect(delta).toContain('+++ b/relocated.mjs');
+          reviewed = true;
+          return 'NOT WEAKENED\nFIXED: guard.mjs:1 gap';
+        },
+      });
+      expect(code).toBe(0);
+      expect(reviewed).toBe(true);
     });
   });
 
-
-  it('keeps reverted guard paths, both rename sides and paths from a changed base in the union', async () => {
+  it('refuses real Git backward and unrelated bases before review', async () => {
     await withRealRepo(async ({ root: repo, tmp, git, head, commit }) => {
-      commit({ 'guard.mjs': 'base guard\n', 'test.mjs': 'guard test\n' });
+      const oldBase = head();
+      commit({ 'base.txt': 'base\n' });
       const base = head();
-      commit({ 'guard.mjs': 'improved guard\n' });
+      commit({ 'anchor.txt': 'anchor\n' });
       const prior = head();
-      commit({ 'guard.mjs': 'base guard\n' });
-      git(['mv', 'test.mjs', 'relocated.mjs']);
-      git(['commit', '--quiet', '-m', 'relocate guard test']);
+      commit({ 'delta.txt': 'delta\n' });
       const current = head();
+      git(['checkout', '--quiet', '--detach', oldBase]);
+      commit({ 'other.txt': 'other\n' });
+      const unrelated = head();
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
-      expect(deps.deltaPaths([base, current])).not.toContain('guard.mjs');
-      const paths = deps.deltaPaths([base, prior], [prior, current]);
-      expect(paths).toEqual(['guard.mjs', 'relocated.mjs', 'test.mjs']);
-      const delta = String(git(['diff', '--no-renames', prior, current, '--', ...paths]));
-      expect(delta).toContain('-improved guard');
-      expect(delta).toContain('deleted file mode');
-      expect(delta).toContain('+++ b/relocated.mjs');
-      // Even a base advanced to the current head cannot erase the previously audited guard path.
-      expect(deps.deltaPaths([base, prior], [current, current])).toEqual(['guard.mjs']);
+      const errors = [];
+      const overrides = { ...deps, now: () => '2026-11-18T00:00:00Z',
+        readRecords: () => [{ at: '2026-11-17T00:00:00Z', base, head: prior, ref: 'lane/audit',
+          questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [] }],
+        runCodex: () => { throw new Error('must refuse before review'); },
+        stderr: text => errors.push(text), stdout: () => {},
+      };
+      expect(await main([`--base=${oldBase}`, `--head=${current}`, '--ref=lane/audit', '--converge'], overrides)).toBe(2);
+      expect(await main([`--base=${unrelated}`, `--head=${current}`, '--ref=lane/audit', '--converge'], overrides)).toBe(2);
+      expect(errors).toHaveLength(2);
+      expect(errors.every(text => text.includes('run a full audit'))).toBe(true);
     });
   });
 

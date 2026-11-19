@@ -78,8 +78,6 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       if (result.error || ![0, 1].includes(result.status)) throw new Error('audit ancestry unavailable');
       return result.status === 0;
     },
-    deltaPaths: (...pairs) => [...new Set(pairs.flatMap(([base, head]) =>
-      run('git', ['diff', '--name-only', '--no-renames', '-z', `${base}...${head}`], 30_000).split('\0').filter(Boolean)))],
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {

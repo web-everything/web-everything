@@ -4813,11 +4813,22 @@ refusing reruns, and executor refusals carrying `why` so logs never read "(no re
 
 ## Audit convergence evidence (R1081)
 
-Convergence selects the last appended record per ref in each ledger, then uses commit ancestry
-to compare ledgers; timestamps only enforce the five-minute future-clock bound. Keep malformed
-prior evidence, exact-head refusal, equal-head lineage, and unrelated-head fallbacks covered in
-`codex-audit-converge.test.mjs`. The real Git regression in `codex-audit-io-real.test.mjs`
-keeps reverted guards and both rename paths in the union of prior and current base/head diffs.
+Convergence anchors only to the latest appended full-ledger record for the ref. Converge
+records are write-only and never influence selection, even at a newer or descendant head.
+Validate the anchor's full mode (or absent mode), current canonical question hash, verdict,
+non-conflicting string findings, commit SHAs and timestamp (at most five minutes ahead).
+A WEAKENED anchor without findings fails closed with exit 3; malformed evidence requires a
+retry or human review of the full diff. Missing anchors, exact-head anchors, rebased heads,
+backward bases or a base outside head ancestry require a full audit (exit 2).
+
+Every round reviews the unrestricted `git diff --no-renames <anchor.head> <head>` and every
+anchor finding, including findings marked FIXED in earlier converge rounds. The command
+contains only validated SHAs and stays outside the untrusted findings fence. Each anchor
+finding needs exactly one exact-text FIXED/OPEN disposition; NEW reports delta weakening.
+Missing, duplicate, unknown or unprefixed dispositions and inconsistent verdicts fail closed.
+Keep these paths covered in `codex-audit-converge.test.mjs`; real Git regressions in
+`codex-audit-io-real.test.mjs` cover forward/backward bases, reverted guards, renames and
+`<material>.mjs` remaining in scope even when the requested base advances to head.
 The canonical question hash stays stable: exhaustive full-pass instructions live outside its text.
 
 Canonical audit lookup rejects non-full positive records even with the current question hash,
