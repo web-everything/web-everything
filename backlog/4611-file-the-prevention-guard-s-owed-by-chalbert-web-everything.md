@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-backlog-item.mjs", "we:scripts/__tests__/check-backlog-item.test.mjs", "we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-09-30"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "2252451f641990568d13fe0ed9bd9f1e179afd48"
+preparedDate: "2026-11-19"
+preparedAgainstSha: "00ecbc1d32b46ff3dd39bd76f6462915f84232cc"
 tags: []
 ---
 
@@ -16,57 +16,66 @@ tags: []
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
 1. `we:backlog/4599-define-human-forge-edits-and-durable-acknowledgements-at-the.md:4` — Make check-backlog-item or check-standards reject any diff that flips a kind:decision to status: resolved without codifiedIn, so it applies to hand edits as well as the verb. Today only the verb and the legacy G6 audit cover this.
-2. `we:backlog/4599-define-human-forge-edits-and-durable-acknowledgements-at-the.md:36` — Add a resolve-time prompt or checklist that walks the Done-when clauses, or requires spun-off follow-up ids for anything left unaddressed. Failing that, add a review lens for decision resolutions that compares the ruling with the Done-when.
+2. `we:backlog/4599-define-human-forge-edits-and-durable-acknowledgements-at-the.md:33` — Add a resolve-time prompt or checklist that walks the Done-when clauses, or requires spun-off follow-up ids for anything left unaddressed. Failing that, add a review lens for decision resolutions that compares the ruling with the Done-when.
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3107@6c66a5ba5bc68b028cb1db8083f1a1cf3f75ea7e
 
 ## Progress
 
-Preparation research (2026-10-02): the prevention is not already delivered.
+Preparation refresh (2026-11-19): the prevention remains outstanding. Source inspection finds no codification check in we:scripts/check-backlog-item.mjs; the resolve checklist in we:docs/agent/backlog-workflow.md:270-280 still lacks explicit clause-by-clause decision accounting. This is source evidence, not a claim that a new regression has been executed.
 
-- **Old premise/scope:** the scope named only the reviewed decision, and the review cited lines 4 and 36 of we:backlog/4599-define-human-forge-edits-and-durable-acknowledgements-at-the.md. Those are incident context (resolved frontmatter and Done-when), not guard implementation locations.
-- **Corrected premise/scope:** implement the first guard in the explicitly permitted per-item checker, we:scripts/check-backlog-item.mjs, with its existing subprocess tests in we:scripts/__tests__/check-backlog-item.test.mjs. Implement the second guard as a resolve-time checklist in we:docs/agent/backlog-workflow.md, beside “Mark it resolved — through the declared operation.” No edit to the incident decision is required; its unfinished substantive ruling must not be invented by this prevention story.
-- **Source evidence:** we:scripts/backlog/frontmatter.mjs exports `validateCodifiedIn` and checks decision resolution in `applyTransition`; we:scripts/operations/resolve.mjs delegates that transition and names the refusal `uncodified-decision`. In contrast, we:scripts/check-backlog-item.mjs checks rendering, YAML, blocker references, queue fields and locus prefixes without a codification guard. A real `npm run check:item -- 4599` equivalent invocation of that checker exited 0 and reported clean despite the incident card's resolved decision having no `codifiedIn`. The G6 scan in we:scripts/audit-backlog-health.mjs remains an audit, not this per-item refusal.
-- **Second guard evidence:** we:docs/agent/backlog-workflow.md already requires codification and existing ids for claimed deferrals, but its resolve step does not explicitly walk every decision Done-when clause against the ruling. Add that missing checklist without changing the decision authority or claiming prose can be semantically validated by a field-presence check.
-- **Overlap:** #4683 independently requests a changed-card whole-repository codification gate. This story uses the per-item alternative already authorized in the original request; coordinate shared validation when #4683 is implemented rather than duplicating its broader integration.
+- **Old premise/scope:** the previous preparation described a presence-only guard while also requiring `validateCodifiedIn`, claimed any nonblank scalar supplied presence, and described fixture cleanup without the current isolated-backlog interface. The original incident references were frontmatter line 4 and a stale Done-when line 36.
+- **Corrected premise/scope:** retain the three scoped files. Reject missing codification and reuse the existing scalar validator, including its existing pointer grammar; arbitrary nonblank strings do not pass. Use temporary backlogs, never fixtures in the real backlog. The incident Done-when is now at we:backlog/4599-define-human-forge-edits-and-durable-acknowledgements-at-the.md:33; its ruling begins at line 37. No substantive ruling is supplied by this prevention story.
+- **Source evidence:** we:scripts/backlog/frontmatter.mjs:174-183 accepts `one-off` or the existing docs Markdown pointer grammar and calls `.trim()` on its input; non-string YAML values therefore need a type guard. The resolution transition already invokes it at we:scripts/backlog/frontmatter.mjs:261. The per-item checker parses fallback frontmatter at we:scripts/check-backlog-item.mjs:75-80 and reports YAML errors at line 89, but never calls that validator. Parse safely for loaded items too, rather than relying on loader field exposure.
+- **Changed callers/defaults:** we:package.json:73 exposes the checker as `check:item`. The explicit directory flag, environment override and default real-backlog path are selected at we:scripts/check-backlog-item.mjs:34-37. Existing caller compatibility tests at we:scripts/__tests__/check-backlog-item.test.mjs:95 cover positional ids, `--item`, flag ordering, flag-over-environment precedence and missing targets. Preserve these interfaces; the intentional default change is that explicitly checking a resolved legacy decision without codification now fails.
+- **Test isolation evidence:** we:scripts/__tests__/check-backlog-item.test.mjs:41 drives real subprocesses; lines 60-64 create and remove temporary backlogs, and the suite checks the real backlog stays untouched. Extend this harness rather than the obsolete real-backlog fixture pattern.
+- **Size:** retain size 3: approximately 25–40 changed lines in we:scripts/check-backlog-item.mjs, 100–140 in we:scripts/__tests__/check-backlog-item.test.mjs, and 10–20 in we:docs/agent/backlog-workflow.md. This story does not receive `estimatedLoc`.
+- **Overlap:** #4683 is still open and owns the whole-repository changed-card gate; this story implements the explicitly authorized per-item alternative. No prerequisite edge change is proposed.
 
 ## Design
 
-Add an error-level check to we:scripts/check-backlog-item.mjs for the explicitly selected card whose raw frontmatter has `kind: decision` and `status: resolved` but lacks a nonblank `codifiedIn`. Read parsed frontmatter rather than depending on the loader exposing that field. Reuse the existing YAML failure reporting: malformed YAML must fail without a second uncaught parse exception. The error names the item and explains promotion to the statute layer or the existing `one-off` sentinel for a genuinely one-off ruling.
+In we:scripts/check-backlog-item.mjs, safely parse raw frontmatter for the selected item and add an error when `kind: decision` and `status: resolved` lack valid scalar `codifiedIn`. Reuse `validateCodifiedIn` from we:scripts/backlog/frontmatter.mjs after checking the value's type. Missing, null, empty, whitespace-only, numeric, boolean, sequence and mapping values fail. Nonblank strings must satisfy the existing validator; do not introduce a second grammar or array support. The diagnostic identifies the item and field and explains promotion to the statute layer or the existing `one-off` sentinel. Pointer target existence is not a new guarantee.
 
-This is a presence guard for hand edits, not a new pointer grammar. Missing, null, empty strings and whitespace-only strings fail. A nonblank scalar supplies presence. Reuse `validateCodifiedIn` for scalar validation rather than inventing a competing pointer grammar; guard non-string values before calling it so malformed types report an error instead of throwing. Adding array support is separate work tracked by #2846, not a compatibility assumption here. Target resolution remains with its existing checks. Open/active decisions and non-decisions are unaffected. Checking one explicitly selected legacy decision may expose its debt; this change does not turn the entire legacy G6 pool into a global gate.
+A failed YAML parse must retain the existing error-level diagnostic and exit 1, not fall through to a clean result or throw a second uncaught exception. Do not rely on the loader retaining `codifiedIn`. Preserve unresolved decisions, non-decisions, CLI arguments, directory precedence and the single-file limitations notice. This is selected-card validation, not Git diff detection: an explicitly selected legacy resolved decision is subject to the same rule. No automatic migration or whole-repository enforcement is introduced.
 
-Add a decision-specific checklist immediately before the resolution instruction in we:docs/agent/backlog-workflow.md: enumerate each Done-when clause, point to the ruling or evidence that satisfies it, and name an already-filed follow-up id plus the remaining obligation for any deferred part. Confirm codification separately. An uncovered clause must be completed or explicitly accounted for before resolution; a follow-up reference records a deferral and does not itself prove the original clause was delivered. Apply the checklist to hand-authored resolution diffs as well as the declared operation.
+In we:docs/agent/backlog-workflow.md, immediately before “Mark it resolved — through the declared operation,” add a decision-resolution checklist: enumerate every Done-when clause; link the ruling/evidence satisfying it; identify each deferred obligation and its already-filed follow-up id; confirm codification separately. Apply it to both operation-driven and hand-authored resolutions. An uncovered clause must be completed or explicitly accounted for; an id alone does not prove delivery. Keep human judgment over whether the ruling satisfies the clauses.
 
 ## MVP
 
-1. **Must 1 — hand-edit refusal:** we:scripts/check-backlog-item.mjs exits nonzero with an actionable codification diagnostic for a selected resolved decision missing codification presence.
-2. **Must 2 — bounded compatibility:** preserve positive results for present codification, unresolved decisions and non-decisions, and preserve malformed-YAML diagnostics. Pin these behaviors through actual checker subprocesses in we:scripts/__tests__/check-backlog-item.test.mjs.
-3. **Must 3 — completeness checklist:** we:docs/agent/backlog-workflow.md requires a clause-by-clause Done-when accounting, existing follow-up ids for deferred obligations, and a codification check before decision resolution.
+1. Add the selected resolved-decision guard and actionable failure output in we:scripts/check-backlog-item.mjs using the existing validator.
+2. Extend we:scripts/__tests__/check-backlog-item.test.mjs with real subprocess regressions, the compatibility matrix and a narrow checklist-document contract test.
+3. Add the resolve-time checklist to we:docs/agent/backlog-workflow.md and demonstrate its use against #4599 without inventing a missing ruling.
+
+## Acceptance
+
+Each named test below is planned in we:scripts/__tests__/check-backlog-item.test.mjs. The shared executable command is the host heavy-run queue invoking Vitest on that file (see Proof plan). Each new regression includes a missing-behavior assertion that fails against the pre-build source and passes after; compatibility rows within the same test must remain green throughout.
+
+- [A1] Executable: test `resolved decision codification matrix` runs the checker against omitted/null/empty/whitespace and malformed scalar/sequence/mapping values, asserting exit 1 and an item-specific codification diagnostic; `one-off` and an existing-grammar pointer assert exit 0. Invalid nonblank strings fail under the shared grammar. This pins the changed default for selected legacy resolved decisions and the type-error fail-closed paths.
+- [A2] Executable: test `codification guard preserves checker callers and eligibility` pairs an invalid resolved decision with open/active/preparing decisions and resolved non-decisions, exercising positional ids, `--item`, directory flag and environment selection. Only the invalid resolved decision fails; retain existing default-directory/missing-target tests and the single-file notice assertion. The invalid-decision assertion makes this regression red before implementation.
+- [A3] Executable: test `malformed YAML and malformed codification fail without an uncaught exception` checks malformed YAML and a parsed mapping-valued codification independently: both exit 1 with the relevant diagnostic and neither emits an uncaught TypeError/stack trace. The mapping case fails the pre-build checker. Error text points to correcting YAML or supplying valid codification; there is no bypass fallback.
+- [A4] Executable: test `decision resolution checklist precedes the resolve instruction` reads we:docs/agent/backlog-workflow.md and asserts that the decision checklist occurs before the resolve step and explicitly includes every Done-when clause, ruling/evidence links, already-filed follow-up ids with remaining obligations, separate codification, and applicability to hand edits and the operation. This document contract fails before the checklist is added; it does not pretend to evaluate the semantic adequacy of a ruling.
 
 ## Test plan
 
-Extend we:scripts/__tests__/check-backlog-item.test.mjs using its existing fixture cleanup pattern. Exercise the real checker and assert both exit status and the codification diagnostic; do not settle for source-text assertions.
+Use the existing subprocess harness and temporary directory lifecycle in we:scripts/__tests__/check-backlog-item.test.mjs. Parameterize fixture frontmatter without weakening existing assertions. Keep fixtures otherwise valid so unrelated lint failures cannot satisfy a regression. Assert exact exit status plus the relevant diagnostic, including absence of uncaught exceptions. Preserve the suite's real-backlog non-mutation assertion.
 
-- Negative rows: resolved decisions with omitted, null, empty or whitespace-only codification; malformed non-string values must produce a diagnostic without throwing.
-- Positive controls: `one-off` and a valid guideline pointer; open and active decisions without codification; a resolved task without codification. Use otherwise valid frontmatter so another error cannot satisfy the assertion accidentally.
-- Malformed YAML stays a reported validation failure rather than a thrown stack trace. Fixtures must be removed even on assertion failure.
-- Source/test pairing: we:scripts/check-backlog-item.mjs → we:scripts/__tests__/check-backlog-item.test.mjs. The workflow document is checked by a manual checklist walkthrough, not a runtime unit test.
+Implement A1–A4 as named tests; A1 covers all invalid YAML value types and valid scalar controls, A2 covers caller and eligibility compatibility, A3 covers parse/type failures, and A4 checks the authored workflow contract. Read the document relative to the repository root. No resolve operation should run against a real card. Source/test pair: we:scripts/check-backlog-item.mjs and we:docs/agent/backlog-workflow.md → we:scripts/__tests__/check-backlog-item.test.mjs.
 
 ## Proof plan
 
-Before implementing, add the missing-codification regression case and run the focused Vitest test: it must fail because the current checker exits 0. After implementation, run the same case and the full we:scripts/__tests__/check-backlog-item.test.mjs suite; assert exit 1 for the invalid fixture and exit 0 for its valid controls. Capture the diagnostic and test result as evidence, using disposable fixtures rather than resolving a real decision.
+Before implementation, add A1–A4 and run the focused test file through the host heavy-run queue. Record the expected failing assertions (missing codification rejection and missing checklist). Implement the scoped changes and rerun the same file, recording exit-code/diagnostic evidence and all compatibility controls. Commands below are expressed with repository-prefixed paths for this card; when executing from WE, strip the `we:` locus marker from path arguments:
 
-Walk the checklist against the incident decision's Done-when: distinguish its recorded human-label ruling from the command acknowledgement boundary, conformance vectors and codification obligations; identify which have evidence and which need explicit accounting. Do not supply a missing human ruling during this exercise. Finally run `npm run check:standards` and the per-item lint for this card under the normal runner checks. A clean per-item result does not assert whole-repository CI coverage of every resolution diff.
+- `node we:scripts/readiness/heavy-admission.mjs run --wait-ms=60000 -- npx vitest run we:scripts/__tests__/check-backlog-item.test.mjs`
+- `node we:scripts/readiness/heavy-admission.mjs run --wait-ms=60000 -- npm run check:standards`
+- Runner per-item check: `npm run check:item -- 4611`.
 
-## Done when
+If admission remains busy after the single bounded wait, stop and report the unrun check; do not poll. The runner owns preparation stamping and its checks. This preparation changes only the card, not the implementation or tests.
 
-1. **Musts 1, 2:** the new missing-codification subprocess regression fails against the pre-change checker and passes after it; all compatibility controls in we:scripts/__tests__/check-backlog-item.test.mjs pass.
-2. **Must 3:** the workflow checklist explicitly covers every Done-when clause, evidence/ruling links, already-filed follow-up ids for deferrals, and codification; the incident walkthrough demonstrates that uncovered obligations are visible before resolution.
-3. `npm run check:standards` passes with the implementation and the focused tests provide actual exit-code evidence.
+Manually walk #4599's Done-when at we:backlog/4599-define-human-forge-edits-and-durable-acknowledgements-at-the.md:33 against its ruling at line 37. Account separately for the human-label rule, durable command acknowledgement boundary, #3216 hand-off, conformance vectors and codification. The visible ruling describes label/command handling and projection receipts but is not evidence that every other obligation is fulfilled. Record missing evidence honestly; do not supply a new decision or claim an unfiled follow-up exists. The automated document test establishes checklist presence, while this walkthrough demonstrates its use.
 
 ## Follow-ups
 
-- #4683 owns the overlapping whole-repository changed-card guard; reuse the resulting presence semantics and avoid a second conflicting rule when that integration lands.
-- Repairing the substance or codification of #4599 is outside this prevention implementation. Any missing ruling remains with its decision authority; this card does not assert a repair was filed or delivered.
-- Automatic semantic evaluation of Done-when prose, a new resolve argument/schema, and migration of the legacy G6 pool are outside this MVP. The authorized resolve-time checklist supplies the second prevention guard without those policy changes.
+- #4683 owns whole-repository changed-card enforcement. Align with its semantics when integrating; this per-item checker alone cannot guarantee every hand edit runs through CI.
+- #2846 tracks array support; this MVP uses the existing scalar validator and does not extend that contract.
+- Substantive completion/codification of #4599 remains outside this implementation. Missing rulings need the decision authority; no repair is claimed filed or delivered here.
+- Automatic semantic evaluation of Done-when prose, new resolve arguments and legacy-pool migration remain outside this MVP. The authorized checklist supplies the second prevention guard.
