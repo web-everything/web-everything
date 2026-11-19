@@ -1,6 +1,7 @@
 /** Replay 2026-11-19: blocked heads consumed the first slots and all children listed live. */
 import { EventEmitter } from 'node:events';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -11,13 +12,16 @@ export default {
   card: '2026-11-19 PRs #6945 #7107 #7117 ahead of #7127 #7148 #7159 #7175',
   fixedBy: { sha: 'HEAD', where: 'catch-up ordering and first-listing', paths: ['scripts/lib/enqueue-on-event.mjs'] },
   fixPresent(root) {
-    try {
-      const source = readFileSync(join(root, 'scripts/lib/enqueue-on-event.mjs'), 'utf8');
-      return source.includes('cleanFirst: true') && source.includes('snapshotFirst: true');
-    } catch { return false; }
+    // Exercise this replay against the requested tree, including its real defaults.
+    const probe = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `const { default: b } = await import(process.argv[1]);
+       const report = await b.run({ sourceRoot: process.argv[2] });
+       process.exit(b.judge(report).length === 0 ? 0 : 1);`, import.meta.url, root],
+    { timeout: 15000, maxBuffer: 65536, encoding: 'utf8' });
+    return !probe.error && probe.status === 0;
   },
   async run({ sourceRoot = process.env.SOAK_TREE_ROOT || ROOT, log = () => {} } = {}) {
-    const { createEnqueueOnEvent, resolveEnqueueOnEventSetting } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/enqueue-on-event.mjs')).href);
+    const { createEnqueueOnEvent, resolveEnqueueOnEventSetting, planCatchUp } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/enqueue-on-event.mjs')).href);
     const violations = [];
     const check = (ok, message) => { if (!ok) violations.push(message); };
     const labels = [{ name: 'ready-to-merge' }];
@@ -30,6 +34,9 @@ export default {
     const setting = resolveEnqueueOnEventSetting({ env: {}, platform: {}, tool: {
       enabled: true, catchUp: { enabled: true, maxQueued: 7, concurrency: 3 },
     } });
+    const plan = planCatchUp({ prs, queued: 0, capacity: 7 });
+    check([...plan.run.map(p => p.num), ...plan.later].join(',') === [...clean, ...numbers.slice(0, 3)].join(','),
+      'planCatchUp defaults must put clean heads first');
     const handle = createEnqueueOnEvent({
       cwd: sourceRoot, localSlug: 'example-owner/example-repo', defaultBranch: 'main', env: {}, now: () => 1000,
       resolveSetting: () => setting, log,
@@ -66,7 +73,7 @@ export default {
     try {
       await flush();
       check(starts.join(',') === '7127', 'only the highest-priority clean head should start before the snapshot');
-      if (snapshots[0]) writeFileSync(snapshots[0], '{}');
+      if (snapshots[0]) writeFileSync(snapshots[0], JSON.stringify({ repo: 'example-owner/example-repo', writtenAt: 1000, rows: [] }));
       children[0]?.finish();
       await flush();
       check(starts.join(',') === '7127,7148,7159,7175', 'normal concurrency should fill with the remaining clean heads');

@@ -14,6 +14,7 @@ import {
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
   fastDrainArgs, summarizeFastDrain, resolveEnqueueOnEventSetting, createEnqueueOnEvent, wakeWorthy,
 } from '../enqueue-on-event.mjs';
+import { readFastDrainRoundSnapshot, readFastDrainRoundListing } from '../fast-drain-scope.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
@@ -1957,7 +1958,7 @@ describe('concurrent catch-up rounds', () => {
   const concurrent = (extra = {}) => catchUpSetup({
     manualFinish: true,
     // These concurrency contracts model a round whose snapshot has already been published.
-    existsSyncImpl: () => true,
+    readRoundSnapshot: () => ({ repo: REPO, writtenAt: 1000, rows: [] }),
     resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, concurrency: 3, busyIntervalSeconds: 60 } }),
     readCapacity: () => ({ capacity: 8, source: 'test' }),
     readCandidates: async () => ({ ok: true, queued: 0, prs: [1, 2, 3, 4, 5].map(n => candidate(n, n)) }),
@@ -2968,10 +2969,19 @@ describe('catch-up snapshot-first scheduling', () => {
       const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).split('=')[1];
       await vi.advanceTimersByTimeAsync(1000);
       expect(f.calls).toHaveLength(1);
-      writeFileSync(path, '{}');
+      const snapshot = { repo: REPO, writtenAt: 1000, rows: [] };
+      writeFileSync(path, JSON.stringify(snapshot));
+      expect(readFastDrainRoundSnapshot({ path, repo: REPO, now: 1000, env: {} })).toEqual(snapshot);
       await vi.advanceTimersByTimeAsync(1000);
       expect(f.calls).toHaveLength(3);
       expect(f.calls.every(c => c.args.includes(`--listing-snapshot=${path}`))).toBe(true);
+      for (const call of f.calls.slice(1)) {
+        const num = Number(call.args.find(a => a.startsWith('--only=')).slice(7));
+        const listLive = vi.fn(() => { throw Error('released child listed live'); });
+        await readFastDrainRoundListing({ path, repo: REPO, onlyPr: num, now: 1000, env: {},
+          listLive, readTarget: async () => ({ number: num, state: 'OPEN' }), log: () => {} });
+        expect(listLive).not.toHaveBeenCalled();
+      }
       f.children.forEach(c => c.finish());
       expect(await round).toHaveLength(3);
     } finally {
@@ -2983,7 +2993,7 @@ describe('catch-up snapshot-first scheduling', () => {
 
   it.each(['error', 'timeout'])('starts the next writer after %s leaves the active set empty without a snapshot', async failure => {
     vi.useFakeTimers();
-    const f = fixture({ timeoutMs: 1000, existsSyncImpl: () => false });
+    const f = fixture({ timeoutMs: 1000, readRoundSnapshot: () => null });
     const round = f.handle.catchUp();
     try {
       await flush();
@@ -3007,11 +3017,36 @@ describe('catch-up snapshot-first scheduling', () => {
     }
   });
 
-  it.each(['disabled', 'check throws'])('retains normal concurrency when snapshot-first is %s', async mode => {
+  it.each(['invalid', 'unreadable', 'check throws'])('keeps catch-up serial when the snapshot is %s, then starts the next writer', async mode => {
+    vi.useFakeTimers();
+    const f = fixture(mode === 'check throws' ? { readRoundSnapshot: () => { throw Error('unreadable'); } } : {});
+    const round = f.handle.catchUp();
+    try {
+      await flush();
+      expect(f.calls).toHaveLength(1);
+      const path = f.calls[0].args.find(a => a.startsWith('--listing-snapshot=')).slice(19);
+      if (mode === 'invalid') writeFileSync(path, '{}');
+      if (mode === 'unreadable') mkdirSync(path); // A directory cannot be read as a snapshot on any host.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(f.calls).toHaveLength(1);
+      if (mode === 'check throws') expect(f.lines).toContain('enqueue-on-event: round snapshot check threw; keeping catch-up serial');
+      for (let i = 0; i < 3; i++) {
+        expect(f.calls).toHaveLength(i + 1);
+        f.children[i].finish();
+        await flush();
+      }
+      expect(await round).toHaveLength(3);
+    } finally {
+      f.handle.kill();
+      f.children.forEach(c => c.emit('close', 143));
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains normal concurrency when snapshot-first is disabled', async () => {
     const f = fixture({
-      existsSyncImpl: () => { if (mode === 'check throws') throw Error('unreadable'); return false; },
       resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp,
-        concurrency: 3, snapshotFirst: mode !== 'disabled' } }),
+        concurrency: 3, snapshotFirst: false } }),
     });
     const round = f.handle.catchUp();
     try {

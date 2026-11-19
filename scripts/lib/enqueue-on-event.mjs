@@ -59,9 +59,9 @@
  *
  *   catchUp.cleanFirst (boolean, default true) stably puts CLEAN/HAS_HOOKS first after all other sorts;
  *   every other state remains a candidate. False retains the previous priority order.
- *   catchUp.snapshotFirst (boolean, default true) allows one catch-up child until its round snapshot exists,
- *   then uses catchUp.concurrency. A failed/timed-out child releases the next attempt; check errors use normal
- *   concurrency. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
+ *   catchUp.snapshotFirst (boolean, default true) allows one catch-up child until the fast-drain reader accepts its round snapshot,
+ *   then uses catchUp.concurrency. Missing/invalid/unreadable evidence keeps starts serial; a failed/timed-out
+ *   child releases the next attempt. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
  *
  *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated hold-eligible not-enqueued summaries at the same
  *   head and sorted-label SHA-256 digest until either changes or TTL (integer 1–1440 minutes) expires.
@@ -75,7 +75,8 @@
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
-import { existsSync, rmSync } from 'node:fs';
+import { rmSync } from 'node:fs';
+import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
 import { tmpdir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
@@ -796,7 +797,7 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, refreshPending?:Function, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, existsSyncImpl?:Function, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readRoundSnapshot?:Function, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
@@ -817,7 +818,7 @@ export function createEnqueueOnEvent({
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
   prestageCache = createPrestageCache({ env }),
-  existsSyncImpl = existsSync,
+  readRoundSnapshot = readFastDrainRoundSnapshot,
   timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
   // The drain's own code version (full sha). A miss-backoff recorded under older code is re-evaluated once.
   readCodeVersion = () => String(execFileSyncImpl('git', ['rev-parse', 'HEAD'], { cwd: scriptRoot(), env, encoding: 'utf8', timeout: 10_000 })).trim(),
@@ -1067,9 +1068,10 @@ export function createEnqueueOnEvent({
       if (!p) { if (active.size) { await Promise.race(active.values()); continue; } break; }
       if (!p.catchUp && active.size) { await Promise.race(active.values()); continue; }
       if (p.catchUp && active.size && (s.catchUp?.snapshotFirst ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.snapshotFirst) && listingSnapshot) {
-        let missing = false;
-        try { missing = !existsSyncImpl(listingSnapshot); } catch { /* retain normal concurrency if unreadable */ }
-        if (missing) {
+        let published = false;
+        try { published = !!readRoundSnapshot({ path: listingSnapshot, repo: p.repo, env, now: now() }); }
+        catch { log('enqueue-on-event: round snapshot check threw; keeping catch-up serial'); }
+        if (!published) {
           // A writer may publish before it exits. Recheck while it runs; failure/timeout also releases the wait.
           let timer;
           try { await Promise.race([...active.values(), new Promise(resolve => { timer = setTimeout(resolve, 1000); })]); }
