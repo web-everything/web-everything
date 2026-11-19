@@ -48,6 +48,7 @@
  * `live-changes-stale-accepted-phase.mjs` uses the same automatic registration.
  *
  * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
+ * `gh-log-escape-sequences-block-ci-heal.mjs` uses the same automatic registration.
  *
  * `daemon-load-overlay-stale-tracking-ref.mjs` uses the same automatic registration.
  *
