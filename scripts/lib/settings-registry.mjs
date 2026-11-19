@@ -72,7 +72,7 @@ export function buildRegistry({ root = ROOT } = {}) {
   for (const key of keys) if (!Object.hasOwn(metadata.settings ?? {}, key)) problems.push(`missing setting metadata: ${key}`);
   for (const [key, meta] of entries(metadata.settings ?? {})) {
     if (!keys.has(key)) problems.push(`orphan setting metadata: ${key}`);
-    if (!['pr', 'capacity-leaf', 'operator-prefs', 'env'].includes(meta?.changeVia)) problems.push(`invalid changeVia: ${key}`);
+    if (!['capacity-leaf', 'env', 'operator-prefs', 'pr'].includes(meta?.changeVia)) problems.push(`invalid changeVia: ${key}`);
     if (typeof meta?.description !== 'string' || !meta.description.trim() || meta.description.length > 160) problems.push(`invalid description: ${key}`);
     if (typeof meta?.instant !== 'boolean') problems.push(`invalid instant: ${key}`);
     if (!rows.some(row => row.key === key && row.owners.includes(meta?.owner))) problems.push(`invalid owner: ${key}`);
