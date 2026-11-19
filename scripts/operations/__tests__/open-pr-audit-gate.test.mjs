@@ -41,7 +41,8 @@ describe('combined open-pr preflight', () => {
     expect(spawn.mock.calls[0][1].some(a => a.startsWith('--body-file='))).toBe(false);
   });
   it('fails closed if the check child dies or returns an opened payload', () => {
-    for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' }]) {
+    for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
+      { status: 0, stdout: '{"reason":"opened","pr":7,"blockers":[]}' }]) {
       const run = createPrLandRunner({ env: {}, spawn: () => child, canonicalAudit: () => ({ ok: true }),
         prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }) });
       expect(run({ argv: ['--ref=lane/audit', '--check'] })).toMatchObject({ outcome: 'refused', reason: 'preflight-unconfirmed' });

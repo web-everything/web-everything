@@ -249,7 +249,7 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     }
     const child = classifySubmit(r ?? {});
     if (collectOnly) {
-      const childBlockers = child.blockers || (child.outcome === 'refused'
+      const childBlockers = child.blockers?.length ? child.blockers : (child.outcome === 'refused'
         ? [blocker('pr-land', child.reason, child.detail)]
         : child.reason === 'check-ok' ? [] : [blocker('pr-land', 'preflight-unconfirmed', child.detail || child.reason)]);
       const all = mergeBlockers(blockers, childBlockers);
