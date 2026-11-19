@@ -149,8 +149,8 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     readSharedOpenPrs(opts({ fields, exec }));
     const before = calls.length;
     markPrSnapshotDirty({ repo: REPO, env: { WE_PR_SNAPSHOT_DIR: dir }, nowMs: clock + 1 });
-    clock += 5 * 60_000;
-    const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: PAGING.heavyMaxAgeSeconds * 1000 });
+    clock += 60_000; // past the dirty floor is not needed: the snapshot is inside its TTL, the dirty mark is ignored
+    const seedOpts = opts({ fields, exec, cacheOnly: true, ttlMs: 75_000 });
     expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty mark still refuses a plain cache read
     const rows = readSharedOpenPrs({ ...seedOpts, ignoreDirty: true });
     expect(rows).toHaveLength(14);
