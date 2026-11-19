@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, test, vi } from 'vitest';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync, readFileSync, readSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { enqueueStuckTrace, drainStuckTraces, TRACE_TRIGGERS } from '../stuck-trace.mjs';
@@ -492,6 +492,47 @@ test('sink completion during the claim lease finishes the drain and never repeat
   assert.equal(f.events.length, 1);
   assert.equal(f.calls.length, 2);
   assert.equal(queue(f)[key].state, 'done');
+});
+
+test('delivery-history failure does not consume unrelated trace attempts', async t => {
+  const f = fixture(t), secondKey = `${repo}#18@${head}`;
+  const entry = { kind: 'ready-stuck', enqueuedAt: now, attempts: 1, claimedAt: now, state: 'queued' };
+  writeFileSync(join(f.root, 'stuck-trace-queue.json'), JSON.stringify({ [key]: entry, [secondKey]: entry }));
+  writeFileSync(f.options.env.WE_DAEMON_EVENTS, '{}\n');
+  let reads = 0;
+  const result = await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_001,
+    readHistory: (...args) => {
+      assert.equal(queue(f)[key].attempts, 2);
+      assert.equal(queue(f)[secondKey].attempts, 2);
+      if (++reads === 1) throw Error('unreadable delivery history');
+      return readSync(...args);
+    } });
+  assert.equal(result.processed, 2);
+  assert.equal(reads, 2);
+  assert.deepEqual(f.calls.map(args => args[1]), ['--pr=18', '--pr=18']);
+  assert.deepEqual(f.events.map(event => event.pr), [18]);
+  assert.equal(queue(f)[key].state, 'queued');
+  assert.equal(queue(f)[secondKey].state, 'done');
+});
+
+test('retry history reads at most 256 KiB at EOF', async t => {
+  const f = fixture(t);
+  enqueueStuckTrace(f.options);
+  await drainStuckTraces({ ...f.options, emit: () => false });
+  const history = '{}\n'.repeat(100_000)
+    + JSON.stringify({ kind: 'stuck-trace', detail: { traceKey: key } }) + '\n';
+  writeFileSync(f.options.env.WE_DAEMON_EVENTS, history);
+  const reads = [];
+  await drainStuckTraces({ ...f.options, now: Date.parse(now) + 600_000,
+    readHistory: (fd, buffer, offset, length, position) => {
+      reads.push({ bufferLength: buffer.length, offset, length, position });
+      return readSync(fd, buffer, offset, length, position);
+    } });
+  assert.deepEqual(reads, [{ bufferLength: 256 * 1024, offset: 0, length: 256 * 1024,
+    position: Buffer.byteLength(history) - 256 * 1024 }]);
+  assert.equal(queue(f)[key].state, 'done');
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.events.length, 0);
 });
 
 test('retry uses only the last 256 KB and leaves unavailable delivery history queued for manual inspection', async t => {

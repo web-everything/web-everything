@@ -82,13 +82,13 @@ export function enqueueStuckTrace({ repo, pr, head, kind, stateDir, now = Date.n
 
 // Retry evidence is bounded; if the retained tail cannot rule out delivery,
 // leave the entry queued and report manual inspection rather than risk a duplicate.
-function wasDelivered(traceKey, env) {
+function wasDelivered(traceKey, env, read = readSync) {
   let fd;
   try {
     fd = openSync(daemonEventsPath({ env }), 'r');
     const size = fstatSync(fd).size, start = Math.max(0, size - 256 * 1024);
     const buffer = Buffer.alloc(size - start);
-    if (readSync(fd, buffer, 0, buffer.length, start) !== buffer.length) throw Error('incomplete event tail');
+    if (read(fd, buffer, 0, buffer.length, start) !== buffer.length) throw Error('incomplete event tail');
     const lines = buffer.toString('utf8').split('\n');
     if (start) lines.shift(); // The first record may begin outside the retained tail.
     for (const line of lines) {
@@ -105,7 +105,7 @@ function wasDelivered(traceKey, env) {
 }
 
 export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), run,
-  emit = appendDaemonEvent, env = process.env } = {}) {
+  emit = appendDaemonEvent, env = process.env, readHistory = readSync } = {}) {
   if (!run && (isUnderTest(env) || isUnderTest())) return { processed: 0 };
   let processed = 0;
   try {
@@ -129,7 +129,12 @@ export async function drainStuckTraces({ stateDir, max = 2, now = Date.now(), ru
       const subject = /^([\w.-]+\/[\w.-]+)#([1-9]\d*)@(.+)$/.exec(key);
       if (!subject) { report(); continue; }
       const [, repo, pr, head] = subject;
-      const result = claim.attempts > 1 && wasDelivered(key, env) ? { posted: true }
+      let delivered = false;
+      if (claim.attempts > 1) {
+        try { delivered = wasDelivered(key, env, readHistory); }
+        catch { report(); continue; }
+      }
+      const result = delivered ? { posted: true }
         : await traceStuckPr({ repo, pr: Number(pr), head, kind: claim.kind, attempts: claim.attempts, run, emit, env });
       if (!result.posted && result.skipped !== 'superseded') continue;
       const completion = { state: 'done', ...(result.skipped === 'superseded' ? { reason: 'superseded' } : {}) };
