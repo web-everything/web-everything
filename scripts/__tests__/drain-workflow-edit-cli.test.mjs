@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { isGateSelfPath } from '../lib/review-escalation.mjs';
 import { isPolicySpecPath } from '../lib/gate-config.mjs';
 import { aiPr } from './fixtures/merge-ai-prs-fixtures.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 
 const source = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const sha = '07a3f88b3754b6d514d839a671ca102d770b92d0';
@@ -33,7 +34,11 @@ require('node:os').homedir = () => process.env.WORKFLOW_HOME;
 require('node:module').syncBuiltinESMExports();
 `);
     // No real git operations (including writes to .git) or network calls in this fixture.
-    writeFileSync(join(root, 'bin/git'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    writeFileSync(join(root, 'bin/git'), `#!/usr/bin/env node
+const pinned = (${pinnedLeafGitFixture})(process.argv.slice(2), [JSON.parse(process.env.WORKFLOW_PR)]);
+if (pinned === null) process.exit(1);
+require('node:fs').writeSync(1, pinned);
+`, { mode: 0o755 });
     writeFileSync(join(root, 'bin/gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);

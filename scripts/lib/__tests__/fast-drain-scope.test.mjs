@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { pinnedLeafGitFixture } from '../../__tests__/fixtures/pinned-leaf-git-fixture.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import { PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 import { buildManifest, embedManifestInBody, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
@@ -233,7 +234,7 @@ describe('mergeLiveTargetIntoRows', () => {
 describe('snapshot fast drain CLI dependency context', () => {
   const repo = 'fixture/repo';
   const pr = (number, item, blockedBy = []) => ({
-    number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: `sha${number}`,
+    number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: number.toString(16).padStart(40, '0'),
     updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
     mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
     labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [],
@@ -243,7 +244,7 @@ describe('snapshot fast drain CLI dependency context', () => {
   });
 
   // Exercise the actual listOne -> context -> planner wiring, with a still-servable snapshot that predates A.
-  // No git repository or network is needed: fake git supplies only the local repo identity.
+  // No git repository or network is needed: fake git supplies identity and pinned scoring evidence.
   const run = ({ snapshot, live, target = live.find(p => p.number === 7), failPage = false, extraLive = {} }) => {
     const dir = mkdtempSync(join(tmpdir(), 'fast-drain-context-'));
     try {
@@ -260,7 +261,14 @@ describe('snapshot fast drain CLI dependency context', () => {
       }
       writeFileSync(join(dir, 'fixture.json'), JSON.stringify({ live, target, failPage, extraLive }));
       writeFileSync(join(dir, 'calls.jsonl'), '');
-      writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/repo.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const fs = require('node:fs'), a = process.argv.slice(2);
+const f = JSON.parse(fs.readFileSync(process.env.CONTEXT_FIXTURE, 'utf8'));
+const pinned = (${pinnedLeafGitFixture})(a, f.live);
+if (pinned !== null) { fs.writeSync(1, pinned); process.exit(0); }
+if (a[0] === 'remote' && a[1] === 'get-url') { fs.writeSync(1, 'https://github.com/fixture/repo.git\\n'); process.exit(0); }
+process.exit(1);
+`, { mode: 0o755 });
       writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);

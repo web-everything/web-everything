@@ -1,6 +1,6 @@
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -10,6 +10,7 @@ import {
   planLabelDrain, revalidateForMerge,
 } from '../merge-ai-prs.mjs';
 import { aiPr } from './fixtures/merge-ai-prs-fixtures.mjs';
+import { pinnedLeafGitFixture } from './fixtures/pinned-leaf-git-fixture.mjs';
 
 const repo = 'web-everything/web-everything';
 const sha = '07a3f88b3754b6d514d839a671ca102d770b92d0';
@@ -131,7 +132,12 @@ describe('drain CLI required-check fallback wiring', () => {
     bin = join(root, 'bin');
     mkdirSync(bin);
     mkdirSync(join(root, 'backlog'));
-    execFileSync('git', ['init', '-q', root]);
+    // Serve pinned scoring evidence without a repository, .git writes or network.
+    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const pinned = (${pinnedLeafGitFixture})(process.argv.slice(2), [JSON.parse(process.env.CHECK_PR)]);
+if (pinned === null) process.exit(1);
+require('node:fs').writeSync(1, pinned);
+`, { mode: 0o755 });
     writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
