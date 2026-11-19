@@ -14,6 +14,37 @@ import { ROOT } from './fixtures/check-standards-rules-fixtures.mjs';
 
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 
+describe('delivery brief keeps tests and audit on the single final commit (PR #7085)', () => {
+  const body = read('skills-src/conveyor/delivery-agent-brief.md');
+  const step7a = body.split(/^### 7a\./m)[1]?.split(/^### 8\./m)[0] ?? '';
+  const step8 = body.split(/^### 8\./m)[1]?.split(/^### 9\./m)[0] ?? '';
+
+  it('requires the card to be resolved before step 7a tests the final commit', () => {
+    expect(step7a).toContain('On the single final commit (card already resolved per step 8)');
+    expect(step7a).not.toMatch(/Commit, then run/i);
+  });
+
+  it('states the same resolve, commit, verify, push, audit, PR order in both steps', () => {
+    const order = /resolve the card in the lane → make the single commit → run `verify-lane request`\/`check` at that HEAD → push → run `codex-audit` on that exact sha → open the PR/;
+    expect(step7a.replace(/\s+/g, ' ')).toMatch(order);
+    expect(step8.replace(/\s+/g, ' ')).toMatch(order);
+    const commands = [
+      'node scripts/operations/run.mjs resolve',
+      'git commit -F',
+      'node scripts/verify-lane.mjs request',
+      'git push origin HEAD:',
+      'node scripts/operations/run.mjs codex-audit',
+      'node scripts/operations/run.mjs open-pr',
+    ].map((command) => step8.indexOf(command));
+    expect(commands.every((index) => index >= 0)).toBe(true);
+    expect(commands).toEqual([...commands].sort((a, b) => a - b));
+  });
+
+  it('invalidates tests and audit if another commit moves HEAD', () => {
+    expect(step8).toContain('Any commit after the audit invalidates it: re-run tests and audit on the new HEAD.');
+  });
+});
+
 describe('conveyor briefs state the at-most-once, right-before-the-gate main-catchup policy (#4297)', () => {
   it('delivery-agent-brief.md: merges main at most once, right before the gate, never speculatively', () => {
     const body = read('skills-src/conveyor/delivery-agent-brief.md');
