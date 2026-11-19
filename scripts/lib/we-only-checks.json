@@ -26,5 +26,13 @@
   {
     "file": "scripts/lib/lane-alternates.mjs",
     "reason": "Names the one GitHub redirect pair (chalbert/web-everything to web-everything/web-everything) so a lane remote and the org URL read as the same repository; deliberately WE-specific and never widened to other repos."
+  },
+  {
+    "file": "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.mjs",
+    "reason": "This soak scenario must use the real registered repository slug so the review-capability admission check passes and the stale-accept recovery path is actually reached."
+  },
+  {
+    "file": "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.mjs",
+    "reason": "This soak scenario must use real registered repository slugs so review-capability admission reaches the injected declining and healthy round-cap outcomes."
   }
 ]

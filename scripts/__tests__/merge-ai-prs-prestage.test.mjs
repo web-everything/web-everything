@@ -72,7 +72,7 @@ else if (a[0] === 'show') {
 }
 `;
 
-async function world(fn, { slug = 'fixture/prestage' } = {}) {
+async function world(fn, { slug = 'web-everything/web-everything' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
   try {
     const bin = join(dir, 'bin'); mkdirSync(bin);
