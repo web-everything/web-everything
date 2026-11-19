@@ -1,0 +1,29 @@
+{
+  "$comment": "Delivery-mode routing (R826, operator 2026-11-09 21:19 ET). Kind -> Mode. Read by guard-delivery-mode.mjs (PreToolUse Agent hook). Edit here to re-route; an override needs 'Mode-override: R<n>' in the brief. Canonical repo setting, read through readSettings(). R1075: daemon-tooling uses its degraded route only when the daemon is not adopting or has been in a discard loop for more than 60 minutes.",
+  "routes": {
+    "forge": "debug",
+    "red-main": "debug",
+    "incident": "debug-to-merge",
+    "delivery-blocker": "debug-to-merge",
+    "investigation": "debug",
+    "daemon-tooling": "fast",
+    "ops-script": "fast",
+    "settings": "fast",
+    "cards": "fast",
+    "deflake": "fast",
+    "pr-delivery": "fast",
+    "product": "full",
+    "standard": "full",
+    "workflow": "full",
+    "security-boundary": "full"
+  },
+  "modes": {
+    "debug": "DEBUG MODE (R817/R823/R826/R852). Diagnose on the live system first (live files, logs, read-only ssh). Make the smallest fix that restores service, load it on the daemon (prototype-load), and prove it LIVE on the blocked case BEFORE any PR (R852, operator: 'confirm it work before pr ... always'). No PR until your report contains the live proof (the blocked PR/run moving, with ET times); if live proof is impossible, say why and stop before the PR. Red-green tests may follow the live fix: commit tests-only first, so red is still observable later. Audit at most 2 rounds (R825); disclose small residual risk as ruled under R825 and file one reinforce-later card. If verify is load-deferred or infra-failed, push the branch as lane/<purpose> and report; do not loop. Never: bypass flags, --force, secrets, pkill.",
+    "fast": "FAST MODE (R825/R826). One build, ONE verify at the end, audit at most 2 rounds. Small residual risk is ruled under R825, disclosed in the PR body, with one reinforce-later card. If verify is load-deferred, push the branch and report. Open the PR straight to ready-to-merge. No converge loop beyond the configured self-review cap.",
+    "full": "FULL MODE. The standard process: red-green, verify, the canonical audit NOT WEAKENED (or an operator ruling), PR, review and red-team. Use for product, standards, workflow and trust-boundary changes.",
+    "debug-to-merge": "DEBUG-TO-MERGE MODE (R1076, rule 31). For a delivery blocker or incident: prove the fix live on the prototype (prototype-load) until the blocked PR merges, THEN open the fix PR. Audit at most 2 rounds; one canonical audit; disclose small residual risk under R825 with one reinforce-later card. No PR before live proof (ET times). Skips: GitHub CI wait for the blocked PR path, extra non-security audit rounds, converge loop. Never: bypass flags, --force, secrets, pkill."
+  },
+  "daemonDegradedModes": {
+    "daemon-tooling": "debug-to-merge"
+  }
+}
