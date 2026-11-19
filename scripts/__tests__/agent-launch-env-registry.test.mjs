@@ -21,6 +21,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const registry = JSON.parse(readFileSync(join(root, 'scripts/lib/agent-launch-env-registry.json'), 'utf8'));
 // Same bounded inventory used to generate the registry. Include literal bracket and optional reads,
 // prose examples conservatively too; exclude test/spec files and test/fixture directory trees.
+// This documents literal reads; computed env[envName] reads can be absent. Unknown ambient
+// names still inherit parent parity, while unknown caller-bag names remain excluded.
 const reads = /\b(?:process\.env|env)(?:\??\.([A-Za-z_][A-Za-z0-9_]*)|(?:\?\.)?\s*\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\])/g;
 function namesIn(text) {
   return [...new Set([...text.matchAll(reads)].map(match => match[1] ?? match[2]))].sort();

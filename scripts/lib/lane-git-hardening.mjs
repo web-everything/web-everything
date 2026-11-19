@@ -68,13 +68,16 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
 
 // Remote proofs use a restricted transport policy. Ordinary hardened callers also fetch/clone
 // from local and HTTP origins, so changing their transport policy here would break those callers.
-const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
+export const REMOTE_PROBE_CONFIG_PINS = Object.freeze([
   ['protocol.allow', 'never'],
   ['protocol.https.allow', 'always'],
   ['protocol.http.allow', 'always'],
   ['protocol.git.allow', 'always'],
   ['protocol.ssh.allow', 'always'],
 ]);
+
+/** History proofs also refuse lane-written commit-graph parent substitutions. */
+export const LANE_HISTORY_CONFIG_PINS = Object.freeze([['core.commitGraph', 'false']]);
 
 /** The two pins that switch off credential helpers and askpass. Left out only for a call in the validated primary. */
 const CREDENTIAL_PIN_KEYS = Object.freeze(['credential.helper', 'core.askPass']);
@@ -228,8 +231,8 @@ export function laneGitHardeningEnv(env = process.env, { remoteProbe = false, cr
 export function laneHistoryProofEnv(env = process.env, options) {
   const out = { ...laneGitHardeningEnv(env, options), GIT_GRAFT_FILE: '/dev/null' };
   const at = Number.parseInt(String(out.GIT_CONFIG_COUNT ?? '0'), 10);
-  out[`GIT_CONFIG_KEY_${at}`] = 'core.commitGraph';
-  out[`GIT_CONFIG_VALUE_${at}`] = 'false';
+  out[`GIT_CONFIG_KEY_${at}`] = LANE_HISTORY_CONFIG_PINS[0][0];
+  out[`GIT_CONFIG_VALUE_${at}`] = LANE_HISTORY_CONFIG_PINS[0][1];
   out.GIT_CONFIG_COUNT = String(at + 1);
   return out;
 }

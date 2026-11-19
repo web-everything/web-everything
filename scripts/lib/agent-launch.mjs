@@ -3,9 +3,11 @@
  * PR #7022's fourteen attack classes (shell/env/other wrappers, raw options, option
  * smuggling, expanded ids, accessors, Proxies, argv0, execPath/execArgv, runtime
  * env, shell env, HOME, mutation/aliasing) shared one root: inspected and executed
- * views differed. No caller argv, unclassified env, binary, or spawn options cross this boundary.
- * Environment threat model: known ambient process.env inherits parent parity minus
- * the registry's never list; value gates and absolute-path validation still apply.
+ * views differed. No caller argv, unclassified caller env, binary, or spawn options cross this boundary.
+ * Environment threat model: ambient process.env, including unknown names, inherits
+ * parent parity (main parity) minus the registry's never list; value gates and
+ * absolute-path validation still apply. Ambient indexed Git config passes only as
+ * a complete set of exact hardening pins; caller Git config is always ignored.
  * Caller inheritEnv is tighten-only: registry classes, parent precedence, and numeric
  * ceilings constrain it. A positive bag limit needs an ambient ceiling; a documented
  * strict zero cannot relax configured policy. Ambient quantities survive verbatim.
@@ -19,6 +21,7 @@ import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { types } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { LANE_GIT_CONFIG_PINS, REMOTE_PROBE_CONFIG_PINS, LANE_HISTORY_CONFIG_PINS } from './lane-git-hardening.mjs';
 
 const FIXED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const ENV_REGISTRY = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'agent-launch-env-registry.json'), 'utf8'));
@@ -83,7 +86,7 @@ function paths(value, name) {
   if (!Array.isArray(value)) fail(`${name} must be an array`);
   return value.map(p => absolute(p, name));
 }
-// Exact > trailing-* prefix > leading-* suffix. Unknown names fail closed.
+// Exact > trailing-* prefix > leading-* suffix. Unknown caller names fail closed.
 function envRule(key) {
   if (Object.hasOwn(ENV_REGISTRY, key)) return ENV_REGISTRY[key];
   return ENV_PREFIXES.find(([pattern]) => key.startsWith(pattern.slice(0, -1)))?.[1]
@@ -115,14 +118,34 @@ function classOf(rule, value, ceiling) {
   }
   return rule?.class;
 }
+// The sole indexed-config exception to GIT_*: validate the entire parent set first.
+function ambientGitConfig(ambient) {
+  const raw = ambient.GIT_CONFIG_COUNT;
+  if (!/^\d+$/.test(raw)) return {};
+  const count = Number(raw);
+  // A complete set needs two distinct entries per pin. Reject impossible counts
+  // before iterating; incomplete/oversized sets are dropped, so Git uses its defaults.
+  if (!Number.isSafeInteger(count) || count * 2 + 1 > Object.keys(ambient).length) return {};
+  const pins = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
+  const out = { GIT_CONFIG_COUNT: raw };
+  for (let i = 0; i < count; i++) {
+    const key = `GIT_CONFIG_KEY_${i}`, value = `GIT_CONFIG_VALUE_${i}`;
+    if (!Object.hasOwn(ambient, key) || !Object.hasOwn(ambient, value)
+      || !pins.some(([k, v]) => ambient[key] === k && ambient[value] === v)) return {};
+    out[key] = ambient[key]; out[value] = ambient[value];
+  }
+  return out;
+}
 function inheritedEnv(inherit, ambient) {
   const out = Object.create(null);
+  Object.assign(out, ambientGitConfig(ambient));
   const checked = (rule, value, key) => rule.value === 'absolute-path' ? absolute(value, key)
     : rule.tighterThan ? String(quantity(value, rule.tighterThan))
     : rule.restrictiveValues?.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : value;
   for (const [key, value] of Object.entries(ambient)) {
     const rule = envRule(key);
-    if (!rule || rule.never) continue;
+    if (!rule) { out[key] = value; continue; }
+    if (rule.never) continue;
     if (rule.restrictiveValues || rule.restrictivePrefixes) {
       if (classOf(rule, value) === 'forward-restrictive') out[key] = checked(rule, value, key);
     } else {

@@ -5204,8 +5204,12 @@ same locked library helper; recovery failure must prevent retirement and unload 
 
 Registry lookup is exact name, then trailing-star prefix, then leading-star suffix.
 A restrictive exact rule overrides a dangerous family (notably GIT_ALLOW_PROTOCOL and
-Git hardening predicates). Unknown ambient names remain excluded; the drift inventory
-keeps repository env reads known. Audit affirmative dangerous `why` reasons and exact
+Git hardening predicates). Unknown ambient names inherit verbatim, preserving computed
+settings such as `WE_PR_LIMIT_WE=0`; unknown caller-bag names remain excluded. The drift
+inventory documents literal repository env reads, not completeness of computed reads.
+Ambient indexed Git config is all-or-nothing: every pair must exactly match an exported
+lane, remote-probe or history-proof hardening pin. Caller-bag config and other Git config
+sources stay excluded. Audit affirmative dangerous `why` reasons and exact
 members of never families too: exact precedence must not accidentally reopen a family.
 Never rules cover runtime/shell injection, launcher-owned paths, exec redirects,
 credentials and guard bypasses. Do not classify a restrictive refusal or a reason

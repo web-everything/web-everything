@@ -106,6 +106,7 @@
   "GIT_OPTIONAL_LOCKS": {"class": "drop", "why": "Value-dependent: read-only probes suppress optional index writes; other values stay dropped. Evidence: scripts/lib/health-watch-lane-scan.mjs:165.", "restrictiveValues": ["0", "false", "no", "off"]},
   "GIT_REFERENCE_BACKEND": {"class": "drop", "never": true, "why": "Caller override is not required by the agent; keep the owning tool default."},
   "GIT_REF_PARANOIA": {"class": "drop", "why": "Value-dependent: broken refs abort instead of being hidden; other values stay dropped. Evidence: scripts/lib/lane-git-hardening.mjs:118.", "restrictiveValues": ["1"]},
+  "GIT_TERMINAL_PROMPT": {"class": "drop", "why": "Value-dependent: disables interactive credential prompts; other values stay dropped. Evidence: scripts/lib/lane-git-hardening.mjs:177.", "restrictiveValues": ["0"]},
   "GMAIL_ACCESS_TOKEN": {"class": "drop", "never": true, "why": "Credential or credential provenance; child tooling must obtain its own authentication."},
   "GMAIL_ADDRESS": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "GOAL": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},

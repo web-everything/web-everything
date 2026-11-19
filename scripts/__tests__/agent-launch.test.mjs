@@ -7,6 +7,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync,
 import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary, buildAgentPath } from '../lib/agent-launch.mjs';
 import { defaultShimDir, checkoutShimDir, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
 import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
 import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 
@@ -162,6 +163,7 @@ describe('built invocation positive controls', () => {
     vi.stubEnv('PATH', '/arbitrary-ambient');
     vi.stubEnv('USER', 'parent-user');
     vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    vi.stubEnv('SEC1_POSITIVE_CONTROL', 'parent-unknown');
     const input = { cwd, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high', env: { PATH: '/usr/bin:/bin' }, ...extra };
     const d = buildCodexDirectTaskDescriptor(input);
     const configPath = fixedPath(CODEX_SHIM_DIR);
@@ -174,11 +176,11 @@ describe('built invocation positive controls', () => {
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(process.execPath, expected, expect.objectContaining({ shell: false, detached: true, cwd, stdio: ['pipe', 'pipe', 'pipe'] }));
     expect(isAbsolute(io.spawn.mock.calls[0][0])).toBe(true);
-    // A PATH-only caller bag retains known ambient metadata and parent restrictions.
+    // A PATH-only caller bag retains ambient metadata (including unknown names) and restrictions.
     const env = io.spawn.mock.calls[0][2].env;
-    expect(env).toMatchObject({ USER: 'parent-user', WE_DAEMON_MANAGED_CLONE: '1' });
+    expect(env).toMatchObject({ USER: 'parent-user', WE_DAEMON_MANAGED_CLONE: '1', SEC1_POSITIVE_CONTROL: 'parent-unknown' });
     expect(Object.keys(env).every(k => ['PATH', 'HOME'].includes(k)
-      || (Object.hasOwn(registry, k) && !registry[k].never))).toBe(true);
+      || Object.hasOwn(process.env, k))).toBe(true);
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
     const tempRoot = '/task "quote" \\ $TMP';
@@ -321,7 +323,7 @@ describe('three-class environment boundary', () => {
     expect(env).toMatchObject({ WE_GH_DAEMON_CALLER: 'host-daemon', LC_MESSAGES: 'C' });
     expect(env.USER).toBe('host-user');
   });
-  it('ignores plain drop rules in the bag and drops unknown names from either source', () => {
+  it('ignores plain drop and unknown bag names while preserving unknown ambient names', () => {
     const dropped = Object.keys(registry).filter(key => registry[key].class === 'drop' && !key.includes('*'));
     const unknown = ['SEC1_UNKNOWN', 'SEC1_UNREGISTERED'];
     for (const key of dropped) clearEnv(key);
@@ -330,7 +332,7 @@ describe('three-class environment boundary', () => {
     for (const key of [...dropped, ...unknown].filter(key => !['PATH', 'HOME'].includes(key))) expect(explicit, key).not.toHaveProperty(key);
     for (const key of unknown) vi.stubEnv(key, 'hostile');
     const ambient = buildAgentInvocation(base(), seam()).options.env;
-    for (const key of unknown) expect(ambient, key).not.toHaveProperty(key);
+    for (const key of unknown) expect(ambient[key], key).toBe('hostile');
     for (const env of [ambient, explicit]) {
       expect(env.HOME).toBe(userInfo().homedir);
       expect(env.PATH).toBe(fixedPath());
@@ -528,6 +530,81 @@ describe('#7022 audit escapes are closed by construction', () => {
     expect([file, ...args]).not.toContain('sh');
     expect(args).not.toContain('-c');
     expect(options.shell).toBe(false);
+  });
+});
+
+describe('final audit: ambient hardening pins and unregistered parent restrictions', () => {
+  const envOf = inheritEnv => buildAgentInvocation({ ...base(), inheritEnv }, seam()).options.env;
+  const configOf = env => Object.fromEntries(Object.entries(env).filter(([key]) => /^GIT_CONFIG_/.test(key)));
+  const setParent = env => { for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value); };
+  beforeEach(() => {
+    for (const key of Object.keys(process.env).filter(key => key.startsWith('GIT_CONFIG_'))) clearEnv(key);
+  });
+  it.each([
+    ['lane', () => laneGitHardeningEnv({})],
+    ['remote and history proof', () => laneHistoryProofEnv({}, { remoteProbe: true })],
+  ])('preserves every exact %s hardening pair and GIT_TERMINAL_PROMPT=0 in the child', (_label, parentEnv) => {
+    const parent = parentEnv();
+    setParent(parent);
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', 'core.hooksPath=.githooks');
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/untrusted/global');
+    vi.stubEnv('GIT_CONFIG_SYSTEM', '/untrusted/system');
+    const io = seam();
+    launchAgent({ ...base(), inheritEnv: {} }, io);
+    const env = io.spawn.mock.calls[0][2].env;
+    expect(configOf(env)).toEqual(configOf(parent));
+    expect(env).toMatchObject({ GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1' });
+    const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+    expect(pairs).toContainEqual(['core.hooksPath', '/dev/null']);
+  });
+  it.each([
+    ['core.sshCommand', '/untrusted/ssh'], ['core.hooksPath', '.githooks'],
+    ['credential.helper', '/untrusted/helper'], ['unregistered.config', 'false'],
+    ['core.hookspath', '/dev/null'], ['core.fsmonitor', 'FALSE'],
+    // Exec-redirect keys are never accepted, whatever their value.
+    ['core.pager', 'less'], ['core.editor', 'vi'], ['diff.external', '/untrusted/diff'],
+    ['diff.any.textconv', '/untrusted/conv'], ['protocol.ext.allow', 'always'],
+    ['url.ext::sh -c touch% /tmp/x.insteadOf', 'https://'],
+  ])('drops the entire ambient set for one extra non-pin %s=%s', (key, value) => {
+    const parent = laneGitHardeningEnv({}), at = Number(parent.GIT_CONFIG_COUNT);
+    setParent({ ...parent, GIT_CONFIG_COUNT: String(at + 1), [`GIT_CONFIG_KEY_${at}`]: key, [`GIT_CONFIG_VALUE_${at}`]: value });
+    expect(configOf(envOf({}))).toEqual({});
+  });
+  it.each(['', '-1', '1.5', '1x', ' 1', '1e0', 'Infinity', '9007199254740992', '999999999'])
+    ('drops malformed or impossible ambient count %j without forwarding a partial set', count => {
+      setParent({ GIT_CONFIG_COUNT: count, GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+      expect(configOf(envOf({}))).toEqual({});
+    });
+  it.each(['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])
+    ('drops the entire set when %s is missing', missing => {
+      setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+      clearEnv(missing);
+      expect(configOf(envOf({}))).toEqual({});
+    });
+  it('preserves a zero count verbatim and drops orphan indexed entries', () => {
+    setParent({ GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks' });
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '0' });
+  });
+  it('ignores caller-bag pins with no ambient set and cannot overwrite a valid ambient set', () => {
+    const bag = laneGitHardeningEnv({});
+    expect(configOf(envOf(bag))).toEqual({});
+    const parent = laneHistoryProofEnv({}, { remoteProbe: true });
+    setParent(parent);
+    expect(configOf(envOf({ ...bag, GIT_CONFIG_VALUE_0: 'true' }))).toEqual(configOf(parent));
+  });
+  it('forwards unregistered ambient WE_PR_LIMIT_WE=0 and arbitrary values but drops unknown bag names', () => {
+    for (const name of ['WE_PR_LIMIT_WE', 'SEC1_ARBITRARY_UNKNOWN', 'SEC1_BAG_UNKNOWN']) clearEnv(name);
+    setParent({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
+    expect(envOf({ SEC1_BAG_UNKNOWN: 'bag', SEC1_ARBITRARY_UNKNOWN: 'replacement' }))
+      .toMatchObject({ WE_PR_LIMIT_WE: '0', SEC1_ARBITRARY_UNKNOWN: ' verbatim\nvalue ' });
+    expect(envOf({ SEC1_BAG_UNKNOWN: 'bag' })).not.toHaveProperty('SEC1_BAG_UNKNOWN');
+  });
+  it('never forwards unregistered FOO_TOKEN or LD_FOO from either source', () => {
+    const blocked = { FOO_TOKEN: 'credential', LD_FOO: 'loader' };
+    setParent(blocked);
+    for (const env of [envOf({}), envOf(blocked)]) {
+      for (const key of Object.keys(blocked)) expect(env).not.toHaveProperty(key);
+    }
   });
 });
 
