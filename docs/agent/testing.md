@@ -5136,3 +5136,11 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+## Carry-proof repository isolation
+
+Carry-proof Git calls use `carryProofEnv`: scrub repository-location overrides before
+applying history pins, including the inert graft-file pin. Keep the traced-call
+assertions in `carry-proof-git-hardening.test.mjs` on every proof path, including the
+final name-only diff. The real non-repository-target test must return no fingerprint
+even when inherited `GIT_DIR` points to a valid repository.

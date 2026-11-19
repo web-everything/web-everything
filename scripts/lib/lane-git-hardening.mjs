@@ -234,6 +234,15 @@ export function laneHistoryProofEnv(env = process.env, options) {
   return out;
 }
 
+/** Carry proofs must read the requested repository, with no inherited repository or history redirects.
+ * Scrub locations before pinning history so the inert graft-file pin survives. Pure.
+ * @param {Record<string,string|undefined>} env
+ * @returns {Record<string,string|undefined>}
+ */
+export function carryProofEnv(env = process.env) {
+  return laneHistoryProofEnv(scrubGitLocationEnv(env));
+}
+
 /** The argv that lists a lane's effective config with each entry's scope, NUL-separated (`scope\0key\nvalue\0…`). Reading
  *  config executes nothing. */
 export const LANE_CONFIG_LIST_ARGS = Object.freeze(['config', '--show-scope', '--list', '--includes', '-z']);

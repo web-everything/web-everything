@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { laneHistoryProofEnv } from './lib/lane-git-hardening.mjs';
+import { carryProofEnv } from './lib/lane-git-hardening.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
@@ -4206,7 +4206,7 @@ function isExecContractError(err) {
 export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [] } = {}) {
   const run = exec;
   if (typeof run === 'function') exec = (file, args, options) => run(file, args, { ...options,
-    env: laneHistoryProofEnv({ ...process.env, ...options?.env }) });
+    env: carryProofEnv({ ...process.env, ...options?.env }) });
   // The identity of the REQUEST this basis answers. Rides both the ok and the failure shape so a shared basis
   // is checkable in every case — an `{ok:false}` basis for the wrong ref must not be reported as this ref's
   // own `'ref-unresolved'` either (that reads as "this branch is gone", which is a different fact).
@@ -4290,7 +4290,7 @@ export function resolveNetDiffBasis({ exec, remote = 'origin', base = 'main', re
 export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
   const run = exec;
   if (typeof run === 'function') exec = (file, args, options) => run(file, args, { ...options,
-    env: laneHistoryProofEnv({ ...process.env, ...options?.env }) });
+    env: carryProofEnv({ ...process.env, ...options?.env }) });
   const empty = { changedFiles: [], diffLines: 0, scored: false, humanBasisFiles: [] };
   if (typeof exec !== 'function' || !rev) return empty;
   const baseRevOk = typeof baseRev === 'string' && /^[0-9a-f]{7,64}$/i.test(baseRev);
@@ -4347,7 +4347,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
 export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const run = exec;
   if (typeof run === 'function') exec = (file, args, options) => run(file, args, { ...options,
-    env: laneHistoryProofEnv({ ...process.env, ...options?.env }) });
+    env: carryProofEnv({ ...process.env, ...options?.env }) });
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -4497,6 +4497,9 @@ export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', 
  * @returns {{paths:string[], base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'}}
  */
 export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [] } = {}) {
+  const run = exec;
+  if (typeof run === 'function') exec = (file, args, options) => run(file, args, { ...options,
+    env: carryProofEnv({ ...process.env, ...options?.env }) });
   const unscored = { paths: [], base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });

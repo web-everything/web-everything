@@ -17,8 +17,11 @@ vi.mock('../red-team-skip-outcome.mjs', async importOriginal => ({
   ...await importOriginal(), settleRedTeamSkip: input => input.io.carry,
 }));
 
+const repositoryRedirectKeys = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM'];
 let repo, base, head, alternate;
-const hostile = () => ({ ...process.env, GIT_NO_REPLACE_OBJECTS: undefined,
+const hostile = () => ({ ...process.env, ...Object.fromEntries(repositoryRedirectKeys.map(key => [key, 'forged-location'])), GIT_NO_REPLACE_OBJECTS: undefined,
   GIT_GRAFT_FILE: 'forged-grafts', GIT_CONFIG_COUNT: '1',
   GIT_CONFIG_KEY_0: 'core.commitGraph', GIT_CONFIG_VALUE_0: 'true' });
 const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8',
@@ -54,6 +57,7 @@ function hardened(calls) {
   expect(calls.length).toBeGreaterThan(0);
   for (const { file, options: { env } } of calls) {
     expect(file).toBe('git');
+    for (const key of repositoryRedirectKeys) expect(env).not.toHaveProperty(key);
     expect(env.GIT_NO_REPLACE_OBJECTS).toBe('1');
     expect(env.GIT_GRAFT_FILE).toBe('/dev/null');
     const pins = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
@@ -67,6 +71,20 @@ it.each([undefined, '0'])('netDiffFingerprint hardens every reader call with rep
   expect(netDiffFingerprint(repo, base, head, { exec: io.exec, env: { ...hostile(), GIT_NO_REPLACE_OBJECTS: replace } })).toMatch(/^[a-f0-9]{64}$/);
   expect(io.calls).toHaveLength(4);
   hardened(io.calls);
+});
+
+it('netDiffFingerprint refuses a non-repository target despite an inherited GIT_DIR pointing at a real repository', () => {
+  const env = { ...process.env, GIT_DIR: join(repo, '.git') };
+  expect(netDiffFingerprint(repo, base, head, { env })).toMatch(/^[a-f0-9]{64}$/);
+  expect(netDiffFingerprint('/', base, head, { env })).toBeNull();
+});
+
+it('merge net-diff paths hardens the final name-only diff and preserves diff visibility flags', () => {
+  const io = reader();
+  expect(computeNetDiffPaths({ exec: io.exec, rev: 'proof' })).toMatchObject({ scored: true, paths: ['code.txt'] });
+  hardened(io.calls);
+  const diff = io.calls.find(c => c.args.includes('--name-only'));
+  expect(diff.args).toEqual(expect.arrayContaining(['--no-textconv', '--ignore-submodules=none']));
 });
 
 it('canonical audit hardens its git runner and nested fingerprint reader', () => {
@@ -87,7 +105,7 @@ it('canonical audit hardens its git runner and nested fingerprint reader', () =>
   hardened(io.calls);
 });
 
-it.each(['basis', 'changed files', 'text', 'shared changed files', 'shared text'])('merge net-diff %s hardens every git call', mode => {
+it.each(['basis', 'changed files', 'paths', 'text', 'shared changed files', 'shared text'])('merge net-diff %s hardens every git call', mode => {
   for (const [key, value] of Object.entries(hostile())) {
     if (key.startsWith('GIT_')) vi.stubEnv(key, value);
   }
@@ -95,7 +113,8 @@ it.each(['basis', 'changed files', 'text', 'shared changed files', 'shared text'
   if (mode.startsWith('shared')) input.basis = resolveNetDiffBasis(input);
   io.calls.length = 0;
   const result = mode === 'basis' ? resolveNetDiffBasis(input)
-    : mode.includes('changed files') ? computeNetDiffChangedFiles({ ...input, baseRev: base })
+    : mode === 'paths' ? computeNetDiffPaths(input)
+      : mode.includes('changed files') ? computeNetDiffChangedFiles({ ...input, baseRev: base })
       : computeNetDiffText({ ...input, pinRev: true });
   expect(result.ok ?? result.scored).toBe(true);
   hardened(io.calls);

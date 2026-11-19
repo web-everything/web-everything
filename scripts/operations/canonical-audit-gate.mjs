@@ -7,7 +7,7 @@ import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
-import { laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
+import { carryProofEnv } from '../lib/lane-git-hardening.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
@@ -30,7 +30,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
-    env: laneHistoryProofEnv(env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    env: carryProofEnv(env), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
   })).trim();
   let fullSha;
   try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).toLowerCase(); } catch { /* refuse below */ }

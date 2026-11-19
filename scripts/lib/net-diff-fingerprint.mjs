@@ -1,4 +1,4 @@
-import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
+import { carryProofEnv } from './lane-git-hardening.mjs';
 /**
  * @file scripts/lib/net-diff-fingerprint.mjs
  * @description R503: the ONE shared "did the code change?" test for every carry (operator approval, canonical
@@ -22,7 +22,7 @@ const FP = /^[0-9a-f]{64}$/i;
 export function netDiffFingerprint(repo, base, head, { exec = execFileSync, env = process.env } = {}) {
   try {
     if (typeof repo !== 'string' || !repo || !REF.test(String(base ?? '')) || !REF.test(String(head ?? ''))) return null;
-    const raw = (args) => exec('git', ['-C', repo, ...args], { env: laneHistoryProofEnv(env), encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 });
+    const raw = (args) => exec('git', ['-C', repo, ...args], { env: carryProofEnv(env), encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 });
     const run = (args) => Buffer.from(raw(args) ?? '').toString('utf8');
     const sha = (rev) => { const s = run(['rev-parse', '--verify', '--end-of-options', `${rev}^{commit}`]).trim(); return /^[0-9a-f]{40,64}$/i.test(s) ? s : null; };
     const headSha = sha(head), baseSha = sha(base);

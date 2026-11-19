@@ -88,7 +88,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { laneGitHardeningEnv, laneHistoryProofEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, carryProofEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
@@ -452,7 +452,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         lanePath: input.carry.lanePath,
         skipPolicy: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
         proveMove: move => proveCardOnlyHeadMove({ ...move,
-          exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv({ ...env, ...options?.env }) }) }),
+          exec: (file, args, options) => exec(file, args, { ...options, env: carryProofEnv({ ...env, ...options?.env }) }) }),
         applyLabel: ({ repo, pr }) => {
           provider.ensureLabel(repo, 'red-team:clear', RED_TEAM_STATUS_LABEL_META['red-team:clear']);
           provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
@@ -566,7 +566,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
     proveCardOnlyHeadMove: ({ lanePath, ...move } = {}) => (typeof lanePath === 'string' && lanePath
       ? proveCardOnlyHeadMove({ ...move, cwd: lanePath,
-        exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv({ ...env, ...options?.env }) }) })
+        exec: (file, args, options) => exec(file, args, { ...options, env: carryProofEnv({ ...env, ...options?.env }) }) })
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
@@ -583,7 +583,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { headSha: view.headRefOid, comments };
     },
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha, env,
-      exec: (f, a, o) => exec(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env: laneHistoryProofEnv({ ...env, ...o.env }) }) }),
+      exec: (f, a, o) => exec(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env: carryProofEnv({ ...env, ...o.env }) }) }),
     restampVerdict: ({ pr, repo, newHead, reason }) => {
       const r = spawnSync(process.execPath, [...heapCapArgs('review-set-label'), join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`,
         '--to=restamp', '--actor=review-carry', `--new-head=${newHead}`, `--reason=${reason}`],
