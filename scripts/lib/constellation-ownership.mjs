@@ -80,9 +80,15 @@ export function existingTrackedPaths(paths, lstat = path => lstatSync(resolve(ro
   });
 }
 
-export function readTracked(path, lstat = lstatSync, indexMode = path =>
-  execFileSync('git', ['ls-files', '-s', '-z', '--', path], { cwd: root, encoding: 'utf8' })
-    .match(/^(\d{6}) /)?.[1]) {
+export function readTracked(path, lstat = lstatSync, indexMode = path => {
+  const records = execFileSync('git', ['ls-files', '-s', '-z', '--', path], { cwd: root, encoding: 'utf8' })
+    .split('\0');
+  for (const record of records) {
+    const match = record.match(/^(\d{6}) [0-9a-f]+ [0-3]\t([\s\S]*)$/);
+    if (match?.[2] === path) return match[1];
+  }
+  return undefined;
+}) {
   const filename = resolve(root, path);
   const stat = lstat(filename);
   if (stat.isSymbolicLink()) return Buffer.from(readlinkSync(filename));

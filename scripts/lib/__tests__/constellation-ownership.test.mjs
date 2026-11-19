@@ -129,6 +129,16 @@ describe('constellation ownership', () => {
     }
   });
 
+  it('counts a projected directory using the default lookup for an exact indexed symlink', () => {
+    const fakeDirLstat = () => ({ isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false });
+    expect(readTracked('.claude/agent-memory', fakeDirLstat)).toEqual(Buffer.from('.claude/agent-memory'));
+  });
+
+  it.each(['.claude', 'scripts'])('rejects directory %s without an exact index entry using the default lookup', path => {
+    const fakeDirLstat = () => ({ isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false });
+    expect(() => readTracked(path, fakeDirLstat)).toThrow(`Cannot count non-file: ${path}`);
+  });
+
   it.each(['100644', undefined])('rejects a directory with non-symlink or missing index mode %s', mode => {
     const scratch = mkdtempSync(join(tmpdir(), 'constellation-ownership-'));
     try {
