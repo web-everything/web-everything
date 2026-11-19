@@ -2176,7 +2176,7 @@ it('declares sandbox-exec confinement and propagates a host confinement refusal 
 it.each([{exitCode:1}, {exitCode:null}, {exitCode:0,timedOut:true}])('reports failed Gemini task %j with its final message', async failure => {
   const {resolveFixProvider} = await import('../fix-run.mjs');
   const provider = await resolveFixProvider('antigravity');
-  await expect(provider.spawn({prompt:'edit',kind:'doc-fix',size:1,scope:['docs'],sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({status:'failed',...failure,events:{agentMessages:['diagnosis']}})}))
+  await expect(provider.spawn({prompt:'edit',kind:'doc-fix',size:1,scope:['docs'],sessionSlug:'fix-7'}, {resolveLane:()=>'/lane',runTask:async()=>({status:'ok',...failure,events:{agentMessages:['diagnosis']}})}))
     .rejects.toMatchObject({finalMessage:'diagnosis'});
 });
 
