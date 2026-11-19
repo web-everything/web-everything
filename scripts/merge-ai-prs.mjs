@@ -6205,7 +6205,7 @@ async function runCli() {
         },
         manifestFree: () => !!behindCleanDir && headTreeLacksManifestFile({
           headRef: v.headRef, headSha: v.listedHeadSha || v.headSha, prNumber: v.num,
-          git: (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: behindCleanDir }),
+          git: (args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], cwd: behindCleanDir, maxBuffer: 16 * 1024 * 1024 }),
         }),
       });
       if (!rebase) {
