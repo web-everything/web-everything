@@ -5,7 +5,8 @@ commit/push. Four layers reduce that risk:
 
 - User-level `permissions.deny` blocks Read/Edit/Write on protected paths.
 - The separate PreToolUse hook denies matching Bash and file-tool requests from
-  agents (`agent_id`, `agent_type`, or `WE_CONVEYOR_WORKER=1`); operator requests ask.
+  agents (`agent_id`, `agent_type`, `WE_CONVEYOR_WORKER=1`, or non-empty
+  `WE_DISPATCH_KIND`); operator requests ask.
 - Git hooks run gitleaks on staged content and each actual pushed range. New refs
   scan their reachable history, including older commits. Findings/scanner errors block.
 - GitHub push protection provides a server-side backstop.
@@ -67,12 +68,18 @@ repeated separators, dot segments and lexical parent segments resolve. Glob patt
 that can reach protected paths also deny. Recursive reads of an ancestor of a protected
 path (including home, `/`, and `~/.config/gh`) deny for archives, copies, recursive
 searches, find content/output actions, and Git add/commit paths. Literal `cd`/`pushd` targets carry the working directory into later compound
-segments; subshell parentheses restore the outer directory. Tar/zip directory options
+segments; subshell parentheses restore the outer directory. A single `&` separates
+commands; background `cd` does not change the parent directory. `&&`, `&>`, and
+descriptor redirects retain their existing meanings. Tar/zip directory options
 and Git `-C` resolve operands within their command. Computed directory targets
 (including `cd -`) make the directory unknown: later relative credential names deny
 with advice to use an explicit absolute path. Metadata listings still pass. Use explicit non-protected subpaths such as
 `~/projects` instead. Metadata listings and non-recursive reads of unrelated files
-remain allowed; `.env*` retains its basename rule rather than forbidding all directories.
+remain allowed. Recursive operands also inspect directory names/metadata for non-example
+`.env*` descendants, through depth 4, skipping `node_modules` and `.git`, with a
+4096-entry budget per operand. Clean trees pass. Unreadable or incomplete scans deny:
+use narrower explicit subpaths and retry, or ask the operator to inspect the tree.
+The matcher accepts injectable `fs.lstatSync` / `fs.readdirSync` for hermetic tests.
 Git, gh, scp, rsync, and curl deny protected path arguments;
 Git/gh commands without those arguments follow normal permission flow. Content
 reads, copies, archives, transforms, interpreters referencing protected paths and input

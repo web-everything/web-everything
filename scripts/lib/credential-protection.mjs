@@ -1,5 +1,5 @@
 /**
- * R1082: lexical content-read boundary, pure and filesystem independent.
+ * R1082: lexical content-read boundary with bounded directory inspection for .env*.
  * ls (including -l) is names/metadata only and falls through. Only ssh and ssh-add
  * allow only plain -i/-F path operands and safe options. Redirections
  * and nested commands are checked even inside these allowed commands. Other commands
@@ -10,6 +10,7 @@
  * symlinks and programs opening unnamed secrets need OS isolation/push scanning.
  */
 import { resolve, basename } from 'node:path';
+import { lstatSync, readdirSync } from 'node:fs';
 
 export const DEFAULT_PROTECTED_PATHS = Object.freeze([
   ['~/.ssh', 'SSH private keys and authentication material'],
@@ -152,8 +153,37 @@ function patternHit(word, options) {
   }
   return pass();
 }
-// Only concrete protected paths participate: .env* remains a basename rule,
-// rather than making every directory a forbidden recursive source.
+// Inspect names/metadata only, never secret contents. Incomplete scans deny with
+// recovery advice; missing operands are not directories. IO is injectable in tests.
+function envDescendantHit(full, { fs = { lstatSync, readdirSync } }) {
+  const incomplete = () => ({ decision: 'deny', path: full,
+    reason: 'Incomplete .env directory scan (depth 4 / 4096 entries or unreadable evidence); use explicit narrower subpaths and retry, or ask the operator to inspect the tree' });
+  let remaining = 4096;
+  const walk = (path, depth, root = false) => {
+    let stat;
+    try { stat = fs.lstatSync(path); } catch (error) {
+      if (root && ['ENOENT', 'ENOTDIR'].includes(error.code)) return pass();
+      return incomplete();
+    }
+    if (!stat.isDirectory()) return pass();
+    if (depth > 4) return incomplete();
+    let names;
+    try { names = fs.readdirSync(path); } catch { return incomplete(); }
+    if (names.length > remaining) return incomplete();
+    remaining -= names.length;
+    for (const name of names) {
+      if (name === 'node_modules' || name === '.git') continue;
+      const child = resolve(path, name);
+      if (name.startsWith('.env') && !examples.has(name)) return { decision: 'deny', path: child,
+        reason: 'Recursive access can reach environment secrets; use explicit non-protected subpaths' };
+      const hit = walk(child, depth + 1);
+      if (hit.decision === 'deny') return hit;
+    }
+    return pass();
+  };
+  return walk(full, 0, true);
+}
+
 function ancestorHit(word, options) {
   const full = resolve(options.repoRoot, expandHome(word, options.home));
   for (const entry of withProtectedPathFloor(options.protectedPaths)) {
@@ -164,7 +194,7 @@ function ancestorHit(word, options) {
         reason: `Recursive access can reach ${root}: ${entry.reason}; use explicit non-protected subpaths` };
     }
   }
-  return pass();
+  return envDescendantHit(full, options);
 }
 
 function recursiveAncestorHit(words, options) {
@@ -247,7 +277,7 @@ export function classifyBashCommand(command, options = {}) {
   };
   let cwd = options.repoRoot;
   const stack = [];
-  const segments = command.replace(/\\\n/g, '').split(/(&&|\|\||[;|\n()`])/);
+  const segments = command.replace(/\\\n/g, '').split(/(&&|\|\||(?<![>&])&(?![&>])|[;|\n()`])/);
   for (const [index, segment] of segments.entries()) {
     if (segment === '(' || segment === '`') { stack.push(cwd); continue; }
     if (segment === ')') { if (stack.length) cwd = stack.pop(); continue; }
@@ -256,7 +286,8 @@ export function classifyBashCommand(command, options = {}) {
     const name = basename(words[0] ?? '');
     if (['cd', 'pushd'].includes(name)) {
       const args = words.slice(1).filter(w => w !== '--');
-      cwd = directory(args[0] ?? (name === 'cd' && !['`', '('].includes(segments[index + 1]) ? '~' : '-'), cwd);
+      // A background directory change runs in a child shell.
+      if (segments[index + 1] !== '&') cwd = directory(args[0] ?? (name === 'cd' && !['`', '('].includes(segments[index + 1]) ? '~' : '-'), cwd);
       continue;
     }
     let localCwd = cwd;
@@ -290,7 +321,7 @@ export function classifyBashCommand(command, options = {}) {
     }
   }
   // Examine each SSH segment before splitting nested shell constructs.
-  for (const segment of text.split(/&&|\|\||[;|\n]/)) {
+  for (const segment of text.split(/&&|\|\||(?<![>&])&(?![&>])|[;|\n]/)) {
     const words = segment.trim().split(/\s+/);
     while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
     if (!['ssh', 'ssh-add'].includes(basename(words[0] ?? ''))) continue;
@@ -323,7 +354,7 @@ export function classifyBashCommand(command, options = {}) {
   }
   // Split every nested command boundary, including backticks exposed by removing
   // escape layers. No outer metadata/SSH exemption can hide a substitution body.
-  for (const segment of text.split(/&&|\|\||[;|\n()`]/)) {
+  for (const segment of text.split(/&&|\|\||(?<![>&])&(?![&>])|[;|\n()`]/)) {
     const words = segment.trim().split(/\s+/);
     while (/^[\w]+=.*/.test(words[0]) || ['command', 'builtin', 'exec', 'sudo', 'env'].includes(words[0])) words.shift();
     if (['ls', 'ssh', 'ssh-add', 'cd', 'pushd'].includes(basename(words[0] ?? ''))) continue;

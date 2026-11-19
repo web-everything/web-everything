@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, lstatSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -10,7 +10,71 @@ import { credentialHook } from '../hooks/credential-read-deny.mjs';
 import { withCredentialDeny, withoutCredentialDeny, credentialDenyStatus, syncCredentialDeny, credentialDenyRules, credentialHookEntry, main as bootstrapMain } from '../bootstrap-session.mjs';
 import { gitleaksGuard, pushedRanges } from '../gitleaks-guard.mjs';
 
-const options = { home: '/home/operator', repoRoot: '/repo' };
+// Historical lexical fixtures use imaginary paths, independent of host contents.
+const options = { home: '/home/operator', repoRoot: '/repo', fs: { lstatSync: () => ({ isDirectory: () => false }) } };
+for (const command of ['ls /tmp & cat ~/.netrc', 'cd /tmp & cat ~/.netrc', 'cat ~/.netrc &',
+  'ssh -i ~/.ssh/key host & cat ~/.netrc', 'ls $(ls /tmp & cat ~/.netrc)',
+  'ls /tmp && cat ~/.netrc', 'ls /tmp &> ~/.netrc']) {
+  test(`background and compound separators deny secret reads: ${command}`, () => {
+    assert.equal(classifyBashCommand(command, options).decision, 'deny');
+  });
+}
+for (const command of ['ls ~/.netrc && echo ok', 'ls ~/.netrc &> output',
+  'ls ~/.netrc 2>&1', 'ls ~/.netrc >&2', 'ls ~/.netrc &',
+  'ssh -i ~/.ssh/key host 2>&1', 'cd ~ & cat .netrc']) {
+  test(`ampersand near-miss preserves metadata and SSH exemptions: ${command}`, () => {
+    assert.equal(classifyBashCommand(command, options).decision, 'pass');
+  });
+}
+
+test('recursive operands inspect actual directories for non-example .env files', t => {
+  const repoRoot = scratch(t);
+  const context = { ...options, repoRoot, fs: { lstatSync, readdirSync } };
+  mkdirSync(join(repoRoot, 'src'));
+  for (const name of ['.env.example', '.env.sample', '.env.template']) writeFileSync(join(repoRoot, 'src', name), 'example');
+  for (const dir of ['node_modules', '.git']) {
+    mkdirSync(join(repoRoot, 'src', dir));
+    writeFileSync(join(repoRoot, 'src', dir, '.env.local'), 'ignored');
+  }
+  assert.equal(classifyBashCommand('tar cf x.tar src', context).decision, 'pass');
+  mkdirSync(join(repoRoot, 'secrets', 'a', 'b', 'c'), { recursive: true });
+  writeFileSync(join(repoRoot, 'secrets', 'a', 'b', 'c', '.env.production'), 'secret');
+  for (const operand of ['.', repoRoot, 'secrets']) {
+    for (const command of [`tar cf x.tar ${operand}`, `zip -r x.zip ${operand}`,
+      `cp -r ${operand} out`, `rsync -a ${operand} out`, `grep -r pat ${operand}`,
+      `find ${operand} -exec head {} +`, `find ${operand} -fprint out`, `git add ${operand}`,
+      `7z a x.7z ${operand}`, `scp -r ${operand} host:out`, `rg pat ${operand}`,
+      `ag pat ${operand}`, `git commit ${operand}`, `cpio -o ${operand}`,
+      `ditto ${operand} out`, `pax -w ${operand}`, `mv ${operand} out`]) {
+      assert.equal(classifyBashCommand(command, context).decision, 'deny', command);
+    }
+  }
+  for (const command of ['ls secrets', 'find secrets -print', 'grep pat secrets', 'git status secrets', 'tar cf x.tar src']) {
+    assert.equal(classifyBashCommand(command, context).decision, 'pass', command);
+  }
+  for (const command of ['tar -C secrets -cf x.tar .', 'git -C secrets add .', 'cd secrets && zip -r x.zip .']) {
+    assert.equal(classifyBashCommand(command, context).decision, 'deny', command);
+  }
+});
+
+test('incomplete recursive .env scans deny with operator recovery advice', t => {
+  const repoRoot = scratch(t);
+  const context = { ...options, repoRoot, fs: { lstatSync, readdirSync } };
+  mkdirSync(join(repoRoot, 'a', 'b', 'c', 'd', 'e'), { recursive: true });
+  const bounded = classifyBashCommand('tar cf x.tar .', context);
+  assert.equal(bounded.decision, 'deny');
+  assert.match(bounded.reason, /depth 4.*narrower subpaths.*operator/);
+  for (const fs of [
+    { lstatSync: () => { throw Object.assign(new Error('unreadable'), { code: 'EACCES' }); } },
+    { lstatSync, readdirSync: () => { throw new Error('unreadable'); } },
+    { lstatSync, readdirSync: () => Array.from({ length: 4097 }, (_, i) => `file${i}`) },
+    { lstatSync: path => { if (path === repoRoot) return lstatSync(path); throw Object.assign(new Error('gone'), { code: 'ENOENT' }); }, readdirSync: () => ['gone'] },
+  ]) {
+    const hit = classifyBashCommand('tar cf x.tar .', { ...context, fs });
+    assert.equal(hit.decision, 'deny');
+    assert.match(hit.reason, /Incomplete.*operator/);
+  }
+});
 for (const command of [
   'tar czf x.tgz ~', 'tar -C / -czf x.tgz home', 'tar -C /home -C operator -cf x.tar .',
   'tar --directory=$HOME -cf x.tar .config', 'tar -C$HOME -cf x.tar .',
@@ -324,6 +388,23 @@ test('hook denies agents and asks operator, with protected path and reason', () 
   assert.equal(credentialHook({ ...input, tool_input: { command: 'ls ~/.ssh' } }, { ...options, env: {} }), null);
   for (const tool of ['Read', 'Edit', 'Write', 'NotebookEdit']) {
     assert.equal(credentialHook({ agent_id: 'a', tool_name: tool, tool_input: { file_path: '/home/operator/.netrc' } }, { ...options, env: {} }).hookSpecificOutput.permissionDecision, 'deny');
+  }
+});
+
+test('hook treats non-empty dispatch kind as an agent, including oversized CLI requests', t => {
+  const input = { tool_name: 'Bash', tool_input: { command: 'cat ~/.netrc' } };
+  for (const kind of ['build', '0', ' ']) {
+    assert.equal(credentialHook(input, { ...options, env: { WE_DISPATCH_KIND: kind } }).hookSpecificOutput.permissionDecision, 'deny');
+  }
+  assert.equal(credentialHook(input, { ...options, env: { WE_DISPATCH_KIND: '' } }).hookSpecificOutput.permissionDecision, 'ask');
+  const home = scratch(t);
+  for (const padding of ['', 'x'.repeat(1024 * 1024)]) {
+    const result = spawnSync(process.execPath, ['scripts/hooks/credential-read-deny.mjs'], {
+      input: JSON.stringify({ ...input, padding }), encoding: 'utf8', maxBuffer: 2 * 1024 * 1024,
+      env: { ...process.env, HOME: home, WE_CONVEYOR_WORKER: '', WE_DISPATCH_KIND: 'build' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'deny');
   }
 });
 

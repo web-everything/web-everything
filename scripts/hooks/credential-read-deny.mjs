@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** R1082 standalone PreToolUse guard. Deliberately separate from operator-owned
  * ~/.plateau/hooks/allow-compound.mjs; ordering independent: any PreToolUse deny wins.
- * Bootstrap copies this hook plus its pure matcher and resolved policy beside it.
+ * Bootstrap copies this hook plus its matcher and resolved policy beside it.
  * Unparseable input is silent; matching reads never fail open. Oversized input asks
  * the operator to inspect the full request rather than approving incomplete evidence.
  */
@@ -11,8 +11,11 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { classifyBashCommand, classifyProtectedPath, readCredentialProtection } from '../lib/credential-protection.mjs';
 
+const isAgent = (input, env) => Boolean(input?.agent_id || input?.agent_type
+  || env.WE_CONVEYOR_WORKER === '1' || env.WE_DISPATCH_KIND);
+
 export function credentialHook(input, { env = process.env, home = homedir(), repoRoot = input?.cwd || process.cwd(), policy } = {}) {
-  const agent = Boolean(input?.agent_id || input?.agent_type || env.WE_CONVEYOR_WORKER === '1');
+  const agent = isAgent(input, env);
   const tool = input?.tool_name;
   const options = { home, repoRoot, ...(policy ? { protectedPaths: policy.protectedPaths } : {}) };
   const hit = tool === 'Bash' ? classifyBashCommand(input.tool_input?.command, options)
@@ -39,7 +42,7 @@ export function main() {
   let output;
   try {
     output = raw.length > 1024 * 1024 ? { hookSpecificOutput: { hookEventName: 'PreToolUse',
-      permissionDecision: input?.agent_id || input?.agent_type || process.env.WE_CONVEYOR_WORKER === '1' ? 'deny' : 'ask',
+      permissionDecision: isAgent(input, process.env) ? 'deny' : 'ask',
       permissionDecisionReason: 'Credential check input exceeds 1 MiB; operator must inspect the full request.' } }
       : credentialHook(input, { policy });
   } catch {
