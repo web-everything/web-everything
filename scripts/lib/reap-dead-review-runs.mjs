@@ -9,33 +9,11 @@ import { hasRejectingReviewVerdict, isRunAbandoned, markRunAbandoned, runRecordV
 import { reviewJobsDir, readJobRecord } from '../operations/review-job-store.mjs';
 import { parseJobHandle } from '../operations/job-record.mjs';
 import { pidIdentity } from './pid-alive.mjs';
-import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { boundedText } from './host-overload-settings.mjs';
+import { resolveReviewRunReaperSettings, stuckReviewThreshold } from './review-run-reaper-settings.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
 const HOUR = 3600000;
 const active = e => e.status === 'pending' || e.status === 'in-flight';
-const MINUTE = 60000;
-
-function settings({ env, log, tool, thresholdMs }) {
-  const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
-  if (p.errors.length) throw Error(p.errors.join('; '));
-  if (tool === undefined) {
-    try { tool = JSON.parse(boundedText(join(ROOT, 'scripts/settings/review-run-reaper.json'))).reviewRunReaper; }
-    catch (e) { if (e.code !== 'ENOENT') throw e; }
-  }
-  const r = resolveCascade({ standard: { abandonAfterHours: 6, abandonStuckAfterMinutes: 30 }, platform: p.prefs.reviewRunReaper, tool,
-    envValues: { abandonAfterHours: env.WE_REAP_DEAD_REVIEW_RUNS_AFTER_HOURS === undefined ? undefined : Number(env.WE_REAP_DEAD_REVIEW_RUNS_AFTER_HOURS),
-      abandonStuckAfterMinutes: env.WE_REAP_DEAD_REVIEW_RUNS_STUCK_AFTER_MINUTES === undefined ? undefined : Number(env.WE_REAP_DEAD_REVIEW_RUNS_STUCK_AFTER_MINUTES) },
-    valid: Object.fromEntries(['abandonAfterHours', 'abandonStuckAfterMinutes'].map(k => [k, v => typeof v === 'number' && Number.isFinite(v) && v > 0])) });
-  log(formatCascadeSourcesLine('reviewRunReaper', r));
-  if (thresholdMs !== undefined && (!Number.isFinite(thresholdMs) || thresholdMs <= 0)) throw Error('thresholdMs must be positive and finite');
-  const ms = thresholdMs ?? r.value.abandonAfterHours * HOUR;
-  const source = thresholdMs === undefined ? r.sources.abandonAfterHours : 'argument';
-  log(`reviewRunReaper: threshold=${ms / HOUR}h (${source})`);
-  return { thresholdMs: ms, thresholdSource: source, stuckThresholdMs: r.value.abandonStuckAfterMinutes * MINUTE,
-    stuckThresholdSource: r.sources.abandonStuckAfterMinutes };
-}
 
 // Do not use listReviewJobAgents: it suppresses read errors AND deletes dead jobs.
 function readReviewJobs(env) {
@@ -82,14 +60,13 @@ function writerHeld(id, dir, identity) {
  */
 export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUNS_DIR?.trim() ? resolve(env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir(env)), now = Date.now(), apply = false,
   log = console.error, thresholdMs, onlyIds, probes = {}, store = {}, tool } = {}) {
-  const result = { ...settings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {} };
+  const result = { ...resolveReviewRunReaperSettings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {} };
   const io = { listRunIds, tryReadRun, runPath, isRunRecordTerminal, markRunAbandoned, stat: statSync, ...store };
   const keep = (reason, id) => { (result.kept[reason] ??= []).push(id); };
   const selected = onlyIds === undefined ? null : new Set(onlyIds);
   const candidates = [];
   for (const id of io.listRunIds(dir)) {
-    // The current shared ID grammar admits dots; ignore our metadata even before it is tightened.
-    if (id.endsWith('.abandoned') || (selected && !selected.has(id))) continue;
+    if (selected && !selected.has(id)) continue;
     let record, stat;
     try { record = io.tryReadRun(id, dir); if (!record) throw Error('missing run'); }
     catch { result.scanned++; keep('unreadable', id); continue; }
@@ -113,11 +90,12 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     try { stat = io.stat(io.runPath(id, dir)); if (!Number.isFinite(stat.mtimeMs)) throw Error('invalid mtime'); }
     catch { keep('unreadable', id); continue; }
     const ageMs = now - stat.mtimeMs;
-    const stuck = pending?.kind === 'effect' || record.effects.some(active);
+    const stuck = pending != null || record.effects.some(active);
     // A confirm/referral/resumed cursor above still belongs to its existing continuation, even when old.
     const useStuckThreshold = stuck && thresholdMs === undefined;
-    const threshold = useStuckThreshold ? result.stuckThresholdMs : result.thresholdMs;
-    const thresholdSource = useStuckThreshold ? result.stuckThresholdSource : result.thresholdSource;
+    const deadline = stuckReviewThreshold(record, result);
+    const threshold = useStuckThreshold ? deadline.ms : result.thresholdMs;
+    const thresholdSource = useStuckThreshold ? deadline.source : result.thresholdSource;
     if (ageMs < threshold) { keep('young', id); continue; }
     const stuckEffect = stuck ? { pending: pending ?? null,
       effects: record.effects.map(({ step, type, status, unknownAttempts }) => ({ step, type, status, unknownAttempts })) } : null;
@@ -168,6 +146,10 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     if (!Array.isArray(jobs) || jobs.some(j => !j || typeof j !== 'object' || !identityOf(j))) throw Error('unreadable review-job list or review-job pr/repo identity');
     for (const { id, record } of candidates) {
       if (writerHeld(id, dir, identity)) { decisions.set(id, 'live-writer'); continue; }
+      const pid = record.job?.pid;
+      if (pid != null && (!Number.isInteger(pid) || pid <= 0 || identity(pid)?.alive !== false)) {
+        decisions.set(id, 'live-pid'); continue;
+      }
       const matching = jobs.filter(j => identityOf(j) === identityOf(record.input));
       if (matching.some(j => !Number.isInteger(j.pid) || j.pid <= 0 || identity(j.pid)?.alive !== false)) {
         decisions.set(id, 'live-review-job'); continue;
@@ -215,7 +197,7 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     if (apply !== true) { result.wouldReap.push(c.id); continue; }
     const marked = io.markRunAbandoned({ id: c.id, dir, now, by: 'reap-dead-review-runs',
       reason: c.stuckEffect
-        ? `stuck pending/unknown effect: pending step ${JSON.stringify(c.record.pending?.step ?? null)}; effects ${JSON.stringify(c.stuckEffect.effects)}; abandoned, effect NOT claimed applied`
+        ? `stuck pending/unknown effect or step: pending step ${JSON.stringify(c.record.pending?.step ?? null)}; effects ${JSON.stringify(c.stuckEffect.effects)}; abandoned, effect NOT claimed applied`
         : `dead: no live pid/handle/lease/session; unchanged for >= ${c.threshold / HOUR}h`,
       // Creation excludes other tombstones, not run writers. Bind to the original version so a writer
       // landing after the final check still wins, even if its mtime precedes sidecar creation.

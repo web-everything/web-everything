@@ -1519,7 +1519,7 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     });
   it.each(both)('%s selects the same verdict-bearing newer run once nothing is pending (control)', (_name, reader) => {
     const f = fixture();
-    const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, pending: null, effects: [{ status: 'applied' }], ...started(15_000) }), 20_000);
+    const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, pending: null, effects: [{ type: 'review.label-swap', status: 'applied' }], ...started(15_000) }), 20_000);
     const result = reader({ ...args, now: 20_000 + 60_000 });
     expect(result.ok).not.toBe(false);
     expect((result.newest ?? result.loopPayload).stepTimings).toEqual(started(15_000).stepTimings);

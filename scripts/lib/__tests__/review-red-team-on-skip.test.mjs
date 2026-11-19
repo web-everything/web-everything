@@ -53,7 +53,7 @@ it.each(['readEvidence', 'readWitness'])('%s review-abandoned waits without disp
   const o = runFixture({ [reader]: () => ({ ok: false, reason: 'review-abandoned' }),
     escalate, settlePending, readReviewRuns });
   const row = runRedTeamOnSkip(o).rows[0];
-  expect(row).toMatchObject({ action: 'skip', why: 'review-abandoned' });
+  expect(row).toMatchObject({ action: 'skip', why: 'review-abandoned', awaitingFreshReview: true });
   expect(row.escalate).not.toBe(true);
   expect(row).not.toHaveProperty('escalationContext');
   expect(row).not.toHaveProperty('settle');
@@ -1141,6 +1141,7 @@ function runFixture(over = {}) {
   const f = fixture();
   return { repo, plan: { refusals: f.refusals }, rawPrs: f.rawPrs, setting: f.setting,
     readEvidence: f.readEvidence, readStatus: f.readStatus, now: () => f.now, lastDispatch: f.lastDispatch,
+    readAbandonedSignal: () => ({ awaitingFreshReview: true, why: 'review-abandoned', escalate: false }),
     syncLabels: vi.fn(), capacity: { lanes: 1, budget: { left: 1 } }, dispatch: vi.fn(() => ({ jobPid: 42 })), ...over };
 }
 describe('operator clearance for a stored not-owed head with no result', () => {
@@ -1177,7 +1178,7 @@ describe('operator clearance for a stored not-owed head with no result', () => {
     o.readEvidence = vi.fn().mockReturnValueOnce(initial).mockReturnValue({ ok: false, reason: 'review-abandoned' });
     o.escalate = escalate;
     const row = runRedTeamOnSkip(o).rows[0];
-    expect(row).toMatchObject({ action: 'skip', why: 'review-abandoned', escalate: false });
+    expect(row).toMatchObject({ action: 'skip', why: 'review-abandoned', awaitingFreshReview: true, escalate: false });
     expect(row).not.toHaveProperty('settle');
     expect(row).not.toHaveProperty('escalationContext');
     expect(o.publishCheck).not.toHaveBeenCalled();

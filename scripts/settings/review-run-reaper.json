@@ -1,6 +1,7 @@
 {
-  "$comment": "Dead stuck-effect review cursors are abandoned via version-bound sidecars; other dead runs retain the six-hour standard. Effects are never claimed applied.",
+  "$comment": "Dead stuck-effect and stuck-judge review cursors are abandoned via version-bound sidecars; other dead runs retain the six-hour standard. Effects are never claimed applied.",
   "reviewRunReaper": {
-    "abandonStuckAfterMinutes": 30
+    "abandonStuckAfterMinutes": 30,
+    "abandonStuckJudgeAfterMinutes": 30
   }
 }

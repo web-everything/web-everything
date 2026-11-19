@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../review-abandon.mjs';
@@ -14,13 +14,14 @@ import { closeConfirmRunsAfterClearance } from '../../review-set-label.mjs';
 
 const MIN = 60000, now = Date.parse('2026-11-18T12:00:00Z');
 const repo = 'owner/repo', head = 'a'.repeat(40);
-let dir, env, probes;
+let root, dir, env, probes;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'review-abandon-'));
+  root = mkdtempSync(join(tmpdir(), 'review-abandon-'));
+  dir = join(root, 'runs'); mkdirSync(dir);
   env = { OPERATION_RUNS_DIR: dir, WE_SHARED_RUNS_DIR: dir, WE_PLATFORM_PREFERENCES_FILE: join(dir, 'prefs.json') };
   probes = { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => rmSync(root, { recursive: true, force: true }));
 function fixture(pr = 7109, age = 31 * MIN) {
   const id = `review-pr-${pr}`;
   const r = newRunRecord({ id, op: 'review-pr', input: { repo, pr } });
@@ -88,11 +89,13 @@ it.each([false, true])('refuses a live review-job pid and writer lock (apply=%s)
   expect(op(args).result.kept['live-writer']).toEqual([r.id]);
   expect(isRunAbandoned(r.id, dir)).toBe(false);
 });
-it('keeps younger-than-threshold effects and preserves six-hour retention for other runs', () => {
+it('keeps younger-than-threshold stuck runs; a stuck judge-step run is abandoned at its own 30 minute setting', () => {
   const young = fixture(7109, 29 * MIN), other = fixture(7120, 31 * MIN);
   other.pending = { kind: 'judge', step: 'panel', stepIndex: 1 }; other.effects = [];
   writeRun(other, dir); utimesSync(runPath(other.id, dir), (now - 31 * MIN) / 1000, (now - 31 * MIN) / 1000);
-  expect(op(['--apply']).result.kept.young).toEqual([young.id, other.id]);
+  const { result } = op(['--apply']);
+  expect(result.kept.young).toEqual([young.id]);
+  expect(result.reaped).toEqual([other.id]);
 });
 it.each(['pending', 'in-flight', 'other'])('explicit thresholdMs wins for %s runs, including --run selection', status => {
   const r = fixture();

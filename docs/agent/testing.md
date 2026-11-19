@@ -4804,16 +4804,38 @@ Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispa
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
 
-## Abandoning stuck review effects
+## Abandoning stuck review cursors
 
 `run.mjs review-abandon [--run=<review-pr-id>] [--apply] [--json]` shares the session-reaper's
 liveness probes and version-bound sidecars. A pending effect uses `reviewRunReaper.abandonStuckAfterMinutes`
-(default 30; `WE_REAP_DEAD_REVIEW_RUNS_STUCK_AFTER_MINUTES` overrides it); other dead cursors retain
-the six-hour horizon. An explicit `thresholdMs` argument overrides both horizons for every run.
+(default 30; `WE_REAP_DEAD_REVIEW_RUNS_STUCK_AFTER_MINUTES` overrides it). A judge or other
+non-confirm pending step uses `reviewRunReaper.abandonStuckJudgeAfterMinutes` (default 30;
+`WE_REAP_DEAD_REVIEW_RUNS_STUCK_JUDGE_AFTER_MINUTES` overrides it), through the same logged
+standard/platform/tool/environment cascade. An explicit `thresholdMs` overrides every horizon.
 Confirm, mandatory-referral, resumed and rejecting-verdict continuations stay kept. Abandonment
 never reconciles unknown effects: planners exclude the unchanged tombstoned record so a new panel
 starts. Gates return `review-abandoned` until a completed same-head panel has a strictly later read
 start; older acceptance and result comments cannot discharge it. Historical tombstones on rejecting
-or unrecognised verdicts retain their original holds. The queue treats `review-abandoned` as a
-non-runnable wait without paging a human. Test cached readers and rewritten records as well as the operation; a record rewrite invalidates
+or unrecognised verdicts, operator `findings.confirm` rejections, and declared/pending/in-flight
+send-back effect payloads retain their original holds through the shared `hasRejectingReviewVerdict` predicate. The queue treats `review-abandoned` as a
+non-runnable wait carrying `awaitingFreshReview: true`. It pages no human initially; after the
+same stuck deadline from the tombstone, absence of a newer same-head read start escalates through
+the existing unfinished-review path. Missing, unreadable or over-400-record replacement evidence
+escalates for operator inspection. Test cached readers and rewritten records as well as the operation; a record rewrite invalidates
 the tombstone. The `review-abandon-redo` soak detects the fix by running the operation and gate.
+
+Tombstones live at `<dirname(runsDir)>/run-tombstones/<runId>.json`, outside the runs directory,
+including when `OPERATION_RUNS_DIR` or `WE_SHARED_RUNS_DIR` overrides it. Legacy
+`<runsDir>/<runId>.abandoned.json` files remain read-only evidence under the same version/mtime
+rules. All run-record scans share filename validation: invalid ids, legacy sidecars and temporary
+files are skipped with a bounded one-line warning once per name per process (after 1000 distinct
+names, a single suppression warning directs the operator to inspect the runs directory).
+Keep `review-abandon-round4.test.mjs` in the scoped gate: exercise real label-clearance, gate,
+reaper, planner and suspended-referral scans with stray names, both tombstone locations, and a
+rewritten record. Writer-lock/temp scans still inspect their sidecars for liveness.
+
+Historical effects can omit `payload`: omission alone is not a rejecting verdict. Keep the
+named round-3 historical label/notice regressions alongside explicit null, malformed and
+send-back payload holds. Archive retention must admit valid `.retiring-<run>.json.<uuid>`
+recovery files before filtering run records; failed restores still emit `ALERT` and continue
+retention even when the alert emitter fails. Invalid parked run names remain untouched.

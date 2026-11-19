@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { filterRunFileNames, resolveRunsDir, tryReadRun, sharedRunsDir } from '../operations/run-store.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -197,7 +197,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json') && !n.endsWith('.abandoned.json') && !isRunAbandoned(n.slice(0, -5), dir)).map(name => {
+  const rows = filterRunFileNames(names).filter(n => n.startsWith('review-pr-') && !isRunAbandoned(n.slice(0, -5), dir)).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };

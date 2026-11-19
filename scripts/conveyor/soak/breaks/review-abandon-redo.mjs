@@ -1,6 +1,6 @@
 /** Replay #7109/#7120: an unknown effect must yield to abandonment and a fresh review. No network. */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, utimesSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -8,17 +8,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 
 async function replay(sourceRoot) {
-  const dir = mkdtempSync(join(tmpdir(), 'soak-review-abandon-'));
+  const root = mkdtempSync(join(tmpdir(), 'soak-review-abandon-'));
+  const dir = join(root, 'runs'); mkdirSync(dir);
   try {
     const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
     const { main } = await load('scripts/operations/review-abandon.mjs');
-    const { newRunRecord, writeRun, runPath } = await load('scripts/operations/run-store.mjs');
+    const { listRunIds, newRunRecord, writeRun, runPath } = await load('scripts/operations/run-store.mjs');
+    const { abandonedPath } = await load('scripts/lib/run-abandoned.mjs');
+    const { closeConfirmRunsAfterClearance } = await load('scripts/review-set-label.mjs');
     const { readDrainRedTeamEvidence } = await load('scripts/lib/drain-red-team-evidence.mjs');
     const now = Date.now(), repo = 'fixture/repo', pr = 7109, head = 'a'.repeat(40), id = 'review-pr-soak-abandon';
     const run = newRunRecord({ id, op: 'review-pr', input: { repo, pr } });
     run.pending = { kind: 'effect', step: 'record', stepIndex: 9 };
     run.verdict = { verdict: 'accept' };
-    run.effects = [{ key: 'label', type: 'review.label-swap', index: 0, stepIndex: 9, step: 'record', status: 'pending', unknownAttempts: 1 }];
+    run.effects = [{ key: 'label', type: 'review.label-swap', index: 0, stepIndex: 9, step: 'record', status: 'pending', payload: { to: 'accepted', addLabel: 'review:accepted' }, unknownAttempts: 1 }];
     run.findings = { read: { repo, pr, netBasis: { rev: head } } };
     run.stepTimings = [{ step: 'read', stepIndex: 0, startedAt: new Date(now - 32 * 60000).toISOString() }];
     writeRun(run, dir);
@@ -31,6 +34,14 @@ async function replay(sourceRoot) {
     const code = main([`--run=${id}`, '--apply', '--json'], { out: text => { result = JSON.parse(text); }, err: () => {},
       reaperOptions: { dir, env, now, tool: {}, probes: { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' } } });
     if (code !== 0 || !result?.reaped.includes(id)) throw Error('dead stuck effect was not abandoned');
+    const tombstone = join(root, 'run-tombstones', `${id}.json`);
+    if (abandonedPath(id, dir) !== tombstone || !existsSync(tombstone)
+      || existsSync(join(dir, `${id}.abandoned.json`))) throw Error('tombstone was not written outside the runs directory');
+    writeFileSync(join(dir, 'review-pr-x.abandoned.json'), '{');
+    writeFileSync(join(dir, 'review-pr-junk!.json'), '{');
+    if (JSON.stringify(listRunIds(dir)) !== JSON.stringify([id])) throw Error('stray run filenames leaked into enumeration');
+    const closed = closeConfirmRunsAfterClearance({ repo, pr, headSha: head, dir, resume: () => { throw Error('unexpected resume'); } });
+    if (closed.closed.length || closed.failed.length) throw Error('stray run filename affected label-clearance enumeration');
     const after = gate();
     if (after.ok !== false || after.reason !== 'review-abandoned' || after.loopPayload) throw Error('abandoned run did not require a fresh review');
     if (before !== readFileSync(runPath(id, dir), 'utf8')) throw Error('abandonment rewrote the unknown effect');
@@ -46,6 +57,20 @@ async function replay(sourceRoot) {
     const released = gate();
     if (released.ok === false || released.loopPayload?.id !== fresh.id) throw Error('newer completed same-head review did not release abandonment');
 
+    // PR #7120: a judge cursor with no verdict/effects uses its own thirty-minute deadline.
+    const judge = structuredClone(run);
+    judge.id = 'review-pr-833c6183'; judge.input.pr = 7120; judge.findings.read.pr = 7120;
+    judge.pending = { kind: 'judge', step: 'judge', stepIndex: 2 }; judge.verdict = null; judge.effects = [];
+    writeRun(judge, dir);
+    utimesSync(runPath(judge.id, dir), (now - 31 * 60000) / 1000, (now - 31 * 60000) / 1000);
+    const judgeCode = main([`--run=${judge.id}`, '--apply', '--json'], {
+      out: text => { result = JSON.parse(text); }, err: () => {},
+      reaperOptions: { dir, env, now, tool: {}, probes: { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' } },
+    });
+    if (judgeCode !== 0 || !result.reaped.includes(judge.id)) throw Error('dead judge-step run was not abandoned');
+    const judgeHeld = readDrainRedTeamEvidence({ repo, pr: 7120, head, runsDir: dir, env, now, readScorecards: () => [] });
+    if (judgeHeld.reason !== 'review-abandoned') throw Error('abandoned judge did not require a fresh review');
+
     const rejecting = structuredClone(run);
     rejecting.id = 'review-pr-soak-rejecting'; rejecting.input.pr = pr + 1;
     rejecting.verdict = { verdict: 'changes' }; rejecting.findings.read.pr = pr + 1;
@@ -58,7 +83,7 @@ async function replay(sourceRoot) {
     if (rejectedCode !== 0 || result.reaped.length || !result.kept['rejecting-verdict']?.includes(rejecting.id)) throw Error('rejecting stuck run was abandoned');
     const held = readDrainRedTeamEvidence({ repo, pr: pr + 1, head, runsDir: dir, env, now, readScorecards: () => [] });
     if (held.ok !== false || held.reason !== 'review-unfinished') throw Error('rejecting stuck run stopped holding');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
 export default {

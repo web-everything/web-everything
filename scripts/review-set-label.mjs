@@ -64,7 +64,7 @@ import { isRunAbandoned } from './lib/run-abandoned.mjs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolveRunsDir } from './operations/run-store.mjs';
+import { filterRunFileNames, resolveRunsDir } from './operations/run-store.mjs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -1108,8 +1108,8 @@ export function closeConfirmRunsAfterClearance({ repo, pr, headSha, dir = resolv
   if (!/^[0-9a-f]{40}$/i.test(String(headSha || ''))) return out;
   let names;
   try { names = readdirSync(dir); } catch { return out; }
-  for (const name of names) {
-    if (!name.startsWith('review-pr-') || !name.endsWith('.json') || name.endsWith('.abandoned.json')
+  for (const name of filterRunFileNames(names)) {
+    if (!name.startsWith('review-pr-')
       || isRunAbandoned(name.slice(0, -5), dir)) continue;
     let text;
     try { text = readFileSync(join(dir, name), 'utf8'); } catch { continue; }
