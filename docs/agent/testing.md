@@ -4912,6 +4912,10 @@ must equal the parent's value. Only plain sh/bash/zsh `-c` wrappers are reviewed
 other shell modes/flags with a literal-argv fallback. Real bash/zsh probes first demonstrate
 that harmless startup files execute with overridden directories, then prove launcher refusal
 before the guard or startup-file side effect. Plain `-c` positive controls execute aliased Node.
+These probes require sh, bash and zsh on PATH. The hosted and Hetzner unit-shard jobs
+install zsh when missing and check it before running tests; keep the real probes mandatory.
+Scripts that spell sandbox tokens must also be listed in `SANDBOX_BEARING_FILES` in
+`scripts/lib/permission-change.mjs`, so unreadable diffs retain the permission-change hold.
 
 Snapshot caller data as the first statement of each launch/completion entry point, before
 option destructuring or spreading; forward only those copies. Share the plain-data snapshot

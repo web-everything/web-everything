@@ -82,6 +82,7 @@ export const SANDBOX_BEARING_FILES = [
   'scripts/conveyor/health-investigate-dispatch.mjs',
   'scripts/conveyor/health-smells/dispatch-permission-stall.mjs',
   'scripts/gemini-direct-task.mjs',
+  'scripts/lib/agent-launch.mjs',
   'scripts/lib/agy-review-juror.mjs',
   'scripts/lib/antigravity-judge-spawn.mjs',
   'scripts/lib/gh-app-shim.mjs',
