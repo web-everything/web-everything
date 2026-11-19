@@ -180,8 +180,12 @@ export function excuseMergeGateRows(rows, { prNumber, headSha, labels, readVerdi
     // Keep the failed conclusion: this annotation grants review admission, never merge clearance.
     if (verdict.workflowEditProtection === true) {
       const holds = verdict.results?.filter(blocking);
+      // The review produces the head's red-team check, so a missing or pending red-team check stays review-owned
+      // alongside the workflow-touch hold; any other extra hold is a real blocker.
       if (!Array.isArray(labels) || labels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')
-        || holds?.length !== 1 || !isWorkflowTouchHold(holds[0])) return unchanged;
+        || !holds?.length || holds.length > 2
+        || holds.filter(isWorkflowTouchHold).length !== 1
+        || !holds.every(h => isWorkflowTouchHold(h) || isRedTeamMissing(h))) return unchanged;
       const replacement = { ...row, mergeGateReviewHold: {
         holds: [...holds.map(r => r.id), 'workflow-edit-protection'], jobId,
       } };

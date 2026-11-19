@@ -655,6 +655,19 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
         .replace('pass  red-team  ok', 'hold  red-team  no red-team check run on head');
     }).out.statusCheckRollup).toEqual([workflowRow]);
   });
+  it.each([
+    ['missing', 'no red-team check run on head'],
+    ['pending', 'red-team check run in progress or incomplete'],
+  ])('keeps review ownership when workflow protection has a %s red-team check', (_name, reason) => {
+    const { out } = probe(e => { e.log = e.log.replace('pass  red-team  ok', `hold  red-team  ${reason}`); });
+    expect(out.statusCheckRollup[0]).toMatchObject({ conclusion: 'FAILURE',
+      mergeGateReviewHold: { holds: expect.arrayContaining(['review-acceptance', 'red-team', 'workflow-edit-protection']), jobId: 123 } });
+  });
+  it('still routes a real red-team failure plus workflow protection to CI repair', () => {
+    expect(probe(e => {
+      e.log = e.log.replace('pass  red-team  ok', 'hold  red-team  red-team check failed on head');
+    }).out.statusCheckRollup).toEqual([workflowRow]);
+  });
   it.each(GATE_IDS.filter(id => id !== 'review-acceptance').flatMap(id =>
     ['hold', 'fail-closed'].map(status => [id, status])))('keeps workflow protection plus %s %s red', (id, status) => {
     expect(probe(e => {
