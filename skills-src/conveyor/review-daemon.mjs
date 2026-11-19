@@ -500,6 +500,20 @@ export function runReviewTick({
   // retry next tick, exactly as before, just without the double, contradictory report.
   // Shared PRs were read before the hold sweep; agent discovery and any captured PR-read failure
   // are isolated with reconcile here. Its injected readers reuse those same snapshots.
+  // Both normal recovery and partial-inventory recovery use the same lane/start bounds.
+  const recoveryCapacity = ({ host, hostLimit, recoveryStarts, occupied = 0, reserve = 0, lanes, reuseLanes = false, onTake = () => {} }) => {
+    let rawLanes = 0;
+    try { rawLanes = reuseLanes && recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo }); }
+    catch (e) { log(`review-daemon: ${repo} recovery lane read failed (${String(e?.message ?? e).split('\n')[0]}); recovery gets 0 lanes this tick`); }
+    const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
+    return { lanes: Math.max(0, rawAcquirable - occupied), budget: liveReviewBudget, remainingStarts: recoveryStarts,
+      startsCeiling: Math.max(0, hostLimit - occupied - reserve),
+      take: () => { onTake(); if (typeof host.take === 'function') host.take(1); } };
+  };
+  const recoveryPlan = plan => ({ ...plan, refusals: (plan.refusals ?? []).map(row =>
+    row.kind === 'nothing-owed' && row.phase === 'queued'
+      ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
+      : row) });
   let plan;
   let rawAgents = null;
   try {
@@ -514,6 +528,26 @@ export function runReviewTick({
     // never "0 owed". Surface it on the reconcile-failed channel (tick line flags it) so the tick retries visibly.
     if (plan?.deferred === true) throw new Error(`open-PR read deferred — owed unknown this tick: ${String(plan.message ?? plan.reason ?? 'deferred').split('\n')[0]}`);
   } catch (e) {
+    if (rawPrsFailed && e === rawPrsError && e?.name === 'PrListUnreadableError'
+      && e.code === 'pr-list-unreadable' && e.stage === 'page' && e.page === 'inventory'
+      && String(e.message).includes('refusing a partial inventory')
+      && !paused && typeof redTeamOnSkip === 'function') {
+      try {
+        let host = { admitted: false };
+        try { host = hostAdmission() ?? host; } catch { /* Unknown host admission refuses recovery. */ }
+        const hostLimit = host.admitted === true && Number.isFinite(host.maxPerTick) ? Math.max(0, host.maxPerTick) : 0;
+        if (hostLimit > 0) {
+          const capacity = recoveryCapacity({ host, hostLimit, recoveryStarts: hostLimit });
+          redTeamOnSkip({ repo, plan: { refusals: [] }, rawPrs: [], listPartial: true, capacity, paused,
+            planPartialRecovery: prs => {
+              const agents = readAgents({});
+              const partialPlan = reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => agents });
+              if (partialPlan?.deferred) throw new Error('partial recovery reconcile deferred');
+              return recoveryPlan(partialPlan);
+            } });
+        }
+      } catch { log(`review-daemon: ${repo} partial-inventory red-team recovery failed`); }
+    }
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
       reconcileError: describeReconcileError(e), staleStatusSwept: [], staleConflictStatusCleared: [],
@@ -760,27 +794,16 @@ export function runReviewTick({
   const reservedRecoveryStarts = hostLimit >= 2 && reviews.length ? Math.min(1, hostLimit - 1) : 0;
   const recoverRedTeam = (recoveryStarts) => {
     if (paused || typeof redTeamOnSkip !== 'function') return;
-    // Recovery starts need only one lane; ordinary rounds reserve a companion lane too.
-    // A failed recovery-only read must not abort the tick (it runs before ordinary dispatch): read it as 0 lanes.
-    let rawLanes = 0;
-    try { rawLanes = recoveryAcquirableLanes === acquirableLanes ? lanes : recoveryAcquirableLanes({ repo }); }
-    catch (e) { log(`review-daemon: ${repo} recovery lane read failed (${String(e?.message ?? e).split('\n')[0]}); recovery gets 0 lanes this tick`); }
-    const rawAcquirable = Math.max(0, (Array.isArray(rawLanes) ? rawLanes.length : Number(rawLanes)) || 0);
-    const recoveryLanes = Math.max(0, rawAcquirable - occupiedLanes);
     let taken = 0;
-    const capacity = { lanes: recoveryLanes, budget: liveReviewBudget, remainingStarts: recoveryStarts,
-      startsCeiling: Math.max(0, hostLimit - occupiedLanes - (reviews.length ? 1 : 0)),
-      take: () => { taken++; if (typeof host.take === 'function') host.take(1); } };
+    const capacity = recoveryCapacity({ host, hostLimit, recoveryStarts, occupied: occupiedLanes,
+      reserve: reviews.length ? 1 : 0, lanes, reuseLanes: true, onTake: () => { taken++; } });
+    const recoveryLanes = capacity.lanes;
     try {
       // Accepted heads normally reconcile as nothing-owed/queued, before the same-head review
       // guard. For red-team recovery they are also already reviewed; the recovery planner still
       // requires an accepting, head-bound payload and checks comments, status and cooldown.
       // Keep the reconcile plan intact for status/hold consumers and never adapt other refusals.
-      const recoveryRefusals = (plan.refusals ?? []).map(row =>
-        row.kind === 'nothing-owed' && row.phase === 'queued'
-          ? { ...row, kind: 'already-reviewed-head', headSha: row.headRefOid }
-          : row);
-      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: { ...plan, refusals: recoveryRefusals }, rawPrs,
+      redTeamOnSkipResult = redTeamOnSkip({ repo, plan: recoveryPlan(plan), rawPrs,
         capacity, paused });
     } catch { log(`review-daemon: ${repo} red-team recovery failed`); }
     finally {

@@ -21,6 +21,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as redTeamQueue from '../red-team-dispatch-queue.mjs';
 import { dirname, join } from 'node:path';
+import { readOperatorPolicy } from '../policy-cascade.mjs';
 import {
   createRedTeamDispatchQueue,
   defaultQueueFile,
@@ -57,7 +58,7 @@ describe('R907 red-team reader retains operator authority under test flags', () 
       env: { VITEST: 'true', WE_UNDER_TEST: '1', NODE_ENV: 'test',
         WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '6', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '4' }, log,
     });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   });
 });
@@ -132,6 +133,12 @@ function refused(pr, reason) {
   };
 }
 
+
+const block = async (f, pr) => {
+  f.queue.admit(repo, pr);
+  await f.queue.settle(repo, refused(pr, 'review-unfinished'));
+};
+
 describe('setting-driven red-team queue floor', () => {
   const floorCapacity = count => ({ ...capacity(count), startsCeiling: Infinity });
   const floor = { minConcurrent: 2, idlePct: 10, reviewStartsPerTick: 0 };
@@ -146,7 +153,7 @@ describe('setting-driven red-team queue floor', () => {
     ['missing minimum', { redTeam: { queue: { minConcurrentIdlePct: 10 } } }],
   ])('%s disables the floor without increasing capacity', (_name, configuration) => {
     const configured = load(JSON.stringify(configuration));
-    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     const bound = floorCapacity(1);
     const log = vi.fn();
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100, log });
@@ -161,7 +168,7 @@ describe('setting-driven red-team queue floor', () => {
     ['nonfinite environment threshold', { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: 'Infinity' }],
   ])('%s defaults to 10 while retaining the configured minimum', (_name, env) => {
     const configured = load(JSON.stringify({ redTeam: { queue: { minConcurrent: 3 } } }), env);
-    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(configured).toEqual({ minConcurrent: 3, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     const bound = floorCapacity(1);
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 9 });
     expect(bound.remainingStarts).toBe(1);
@@ -176,7 +183,7 @@ describe('setting-driven red-team queue floor', () => {
     ['valid environment over invalid file minimum', settings('bad'), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '3' }, 3],
   ])('%s minimum resolves with a hard cap of six and invalid overrides disable it', (_name, text, env, expected) => {
     const configured = load(text, env);
-    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(configured).toEqual({ minConcurrent: expected, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 1, budget: { left: 10 } };
     applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 100 });
     expect(bound.remainingStarts).toBe(Math.max(1, expected));
@@ -205,7 +212,7 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it('loads defaults 6/10 from the real shipped settings file with no environment overrides', () => {
-    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6 });
+    expect(loadRedTeamQueueFloor({ env: {} })).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 6, maxProbesPerTick: 6 });
     expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_MAX).toBe(24);
     expect(redTeamQueue.RED_TEAM_QUEUE_MIN_CONCURRENT_CAP).toBe(6);
   });
@@ -214,13 +221,13 @@ describe('setting-driven red-team queue floor', () => {
     expect(load(settings(4, 80), {
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '1',
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: '20',
-    })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0 });
+    })).toEqual({ minConcurrent: 1, idlePct: 20, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
   });
 
   it.each([['file', 99, {}], ['environment', 2, { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '99' }]])(
     '%s oversized file/env minimum clamps to six and admits only six', async (_source, minimum, env) => {
       const configured = load(settings(minimum), env);
-      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 6, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
       const bound = { lanes: 10, startsCeiling: Infinity, remainingStarts: 0, budget: { left: 10 } };
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
       expect(redTeamQueueAdmitCount(bound)).toBe(6);
@@ -291,7 +298,7 @@ describe('setting-driven red-team queue floor', () => {
 
   it('zero minimum explicitly disables the floor in both file and environment', () => {
     for (const configured of [load(settings(0)), load(settings(2), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '0' })]) {
-      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+      expect(configured).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
       const bound = floorCapacity(1);
       applyRedTeamQueueFloor(bound, { floor: configured, cpuIdlePct: 50, log: vi.fn() });
       expect(bound).toEqual(floorCapacity(1));
@@ -299,14 +306,14 @@ describe('setting-driven red-team queue floor', () => {
   });
 
   it.each(['bad', -1, 101, 1.5, null])('invalid idle threshold %j disables the floor', value => {
-    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
-    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0 });
+    expect(load(settings(2, value))).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
+    expect(load(settings(2, 0), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(value) })).toEqual({ minConcurrent: 2, idlePct: 0, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
   });
 
   it.each([0, 100])('accepts idle threshold boundary %s', idlePct => {
-    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+    expect(load(settings(2, idlePct))).toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     expect(load(settings(), { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: String(idlePct) }))
-      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0 });
+      .toEqual({ minConcurrent: 2, idlePct, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
   });
 
   it.each([null, undefined, NaN, Infinity, -Infinity, '38', -1])(
@@ -1000,10 +1007,6 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(defaultQueueFile({ WE_RED_TEAM_QUEUE_FILE: override }, home)).toBe(override);
   });
   describe('non-runnable head does not consume an admission', () => {
-    const block = async (f, pr) => {
-      f.queue.admit(repo, pr);
-      await f.queue.settle(repo, refused(pr, 'review-unfinished'));
-    };
     it('a review-unfinished head is probed each tick but the next runnable PR is admitted in the same tick', async () => {
       const f = fixture();
       await f.queue.sync(repo, candidates([1, 2, 3]));
@@ -1027,24 +1030,21 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       expect(numbers(f.queue.admit(repo, 2))).toEqual([1, 2, 3]);
       expect(numbers(f.queue.admit(repo, 0))).toEqual([1]); // a probe uses no slot, so it still runs at zero admission
     });
-    it('caps probes at two and rotates heads that stay blocked to the tail after maxAttempts', async () => {
-      const f = fixture();
-      await f.queue.sync(repo, candidates([1, 2, 3, 4]));
-      for (const pr of [1, 2, 3]) {
-        f.queue.admit(repo, 3);
-        await f.queue.settle(repo, { rows: [1, 2, 3].map(n => ({ prNumber: n, action: 'skip', why: 'review-unfinished' })),
-          dispatched: [], notStarted: [1, 2, 3].map(n => ({ prNumber: n, reason: 'review-unfinished' })) });
-        break;
-      }
-      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 4]); // at most 2 probes plus 1 runnable slot
-      for (let tick = 0; tick < 3; tick++) {
-        const ids = numbers(f.queue.admit(repo, 1));
-        const why = n => (n === 4 ? 'no review capacity left' : 'review-unfinished');
-        await f.queue.settle(repo, { rows: ids.map(n => ({ prNumber: n, action: 'skip', why: why(n) })),
-          dispatched: [], notStarted: ids.map(n => ({ prNumber: n, reason: why(n) })) });
-      }
-      expect(numbers(f.queue.entries())).toEqual([4, 3, 1, 2]); // blocked heads rotate after maxAttempts, independently of probe turns
-      expect(numbers(f.queue.entries())).toContain(3);
+    it('caps probes at six and rotates heads that stay blocked to the tail after maxAttempts', async () => {
+      const f = fixture({ maxAttempts: 2 });
+      await f.queue.sync(repo, candidates([1, 2, 3, 4, 5, 6, 7, 8]));
+      f.queue.admit(repo, 7);
+      const stillBlocked = ids => ({
+        rows: ids.map(prNumber => ({ prNumber, action: 'skip', why: 'review-unfinished' })),
+        dispatched: [], notStarted: ids.map(prNumber => ({ prNumber, reason: 'review-unfinished' })),
+      });
+      await f.queue.settle(repo, stillBlocked([1, 2, 3, 4, 5, 6, 7]));
+      expect(numbers(f.queue.admit(repo, 1))).toEqual([1, 2, 3, 4, 5, 6, 8]);
+      const outcome = stillBlocked([1, 2, 3, 4, 5, 6]);
+      // PR 8 was admitted too; report its capacity deferral so it remains runnable.
+      outcome.notStarted.push({ prNumber: 8, reason: 'no review capacity left' });
+      await f.queue.settle(repo, outcome);
+      expect(numbers(f.queue.entries())).toEqual([7, 8, 1, 2, 3, 4, 5, 6]);
     });
     const persistedBlocked = (f, reason, runnable = []) => {
       f.files.set(f.file, JSON.stringify(candidates([1, 2, 3, 4, 5, ...runnable]).map(c => ({
@@ -1056,7 +1056,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     it.each(['review-unfinished', 'planner-skip'])('new %s blocks join the tail and preserve turns assigned to probes', reason => {
       const f = fixture();
       const queue = persistedBlocked(f, reason, [6, 7]);
-      queue.admit(repo, 2);
+      queue.admit(repo, 2, { maxProbes: 2 });
       const before = queue.entries();
       queue.settle(repo, { rows: [1, 2, 6, 7].map(prNumber => ({ prNumber, action: 'skip', why: reason })),
         notStarted: reason === 'planner-skip' ? [] : [1, 2, 6, 7].map(prNumber => ({ prNumber, reason })) });
@@ -1083,7 +1083,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
         const fresh = tick === 1 ? [] : [2 * tick + 1, 2 * tick + 2];
         const ids = [...numbers(queue.entries()), ...fresh];
         f.logs.length = 0;
-        runWithRedTeamQueue({ queue, ...inputs(ids), log: f.log, run: options => {
+        runWithRedTeamQueue({ queue, floor: { maxProbesPerTick: 2 }, ...inputs(ids), log: f.log, run: options => {
           const admitted = options.plan.refusals.map(row => row.prNumber);
           const probed = admitted.filter(pr => !fresh.includes(pr));
           expect(probed).toHaveLength(2);
@@ -1112,9 +1112,9 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     it('a runnable entry with an old turn rejoins the tail when it blocks again', () => {
       const f = fixture();
       const queue = persistedBlocked(f, 'planner-skip');
-      queue.admit(repo, 0);
+      queue.admit(repo, 0, { maxProbes: 2 });
       queue.settle(repo, { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'temporary start failure' })) });
-      queue.admit(repo, 0);
+      queue.admit(repo, 0, { maxProbes: 2 });
       queue.settle(repo, { rows: [3, 4].map(prNumber => ({ prNumber, action: 'skip' })) });
       const maxTurn = Math.max(...queue.entries().map(entry => entry.lastProbeTurn ?? 0));
       queue.admit(repo, 1, { allowProbes: false });
@@ -1135,7 +1135,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
         .toEqual([1, 2, 3, 4, 5, 6, 7]);
       expect(reopened.entries().find(entry => entry.repo === otherRepo)).toEqual(foreign);
       expect(f.open().entries()).toEqual(reopened.entries());
-      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
+      expect(numbers(reopened.admit(repo, 0, { maxProbes: 2 }))).toEqual([1, 2]);
     });
     it.each(['review-unfinished', 'planner-skip'])('probes all five persisted %s entries within three ticks, capped at two even across restarts', reason => {
       const f = fixture();
@@ -1144,7 +1144,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       const seen = new Set();
       for (const expected of turns) {
         f.logs.length = 0;
-        runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5], { capacity: capacity(4) }), log: f.log,
+        runWithRedTeamQueue({ queue, floor: { maxProbesPerTick: 2 }, ...inputs([1, 2, 3, 4, 5], { capacity: capacity(4) }), log: f.log,
           run: options => {
             const ids = options.plan.refusals.map(row => row.prNumber);
             expect(ids).toEqual(expected);
@@ -1169,7 +1169,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       const remaining = [[1, 2, 3, 4, 5], [3, 4, 5], [5]];
       const turns = [[1, 2], [3, 4], [5]];
       for (let tick = 0; tick < turns.length; tick++) {
-        runWithRedTeamQueue({ queue, ...inputs(remaining[tick], { capacity: capacity(4) }), log: f.log,
+        runWithRedTeamQueue({ queue, floor: { maxProbesPerTick: 2 }, ...inputs(remaining[tick], { capacity: capacity(4) }), log: f.log,
           run: options => {
             expect(options.plan.refusals.map(row => row.prNumber)).toEqual(turns[tick]);
             return { rows: turns[tick].map(prNumber => ({ prNumber, action: 'clear' })) };
@@ -1183,7 +1183,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     it('two probes use no runnable slots and only excess runnable entries log capacity holds', () => {
       const f = fixture();
       const queue = persistedBlocked(f, 'planner-skip', [6, 7]);
-      runWithRedTeamQueue({ queue, ...inputs([1, 2, 3, 4, 5, 6, 7], { capacity: capacity(1) }), log: f.log,
+      runWithRedTeamQueue({ queue, floor: { maxProbesPerTick: 2 }, ...inputs([1, 2, 3, 4, 5, 6, 7], { capacity: capacity(1) }), log: f.log,
         run: options => {
           expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1, 2, 6]);
           return { rows: [], dispatched: [], notStarted: [] };
@@ -1205,9 +1205,9 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
         ...entry, repo: otherRepo, key: `${otherRepo}#${entry.pr}`,
       }))]));
       const reopened = f.open();
-      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
-      expect(numbers(reopened.admit(otherRepo, 0))).toEqual([1, 2]);
-      expect(numbers(reopened.admit(repo, 0))).toEqual([3, 4]);
+      expect(numbers(reopened.admit(repo, 0, { maxProbes: 2 }))).toEqual([1, 2]);
+      expect(numbers(reopened.admit(otherRepo, 0, { maxProbes: 2 }))).toEqual([1, 2]);
+      expect(numbers(reopened.admit(repo, 0, { maxProbes: 2 }))).toEqual([3, 4]);
     });
     it('rebases persisted probe turns before overflow while preserving fair order', () => {
       const f = fixture();
@@ -1216,10 +1216,10 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
         ...entry, lastProbeTurn: Number.MAX_SAFE_INTEGER - 4 + index,
       }))));
       const reopened = f.open();
-      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 2]);
+      expect(numbers(reopened.admit(repo, 0, { maxProbes: 2 }))).toEqual([1, 2]);
       expect(f.open().entries()).toEqual(reopened.entries());
-      expect(numbers(reopened.admit(repo, 0))).toEqual([3, 4]);
-      expect(numbers(reopened.admit(repo, 0))).toEqual([1, 5]);
+      expect(numbers(reopened.admit(repo, 0, { maxProbes: 2 }))).toEqual([3, 4]);
+      expect(numbers(reopened.admit(repo, 0, { maxProbes: 2 }))).toEqual([1, 5]);
     });
     it('disabled probes fail closed for five blocked entries and never log capacity holds', () => {
       const f = fixture();
@@ -1335,7 +1335,7 @@ describe('red-team queue floor idle override', () => {
     const text = JSON.stringify({ redTeam: { queue: { minConcurrent: 2, minConcurrentIdlePct: 80 } } });
     for (const bad of ['bad', '', ' ', 'Infinity', '-1', '101', '1.5']) {
       expect(loadRedTeamQueueFloor({ env: { WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT: bad }, file: 'x', readFile: () => text }))
-        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0 });
+        .toEqual({ minConcurrent: 2, idlePct: 80, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     }
   });
 });
@@ -1436,7 +1436,7 @@ it('corrupt operator store disables red-team capacity raises and logs operator-d
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     expect(log.mock.calls.flat().join(' ')).toContain('operator-db-unreadable');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1471,7 +1471,7 @@ it.each([
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: { ...operatorEnv(file),
       WE_RED_TEAM_QUEUE_MIN_CONCURRENT: '12', WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE: '6' }, log });
-    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0 });
+    expect(floor).toEqual({ minConcurrent: 0, idlePct: 10, reviewStartsPerTick: 0, maxProbesPerTick: 6 });
     const bound = { lanes: 20, startsCeiling: 20, remainingStarts: 0, budget: { left: 20 } };
     applyRedTeamQueueFloor(bound, { floor, cpuIdlePct: 100 });
     expect(redTeamQueueAdmitCount(bound)).toBe(0);
@@ -1555,5 +1555,224 @@ describe('live red-team queue reconciliation', () => {
     expect(result.dispatched).toEqual([]);
     expect(f.open().entries()).toEqual(before);
     expect(f.logs.filter(line => line.includes('live PR unreadable'))).toHaveLength(2);
+  });
+});
+
+// Persist the production queue shape and reopen it, including legacy entries without probe turns.
+function savedProbeQueue({ count = 10, readLivePr, turns, runnable = [] } = {}) {
+  const f = fixture({ readLivePr });
+  f.readPartialPr = key => ({ number: key.pr, labels: [], comments: [],
+    ...(readLivePr ? readLivePr(key) : { state: 'OPEN', headRefOid: head(key.pr) }) });
+  const ids = Array.from({ length: count }, (_, index) => index + 1);
+  f.files.set(f.file, JSON.stringify(candidates([...ids, ...runnable]).map(c => ({
+    key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head, enqueuedAt: 1, attempts: 0,
+    ...(!runnable.includes(c.pr) ? { blocked: c.pr % 2 ? 'review-unfinished' : 'planner-skip' } : {}),
+    ...(turns ? { lastProbeTurn: turns(c.pr) } : {}),
+  }))));
+  f.queue = f.open();
+  return f;
+}
+
+function probeTick(f, floor, extra = {}) {
+  const run = vi.fn(options => ({
+    rows: options.plan.refusals.map(row => ({ prNumber: row.prNumber, action: 'skip', why: 'review-unfinished' })),
+    dispatched: [],
+    notStarted: options.plan.refusals.map(row => ({ prNumber: row.prNumber, reason: 'review-unfinished' })),
+  }));
+  runWithRedTeamQueue({ queue: f.queue, ...inputs(numbers(f.queue.entries())),
+    capacity: capacity(1), floor, log: f.log, readPartialPr: f.readPartialPr, ...extra, run });
+  expect(run).toHaveBeenCalledOnce();
+  return run.mock.calls[0][0].plan.refusals;
+}
+
+function probeFloor(source, value, present = true) {
+  const configuration = { redTeam: { queue: source === 'file' && present ? { maxProbesPerTick: value } : {} } };
+  const store = join(operatorRoot, 'probe-overrides.json');
+  // JSON stores encode non-finite numbers as null. Direct-floor tests below also exercise raw NaN/Infinity.
+  writeFileSync(store, JSON.stringify(source === 'operator' && present ? { 'redTeamQueue.maxProbesPerTick': value } : {}));
+  return loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
+    readFile: () => JSON.stringify(configuration), log: vi.fn() });
+}
+
+describe('probe cap resolution through queue admission', () => {
+  it.each([
+    ['settings-only nondefault', 9, undefined, 9],
+    ['lower operator overrides higher settings', 9, 3, 3],
+    ['higher operator overrides lower settings', 3, 9, 9],
+    ['oversized settings clamps at hard ceiling', 500, undefined, 50],
+    ['operator at hard ceiling overrides settings', 3, 50, 50],
+    ['oversized operator is refused with finite default', 9, 500, 6],
+    ['invalid settings uses finite default', '9', undefined, 6],
+    ['invalid operator refuses otherwise valid settings', 9, '3', 6],
+  ])('%s determines the actual bounded probe count', (_name, fileCap, operatorCap, expected) => {
+    const store = join(operatorRoot, 'probe-cap-precedence.json');
+    writeFileSync(store, JSON.stringify(operatorCap === undefined ? {} : { 'redTeamQueue.maxProbesPerTick': operatorCap }));
+    const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
+      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: fileCap } } }), log: vi.fn() });
+    expect(floor.maxProbesPerTick).toBe(expected);
+    expect(probeTick(savedProbeQueue({ count: 60 }), floor)).toHaveLength(expected);
+  });
+
+  it.each(['settings', 'operator'])('unreadable %s falls back to six actual probes', source => {
+    const store = join(operatorRoot, 'probe-cap-unreadable.json');
+    writeFileSync(store, source === 'operator' ? '{' : '{}');
+    const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
+      readFile: () => {
+        if (source === 'settings') throw new Error('settings unreadable');
+        return JSON.stringify({ redTeam: { queue: { maxProbesPerTick: 9 } } });
+      }, log: vi.fn() });
+    expect(floor.maxProbesPerTick).toBe(6);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
+  });
+});
+
+describe('probe cap setting', () => {
+  it.each(['file', 'operator'])('%s setting 10 probes all ten blocked entries in one tick', source => {
+    const f = savedProbeQueue();
+    const floor = probeFloor(source, 10);
+    const rows = probeTick(f, floor);
+    expect(rows.map(row => row.prNumber)).toEqual(numbers(f.queue.entries()));
+    expect(rows).toHaveLength(10);
+    expect(floor.maxProbesPerTick).toBe(10);
+  });
+
+  it.each(['file', 'operator'])('%s setting 0 disables probes and retains blocked entries', source => {
+    const f = savedProbeQueue();
+    const before = f.queue.entries();
+    const floor = probeFloor(source, 0);
+    expect(floor.maxProbesPerTick).toBe(0);
+    expect(probeTick(f, floor)).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+  });
+
+  it('setting absent defaults to exactly six probes among ten blocked entries', () => {
+    const f = savedProbeQueue();
+    const floor = probeFloor('file', undefined, false);
+    expect(probeTick(f, floor).map(row => row.prNumber)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(floor.maxProbesPerTick).toBe(6);
+  });
+
+  it.each(['file', 'operator'])('%s setting 500 is refused or clamped at the hard ceiling 50', source => {
+    const floor = probeFloor(source, 500);
+    const rows = probeTick(savedProbeQueue({ count: 60 }), floor);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.length).toBeLessThanOrEqual(50);
+    expect(Number.isSafeInteger(floor.maxProbesPerTick)).toBe(true);
+    expect(floor.maxProbesPerTick).toBeGreaterThan(0);
+    expect(floor.maxProbesPerTick).toBeLessThanOrEqual(50);
+  });
+
+  it('probe order stays least-recently-probed first across persisted ticks', () => {
+    const f = savedProbeQueue({ turns: pr => 11 - pr });
+    const floor = probeFloor('file', undefined, false);
+    expect(probeTick(f, floor).map(row => row.prNumber).sort((a, b) => a - b)).toEqual([5, 6, 7, 8, 9, 10]);
+    const advanced = f.open().entries().filter(entry => entry.lastProbeTurn > 10)
+      .sort((a, b) => a.lastProbeTurn - b.lastProbeTurn);
+    expect(numbers(advanced)).toEqual([10, 9, 8, 7, 6, 5]);
+    f.queue = f.open();
+    expect(probeTick(f, floor).map(row => row.prNumber).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 9, 10]);
+  });
+});
+
+describe('invalid probe cap', () => {
+  const invalid = [-1, 2.5, '7', NaN, Infinity, null, true];
+  describe.each(['file', 'operator'])('%s setting', source => {
+    it.each(invalid)('%s falls back to exactly six finite probes', value => {
+      const floor = probeFloor(source, value);
+      expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
+      expect(floor.maxProbesPerTick).toBe(6);
+    });
+  });
+  it.each(invalid)('raw floor value %s also falls back to six probes', value => {
+    expect(probeTick(savedProbeQueue(), { maxProbesPerTick: value })).toHaveLength(6);
+  });
+  it.each([0, 1])('an unreadable operator store preserves a stricter settings cap of %i', cap => {
+    const store = join(operatorRoot, 'restrictive-probe-store.json');
+    writeFileSync(store, '{');
+    const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
+      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: cap } } }), log: vi.fn() });
+    expect(floor.maxProbesPerTick).toBe(cap);
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(cap);
+  });
+
+  it('an unreadable operator store returns null policy and uses the finite default', () => {
+    const store = join(operatorRoot, 'unreadable-probe-store.json');
+    writeFileSync(store, '{');
+    operatorEnv(store);
+    expect(readOperatorPolicy('redTeamQueue')).toBeNull();
+    const floor = loadRedTeamQueueFloor({ env: {}, file: 'probe-settings.json',
+      readFile: () => JSON.stringify({ redTeam: { queue: { maxProbesPerTick: 500 } } }) });
+    expect(probeTick(savedProbeQueue(), floor)).toHaveLength(6);
+    expect(floor.maxProbesPerTick).toBe(6);
+  });
+});
+
+describe('list read partial', () => {
+  it('never fabricates recovery refusals when the planner supplied none', () => {
+    const f = savedProbeQueue({ count: 3 });
+    expect(probeTick(f, undefined, { listPartial: true, plan: { refusals: [] } })).toEqual([]);
+    expect(numbers(f.open().entries())).toEqual([1, 2, 3]);
+  });
+
+  it('retains persisted known entries and probes only planner-provided head-bound refusal rows', () => {
+    const f = savedProbeQueue({ count: 3, runnable: [4] });
+    const stored = f.queue.entries();
+    const rows = probeTick(f, undefined, { listPartial: true });
+    expect(rows).toEqual([1, 2, 3].map(prNumber => ({
+      prNumber, kind: 'already-reviewed-head', headSha: stored.find(entry => entry.pr === prNumber).head,
+    })));
+    expect(numbers(f.open().entries())).toEqual([1, 2, 3, 4]);
+  });
+
+  it('fails closed on unknown PR admission and does not admit known runnable entries', () => {
+    const f = savedProbeQueue({ count: 3, runnable: [4] });
+    const rows = probeTick(f, undefined, { ...inputs([1, 2, 3, 4, 99]), listPartial: true });
+    expect(rows.map(row => row.prNumber)).toEqual([1, 2, 3]);
+    expect(numbers(f.open().entries())).toEqual([1, 2, 3, 4]);
+    expect(f.logs.some(line => line.includes('enqueue example/project#99'))).toBe(false);
+  });
+
+  it.each(['CLOSED', 'MERGED', 'head-moved'])('does not probe a known %s entry', state => {
+    const readLivePr = vi.fn(({ pr }) => ({
+      state: pr === 3 && state !== 'head-moved' ? state : 'OPEN',
+      headRefOid: pr === 3 && state === 'head-moved' ? head(300) : head(pr),
+    }));
+    const f = savedProbeQueue({ count: 3, readLivePr });
+    const rows = probeTick(f, undefined, { listPartial: true });
+    expect(rows.map(row => row.prNumber)).toEqual([1, 2]);
+    expect(readLivePr).toHaveBeenCalledWith({ repo, pr: 3 });
+  });
+
+  it.each([undefined, false])('listPartial=%s keeps complete-list eviction and admission behavior', listPartial => {
+    const f = savedProbeQueue({ count: 3, runnable: [4] });
+    const rows = probeTick(f, undefined, { ...inputs([99]), ...(listPartial === undefined ? {} : { listPartial }) });
+    expect(rows).toEqual([{ prNumber: 99, kind: 'already-reviewed-head', headSha: head(99) }]);
+    expect(numbers(f.open().entries())).toEqual([99]);
+  });
+});
+
+describe('partial inventory recovery safety', () => {
+  it.each(['unreadable', 'throw', 'missing-head'])('partial inventory retains entries and refuses %s live evidence', mode => {
+    const readLivePr = vi.fn(() => {
+      if (mode === 'throw') throw new Error('offline');
+      return mode === 'missing-head' ? { state: 'OPEN' } : null;
+    });
+    const f = savedProbeQueue({ count: 3, runnable: [4], readLivePr });
+    const before = f.queue.entries();
+    expect(probeTick(f, undefined, { listPartial: true })).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+    expect(readLivePr.mock.calls.map(([input]) => input.pr)).toEqual([1, 2, 3]);
+  });
+
+  it('partial inventory runner receives only raw PRs from matching live reads', () => {
+    const f = savedProbeQueue({ count: 3, runnable: [4] });
+    const readPartialPr = vi.fn(({ pr }) => ({ number: pr, labels: [], comments: [], state: pr === 3 ? 'CLOSED' : 'OPEN', headRefOid: head(pr), title: `live ${pr}` }));
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 99]), listPartial: true, readPartialPr,
+      capacity: capacity(1), run: options => {
+        expect(options.rawPrs).toEqual([1, 2].map(pr => ({ number: pr, labels: [], comments: [], state: 'OPEN', headRefOid: head(pr), title: `live ${pr}` })));
+        return { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'review-unfinished' })) };
+      } });
+    expect(readPartialPr.mock.calls.map(([input]) => input.pr)).toEqual([1, 2, 3]);
+    expect(numbers(f.open().entries())).toEqual([1, 2, 3, 4]);
   });
 });
