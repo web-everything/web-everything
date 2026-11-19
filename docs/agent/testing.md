@@ -4791,3 +4791,9 @@ The ordinary drain's fresh merge revalidation also hydrates from the complete
 check/status reader; its flattened `gh pr view` rollup is insufficient. The
 pre-stage CLI suite pins unreadable check-run and commit-status refusal before
 enqueue, alongside the successful ordinary cascade and cached pre-stage paths.
+
+Hermetic ordinary-drain CLI shims use `scripts/__tests__/fixtures/complete-check-read-fixture.mjs`
+to serve the complete paginated check-run and legacy-status endpoints from their PR database.
+The real reader supplies provenance only after both reads. The helper refuses unknown heads
+and absent rollups, preserves failing/pending/wrong-head rows, and leaves targeted freshness
+reads to the caller. A flattened PR view alone must never acquire completeness metadata.
