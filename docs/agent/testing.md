@@ -2341,8 +2341,8 @@ telemetry sample taken after the failure; a bounded probe that stalls or returns
 keeps exit 124 and the marker. Telemetry confirms termination, never a verified remote success.
 Regressions live in `forge-slot-markers-per-run.test.mjs` and `heavy-admission-remote.test.mjs`.
 
-After a run timeout, allow 30 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
-validated as a nonnegative integer and capped at 90 seconds), probing fresh per-run telemetry
+After a run timeout, allow 180 seconds for cancellation (`WE_HEAVY_TIMEOUT_CANCEL_WAIT_MS`,
+validated as a nonnegative integer and capped at 300 seconds), probing fresh per-run telemetry
 about every two seconds while also waiting for the executor. R989 accepts a late receipt-verified
 `mode: 'remote'` answer with an integer code 0–254 only inside this cancel wait and only when
 its string `run` strictly matches the non-null execution run recorded by `onRun` for this dispatch;
@@ -2350,7 +2350,9 @@ return its exit code (including failures), record it, and release the slot and b
 Missing/mismatched run IDs, invalid codes, executor rejection and other ambiguous answers must
 not stop telemetry probes. A client signal still wins. Only confirmed cancellation
 or fresh `finished` telemetry permits local fallback; deadline expiry
-keeps exit 124 and both marker files.
+keeps exit 124 and both marker files. Busy unit-run rejections preserve `forge-busy`;
+only a matching finish from protected `prepared` state certifies `started: false`.
+A protected `running` state and plain non-sibling snapshot rejection remain unconfirmed.
 ### Forge warm bases and delta snapshots
 
 The Mac client and public-base warmer share `forge-exec-manifest.mjs`: path bytes,
@@ -4796,6 +4798,18 @@ model finding text. A confirmed held card satisfies existence (D5). Security fix
 for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
 and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
 stdout/record golden unchanged when changing proof-mode policy.
+## Stuck trace isolation
+
+The stuck-trace node:test fixtures inject both operations and the event sink. Keep
+`fileURLToPath(import.meta.url)` resolution inside the default child runner: the digest
+fixtures import modules through data URLs, where eager file-path resolution fails.
+The digest and merge watcher share the watcher receipt directory; when overriding
+its state directory, pass that directory as the digest’s `traceStateDir` too.
+When exercising production branches with fully injected IO, stub `VITEST` and
+`WE_UNDER_TEST` to empty strings and assert `isUnderTest()` is false. Vitest 1.x
+stringifies `vi.stubEnv(name, undefined)` to the truthy string `"undefined"`, which
+keeps the isolation guards active and can make negative-path assertions vacuous.
+Restore the environment after each case; retain the production isolation guards.
 
 ## Antigravity binary maintenance
 
@@ -4957,6 +4971,28 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+
+
+## Verify failed-file recovery
+
+`verify.retryFailed` (`scripts/verify-settings.json`, env `WE_VERIFY_RETRY_FAILED`) defaults to 1,
+accepts 0–10 attempts, and logs its effective value/source. Zero retains the historical
+`isolatedRetry` policy. Positive values retry up to three failed files per Vitest/scan/guard
+phase, including edited files, using serial workers and the phase's scaled timeouts. `isolatedRetry=off`
+disables all retries; `isolatedRetry=timeouts` permits only timeout-only failure inventories, including
+on later attempts. These restrictions also apply to scan and guard retries. A complete
+failure inventory and a JSON report proving the original failing assertions passed are required;
+missing, skipped, or incomplete execution never clears red. Every duplicate of an original full test
+name in that exact file's retry report must pass; a passing namesake cannot mask a skipped test.
+Oversized/incomplete inventories stay red: fix the failures or run a fresh verify. The recognized full-unit default separates tests
+from standards; opaque explicit combined commands retain their verdict. Recovered files appear in
+marker `flakes` and the advisory coordination-root `.operations/test-flakes.jsonl`; merge CI is unchanged.
+Full-unit recovery requires a runtime read proving the target checkout's `test:unit` is exactly the
+heavy-admission `vitest run` script with neither `pretest:unit` nor `posttest:unit`. Missing, unreadable,
+malformed or oversized package evidence leaves the full gate opaque. Scan retries retain the original
+command's environment assignments, including `VERIFY_SCAN_FILES`; an unrecognized assignment or shell
+shape refuses recovery. Both refusals retain red: fix the failures or run a fresh verify.
+`verify-retry-context.test.mjs` covers package evidence and an untracked deterministic scan violation.
 ## Urgent prototype verification
 
 `node scripts/operations/run.mjs urgent-verify --sha=<full sha>` requires a clean checkout at
@@ -5120,3 +5156,17 @@ Keep audit proof dependencies outside held-card filing and CLI loading. Share ba
 qualification through `scripts/lib/qualify-bare-basenames.mjs`; importing the filer from the
 classifier pulls the CLI adapter into review/promotion closures and creates a cycle through
 the audit loader. The import-closure regression in `audit-base-repro.test.mjs` pins this boundary.
+## Forge sweep partial work
+
+`forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between
+slot and presync tree inspection and proven-tree removal. Entry-bound exhaustion
+preserves the tree and reports `partial` with an operator fallback to raise the
+bound or stop writers and inspect manually. Depth limits and filesystem errors
+remain refusals. `slots.maxRunDirsPerTick` (integer 1–10000, default 200) counts only
+reclaimed directories (would-reclaim in dry-run) across sorted slots and legacy
+directories. Fresh, reserved, live-record and oversized trees do not consume this
+budget. At the bound, inspection stops and unexamined candidates carry over with
+a reclaimed/remaining partial note. Invalid bounds use defaults and report
+`default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
+warning. Unreadable reservations refuse and preserve the entire affected slot.
+The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
