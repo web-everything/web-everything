@@ -433,18 +433,25 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
 const admissionPolicyCache = new Map();
 const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
 const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+function readPlatformPreferences(path) {
+  if (!path) throw new Error('canonical host preferences path unavailable');
+  if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
 /**
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:
  * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
  * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test), and cannot select executable
  * remote client code or manifest validation. `home` injects the canonical host file's directory for tests.
- * Redirected preferences always take remote.manifest from that canonical file; read failures require local execution.
- * A read that fails keeps the last
- * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
+ * remote.manifest always comes from the canonical file; failed reads require local execution, except ENOENT
+ * for direct callers. Redirected callers require a valid canonical object even when the file is absent.
+ * Other settings keep their last good values after a failed read. Failures are not cached, so a torn write
+ * is retried by the next caller instead of pinning the standard.
  */
 export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
   let platform; let tool; let path; let hostPath; let envSelected = false; const errors = []; const ignored = []; let readFailed = false;
+  let platformFile; let platformReadError;
   let canonicalManifestReadFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
@@ -461,11 +468,11 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
   if (path) try {
-    if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
-    const file = JSON.parse(readFileSync(path, 'utf8'));
-    if (admissionObject(file) && Object.hasOwn(file, 'heavyAdmission')) platform = file.heavyAdmission;
+    platformFile = readPlatformPreferences(path);
+    if (admissionObject(platformFile) && Object.hasOwn(platformFile, 'heavyAdmission')) platform = platformFile.heavyAdmission;
     platformLastGood.set(path, platform);
   } catch (e) {
+    platformReadError = e;
     if (e?.code !== 'ENOENT') {
       readFailed = true;
       errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`);
@@ -478,23 +485,25 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
     platform = { ...platform, remote };
     ignored.push(`platform.remote.clientPath=${clientPathForLog(clientPath)} (ignored: preferences selected via WE_PLATFORM_PREFERENCES; only the host preferences file may select executable client code)`);
   }
-  if (envSelected) {
+  {
+    // Resolve manifest evidence once for every caller. Last-good settings may not supply this decision.
     const { manifest, ...remote } = platform?.remote ?? {};
-    if (manifest !== undefined) ignored.push(`platform.remote.manifest=${oneLine(JSON.stringify(manifest))} (ignored: redirected preferences; only the canonical host preferences file may select manifest validation)`);
+    if (envSelected && manifest !== undefined) ignored.push(`platform.remote.manifest=${oneLine(JSON.stringify(manifest))} (ignored: redirected preferences; only the canonical host preferences file may select manifest validation)`);
     let hostManifest;
     try {
-      if (!hostPath) throw new Error('canonical host preferences path unavailable');
-      if (statSync(hostPath).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
-      const host = JSON.parse(readFileSync(hostPath, 'utf8'));
+      if (!envSelected && platformReadError) throw platformReadError;
+      const host = envSelected ? readPlatformPreferences(hostPath) : platformFile;
       if (!admissionObject(host) || (Object.hasOwn(host, 'heavyAdmission') && !admissionObject(host.heavyAdmission))
         || (host.heavyAdmission && Object.hasOwn(host.heavyAdmission, 'remote') && !admissionObject(host.heavyAdmission.remote)))
         throw new Error('invalid canonical preferences object');
       hostManifest = host.heavyAdmission?.remote?.manifest;
     } catch (e) {
-      // Never inherit redirected or last-good manifest values when canonical evidence is unavailable.
-      readFailed = true;
-      canonicalManifestReadFailed = true;
-      errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
+      // Only direct ENOENT is a default decision. Redirected callers must prove canonical policy exists.
+      if (envSelected || e?.code !== 'ENOENT') {
+        readFailed = true;
+        canonicalManifestReadFailed = true;
+        errors.push(`canonical platform manifest: ${String(e?.message ?? e).split('\n')[0]}`);
+      }
     }
     platform = { ...platform, remote: { ...remote, ...(hostManifest !== undefined ? { manifest: hostManifest } : {}) } };
   }

@@ -4821,7 +4821,9 @@ in private pools. The policy log includes its source.
 Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
 Tracked transport is always rsync: Git bundles contain history outside the validated
 leaf manifest. Git-dependent tests refuse with `bundle-local`, including needsGit
-routing with a cached bundle capability and the host-overload route; record the refusal
+routing with a cached bundle capability and the host-overload route. Tracked rsync uses
+the same route plus full-selection proof as legacy bundles: a readable pure-test filter
+can also select a Git-dependent test by substring, and must fall back locally. Record the refusal
 in the manifest log before local execution. Presync resolves the same canonical policy
 as admission and skips tracked or manifest-related fail-closed policies before any Git,
 SSH, rsync, lock or cache-state operation. Its legacy delta behavior is unchanged.
@@ -4851,6 +4853,10 @@ into `loadAdmissionPolicy` to test that path without reading the real home file.
 unreadable, oversized, malformed or structurally invalid canonical evidence disables remote
 execution for redirected callers, with a policy source explaining the local fallback. A valid
 canonical object without `remote.manifest` uses the standard manifest default. Failed reads
+also disable remote execution for direct callers; only `ENOENT` may select the default
+without a valid canonical object for a direct caller. Neither CLI enablement nor last-good
+settings may override that manifest refusal. The shared `loadAdmissionPolicy` resolver is
+the only canonical manifest source for admission, the explicit CLI and presync. Failed reads
 are retried on the next call; they never use the redirected manifest or a cached last-good
 host manifest. An invalid
 platform manifest value disables remote execution with a policy source explaining the local

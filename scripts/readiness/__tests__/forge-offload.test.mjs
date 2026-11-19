@@ -894,7 +894,8 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     }
     const runRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/work/'));
     const presyncRsync=calls=>calls.filter(c=>c.file==='rsync'&&c.args.at(-1).includes('/presync/'));
-    it.each(['tracked','invalid','missing','malformed','oversized','invalid object','unreadable'])('presync is a no-op for canonical %s policy despite a usable base and dirty/untracked bytes',async fault=>{
+    it.each(['direct','redirected'].flatMap(mode=>
+      ['tracked','invalid','malformed','oversized','invalid object','unreadable',...(mode==='redirected'?['missing']:[])].map(fault=>[mode,fault])))('presync is a no-op for %s canonical %s policy despite a usable base and dirty/untracked bytes',async(mode,fault)=>{
       const f=await setup(),t=presyncTransport(f);
       await fs.writeFile(join(repo,'scratch.txt'),'private untracked bytes');
       const path=join(root,'.claude','platform-preferences.json');
@@ -906,16 +907,17 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
       if(fault==='unreadable'){await fs.rm(path);await fs.mkdir(path);}
       const redirected=join(root,'redirected.json');
       await fs.writeFile(redirected,JSON.stringify({heavyAdmission:{remote:{manifest:'legacy',enabled:true}}}));
-      const round=await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{...process.env,WE_PLATFORM_PREFERENCES:redirected}});
+      const round=await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{...process.env,WE_PLATFORM_PREFERENCES:mode==='redirected'?redirected:undefined}});
       expect(round).toEqual({status:'skipped',reason:fault==='tracked'?'tracked-manifest':expect.stringContaining(fault==='invalid'?'invalid remote.manifest':'canonical remote.manifest unavailable')});
       expect(t.calls).toEqual([]);
       expect(await remote.readPresyncState(gitDir())).toBeNull();
       await expect(fs.stat(join(gitDir(),'forge-presync.lock'))).rejects.toMatchObject({code:'ENOENT'});
     },30_000);
-    it('legacy presync still ships dirty and untracked delta leaves',async()=>{
+    it.each(['legacy','absent'])('legacy presync still ships dirty and untracked delta leaves with %s canonical policy',async policyCase=>{
       const f=await setup(),t=presyncTransport(f);
+      if(policyCase==='absent')await fs.rm(join(root,'.claude','platform-preferences.json'));
       await fs.writeFile(join(repo,'scratch.txt'),'legacy untracked bytes');
-      expect(await presync({cwd:repo,exec:t.transport,sshOptions:[]})).toMatchObject({status:'synced',count:2});
+      expect(await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{...process.env,WE_PLATFORM_PREFERENCES:undefined}})).toMatchObject({status:'synced',count:2});
       const state=await remote.readPresyncState(gitDir());
       expect(await fs.readFile(join(t.cacheRoot,state.key,'scratch.txt'),'utf8')).toBe('legacy untracked bytes');
       expect(await fs.readFile(join(t.cacheRoot,state.key,'a.test.mjs'),'utf8')).toBe('changed');

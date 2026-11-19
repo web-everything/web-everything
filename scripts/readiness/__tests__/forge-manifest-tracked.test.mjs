@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { buildManifest, runRemote, main, defaultExec, FORGE_MANIFEST_SIZE_EXCEPTIONS } from '../remote-exec.mjs';
 import { resolveAdmissionPolicy, formatAdmissionPolicy, decideRemote, runWithRemoteDecision, createRemoteExec } from '../heavy-admission.mjs';
 import { easternTimestamp } from '../forge-exec-run.mjs';
+import { routeNeedsGit, selectionUnproven } from '../needs-git-route.mjs';
 
 let root, cwd, env, log;
 const git = args => {
@@ -26,6 +27,7 @@ beforeEach(async () => {
   for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
   git(['init', '-q']);
   await write('clean.txt', 'clean\n'); await write('package-lock.json', '{}');
+  await write('clean.test.mjs', '// pure test\n');
   await write('.gitignore', 'coverage/\nignored/\n'); commit();
 });
 afterEach(async () => { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); });
@@ -134,6 +136,17 @@ it.each(['HEAD', 'history'])('tracked bundles refuse Git-dependent tests before 
   await fallback('bundle-local', { transport: 'git-bundle', argv: ['npx', 'vitest', 'run', 'git.test.mjs'] });
   expect(await lines()).toEqual([expect.objectContaining({ mode: 'tracked', reason: 'bundle-local' })]);
 });
+it.each(['rsync', 'git-bundle'])('tracked %s refuses a readable pure filter that also selects a Git-dependent test by substring', async transport => {
+  await write('pure.test.mjs', '// pure test\n');
+  await fs.mkdir(join(cwd, 'nested'));
+  await write('nested/prefix-pure.test.mjs', "import {spawnSync} from 'node:child_process'; spawnSync('git', ['status']);\n");
+  commit();
+  const argv = ['npx', 'vitest', 'run', 'pure.test.mjs'];
+  expect(routeNeedsGit({ argv, cwd })).toEqual({ local: false });
+  expect(selectionUnproven({ argv, cwd })).toBe(true);
+  await fallback('bundle-local', { transport, argv });
+  expect(await lines()).toEqual([expect.objectContaining({ mode: 'tracked', reason: 'bundle-local' })]);
+});
 it('tracked bundle requests ship only a full tracked rsync manifest despite a usable warm base', async () => {
   await write('pure.test.mjs', '// pure test\n');
   await coverage({ 'clean.txt': { ...coverageEntry('clean.txt'), s: { 0: 126879297332596 } } });
@@ -183,7 +196,9 @@ it.each(['always', 'overloaded'])('tracked needsGit routing refuses bundles loca
   expect(await lines()).toEqual([expect.objectContaining({mode:'tracked',reason:'bundle-local'})]);
 });
 
-it.each(['invalid', 'missing', 'malformed', 'oversized', 'invalid object', 'unreadable'])('explicit remote CLI preserves the canonical %s manifest refusal and runs locally', async fault => {
+it.each(['direct', 'redirected'].flatMap(mode =>
+  ['invalid', 'malformed', 'oversized', 'invalid object', 'unreadable', ...(mode === 'redirected' ? ['missing'] : [])]
+    .map(fault => [mode, fault])))('explicit remote CLI preserves the %s canonical %s manifest refusal and runs locally', async (mode, fault) => {
   const home = join(root,'host'), hostPath = join(home,'.claude','platform-preferences.json');
   await fs.mkdir(join(home,'.claude'),{recursive:true});
   if (fault === 'invalid') await fs.writeFile(hostPath,JSON.stringify({heavyAdmission:{remote:{manifest:'trackd',enabled:true}}}));
@@ -195,20 +210,21 @@ it.each(['invalid', 'missing', 'malformed', 'oversized', 'invalid object', 'unre
   await fs.writeFile(redirected,JSON.stringify({heavyAdmission:{remote:{manifest:'legacy',enabled:true,mode:'always'}}}));
   const remoteExec = vi.fn(), local = vi.fn(async()=>17), output = vi.fn();
   const argv = ['npx','vitest','run','clean.test.mjs'];
-  expect(await main({argv,cwd,home,env:{...env,WE_PLATFORM_PREFERENCES:redirected},lockRoot:join(root,'heavy'),remoteExec,local,log:output})).toBe(17);
+  expect(await main({argv,cwd,home,env:{...env,WE_PLATFORM_PREFERENCES:mode === 'redirected' ? redirected : undefined},lockRoot:join(root,'heavy'),remoteExec,local,log:output})).toBe(17);
   expect(remoteExec).not.toHaveBeenCalled(); expect(local).toHaveBeenCalledWith(argv);
   expect(output).toHaveBeenCalledWith(expect.stringContaining(fault === 'invalid' ? 'invalid remote.manifest; local execution required' : 'canonical remote.manifest unavailable; local execution required'));
 });
-it.each(['legacy','tracked'])('explicit remote CLI still forces enabled/always for valid %s policy and dispatches the effective transport', async manifest => {
+it.each(['legacy','tracked','absent','no key'])('explicit remote CLI still forces enabled/always for valid %s policy and dispatches the effective transport', async policyCase => {
+  const manifest = policyCase === 'tracked' ? 'tracked' : 'legacy';
   const home = join(root,'host'); await fs.mkdir(join(home,'.claude'),{recursive:true});
-  await fs.writeFile(join(home,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{manifest,enabled:false,transport:'git-bundle'}}}));
+  if (policyCase !== 'absent') await fs.writeFile(join(home,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{...(policyCase !== 'no key' ? {manifest} : {}),enabled:false,transport:'git-bundle'}}}));
   await write('pure.test.mjs','// pure test\n'); commit();
   const remoteExec = vi.fn(async()=>({mode:'remote',code:0})), local = vi.fn(), output = vi.fn();
   const now = Date.now();
-  expect(await main({argv:['npx','vitest','run','pure.test.mjs'],cwd,home,env,lockRoot:join(root,'heavy'),remoteExec,local,log:output,
+  expect(await main({argv:['npx','vitest','run','pure.test.mjs'],cwd,home,env:{...env,WE_PLATFORM_PREFERENCES:undefined},lockRoot:join(root,'heavy'),remoteExec,local,log:output,
     clock:()=>now,readTelemetry:async()=>({sampledAtET:easternTimestamp(now),cores:8,loadPerCore:0.1,memFreePct:96,activeRuns:0,recent:[]})})).toBe(0);
   expect(local).not.toHaveBeenCalled();
-  expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({manifestMode:manifest,transport:manifest === 'tracked' ? 'rsync' : 'git-bundle'}));
+  expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({manifestMode:manifest,transport:manifest === 'tracked' || policyCase === 'absent' ? 'rsync' : 'git-bundle'}));
   expect(output).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=true (explicit remote CLI request); mode=always'));
 });
 it('tracked admission refuses an external client before importing code that could ignore manifestMode', async () => {
@@ -333,7 +349,7 @@ it.each(['fs', 'listFiles'])('legacy runRemote with injected %s skips shadow eve
 });
 it.each(['fs', 'listFiles'])('legacy with injected %s skips shadow IO and logging', async kind => {
   const options = kind === 'fs' ? { fs: { ...fs } }
-    : { listFiles: async () => ['.gitignore', 'clean.txt', 'package-lock.json'] };
+    : { listFiles: async () => ['.gitignore', 'clean.txt', 'clean.test.mjs', 'package-lock.json'] };
   const baseline = await build({ ...options, manifestMode: 'legacy', env: { ...env, FORGE_MANIFEST_SHADOW: '0' } });
   expect(await build({ ...options, manifestMode: 'legacy' })).toEqual(baseline);
   await expect(fs.stat(log)).rejects.toMatchObject({ code: 'ENOENT' });

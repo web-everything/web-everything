@@ -1453,11 +1453,8 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   const bundleTransport=manifestMode === 'legacy' && bundleRequested;
   const standardsNeedGit=argv[2]==='check:standards'||Object.hasOwn(executionEnv,'DIFF_COVERAGE_BASE');
   // Legacy bundles provide a real worktree. Tracked runs must keep Git-dependent tests local.
-  let testNeedsGit=false;
-  if(!standardsNeedGit) {
-    if(bundleRequested)testNeedsGit=detectTestNeedsGit({argv,cwd});
-    else if(manifestMode === 'tracked')testNeedsGit=detectTestNeedsGit({argv,cwd,unproven:()=>false});
-  }
+  const testNeedsGit=!standardsNeedGit && (bundleRequested || manifestMode === 'tracked')
+    && detectTestNeedsGit({argv,cwd});
   if (manifestMode === 'tracked' && testNeedsGit) {
     const error=manifestRefusal('bundle-local','.');
     await logManifestVerdict({env,mode:manifestMode,error});
