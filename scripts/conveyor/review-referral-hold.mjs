@@ -224,6 +224,9 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
         for (const key of ['pendingReferrals', 'blockedReferrals']) {
           if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new Error(`verdict ${key} is not a list`);
         }
+        // Element shapes the pipeline writes: pendingReferrals are non-empty reason strings, blockedReferrals are objects.
+        if (payload.pendingReferrals?.some(item => typeof item !== 'string' || !item.trim())) throw new Error('verdict pendingReferrals holds a malformed element');
+        if (payload.blockedReferrals?.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('verdict blockedReferrals holds a malformed element');
         if (payload.verdict === VERDICTS.NEEDS_HUMAN && !Array.isArray(payload.pendingReferrals)) throw new Error('needs-human verdict without pendingReferrals');
       }
       // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
