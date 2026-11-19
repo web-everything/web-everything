@@ -250,6 +250,36 @@ it('T8 a torn target file is charged and HOLDs despite a valid accept', () => {
   expect(io.ids.length).toBeLessThanOrEqual(2);
 });
 
+it.each(['legacy', 'same-PR named'])('T9 flat %s archived evidence requires restoration and HOLD', kind => {
+  const f = fixture();
+  persist(f);
+  const archived = record(f, kind === 'legacy' ? { id: 'review-pr-legacy-flat' } : {});
+  const directory = join(f.runsDir, 'archive', 'review-pr');
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, `${archived.id}.json`), JSON.stringify(archived));
+  expect(candidates(f)).toBeNull();
+  hold(evidence(f));
+});
+
+it('T9 flat other-N named archived evidence still allows the live review to be found', () => {
+  const f = fixture(), live = persist(f), archived = record(f, { pr: f.pr + 1 });
+  const directory = join(f.runsDir, 'archive', 'review-pr');
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, `${archived.id}.json`), JSON.stringify(archived));
+  expect(candidates(f)).toEqual({ ids: [live.id], source: 'names', legacy: 0, mismatch: 0 });
+  found(f, live);
+});
+
+it('T9 an unreadable flat archive directory gives HOLD', () => {
+  const f = fixture();
+  persist(f);
+  mkdirSync(join(f.runsDir, 'archive'));
+  // ENOTDIR is deterministic even when the test process can bypass permissions.
+  writeFileSync(join(f.runsDir, 'archive', 'review-pr'), 'not a directory');
+  expect(candidates(f)).toBeNull();
+  hold(evidence(f));
+});
+
 it.each([undefined, 14, 21])('T9 archive age %s uses repo/PR directories; reopened evidence holds until restored', minAgeDays => {
   const f = fixture(), old = persist(f), young = persist(f, { pr: 8 }), open = persist(f, { pr: 9 });
   const middle = persist(f, { pr: 10 });
