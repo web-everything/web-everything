@@ -61,7 +61,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
             ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
               ?? ({ 10080: 'weekly', 300: 'five_hour' })[w.window_minutes] ?? `${w.window_minutes}_minutes`
             : fallback;
-          add(name(raw, def.readers?.find(r => r.window)?.window ?? 'five_hour'), raw);
+          add(name(raw, def.readers?.find(r => r.window)?.window ?? def.windows?.[0]?.name ?? 'five_hour'), raw);
           add(name(raw?.secondary, 'weekly'), raw?.secondary);
         } else {
           add('five_hour', raw?.five_hour); add('seven_day', raw?.seven_day);
