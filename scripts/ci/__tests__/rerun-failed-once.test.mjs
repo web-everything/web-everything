@@ -1,0 +1,142 @@
+// @vitest-environment node
+import { describe, expect, it, vi } from 'vitest';
+import { parseReport, planRetry, retryVerdict, rerunOnce, resolvePolicy } from '../rerun-failed-once.mjs';
+import UnitJsonReporter from '../unit-json-reporter.mjs';
+
+const root = '/repo';
+const policy = { enabled: true, maxFiles: 10 };
+const report = (...testResults) => JSON.stringify({ numUnhandledErrors: 0, testResults });
+const entry = (name, status = 'failed', extra = {}) => ({ name, status, assertionResults: [], ...extra });
+const firstText = report(entry('/repo/a.test.mjs', 'failed', { assertionResults: [{ status: 'failed', fullName: 'suite fails' }] }));
+const first = planRetry(firstText, policy, root);
+const metadata = { shard: '2', sha: 'abc', runId: '123', root, exitCode: 0 };
+
+describe('single failed-file retry core', () => {
+  it.each([undefined, null, '0', -1, 1])('fails closed on missing, invalid or nonzero global error counts (%s)', numUnhandledErrors => {
+    const text = JSON.stringify({ ...JSON.parse(firstText), numUnhandledErrors });
+    expect(() => planRetry(text, policy, root)).toThrow(/global error/);
+  });
+  it.each([{ unhandledErrors: [{ message: 'unhandled rejection' }] }, { errors: [{ message: 'runtime error' }] }, { numRuntimeErrorTestSuites: 1 }])('rejects additional report-level failure evidence %j', global => {
+    expect(() => planRetry(JSON.stringify({ ...JSON.parse(firstText), ...global }), policy, root)).toThrow(/global error/);
+  });
+  it('extracts failed assertions and file/collection errors, excluding passed files', () => {
+    const text = report(entry('a', 'failed'), entry('b', 'passed'), entry('c', 'passed', { testExecError: { message: 'collection' } }), entry('d', 'passed', { message: 'load failed' }), { name: 'e', errors: [{ message: 'collection failed' }] });
+    expect(planRetry(text, policy, root).map(f => f.file)).toEqual(['a', 'c', 'd', 'e']);
+    expect(first[0].failedTests).toEqual(['suite fails']);
+  });
+  it.each([undefined, '', '{', '{}', report(), report(entry('a', 'passed'))])('fails closed on unreadable, empty or non-test failure evidence %s', text => {
+    expect(() => planRetry(text, policy, root)).toThrow();
+  });
+  it('refuses oversized input with an operator-visible manual fallback', () => {
+    expect(() => planRetry(report(...Array.from({ length: 11 }, (_, i) => entry(`f${i}`))), policy, root)).toThrow(/cap 10 exceeded.*rerun manually/);
+    expect(planRetry(report(...Array.from({ length: 10 }, (_, i) => entry(`f${i}`))), policy, root)).toHaveLength(10);
+  });
+  it('disabled retry retains the original failure', () => {
+    expect(() => planRetry(firstText, { ...policy, enabled: false }, root)).toThrow(/disabled/);
+  });
+  it.each([entry('../escape'), entry('-option'), entry('a\ncontrol'), entry('a', 'unknown')])('refuses invalid paths/statuses', result => {
+    expect(() => parseReport(report(result), root)).toThrow();
+  });
+  it('records a passing retry as flaky with portable paths and first-run failed test names', () => {
+    expect(retryVerdict(first, report(entry('a.test.mjs', 'passed')), metadata)).toEqual({ passed: true, record: {
+      shard: '2', sha: 'abc', runId: '123', files: [{ file: 'a.test.mjs', firstRun: 'failed', rerun: 'passed', failedTests: ['suite fails'] }],
+    } });
+  });
+  it.each([report(entry('a.test.mjs')), report(), undefined, report(entry('a.test.mjs', 'skipped')), report(entry('a.test.mjs', 'passed', { testExecError: {} }))])('a second failure or incomplete evidence fails the shard', text => {
+    const verdict = retryVerdict(first, text, metadata);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.record.files[0].rerun).toBe('failed');
+  });
+  it('a process failure remains red even with passing files', () => {
+    expect(retryVerdict(first, report(entry('a.test.mjs', 'passed')), { ...metadata, exitCode: 1 }).passed).toBe(false);
+  });
+  it('mixed flaky and reproducible failures retain both records and fail the shard', () => {
+    const files = planRetry(report(entry('a'), entry('b')), policy, root);
+    const verdict = retryVerdict(files, report(entry('a', 'passed'), entry('b')), { ...metadata, exitCode: 1 });
+    expect(verdict.passed).toBe(false);
+    expect(verdict.record.files.map(f => f.rerun)).toEqual(['passed', 'failed']);
+  });
+  it('resolves defaults and standard/platform/tool/environment provenance', () => {
+    const log = vi.fn();
+    expect(resolvePolicy({ platform: {}, log })).toEqual(policy);
+    expect(resolvePolicy({ platform: { maxFiles: 4 }, tool: { enabled: false }, env: { WE_CI_UNIT_RERUN_MAX_FILES: '3' }, log })).toEqual({ enabled: false, maxFiles: 3 });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/enabled=false \(tool\).*maxFiles=3 \(env\)/);
+    expect(resolvePolicy({ platform: {}, tool: { maxFiles: 0 }, env: { WE_CI_UNIT_RERUN_ENABLED: 'bad' }, log })).toEqual(policy);
+  });
+});
+
+function fixture(overrides = {}) {
+  return { shard: '2', root, env: { GITHUB_SHA: 'abc', GITHUB_RUN_ID: '123' }, policy,
+    skipArgs: ['--exclude=quarantined.test.mjs'],
+    read: vi.fn(file => file.includes('timing') ? firstText : report(entry('a.test.mjs', 'passed'))),
+    write: vi.fn(), remove: vi.fn(), run: vi.fn(() => ({ status: 0 })),
+    listFiles: vi.fn(async () => ['a.test.mjs', 'other.test.mjs']), warn: vi.fn(), error: vi.fn(), ...overrides };
+}
+
+describe('retry IO boundary', () => {
+  it('runs exactly once without coverage, preserves skip arguments, clears stale evidence and logs each flake', async () => {
+    const io = fixture();
+    expect(await rerunOnce(io)).toBe(0);
+    expect(io.run).toHaveBeenCalledTimes(1);
+    expect(io.run).toHaveBeenCalledWith(['run', 'test:unit', '--', '--reporter=default', '--reporter=./scripts/ci/unit-json-reporter.mjs', '--outputFile.json=coverage/rerun-unit-2.json', 'a.test.mjs', '--exclude=quarantined.test.mjs']);
+    expect(io.remove).toHaveBeenCalledWith('coverage/rerun-unit-2.json');
+    expect(io.remove.mock.invocationCallOrder[0]).toBeLessThan(io.run.mock.invocationCallOrder[0]);
+    expect(io.warn).toHaveBeenCalledTimes(1);
+    expect(io.warn).toHaveBeenCalledWith('::warning::flaky test file a.test.mjs');
+    expect(JSON.parse(io.write.mock.calls[0][1])).toEqual(retryVerdict(first, report(entry('a.test.mjs', 'passed')), metadata).record);
+  });
+  it('missing/unreadable first report never launches a retry', async () => {
+    const io = fixture({ read: () => { throw new Error('ENOENT'); } });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).not.toHaveBeenCalled();
+  });
+  it('a failed file plus a first-run unhandled error cannot recover even if its file retry would pass', async () => {
+    const text = JSON.stringify({ ...JSON.parse(firstText), numUnhandledErrors: 1 });
+    const io = fixture({ read: file => file.includes('timing') ? text : report(entry('a.test.mjs', 'passed')) });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).not.toHaveBeenCalled();
+    expect(io.listFiles).not.toHaveBeenCalled();
+    expect(io.warn).not.toHaveBeenCalled();
+    expect(io.error).toHaveBeenCalledWith(expect.stringMatching(/global error.*inspect original run/));
+  });
+  it('missing retry report still writes failure records and never retries twice', async () => {
+    const io = fixture({ read: file => { if (file.includes('timing')) return firstText; throw new Error('ENOENT'); } });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(io.write.mock.calls[0][1]).files[0].rerun).toBe('failed');
+    expect(io.warn).not.toHaveBeenCalled();
+  });
+  it('refuses substring filters that would rerun extra files', async () => {
+    const io = fixture({ listFiles: async () => ['a.test.mjs', 'extra/a.test.mjs'] });
+    expect(await rerunOnce(io)).toBe(1);
+    expect(io.run).not.toHaveBeenCalled();
+  });
+  it('failure to write the flake record cannot recover the shard', async () => {
+    const io = fixture({ write: () => { throw new Error('disk full'); } });
+    expect(await rerunOnce(io)).toBe(1);
+  });
+});
+
+describe('unit JSON evidence producer', () => {
+  it.each([{ errors: [] }, { errors: [{ message: 'unrelated unhandled rejection' }] }])('serializes the actual Vitest global error count alongside failed files: %j', async ({ errors }) => {
+    const log = vi.fn();
+    const reporter = new UnitJsonReporter();
+    reporter.onInit({ config: { root }, logger: { log }, state: { getUnhandledErrors: () => errors } });
+    await reporter.onFinished([{ type: 'suite', tasks: [], filepath: '/repo/a.test.mjs', result: { state: 'fail' } }]);
+    const text = log.mock.calls[0][0];
+    expect(JSON.parse(text)).toMatchObject({ numUnhandledErrors: errors.length, testResults: [{ name: '/repo/a.test.mjs', status: 'failed' }] });
+    if (errors.length) expect(() => planRetry(text, policy, root)).toThrow(/global error/);
+    else expect(planRetry(text, policy, root)).toHaveLength(1);
+  });
+  it('refuses to emit a clean count when global error evidence is unavailable', async () => {
+    const log = vi.fn();
+    const reporter = new UnitJsonReporter();
+    reporter.onInit({ config: { root }, logger: { log }, state: { getUnhandledErrors: () => undefined } });
+    await expect(reporter.onFinished([])).rejects.toThrow(/cannot determine global unit errors/);
+    expect(log).not.toHaveBeenCalled();
+  });
+  it('a passing retry report with global errors cannot pass the verdict', () => {
+    const text = JSON.stringify({ ...JSON.parse(report(entry('a.test.mjs', 'passed'))), numUnhandledErrors: 1 });
+    expect(retryVerdict(first, text, metadata).passed).toBe(false);
+  });
+});

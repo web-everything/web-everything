@@ -348,6 +348,7 @@
   "scripts/backlog/__tests__/resolve-parent-cli.test.mjs": 1.02,
   "scripts/backlog/__tests__/scaffold.test.mjs": 0.03,
   "scripts/backlog/__tests__/task-agreement.test.mjs": 0.1,
+  "scripts/ci/__tests__/rerun-failed-once.test.mjs": 0.05,
   "scripts/ci/__tests__/ci-light-checkout.test.mjs": 3.51,
   "scripts/ci/__tests__/ci-run-less-cache.test.mjs": 0.03,
   "scripts/ci/__tests__/ci-shard-runner-switch.test.mjs": 0.02,

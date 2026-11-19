@@ -23,14 +23,14 @@ const STEPS = [
   ['no-coverage group step', 'Unit suite no-coverage group'],
 ];
 
-function runStep(run, nodeStub) {
+function runStep(run, nodeStub, npmExit = 0) {
   const dir = mkdtempSync(join(tmpdir(), 'ci-shard-steps-'));
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
     const marker = join(dir, 'npm-invoked');
     writeFileSync(join(bin, 'node'), `#!/bin/bash\n${nodeStub}\n`);
-    writeFileSync(join(bin, 'npm'), `#!/bin/bash\necho "$@" > "${marker}"\n`);
+    writeFileSync(join(bin, 'npm'), `#!/bin/bash\necho "$@" > "${marker}"\nexit ${npmExit}\n`);
     chmodSync(join(bin, 'node'), 0o755);
     chmodSync(join(bin, 'npm'), 0o755);
     const r = spawnSync('bash', ['-e', '-c', run], {
@@ -45,6 +45,28 @@ function runStep(run, nodeStub) {
 }
 
 describe.each(STEPS)('ci.yml test-shard %s', (_label, prefix) => {
+  it('uses the JSON producer that preserves global errors', () => {
+    expect(stepRun(prefix)).toContain('--reporter=./scripts/ci/unit-json-reporter.mjs');
+  });
+
+  it.each([0, 1])('failed first run calls retry and propagates its exit %s', retryExit => {
+    const r = runStep(stepRun(prefix), `
+      case "$1" in
+        *shard-assign*) echo scripts/a.test.mjs ;;
+        *quarantine-skip*) echo --exclude=quarantined.test.mjs ;;
+        *rerun-failed-once*) echo "retry-invoked:$*"; exit ${retryExit} ;;
+      esac`, 1);
+    expect(r.status).toBe(retryExit);
+    expect(r.out).toContain('retry-invoked:scripts/ci/rerun-failed-once.mjs --shard=2 -- --exclude=quarantined.test.mjs');
+    expect(r.npmArgs).toContain('--exclude=quarantined.test.mjs');
+  });
+
+  it('a successful first run never calls retry', () => {
+    const r = runStep(stepRun(prefix), `case "$1" in *shard-assign*) echo scripts/a.test.mjs ;; *rerun-failed-once*) echo unexpected-retry; exit 1 ;; esac`);
+    expect(r.status).toBe(0);
+    expect(r.out).not.toContain('unexpected-retry');
+  });
+
   it('assignment failure prevents the Vitest invocation', () => {
     const r = runStep(stepRun(prefix), 'echo "ambiguous filter" >&2; exit 2');
     expect(r.status).not.toBe(0);
@@ -75,4 +97,12 @@ describe('ci.yml test-shard steps — no fail-open list construction', () => {
   it.each(STEPS)('%s does not build the file list from a process substitution', (_label, prefix) => {
     expect(stepRun(prefix)).not.toMatch(/<\s*<\(/);
   });
+});
+
+it('covered first runs retain coverage on failure, with always-uploaded flake evidence', () => {
+  expect(stepRun('Unit suite shard')).toContain('--coverage.reportOnFailure=true');
+  const upload = steps.find(s => s.name === 'Upload shard flake records');
+  expect(upload.if).toBe('always()');
+  expect(upload.with['if-no-files-found']).toBe('ignore');
+  expect(upload.with.path).toBe('web-everything/coverage/flaky-unit-*.json');
 });

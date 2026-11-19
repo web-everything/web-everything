@@ -22,6 +22,8 @@ beforeEach(() => {
   // Stub `node`: behaviour chosen by STUB_ASSIGN; stub `npm` records its argv so we can see if vitest would launch.
   writeFileSync(join(dir, 'bin', 'node'), [
     '#!/bin/bash',
+    // quarantine-skip.mjs prints its (empty) skip args; only shard-assign follows STUB_ASSIGN.
+    'case "$1" in *quarantine-skip.mjs) exit 0 ;; esac',
     'case "$STUB_ASSIGN" in',
     '  fail) echo "shard-assign: filter is a substring of another test path" >&2; exit 2 ;;',
     '  fail-after-output) echo "a.test.ts"; exit 2 ;;',
