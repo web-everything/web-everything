@@ -14,14 +14,15 @@ export function exercise(runReviewJob) {
       root: '.', now: () => 1000, newActorId: () => 'test', readPrevCompletion: () => null,
       report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
       acquireLane: () => ({ lanePath: '.' }), prepareLane: () => ({ head }), releaseLane: () => {}, log: () => {},
-      liveHead: () => head,
+      liveHead: () => moved ? 'b'.repeat(40) : head,
+      finalHeadSeatsSetting: () => ({ mode: 'off' }),
       concurrentSeatsSetting: () => ({ enabled: true, value: true, source: 'standard' }),
       startSpeculativeSeats: () => { calls.push('start'); return { readSink: 'sink', startedAt: Date.now() }; },
       runLoop: o => {
         calls.push('loop');
         if (o.readSink !== 'sink') violations.push('loop did not receive seats read sink');
         return { status: 0, stdout: JSON.stringify({ runId: 'test', stopped: 'complete', verdict: { verdict: 'accept', loop: { outcome: 'converged' } },
-          findings: { read: { diffText: '+change', netBasis: { rev: moved ? 'b'.repeat(40) : head } } } }) };
+          findings: { read: { diffText: '+change', netBasis: { rev: head } } } }) };
       },
       awaitSpeculativeSeats: () => ({ spec: { status: 'speculated', rev: head } }),
       finishSpeculativeSeats: () => { calls.push('finish'); return { status: 'ran', seats: [] }; },
@@ -29,7 +30,7 @@ export function exercise(runReviewJob) {
       recordDiscardedSeats: () => { calls.push('spend'); return { status: 'recorded' }; }, cleanupSpeculativeSeats: () => calls.push('cleanup'),
       runExtraSeats: () => { calls.push('sequential'); return { status: 'ran', seats: [] }; },
     };
-    const result = runReviewJob({ pr: 7, repo: 'test/repo', pid: 1 }, io);
+    const result = runReviewJob({ pr: 7, repo: 'web-everything/web-everything', pid: 1 }, io);
     const expected = moved ? ['start', 'loop', 'cancel', 'spend', 'cleanup'] : ['start', 'loop', 'finish', 'cleanup'];
     if (JSON.stringify(calls) !== JSON.stringify(expected)) violations.push(`moved=${moved}: wrong concurrent order ${calls.join(',')}`);
     if (result.extraSeats?.status !== (moved ? 'discarded' : 'ran')) violations.push(`moved=${moved}: incorrect evidence status`);

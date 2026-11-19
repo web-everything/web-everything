@@ -968,11 +968,19 @@ export function settleSpeculativeSeats({ spec, out, input }, io) {
     if (['bounced', 'parked'].includes(out.outcome)) return { ...discard(`review ${out.outcome}`), sequential: Boolean(input) };
     if (out.outcome === BLOCKED_ON_INFRA) return discard(`review ${out.outcome}`);
     if (!input) return discard('no final loop input');
-    if (io.speculativeSeatsReadSunk?.(spec) === false) return { ...discard('the review loop wrote no read sink'), sequential: true };
+    const sequential = reason => {
+      const rev = input.loopPayload?.findings?.read?.netBasis?.rev;
+      const liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo });
+      if (!isRealHead(rev) || !isRealHead(liveHead) || liveHead.toLowerCase() !== rev.toLowerCase()) {
+        return discard('added seats live head differs or is unreadable');
+      }
+      return { ...discard(reason), sequential: true };
+    };
+    if (io.speculativeSeatsReadSunk?.(spec) === false) return sequential('the review loop wrote no read sink');
     const waited = io.awaitSpeculativeSeats(spec, { timeoutMs: Math.max(0, (spec.wallMs ?? resolveSeatTimeoutMs() + 5 * 60_000) - (Date.now() - spec.startedAt)) });
     const pass = waited?.spec;
     if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
-    if (!waited?.timedOut && pass?.status === 'no-read') return { ...discard(pass.reason ?? 'no added seats read'), sequential: true };
+    if (!waited?.timedOut && pass?.status === 'no-read') return sequential(pass.reason ?? 'no added seats read');
     if (waited?.timedOut || pass?.status !== 'speculated') return discard(pass?.reason ?? 'added seats pass failed or incomplete');
     const rev = input.loopPayload?.findings?.read?.netBasis?.rev;
     if (!isRealHead(rev) || pass.rev !== rev) return discard('added seats head differs from final loop head');

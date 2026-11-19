@@ -682,6 +682,23 @@ describe('added seats concurrent evidence', () => {
     expect(kinds(calls)).not.toContain('seats-sequential');
   });
   it.each([
+    ['moved', () => 'b'.repeat(40)],
+    ['unreadable', () => null],
+    ['read failed', () => { throw Error('unreadable'); }],
+  ])('missing sink with %s live head runs no seats even with final-head seats off', (_label, liveHead) => {
+    for (const noRead of [
+      { speculativeSeatsReadSunk: () => false },
+      { awaitSpeculativeSeats: () => ({ spec: { status: 'no-read' } }) },
+    ]) {
+      const { io, calls } = seatsIo({ extra: { ...noRead, liveHead, finalHeadSeatsSetting: () => ({ mode: 'off' }) } });
+      const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+      expect(out.extraSeats).toMatchObject({ status: 'discarded', reason: expect.stringMatching(/unreadable/) });
+      expect(kinds(calls)).not.toContain('seats-finish');
+      expect(kinds(calls)).not.toContain('seats-sequential');
+      expect(kinds(calls)).toContain('seats-cleanup');
+    }
+  });
+  it.each([
     ['sink write failed', { speculativeSeatsReadSunk: () => false }],
     ['worker no-read', { awaitSpeculativeSeats: () => ({ spec: { status: 'no-read' } }) }],
     ['start failed', { startSpeculativeSeats: () => { throw Error('start failed'); },
