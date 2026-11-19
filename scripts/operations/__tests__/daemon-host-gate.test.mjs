@@ -357,6 +357,28 @@ describe('wrapper shutdown', () => {
   });
 });
 
+describe('completed command is never re-run after a failed ownership read', () => {
+  it.each([0, 3])('reports recorded exit code %i when the command ends while the post-run read fails', async (exitCode) => {
+    const h = harness({ owners: [{ host: HOST_A, version: 'v' }] });
+    const ticks = [];
+    h.deps.watchSleep = () => new Promise((r) => ticks.push(r));
+    let reads = 0;
+    h.deps.source = { readOwner: async () => {
+      reads += 1;
+      if (reads === 1) return { host: HOST_A, version: 'v' };
+      // The command completes while this ownership read is in flight, then the read fails.
+      h.children[0].emit('exit', exitCode, null);
+      throw new Error('offline');
+    } };
+    const run = runGate({ cmd: 'd', args: [] }, h.deps);
+    await new Promise(setImmediate);
+    expect(h.spawns).toHaveLength(1);
+    ticks[0]();
+    expect(await run).toBe(exitCode);
+    expect(h.spawns).toHaveLength(1);
+  });
+});
+
 describe('cleanup state is keyed by daemon identity', () => {
   it('derives one identity from the daemon script, not its checkout path or flags', () => {
     expect(daemonIdentity({ cmd: 'node', args: ['/a/checkout/scripts/d.mjs', '--x'] }))

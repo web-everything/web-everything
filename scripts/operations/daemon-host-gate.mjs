@@ -104,6 +104,8 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
   let ended = false;
   let stopping = false;
   let cleanupFailed = false;
+  let revoking = false; // set by the wrapper before it stops the child for revocation
+  let completedCode = null; // the command's own exit code, recorded when it ends without a wrapper stop
   const grace = new AbortController();
   const done = new Promise((resolve) => { finish = resolve; });
   const stop = (sig) => {
@@ -146,6 +148,8 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
   };
   const end = (code) => {
     if (ended) return;
+    // Record completion before anything else (including any later ownership read) can discard it.
+    if (!revoking && !stopping) completedCode = code;
     // The leader can exit before workers (including on a natural exit). Do not
     // cancel escalation and release the gate while its process group can run.
     stop('SIGKILL');
@@ -170,7 +174,12 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
     if (child.pid) marker.track(child.pid);
   } catch { end(127); }
-  return { done, stop, get cleanupFailed() { return cleanupFailed; } };
+  return {
+    done, stop,
+    revoke() { revoking = true; },
+    get completedCode() { return completedCode; },
+    get cleanupFailed() { return cleanupFailed; },
+  };
 }
 
 async function pollRole(thisHost, source) {
@@ -189,8 +198,12 @@ async function watchChild(child, ctx) {
     ]);
     if (winner) return winner.code;
     const now = await pollRole(thisHost, source);
+    // The command may have completed while the ownership read was in flight (or the read failed afterwards):
+    // report its recorded exit code and never run it again.
+    if (child.completedCode !== null) return await child.done;
     if (now.active) continue;
     const owner = now.owner;
+    child.revoke();
     revoked = true;
     log(`host-gate: owner=${owner} self=${thisHost}; stopping daemon, back to standby`);
   }
