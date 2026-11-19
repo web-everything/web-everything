@@ -47,6 +47,76 @@ describe('Forge key structure slice 1',()=>{
     expect(createPrivateKey({key:Buffer.from(text,'base64'),format:'der',type:'pkcs1'}).type).toBe('private');
     blocked(Buffer.from(text));
   });
+  it('one normalization layer closes the encoding class (red-team #7076 round 5)',()=>{
+    const ed=Buffer.from('302e020100300506032b657004220420'+'01'.repeat(32),'hex');
+    const jwk=JSON.stringify({kty:'oct',k:'YQ'});
+    const b64=text=>Buffer.from(text).toString('base64');
+    const uri=text=>[...Buffer.from(text)].map(byte=>'%'+byte.toString(16).padStart(2,'0')).join('');
+    const html=text=>[...text].map(char=>'&#'+char.codePointAt(0)+';').join('');
+    // the two red-team payloads
+    blocked(Buffer.from(ed.toString('base64').split('').join('!')));
+    blocked(Buffer.from(uri(jwk)));
+    // single layers
+    blocked(Buffer.from(html(jwk)));
+    blocked(Buffer.from(JSON.stringify(jwk)));
+    blocked(Buffer.from(b64(jwk).split('').join(' , ')));
+    // nested combinations in both orders and three deep
+    blocked(Buffer.from(b64(uri(jwk))));
+    blocked(Buffer.from(uri(b64(jwk))));
+    blocked(Buffer.from(html(b64(jwk))));
+    blocked(Buffer.from(b64(html(uri(jwk)))));
+    blocked(Buffer.from(uri(b64(ed.toString('base64').split('').join('!')))));
+    // prose around an encoded view does not hide it
+    blocked(Buffer.from('config: '+uri(jwk)+' trailing "text"'));
+    expect(keyStructureFinding(Buffer.from('ordinary prose, with punctuation! and 100% effort & more.'))).toBeFalsy();
+  });
+  it('fails closed when nesting exceeds the budget (never silently admits)',()=>{
+    let text=JSON.stringify({kty:'oct',k:'YQ'});
+    for(let layer=0;layer<12;layer++)text=Buffer.from(text).toString('base64');
+    const finding=keyStructureFinding(Buffer.from(text));
+    expect(finding).toBeTruthy();
+    expect(()=>manifestEntry(path,Buffer.from(text),false,true)).toThrow(expect.objectContaining({code:'excluded-source-file'}));
+  });
+  it('base64 key material prefixed with replacement characters or NULs is still blocked (audit #7076)',()=>{
+    const ed=Buffer.from('302e020100300506032b657004220420'+'02'.repeat(32),'hex').toString('base64');
+    blocked(Buffer.from([0xff,0xfe,...Buffer.from(ed)]));
+    blocked(Buffer.from('�'+ed));
+    blocked(Buffer.from(['\0',ed,'\0'].join('')));
+  });
+  it('comment scanning is linear (CodeQL js/redos on the brace and oth lookaheads)',()=>{
+    const quote='"';
+    const hostile='/*'+'*/'.repeat(40000)+' tail';
+    for(const text of ['x {'+hostile,'x '+quote+' {'+hostile+' kty',quote+'kty'+quote+': {'+quote+'oth'+quote+': ['+hostile]) {
+      const started=Date.now();
+      keyStructureFinding(Buffer.from(text));
+      expect(Date.now()-started).toBeLessThan(5000);
+    }
+    // comments before the first member name and inside an empty oth still behave
+    blocked(Buffer.from('say '+quote+' {/* c */ // d\n'+quote+'kty'+quote+':'+quote+'oct'+quote+','+quote+'k'+quote+':'+quote+'YQ'+quote+'}'));
+    expect(keyStructureFinding(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB'}).slice(0,-1)+',"oth":/* none */[ // x\n]}'))).toBeFalsy();
+  });
+  it('blocks AES-encrypted PKCS#8 DER in every view (audit #7076)',()=>{
+    const encrypted=generateKeyPairSync('ed25519').privateKey.export({format:'der',type:'pkcs8',cipher:'aes-256-cbc',passphrase:'pw'});
+    for(const encode of Object.values(views))blocked(Buffer.from(encode(encrypted)));
+  });
+  it('blocks RSA multiprime oth private members without a top-level d (red-team #7076)',()=>{
+    blocked(Buffer.from(JSON.stringify({kty:'RSA',oth:[{r:'a',d:'b',t:'c'}]})));
+    blocked(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[{r:'a',d:'b',t:'c'}]}).replace(/\[/g,'/* x */[')));
+    expect(keyStructureFinding(Buffer.from(JSON.stringify({kty:'RSA',n:'AQAB',e:'AQAB',oth:[]})))).toBeFalsy();
+  });
+  it('blocks a JWK after stray double quotes or an unclosed string (red-team #7076)',()=>{
+    const jwk=JSON.stringify({kty:'oct',k:'abcdefghijklm'+'n'});
+    const quote='"';
+    for(const lead of [quote+' ',quote+' a '+quote+' b '+quote+' ','say '+quote+'hello '+quote+'x '+quote+'y\n','an unclosed '+quote+'string, '])
+      blocked(Buffer.from(lead+jwk));
+    expect(keyStructureFinding(Buffer.from('prose with a '+quote+' and {not json} only'))).toBeFalsy();
+    // long whitespace between the brace and the first member name (red-team #7076, 4,096-space lookahead)
+    for(const pad of [4095,4096,5000])blocked(Buffer.from('an unclosed '+quote+'string, {'+' '.repeat(pad)+quote+'kty'+quote+':'+quote+'oct'+quote+','+quote+'k'+quote+':'+quote+'YQ'+quote+'}'));
+    // key name spelled with a JSON escape, and an object longer than the per-candidate bound (fails closed, never skipped)
+    blocked(Buffer.from(quote+' '+jwk.replace('kty','k\\u0074y')));
+    const long=JSON.stringify({kty:'oct',k:'abcdefghijklm'+'n',pad:'x'.repeat(66000)});
+    expect(keyStructureFinding(Buffer.from(quote+' '+long))).toBeTruthy();
+  });
   it('I1 decode once then detect (mixed alphabets, comments in byte arrays, hex, PEM)',()=>{
     for(const bytes of keys)for(const encode of Object.values(views))blocked(Buffer.from(encode(bytes)));
   });

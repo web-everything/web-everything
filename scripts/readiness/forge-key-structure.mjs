@@ -1,5 +1,11 @@
 // One bounded decoding pipeline feeds byte-only DER and parsed-JSON detectors.
 // Exhaustion refuses remote admission; the operator can inspect the file and run locally.
+//
+// ROLE: this is a TRIPWIRE, not the containment boundary. It catches common and nested encodings of private keys
+// (PEM, DER, JWK, base64 and URL-safe base64, hex, percent and HTML encodings, byte arrays) and refuses admission.
+// RESIDUAL: Keys hidden by junk padding over 50%, custom encodings, or other obfuscation are NOT detected;
+// containment is the allowlist manifest (S1/S2) plus read-deny on credential stores.
+// See designs/forge-allowlist-manifest.md (S1: only tracked files at HEAD; S2: only pushed commits).
 const LIMITS={bytes:32*1024*1024,candidates:16384,depth:8,steps:4*1024*1024,derDepth:64,jsonDepth:64};
 // Reserve the initial candidate and conservatively allow one counted unit per
 // input byte. This bounds bytes, candidates and ticks by their smallest budget.
@@ -74,6 +80,11 @@ function derFinding(bytes,tick) {
     if(!sequence)continue;
     const fields=children(sequence);
     if(!fields||fields.length<2)continue;
+    // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): AlgorithmIdentifier(OID, parameters SEQUENCE) and OCTET STRING.
+    if(fields.length===2&&fields[0].tag===48&&nonempty(fields[1],4)) {
+      const algorithm=children(fields[0]);
+      if(algorithm?.length===2&&nonempty(algorithm[0],6)&&algorithm[1].tag===48)return true;
+    }
     const version=fields[0];
     if(version.tag!==2||version.end-version.start!==1)continue;
     const value=bytes[version.start];
@@ -94,6 +105,28 @@ function derFinding(bytes,tick) {
 }
 
 // Scan every top-level member occurrence (duplicates included); a parsed object keeps only the last one.
+// Index of the first character at or after `index` that is not whitespace or a JS comment; -1 when a comment is
+// unterminated. Linear and deterministic (no regex alternation over comment bodies, so no ReDoS).
+function afterTrivia(text,index) {
+  for(let i=index;i<text.length;) {
+    const code=text.charCodeAt(i);
+    if(code===32||(code>=9&&code<=13)||code===160||code===0xfeff||code===0x2028||code===0x2029||(code>=0x2000&&code<=0x200a)||code===0x1680||code===0x202f||code===0x205f||code===0x3000) {i++;continue;}
+    if(code===47&&text[i+1]==='/') {
+      const lf=text.indexOf('\n',i+2),cr=text.indexOf('\r',i+2);
+      const end=lf===-1?cr:cr===-1?lf:Math.min(lf,cr);
+      if(end===-1)return -1;
+      i=end+1;continue;
+    }
+    if(code===47&&text[i+1]==='*') {
+      const end=text.indexOf('*/',i+2);
+      if(end===-1)return -1;
+      i=end+2;continue;
+    }
+    return i;
+  }
+  return text.length;
+}
+
 function jwkFinding(bytes) {
   const text=bytes.toString('utf8');
   if(!text.trimStart().startsWith('{'))return false;
@@ -102,7 +135,15 @@ function jwkFinding(bytes) {
   for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]:,]/g)) {
     const token=match[0];
     if(token[0]==='/')continue;
-    if(token==='{'||token==='[')depth++;
+    if(token==='{'||token==='[') {
+      // RFC 7518 6.3.2.7: `oth` (other primes: r, d, t) is private multiprime RSA material even without a top-level d.
+      if(depth===1&&key==='oth') {
+        const next=afterTrivia(text,match.index+1);
+        // empty container is not private material; an unterminated comment is treated as non-empty (conservative)
+        if(next===-1||(text[next]!==']'&&text[next]!=='}'))priv=true;
+      }
+      depth++;
+    }
     else if(token==='}'||token===']')depth--;
     else if(depth!==1)continue;
     else if(token===':') {key=pending;pending=null;}
@@ -126,14 +167,22 @@ function encodedText(text) {
     ||(text.includes('"')&&text.includes('\\'))
     ||(text.match(/[\[{]/g)?.length??0)>=64
     ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
-    ||/[A-Za-z0-9+/_=-]{11}/.test(text.replace(/\s/g,''));
+    ||/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)
+    // Lenient base64 ignores every non-alphabet character (whitespace and punctuation alike), so the gate does too.
+    // Readable text always expands. Binary-looking text (replacement characters or NULs) expands only when it is
+    // mostly alphabet (a consumer ignores junk before or around the material); sparse binary stays terminal so
+    // random fragments do not re-expand.
+    ||(()=>{
+      const stripped=text.replace(/[^A-Za-z0-9+/_=-]/g,'').length;
+      return stripped>=11&&(!/[�\0]/.test(text)||stripped*2>=text.length);
+    })();
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.
 function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
-  const stack=[];
+  const stack=[],visited=new Set();
   const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}\[\]\ufffd]/g
     :/"(?:\\[\s\S]|[^"\\])*"|[{}\[\]\ufffd]/g;
   for(const match of text.matchAll(tokens)) {
@@ -156,11 +205,36 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
         stack.length=0;continue;
       }
       if(stack.length>=64)throw EXHAUSTED;
-      stack.push({token,start:match.index});
-    } else if(token==='}'||token===']') {
+      stack.push({token,start:match.index});    } else if(token==='}'||token===']') {
       const open=stack.pop();
       // This pass already visits everything inside the container; only detect its members.
+      if(open&&open.token==='{'&&token==='}')visited.add(open.start);
       if(open&&open.token===(token==='}'?'{':'['))emit(Buffer.from(text.slice(open.start,match.index+1)),{expand:false});
+    }
+  }
+  // Independent object candidates: global quote pairing above can be thrown off by stray double quotes in prose
+  // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
+  // from that brace only, bounded in length, so nothing before it can hide the object.
+  // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
+  if(/kty|\\u/i.test(text)) {
+    const pieces=/"(?:\\[\s\S]|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|[{}]/g;
+    for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
+      // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
+      // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
+      if(visited.has(at))continue;
+      // A JWK object opens with a quoted member name (after optional whitespace or comments).
+      // No lookahead bound: whitespace or comments of any length between the brace and the name must not hide it.
+      if(text[afterTrivia(text,at+1)]!=='"')continue;
+      tick();
+      const limit=Math.min(text.length,at+65536);
+      let depth=0,closed=false;
+      pieces.lastIndex=at;
+      for(let piece=pieces.exec(text);piece&&pieces.lastIndex<=limit;piece=pieces.exec(text)) {
+        if(piece[0]==='{')depth++;
+        else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
+      }
+      // A candidate longer than the bound is never silently skipped: fail closed.
+      if(!closed&&at+65536<text.length)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
@@ -170,6 +244,27 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
     if(!/^(?:-?\d+|0x[\da-f]+)(?:\s*,\s*(?:-?\d+|0x[\da-f]+))*\s*,?$/i.test(body))continue;
     const numbers=body.replace(/,\s*$/,'').split(',').map(Number);
     if(numbers.every(number=>Number.isInteger(number)&&number>=-128&&number<=255))emit(Buffer.from(numbers));
+  }
+  // Percent-encoding decodes the WHOLE input once, literal text kept, so an encoded JSON object stays one object
+  // instead of separately scanned escape runs.
+  if(/%[\da-f]{2}/i.test(text)) {
+    tick();
+    const out=[];
+    for(let i=0;i<bytes.length;i++) {
+      const pair=bytes[i]===37?bytes.toString('latin1',i+1,i+3):'';
+      if(/^[\da-f]{2}$/i.test(pair)) {out.push(parseInt(pair,16));i+=2;} else out.push(bytes[i]);
+    }
+    emit(Buffer.from(out));
+  }
+  // HTML character references decode once over the whole text (numeric and the five named XML entities).
+  if(/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)) {
+    tick();
+    const named={quot:'"',amp:'&',lt:'<',gt:'>',apos:"'"};
+    emit(Buffer.from(text.replace(/&(?:#(\d+)|#x([\da-f]+)|(quot|amp|lt|gt|apos));/gi,(whole,dec,hex,name)=>{
+      if(name)return named[name.toLowerCase()];
+      const code=dec?Number(dec):parseInt(hex,16);
+      return code>0&&code<=0x10ffff?String.fromCodePoint(code):whole;
+    })));
   }
   // Hex byte notations all decode to the same candidate type.
   for(const match of text.matchAll(/(?:\\x[\da-f]{2})+|(?:%[\da-f]{2})+|(?:[\da-f]{2}:)+[\da-f]{2}|\b(?:[\da-f]{2})+\b/gi)) {
@@ -199,6 +294,14 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
     end=match.index+match[0].length;
   }
   if(run)decode(run);
+  // Node's base64 decoder ignores every character outside the alphabet, so punctuation interleaved with the
+  // material (`A!B!C`) still decodes for a consumer. Whitespace-delimited chunks are stripped to the alphabet and
+  // joined like the run above.
+  if(/[^A-Za-z0-9+/_=\s-]/.test(text)) {
+    tick();
+    const joined=text.replace(/[^A-Za-z0-9+/_=-]/g,'');
+    if(joined)decode(joined);
+  }
   // Preserve the existing scanner's UTF-16 reach for structured material, too.
   if(utf16&&bytes.includes(0)&&bytes.length>=2) {
     // Random binary can expand into much larger Unicode views. Continue only
