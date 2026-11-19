@@ -283,16 +283,28 @@ export async function recordVerifyResult({ root, env = process.env, sha,
   return out;
 }
 
-export function recordHotPatchPr({ root, env = process.env, sha, pr, inMergeQueue = false, now = Date.now }) {
+export function recordHotPatchPr({ root, env = process.env, sha, pr, inMergeQueue = false, now = Date.now, run = spawnSync }) {
   if (typeof sha === 'string') sha = sha.toLowerCase();
   if (!Number.isSafeInteger(pr) || pr <= 0) return { ok: false, reason: 'invalid-pr' };
   return mutate(root, env, record => {
     if (!record || record.sha !== sha) return { result: { ok: false, reason: 'hot-patch-sha-mismatch' } };
+    const refuse = () => ({ result: { ok: false,
+      reason: 'pr-verification-failed; retry linkage with readable PR evidence matching this branch and SHA' } });
+    try {
+      const response = run('gh', ['pr', 'view', String(pr), '--json', 'headRefName,headRefOid,state'],
+        { cwd: root, env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+      if (response?.status !== 0 || response.error || typeof response.stdout !== 'string'
+        || Buffer.byteLength(response.stdout, 'utf8') > 65536) return refuse();
+      const evidence = JSON.parse(response.stdout);
+      if (evidence?.headRefName !== record.branch || typeof evidence.headRefOid !== 'string'
+        || !/^[a-f0-9]{40}$/i.test(evidence.headRefOid) || evidence.headRefOid.toLowerCase() !== record.sha
+        || !['OPEN', 'CLOSED', 'MERGED'].includes(evidence.state)) return refuse();
+    } catch { return refuse(); }
     const state = readOverlayState(root, { env });
     if (state.corrupt) throw new Error('overlay state unreadable');
     const entry = state.overlays.find(o => o.ref === record.branch);
     if (entry) addOverlay(root, { ...entry, pr }, { env, expectedOverlay: entry });
-    write(root, env, { ...record, owed: { ...record.owed, pr }, inMergeQueue: inMergeQueue === true,
+    write(root, env, { ...record, owed: { ...record.owed, pr }, prVerifiedSha: record.sha, inMergeQueue: inMergeQueue === true,
       inMergeQueueAt: inMergeQueue === true ? new Date(typeof now === 'function' ? now() : now).toISOString() : null });
     return { result: { ok: true } };
   });

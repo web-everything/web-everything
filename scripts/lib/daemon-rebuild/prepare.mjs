@@ -417,7 +417,7 @@ export async function prepareRebuild({
   // The planner already paid for PR state evidence. Reuse its positive merge verdict.
   if (!strictState && plan.ok) {
     const hot = readHotPatch(root, stEnv);
-    if (hot?.owed.pr && plan.decisions?.some(d => d.ref === hot.branch && d.pr === hot.owed.pr && d.reason === 'pr-merged')) {
+    if (hot?.owed.pr && hot.prVerifiedSha === hot.sha && plan.decisions?.some(d => d.ref === hot.branch && d.pr === hot.owed.pr && d.reason === 'pr-merged')) {
       await closeHotPatch({ root, env: stEnv, sha: hot.sha, reason: 'merged' });
     }
   }

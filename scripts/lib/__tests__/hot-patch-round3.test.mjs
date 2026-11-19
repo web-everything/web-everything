@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
-import { requestHotPatch, readHotPatch, recordVerifyResult, hotPatchPath } from '../hot-patch.mjs';
+import { requestHotPatch, readHotPatch, recordVerifyResult, recordHotPatchPr, hotPatchPath } from '../hot-patch.mjs';
 import { main } from '../../hot-patch.mjs';
 
 const fixture = fn => async () => {
@@ -61,3 +61,58 @@ test('green comes from the signed marker without a caller result', fixture(async
   marker(); expect((await recordVerifyResult({ root, env, sha })).ok).toBe(true);
   expect(readHotPatch(root, env).owed.verify).toBe('green');
 }));
+
+for (const inMergeQueue of [false, true]) {
+  for (const evidence of ['wrong-branch', 'wrong-sha', 'short-sha', 'nonhex-sha', 'missing-state',
+    'unknown-state', 'failed', 'error', 'throws', 'invalid-json', 'null', 'oversized']) {
+    test(`PR linkage refuses ${evidence}, queued=${inMergeQueue}, without changing ledger or overlays`,
+      fixture(async ({ root, env, sha }) => {
+        const before = readFileSync(hotPatchPath(root, env), 'utf8');
+        // Observe the actual overlay directory as well as the ledger; refusal must precede registration edits.
+        const { readdirSync } = await import('node:fs');
+        const snapshot = () => readdirSync(env.WE_DAEMON_OVERLAY_DIR).map(name =>
+          [name, readFileSync(join(env.WE_DAEMON_OVERLAY_DIR, name), 'utf8')]);
+        const overlaysBefore = snapshot();
+        const data = { headRefName: 'lane/hot', headRefOid: sha, state: 'OPEN' };
+        if (evidence === 'wrong-branch') data.headRefName = 'lane/other';
+        if (evidence === 'wrong-sha') data.headRefOid = 'a'.repeat(40);
+        if (evidence === 'short-sha') data.headRefOid = sha.slice(0, 7);
+        if (evidence === 'nonhex-sha') data.headRefOid = 'z'.repeat(40);
+        if (evidence === 'missing-state') delete data.state;
+        if (evidence === 'unknown-state') data.state = 'UNKNOWN';
+        const run = () => {
+          if (evidence === 'throws') throw new Error('unavailable');
+          return { status: evidence === 'failed' ? 1 : 0, error: evidence === 'error' ? new Error('failed') : undefined, stdout: evidence === 'invalid-json' ? '{bad'
+            : evidence === 'null' ? 'null' : evidence === 'oversized' ? ' '.repeat(65537) : JSON.stringify(data) };
+        };
+        expect(recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue, run }).ok).toBe(false);
+        expect(readFileSync(hotPatchPath(root, env), 'utf8')).toBe(before);
+        expect(snapshot()).toEqual(overlaysBefore);
+      }));
+  }
+}
+for (const state of ['OPEN', 'CLOSED', 'MERGED']) {
+  test(`PR linkage verifies branch and full SHA case-insensitively for ${state}`, fixture(async ({ root, env, sha }) => {
+    const run = (cmd, args, options) => {
+      expect(cmd).toBe('gh');
+      expect(args).toEqual(['pr', 'view', '42', '--json', 'headRefName,headRefOid,state']);
+      expect(options).toMatchObject({ cwd: root, env, encoding: 'utf8' });
+      expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBeGreaterThan(0);
+      return { status: 0, stdout: JSON.stringify({ headRefName: 'lane/hot', headRefOid: sha.toUpperCase(), state }) };
+    };
+    expect(recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, run }).ok).toBe(true);
+    expect(readHotPatch(root, env)).toMatchObject({ owed: { pr: 42 }, prVerifiedSha: sha, inMergeQueue: true });
+  }));
+}
+test('merged PR closure requires prior linkage verified for the current SHA, including historical records', async () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/lib/daemon-rebuild/prepare.mjs'), 'utf8');
+  const block = source.match(/    if \(hot\?\.owed\.pr[^]*?await closeHotPatch[^]*?\n    }/)[0];
+  const invoke = new Function('hot', 'plan', 'closeHotPatch', 'root', 'stEnv', `return (async () => { ${block} })()`);
+  const sha = 'a'.repeat(40);
+  for (const [pr, verified, expected] of [[42, sha, 1], [42, undefined, 0], [42, 'b'.repeat(40), 0], [null, sha, 0]]) {
+    let closed = 0;
+    await invoke({ branch: 'lane/hot', sha, owed: { pr }, prVerifiedSha: verified },
+      { decisions: [{ ref: 'lane/hot', pr: 42, reason: 'pr-merged' }] }, () => { closed++; }, '', {});
+    expect(closed).toBe(expected);
+  }
+});

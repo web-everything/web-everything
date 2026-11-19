@@ -21,6 +21,7 @@ import { main, easternIso } from '../../hot-patch.mjs';
 
 let sha = 'b'.repeat(40), good = 'a'.repeat(40);
 const at = 1700000000000;
+const verifiedPr = () => ({ status: 0, stdout: JSON.stringify({ headRefName: 'lane/repair', headRefOid: sha, state: 'OPEN' }) });
 const verifyMarker = (env, sha, result) => {
   const key = Buffer.alloc(32, 7);
   const record = { sha, suite: 'full', shards: 1, result, host: 'test-host',
@@ -178,7 +179,7 @@ test('PR linkage updates pinned registration; owed tick withdraws and watches; c
   addOverlay(root, { ref: request.branch, pinned: true }, { env });
   await requestHotPatch(request); arm();
   assert.equal(recordHotPatchPr({ root, env, sha: good, pr: 42 }).ok, false);
-  assert.equal(recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: false }).ok, true);
+  assert.equal(recordHotPatchPr({ root, env, sha, pr: 42, run: verifiedPr, inMergeQueue: false }).ok, true);
   assert.equal(readOverlays(root, { env })[0].pr, 42);
   assert.equal(await runOwedTick({ root, env, now: () => at + 24 * 3600000, emit }), 'rollback');
   assert.equal(readOverlays(root, { env }).length, 0);
@@ -585,7 +586,7 @@ test('audit-1: ledger removed during registration withdraws the no-PR overlay', 
 for (const membership of [{ ok: true, inQueue: false }, { ok: false }, null]) {
   test(`audit-3: caller queued claim cannot waive rollback on nonmembership or unreadable queue: ${JSON.stringify(membership)}`, fixture(async ({ root, env, request }) => {
     await requestHotPatch(request);
-    recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
+    recordHotPatchPr({ root, env, sha, pr: 42, run: verifiedPr, inMergeQueue: true, now: at });
     verifyMarker(env, sha, 'green');
     await recordVerifyResult({ root, env, sha });
     let reads = 0;
@@ -607,7 +608,7 @@ test('audit-3: historical, expired and future queue timestamps cannot grant fall
 
 test('audit-3: every owed tick rechecks real queue membership, including after a successful check', fixture(async ({ root, env, request }) => {
   await requestHotPatch(request);
-  recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
+  recordHotPatchPr({ root, env, sha, pr: 42, run: verifiedPr, inMergeQueue: true, now: at });
   assert.equal(readHotPatch(root, env).inMergeQueueAt, new Date(at).toISOString());
   verifyMarker(env, sha, 'green');
   await recordVerifyResult({ root, env, sha });
@@ -621,7 +622,7 @@ test('audit-3: every owed tick rechecks real queue membership, including after a
 
 test('audit-3: default queue reader refuses unknown origin instead of trusting --queued', fixture(async ({ root, env, request }) => {
   await requestHotPatch(request);
-  recordHotPatchPr({ root, env, sha, pr: 42, inMergeQueue: true, now: at });
+  recordHotPatchPr({ root, env, sha, pr: 42, run: verifiedPr, inMergeQueue: true, now: at });
   verifyMarker(env, sha, 'green');
   await recordVerifyResult({ root, env, sha });
   assert.equal(await runOwedTick({ root, env, now: at + 24 * 3600000 }), 'rollback');
