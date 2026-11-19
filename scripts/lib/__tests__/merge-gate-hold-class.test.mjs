@@ -219,6 +219,14 @@ describe('settings and row evidence', () => {
     excuseMergeGateRows([row, { ...row, id: 124, conclusion: 'SUCCESS' }], opts({ readVerdict }));
     expect(readVerdict).not.toHaveBeenCalled();
   });
+  it('reads an ANSI-coloured log exactly like its plain form and refuses other escapes', () => {
+    const colour = candidacyWithCodeqlHold.replace(/^(  )(hold)(\s+codeql\s)/m, '$1\u001b[31m$2\u001b[0m$3');
+    const job = JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' });
+    const read = log => readMergeGateVerdict({ repo: 'o/r', jobId: Math.random(), prNumber: 4965, cache: new Map(),
+      runGh: args => args.at(-1).endsWith('/logs') ? log : job });
+    expect(read(colour)).toEqual(read(candidacyWithCodeqlHold));
+    expect(read(candidacy + '\u001b]0;x\u0007')).toMatchObject({ error: expect.stringContaining('escape') });
+  });
   it('reads and caches immutable job evidence with throttled gh', () => {
     const runGh = vi.fn(args => args.at(-1).endsWith("/logs") ? candidacy : JSON.stringify({ head_sha: sha, completed_at: '2026-10-12T11:56:08Z' }));
     const cache = new Map();

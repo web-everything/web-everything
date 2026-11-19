@@ -245,7 +245,10 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'merge-gate-verdict', repo } };
       const job = JSON.parse(runGh(['api', path], options));
       // gh >= 2.10x refuses a raw log carrying terminal escapes unless told otherwise (no verdict = no annotation).
-      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options));
+      // Colour (CSI) codes are stripped before parsing so an ANSI-wrapped row reads exactly like its plain form;
+      // any other escape is ambiguous evidence and fails closed.
+      const log = String(runGh(ciJobLogApiArgs(`${path}/logs`), options)).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '');
+      if (log.includes('\u001b')) throw new Error('job log carries an unrecognised terminal escape sequence');
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);
