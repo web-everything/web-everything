@@ -9,7 +9,7 @@ import * as nodeFs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { createFileRunStore, isValidRunId, listRunIds, runPath } from '../operations/run-store.mjs';
+import { createFileRunStore, filterRunFileNames, isValidRunId, listRunIds, runPath } from '../operations/run-store.mjs';
 import { detachedWrapperPidsBySession } from './lease-reaper.mjs';
 
 const STANDARD = Object.freeze({ mode: 'index', maxAgeMs: 0 });
@@ -62,8 +62,8 @@ export function readDetachedWrapperPidsIndexed({
   } catch { /* missing/unreadable/corrupt index: rebuild */ }
 
   // Use the canonical listing normally; injected fs mirrors its exact filename filter and order.
-  const ids = fs === nodeFs ? listRunIds(dir) : (fs.existsSync(dir) ? fs.readdirSync(dir)
-    .filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).filter(isValidRunId).sort() : []);
+  const ids = fs === nodeFs ? listRunIds(dir) : (fs.existsSync(dir) ? filterRunFileNames(fs.readdirSync(dir))
+    .map((f) => f.slice(0, -5)).sort() : []);
   stats.listed = ids.length;
   const next = Object.create(null);
   const bySession = new Map();

@@ -63,6 +63,7 @@ import { pidIdentity } from '../lib/pid-alive.mjs';
  */
 
 import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
+import { filterRunFileNames } from '../operations/run-store.mjs';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -552,7 +553,7 @@ export function newestScopedRun({ checkout, queueKeys, nowMs, lookbackMs, readDi
   let names;
   try { names = readDir(dir); } catch { return null; }
   const rows = [];
-  for (const name of Array.isArray(names) ? names : []) {
+  for (const name of filterRunFileNames(Array.isArray(names) ? names : [])) {
     if (!String(name).endsWith('.json')) continue;
     const path = join(dir, name);
     const at = stat(path);

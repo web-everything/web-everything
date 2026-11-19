@@ -1,4 +1,5 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
+import { hasRejectingReviewVerdict, isRunAbandoned, readRunAbandonment } from './run-abandoned.mjs';
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
@@ -256,12 +257,14 @@ const unfinishedSince = run => {
 // `pending: null` but never applied its verdict's label. It is NOT a finished review: it holds like open work (fails
 // closed), so a refused accept can never count as completed accept evidence.
 const hasOpenEffect = run => run.outcome === 'refused'
-  || run.effects?.some(effect => ['pending', 'in-flight', 'refused'].includes(effect?.status));
-const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run);
+  || run.effects?.some(effect => ['declared', 'pending', 'in-flight', 'refused'].includes(effect?.status));
+const unfinishedReview = run => !run.verdict || run.pending != null || hasOpenEffect(run)
+  || (hasRejectingReviewVerdict(run) && ['accept', 'prevention-outstanding', 'needs-human'].includes(verdictOf(run)));
 // An unfinished run that already ACCEPTED a readable sha other than the live head only waits on bookkeeping effects
 // for a superseded head: it cannot hold the live head. A run still deciding or rejecting (it may send the PR back),
 // or with an unreadable head (cleanRev null), stays unfinished (fail closed). Only the gate decision changes.
 const supersededUnfinished = (run, head) => {
+  if (hasRejectingReviewVerdict(run)) return false;
   if (verdictOf(run) !== 'accept') return false;
   const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
   return rev !== null && live !== null && rev !== live;
@@ -273,10 +276,10 @@ const supersededUnfinished = (run, head) => {
 const verdictOf = run => (typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict);
 // A verdict is PRESENT when it is anything but undefined or null: false, 0 and '' are malformed present verdicts, not absent ones.
 const hasVerdict = run => run.verdict !== undefined && run.verdict !== null;
-const abandonableReview = run => !hasVerdict(run) && run.resumeOf == null && run.resumedAt == null && isRunRecordTerminal(run);
+const abandonableReview = run => !hasRejectingReviewVerdict(run) && !hasVerdict(run) && run.resumeOf == null && run.resumedAt == null && isRunRecordTerminal(run);
 const undecidedUnfinished = run => {
   // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array, false, 0, '') counts as decided.
-  return (!hasVerdict(run) || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
+  return !hasRejectingReviewVerdict(run) && (!hasVerdict(run) || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
 };
 // R622: how a record weighs on comment settlement (what the complete same-head read keeps of it):
 //  hard      a label effect still pending or in flight, a rejection still waiting on a step, or a present verdict this
@@ -288,6 +291,7 @@ const undecidedUnfinished = run => {
 const ACCEPT_VERDICTS = ['accept', 'prevention-outstanding'];
 const settleKind = run => {
   if (hasOpenEffect(run)) return 'hard';
+  if (hasRejectingReviewVerdict(run) && verdictOf(run) !== 'changes') return 'hard';
   if (!hasVerdict(run)) return 'undecided';
   const verdict = verdictOf(run);
   if (typeof verdict !== 'string' || verdict === '') return 'hard';
@@ -297,6 +301,8 @@ const settleKind = run => {
   // 'bogus') is a shape this reader does not recognise and fails closed like a non-string one.
   return verdict === 'changes' && run.pending == null ? 'reject' : 'hard';
 };
+/** A replacement completes only with a settled verdict, without pending or refused work. */
+export const isCompletedReview = run => ['accept', 'reject'].includes(settleKind(run));
 // What the complete read keeps of a record: never its payload. Cached per (read function, dir, id) with the mtime and
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
@@ -307,9 +313,20 @@ const summaryCache = new WeakMap();
 const strictPr = value => (Number.isSafeInteger(value) && value > 0 ? value : typeof value === 'string' && /^[1-9]\d*$/.test(value.trim()) ? Number(value.trim()) : NaN);
 const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) ? value.toLowerCase() : null);
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
-  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run),
+  pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run), completed: isCompletedReview(run),
+  rejecting: hasRejectingReviewVerdict(run), startedAt: reviewStartedAt({ run }),
   // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
   orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run) });
+// Only a completed same-head panel whose READ started after the tombstone discharges abandonment.
+// Missing head/start cannot prove a replacement; comments and mtimes never stand in for one.
+const reviewAbandoned = (abandoned, completed) => abandoned.some(s => s.rev === null || !Number.isFinite(s.startedAt)
+  || !Number.isFinite(s.abandonedAt) || !(completed.get(s.rev) > s.abandonedAt));
+const rememberCompleted = (completed, s, now) => {
+  if (s.completed && s.rev !== null && Number.isFinite(s.startedAt)
+    && s.startedAt <= now + RUN_MTIME_SLACK_MS) {
+    completed.set(s.rev, Math.max(completed.get(s.rev) ?? -Infinity, s.startedAt));
+  }
+};
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
 // record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Over the
 // records of this PR whose head is this head (or whose head cannot be read):
@@ -331,6 +348,7 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
     // Same id universe as the bounded scan and every other review-run reader: the `review-pr-` id minted for the op.
     // A review run given another id by `--run-id` is invisible to all of them before settlement is ever asked.
     let newest = null; // the newest completed review of this exact head: { at, rejects }
+    const summaries = [], abandoned = [], completed = new Map();
     for (const id of list(runsDir).filter(id => id.startsWith('review-pr-'))) {
       const st = stat(join(runsDir, `${id}.json`));
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
@@ -345,6 +363,13 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) continue;
+      const tombstone = readRunAbandonment(id, runsDir);
+      if (tombstone && !s.rejecting) { abandoned.push({ ...s, abandonedAt: Date.parse(tombstone.at) }); continue; }
+      summaries.push({ s, st });
+      rememberCompleted(completed, s, now);
+    }
+    if (reviewAbandoned(abandoned, completed)) return { ok: false, reason: 'review-abandoned', complete: true, blocked: true };
+    for (const { s, st } of summaries) {
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
         const quiet = now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
@@ -385,7 +410,7 @@ export const RUN_MTIME_SLACK_MS = 2000;
 export const ABANDONED_REVIEW_AFTER_MS = 60 * 60 * 1000;
 // The bounded scan's predicate is unchanged (a `resumedAt` stamp alone does not keep a record in it); only the
 // complete same-head read additionally requires `resumedAt == null` (abandonableReview).
-const abandonedReview = (hit, now) => !hasVerdict(hit.run) && hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
+const abandonedReview = (hit, now) => !hasRejectingReviewVerdict(hit.run) && !hasVerdict(hit.run) && hit.run.resumeOf == null && isRunRecordTerminal(hit.run)
   && now - hit.at >= ABANDONED_REVIEW_AFTER_MS;
 const TIE_ORDERS = ['id-asc', 'id-desc'];
 // R622: the times a result comment must beat to settle unknown evidence. Non-enumerable, so every existing
@@ -432,11 +457,15 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     const mtimes = new Map();
+    const abandoned = [], completed = new Map();
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
     // different records in the drain's and recovery's windows, and the two could disagree.
-    const find = createNewestRunFinder({ ids: indexedIds ?? list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
+    const ids = indexedIds ?? list(runsDir).filter(id => id.startsWith('review-pr-'));
+    // Tombstones cannot be discharged by mtime bounds; inspect them within the shared parse budget.
+    const unreadTombstones = new Set(ids.filter(id => isRunAbandoned(id, runsDir)));
+    const find = createNewestRunFinder({ ids, tieBreak: 'id-asc',
       stat: id => {
         const metadata = stat(join(runsDir, `${id}.json`));
         mtimes.set(id, metadata.mtimeMs);
@@ -463,9 +492,15 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       }, scanSettings, warn });
     let end;
     try { end = find((run, id, at, nextAt) => {
+      unreadTombstones.delete(id);
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
-        if (!abandonedReview(hit, now)) {
+        const tombstone = readRunAbandonment(id, runsDir);
+        if (tombstone && !hasRejectingReviewVerdict(run)) {
+          const s = summarizeRun(run);
+          if (s.rev === null || s.rev === cleanRev(head)) abandoned.push({ ...s, abandonedAt: Date.parse(tombstone.at) });
+        } else if (!abandonedReview(hit, now)) {
+          rememberCompleted(completed, summarizeRun(run), now);
           count++;
           if (!Number.isFinite(reviewStartedAt(hit))) startless.push({ id, at });
           for (const slot of Object.values(slots)) {
@@ -489,14 +524,15 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       const { exact, newest } = slots[tieBreak];
       boundary = nextAt;
       if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
-      return !indexedIds && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
+      return !indexedIds && unreadTombstones.size === 0 && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
     }); } catch (error) {
       if (error !== budgetExhausted) throw error;
       end = RUN_SCAN_CAPPED;
     }
-    scan = { slots, startless, count, end, newestSettled, boundary };
+    scan = { slots, startless, count, end, newestSettled, boundary, abandoned, completed, unreadTombstones: unreadTombstones.size };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
+    if (reviewAbandoned(scan.abandoned, scan.completed)) return { ok: false, reason: 'review-abandoned' };
     const { newest, exact, unfinished, unfinishedExact, since, undecided, active } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
@@ -517,7 +553,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     // carried-from panel): an unread exact-head run could otherwise hide an unread unfinished re-review.
     // `writtenAfter` and the boundary are both mtimes: an unread record stamped in the same coarse
     // mtime tick as the status may have been written after it, so it must be older by the slack.
-    if (exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
+    if (scan.unreadTombstones === 0 && exact === null && scan.newestSettled && (!exactHead || (Number.isFinite(writtenAfter)
       && scan.boundary + RUN_MTIME_SLACK_MS <= writtenAfter
       && typeof newestHead === 'string' && newest.run.findings?.read?.netBasis?.rev === newestHead))) return null;
     return withSettleBounds({ ...scan.end }, { unreadBoundaryAt: scan.boundary, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead });
@@ -1143,6 +1179,7 @@ export function settleUnknownEvidenceByComment(evidence, comments, pr, head, rev
   // complete same-PR, same-head read with nothing blocking settles; no such read, or an incomplete one, stays held.
   let complete = null;
   try { complete = typeof bounds.completeHeadRead === 'function' ? bounds.completeHeadRead({ pr, head, at }) : null; } catch { /* unreadable: stays held */ }
+  if (complete?.reason === 'review-abandoned') return { ok: false, reason: 'review-abandoned' };
   if (complete?.complete !== true || complete.blocked !== false) return evidence;
   return { ok: true, settledByComment: evidence.reason, loopPayload: null, scheduled: false, inFlight: false,
     queued: false, recorded: true, skipCardOnly: false };

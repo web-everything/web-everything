@@ -55,7 +55,7 @@ export function hasPermanentGuardRefusalEvidence(entry) {
 }
 
 /** Ids are used as filenames, so the character set is closed — no separators, no traversal, no surprises. */
-const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\s\S])/;
 
 /**
  * Is this string something an observer could actually poll?
@@ -83,7 +83,7 @@ function isPlainObject(v) {
 
 /**
  * Is `id` usable as a run id (and therefore as a filename)? R755: an id ending `.abandoned` is reserved for the
- * `<id>.abandoned.json` tombstone sidecar, so listRunIds never mistakes a tombstone for a run record.
+ * legacy `<id>.abandoned.json` sidecar. New tombstones live outside the runs directory.
  */
 export function isValidRunId(id) {
   return typeof id === 'string' && RUN_ID_RE.test(id) && id !== '.' && id !== '..' && !id.endsWith('.abandoned');

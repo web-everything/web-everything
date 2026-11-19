@@ -53,6 +53,7 @@
  * error match only ever contributes to a COUNT; the matched text itself is never retained past the check.
  */
 
+import { filterRunFileNames } from '../operations/run-store.mjs';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
@@ -1550,7 +1551,7 @@ function readReviewRunsIn(runsDir, sinceMs) {
   try { names = readdirSync(runsDir); } catch { return { claudeRows: [], nonClaudeRows: [] }; }
   const claudeRows = [];
   const nonClaudeRows = [];
-  for (const name of names) {
+  for (const name of filterRunFileNames(names)) {
     if (!name.startsWith('review-pr-') || !name.endsWith('.json')) continue;
     const path = join(runsDir, name);
     if (sinceMs !== null) {

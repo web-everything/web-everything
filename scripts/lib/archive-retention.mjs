@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID, createHash } from 'node:crypto';
-import { sharedRunsDir } from '../operations/run-store.mjs';
+import { filterRunFileNames, isValidRunId, sharedRunsDir } from '../operations/run-store.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { boundedText } from './host-overload-settings.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
@@ -14,6 +14,11 @@ import { createRunsWriterExclusion, runRecordEligible, loadRunCompletion } from 
 import { readFile } from 'node:fs/promises';
 const exec = promisify(execFile);
 const DAY = 86400000;
+// Recovery entries are not run records, but must survive the runs scan's name filter.
+function parkedRunName(name) {
+  const match = /^\.retiring-(.+\.json)\.[0-9a-f-]{36}(?![\s\S])/.exec(name);
+  return match && isValidRunId(match[1].slice(0, -5)) ? match[1] : null;
+}
 const standard = { runs: { keepDays: 14 }, sessions: { keepDays: 30 }, runsBatchCap: 5000, runsMinAgeDays: 7, driveRoot: join(homedir(), 'Library', 'CloudStorage', 'GoogleDrive-nic.g.gilbert@gmail.com', 'My Drive', 'web-everything-archive') };
 export function archiveSettings({ env = process.env, tool, log = console.error } = {}) {
   const p = readPlatformPreferences({ env, readFile: path => boundedText(path) });
@@ -133,6 +138,7 @@ export async function archiveRetention(o = {}) {
       const files = [], dirs = []; let fresh = false;
       for await (const entry of await opendir(dir)) {
         if (++scanned > maxFiles) throw Error('scan bound exceeded; operator must split the source or raise maxFiles after inspection');
+        if (kind === 'runs' && !parkedRunName(entry.name) && !filterRunFileNames([entry.name]).length) continue;
         if (/[\r\n]/.test(entry.name)) throw Error('unsupported filename; operator must inspect');
         const path = join(dir, entry.name), s = await lstat(path);
         if (s.isSymbolicLink()) { fresh = true; continue; }
@@ -198,10 +204,10 @@ export async function archiveRetention(o = {}) {
       const cap = o.batchCap ?? settings.value.runsBatchCap;
       const scanned1 = (await scan(source, true)).files;
       for (const f of scanned1) {
-        const m = /^\.retiring-(.+)\.[0-9a-f-]{36}$/.exec(basename(f.path));
-        if (!m) continue;
+        const canonical = parkedRunName(basename(f.path));
+        if (!canonical) continue;
         if (o.dryRun) { out.errors.push(`ALERT: parked ${basename(f.path)} awaits restore`); continue; }
-        await restore(f.path, join(dirname(f.path), m[1]));
+        await restore(f.path, join(dirname(f.path), canonical));
       }
       // Crash recovery: a run killed between the manifest commit and the removal loop's bookkeeping leaves an intent file
       // naming the records it archived but had not yet removed. Treat them like skipped records (bounded retry) so the

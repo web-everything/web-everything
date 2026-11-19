@@ -3,13 +3,30 @@ import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isValidRunId, listRunIds } from '../../operations/run-store.mjs';
-import { abandonedPath, markRunAbandoned, isRunAbandoned, isAbandonedGivenStats, isRunTerminalOrAbandoned, runRecordVersion } from '../run-abandoned.mjs';
+import { abandonedPath, markRunAbandoned, isRunAbandoned, isAbandonedGivenStats, isRunTerminalOrAbandoned, runRecordVersion, hasRejectingReviewVerdict } from '../run-abandoned.mjs';
 
-let dir;
+let root, dir;
 const id = 'review-dead';
 const options = () => ({ id, dir, reason: 'dead', probes: { pid: false }, by: 'test', now: 1800000000000 });
-beforeEach(() => { dir = fs.mkdtempSync(join(tmpdir(), 'run-abandoned-')); fs.writeFileSync(join(dir, `${id}.json`), '{}'); });
-afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+it.each(['declared', 'pending', 'in-flight'])('only proven non-rejecting %s effects permit abandonment', status => {
+  for (const type of ['review.label-swap', 'verdict-ledger.append', 'review.notice', 'review.ledger-events', 'review.scoped-rereview-shadow', 'unknown']) {
+    for (const payload of [undefined, null, false, 'accept', []]) {
+      expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload }] })).toBe(true);
+    }
+    expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload: { to: 'accepted', verdict: 'accept' } }] }))
+      .toBe(type === 'unknown');
+    expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload: { to: 'accepted', nested: [[{ verdict: 'changes' }]] } }] })).toBe(true);
+  }
+  for (const type of ['review.label-swap', 'verdict-ledger.append', 'review.notice', 'unknown']) {
+    expect(hasRejectingReviewVerdict({ effects: [{ type, status, payload: {} }] })).toBe(true);
+  }
+});
+it('unreadable effect payload retains the hold instead of throwing or permitting abandonment', () => {
+  const effect = { type: 'review.label-swap', status: 'pending', get payload() { throw Error('unreadable'); } };
+  expect(hasRejectingReviewVerdict({ effects: [effect] })).toBe(true);
+});
+beforeEach(() => { root = fs.mkdtempSync(join(tmpdir(), 'run-abandoned-')); dir = join(root, 'runs'); fs.mkdirSync(dir); fs.mkdirSync(join(root, 'run-tombstones')); fs.writeFileSync(join(dir, `${id}.json`), '{}'); });
+afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 it.each([[10, 9, true], [10, 10, true], [10, 11, false], [NaN, 1, false], [1, undefined, false]])(
   'mtime rule: tombstone %s record %s abandoned %s', (t, r, expected) => expect(isAbandonedGivenStats(t, r)).toBe(expected));
 it('tombstone makes a nonterminal record terminal via the reader helper', () => {
@@ -57,7 +74,7 @@ it('stat and read errors fail closed toward alive', () => {
   }
 });
 it('creation errors other than EEXIST propagate', () => {
-  expect(() => markRunAbandoned({ ...options(), fs: { openSync: () => { throw Error('denied'); } } })).toThrow('denied');
+  expect(() => markRunAbandoned({ ...options(), fs: { ...fs, openSync: () => { throw Error('denied'); } } })).toThrow('denied');
 });
 
 it('a bound tombstone abandons the observed version but not an atomic replacement with the same mtime', () => {
@@ -90,7 +107,7 @@ it('re-abandons after a stale (record-version-mismatched) tombstone: resume, die
   expect(JSON.parse(fs.readFileSync(abandonedPath(id, dir))).reason).toBe('dead again');
   fs.utimesSync(abandonedPath(id, dir), new Date(dead.getTime() + 1000), new Date(dead.getTime() + 1000));
   expect(isRunAbandoned(id, dir)).toBe(true);
-  expect(fs.readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]); // no temp left behind
+  expect(fs.readdirSync(join(root, 'run-tombstones')).filter(f => f.endsWith('.tmp'))).toEqual([]); // no temp left behind
 });
 it.each([['zero-byte (crash between open and write)', ''], ['partial JSON', '{"at":'], ['unbound mtime-stale older than record', null]])(
   'replaces an unreadable or stale tombstone: %s', (_name, body) => {
@@ -111,9 +128,41 @@ it('stale replacement is atomic (temp + rename) and a failed rename leaves the o
     .toEqual({ written: false, alreadyAbandoned: false, staleUnreplaceable: 'EACCES' });
   expect(renameSync).toHaveBeenCalledTimes(1);
   expect(fs.readFileSync(abandonedPath(id, dir), 'utf8')).toBe('');
-  expect(fs.readdirSync(dir).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  expect(fs.readdirSync(join(root, 'run-tombstones')).filter(f => f.endsWith('.tmp'))).toEqual([]);
 });
 it('unreadable stat identity on a bound tombstone fails closed toward alive', () => {
   markRunAbandoned({ ...options(), probes: { recordVersion: runRecordVersion(fs.statSync(join(dir, `${id}.json`))) } });
   expect(isRunAbandoned(id, dir, { fs: { ...fs, statSync: () => ({ mtimeMs: 0 }) } })).toBe(false);
+});
+
+it('legacy sidecars still bind record versions, and malformed/stale new evidence does not mask a valid legacy tombstone', () => {
+  markRunAbandoned(bound());
+  const legacy = join(dir, `${id}.abandoned.json`);
+  fs.renameSync(abandonedPath(id, dir), legacy);
+  const bytes = fs.readFileSync(legacy), mtime = fs.statSync(legacy).mtimeMs;
+  fs.writeFileSync(abandonedPath(id, dir), '{');
+  expect(isRunAbandoned(id, dir)).toBe(true);
+  expect(markRunAbandoned(bound())).toEqual({ written: false, alreadyAbandoned: true });
+  expect(fs.readFileSync(legacy)).toEqual(bytes); expect(fs.statSync(legacy).mtimeMs).toBe(mtime);
+  const replacement = join(dir, 'replacement'); fs.writeFileSync(replacement, '{}');
+  const observed = fs.statSync(join(dir, `${id}.json`));
+  fs.utimesSync(replacement, observed.atime, observed.mtime); fs.renameSync(replacement, join(dir, `${id}.json`));
+  expect(isRunAbandoned(id, dir)).toBe(false);
+});
+
+it.each(['{', '{}', 'null', '[]'])('malformed legacy sidecar %s fails closed toward alive and is never modified', body => {
+  const path = join(dir, `${id}.abandoned.json`); fs.writeFileSync(path, body);
+  expect(isRunAbandoned(id, dir)).toBe(false);
+  expect(markRunAbandoned(bound()).written).toBe(true);
+  expect(fs.readFileSync(path, 'utf8')).toBe(body);
+});
+
+it('legacy sidecars obey the newer-record mtime rule and remain untouched on a fresh abandonment', () => {
+  markRunAbandoned(options());
+  const path = join(dir, `${id}.abandoned.json`); fs.renameSync(abandonedPath(id, dir), path);
+  const bytes = fs.readFileSync(path), later = fs.statSync(path).mtimeMs + 1000;
+  fs.utimesSync(join(dir, `${id}.json`), new Date(later), new Date(later));
+  expect(isRunAbandoned(id, dir)).toBe(false);
+  expect(markRunAbandoned(bound()).written).toBe(true);
+  expect(fs.readFileSync(path)).toEqual(bytes);
 });

@@ -25,7 +25,7 @@ const MAX_CARD_ONLY_HEADS = 256;
 const MAX_PROBES = 2;
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // probed in fair, bounded turns, without occupying a capacity-bound admission.
-const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
+const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'review-abandoned', 'planner-skip']);
 const copy = entries => entries.map(entry => ({ ...entry }));
 const advanceProbeTurns = (mine, selected) => {
   let turn = mine.reduce((max, entry) => Math.max(max, entry.lastProbeTurn ?? 0), 0);
