@@ -136,6 +136,23 @@ function checkoutHasSelfWrappedTestUnit(cwd, readPackageJson = readCheckoutPacka
     return typeof script === 'string' && SELF_WRAPPED_TEST_UNIT.test(script);
   } catch { return false; }
 }
+
+// Replacing npm with isolated Vitest must not skip lifecycle hooks or script-specific checks.
+export function checkoutHasRetryableTestUnit(cwd, readPackageJson = readCheckoutPackageJson) {
+  try {
+    const scripts = JSON.parse(readPackageJson(cwd))?.scripts;
+    return scripts?.['test:unit'] === 'node scripts/readiness/heavy-admission.mjs run -- vitest run'
+      && !Object.hasOwn(scripts, 'pretest:unit') && !Object.hasOwn(scripts, 'posttest:unit');
+  } catch { return false; }
+}
+
+// Keep the original scan's assignments byte-for-byte. Unknown shell syntax cannot prove the same inputs.
+export function scanRetryCommand(command, argv) {
+  if (typeof command !== 'string') return null;
+  const parts = segmentParts(command);
+  if (!parts || parts.words.slice(0, 3).join(' ') !== 'npx vitest run') return null;
+  return parts.prefix + argv.map(shellQuote).join(' ');
+}
 const REWRITTEN_VITEST_SEGMENT = /^npx vitest (?:related|run)(?=\s|$)/;
 // Why a phase the wrapper cannot take stays local. A `vitest related` phase whose args Forge cannot run as written
 // (no `--run`, unknown flag, quoted option) still stays local; a clean one is wrapped in heavy-admission above.
