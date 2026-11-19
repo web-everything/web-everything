@@ -15,7 +15,8 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   const fui = resolve(cwd, '../frontierui');
   // Child env is scrubbed to a few keys; local bins (vitest etc.) must stay resolvable.
   const binDirs = [join(cwd, 'node_modules/.bin'), join(fui, 'node_modules/.bin')];
-  childEnv.PATH = [...binDirs, childEnv.PATH].filter(Boolean).join(delimiter);
+  // Appended (not prepended) so checkout-local binaries can never shadow system git/sh/npm.
+  childEnv.PATH = [childEnv.PATH, ...binDirs].filter(Boolean).join(delimiter);
   const run = (cmd, args, dir = cwd) => {
     const r = spawnSync(cmd, args, { cwd: dir, env: childEnv, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
     if (r.error || r.status !== 0) {
@@ -45,7 +46,13 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       return ciUnitPlan(workflow);
     },
     verifyFui: (expected) => {
-      const repo = canonicalFuiRepo(normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'], fui)));
+      const rawRepo = normalizeUrgentRepo(run('git', ['remote', 'get-url', 'origin'], fui));
+      const repo = canonicalFuiRepo(rawRepo);
+      if (repo !== rawRepo) {
+        // Old owner: prove GitHub really redirects it to the canonical repo before trusting it.
+        const resolved = run('gh', ['repo', 'view', rawRepo.replace('https://github.com/', ''), '--json', 'url', '-q', '.url']).trim().toLowerCase();
+        if (resolved !== urgentFuiRepo) throw new Error('FUI sibling origin must be frontier-ui/frontierui on github.com');
+      }
       if (repo !== urgentFuiRepo) throw new Error('FUI sibling origin must be frontier-ui/frontierui on github.com');
       if (run('git', ['status', '--porcelain', '--untracked-files=all'], fui) !== '') throw new Error('FUI sibling must exist and be clean');
       if (expected) {

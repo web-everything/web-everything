@@ -151,7 +151,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(spawnSync).toHaveBeenCalledTimes(2);
     for (const [, args, options] of spawnSync.mock.calls) {
       expect(args[0]).toBe('scripts/readiness/heavy-admission.mjs');
-      expect(options.env).toEqual({ PATH: expect.stringMatching(/node_modules\/\.bin.*:\/bin$/), HOME: '/home/test' });
+      expect(options.env).toEqual({ PATH: expect.stringMatching(/^\/bin:.*node_modules\/\.bin/), HOME: '/home/test' });
       for (const marker of markers) expect(options.env).not.toHaveProperty(marker);
     }
     expect(env.CI).toBe('true');
@@ -436,11 +436,12 @@ describe('FUI origin binding', () => {
 });
 
 describe('urgent-verify blocker fixes', () => {
-  it('prepends the checkout node_modules/.bin to the scrubbed child PATH', () => {
+  it('appends the checkout node_modules/.bin after system PATH so it cannot shadow system tools', () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
     createUrgentDeps({ cwd: '/repo', env: { PATH: '/usr/bin', HOME: '/h' }, spawnSync }).head();
-    expect(spawnSync.mock.calls[0][2].env.PATH.split(':')[0]).toBe('/repo/node_modules/.bin');
-    expect(spawnSync.mock.calls[0][2].env.PATH).toContain('/usr/bin');
+    const parts = spawnSync.mock.calls[0][2].env.PATH.split(':');
+    expect(parts[0]).toBe('/usr/bin');
+    expect(parts).toContain('/repo/node_modules/.bin');
   });
   it('records exit code and stderr tail in the red marker and result', async () => {
     const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
@@ -455,8 +456,12 @@ describe('urgent-verify blocker fixes', () => {
     expect(JSON.parse(fs.appendFileSync.mock.calls[0][1]).failure.exit).toBe(127);
   });
   it.each(['git@github.com:chalbert/frontierui.git', 'https://github.com/chalbert/frontierui', 'ssh://git@github.com/frontier-ui/frontierui.git'])('accepts FUI origin %s', url => {
-    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'remote' ? url : args[0] === 'status' ? '' : sha }));
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: cmd === 'gh' ? urgentFuiRepo : args[0] === 'remote' ? url : args[0] === 'status' ? '' : sha }));
     expect(createUrgentDeps({ cwd: '/repo/x', spawnSync }).verifyFui({ sha, repo: urgentFuiRepo })).toEqual({ sha, repo: urgentFuiRepo });
+  });
+  it('rejects the old owner when gh does not resolve it to the canonical repo', () => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: cmd === 'gh' ? 'https://github.com/chalbert/frontierui' : args[0] === 'remote' ? 'git@github.com:chalbert/frontierui.git' : '' }));
+    expect(() => createUrgentDeps({ spawnSync }).verifyFui()).toThrow(/frontier-ui/);
   });
   it.each(['git@github.com:evil/frontierui.git', 'https://gitlab.com/frontier-ui/frontierui'])('rejects FUI origin %s', url => {
     const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'remote' ? url : '' }));
