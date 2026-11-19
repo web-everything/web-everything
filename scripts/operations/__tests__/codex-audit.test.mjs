@@ -617,7 +617,7 @@ describe('R1053 prove mode', () => {
     else f.deps.preExistingExemptionEnabled = () => enabled;
     expect(await main(ARGS, f.deps)).toBe(1);
     expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', modelVerdict: 'WEAKENED', findings: [finding],
-      findingKeys: ['x.mjs|X|B2'], preExisting: [], shadowPreExisting: [{ line: finding, key: 'x.mjs|X|B2', relation: 'SAME' }] });
+      findingKeys: ['x.mjs|X|E1'], preExisting: [], shadowPreExisting: [{ line: finding, key: 'x.mjs|X|E1', relation: 'SAME' }] });
     expect(f.deps.fileCard).toHaveBeenCalledOnce();
   });
   it.each([

@@ -3,7 +3,7 @@ import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { AUDIT_SETTINGS_PATH } from '../../lib/audit-settings.mjs';
 import { canonicalAuditEvidence } from '../prototype-load.mjs';
-import { cardHash } from '../audit-base-repro.mjs';
+import { cardHash, cardLine } from '../audit-base-repro.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -220,7 +220,10 @@ describe('R1053 additive audit records', () => {
   const entry = { line: 'x.mjs:2 unsafe return', key: 'x.mjs|X|E1',
     base: { sha: base, path: 'x.mjs', line: 2, quote: 'return unsafe();' }, relation: 'SAME', cardHash: cardHash('x.mjs|X|E1') };
   const scoped = { ...green, modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [entry] };
-  const held = f => `- [R1053] today ET: pre-existing audit finding (${f.key.split('|').at(-1)}) in we:${f.key.split('|')[0]}#${f.key.split('|')[1]}, reproduces on main ${f.base.sha.slice(0, 10)}: we:${f.line}`;
+  const held = f => {
+    const [path, symbol, cls] = f.key.split('|');
+    return cardLine({ date: '2026-11-18 07:00', cls, path, symbol, sha10: f.base.sha.slice(0, 10), text: f.line });
+  };
   const security = f => `- [R1053][needs-you] today ET: security pre-existing (${f.key.split('|').at(-1)}) ${f.key}`;
   const current = (audit = {}, cards = {}) => ({
     settingsOptions: { platform: null, env: {}, fileRead: () => JSON.stringify({ audit: {
@@ -303,6 +306,14 @@ describe('R1053 additive audit records', () => {
     expect(fixture({ records, exemptionIO: io }).result.ok).toBe(true);
     io.now = () => Date.parse('2099-01-01');
     expect(fixture({ records, exemptionIO: io }).result.reason).toBe('canonical-audit-exemption-stale');
+  });
+  it('rejects a held card whose debt reference differs from the writer-qualified text', () => {
+    const exemption = { ...entry, line: `${entry.line} backlog/debt.md` };
+    const cards = held(exemption);
+    expect(cards).toContain('we:backlog/debt.md');
+    expect(fixture({ records: [{ ...scoped, preExisting: [exemption] }],
+      exemptionIO: current({}, { cards: cards.replace('we:backlog/debt.md', 'backlog/debt.md') }) }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
   });
   it.each(['', undefined, 'unrelated card'])('index alone cannot authorize missing or changed card storage: %j', cards => {
     expect(fixture({ records: [scoped], exemptionIO: current({}, { cards }) }).result.reason)

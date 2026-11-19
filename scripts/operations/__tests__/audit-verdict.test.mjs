@@ -1362,7 +1362,7 @@ describe('AU1 PR-A is inert', () => {
     const hits = [...new Set(matches.filter(m => !m || (/\.(mjs|js|cjs|ts)$/.test(m.file) && !/__tests__\/|\.test\./.test(m.file)
       && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text))).map(m => m?.file ?? 'unparsed grep line'))];
     // Audit adapters and the canonical evidence reader wire trusted settings; saved exemptions must obey current policy.
-    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/codex-audit-io.mjs', 'scripts/operations/prototype-load.mjs']);
+    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/codex-audit-io.mjs', 'scripts/operations/prototype-load-io.mjs', 'scripts/operations/prototype-load.mjs']);
     const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts', 'skills-src', '.claude', 'src'],
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     expect(callers.error).toBeUndefined();

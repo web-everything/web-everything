@@ -121,7 +121,7 @@ describe('pre-existing classification', () => {
     const answers = parseReproAnswer(answer().replace(':2', ':3'), 1);
     expect(classify({ answers, readBaseFile: () => `\n${source}` })[0].blocking).toBe(false);
   });
-  it.each(['changed', 'removed', 'unknown'])('nested B2 retains human review for an %s enclosing auth guard', kind => {
+  it.each(['changed', 'removed', 'unknown'])('nested E1 retains human review for an %s enclosing auth guard', kind => {
     const base = ['function outer(req) {', '  requireAuth(req);', '  const route = req.route;', '  function inner() {',
       '    return unsafe();', '  }', '  return inner();', '}'].join('\n');
     const sourceText = kind === 'removed' ? base.replace('  requireAuth(req);\n', '')
@@ -148,13 +148,14 @@ describe('pre-existing classification', () => {
     const sourceText = base.replace('requireAuth', 'skipAuth');
     const changedLines = parseDiffChangedLines(diff.replace('@@ -5 +5 @@', '@@ -4 +4 @@')
       .replace('return old();', 'requireAuth(req);').replace('return fixed();', 'skipAuth(req);'), stat);
-    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=E1 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
     expect(changedLines.complete).toBe(true);
     expect(classify({ findings: [{ text: 'lib/x.mjs:2 unsafe', sourceText }], answers,
       readBaseFile: () => base, changedLines })[0]).toMatchObject({ blocking: true,
       reason: expect.stringContaining('human review required') });
   });
   it.each(['base', 'head'])('parser rejects a truncated regexp range on the %s side independently', side => {
+    // Non-security findings reach the range verifier; B classes stop before parsing (R1085).
     const plain = 'function serve(req) {\n  unsafeResponse(req);\n  const end = 0;\n  requireAuth(req);\n}';
     const truncated = plain.replace('const end = 0;', 'const end = /}/;');
     expect(symbolRangeAt(truncated, 2)).toEqual({ symbol: 'serve', start: 1, end: 3 });
@@ -164,7 +165,7 @@ describe('pre-existing classification', () => {
     const changedLines = side === 'head'
       ? parseDiffChangedLines('diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n@@ -3,0 +4 @@\n+  skipAuth(req);\n', '1\t0\tlib/x.mjs\n')
       : parseDiffChangedLines(diff.replace('@@ -5 +5 @@', '@@ -4 +4 @@'), stat);
-    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=E1 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
     expect(classify({ findings: [{ text: 'lib/x.mjs:2 unsafe', sourceText }], answers,
       readBaseFile: () => base, changedLines })[0]).toMatchObject({ blocking: true,
       reason: expect.stringContaining(side === 'base' ? 'base quote outside the finding symbol' : 'unknown symbol extent in a changed file') });
@@ -176,14 +177,14 @@ describe('pre-existing classification', () => {
   ])('parser accepts complete function, method and arrow ranges: %s', sourceText => {
     const line = sourceText.includes('\n') ? 2 : 1;
     const quote = sourceText.split('\n')[line - 1].trim();
-    const answers = parseReproAnswer(`#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:${line}\nQUOTE: ${quote}`, 1);
+    const answers = parseReproAnswer(`#1 REPRODUCES SAME CLASS=E1 BASE=lib/x.mjs:${line}\nQUOTE: ${quote}`, 1);
     expect(classify({ findings: [{ text: `lib/x.mjs:${line} unsafe`, sourceText }], answers,
       readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0].blocking).toBe(false);
   });
   it('rejects a scanned range whose first line does not contain its symbol name', () => {
     const sourceText = 'function\nserve(req) {\n  unsafeResponse(req);\n}';
     expect(symbolRangeAt(sourceText, 3)).toEqual({ symbol: 'serve', start: 1, end: 4 });
-    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:3\nQUOTE: unsafeResponse(req);', 1);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=E1 BASE=lib/x.mjs:3\nQUOTE: unsafeResponse(req);', 1);
     expect(classify({ findings: [{ text: 'lib/x.mjs:3 unsafe', sourceText }], answers,
       readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0])
       .toMatchObject({ blocking: true, reason: expect.stringContaining('base quote outside the finding symbol') });
@@ -195,7 +196,7 @@ describe('pre-existing classification', () => {
   ])('rejects a compilable snippet starting before the matched header: %s', header => {
     const sourceText = `${header}\n  unsafeResponse(req);\n}`;
     expect(symbolRangeAt(sourceText, 2)).toEqual({ symbol: 'serve', start: 1, end: 3 });
-    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=E1 BASE=lib/x.mjs:2\nQUOTE: unsafeResponse(req);', 1);
     expect(classify({ findings: [{ text: 'lib/x.mjs:2 unsafe', sourceText }], answers,
       readBaseFile: () => sourceText, changedLines: Object.assign(new Map(), { complete: true }) })[0])
       .toMatchObject({ blocking: true, reason: expect.stringContaining('base quote outside the finding symbol') });
@@ -310,7 +311,7 @@ describe('pre-existing classification', () => {
     const base = [declaration, '  requireAuth(req);', ...Array.from({ length: 6 }, (_, i) => `  const v${i} = ${i};`),
       '  return unsafeResponse(req);', '}'].join('\n');
     const hdr = 'diff --git a/lib/x.mjs b/lib/x.mjs\n--- a/lib/x.mjs\n+++ b/lib/x.mjs\n';
-    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=B2 BASE=lib/x.mjs:9\nQUOTE: return unsafeResponse(req);', 1);
+    const answers = parseReproAnswer('#1 REPRODUCES SAME CLASS=E1 BASE=lib/x.mjs:9\nQUOTE: return unsafeResponse(req);', 1);
     for (const removed of [false, true]) {
       const sourceText = removed ? base.replace('  requireAuth(req);\n', '') : base.replace('requireAuth', 'skipAuth');
       const changedLines = parseDiffChangedLines(removed ? `${hdr}@@ -2 +1,0 @@\n-  requireAuth(req);\n`
