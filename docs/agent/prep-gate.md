@@ -80,3 +80,44 @@ copy read the same file selected by that expansion.
 Both reads use the publisher's working directory for relative paths and preserve
 symlink/`..` segments for filesystem traversal; lexical path normalization can
 select a different body file.
+
+
+## Advise-only preparation records (S2)
+
+The `prep` operation is declared in `scripts/operations/prep.mjs`; CLI flags come
+from that declaration. It does not change dispatch, PR, audit, or guard enforcement.
+Use `node scripts/operations/run.mjs prep --action=new --id=<slug>` with
+`--card=<number|path>`, `--brief=<file>`, `--pr=<number>`, or explicit record fields.
+Briefs accept JSON records or Markdown card sections. Card headings are Acceptance,
+Pre-mortem (or Risks), and Tests (or Test plan); frontmatter `scope` supplies paths.
+Supply `--baseSha=<base>` for cards and briefs. Explicit fields include
+`--acceptance`, `--preMortem`, `--testPlan`, `--touchSet` (comma-separated paths),
+`--source`, `--untrustedOutput`, and `--threatModel`.
+
+`--action=check --id=<id>` prints validation advice, classes, flow, design-pass
+requirement, and canonical SHA-256. It exits zero even when evidence is incomplete.
+`--action=amend --id=<id>` appends `--touchSet` entries or replaces supplied fields;
+it retains previous content and hashes in history. These hashes identify content,
+not approval. There is no `auto` action in S2.
+
+`scripts/settings/prep-flow.json` controls advisory classification. The IO loader
+uses the shared standard → platform (`prepFlow`) → tool → environment cascade and
+reports provenance. Invalid settings require design review, disable fast-path
+qualification, and retain advice-only enforcement. Unknown sensitive paths and
+unexpanded scope globs also require design review. Fast-path evidence is a JSON
+`fastPath: {loc: <nonnegative integer>}` record field; only concrete, nonsensitive
+sets within both configured bounds and without threat-model reasons qualify.
+Untrusted output and narrative threat-model triggers always require design review,
+even when file and line counts fit the fast-path bounds.
+
+Records live in the configured `storeDir`; `WE_PREP_STORE_DIR` or an injected store
+redirects local storage. Tests always inject temporary directories and PR evidence;
+they never read live PRs or write the operator's home coordination store.
+
+
+Record creation publishes a complete temporary file with an atomic, exclusive
+hard link. Concurrent `new` requests for the same ID cannot replace the first
+record; the losing writer reports that the record exists and directs the caller
+to `amend`. Explicit amendments retain atomic replacement by rename. Older
+record-only pending effects are treated as creation requests and cannot replace
+an existing record.

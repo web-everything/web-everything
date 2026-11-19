@@ -166,7 +166,8 @@ const HELPER_DYNAMIC_IMPORT = new RegExp(`\\bimport\\s*\\(\\s*['"][^'"]*${esc(HE
 
 // THE NAMES the helper exports. A test satisfies the fidelity rule only by USING one of them — see
 // `importsRealRepoHelper` for why importing is not enough.
-const HELPER_EXPORTS = ['withRealRepo', 'withBareOrigin', 'withNarrowClone'];
+// Filesystem-only operations still need real effects, but cannot benefit from clone geometry.
+const HELPER_EXPORTS = ['withRealRepo', 'withBareOrigin', 'withNarrowClone', 'withRealDirectory'];
 
 export function importsRealRepoHelper(content) {
   const src = String(content ?? '');

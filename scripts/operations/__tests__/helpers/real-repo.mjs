@@ -153,6 +153,14 @@ async function within(tmp, ctx, fn) {
   }
 }
 
+/** Real filesystem fixture for local-store operations with no Git dependency.
+ * Uses the same scratch/cleanup contract as the repo fixtures without invoking Git.
+ */
+export async function withRealDirectory(fn) {
+  const root = scratch('we-real-directory-');
+  return within(root, { root }, fn);
+}
+
 /**
  * ONE real repo with one real commit, no remote.
  *

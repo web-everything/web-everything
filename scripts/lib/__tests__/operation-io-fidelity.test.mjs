@@ -203,11 +203,15 @@ describe('importsRealRepoHelper — importing is not using (PR #1549 juror)', ()
     expect(importsRealRepoHelper(real)).toBe(true);
   });
 
-  it('accepts any of the three harness entry points, not just the first', () => {
-    for (const name of ['withRealRepo', 'withBareOrigin', 'withNarrowClone']) {
+  it('accepts the repository and filesystem harness entry points', () => {
+    for (const name of ['withRealRepo', 'withBareOrigin', 'withNarrowClone', 'withRealDirectory']) {
       const src = `import { ${name} } from '../helpers/real-repo.mjs';\nit('x', () => ${name}(() => {}));\n`;
       expect(importsRealRepoHelper(src)).toBe(true);
     }
+  });
+
+  it('refuses a decorative filesystem fixture import without a call', () => {
+    expect(importsRealRepoHelper("import { withRealDirectory } from '../helpers/real-repo.mjs';\nit('stubbed', () => {});")).toBe(false);
   });
 
   it('still refuses a file that uses the names but never imports the helper', () => {

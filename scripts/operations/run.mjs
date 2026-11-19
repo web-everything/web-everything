@@ -63,6 +63,8 @@ import { createReviewPrReader, createReviewPrSinks, PR_VIEW_FIELDS, prViewFileNa
 import { stagePrViewOperation, STAGE_PR_VIEW_OP } from './stage-pr-view.mjs';
 import { createPayloadReader, createStagePrViewSinks, defaultViewDir } from './stage-pr-view-io.mjs';
 import { reviewPrepOperation, REVIEW_PREP_OP } from './review-prep.mjs';
+import { prepOperation, PREP_OP, finishPrep } from './prep.mjs';
+import { createPrepIO } from './prep-io.mjs';
 import { createReviewPrepReader, createReviewPrepSinks } from './review-prep-io.mjs';
 import { suggestNextOperation, SUGGEST_NEXT_OP } from './suggest-next.mjs';
 import { createBoardReader, createExclusionReader } from './suggest-next-io.mjs';
@@ -343,6 +345,10 @@ export const OPERATIONS = Object.freeze({
     declaration: reviewPrepOperation({ readPrep: createReviewPrepReader() }),
     sinks: createReviewPrepSinks(),
   }),
+  [PREP_OP]: () => {
+    const io = createPrepIO();
+    return { declaration: prepOperation({ readContext: io.readContext }), sinks: io.sinks, finish: finishPrep };
+  },
   // #xrk6hmj — carry a verdict from a host with no GitHub credential to the CI job that has one. The request's
   // rules are the APPLIER's, passed in rather than restated: one answer to "is this request legal".
   [RECORD_VERDICT_OP]: () => ({
