@@ -843,7 +843,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
     expect(commands.some(line=>line.includes('--dry-run --offline'))).toBe(true);
     expect(await fs.stat(join(f.server,'cache',hash(lockData),'dev-v5-'+manifestDigest,'dependencies.tar'))).toBeDefined();
     await f.runner.finish(request);
-  });
+  },30_000); // Real git + warmInstall + run cycle; same budget as its sibling tests (timed out at the 5s default on a loaded CI shard).
 
   // Card 7515: presync ships delta leaves ahead of the run; the run offers them
   // only as an rsync --copy-dest basis, and Forge still verifies every byte.
