@@ -4021,6 +4021,7 @@ export function planReconcile({
       const advisoryAlsoPending = withPhase.labels.includes(ADVISORY_LABELS.CHANGES);
       dispatch.push({
         ...base, ...withPhase, kind: 'fix', isConflict: true, advisoryPending: advisoryAlsoPending,
+        conflictFixMechanical: pr.baseRefName === defaultBranch && ['clean', 'manifest-only'].includes(pr.conflictDisposition),
         findings, attempts: conflictAttempts, cap: conflictFixCapHere,
         why: `bounced with ${findings} finding(s) via a mechanical conflict-resolution route (merge-status:conflicting),`
           + ` nothing live is working it, and ${conflictAttempts} of ${conflictFixCapHere} conflict-fix attempts are spent`

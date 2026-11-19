@@ -535,6 +535,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
 /** Card xrbu1bp — the planner's spent-round count and the PR's base ref, carried onto a planned fix. */
 function roundFields(entry) {
   return {
+    ...(entry.isConflict === true && entry.conflictFixMechanical === true ? { conflictFixMechanical: true } : {}),
     ...(Number.isFinite(Number(entry.attempts)) && entry.attempts != null ? { attempts: Number(entry.attempts) } : {}),
     ...(Number.isFinite(Number(entry.cap)) && entry.cap != null ? { cap: Number(entry.cap) } : {}),
     ...(entry.baseRefName ? { baseRefName: entry.baseRefName } : {}),
@@ -2172,12 +2173,19 @@ export function runReconcileFixDispatch({
   const dispatched = [];
   let handled = 0;
   let deferred = [];
+  let conflictExemptHandled = 0;
+  const exemptCap = Number.isSafeInteger(fixSettings.conflictFixExemptPerPass) && fixSettings.conflictFixExemptPerPass >= 0
+    ? fixSettings.conflictFixExemptPerPass : 0;
+  console.error(`reconcile-fix-dispatch: fix.conflictFixExemptPerPass=${exemptCap} (source ${fixSettings.sources?.conflictFixExemptPerPass ?? 'invalid'})`);
   for (const entry of planned) {
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if ((handled > 0 && deadlineAt != null && clock() > deadlineAt) || yieldedForAdoption) {
-      deferred = planned.slice(handled).map(row => row.pr);
-      break;
+    const exempt = entry.isConflict === true && entry.conflictFixMechanical === true && !entry.restack
+      && conflictExemptHandled < exemptCap;
+    if ((handled > 0 && deadlineAt != null && clock() > deadlineAt && !exempt) || yieldedForAdoption) {
+      deferred.push(entry.pr);
+      continue;
     }
+    if (exempt) conflictExemptHandled += 1;
     handled += 1;
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };

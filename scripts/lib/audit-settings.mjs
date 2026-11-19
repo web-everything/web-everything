@@ -253,7 +253,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.mjs', 'scripts/conveyor/stand-down-auto-proceed-io.mjs',
   'scripts/held-cards-io.mjs', 'scripts/lane-drain.mjs', 'scripts/lib/card-group.mjs', 'scripts/lib/card-number-ledger.mjs',
   'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-item-tasks.mjs', 'scripts/lib/daemon-jobs-runtime.mjs',
-  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
+  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/adopt.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
   'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
@@ -320,6 +320,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   // The agy confined build (R1062 S7): its transcript is an exclusive-create (O_EXCL|O_NOFOLLOW) file the sandboxed worker must not
   // pre-plant or replace; a race in either module weakens the confinement.
   'scripts/lib/agy-confined-build.mjs', 'scripts/gemini-direct-task.mjs', 'scripts/settings/agy-build.json',
+  // The AGY usage reader writes its record through an exclusive-create (`wx`) temp file before the rename.
+  'scripts/operations/agy-usage-reader.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',
