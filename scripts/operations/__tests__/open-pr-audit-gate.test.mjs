@@ -8,7 +8,7 @@ import { createPrLandRunner } from '../open-pr-io.mjs';
 import { classifySubmit } from '../open-pr.mjs';
 import { admitCanonicalAudit } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
-import { QUESTION_HASH } from '../codex-audit.mjs';
+import { QUESTION_HASH, LEGACY_QUESTION_HASHES } from '../codex-audit.mjs';
 
 const sha = 'a'.repeat(40);
 const base = 'b'.repeat(40);
@@ -99,6 +99,19 @@ describe('default canonical checker integration', () => {
     expect(result).toMatchObject({ merged: false, reason: 'canonical-audit-missing' });
     expect(result.detail).toContain(`codex-audit --base=origin/main --head=${sha}`);
     expect(effects.some(([cmd, args]) => cmd !== 'git' || args.includes('push'))).toBe(false);
+  });
+  it.each([false, true])('producer refuses a legacy veto despite a current pass on another base, direct=%s', direct => {
+    const weak = { head: sha, base, questionHash: LEGACY_QUESTION_HASHES[0], at: '2026-11-17T00:00:00Z', verdict: 'WEAKENED', findings: ['x.mjs:1 gap'] };
+    const pass = { ...weak, base: 'c'.repeat(40), questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [] };
+    const { result, effects } = defaultProducer({ direct, records: [weak, pass] });
+    expect(result.reason).toBe('canonical-audit-weakened');
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push'))).toBe(false);
+  });
+  it.each([false, true])('producer requires a fresh audit for a legacy pass, direct=%s', direct => {
+    const record = { head: sha, base, questionHash: LEGACY_QUESTION_HASHES[0], at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { result, effects } = defaultProducer({ direct, records: [record] });
+    expect(result.reason).toBe('canonical-audit-missing');
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push'))).toBe(false);
   });
   it('default open-pr admits an audited unpublished local head and delegates publication', () => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };

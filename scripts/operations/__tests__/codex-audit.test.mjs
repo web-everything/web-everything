@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
+import { CANONICAL_QUESTION, QUESTION_HASH, LEGACY_QUESTION_HASHES, vetoesAsCurrent, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
@@ -496,20 +496,26 @@ describe('prior question hashes (AU1 PR-B)', () => {
     // the shipped (empty) setting accepts nothing extra
     expect(omit([prior])).toBeNull();
   });
-  it('replay over a frozen copy of audits.jsonl is identical with priorQuestionHashes empty', () => {
+  it('replays unchanged frozen hashes: preserves each negative record and requires a fresh audit for the sole pass', () => {
     const dir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
-    // The frozen copy predates R1081: its records carry the pre-R1081 question hash, replayed here as the current one
-    // (this test pins the selection logic, not the question text; that is pinned above).
-    const PRE_R1081 = 'c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284';
-    const records = realFs.readFileSync(join(dir, 'audits-frozen.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
-      .map(r => r.questionHash === PRE_R1081 ? { ...r, questionHash: QUESTION_HASH } : r);
+    const records = realFs.readFileSync(join(dir, 'audits-frozen.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l));
     const expected = JSON.parse(realFs.readFileSync(join(dir, 'audits-frozen.expected.json'), 'utf8'));
     const pairs = [...new Set(records.map(r => `${r.head}/${r.base}`))];
     expect(pairs.length).toBeGreaterThan(10);
+    // Inspected ledger: the sole historical pass has no superseded negative. All other pairs ended WEAKENED.
+    const passKey = '03742c863d650997441d4203ce0bdc9eb622cfc4/e2a3dd5666d426bb9cd8f186da5ebd647cae5289';
+    expect(Object.keys(expected).filter(k => expected[k]?.verdict === 'NOT WEAKENED')).toEqual([passKey]);
+    expect(records.filter(r => `${r.head}/${r.base}` === passKey && r.verdict === 'WEAKENED')).toEqual([]);
     for (const key of pairs) {
       const [head, base] = key.split('/');
       const got = findAudit(records, { head, base, questionHash: QUESTION_HASH, priorQuestionHashes: [] });
-      expect(got ? { at: got.at, verdict: got.verdict } : null).toEqual(expected[key]);
+      if (key === passKey) expect(got).toBeNull();
+      else {
+        expect(expected[key].verdict).toBe('WEAKENED');
+        const original = records.find(r => r.head === head && r.base === base && r.at === expected[key].at && r.verdict === 'WEAKENED');
+        expect(original).toBeDefined();
+        expect(got).toBe(original);
+      }
     }
   });
 });
@@ -557,5 +563,35 @@ describe('findAudit ordering and clock trust (#7011)', () => {
     const second = rec('WEAKENED', '2026-11-17T10:00:00Z');
     expect(find([first, second])).toBe(second);
     expect(find([second, first])).toBe(first);
+  });
+});
+
+
+describe('legacy question veto eligibility', () => {
+  const legacy = LEGACY_QUESTION_HASHES[0];
+  const query = { head: HEAD, base: BASE, questionHash: QUESTION_HASH, priorQuestionHashes: [] };
+  const weak = { head: HEAD, base: BASE, at: AT, questionHash: legacy, verdict: 'WEAKENED', findings: ['x.mjs:1 gap'] };
+  const pass = { ...weak, verdict: 'NOT WEAKENED', findings: [] };
+  it('pins the pre-R1081 question hash and frozen legacy list', () => {
+    const oldQuestion = CANONICAL_QUESTION.replace('List EVERY finding you can find in this one exhaustive pass; do not stop at the first finding. ', '');
+    expect(LEGACY_QUESTION_HASHES).toEqual([createHash('sha256').update(oldQuestion).digest('hex')]);
+    expect(Object.isFrozen(LEGACY_QUESTION_HASHES)).toBe(true);
+    expect(vetoesAsCurrent(weak)).toBe(true);
+    expect(vetoesAsCurrent(pass)).toBe(false);
+  });
+  it('keeps legacy negatives in ledger order alongside current records', () => {
+    const current = { ...pass, questionHash: QUESTION_HASH };
+    expect(findAudit([weak, pass], query)).toBe(weak);
+    expect(findAudit([weak, current], query)).toBe(current);
+    expect(findAudit([current, weak], query)).toBe(weak);
+  });
+  it.each(['NOT WEAKENED', 'WEAKENED', 'unknown'])('legacy %s blocks configured prior fallback even when unusable', verdict => {
+    const prior = { ...pass, questionHash: 'd'.repeat(64) };
+    const options = { ...query, now: Date.parse(AT), priorQuestionHashes: [{ hash: prior.questionHash, acceptUntil: '2026-11-10T00:00:00Z' }] };
+    expect(findAudit([prior, { ...weak, verdict, at: 'invalid' }], options)).toBeNull();
+  });
+  it('never accepts a legacy pass even if configured as an accepted prior hash', () => {
+    expect(findAudit([pass], query)).toBeNull();
+    expect(findAudit([pass], { ...query, now: Date.parse(AT), priorQuestionHashes: [{ hash: legacy, acceptUntil: '2026-11-10T00:00:00Z' }] })).toBeNull();
   });
 });

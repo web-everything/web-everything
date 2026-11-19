@@ -7,6 +7,10 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. List EVERY finding you can find in this one exhaustive pass; do not stop at the first finding. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
 export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).digest('hex');
+// Historical negatives retain their original veto power; historical passes require a fresh full audit.
+export const LEGACY_QUESTION_HASHES = Object.freeze(['c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284']);
+export const vetoesAsCurrent = record => record?.questionHash === QUESTION_HASH
+  || (record?.verdict === 'WEAKENED' && LEGACY_QUESTION_HASHES.includes(record.questionHash));
 const SHA = /^[a-fA-F0-9]{40}(?![\s\S])/;
 const USAGE = 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n';
 const clean = text => stripVTControlCharacters(text).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '');
@@ -60,8 +64,8 @@ export function isAcceptedQuestionHash(hash, { priorQuestionHashes = [], now = D
   return priorQuestionHashes.some(e => e?.hash === hash && Number.isFinite(Date.parse(e.acceptUntil)) && now <= Date.parse(e.acceptUntil) && recordInWindow(e, at));
 }
 
-/** Latest timestamp wins, with later appended records breaking ties; foreign hashes never qualify. Records under a
- * prior question hash qualify only while inside their window; a prior WEAKENED is returned (and so blocks). */
+/** Latest usable ledger entry wins. Legacy negatives retain current-question eligibility; legacy passes never
+ * qualify. Other prior hashes qualify only inside their window and when no current or legacy record exists. */
 const FUTURE_SKEW_MS = 5 * 60 * 1000;
 
 export function findAudit(records, { head, base, questionHash, priorQuestionHashes = resolvePriorQuestionHashes(), now = Date.now() }) {
@@ -69,10 +73,12 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
   let latest = null, prior = null, sawCurrent = false;
   for (const record of records) {
     if (record?.head !== head || record.base !== base) continue;
-    const isCurrent = record.questionHash === QUESTION_HASH;
-    // Any matching current-question record, usable or not (bad timestamp, unknown verdict), blocks the prior fallback.
-    if (isCurrent) sawCurrent = true;
-    if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
+    const isCurrent = vetoesAsCurrent(record);
+    const isLegacy = LEGACY_QUESTION_HASHES.includes(record.questionHash);
+    // Any matching current or legacy record, even unusable or requiring re-audit, blocks the prior fallback.
+    if (isCurrent || isLegacy) sawCurrent = true;
+    if (isLegacy && !isCurrent) continue;
+    if ((!isCurrent && !isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at })) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
     if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
     // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question

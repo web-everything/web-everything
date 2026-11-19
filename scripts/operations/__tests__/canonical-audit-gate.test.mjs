@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
-import { QUESTION_HASH } from '../codex-audit.mjs';
+import { QUESTION_HASH, LEGACY_QUESTION_HASHES } from '../codex-audit.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +33,22 @@ function fixture({ records = [green], auditText, tool = {}, writerSettings, targ
   return { result, reads, calls };
 }
 describe('canonical audit before opening a PR', () => {
+  it.each([QUESTION_HASH, ...LEGACY_QUESTION_HASHES])('a %s negative on B1 vetoes a current pass on B2 for the same head', questionHash => {
+    expect(fixture({ records: [{ ...weak, questionHash }, { ...green, base: other }] }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+  });
+  it('a legacy pass never admits', () => {
+    expect(fixture({ records: [{ ...green, questionHash: LEGACY_QUESTION_HASHES[0] }] }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+  });
+  it('an exact waiver keeps binding to a legacy negative', () => {
+    expect(fixture({ records: [{ ...weak, questionHash: LEGACY_QUESTION_HASHES[0] }], tool: { ruledWeakened: [waiver] } }).result)
+      .toMatchObject({ ok: true, record: { verdict: 'WEAKENED', questionHash: LEGACY_QUESTION_HASHES[0] } });
+  });
+  it('malformed legacy negative evidence still refuses alongside a current pass', () => {
+    expect(fixture({ records: [green, { ...weak, questionHash: LEGACY_QUESTION_HASHES[0], at: 'invalid' }] }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+  });
   it('allows NOT WEAKENED on the exact resolved head and expands the configured path', () => {
     const { result, reads, calls } = fixture();
     expect(result).toMatchObject({ ok: true, sha, record: green });

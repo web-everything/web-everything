@@ -5076,3 +5076,13 @@ entries, moved/unreadable tips, the lock and
 persisted drop intent at interruption, and recovery confirming or restoring the drop. The mode
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
+
+
+## Canonical question rotation and persisted negatives
+
+When rotating the canonical audit question, keep historical hashes in `LEGACY_QUESTION_HASHES`
+for negative evidence only. `vetoesAsCurrent` preserves veto and ruled-weakened binding;
+legacy passes require a fresh full audit and still block the configured prior-hash fallback.
+Replay frozen audit ledgers unchanged: pin negative record identity and explicitly derive
+which historical passes now return no evidence. Test a legacy negative on one base beside a
+current pass on another base through both the evaluator and PR producers.
