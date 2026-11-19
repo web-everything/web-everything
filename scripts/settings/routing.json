@@ -1,9 +1,9 @@
 {
-  "$comment": "Who writes code: routing.builder=claude|codex|auto; explicit builders stay explicit. Auto uses routing.capacity scores (enabled by default for auto). Unknown usage is excluded; when all readers are unknown, autoClaudeAbovePercent retains the historical threshold fallback (unknown Codex -> Claude). Audit/review routing is unchanged. Capacity defaults and settings are documented in docs/agent/architecture.md; platform < repo < environment via policy-cascade. WE_ROUTING_BUILDER overrides the builder.",
+  "$comment": "Who writes code. routing.builder: claude | codex | auto. 'claude' sends the build kinds (prepare, takeover, design, fix, ci-heal) to Claude and drops the codex rungs from the repair chain; 'codex' is the pre-R477 behaviour; 'auto' routes build kinds by routing.capacity scores (spare capacity that would otherwise expire; unknown usage is excluded; see docs/agent/architecture.md). When every capacity reader is unknown, auto falls back to the threshold: Codex until the newest reading reaches autoClaudeAbovePercent (90, raised from 70 on 2026-11-19 because Codex has the most spare quota), then Claude (unknown reading goes to claude). codexReserveForAudit keeps Codex for audits and review seats only: it is never held by this setting. auditProvider names the canonical audit provider. Cascade: platform < repo < env WE_ROUTING_BUILDER, so a platform-file override cannot beat this repo file.",
   "routing": {
     "builder": "auto",
     "auditProvider": "codex",
     "codexReserveForAudit": true,
-    "autoClaudeAbovePercent": 70
+    "autoClaudeAbovePercent": 90
   }
 }

@@ -54,14 +54,17 @@ export const PR_FACTS_DISABLE_ENV = 'WE_PR_FACTS';
 export const PR_FACTS_DIR_ENV = 'WE_PR_FACTS_DIR';
 export const PR_FACTS_TTL_ENV = 'WE_PR_FACTS_TTL_MS';
 export const PR_FACTS_REFRESH_ENV = 'WE_PR_FACTS_REFRESH_MS';
+export const PR_FACTS_CLOSED_RETENTION_ENV = 'WE_PR_FACTS_CLOSED_RETENTION_MS';
 
 /** The declared settings. `ttlMs` is the staleness bound: an answer older than this is never served. */
 export const PR_FACTS_DEFAULTS = Object.freeze({
   ttlMs: 120_000,          // mirror older than this → null → the caller reads GitHub
   refreshAfterMs: 15_000,  // mirror older than this → refresh from the Worker first (a Worker call, no GitHub budget)
+  closedRetentionMs: 86_400_000, // retain closed PRs for 24 hours after first observing closure
   staleAfterMs: PR_EVENTS_DEFAULTS.staleAfterMs, // no webhook delivery for this long → feed 'stale' → null
   maxDeltaPages: 5,        // a backlog deeper than this many /events pages → one full /prs pull instead
   pageLimit: 500,
+  maxTombstones: 5000,    // bounded history; lost evidence beyond it falls back to GitHub
   timeoutMs: PR_EVENTS_DEFAULTS.timeoutMs,
   lockWaitMs: 10_000,
   lockStaleMs: 60_000,
@@ -90,6 +93,7 @@ export function resolvePrFactsConfig(env = process.env, { readFile = readFileSyn
     disabledReason: off ? `${PR_FACTS_DISABLE_ENV}=0` : testOff ? 'test run' : ev.enabled ? null : `not configured (missing ${ev.missing.join(', ') || ev.tokenError})`,
     ttlMs: num(env[PR_FACTS_TTL_ENV], PR_FACTS_DEFAULTS.ttlMs),
     refreshAfterMs: num(env[PR_FACTS_REFRESH_ENV], PR_FACTS_DEFAULTS.refreshAfterMs),
+    closedRetentionMs: num(env[PR_FACTS_CLOSED_RETENTION_ENV], PR_FACTS_DEFAULTS.closedRetentionMs),
     staleAfterMs: PR_FACTS_DEFAULTS.staleAfterMs,
   };
 }
@@ -109,16 +113,33 @@ function bucketStorage(buckets) {
   };
 }
 
+/** Bound tombstones while keeping permanent fail-closed summaries of trimmed history. */
+function boundTombstones(mirror, evicted, evictedShas, maxTombstones) {
+  const numbers = [...new Set(evicted)].sort((a, b) => a - b);
+  const trimmed = numbers.splice(0, Math.max(0, numbers.length - maxTombstones));
+  const evictedFloor = Math.max(mirror.evictedFloor ?? 0, trimmed.at(-1) ?? 0);
+  const shas = [...new Set(evictedShas)]; // deterministic insertion order, newest additions last
+  const shaTrimmed = shas.splice(0, Math.max(0, shas.length - maxTombstones));
+  return {
+    evicted: numbers.filter((n) => n > evictedFloor), evictedShas: shas,
+    ...(evictedFloor ? { evictedFloor } : {}),
+    ...(mirror.evictedShasTruncated || shaTrimmed.length ? { evictedShasTruncated: true } : {}),
+  };
+}
+
 /**
  * Build a mirror from one full `/prs` answer, keeping only `repo`'s rows. The served rows are folded back into
  * projection buckets keyed exactly as the Worker keys them, so later deltas replace (never duplicate) entries.
  */
-export function seedMirror({ repo, body, nowMs }) {
+export function seedMirror({ repo, body, nowMs, prev, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, maxTombstones = PR_FACTS_DEFAULTS.maxTombstones }) {
   const r = repoKey(repo);
   const buckets = { prs: {}, checks: {}, shas: {} };
+  const closedSeen = {};
   for (const row of body.prs || []) {
     if (repoKey(row.repo) !== r || !Number.isInteger(row.number)) continue;
     const { checks = [], suites = [], ...rest } = row;
+    // A full snapshot cannot date a closure; unknown closed rows are already expired.
+    if (row.state === 'closed') closedSeen[row.number] = prev?.closedSeen?.[row.number] ?? nowMs - retentionMs;
     buckets.prs[JSON.stringify([r, row.number])] = { ...rest, repo: r, checks: [], suites: [], fields: {}, labelChanges: rest.labelChanges || {} };
     if (row.sha) {
       const k = JSON.stringify([r, row.sha]);
@@ -133,7 +154,11 @@ export function seedMirror({ repo, body, nowMs }) {
   }
   const bootstrap = (body.coverage?.bootstrap || []).find((x) => repoKey(x?.repo) === r) || null;
   return {
-    v: PR_FACTS_VERSION, repo: r, buckets, cursor: body.stateCursor ?? body.head ?? null,
+    // Tombstones survive a full seed: /prs does not serve unattached or evicted checks back.
+    // A previously cached check the snapshot no longer serves (unattached, or dropped) taints its sha too.
+    ...boundTombstones(prev || {}, prev?.evicted || [], [...(prev?.evictedShas || []),
+      ...Object.entries(prev?.buckets?.checks || {}).filter(([k, c]) => c?.sha && !(k in buckets.checks)).map(([, c]) => c.sha)], maxTombstones),
+    v: PR_FACTS_VERSION, repo: r, buckets, closedSeen, cursor: body.stateCursor ?? body.head ?? null,
     fetchedAtMs: nowMs, lastOkAt: nowMs, lastFailAt: null, lastError: null,
     lastDeliveryAt: body.lastDeliveryAt ?? null, lastEventAt: body.lastEventAt ?? null,
     bootstrap: bootstrap ? { status: bootstrap.status, baseCursor: bootstrap.baseCursor, importId: bootstrap.importId } : null,
@@ -150,6 +175,44 @@ export function applyDelta(mirror, events) {
     foldObservation(storage, e);
   }
   return next;
+}
+
+/** Bound the disposable mirror; uncertain evidence falls back to GitHub. PURE (no input mutation). */
+export function compactMirror(mirror, { nowMs, retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, maxTombstones = PR_FACTS_DEFAULTS.maxTombstones }) {
+  const prs = {}, checks = {}, shas = {}, closedSeen = {};
+  const retained = new Map();
+  // Numbers whose evidence was dropped: a later reopen recreates a row without it, so it must never be served as facts.
+  const evicted = new Set(mirror.evicted || []);
+  // Head shas whose checks/rows were dropped: a PR that later adopts one of them has lost evidence too.
+  const evictedShas = new Set(mirror.evictedShas || []);
+  const droppedHeads = [];
+  for (const [key, row] of Object.entries(mirror.buckets.prs)) {
+    if (row.state === 'closed' || !row.state) {
+      // A legacy mirror (no closedSeen yet) cannot date its closures: treat them as expired.
+      const seen = mirror.closedSeen?.[row.number] ?? (mirror.closedSeen ? nowMs : nowMs - retentionMs);
+      if (nowMs - seen >= retentionMs) { evicted.add(row.number); if (row.sha) droppedHeads.push(row.sha); continue; }
+      closedSeen[row.number] = seen;
+    }
+    prs[key] = row;
+    retained.set(row.number, row);
+  }
+  for (const [key, c] of Object.entries(mirror.buckets.checks)) {
+    // projectPrRows joins a check to its PRs both by `prs` and by the head-sha → PRs bucket.
+    const attached = [...new Set([...(c.prs || []), ...(mirror.buckets.shas[JSON.stringify([c.repo, c.sha])] || [])])];
+    // Every sha an open PR has had keeps its checks: a head that returns to an old sha must still see its failures.
+    const keep = attached.some((n) => retained.has(n));
+    const age = nowMs - Date.parse(c.at);
+    if (keep || (!attached.length && age >= 0 && age < retentionMs)) checks[key] = c;
+    else if (c.sha) evictedShas.add(c.sha);
+  }
+  for (const [key, numbers] of Object.entries(mirror.buckets.shas)) {
+    const kept = numbers.filter((n) => retained.has(n));
+    if (kept.length) shas[key] = kept;
+  }
+  // A dropped PR's head is tombstoned unless a retained PR still holds it (its checks stayed with that PR).
+  const heldHeads = new Set([...retained.values()].map((r) => r.sha));
+  for (const s of droppedHeads) if (!heldHeads.has(s)) evictedShas.add(s);
+  return { ...mirror, buckets: { ...mirror.buckets, prs, checks, shas }, closedSeen, ...boundTombstones(mirror, evicted, evictedShas, maxTombstones) };
 }
 
 const sortBy = (...keys) => (a, b) => { for (const k of keys) { const x = String(a[k] ?? ''); const y = String(b[k] ?? ''); if (x !== y) return x < y ? -1 : 1; } return 0; };
@@ -210,12 +273,22 @@ export function mirrorRows(mirror) {
   return projectPrRows({ ...bucketStorage(structuredClone(mirror.buckets)) });
 }
 
+/** Compaction dropped this PR's (or its head sha's) evidence: the row cannot prove its checks/review, so it is not served. */
+const lostEvidence = (mirror, row) => !!(
+  // No exemption for retained open PRs: trimmed number history cannot prove their evidence survived.
+  row.number <= (mirror.evictedFloor ?? 0) || mirror.evicted?.includes(row.number) ||
+  // Once SHA history is truncated, partial checks/mappings (even from /prs) cannot prove completeness.
+  // Keep falling back to GitHub; no independent completeness proof currently exists to clear this flag.
+  mirror.evictedShasTruncated || (row.sha && mirror.evictedShas?.includes(row.sha))
+);
+
 /** Look one PR up in a mirror. `{ facts }` or `{ facts:null, reason }`. PURE. */
 export function lookupInMirror(mirror, { number, nowMs, ttlMs, staleAfterMs }) {
   const verdict = judgeMirror(mirror, { nowMs, ttlMs, staleAfterMs });
   if (!verdict.ok) return { facts: null, reason: verdict.reason };
   const row = mirrorRows(mirror).find((r) => r.number === Number(number));
   if (!row) return { facts: null, reason: 'no-row' };
+  if (lostEvidence(mirror, row)) return { facts: null, reason: 'evicted' }; // reopened: evidence was dropped, read GitHub
   if (!row.sha || !row.state || row.draft == null || !Array.isArray(row.labels)) return { facts: null, reason: 'incomplete-row' };
   return { facts: { ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor } };
 }
@@ -268,9 +341,11 @@ async function withAsyncLock(lockPath, fn, { waitMs, staleMs }) {
  * judges `feed-unreachable` and every read falls back to GitHub.
  */
 export async function refreshMirror(prev, { repo, url, token, fetchImpl = globalThis.fetch, nowMs = Date.now(),
-  timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
+  retentionMs = PR_FACTS_DEFAULTS.closedRetentionMs, timeoutMs = PR_FACTS_DEFAULTS.timeoutMs, maxDeltaPages = PR_FACTS_DEFAULTS.maxDeltaPages, pageLimit = PR_FACTS_DEFAULTS.pageLimit } = {}) {
   const io = { fetchImpl, timeoutMs };
-  const full = async () => seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs });
+  const compact = (mirror) => compactMirror(mirror, { nowMs, retentionMs });
+  // Seed from the newest state held (after delta pages), so evidence gathered mid-refresh is tombstoned, not silently lost.
+  const full = async (base = prev) => compact(seedMirror({ repo, body: await getJson(`${url}/prs`, token, io), nowMs, prev: base, retentionMs }));
   try {
     if (!prev || prev.v !== PR_FACTS_VERSION || !Number.isInteger(prev.cursor)) return { mirror: await full(), mode: 'full' };
     let m = prev;
@@ -279,13 +354,13 @@ export async function refreshMirror(prev, { repo, url, token, fetchImpl = global
       const b = await getJson(`${url}/events?${q}`, token, io);
       if (!b || !Number.isInteger(b.cursor) || !Array.isArray(b.events)) throw new Error('malformed /events response');
       if (b.gap || b.reset) {
-        const mirror = await full();
+        const mirror = await full(m);
         return { mirror: { ...mirror, fullPulls: (prev.fullPulls || 0) + 1 }, mode: b.gap ? 'full:gap' : 'full:reset' };
       }
       m = { ...applyDelta(m, b.events), cursor: b.cursor, lastDeliveryAt: b.lastDeliveryAt ?? m.lastDeliveryAt, lastEventAt: b.lastEventAt ?? m.lastEventAt };
-      if (!b.more) return { mirror: { ...m, fetchedAtMs: nowMs, lastOkAt: nowMs, lastError: null }, mode: 'delta' };
+      if (!b.more) return { mirror: compact({ ...m, fetchedAtMs: nowMs, lastOkAt: nowMs, lastError: null }), mode: 'delta' };
     }
-    const mirror = await full();
+    const mirror = await full(m);
     return { mirror: { ...mirror, fullPulls: (prev.fullPulls || 0) + 1 }, mode: 'full:backlog' };
   } catch (e) {
     const base = prev && prev.v === PR_FACTS_VERSION ? prev : { v: PR_FACTS_VERSION, repo: repoKey(repo), buckets: { prs: {}, checks: {}, shas: {} }, cursor: null, fetchedAtMs: 0, lastOkAt: null, bootstrap: null };
@@ -323,7 +398,7 @@ export async function loadMirror({ repo, env = process.env, fetchImpl = globalTh
     const locked = await withAsyncLock(`${path}.lock`, async () => {
       const again = readMirrorFile(path); // a concurrent refresher may have finished while we waited
       if (!due(again)) return again;
-      const r = await refreshMirror(again, { repo, url, token, fetchImpl, nowMs: now(), timeoutMs: o.timeoutMs, maxDeltaPages: o.maxDeltaPages });
+      const r = await refreshMirror(again, { repo, url, token, fetchImpl, nowMs: now(), retentionMs: o.closedRetentionMs ?? cfg.closedRetentionMs, timeoutMs: o.timeoutMs, maxDeltaPages: o.maxDeltaPages });
       writeJsonAtomic(path, r.mirror);
       return r.mirror;
     }, { waitMs: o.lockWaitMs ?? PR_FACTS_DEFAULTS.lockWaitMs, staleMs: PR_FACTS_DEFAULTS.lockStaleMs });
@@ -358,7 +433,7 @@ export async function readRepoFacts({ repo, caller = null, env = process.env, no
   const { mirror, settings } = await loadMirror({ repo, env, now, ...o });
   if (!mirror || !judgeMirror(mirror, { nowMs: now(), ...settings }).ok) return null;
   const prs = mirrorRows(mirror)
-    .filter((row) => row.sha && row.state && row.draft != null && Array.isArray(row.labels))
+    .filter((row) => !lostEvidence(mirror, row) && row.sha && row.state && row.draft != null && Array.isArray(row.labels))
     .map((row) => ({ ...normalizeStoreRow(row), source: 'store', asOfMs: mirror.fetchedAtMs, cursor: mirror.cursor }))
     .sort((a, b) => a.number - b.number);
   logFactsHit(env, caller || deriveGhCaller({}, env), repoKey(repo), prs.length);
@@ -391,10 +466,24 @@ export function readPrFactsFromGithub({ repo, number, exec = execFileSyncThrottl
     throttle: { op: 'pr facts (github)', ...(caller ? { caller } : {}) },
   }) || 'null'));
   const pull = api(`repos/${repo}/pulls/${Number(number)}`);
+  if (!pull || typeof pull !== 'object' || Array.isArray(pull) || typeof pull.head?.sha !== 'string' || !pull.head.sha) {
+    throw new Error('malformed pull; refusing a partial read');
+  }
   const sha = pull?.head?.sha;
-  const checkRuns = sha ? api(`repos/${repo}/commits/${sha}/check-runs?per_page=100`)?.check_runs || [] : [];
-  const checkSuites = sha ? api(`repos/${repo}/commits/${sha}/check-suites?per_page=100`)?.check_suites || [] : [];
-  const reviews = api(`repos/${repo}/pulls/${Number(number)}/reviews?per_page=100`) || [];
+  // Every page: the latest review / check must never fall off the end (a short page ends the walk; the cap fails loud).
+  const paged = (path, pick) => {
+    const all = [];
+    for (let page = 1; page <= 50; page += 1) {
+      const rows = pick(api(`${path}?per_page=100${page > 1 ? `&page=${page}` : ''}`));
+      if (!Array.isArray(rows)) throw new Error(`${path}: malformed page ${page}; refusing a partial read`);
+      all.push(...rows);
+      if (rows.length < 100) return all;
+    }
+    throw new Error(`${path}: more than 5000 rows; refusing a truncated read`);
+  };
+  const checkRuns = paged(`repos/${repo}/commits/${sha}/check-runs`, (b) => b?.check_runs);
+  const checkSuites = paged(`repos/${repo}/commits/${sha}/check-suites`, (b) => b?.check_suites);
+  const reviews = paged(`repos/${repo}/pulls/${Number(number)}/reviews`, (b) => b);
   return { ...normalizeGithubPr({ repo, pull, checkRuns, checkSuites, reviews }), source: 'github', asOfMs: Date.now(), cursor: null };
 }
 

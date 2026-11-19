@@ -1,4 +1,4 @@
-import { decideMemoryFloor } from './memory-available.mjs';
+import { decideMemoryFloor } from './memory-warn-corroboration.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
@@ -39,7 +39,7 @@ import { admit, decideAdmission, readSnapshot, shadowAdmission } from './resourc
 import { countLiveFixSessions, gateHost, isPidAlive, resolveFixDispatchMaxConcurrent } from './dispatch-throttle.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from './settings-files.mjs';
 // A cycle (heavy-admission imports this module's cut-over step); safe because neither side calls the other at load time.
-import { resolveLiveQueueBaseline } from '../readiness/heavy-admission.mjs';
+import { resolveLiveQueueBaseline, loadMemoryPressureSettings } from '../readiness/heavy-admission.mjs';
 
 export const RESOURCE_GATE_STANDARD = Object.freeze({
   cutover: 'enforce',
@@ -350,7 +350,8 @@ export function createResourceFixThrottle({
     const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;
     const d = !metricOk && fresh && floor.floorMb != null
       ? { admit: false, reason: `memory metric mismatch (snapshot ${m.metric ?? 'unstamped'}, policy ${floor.metric ?? 'unknown'})` }
-      : decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh });
+      : decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh,
+        freePct: m.freePct, swapGrowthMb: m.swapGrowthMb, ...loadMemoryPressureSettings({ env }) });
     if (d.admit) return { admit: true };
     return { admit: false, refusal: { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${d.reason} (floor ${floor.floorMb ?? '?'} MB from ${floor.source}); ${kind} deferred, no claim taken` } };
   };
@@ -369,7 +370,7 @@ export function createResourceFixThrottle({
       const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, ...resolved.settings.fixCap };
       const thresholds = FIX_CAP_SIGNAL_LEAVES.map((leaf) => `${leaf}=${fixCap[leaf]} (${resolved.sources?.[`fixCap.${leaf}`] ?? 'standard'})`).join(', ');
       log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: cap ${c.cap} (floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}; ${live} live) → using ${c.effective} (${resolved.settings.cutover})`
-        + ` · mem floor ${v(lastFloor?.floorMb, ' MB')} (${lastFloor?.source ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${decideMemoryFloor({ availableMb: lastSnap?.memory?.availableMb, floorMb: lastFloor?.floorMb, pressureLevel: lastSnap?.memory?.pressureLevel, snapshotFresh: !!lastSnap }).admit ? 'admit' : 'refuse'}`
+        + ` · mem floor ${v(lastFloor?.floorMb, ' MB')} (${lastFloor?.source ?? '?'}) available ${v(lastSnap?.memory?.availableMb, ' MB')} pressure ${v(lastSnap?.memory?.pressureLevel, '')} → ${decideMemoryFloor({ availableMb: lastSnap?.memory?.availableMb, floorMb: lastFloor?.floorMb, pressureLevel: lastSnap?.memory?.pressureLevel, snapshotFresh: !!lastSnap, freePct: lastSnap?.memory?.freePct, swapGrowthMb: lastSnap?.memory?.swapGrowthMb, ...loadMemoryPressureSettings({ env }) }).admit ? 'admit' : 'refuse'}`
         + ` · inputs: mem free ${v(c.memFreePct, '%')} · swap ${v(c.swapUsedPct, '%')} · heavy wait ${v(c.heavyWaitMinutes, 'm')} · cpu idle ${v(c.cpuIdlePct, '%')} · fix queue ${v(c.queueLength, '')}`
         + ` · thresholds: ${thresholds}\n`);
     } catch { /* best effort */ }
@@ -393,7 +394,7 @@ export function createResourceFixThrottle({
       if (live === null) { try { live = countLiveFixSessions(listClaims(), { alive }); } catch { live = 0; } }
       // R553/R559 hard floor, before any cap arithmetic. The memory reading is re-read on EVERY admission (never the
       // pass-start copy) and the floor comes from THIS process's own policy cascade, never from the sampler's snapshot.
-      // Below the floor, under pressure warn/critical, stale, or unreadable on either side → refuse.
+      // Below the floor, under corroborated warn/critical, stale, or unreadable on either side → refuse.
       const fl = floorCheck(kind);
       if (!fl.admit) return fl.refusal;
       const c = currentCap();
