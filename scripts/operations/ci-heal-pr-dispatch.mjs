@@ -496,11 +496,11 @@ export async function runReconcileCiHealDispatch({
       const rounds = entry.timeoutRetry?.infraCancelled ? Math.max(1, entry.timeoutRetry.jobs?.length ?? 1) : 1;
       for (let i = 0; i < rounds; i++) {
         const result = await retryTimeout(entry.timeoutRetry, { root, repo: CONSTELLATION_REPOS[repoKey].slug });
-        timeoutResults.push({ ...result, kind: 'ci-timeout-rerun', pr: entry.prNumber });
+        timeoutResults.push({ ...result, kind: 'ci-timeout-rerun', pr: entry.prNumber, ...(result.why == null && result.reason != null ? { why: result.reason } : {}) });
         if (result.status !== 'requested') break;
       }
     } catch (error) {
-      timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message });
+      timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message, why: error.message });
     }
   }
   let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
@@ -580,7 +580,7 @@ export async function runReconcileCiHealDispatch({
       if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
       if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
       const hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
-      if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold }); continue; }
+      if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold, why: hold.why ?? hold.reason }); continue; }
       if (salvageEnabled()) {
         let recovered = null;
         try { recovered = await salvage({ entry, root, repoKey, profile }); } catch { /* Fall through to dispatch. */ }

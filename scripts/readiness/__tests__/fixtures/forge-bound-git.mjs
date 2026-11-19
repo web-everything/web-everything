@@ -4,6 +4,9 @@ import {readFile} from 'node:fs/promises';
 // Keep fault injection on the Git subcommand while retaining the binding on IO.
 export const gitArgs=call=>call.args[0]?.startsWith('--git-dir=')?call.args.slice(4):call.args;
 export function bindingEvidence(call) {
+  // The client compares its index with the pinned HEAD at every HEAD symlink; stubbed
+  // repositories have no staged link change. forge-head-symlink-change.test.mjs covers the refusals.
+  if(call.file==='git'&&gitArgs(call)[0]==='diff-index')return {code:0,stdout:Buffer.alloc(0)};
   if(call.file!=='git'||!call.args.includes('--show-toplevel'))return;
   mkdirSync(join(call.cwd,'.git'),{recursive:true});
   return {code:0,stdout:Buffer.from(realpathSync(call.cwd)+'\n'+realpathSync(join(call.cwd,'.git'))+'\n')};

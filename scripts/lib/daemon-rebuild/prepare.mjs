@@ -27,6 +27,8 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { readPendingDrops } from '../overlay-drop-pending.mjs';
+import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
 import { carriedBeyondMain } from '../../operations/prototype-retire.mjs';
 import * as realAutoRebase from './auto-rebase.mjs';
@@ -96,6 +98,8 @@ export async function prepareRebuild({
   if (process.env.VITEST === 'true' && env?.WE_DAEMON_AUTO_REBASE === undefined) {
     env = { ...env, WE_DAEMON_AUTO_REBASE: '0' };
   }
+  // Tests must opt in to the detector: it queries GitHub for open PR heads.
+  if (process.env.VITEST === 'true' && env?.WE_OVERLAY_STALE === undefined) env = { ...env, WE_OVERLAY_STALE: '0' };
   // Status must not refresh the live index while an excluded spawner may still be reading it.
   if (readyOnly) env = { ...env, GIT_OPTIONAL_LOCKS: '0' };
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
@@ -129,11 +133,21 @@ export async function prepareRebuild({
 
   const state = readRebuildState(root, stEnv);
   const writeState = () => writeRebuildState(root, state, stEnv);
+  // A pending (or unreadable) drop intent blocks only a NEW build that changes what is applied (checked after planning).
+  // Recovery paths — unverified-build recovery, quarantine lift, rollback — never drop registrations and still run.
+  // Re-read at each mutation point (not one early snapshot): a retirement can start during recovery or planning.
+  const dropPendingNow = () => {
+    try { return readPendingDrops(root, env).length > 0; } catch (error) {
+      alert('drop-pending-unsettled', { error: String(error.message) });
+      return true;
+    }
+  };
 
   const finishVerifiedSwaps = async () => {
     try {
       if (!state.inProgress && !state.unverified && !state.quarantine && state.adopted?.head
-        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled) {
+        && state.adopted.head === verifyRev(git, 'HEAD') && autoRebase.resolveAutoRebaseSwitch(env).enabled
+        && !dropPendingNow()) { // swaps remove registrations: never while a drop intent is unsettled
         await autoRebase.finishPendingSwaps({ root, env, run, removeOverlay, appendOverlayEvent });
       }
     } catch (error) {
@@ -375,6 +389,11 @@ export async function prepareRebuild({
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
+  if (plan.ok && (plan.finalSha !== prevHead || plan.decisions?.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
+  if (!readyOnly) {
+    try { detectOverlayStale({ root, env, overlays: overlaysBefore, plan, mainSha: fetchedMainSha, git, feed: await import('../../operations/needs-you-feed.mjs') }); }
+    catch (error) { alert('overlay-stale-unknown', { error: String(error.message) }); }
+  }
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
   // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
@@ -482,11 +501,26 @@ export async function prepareRebuild({
     }
     return terminal({ moved: false, reason: 'established-overlay-conflict', detail });
   }
+  if ((plan.finalSha !== prevHead || plan.decisions.some(d => d.action === 'remove')) && dropPendingNow()) return terminal({ moved: false, reason: 'drop-pending-unsettled' });
   for (const d of plan.decisions) {
     if (d.pr != null && (d.action === 'apply' || d.action === 'remove') && !d.pinned) clearOverlayConflictWake(env, d.pr);
     if (d.action === 'remove') {
       const proof = d.reason === 'pr-merged' ? prMergedDropEvidence({ git, ref: d.ref, mainSha: plan.mainSha }) : {};
-      removeOverlay(root, d.ref, { env, why: d.reason });
+      // Bind the removal to the registration the plan judged: a re-registration after planning is not removed.
+      // The pending-drop check and the removal are atomic under the add-guard lock retire/replace use (I2).
+      let refused = null;
+      try {
+        const { withAddGuardLock } = await import('../../daemon-overlay.mjs');
+        refused = await withAddGuardLock(root, env, () => {
+          if (dropPendingNow()) return 'drop-pending-unsettled';
+          removeOverlay(root, d.ref, { env, why: d.reason, expectedOverlay: overlaysBefore.find((o) => o.ref === d.ref) });
+          return null;
+        });
+      } catch (error) { // a refused removal stops this build; the next tick replans from the current registrations
+        alert('overlay-removal-refused', { ref: d.ref, error: String(error.message) });
+        return terminal({ moved: false, reason: 'overlay-removal-refused', plan });
+      }
+      if (refused) return terminal({ moved: false, reason: refused, plan });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
@@ -543,6 +577,18 @@ export async function prepareRebuild({
       for (const d of plan.decisions) {
         if (d.action === 'remove' && (d.reason === 'pr-merged' || d.reason === 'in-main')) wantedRefs.add(d.ref);
       }
+      const wantedTips = new Map();
+      const wantedTip = (ref) => {
+        if (!wantedTips.has(ref)) wantedTips.set(ref, verifyRev(git, `refs/remotes/origin/${ref}^{commit}`));
+        return wantedTips.get(ref);
+      };
+      const stillWanted = (ref, sha) => {
+        if (!wantedRefs.has(ref)) return false;
+        if (!sha) return true; // fallback registration check
+        const tip = wantedTip(ref);
+        return tip ? tip === sha || git(['merge-base', '--is-ancestor', sha, tip]).status === 0
+          : !registeredRefs.has(ref) && tipInMain(git, plan.mainSha, sha);
+      };
       const maxAgeMs = Number(env?.[READY_MAX_AGE_ENV]) > 0 ? Number(env[READY_MAX_AGE_ENV]) : DEFAULT_READY_MAX_AGE_MS;
       let overlayEvents;
       const readOverlayEvents = () => {
@@ -556,7 +602,7 @@ export async function prepareRebuild({
         plan,
         prevHead,
         treeOf: (sha) => verifyRev(git, `${sha}^{tree}`),
-        stillWanted: (ref) => wantedRefs.has(ref),
+        stillWanted,
         verifyBuilt: (adopt) => readyBuildVerified({
           git, adopt, mainTip: plan.mainSha, prevHead,
           approvedEdgeShaFor: (ref) => recordedEdgeSha((overlaysBefore || []).find((o) => o?.ref === ref)),
@@ -639,6 +685,11 @@ export async function prepareRebuild({
             : undefined,
         });
         const { alerts: finAlerts = [], ...finResult } = fin;
+        if (finResult.adopted && ready.kind !== 'fallback') {
+          const pending = [...registeredRefs].filter((ref) => wantedRefs.has(ref)
+            && !m.adopt.applied?.some((a) => a.ref === ref && a.sha === wantedTip(ref)));
+          if (pending.length) alert('ready-candidate-adopted-partial', { target: m.adopt.finalSha, pending });
+        }
         return {
           terminal: true,
           result: { ...finResult, ...(finResult.adopted ? { reason: 'ready-adopted', readyMatch: m.match } : {}) },

@@ -50,6 +50,7 @@
  *                                          [--allow-no-pr --reason=..]
  *   node scripts/daemon-overlay.mjs remove --clone=<path> --ref=<branch> [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs list   --clone=<path> [--json]
+ *   node scripts/daemon-overlay.mjs stale  --clone=<path> [--json] (last detector observations; read-only)
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
  *   node scripts/daemon-overlay.mjs replace --clone=<path> --ref=<new> --replaces=<old> --expected-sha=<40-hex> [--pr=N] [--check] [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs retire  --clone=<path> --ref=<branch> --expected-tip=<40-hex> [--expected-entry=<json>] [--reason=..] [--by=..] [--json]
@@ -106,6 +107,7 @@
  * Accept only if that preview is clean; conflicts with main or other overlays still refuse, and a failed
  * second preview preserves the original refusal.
  */
+import { readPendingDrops, pendingPath } from './lib/overlay-drop-pending.mjs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -122,6 +124,7 @@ import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuil
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
+import { readOverlayStale } from './lib/daemon-rebuild/overlay-prune.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
 
 /**
@@ -367,17 +370,7 @@ function restoreRegistration(root, entry, env) {
 // registration is restored. Because every guarded add settles intents before its own check, no add is ever admitted
 // against a list that is missing an unsettled registration, so a restore returns the list to its pre-drop state.
 // No `.json` suffix: `pruneStaleOverlayRecords` deletes every clone-less `*.json` in the overlay dir.
-const pendingPath = (root, env) => `${overlayFilePath(root, env)}.drop-pending`;
-export function readPendingDrops(root, env = process.env) {
-  try {
-    const parsed = JSON.parse(readFileSync(pendingPath(root, env), 'utf8'));
-    if (!Array.isArray(parsed?.pending)) throw new Error('bad shape');
-    return parsed.pending;
-  } catch (e) {
-    if (e?.code === 'ENOENT') return [];
-    throw new Error(`drop-intent record ${pendingPath(root, env)} is unreadable — refusing to drop anything until it is fixed`);
-  }
-}
+export { readPendingDrops };
 function writePendingDrops(root, env, pending) {
   const file = pendingPath(root, env);
   if (!pending.length) { rmSync(file, { force: true }); return; }
@@ -713,20 +706,20 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
 
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
-  if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops'].includes(cmd)) {
-    fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops, got ${JSON.stringify(cmd ?? null)}`);
+  if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops', 'stale'].includes(cmd)) {
+    fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops|stale, got ${JSON.stringify(cmd ?? null)}`);
     return;
   }
 
   try {
-    pruneStaleOverlayRecords(workspaceFor(dirname(fileURLToPath(import.meta.url))));
+    if (cmd !== 'stale') pruneStaleOverlayRecords(workspaceFor(dirname(fileURLToPath(import.meta.url))));
   } catch { /* self-heal is best-effort */ }
   const flags = parseFlags(rest);
   const clone = typeof flags.clone === 'string' ? flags.clone : null;
   if (!clone) return fail('--clone=<path> is required');
   const root = resolve(clone);
 
-  if (cmd !== 'list' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
+  if (cmd !== 'list' && cmd !== 'stale' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
     return fail(`--ref=<branch> is required for ${cmd}`);
   }
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
@@ -755,7 +748,9 @@ async function main() {
   const env = process.env;
 
   let output;
-  if (cmd === 'list') {
+  if (cmd === 'stale') {
+    output = readOverlayStale(root, env);
+  } else if (cmd === 'list') {
     // A corrupt file must not read as a plain empty list: flag it and exit 1 (add/remove throw on it instead).
     const state = readOverlayState(root, { env });
     output = state.corrupt ? { list: [], corrupt: true } : { list: state.overlays };
@@ -973,6 +968,8 @@ async function main() {
 
   if (asJson) {
     process.stdout.write(`${JSON.stringify(output)}\n`);
+  } else if (cmd === 'stale') {
+    for (const row of output) process.stdout.write(`${JSON.stringify(row).replace(/[\x00-\x1f\x7f]/g, '')}\n`);
   } else if (cmd === 'approve-edge') {
     process.stdout.write(`daemon-overlay: approved edge/${flags.ref} @ ${flags.sha} by ${by} list=${JSON.stringify(output.list)}\n`);
   } else if (cmd === 'remove') {
