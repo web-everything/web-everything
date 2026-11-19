@@ -461,6 +461,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: restoreAdmission,
+    planRedTeamMode: ({ pr, repo, head }) => planRedTeamRecovery(readWitness({ pr, repo, head, env }),
+      { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env }).mode,
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
       const key = { repo: input.repo, pr: input.pr, head, env };
@@ -1455,6 +1457,10 @@ function runReviewArc({
       return result({ ...classified, lanePath });
     };
     if (redTeamOnly) {
+      if (redTeamMode === 'auto') {
+        const mode = io.planRedTeamMode({ pr: planned.pr, repo: planned.repo, head });
+        redTeamMode = ['fresh', 'resume'].includes(mode) ? mode : 'fresh';
+      }
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
@@ -1828,8 +1834,8 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
-      // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
-      const redTeamMode = flag('red-team-only') ?? 'fresh';
+      // Bare legacy flag selects recovery automatically; explicit modes stay strict.
+      const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
