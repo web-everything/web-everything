@@ -1,4 +1,6 @@
 /** Observe-only contradictions. Missing evidence is unknown; no IO or mutation. */
+import { CONSTELLATION_REPOS } from '../../lib/constellation-repos.mjs';
+
 const clean = s => s.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
 const time = value => typeof value === 'number' ? value : Date.parse(value);
 const et = value => new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York',
@@ -30,12 +32,12 @@ export function evaluateStuck({ now, prs, logs, claims } = {}) {
       const rows = logs?.[daemon];
       if (!Array.isArray(rows) || rows.some(r => !r || typeof r.line !== 'string' || !Number.isFinite(time(r.at)))) return [];
       return rows.filter(r => time(r.at) <= stamp && subject.test(r.line)
-        && (!qualified.test(r.line) || qualified.exec(r.line)[1] === 'web-everything/web-everything'))
+        && (!qualified.test(r.line) || qualified.exec(r.line)[1] === CONSTELLATION_REPOS.we.slug))
         .map(r => ({ at: time(r.at), line: clean(r.line) })).sort((a, b) => a.at - b.at);
     };
     const add = (rule, cause, rows, since = rows[0]?.at ?? stamp) => out.push({ pr: pr.number, rule,
       evidence: rows.map(r => r.line), sinceET: et(since), cause,
-      link: `https://github.com/web-everything/web-everything/pull/${pr.number}` });
+      link: `https://github.com/${CONSTELLATION_REPOS.we.slug}/pull/${pr.number}` });
     const drain = mentions('drain'), fix = mentions('fix'), review = mentions('review');
     const lastDrain = drain.at(-1), reason = lastDrain && /(?:not enqueued|not woken):/.test(lastDrain.line)
       ? refusal(normal(lastDrain.line)) : null;

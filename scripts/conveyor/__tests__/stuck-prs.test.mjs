@@ -41,7 +41,8 @@ test.each([
 test('R-a: captured not-woken run reaches 30 minutes; first same-reason timestamp and ET', () => {
   const records = rule(evaluate([ready], { drain: [row(drain), row(drain, now)] }), 'R-a');
   assert.equal(records.length, 1); assert.equal(records[0].sinceET, '11:11');
-  assert.equal(records[0].cause, 'B'); assert.match(records[0].link, /pull\/7204$/);
+  assert.equal(records[0].cause, 'B');
+  assert.equal(records[0].link, 'https://github.com/web-everything/web-everything/pull/7204');
   assert.ok(records[0].evidence.length);
 });
 test('R-a negative: young, changed reason, intervening success, missing labels and non-CLEAN', () => {
@@ -121,6 +122,16 @@ test('R-c collector: only successfully listed sessions and claims older than ten
     assert.equal(collect({ mtimeMs: stamp - 600001 }, readAgents), null);
   assert.equal(collect({ mtimeMs: stamp }, () => [{ name: 'fix-7171', state: 'working' }]), true);
 });
+test('R-c collector retains legacy and qualified WE claims while excluding other repositories', () => {
+  const repos = ['web-everything', 'web-everything/web-everything', 'frontier-ui/frontierui', 'other/web-everything'];
+  const claims = collectClaims(() => {}, {
+    listClaims: () => repos.map((repo, index) => ({ mtimeMs: Date.parse(at),
+      meta: { repo, pr: 7171 + index, kind: 'fix', who: `fix-${7171 + index}` } })),
+    readAgents: () => [], now: () => Date.parse(now),
+  });
+  assert.deepEqual(claims.map(c => c.pr), [7171, 7172]);
+  assert.ok(claims.every(c => c.live === false));
+});
 test('R-e: three captured same-daemon refusals ignore timestamps and seq numbers', () => {
   const lines = [1, 2, 3].map(n => row(`${nothing} seq ${n}`, new Date(Date.parse(at) + n).toISOString()));
   assert.equal(rule(evaluate([pr(7042)], { fix: lines }), 'R-e')[0].cause, 'E');
@@ -180,6 +191,7 @@ test('CLI: one batched PR read, no mutation, empty/json/md output and listing ca
     readLogs: () => ({ drain: [row(drain)], fix: [], review: [] }), readClaims: () => [], now: () => now, emit: async () => {} };
   assert.match(await runStuckCli(['--md'], base), /^#7204 R-a \(cause B\) since 11:11 ET https:/);
   assert.equal(calls.length, 1); assert.ok(calls[0].includes('200')); assert.ok(calls[0].includes('number,headRefOid,labels,mergeStateStatus'));
+  assert.equal(calls[0][calls[0].indexOf('--repo') + 1], 'web-everything/web-everything');
   assert.equal(await runStuckCli(['--json'], { ...base, readPrs: () => [] }), 'none');
   assert.equal(JSON.parse(await runStuckCli(['--json'], base))[0].pr, 7204);
   await runStuckCli([], { ...base, readPrs: () => Array(200).fill(ready), warn: s => warnings.push(s) });

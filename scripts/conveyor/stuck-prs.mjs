@@ -12,6 +12,7 @@ import { isClaimSessionLive } from './fix-dispatch-claim.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { handoffHome } from '../lib/handoff-path.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 const warnDefault = s => console.error(`stuck-prs: ${s}`);
 const safeText = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
@@ -44,7 +45,7 @@ export function collectClaims(warn = warnDefault, { claimRoot = fixDispatchClaim
   }), readAgents = () => JSON.parse(execFileSync('claude', ['agents', '--json', '--all'],
     { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 })),
 } = {}) {
-  const claims = listClaims().filter(c => ['web-everything', 'web-everything/web-everything'].includes(c.meta?.repo)
+  const claims = listClaims().filter(c => ['web-everything', CONSTELLATION_REPOS.we.slug].includes(c.meta?.repo)
     && ['fix', 'ci-heal'].includes(c.meta.kind));
   let agents = null;
   if (claims.length) try {
@@ -119,7 +120,7 @@ export async function runStuckCli(args = [], { now = () => new Date().toISOStrin
   readClaims ??= () => collectClaims(warn, { now: () => Date.parse(now()) });
   let prs;
   try {
-    prs = await readPrs(['pr', 'list', '--repo', 'web-everything/web-everything', '--state', 'open', '--json',
+    prs = await readPrs(['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'open', '--json',
       'number,headRefOid,labels,mergeStateStatus', '--limit', '200']);
     if (!Array.isArray(prs)) throw Error('invalid PR list');
     if (prs.length >= 200) warn('200 PR listing cap reached; omitted PRs unknown; inspect open PRs manually');
