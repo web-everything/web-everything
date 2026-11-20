@@ -17,6 +17,18 @@ const checksRunning = reason => {
   const check = reason.indexOf('check(s)');
   return check !== -1 && reason.includes('running', check + 'check(s)'.length);
 };
+const mentionsPr = (line, number) => {
+  // Parse with fixed patterns; PR input is only compared as literal text.
+  // Start only at a token boundary: retrying inside a long slashless token is quadratic.
+  // Leave digits unconsumed: they may also begin a later repository qualifier.
+  for (const match of line.matchAll(/(?<![\w.-])([\w.-]+\/[\w.-]+)(?: PR )?#(?=(\d+))/g)) {
+    if (match[2] === number) return match[1] === CONSTELLATION_REPOS.we.slug;
+  }
+  for (const match of line.matchAll(/#(\d+)/g)) {
+    if (match[1] === number) return true;
+  }
+  return false;
+};
 
 export function evaluateStuck({ now, prs, logs, claims } = {}) {
   const stamp = time(now), out = [];
@@ -25,14 +37,11 @@ export function evaluateStuck({ now, prs, logs, claims } = {}) {
     if (!Number.isSafeInteger(pr?.number) || pr.number <= 0 || !/^[a-f0-9]{40}$/.test(pr.headSha ?? '')
       || !Array.isArray(pr.labels) || !pr.labels.every(l => typeof l === 'string')) continue;
     // All mentions count, including a wake/progress line that ends a refusal streak.
-    const subject = new RegExp(`#${pr.number}(?!\\d)`);
-    // Start only at a token boundary: retrying inside a long slashless token is quadratic.
-    const qualified = new RegExp(`(?<![\\w.-])([\\w.-]+/[\\w.-]+)(?: PR )?#${pr.number}(?!\\d)`);
+    const number = String(pr.number);
     const mentions = daemon => {
       const rows = logs?.[daemon];
       if (!Array.isArray(rows) || rows.some(r => !r || typeof r.line !== 'string' || !Number.isFinite(time(r.at)))) return [];
-      return rows.filter(r => time(r.at) <= stamp && subject.test(r.line)
-        && (!qualified.test(r.line) || qualified.exec(r.line)[1] === CONSTELLATION_REPOS.we.slug))
+      return rows.filter(r => time(r.at) <= stamp && mentionsPr(r.line, number))
         .map(r => ({ at: time(r.at), line: clean(r.line) })).sort((a, b) => a.at - b.at);
     };
     const add = (rule, cause, rows, since = rows[0]?.at ?? stamp) => out.push({ pr: pr.number, rule,

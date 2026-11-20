@@ -23,6 +23,39 @@ const evaluate = (prs, logs = {}, claims = [], time = now) => evaluateStuck({ no
 const rule = (records, name) => records.filter(r => r.rule === name);
 const ready = pr(7204, ['review:accepted', 'red-team:clear']);
 
+test('PR log matching never compiles input into a regular expression', () => {
+  // Isolate the security invariant from Vitest's own use of RegExp constructors.
+  const source = `import { evaluateStuck } from ${JSON.stringify(new URL('../pass-daemons/stuck-rules.mjs', import.meta.url).href)};
+    globalThis.RegExp = new Proxy(RegExp, {
+      construct() { throw Error('Runtime regex construction is forbidden'); },
+      apply() { throw Error('Runtime regex construction is forbidden'); },
+    });
+    const records = evaluateStuck({ now: ${JSON.stringify(now)},
+      prs: [${JSON.stringify(pr(7042, ['red-team:blocked']))}],
+      logs: { fix: [{ at: ${JSON.stringify(at)}, line: ${JSON.stringify(nothing)} }] } });
+    if (records.length === 1 && records[0].rule === 'R-b') console.log('ok');`;
+  assert.equal(execFileSync(process.execPath, ['--input-type=module', '-e', source],
+    { encoding: 'utf8', timeout: 3000, maxBuffer: 4096 }).trim(), 'ok');
+});
+
+test.each([
+  ['#7042', true], ['#70420', false], ['#07042', false], ['#7042:', true],
+  ['#70420 then #7042', true],
+  ['other/repo#70420 then web-everything/web-everything#7042', true],
+  ['web-everything/web-everything#70420 then other/repo#7042', false],
+  ['other/repo#70420/else#7042', false],
+  ['other/repo PR #7042', false], ['web-everything/web-everything PR #7042', true],
+])('PR log matching preserves exact number and repository boundaries: %s', (mention, matches) => {
+  const records = evaluate([pr(7042, ['red-team:blocked'])],
+    { fix: [row(`reconcile-refused nothing-owed ${mention}`)] });
+  assert.equal(rule(records, 'R-b').length, matches ? 1 : 0);
+});
+
+test.each(['7042|.*', '7042', -1, 0, 7.5, Number.MAX_SAFE_INTEGER + 1, null])(
+  'invalid PR number cannot become a matching pattern: %s', number => {
+    assert.deepEqual(evaluate([pr(number, ['red-team:blocked'])], { fix: [row(nothing)] }), []);
+  });
+
 test.each([
   ['unqualified token', '"a".repeat(262144) + " #7204 — not woken: unknown refusal"'],
   ['incomplete qualified name', '"other/" + "a".repeat(262144) + " #7204 — not woken: unknown refusal"'],
