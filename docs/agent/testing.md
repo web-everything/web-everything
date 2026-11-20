@@ -5661,6 +5661,7 @@ diagnostic and records `shadowEscaped` failures outside its test list. Each sour
 512 KB UTF-8 input cap: oversized files are skipped; oversized or unreadable evidence
 sets `partial: true` (as does a truncated test list). Treat partial output as incomplete
 measurement requiring inspection, never as proof of coverage or an input to a gate.
+
 ## Lane reset safety probe regressions
 
 `lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
