@@ -1731,7 +1731,7 @@ exit 0
     expect(JSON.parse(r.stdout.trim().split('\n').filter(Boolean).pop()).error).toMatch(/502|Bad gateway/);
     // The whole assertion: the unsafe half never ran. Under the pre-#2964 order this list contains 'pr edit'.
     expect(verbs()).not.toContain('pr edit');
-    expect(verbs()).toEqual(['pr view', 'pr comment']);
+    expect(verbs()).toEqual(['pr view', 'pr view', 'pr comment']);
     expect(existsSync(join(dir, 'edited'))).toBe(false);
   }, 120000);
 
@@ -1741,7 +1741,8 @@ exit 0
     const r = runHarness(NOT_YET_ACCEPTED);
     expect(r.status).toBe(0);
     expect(r.payload).toMatchObject({ ok: true, to: 'accepted' });
-    expect(verbs()).toEqual(['pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
+    // Acceptance checks before any writes and again after the comment, immediately before the swap.
+    expect(verbs()).toEqual(['pr view', 'pr view', 'pr comment', 'pr view', 'pr edit', 'pr view']);
     expect(verbs().indexOf('pr comment')).toBeLessThan(verbs().indexOf('pr edit'));
     // And the acceptance it records is the one the drain will honour: marker at the live head, label live.
     expect(parseReviewedSha(posted())).toBe(NEW_SHA);
@@ -1790,7 +1791,7 @@ exit 0
     const r = runCli({ ...ALREADY_ACCEPTED, failOn: 'pr edit' });
     expect(r.status).not.toBe(0);
     // The swap was attempted FIRST and failed, so the run exited before writing anything durable.
-    expect(verbs()).toEqual(['pr view', 'pr view', 'pr edit']);
+    expect(verbs()).toEqual(['pr view', 'pr view', 'pr view', 'pr edit']);
     expect(verbs()).not.toContain('pr comment');
     expect(posted()).toEqual([]);
 
@@ -1811,7 +1812,7 @@ exit 0
     const r = runHarness(ALREADY_ACCEPTED);
     expect(r.status).toBe(0);
     // Swap first HERE — the inverse of the not-yet-accepted case above, and deliberately so.
-    expect(verbs()).toEqual(['pr view', 'pr view', 'pr edit', 'pr comment', 'pr view']);
+    expect(verbs()).toEqual(['pr view', 'pr view', 'pr view', 'pr edit', 'pr comment', 'pr view']);
     expect(verbs().indexOf('pr edit')).toBeLessThan(verbs().indexOf('pr comment'));
     const comments = [PRIOR_ACCEPT_COMMENT, ...posted()];
     expect(parseReviewedSha(comments)).toBe(NEW_SHA);
