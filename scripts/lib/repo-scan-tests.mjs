@@ -142,6 +142,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/operations/__tests__/prototype-load-remove-real.test.mjs': 'false positive: readdirSync lists only overlay event logs in its mkdtemp fixture, never the live repo; imports prototype-load-io.mjs, so vitest related selects this guarded removal integration test when the implementation changes',
   'scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs': 'false positive: its readdirSync calls only list scripts/ to symlink a throwaway pre-fix tree under mkdtemp for the break replay; it asserts a planner outcome, never a repo rule; the soak lane runs it',
   'scripts/lib/__tests__/gh-ci-log.test.mjs': 'whole-tree structural check that every job-log reader under scripts/ and skills-src/ uses the shared gh-ci-log helper or is on its explicit deferred allowlist; it imports gh-ci-log.mjs so `vitest related` selects it when the helper changes, and CI runs it for any new bypass elsewhere',
   'scripts/lib/__tests__/daemon-host-guard.test.mjs': 'false positive: readdirSync(join(root, ...)) lists only mkdtemp host-identity fixtures to assert atomic publication and cleanup; imports daemon-host-guard.mjs, so vitest related already selects it when the guard changes',
