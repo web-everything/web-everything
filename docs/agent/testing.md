@@ -5658,3 +5658,10 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+## Pinned merge-drain leaf fixtures (R1105)
+
+CLI fixtures exercising gates after the test-gaming scan must provide a resolved
+commit matching the listed head, a merge-base, numstat and a readable unified diff.
+Use `scripts/__tests__/fixtures/pinned-leaf-diff-fixture.mjs` for synthetic
+`lane/leaf-N` backlog-only PRs; an always-failing Git diff now exercises the
+incomplete-evidence human hold instead of the downstream gate.
