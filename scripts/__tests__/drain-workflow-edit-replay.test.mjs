@@ -231,5 +231,5 @@ it('unknown default branch keeps the listing hold (no net-diff clearing against 
 it('a re-admitted workflow-hold PR never takes the test-tampering mechanical park', () => {
   const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
   expect(src).toMatch(/gaming\.tampered && hasReviewLabel\(v\.prLabels, REVIEW_LABELS\.accepted\) && !v\.workflowHoldRepark/);
-  expect(src).toMatch(/if \(!v\.workflowHoldRepark && shouldReparkForTestTampering\(/);
+  expect(src).toMatch(/if \(!v\.workflowHoldRepark && \(netDiffText\.scored !== true \|\| shouldReparkForTestTampering\(/);
 });
