@@ -87,7 +87,7 @@ describe('mechanical round enrichment port (#5948)', () => {
   const head = 'b'.repeat(40), priorHead = 'a'.repeat(40);
   const comment = (body, hour) => ({ author: { login: 'web-everything' }, body,
     createdAt: `2026-10-10T${String(hour).padStart(2, '0')}:00:00Z` });
-  const snapshot = (ordinary = false) => ({ number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
+  const snapshot = (ordinary = false) => ({ rowsComplete: true, rowsHead: head, number: 5948, headRefName: 'lane/mechanical', headRefOid: head,
     baseRefName: 'main', labels: [{ name: 'review:pending' }], files: [{ path: 'src/a.mjs' }],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }],
     comments: [...[1, 2, 3, 4, 5].map(h => comment(REARM_COMMENT_MARKER, h)),
@@ -187,7 +187,7 @@ it('maps repo slugs before binding and refuses unknown repos before IO', async (
   const options = {
     env: { WE_REVIEW_START_AFTER: 'ci-green' },
     readRequiredChecks: () => ({ checks: requiredChecks, source: 'live' }),
-    readPrs: () => [{ statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
+    readPrs: () => [{ rowsComplete: true, rowsHead: 'a'.repeat(40), statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' })), number: 49, headRefName: 'lane/1-x', headRefOid: 'a'.repeat(40), labels: [{ name: 'review:pending' }], comments: [] }],
     readAgents: () => [{ name: 'review-fui-49', pidAlive: true, pid: 1 }], enrich: (agents) => agents,
   };
   expect(runReconcilePass({ ...options, repo: 'frontier-ui/frontierui' }).refusals.some((r) => r.kind === 'live-process')).toBe(true);
@@ -1298,7 +1298,8 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
   try {
     const path = join(dir, 'prs.json');
     writeFileSync(path, JSON.stringify([xxPr()]));
-    const exec = vi.fn(() => xxRuns().map(row => JSON.stringify(row)).join('\n'));
+    const exec = vi.fn((_file, args) => JSON.stringify(args.some(arg => arg.includes('/check-runs'))
+      ? [{ check_runs: xxRuns() }] : [{ statuses: [] }]));
     const plan = runReconcilePass({ ...xxOptions(), readPrs: () => readPrsFromFile(path),
       readChecks: args => defaultReadChecks(args, { exec }),
       enrichMainRed: (prs, opts) => {
@@ -1311,8 +1312,8 @@ it('xxh4zw8 hydrates shared-file input and preserves attribution timestamps and 
       } });
     expect(plan.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
     expect(exec.mock.calls[0][1]).toContain('--paginate');
-    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs`);
-    expect(exec.mock.calls[0][1].at(-1)).toContain('completed_at');
+    expect(exec.mock.calls[0][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/check-runs?per_page=100&filter=all`);
+    expect(exec.mock.calls[1][1]).toContain(`repos/web-everything/web-everything/commits/${XX_HEAD}/status?per_page=100`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1426,7 +1427,7 @@ it('xxh4zw8 hydration collapses superseded cancellations and unreadable conclusi
   }
 });
 
-it('xxh4zw8 malformed JSON-lines read is refused and failed identical-head reads are deduplicated', async () => {
+it('xxh4zw8 malformed paged JSON read is refused and failed identical-head reads are deduplicated', async () => {
   const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
   const exec = vi.fn(() => '{not-json');
   const plan = runReconcilePass({ ...xxOptions(), readPrs: () => [xxPr(), { ...xxPr(), number: 3337 }],

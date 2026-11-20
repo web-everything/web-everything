@@ -464,13 +464,18 @@ describe('land-human-only — the reader', () => {
     expect(() => planLandHumanOnly(context, input())).toThrow(/change list unreadable/);
   });
 
-  async function runWithCeremony(clearedHead) {
+  async function runWithCeremony(clearedHead, { unreadableStatuses = false } = {}) {
     const live = { number: 7, state: 'OPEN', isDraft: false, baseRefName: 'main', headRefOid: head,
       body: 'Land the approved workflow update.', title: 'Workflow update', headRefName: 'lane/workflow',
       labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], commits: [],
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', id: 'PR_node',
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (_bin, args) => {
+      if (args[0] === 'api' && args.some(a => a.includes('/check-runs?'))) return JSON.stringify([{ check_runs: live.statusCheckRollup }]);
+      if (args[0] === 'api' && args.some(a => a.includes('/status?'))) {
+        if (unreadableStatuses) throw new Error('status read unavailable');
+        return JSON.stringify([{ statuses: [] }]);
+      }
       if (args[0] === 'pr') return JSON.stringify(live);
       if (args[0] === 'repo') return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (args.join(' ').includes('isInMergeQueue')) return JSON.stringify({ data: { repository: {
@@ -514,6 +519,13 @@ describe('land-human-only — the reader', () => {
     expect(write).not.toHaveBeenCalled();
   });
 
+  it('refuses a complete check-run read when commit statuses are unreadable, with no write effects', async () => {
+    const { outcome, write } = await runWithCeremony(head, { unreadableStatuses: true });
+    expect(outcome.run.effects).toEqual([]);
+    expect(write).not.toHaveBeenCalled();
+    expect(String(outcome.error?.message ?? outcome.error)).toMatch(/required/);
+  });
+
   it('permits the write only for a clear-human ceremony at the current head', async () => {
     const { outcome, write } = await runWithCeremony(head);
     expect(outcome.error).toBeNull();
@@ -545,6 +557,8 @@ describe('land-human-only — the reader', () => {
       statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
     const exec = (bin, args) => {
       const a = args.join(' ');
+      if (args[0] === 'api' && a.includes('/check-runs?')) return JSON.stringify([{ check_runs: live.statusCheckRollup }]);
+      if (args[0] === 'api' && a.includes('/status?')) return JSON.stringify([{ statuses: [] }]);
       if (a.startsWith('pr view')) return JSON.stringify(live);
       if (a.startsWith('repo view')) return JSON.stringify({ defaultBranchRef: { name: 'main' } });
       if (a.includes('isInMergeQueue')) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
