@@ -968,3 +968,31 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
     expect(calls.length).toBe(0);
   });
 });
+
+
+describe('R1105 pinned test-gaming evidence producer', () => {
+  it('resolves a full commit before reading text and returns that immutable revision', () => {
+    const head = 'a'.repeat(40), base = 'c'.repeat(40);
+    const calls = [];
+    const exec = (_cmd, args) => {
+      calls.push(args);
+      if (args[0] === 'fetch') return '';
+      if (args[0] === 'merge-base') return base;
+      if (args[0] === 'rev-parse') return head;
+      if (args.includes('--numstat')) return '1\t0\tx.mjs\n';
+      if (args[0] === 'diff') return 'diff --git a/x.mjs b/x.mjs\n@@\n+x';
+      throw new Error(`unexpected git command: ${args[0]}`);
+    };
+    const sig = computeNetDiffSignals({ exec, rev: 'lane/x', pinRev: true });
+    expect(sig.netDiffText).toMatchObject({ scored: true, rev: head });
+    expect(calls.filter((a) => a[0] === 'diff' && !a.includes('--numstat'))).toEqual([
+      ['diff', '--no-ext-diff', '--end-of-options', base, head],
+    ]);
+  });
+  it('the drain requests pinning, supplies approved-head evidence, and holds incomplete scans', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/computeNetDiffSignals\(\{ exec, rev: v\.headRef,[^\n]*pinRev: true/);
+    expect(src).toMatch(/scanTestTampering\(\{\s*netDiffText, pinnedHeadSha: v\.listedHeadSha \|\| v\.headSha \|\| null/);
+    expect(src).toMatch(/gaming\.evidenceIncomplete \|\| shouldReparkForTestTampering/);
+  });
+});

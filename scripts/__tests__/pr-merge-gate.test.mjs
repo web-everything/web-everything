@@ -559,3 +559,60 @@ describe('pr-merge-gate — retargetStackedPrs (#3383, the #2578 incident)', () 
     expect(failed).toEqual([2]);
   });
 });
+
+
+describe('R1105 strict test-gaming strengthenings', () => {
+  const head = 'a'.repeat(40);
+  const clean = 'diff --git a/src/x.mjs b/src/x.mjs\n@@\n+export const x = 1;';
+  const scanEvidence = (netDiffText, extra = {}) => scanTestTampering({
+    diffText: netDiffText?.text, netDiffText, pinnedHeadSha: head, ...extra,
+  });
+
+  it('(a) holds empty, unresolved and unscored clone evidence for human inspection', () => {
+    for (const net of [
+      { text: '', scored: false, reason: 'ref-unresolved' },
+      { text: clean, scored: false, rev: head },
+      { text: '', scored: true, rev: head },
+      { text: '', scored: false, reason: 'no-clone' }, // a clone exists; reason alone cannot waive
+    ]) expect(scanEvidence(net)).toMatchObject({ tampered: true, evidenceIncomplete: true });
+  });
+  it('(a) preserves only the explicit no-clone exception', () => {
+    expect(scanEvidence({ text: '', scored: false, reason: 'no-clone' }, { noClone: true }).tampered).toBe(false);
+  });
+  it('(b) holds a permissive intermediate commit or mutable branch even when the final head returns', () => {
+    for (const rev of ['b'.repeat(40), 'origin/lane/x', null]) {
+      expect(scanEvidence({ text: clean, scored: true, rev })).toMatchObject({ tampered: true, evidenceIncomplete: true });
+    }
+  });
+  it('(c) decodes git C-quoted UTF-8 paths and refuses undecodable paths', () => {
+    const path = String.raw`"a/\303\251\t\n\\\".test.mjs" "b/\303\251\t\n\\\".test.mjs"`;
+    const diff = `diff --git ${path}\ndeleted file mode 100644`;
+    expect(parseUnifiedDiff(diff)[0].path).toBe('é\t\n\\".test.mjs');
+    expect(scanTestTampering({ diffText: diff }).tampered).toBe(true);
+    for (const paths of [String.raw`"a/x\q.test.mjs" "b/x\q.test.mjs"`, String.raw`"a/\377.test.mjs" "b/\377.test.mjs"`, 'unresolved']) {
+      expect(scanTestTampering({ diffText: `diff --git ${paths}` }).tampered).toBe(true);
+    }
+  });
+  it('(d) holds binary test diffs in either git binary format', () => {
+    for (const marker of ['Binary files a/x.test.mjs and b/x.test.mjs differ', 'GIT binary patch']) {
+      expect(scanTestTampering({ diffText: `diff --git a/x.test.mjs b/x.test.mjs\n${marker}` }).tampered).toBe(true);
+    }
+  });
+  it('(e) counts a test renamed outside discovery as removal, including delete/add', () => {
+    for (const diff of [
+      'diff --git a/x.test.mjs b/x.mjs\nsimilarity index 100%\nrename from x.test.mjs\nrename to x.mjs',
+      'diff --git a/x.test.mjs b/x.test.mjs\ndeleted file mode 100644\ndiff --git a/x.mjs b/x.mjs\nnew file mode 100644',
+    ]) expect(scanTestTampering({ diffText: diff }).findings).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'test-file-removed' })]));
+  });
+  it('(f) todo and skip replacements do not balance a removed live case', () => {
+    for (const modifier of ['todo', 'skip']) {
+      const diffText = `diff --git a/x.test.mjs b/x.test.mjs\n@@\n-it('x', () => {});\n+it.${modifier}('x');`;
+      expect(scanTestTampering({ diffText }).findings).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'tests-removed' })]));
+    }
+  });
+  it('keeps scored non-test changes and only-added tests clean at the pinned head', () => {
+    for (const text of [clean, "diff --git a/x.test.mjs b/x.test.mjs\n@@\n+it('new', () => {});"]) {
+      expect(scanEvidence({ text, scored: true, rev: head }).tampered).toBe(false);
+    }
+  });
+});

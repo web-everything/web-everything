@@ -4446,10 +4446,10 @@ export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = com
  * @returns {{changedFiles:string[], diffLines:number, humanBasisFiles:string[], cumulativeDiffLines:number,
  *   scored:boolean, netDiffText:{text:string,scored:boolean,reason?:string}, diffHunks:string|null}}
  */
-export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [] } = {}) {
+export function computeNetDiffSignals({ exec, remote = 'origin', base = 'main', baseRev = null, rev, fetchExtraRefs = [], pinRev = false } = {}) {
   const basis = resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   const net = computeNetDiffChangedFiles({ exec, remote, base, baseRev, rev, fetchExtraRefs, basis });
-  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis });
+  const netDiffText = computeNetDiffText({ exec, remote, base, rev, fetchExtraRefs, basis, pinRev });
   return {
     changedFiles: net.changedFiles,
     diffLines: net.diffLines,
@@ -6506,7 +6506,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
         diffExec = exec;
-        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
+        const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef], pinRev: true });
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
         humanBasisFiles = sig.humanBasisFiles;
@@ -6630,7 +6630,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
-      const gaming = scanTestTampering({ diffText: netDiffText.text });
+      const gaming = scanTestTampering({
+        netDiffText, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
+        noClone: !isLocalRepo(v.repo) && !escCwd,
+      });
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
       // diff, even seconds after a human ran the sanctioned `--to=clear-human` ceremony specifically to clear it
@@ -6647,7 +6650,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
       // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
       let carryRetryable = false;
-      if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
+      if (!gaming.evidenceIncomplete && netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && !v.workflowHoldRepark) { // a re-admitted workflow hold parks review:human through its own gate; never the retryable mechanical park
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
@@ -6680,7 +6683,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      // R1105: incomplete/head-mismatched evidence is an additional hold, never
+      // clearance evidence. Leave the existing human-clearance decision unchanged.
+      if (!v.workflowHoldRepark && (gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;

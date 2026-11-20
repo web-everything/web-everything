@@ -152,25 +152,63 @@ export function stripStringsAndComments(line) {
   return out;
 }
 
+// Git's quoted paths encode UTF-8 BYTES in octal, not Unicode code points. Refuse
+// unknown escapes/invalid UTF-8 instead of losing a test path before classification.
+function decodeGitPath(token) {
+  if (!token) return null;
+  if (!token.startsWith('"')) return token;
+  if (!/^"(?:[^"\\]|\\.)*"$/.test(token)) return null;
+  const bytes = [];
+  const escapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '\\': 92, '"': 34 };
+  for (let i = 1; i < token.length - 1; i++) {
+    if (token[i] !== '\\') {
+      const cp = String.fromCodePoint(token.codePointAt(i));
+      bytes.push(...Buffer.from(cp));
+      i += cp.length - 1;
+      continue;
+    }
+    const octal = token.slice(i + 1).match(/^[0-3][0-7]{2}/);
+    if (octal) { bytes.push(parseInt(octal[0], 8)); i += 3; }
+    else if (Object.hasOwn(escapes, token[i + 1])) bytes.push(escapes[token[++i]]);
+    else return null;
+  }
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(bytes)) || null; }
+  catch { return null; }
+}
+
 /**
  * Parse a unified `git diff` into per-file added/removed CONTENT lines + a `deleted` flag. Pure. Only the diff
  * BODY matters here (not exact line numbers), so this is intentionally minimal: it keys files off the
  * `diff --git a/… b/…` header, notes `deleted file mode`, and buckets `+`/`-` content lines (skipping the
  * `+++`/`---` file headers and `@@` hunk markers). Good enough to detect test tampering; not a general patch lib.
  * @param {string} diffText
- * @returns {Array<{path:string|null, deleted:boolean, added:string[], removed:string[]}>}
+ * @returns {Array<{path:string|null, oldPath:string|null, pathUnresolved:boolean, binary:boolean, deleted:boolean, added:string[], removed:string[]}>}
  */
 export function parseUnifiedDiff(diffText) {
   const files = [];
   let cur = null;
   for (const raw of String(diffText || '').split('\n')) {
     if (raw.startsWith('diff --git ')) {
-      const m = raw.match(/ b\/(.+)$/);
-      cur = { path: m ? m[1] : null, deleted: false, added: [], removed: [] };
+      const m = raw.match(/^diff --git ("(?:[^"\\]|\\.)*"|a\/.*?) ("(?:[^"\\]|\\.)*"|b\/.+)$/);
+      const old = m && decodeGitPath(m[1]);
+      const next = m && decodeGitPath(m[2]);
+      cur = { path: next?.startsWith('b/') ? next.slice(2) : null,
+        oldPath: old?.startsWith('a/') ? old.slice(2) : null,
+        pathUnresolved: !old?.startsWith('a/') || !next?.startsWith('b/'),
+        binary: false, deleted: false, added: [], removed: [] };
       files.push(cur);
       continue;
     }
     if (!cur) continue;
+    if (raw.startsWith('rename from ') || raw.startsWith('rename to ')) {
+      const from = raw.startsWith('rename from ');
+      const path = decodeGitPath(raw.slice(from ? 12 : 10));
+      cur[from ? 'oldPath' : 'path'] = path;
+      cur.pathUnresolved ||= !path;
+      continue;
+    }
+    if (raw.startsWith('similarity index ')) continue; // rename metadata, never content
+    if (raw.startsWith('Binary files ') || raw === 'GIT binary patch') { cur.binary = true; continue; }
     if (raw.startsWith('deleted file mode')) { cur.deleted = true; continue; }
     if (raw.startsWith('+++') || raw.startsWith('---') || raw.startsWith('@@')) continue; // headers/hunk markers, not content
     if (raw.startsWith('+')) cur.added.push(raw.slice(1));
@@ -187,13 +225,36 @@ export function parseUnifiedDiff(diffText) {
  *   - `tests-removed`      — net test CASES removed (removed `it(`/`test(` openers exceed added ones).
  * Returns `{ tampered, findings, reasons }`, mirroring the manifest-tamper shape the drain's land loop already
  * consumes, so wiring it is a drop-in park. A clean diff (no test file, or only ADDED tests) → `tampered:false`.
- * @param {{diffText?:string}} o  the two-tree net diff TEXT (`computeNetDiffText`, merge-ai-prs.mjs).
+ * @param {{diffText?:string, netDiffText?:object, pinnedHeadSha?:string|null, noClone?:boolean}} o  the two-tree net diff TEXT (`computeNetDiffText`, merge-ai-prs.mjs).
  * @returns {{tampered:boolean, findings:Array<{path:string,kind:string,detail:string}>, reasons:string[]}}
  */
-export function scanTestTampering({ diffText = '' } = {}) {
+export function scanTestTampering({ diffText = '', netDiffText, pinnedHeadSha = null, noClone = false } = {}) {
   const findings = [];
-  for (const f of parseUnifiedDiff(diffText)) {
-    if (!f.path || !isTestPath(f.path)) continue;
+  // Only the deliberately documented no-clone path remains fail-open. Evidence
+  // failures must park even when unscored or an older human clearance exists.
+  if (noClone && netDiffText?.reason === 'no-clone') return { tampered: false, findings, reasons: [] };
+  let evidenceReason = null;
+  if (netDiffText !== undefined) {
+    diffText = netDiffText?.text;
+    if (!netDiffText?.scored) evidenceReason = 'net diff unscored or unresolved';
+    else if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(netDiffText.rev || '') || netDiffText.rev !== pinnedHeadSha) {
+      evidenceReason = 'net diff commit differs from the approved merge head';
+    }
+  }
+  const files = parseUnifiedDiff(diffText);
+  if (typeof diffText !== 'string' || !diffText.trim() || !files.length) evidenceReason ||= 'net diff empty or unreadable';
+  if (evidenceReason) findings.push({ path: '(net diff)', kind: 'test-diff-unverified', detail: `${evidenceReason}; human review of the full diff required` });
+  for (const f of files) {
+    if (f.pathUnresolved || !f.path || !f.oldPath) {
+      findings.push({ path: '(unresolved)', kind: 'test-path-unresolved', detail: 'diff path could not be decoded; human review of the full diff required' });
+      continue;
+    }
+    if (isTestPath(f.oldPath) && !isTestPath(f.path)) {
+      findings.push({ path: f.oldPath, kind: 'test-file-removed', detail: 'a test file was renamed outside test discovery' });
+      continue;
+    }
+    if (!isTestPath(f.path)) continue;
+    if (f.binary) findings.push({ path: f.path, kind: 'test-binary-diff', detail: 'binary test diff cannot be inspected; human review of the full diff required' });
     if (f.deleted) {
       findings.push({ path: f.path, kind: 'test-file-removed', detail: 'a test file was deleted' });
       continue; // a delete has no surviving markers/cases to also flag
@@ -208,11 +269,12 @@ export function scanTestTampering({ diffText = '' } = {}) {
     }).length;
     if (skipAdds) findings.push({ path: f.path, kind: 'test-skipped', detail: `${skipAdds} skip/only marker(s) added` });
     const removedCases = f.removed.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
-    const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
+    // Disabled/unwritten replacements provide no live case to offset a removal.
+    const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l) && !/(?<![.\w])(?:it|test)\s*\.\s*(?:todo|skip)\b/.test(l)).length;
     if (removedCases > addedCases) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${removedCases - addedCases} test case(s) removed` });
   }
   const reasons = findings.map((x) => `${x.kind}: ${x.path} (${x.detail})`);
-  return { tampered: findings.length > 0, findings, reasons };
+  return { tampered: findings.length > 0, findings, reasons, evidenceIncomplete: !!evidenceReason };
 }
 
 /**
