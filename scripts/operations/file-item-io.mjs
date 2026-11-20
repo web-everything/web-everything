@@ -46,7 +46,7 @@ export { REPO_ROOT };
  * A new batch starts at the known origin/main commit, never unpublished worker history.
  */
 export function createCardBranchSink({ root = REPO_ROOT,
-  git = (args, options) => execFileSync('git', args, options), warn = console.warn } = {}) {
+  git = (args, options) => execFileSync('git', args, { maxBuffer: 1024 * 1024, ...options }), warn = console.warn } = {}) {
   return async ({ rel, content, batchDate } = {}) => {
     let scratch;
     let branch;
