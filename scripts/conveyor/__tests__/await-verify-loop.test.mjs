@@ -474,6 +474,28 @@ describe('superviseAwaitVerifyLoop (the daemon\'s child lifecycle)', () => {
     replacement.h.error(new Error('stopped'));
     expect(timers).toHaveLength(1);
   });
+  it('an asynchronous spawn error retries without an exit event and keeps inline fallback available until replacement', () => {
+    const child = fakeChild(), replacement = fakeChild(), timers = [];
+    const spawnLoop = vi.fn().mockReturnValueOnce(child).mockReturnValue(replacement);
+    const unref = vi.fn();
+    let now = 1000;
+    const sup = superviseAwaitVerifyLoop({ spawnLoop, log: { error: vi.fn() }, now: () => now,
+      setTimer: (fn, ms) => { timers.push({ fn, ms }); return { unref }; } });
+    sup.start();
+    now += 10_000;
+    child.h.error(new Error('EAGAIN'));
+    expect(sup.current()).toBeNull();
+    expect(timers).toEqual([{ fn: expect.any(Function), ms: 50_000 }]);
+    expect(unref).toHaveBeenCalledOnce();
+    child.h.error(new Error('EAGAIN'));
+    expect(timers).toHaveLength(1);
+    now += timers[0].ms;
+    timers[0].fn(); // no exit event ever arrived from the failed spawn
+    expect(spawnLoop).toHaveBeenCalledTimes(2);
+    expect(sup.current()).toBe(replacement);
+    sup.stop();
+    expect(replacement.kill).toHaveBeenCalledWith('SIGTERM');
+  });
   it('a spawn that throws is logged, leaves no child, and is retried no sooner than once a minute until it works or the daemon stops it', () => {
     const log = { error: vi.fn() };
     const timers = [];

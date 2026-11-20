@@ -5689,3 +5689,19 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+
+## In-process CI-heal cadence
+
+The fix daemon retains inline healing and also runs a heal-only effect on one unref'd interval.
+Both effects pass through `wrapFixDaemonTick` (self-sync, strict GitHub App auth and claim refresh).
+Use a shared `healState` and `dispatchState` in fixtures: a timer tick reuses the current main
+pass's queue budget and dispatch throttle, including reservations made before the timer fired.
+A main pass starting during timer healing must preserve those reservations and skip inline healing.
+`ci-heal-ticker.test.mjs` exercises interval scheduling, both overlap directions, error cleanup,
+admission at the cap, quarantine/auth refusal and stale-main recovery through the real wrappers.
+The `ci-heal-runs-on-own-interval` soak presence probe fires the real ticker with an injected timer;
+checking only the interval resolver would not prove the timer was wired.
+The separate await-verify child supervisor must clear its current child and arm one rate-limited
+retry on an asynchronous spawn error, even when no exit event follows; test both error-only
+and error-then-exit paths so inline verification remains available and retries stay deduplicated.

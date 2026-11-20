@@ -1210,8 +1210,7 @@ describe('buildCliDaemonEffects — tickOnce is wired to runTickAllRepos, not th
     expect(start).toBeGreaterThan(-1);
     const body = src.slice(start, src.indexOf('\n}\n', start));
     expect(body).toMatch(/runReconcileFixDispatchAllRepos\(/);
-    expect(body).toMatch(/const heal = \(\) => runReconcileCiHealDispatchAllRepos\(/);
-    expect(body).toMatch(/ciHealLock \? await withCiHealCycleLock\(heal\) : await heal\(\)/);
+    expect(body).toMatch(/await runReconcileCiHealDispatchAllRepos\(/);
   });
 });
 
