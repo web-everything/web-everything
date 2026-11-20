@@ -82,7 +82,7 @@ function derFinding(bytes,tick) {
     const fields=children(sequence);
     if(!fields||fields.length<2)continue;
     // Encrypted PKCS#8 (EncryptedPrivateKeyInfo): AlgorithmIdentifier(OID, parameters SEQUENCE) and OCTET STRING.
-    if(fields.length===2&&fields[0].tag===48&&nonempty(fields[1],4)) {
+    if(fields.length===2&&fields[0].tag===48&&octets(fields[1])>0) {
       const algorithm=children(fields[0]);
       if(algorithm?.length===2&&nonempty(algorithm[0],6)&&algorithm[1].tag===48)return true;
     }

@@ -4,7 +4,7 @@ import {performance} from 'node:perf_hooks';
 import {describe,expect,it,vi} from 'vitest';
 import * as keyStructure from '../forge-key-structure.mjs';
 import {keyStructureFinding,keyStructurePrecheck} from '../forge-key-structure.mjs';
-import {manifestEntry} from '../forge-exec-manifest.mjs';
+import {credentialBufferFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 
 const FINDING='private-key-structure';
 const encode=(tag,body,indefinite=false)=>{
@@ -97,6 +97,57 @@ const fixtures=()=>{
 };
 
 describe('Forge key structure consumer compatibility',()=>{
+  it.each(['primitive','constructed','indefinite constructed','nested fragments','indefinite nested fragments'])(
+    'I2 encrypted PKCS8 %s ciphertext imports and is blocked through manifest admission',variant=>{
+      const {privateKey}=generateKeyPairSync('ed25519');
+      const passphrase='test';
+      const primitive=privateKey.export({format:'der',type:'pkcs8',cipher:'aes-256-cbc',passphrase});
+      const ciphertext=parts(read(primitive).body)[1];
+      const octet=encode(ciphertext.tag,ciphertext.body);
+      const indefinite=variant.startsWith('indefinite');
+      const replacement=variant==='primitive'?octet:variant.endsWith('fragments')?
+        ber(octet,{indefinite,octets:true}):encode(36,octet,indefinite);
+      const bytes=replaceField(primitive,1,replacement);
+      // No import catch/skip: each shape must be a real consumer witness.
+      const imported=createPrivateKey({key:bytes,format:'der',type:'pkcs8',passphrase});
+      expect(imported.export({format:'der',type:'pkcs8'}))
+        .toEqual(privateKey.export({format:'der',type:'pkcs8'}));
+      for(const view of wrappers(bytes)) {
+        expect.soft(keyStructurePrecheck(view)).toBe(true);
+        expect.soft(keyStructureFinding(view,{precheck:false})).toBe(FINDING);
+        expect.soft(keyStructureFinding(view)).toBe(FINDING);
+        expect.soft(credentialBufferFinding(view)).toBe(FINDING);
+      }
+      for(const encoding of ['base64','hex']) {
+        expect.soft(()=>manifestEntry(Buffer.from('docs/token.md'),Buffer.from(bytes.toString(encoding)),false,true))
+          .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(FINDING)}));
+      }
+    });
+
+  it('I2 encrypted PKCS8 rejects empty or malformed constructed ciphertext',()=>{
+    const algorithm=encode(48,Buffer.concat([encode(6,Buffer.from([42,3])),encode(48,Buffer.alloc(0))]));
+    for(const ciphertext of [encode(36,Buffer.alloc(0)),encode(36,encode(4,Buffer.alloc(0))),
+      encode(36,encode(2,Buffer.from([7]))),encode(36,Buffer.from([4,2,7])),
+      encode(36,encode(4,Buffer.from([7])),true).subarray(0,-1)]) {
+      const bytes=encode(48,Buffer.concat([algorithm,ciphertext]));
+      expect(keyStructureFinding(bytes,{precheck:false})).toBeNull();
+      expect(keyStructureFinding(bytes)).toBeNull();
+    }
+  });
+
+  it('I2 encrypted PKCS8 excessive constructed ciphertext nesting fails closed',()=>{
+    const algorithm=encode(48,Buffer.concat([encode(6,Buffer.from([42,3])),encode(48,Buffer.alloc(0))]));
+    let ciphertext=encode(4,Buffer.from([7]));
+    for(let depth=0;depth<66;depth++)ciphertext=encode(36,ciphertext);
+    const bytes=encode(48,Buffer.concat([algorithm,ciphertext]));
+    const exhausted='private-key-scan-budget-exhausted-use-local';
+    expect(keyStructureFinding(bytes,{precheck:false})).toBe(exhausted);
+    expect(keyStructureFinding(bytes)).toBe(exhausted);
+    expect(credentialBufferFinding(bytes)).toBe(exhausted);
+    expect(()=>manifestEntry(Buffer.from('docs/token.md'),Buffer.from(bytes.toString('base64')),false,true))
+      .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(exhausted)}));
+  });
+
   it('I2 differential: flags raw/base64/hex for every consumer-importable generated DER/BER form',()=>{
     const accepted=new Set();
     for(const {name,type,bytes} of fixtures()) {
