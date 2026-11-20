@@ -16,6 +16,18 @@ const admissionEnd = source.indexOf('const admission = await acquireAdmission(',
 const selectedTests = "npx vitest run 'a test.mjs' b.test.mjs --testTimeout=15000 --hookTimeout=30000";
 const shardCommand = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`;
 const unsupportedShardCommand = `node ${shellQuote(SHARD_RUN_SCRIPT)} --shards=2 --parallel=2 --budget-ms=1000 -- echo unexpected`;
+const shardPathVariants = [
+  'scripts/lib/verify-shard-run.mjs',
+  './scripts/lib/verify-shard-run.mjs',
+  "'scripts/lib/verify-shard-run.mjs'",
+  '"./scripts/lib/verify-shard-run.mjs"',
+  SHARD_RUN_SCRIPT,
+  `"${SHARD_RUN_SCRIPT}"`,
+  "scripts/'lib'/verify-shard-run.mjs",
+  'scripts/lib/verify-shard-\\run.mjs',
+  'scripts/../scripts/lib/verify-shard-run.mjs',
+];
+const relativeShard = `node scripts/lib/verify-shard-run.mjs --shards=2 --parallel=2 --budget-ms=60000 -- ${selectedTests}`;
 const commandShapes = [
   ['npm', 'npm run test:unit -- a.test.mjs'],
   ['vitest', selectedTests],
@@ -24,6 +36,18 @@ const commandShapes = [
   ['standards', 'npm run check:standards -- --files=scripts/a.mjs'],
   ['admission wrapper', 'node scripts/readiness/heavy-admission.mjs run -- npx vitest run a.test.mjs'],
   ['shard wrapper', shardCommand, selectedTests],
+  ...shardPathVariants.map(path => [
+    `shard path ${path}`, `node ${path} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, selectedTests,
+  ]),
+  ['relative shard after standards', `npm run check:standards && ${relativeShard}`, `npm run check:standards && ${selectedTests}`],
+  ['two shard wrappers', `${relativeShard} && ${shardCommand}`, `${selectedTests} && ${selectedTests}`],
+  ['reordered shard options and tabs', `node\t./scripts/lib/verify-shard-run.mjs\t--budget-ms=1000 --parallel=2 --shards=2 -- ${selectedTests}`, selectedTests],
+  ['node option terminator', relativeShard.replace('node ', 'node -- '), selectedTests],
+  ['unsupported node options refuse local execution', relativeShard.replace('node ', 'node --no-warnings '), null],
+  ['relative shard unsupported selection', relativeShard.replace(selectedTests, 'echo unexpected'), null],
+  ['relative shard malformed options', relativeShard.replace('--parallel=2', '--parallel=bad'), null],
+  ['dynamic shard path refuses local execution', `node "$PWD/scripts/lib/verify-shard-run.mjs" --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, null],
+  ['quoted wrapper text stays an argument', `echo '${relativeShard.replaceAll("'", '')}'`],
   ['whole gate with shard wrapper', `${shardCommand} && npm run check:standards`, `${selectedTests} && npm run check:standards`],
   ['shard wrapper from quoted requester checkout', `node ${shellQuote("/tmp/requester's -- npx vitest run checkout/scripts/lib/verify-shard-run.mjs")} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, selectedTests],
   ['scan', "VERIFY_SCAN_FILES='scripts/a.mjs' npx vitest run scripts/scan.test.mjs"],
@@ -173,7 +197,7 @@ describe('verify-lane --local', () => {
       expect(timedEnd).toBeGreaterThan(timedStart);
       context.runGate = vi.fn(runInNewContext(`${source.slice(runStart, runEnd)}; runGate`, context));
       const timedRunGate = runInNewContext(`${source.slice(timedStart, timedEnd)}; timedRunGate`, context);
-      if (local && command === unsupportedShardCommand) {
+      if (local && (command === unsupportedShardCommand || localCommand === null)) {
         await expect(timedRunGate('vitestMs', command)).rejects.toThrow('--local requires a selected Vitest command');
         expect(spawn).not.toHaveBeenCalled();
         expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);

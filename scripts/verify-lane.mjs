@@ -899,12 +899,43 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
     if (currentAdmission.forceLocal) {
-      if (isShardWrapperCommand(command)) {
-        // Shards drop the parent's held slot and choose remote policy independently. Run the exact selected
-        // Vitest command under our local slot instead; retain all test paths, flags and timeout settings.
-        const selected = command.replace(/^node '(?:[^']|'\\'')*' --shards=\d+ --parallel=\d+ --budget-ms=\d+ -- (?=npx vitest run )/, '');
-        if (selected === command) throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper');
-        plan.command = selected;
+      // Default-gate equivalence deliberately recognizes only generated absolute paths. Local policy
+      // must also handle user-supplied relative paths and shell quoting, in every && segment.
+      // Shards discard the held slot and route independently: remove their wrapper, retaining the
+      // selected command byte-for-byte. Never interpret expansions to guess a wrapper's arguments.
+      const token = /[ \t]+|&&|(?:[^\s'"\\;&|<>$`()#]|'[^']*'|"(?:[^"\\$`]|\\[^\r\n])*"|\\[^\r\n])+/gy;
+      const unquote = word => word.replace(/'([^']*)'|"((?:[^"\\]|\\.)*)"|\\(.)/gs,
+        (_match, single, double, escaped) => single ?? (double !== undefined ? double.replace(/\\(["\\$`])/g, '$1') : escaped));
+      const segments = [[]];
+      let offset = 0;
+      let match;
+      while ((match = token.exec(command))) {
+        offset = token.lastIndex;
+        if (match[0] === '&&') segments.push([]);
+        else if (!/^[ \t]+$/.test(match[0])) segments.at(-1).push({ value: unquote(match[0]), start: match.index });
+      }
+      const refusal = () => { throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper; use a literal node path and an &&-joined gate'); };
+      if (offset !== command.length) {
+        if (command.includes('verify-shard-run.mjs') || segments.flat().some(t => t.value.includes('verify-shard-run.mjs'))) refusal();
+      } else {
+        // Apply edits from the end so earlier token offsets remain valid. Only executable positions
+        // count: a quoted test name or echo argument containing wrapper text is never rewritten.
+        for (const words of segments.reverse()) {
+          const start = words.findIndex(t => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t.value));
+          if (start < 0 || !/(?:^|\/)node$/.test(words[start].value)) continue;
+          const scriptIndex = start + (words[start + 1]?.value === '--' ? 2 : 1);
+          const isWrapper = word => word && resolve(REPO, word.value).endsWith('/scripts/lib/verify-shard-run.mjs');
+          if (!isWrapper(words[scriptIndex])) {
+            if (words[scriptIndex]?.value.startsWith('-') && words.slice(scriptIndex + 1).some(isWrapper)) refusal();
+            continue;
+          }
+          const options = words.slice(scriptIndex + 1, scriptIndex + 4).map(t => t.value);
+          const keys = options.map(option => /^--(shards|parallel|budget-ms)=\d+$/.exec(option)?.[1]);
+          if (keys.length !== 3 || keys.some(key => !key) || new Set(keys).size !== 3
+            || words[scriptIndex + 4]?.value !== '--'
+            || words.slice(scriptIndex + 5, scriptIndex + 8).map(t => t.value).join(' ') !== 'npx vitest run') refusal();
+          plan.command = plan.command.slice(0, words[start].start) + plan.command.slice(words[scriptIndex + 5].start);
+        }
       }
       plan.takeLocalSlot = true;
       plan.setHeld = true;
