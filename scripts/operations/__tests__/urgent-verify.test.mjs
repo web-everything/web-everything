@@ -328,7 +328,9 @@ describe('CI gate mirroring fails closed', () => {
   const runSteps = Object.entries(real.jobs).filter(([job]) => mirroredJobs.includes(job))
     .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => typeof step.run === 'string' ? [[job, index, step.name]] : []));
   it.each(runSteps)('refuses changed execution context for %s step %i (%s)', (job, index) => {
-    for (const [key, value] of Object.entries({ 'working-directory': 'unexpected', env: { NODE_OPTIONS: '--require=unexpected' }, shell: 'bash', if: '${{ false }}', 'continue-on-error': true })) {
+    // The non-failing measurement step is mirrored as continue-on-error: true; flipping it must be refused too.
+    const coe = real.jobs[job].steps[index]['continue-on-error'] === true ? false : true;
+    for (const [key, value] of Object.entries({ 'working-directory': 'unexpected', env: { NODE_OPTIONS: '--require=unexpected' }, shell: 'bash', if: '${{ false }}', 'continue-on-error': coe })) {
       const changed = yaml.safeLoad(workflow);
       changed.jobs[job].steps[index][key] = value;
       expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');

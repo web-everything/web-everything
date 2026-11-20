@@ -205,9 +205,6 @@ jobs:
         # Keep --expect=9 in coverage-merge and the /9 unit-suite divisors in lockstep.
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
-      - name: Record shard start
-        if: ${{ needs.changes.outputs.light != 'true' }}
-        run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
       # Keep the fast-check name green for an intentionally empty unit-test scope.
       - name: Card-only unit scope receipt
         if: ${{ needs.changes.outputs.light == 'true' }}
@@ -325,11 +322,11 @@ jobs:
       - name: Measure shard resources
         if: ${{ always() && needs.changes.outputs.light != 'true' }}
         continue-on-error: true
+        working-directory: web-everything
         run: |
           cpu_count=$(nproc)
           memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-          end_seconds=$(date +%s)
-          wall_seconds=$((end_seconds - ${SHARD_START_SECONDS:-end_seconds}))
+          wall_seconds=$(cut -d. -f1 /proc/uptime)
           printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
           printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 
@@ -339,7 +336,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: shard-resources-test-${{ matrix.shard }}
-          path: shard-resources.json
+          path: web-everything/shard-resources.json
           if-no-files-found: ignore
 
   # Coverage merging and host-path checks run independently; the required test job only reads results.
@@ -643,8 +640,6 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
-      - name: Record shard start
-        run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
@@ -671,8 +666,7 @@ jobs:
         run: |
           cpu_count=$(nproc)
           memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-          end_seconds=$(date +%s)
-          wall_seconds=$((end_seconds - ${SHARD_START_SECONDS:-end_seconds}))
+          wall_seconds=$(cut -d. -f1 /proc/uptime)
           printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
           printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 

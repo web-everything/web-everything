@@ -22,16 +22,14 @@ describe('CI worker count and shard measurements', () => {
       expect(measure.run).toContain('/sys/fs/cgroup/memory.peak');
       expect(measure.run).toContain('unavailable');
       expect(measure.run).toContain('GITHUB_STEP_SUMMARY');
-      expect(measure.run).toContain('SHARD_START_SECONDS');
-      expect(job.steps[0].run).toContain('SHARD_START_SECONDS=');
-      expect(job.steps[0].run).toContain('GITHUB_ENV');
+      expect(measure.run).toContain('/proc/uptime');
       const upload = job.steps.at(-1);
       expect(job.steps.at(-2)).toBe(measure);
       expect(upload.uses).toBe('actions/upload-artifact@v4');
       expect(upload.if).toContain('always()');
       expect(upload['continue-on-error']).toBe(true);
       expect(upload.with.name).toBe(`shard-resources-${name.replace('-shard', '')}-` + '${{ matrix.shard }}');
-      expect(upload.with.path).toBe('shard-resources.json');
+      expect(upload.with.path).toBe(name === 'test-shard' ? 'web-everything/shard-resources.json' : 'shard-resources.json');
       expect(upload.with['if-no-files-found']).toBe('ignore');
     });
 
