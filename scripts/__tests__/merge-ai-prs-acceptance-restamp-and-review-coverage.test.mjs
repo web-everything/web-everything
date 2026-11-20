@@ -482,9 +482,10 @@ describe('computeNetDiffSignals carries the basis trust question (#3343)', () =>
   const BASE_SHA = 'a'.repeat(40);
   const fakeExec = (script = {}) => {
     const exec = (cmd, args) => {
-      args = args[0] === '-c' ? args.slice(8) : args;
+      while (args[0] === '-c') args = args.slice(2);
+      if (args.includes('--git-common-dir')) return `${process.env.TMPDIR}\n${process.env.TMPDIR}`;
       if (args[0] === 'rev-parse' && args.includes('refs/remotes/origin/main^{commit}')) return `${BASE_SHA}\n`;
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv' && a !== '--no-color' && a !== '--src-prefix=a/' && a !== '--dst-prefix=b/');
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
       if (h && 'stdout' in h) return h.stdout;

@@ -148,10 +148,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { cascadePolicy } from './lib/policy-cascade.mjs';
 import { readGit, readGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
-import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve, join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { resolve, join, dirname, isAbsolute } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import { createLabelEnsurer, isLabelNotFoundError } from './lib/label-memo.mjs';
 import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
@@ -4023,11 +4023,38 @@ export function parseNumstat(numstat) {
 
 // Keep injected exec's (command, argv, options) contract; isolate all net-diff Git reads.
 function netDiffGit(exec, args, opts = {}) {
-  const flags = args[0] === 'diff' || args[0] === 'log'
-    ? ['--no-textconv', '--no-ext-diff', '--no-color'] : [];
-  return exec('git', ['-c', 'core.quotepath=false', '-c', 'color.ui=never',
-    '-c', 'diff.noprefix=false', '-c', 'diff.external=', args[0], ...flags, ...args.slice(1)],
-  { ...opts, env: { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' } });
+  const measuresDiff = args[0] === 'diff' || args[0] === 'log';
+  const flags = measuresDiff ? ['--no-textconv', '--no-ext-diff', '--no-color'] : [];
+  const config = ['-c', 'core.quotepath=false', '-c', 'color.ui=never',
+    '-c', 'diff.noprefix=false', '-c', 'diff.external=',
+    '-c', 'diff.srcPrefix=a/', '-c', 'diff.dstPrefix=b/', '-c', 'diff.mnemonicPrefix=false',
+    '-c', 'core.attributesFile=/dev/null'];
+  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
+    GIT_ATTR_NOSYSTEM: '1', GIT_ATTR_SOURCE: '4b825dc642cb6eb9a060e54bf8d69288fbee4904' };
+  let diffCwd;
+  const run = () => exec('git', [...config, args[0], ...flags, ...args.slice(1)],
+    { ...opts, ...(diffCwd ? { cwd: diffCwd } : {}), env });
+  if (!measuresDiff) return run();
+
+  // GIT_ATTR_SOURCE (Git >= 2.43) excludes committed attributes, but NOT info/attributes.
+  // Give diff/log a private common directory with the same objects/refs/config and no info directory.
+  // An empty worktree/index also excludes tree attributes on older Git, which ignores GIT_ATTR_SOURCE.
+  // Never rename or rewrite the checkout's attributes: other readers may be using that checkout.
+  const [common, gitDir] = String(exec('git', [...config, 'rev-parse', '--path-format=absolute', '--git-common-dir', '--absolute-git-dir'],
+    { ...opts, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env }) || '').trim().split('\n');
+  if (!common || !isAbsolute(common) || !gitDir || !isAbsolute(gitDir)) throw new Error('net-diff common directory unresolved');
+  const scratch = mkdtempSync(join(tmpdir(), 'net-diff-attributes-'));
+  try {
+    for (const entry of ['objects', 'refs', 'packed-refs', 'shallow', 'config', 'config.worktree', 'reftable']) {
+      symlinkSync(join(common, entry), join(scratch, entry));
+    }
+    diffCwd = scratch;
+    env.GIT_DIR = gitDir;
+    env.GIT_COMMON_DIR = scratch;
+    env.GIT_WORK_TREE = scratch;
+    env.GIT_INDEX_FILE = join(scratch, 'index');
+    return run();
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
 }
 
 /**
@@ -4412,7 +4439,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // Deliberately NOT `--text`: unlike the single-file write-time diff, this is a whole-PR diff and forcing
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
-    const text = String(netDiffGit(exec, ['diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
+    const text = String(netDiffGit(exec, ['diff', '--src-prefix=a/', '--dst-prefix=b/', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
     return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
@@ -4525,7 +4552,7 @@ export function computeNetDiffPaths({ exec, remote = 'origin', base = 'main', re
   if (!basis.ok) return { ...unscored, reason: basis.reason };
   const { diffBase, candidate } = basis;
   try {
-    const raw = exec('git', ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const raw = netDiffGit(exec, ['diff', '--name-only', '-z', '--end-of-options', `${diffBase}..${candidate}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const paths = String(raw || '').split('\0').filter(Boolean);
     return { paths, base: diffBase, rev: candidate, scored: true };
   } catch (err) {
@@ -6555,6 +6582,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // are always CUMULATIVE while `changedFiles` may be de-inflated to `v.base…head`; the verdict's
       // `diffHunksBasisFiles` (= `humanBasisFiles`, same basis as the hunks) is what a detector pairs them with.
       const score = scoreEscalation({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings: v.dismissedFindings, crossRepo: v.crossRepo, diffHunks, basisNarrowed, deviation: v.deviation });
+      if (netDiffText.scored !== true) {
+        score.escalate = true;
+        score.humanRequired = true;
+        score.careLevel = 'high';
+        score.reasons.push(`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`);
+      }
       // #2766/#2767 — this PR's OWN changed-file set, stamped onto the verdict (best-effort — whatever this
       // pass already scored, never a new `gh` call) so a LATER sibling verdict in this SAME batch can ask
       // "did this PR's own commits touch the file my test-gaming finding cites?" without re-fetching — the
@@ -6647,7 +6680,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // diff-visible tamper forms; on a hit, REFUSE the auto-land and park `review:human` — a test removal is a
       // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal. Best-
       // effort like the manifest gate: only when a local/sibling clone is present to read the diff text (no
-      // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
+      // clone ⇒ no text ⇒ unverified: the gate below requires review rather than trusting an empty scan).
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
       const gaming = scanTestTampering({ diffText: netDiffText.text });
@@ -6700,11 +6733,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      if (!v.workflowHoldRepark && (netDiffText.scored !== true || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
-        v.escalateReasons = gaming.reasons;
+        const tamperReasons = netDiffText.scored === true ? gaming.reasons
+          : [`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`];
+        v.escalateReasons = tamperReasons;
         // #2766/#2767 — is this PR's own tampering finding (at least partly) INHERITED from an already-
         // escalated stacked base (its own `baseRefName` IS another open PR's `headRef`, and that PR already
         // carries `review:human`)? Best-effort, off data this SAME batch already fetched (`v.changedFiles`,
@@ -6717,7 +6752,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           baseFiles: stackedBase.changedFiles,
           baseAlreadyEscalated: hasReviewLabel(stackedBase.prLabels, REVIEW_LABELS.human),
         }) : null;
-        v.reason = buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
+        v.reason = netDiffText.scored === true
+          ? buildTestGamingParkReason(tamperReasons, stackedOrigin, stackedBase?.num)
+          : tamperReasons.join('; ');
         if (!candidateDryRun) {
           // #2766/#2767 — MUTUAL EXCLUSIVITY. `keepHumanClearance` is `true` ONLY when the humanClearedSha
           // fetch above never ran/succeeded (`tamperHeadSha === null`, incl. a `gh` fetch miss) — the fail-
@@ -6758,8 +6795,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const posted = postDrainReasonComment(v.repo, v.num, 'park', v.reason, auditLineFor(v));
           if (posted && !AS_JSON) process.stderr.write(`  💬 ${repoTag(v.repo)}${v.num} test-gaming reason stamped on PR\n`);
         }
-        parked.push({ num: v.num, repo: v.repo || localSlug, humanRequired: true, reasons: gaming.reasons, headSha: v.headSha ?? null });
-        if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} parked — anti-test-gaming gate tripped (HUMAN required): ${gaming.reasons.join('; ')}\n`);
+        parked.push({ num: v.num, repo: v.repo || localSlug, humanRequired: true, reasons: tamperReasons, headSha: v.headSha ?? null });
+        if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(v.repo)}${v.num} parked — anti-test-gaming gate tripped (HUMAN required): ${tamperReasons.join('; ')}\n`);
         continue;
       }
       // #2412 layer 4 — this PR's basis (the SAME set `score` scored blast-radius/gate-self over, #3317) touches
