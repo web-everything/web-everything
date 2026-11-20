@@ -187,8 +187,14 @@ function decodeGitPath(token) {
 export function parseUnifiedDiff(diffText) {
   const files = [];
   let cur = null;
+  let hunk = null;
+  const finishHunk = () => {
+    if (hunk && (hunk.old !== hunk.expectedOld || hunk.next !== hunk.expectedNext)) cur.hunkIncomplete = true;
+    hunk = null;
+  };
   for (const raw of String(diffText || '').split('\n')) {
     if (raw.startsWith('diff --git ')) {
+      finishHunk();
       const m = raw.match(/^diff --git ("(?:[^"\\]|\\.)*"|a\/.*?) ("(?:[^"\\]|\\.)*"|b\/.+)$/);
       const old = m && decodeGitPath(m[1]);
       const next = m && decodeGitPath(m[2]);
@@ -200,6 +206,16 @@ export function parseUnifiedDiff(diffText) {
       continue;
     }
     if (!cur) continue;
+    if (raw.startsWith('@@')) {
+      finishHunk();
+      const counts = raw.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+      if (counts) hunk = { expectedOld: Number(counts[1] ?? 1), expectedNext: Number(counts[2] ?? 1), old: 0, next: 0 };
+      continue;
+    }
+    if (hunk) {
+      if (raw.startsWith(' ') || raw.startsWith('-')) hunk.old++;
+      if (raw.startsWith(' ') || raw.startsWith('+')) hunk.next++;
+    }
     if (raw.startsWith('rename from ') || raw.startsWith('rename to ')) {
       const from = raw.startsWith('rename from ');
       const path = decodeGitPath(raw.slice(from ? 12 : 10));
@@ -214,6 +230,7 @@ export function parseUnifiedDiff(diffText) {
     if (raw.startsWith('+')) cur.added.push(raw.slice(1));
     else if (raw.startsWith('-')) cur.removed.push(raw.slice(1));
   }
+  finishHunk();
   return files;
 }
 
@@ -243,6 +260,7 @@ export function scanTestTampering({ diffText = '', netDiffText, pinnedHeadSha = 
   }
   const files = parseUnifiedDiff(diffText);
   if (typeof diffText !== 'string' || !diffText.trim() || !files.length) evidenceReason ||= 'net diff empty or unreadable';
+  if (files.some((f) => f.hunkIncomplete)) evidenceReason ||= 'net diff hunk line counts do not match its body';
   if (evidenceReason) findings.push({ path: '(net diff)', kind: 'test-diff-unverified', detail: `${evidenceReason}; human review of the full diff required` });
   for (const f of files) {
     if (f.pathUnresolved || !f.path || !f.oldPath) {

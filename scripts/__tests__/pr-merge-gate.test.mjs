@@ -616,3 +616,26 @@ describe('R1105 strict test-gaming strengthenings', () => {
     }
   });
 });
+
+
+describe('test-gaming hunk count evidence', () => {
+  const header = 'diff --git a/src/x.mjs b/src/x.mjs\n';
+  it.each([
+    '@@ -1,100 +1,100 @@\n',
+    '@@ -1,2 +1,2 @@\n context\n',
+    '@@ -0,0 +1 @@\n+one\n+extra\n',
+    '@@ -1 +1 @@\n-old\n',
+    '@@ -1,2 +1,2 @@\n context\ndiff --git a/y b/y\n',
+    '@@ -1,2 +1,2 @@\n context\n@@ -0,0 +1 @@\n+new\n',
+  ])('holds mismatched hunk counts: %s', body => {
+    expect(scanTestTampering({ diffText: header + body })).toMatchObject({ tampered: true, evidenceIncomplete: true });
+  });
+  it.each([
+    '@@ -1 +1 @@\n-old\n+new\n',
+    '@@ -1,2 +1,2 @@\n context\n-old\n+new\n',
+    '@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n',
+    '@@ -0,0 +1 @@\n+new\n@@ -3 +4,0 @@\n-old\n',
+  ])('keeps well-formed hunk evidence clean: %s', body => {
+    expect(scanTestTampering({ diffText: header + body })).toMatchObject({ tampered: false, evidenceIncomplete: false });
+  });
+});

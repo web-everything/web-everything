@@ -49,7 +49,7 @@ describe('computeNetDiffChangedFiles (#2373 — SHARED net-diff basis, producer 
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -487,7 +487,7 @@ describe('computeNetDiffText (#2450 — reviewer-facing NET diff TEXT, SAME basi
       // fixture key means adding one guard to one more call site reds 17 unrelated tests and tempts the author
       // to drop the guard instead of the fixtures. Each has its own dedicated assertion (`guards the git-diff
       // argv…`, `computeNetDiffText passes --no-ext-diff`), which is where a regression must fail.
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -581,7 +581,7 @@ describe('resolveNetDiffBasis shared across both helpers (#2890-review-fix findi
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -654,7 +654,7 @@ describe('#2890-review-r2 finding 1 — a basis resolved for a DIFFERENT request
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -754,7 +754,7 @@ describe('computeNetDiffSignals — the ONE net-diff derivation both call sites 
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -889,6 +889,8 @@ describe('computeNetDiffText passes --no-ext-diff (#2890-review-r2 finding 2b)',
     computeNetDiffText({ exec, rev: 'deadbeef' });
     const textDiff = calls.find((a) => a[0] === 'diff' && !a.includes('--numstat'));
     expect(textDiff).toContain('--no-ext-diff');
+    expect(textDiff).toContain('--no-textconv');
+    expect(textDiff.indexOf('--no-textconv')).toBeLessThan(textDiff.indexOf('--end-of-options'));
     expect(textDiff.indexOf('--no-ext-diff')).toBeLessThan(textDiff.indexOf('--end-of-options'));
   });
   it('but NOT --text: a whole-PR diff must not force binary assets into the reviewer-facing text', () => {
@@ -907,7 +909,7 @@ describe('computeNetDiffPaths (#2901/#1031 — NET changed-file list as plain pa
   const fakeExec = (script = {}) => {
     const calls = [];
     const exec = (cmd, args, opts) => {
-      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff');
+      const intent = args.filter((a) => a !== '--end-of-options' && a !== '--verify' && a !== '--no-ext-diff' && a !== '--no-textconv');
       calls.push({ cmd, args, opts, key: `${cmd} ${intent.join(' ')}` });
       const h = script[`${cmd} ${intent.join(' ')}`];
       if (h && h.throw) throw new Error(h.throw);
@@ -986,7 +988,7 @@ describe('R1105 pinned test-gaming evidence producer', () => {
     const sig = computeNetDiffSignals({ exec, rev: 'lane/x', pinRev: true });
     expect(sig.netDiffText).toMatchObject({ scored: true, rev: head });
     expect(calls.filter((a) => a[0] === 'diff' && !a.includes('--numstat'))).toEqual([
-      ['diff', '--no-ext-diff', '--end-of-options', base, head],
+      ['diff', '--no-ext-diff', '--no-textconv', '--end-of-options', base, head],
     ]);
   });
   it('the drain requests pinning, supplies approved-head evidence, and holds incomplete scans', () => {

@@ -26,7 +26,7 @@ const base = () => ({
     commits: [{ oid: HEAD, messageHeadline: 'x', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>' }],
     statusCheckRollup: [] },
   manifest: { live: null },
-  netSignals: { scored: true, changedFiles: ['docs/a.md'], diffLines: 2, humanBasisFiles: ['docs/a.md'], cumulativeDiffLines: 2, basisNarrowed: true, netDiffText: { text: '', scored: true }, diffHunks: '' },
+  netSignals: { scored: true, changedFiles: ['docs/a.md'], diffLines: 2, humanBasisFiles: ['docs/a.md'], cumulativeDiffLines: 2, basisNarrowed: true, netDiffText: { text: 'diff --git a/docs/a.md b/docs/a.md\n@@ -0,0 +1 @@\n+doc\n', scored: true, rev: HEAD }, diffHunks: '' },
   acceptance: { headSha: HEAD, acceptedSha: HEAD, acceptedDiff: null, acceptedContribution: null, operatorClearance: null, humanClearedSha: null, headDiff: null, headContribution: null, headReadFailed: false },
   bodyHistory: { bodies: ['A real body'], complete: true },
   duplicateIds: { main: [] },
@@ -108,6 +108,7 @@ describe('red-team check run merge gate', () => {
     const prs = membership.nums.map(num => {
       const sha = membership.heads[num];
       return evaluatePrGates(facts({ num, pr: { number: num, headRefOid: sha }, pinnedHead: { sha },
+        netSignals: { netDiffText: { ...base().netSignals.netDiffText, rev: sha } },
         acceptance: { headSha: sha, acceptedSha: sha }, duplicateIds: { main: [], group: [] },
         redTeamCheck: { ok: num === 7 || secondOk, reason: num === 8 && !secondOk ? 'no red-team check run on head' : 'success' },
       }), { mergeEvent: 'merge_group' });
@@ -123,6 +124,21 @@ describe('red-team check run merge gate', () => {
 });
 
 describe('evaluatePrGates', () => {
+  it.each([
+    ['empty', { text: '', scored: true, rev: HEAD }],
+    ['unscored', { text: "diff --git a/docs/a.md b/docs/a.md\n@@ -0,0 +1 @@\n+doc\n", scored: false, rev: HEAD }],
+    ['unpinned', { text: "diff --git a/docs/a.md b/docs/a.md\n@@ -0,0 +1 @@\n+doc\n", scored: true, rev: 'origin/lane/x' }],
+    ['truncated', { text: "diff --git a/docs/a.md b/docs/a.md\n@@ -1,100 +1,100 @@\n", scored: true, rev: HEAD }],
+  ])('holds %s test evidence despite matching human clearance', (_name, netDiffText) => {
+    check(facts({ netSignals: { netDiffText }, acceptance: { humanClearedSha: HEAD } }), 'test-gaming', 'hold');
+  });
+
+  it('preserves matching human clearance for genuine test findings', () => {
+    const text = "diff --git a/x.test.mjs b/x.test.mjs\n@@ -0,0 +1 @@\n+it.skip('x', () => {});\n";
+    check(facts({ netSignals: { netDiffText: { text, scored: true, rev: HEAD } },
+      acceptance: { humanClearedSha: HEAD } }), 'test-gaming', 'pass', true);
+  });
+
   it('passes the accepted baseline', () => {
     const result = evaluatePrGates(base());
     expect(result.ok, JSON.stringify(result.blocking)).toBe(true);
@@ -144,7 +160,7 @@ describe('evaluatePrGates', () => {
     ['non-default base', { pr: { baseRefName: 'lane/y' } }, 'default-base', 'hold'],
     ['unknown default branch', { defaultBranch: null }, 'default-base', 'fail-closed'],
     ['failed CodeQL', { pr: { statusCheckRollup: codeql } }, 'codeql', 'hold'],
-    ['deleted test', { netSignals: { netDiffText: { text: "diff --git a/x.test.mjs b/x.test.mjs\ndeleted file mode 100644\n--- a/x.test.mjs\n+++ /dev/null\n@@ -1 +0,0 @@\n-it('a', () => {})\n", scored: true } } }, 'test-gaming', 'hold'],
+    ['deleted test', { netSignals: { netDiffText: { text: "diff --git a/x.test.mjs b/x.test.mjs\ndeleted file mode 100644\n--- a/x.test.mjs\n+++ /dev/null\n@@ -1 +0,0 @@\n-it('a', () => {})\n", scored: true, rev: HEAD } } }, 'test-gaming', 'hold'],
     ['unscored diff without fallback files', { netSignals: { scored: false } }, 'test-gaming', 'fail-closed'],
     ['removed historical manifest', { bodyHistory: { bodies: ['A real body', manifestBody] } }, 'manifest-baseline', 'hold'],
     ['incomplete body history', { bodyHistory: { complete: false } }, 'manifest-baseline', 'fail-closed'],
@@ -990,7 +1006,7 @@ describe('ci.yml and soak-replay-gate.yml report on merge_group', () => {
 describe('a diff to the merge-gate workflow is escalated, not waved through', () => {
   const file = '.github/workflows/merge-gate.yml';
   const patch = `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-run: node scripts/merge-gate-check.mjs\n+run: exit 0\n`;
-  const edit = { netSignals: { changedFiles: [file], humanBasisFiles: [file], diffLines: 2, cumulativeDiffLines: 2, netDiffText: { text: patch, scored: true }, diffHunks: patch } };
+  const edit = { netSignals: { changedFiles: [file], humanBasisFiles: [file], diffLines: 2, cumulativeDiffLines: 2, netDiffText: { text: patch, scored: true, rev: HEAD }, diffHunks: patch } };
 
   it('scores the edit as a blast-radius escalation', () => {
     const score = scoreEscalation({ changedFiles: [file], diffLines: 2, humanBasisFiles: [file], cumulativeDiffLines: 2, dismissedFindings: 0, crossRepo: false, diffHunks: patch, basisNarrowed: true });
