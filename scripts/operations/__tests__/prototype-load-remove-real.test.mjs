@@ -32,6 +32,8 @@ async function removalFixture({ concurrent = false, descendant = true, identity 
       if (command === 'git') {
         if (args[0] === 'fetch') return '';
         if (args[0] === 'rev-parse') {
+          if (args[1] === '--is-shallow-repository') return 'false';
+          if (args[1] === '--git-path') return '.git/shallow';
           if (args.at(-1) === `refs/remotes/origin/${BASE}^{commit}`) {
             // The listing has already been captured. Introduce the new dependent
             // immediately before the real retirement acquires its add guard.

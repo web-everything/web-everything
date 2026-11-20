@@ -63,7 +63,11 @@ describe('operator retirement of a live overlay', () => {
       exec: (command, args) => {
         if (command === 'node' && args[1] === 'list') return JSON.stringify({ list: readOverlays(root, { env }) });
         if (command === 'git' && args[0] === 'fetch') return '';
-        if (command === 'git' && args[0] === 'rev-parse') return sha;
+        if (command === 'git' && args[0] === 'rev-parse') {
+          if (args[1] === '--is-shallow-repository') return 'false';
+          if (args[1] === '--git-path') return '.git/shallow';
+          return sha;
+        }
         if (command === 'git' && args[0] === 'ls-remote') return `${sha}\trefs/heads/${ref}`;
         throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
       } });

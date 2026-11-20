@@ -3,8 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { withdrawUnregisteredOverlay, main, replaceRegistration } from '../daemon-overlay.mjs';
-import { addOverlay, appendOverlayEvent, overlayFilePath } from '../lib/daemon-overlays.mjs';
+import { withdrawUnregisteredOverlay, withdrawRegisteredOverlay, main, replaceRegistration } from '../daemon-overlay.mjs';
+import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays } from '../lib/daemon-overlays.mjs';
 import { overlayRetiredByOperator } from '../lib/daemon-rebuild/adopt.mjs';
 import { REBUILD_IDENTITY_ENV } from '../lib/daemon-rebuild/shared.mjs';
 import { AUTOMATIC_RETIREMENT_REASONS } from '../operations/prototype-retire.mjs';
@@ -40,6 +40,39 @@ function fixture() {
   const events = () => { try { return readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); } catch { return []; } };
   return { root, env, git, args, tip, events };
 }
+
+describe.each(['registered', 'unregistered'])('%s withdrawal history guard', path => {
+  it.each([true, false])('refuses shallow clones and accepts complete clones (shallow: %s)', async shallow => {
+    const f = fixture();
+    const root = join(f.root, 'clone');
+    const cloned = spawnSync('git', ['clone', ...(shallow ? ['--depth=2'] : []), '--branch=main', `file://${f.root}`, root], { encoding: 'utf8' });
+    expect(cloned.status, cloned.stderr).toBe(0);
+    const env = { ...f.env, WE_DAEMON_OVERLAY_DIR: join(root, 'store') };
+    const runGit = (...args) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8' });
+    expect(runGit('rev-parse', '--is-shallow-repository').stdout.trim()).toBe(String(shallow));
+    expect(runGit('update-ref', 'refs/remotes/origin/main', f.git('rev-parse', 'refs/remotes/origin/main')).status).toBe(0);
+    if (path === 'registered') addOverlay(root, { ref: f.args.ref }, { env });
+    const before = readOverlays(root, { env });
+    const withdraw = () => path === 'unregistered'
+      ? withdrawUnregisteredOverlay({ ...f.args, root, env })
+      : withdrawRegisteredOverlay({ root, env, ref: f.args.ref, expectedTip: f.tip, actor: 'chalbert', reason: f.args.reason,
+        deps: { tip: () => f.tip },
+        git: (...args) => {
+          const r = args[0] === 'ls-remote' ? { status: 0, stdout: `${f.tip}\trefs/heads/${f.args.ref}` } : runGit(...args);
+          return { code: r.status, stdout: r.stdout ?? '' };
+        } });
+    if (shallow) {
+      await expect(withdraw()).rejects.toThrow(
+        'history is shallow; cannot prove no registered overlay depends on lane/withdraw; restore complete clone history and retry withdrawal');
+      expect(readOverlays(root, { env })).toEqual(before);
+      expect(() => readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'))).toThrow();
+    } else {
+      expect(await withdraw()).toMatchObject({ retired: true });
+      const events = readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+      expect(events.at(-1)).toMatchObject({ operatorReason: true });
+    }
+  });
+});
 
 describe('operator withdrawal of an unregistered live overlay', () => {
   it.each(['stackBases', 'stackVia', 'ancestry'])('refuses a registered stacked dependent via %s even with acceptance', async (via) => {
@@ -138,19 +171,6 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
       "history is shallow; cannot prove no registered overlay depends on lane/withdraw");
     expect(f.events()).toEqual(before);
-  });
-  it('refuses a depth-limited shallow clone even with explicit acceptance', async () => {
-    const f = fixture();
-    const root = join(f.root, 'clone');
-    const cloned = spawnSync('git', ['clone', '--depth=2', '--branch=main', `file://${f.root}`, root], { encoding: 'utf8' });
-    expect(cloned.status, cloned.stderr).toBe(0);
-    const env = { ...f.env, WE_DAEMON_OVERLAY_DIR: join(root, 'store') };
-    const runGit = (...args) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8' });
-    expect(runGit('rev-parse', '--is-shallow-repository').stdout.trim()).toBe('true');
-    expect(runGit('update-ref', 'refs/remotes/origin/main', f.git('rev-parse', 'refs/remotes/origin/main')).status).toBe(0);
-    await expect(withdrawUnregisteredOverlay({ ...f.args, root, env })).rejects.toThrow(
-      'history is shallow; cannot prove no registered overlay depends on lane/withdraw');
-    expect(() => readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'))).toThrow();
   });
   it.each([false, true])('refuses a fetched dependent with a shallow merge parent despite a common ancestor (reported shallow: %s)', async reportedShallow => {
     const f = fixture();

@@ -146,6 +146,35 @@ function removalActor({ actor, env, deps }) {
   }
 }
 
+/** Incomplete history cannot prove independence, even when Git reports a negative ancestry result. */
+function refuseShallowHistory({ root, ref, env, git = (...args) => {
+  const r = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
+  return { code: r.error ? null : r.status, stdout: r.stdout };
+} }) {
+  let shallow;
+  try {
+    const state = git('rev-parse', '--is-shallow-repository');
+    if (state.error || state.code !== 0 || !['true', 'false'].includes(state.stdout?.trim()))
+      throw new Error('unreadable shallow state');
+    shallow = state.stdout.trim() === 'true';
+    if (!shallow) {
+      const path = git('rev-parse', '--git-path', 'shallow');
+      if (path.error || path.code !== 0 || !path.stdout?.trim()) throw new Error('unreadable shallow path');
+      const shallowPath = resolve(root, path.stdout.trim());
+      let exists = true;
+      try { lstatSync(shallowPath); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        exists = false;
+      }
+      if (exists) shallow = readFileSync(shallowPath).length > 0;
+    }
+  } catch {
+    throw new Error(`history state unreadable; cannot prove no registered overlay depends on ${ref}; restore complete clone history and retry withdrawal`);
+  }
+  if (shallow) throw new Error(`history is shallow; cannot prove no registered overlay depends on ${ref}; restore complete clone history and retry withdrawal`);
+}
+
 /** Operator repair of an actorless withdrawal: refresh registered overlays before proving independence. */
 export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reason, acceptUncontained = false, env = process.env, deps = {} }) {
   if (!safeRegistrationRef(ref)) throw new Error('a valid --ref is required');
@@ -180,30 +209,11 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
     } catch { /* Unknown freshness cannot authorize withdrawal. */ }
     if (fetched?.ok !== true || !Array.isArray(fetched.goneRefs) || fetched.goneRefs.length > 0)
       throw new Error("could not refresh the clone's overlays; restore remote access and overlay refs, then retry withdrawal");
-    // Fetch does not unshallow history. Check the same Git context used below for
-    // dependent ancestry, including its shallow file even if Git reports false.
-    let shallow;
-    try {
-      const state = git(['rev-parse', '--is-shallow-repository']);
-      if (state.error || state.status !== 0 || !['true', 'false'].includes(state.stdout?.trim()))
-        throw new Error('unreadable shallow state');
-      shallow = state.stdout.trim() === 'true';
-      if (!shallow) {
-        const path = git(['rev-parse', '--git-path', 'shallow']);
-        if (path.error || path.status !== 0 || !path.stdout?.trim()) throw new Error('unreadable shallow path');
-        const shallowPath = resolve(root, path.stdout.trim());
-        let exists = true;
-        try { lstatSync(shallowPath); }
-        catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-          exists = false;
-        }
-        if (exists) shallow = readFileSync(shallowPath).length > 0;
-      }
-    } catch {
-      throw new Error(`history state unreadable; cannot prove no registered overlay depends on ${ref}; restore complete clone history and retry withdrawal`);
-    }
-    if (shallow) throw new Error(`history is shallow; cannot prove no registered overlay depends on ${ref}; restore complete clone history and retry withdrawal`);
+    // Fetch does not unshallow history; inspect the same Git context used for ancestry.
+    refuseShallowHistory({ root, ref, env, git: (...args) => {
+      const r = git(args);
+      return { code: r.error ? null : r.status, stdout: r.stdout };
+    } });
     const proof = proveOverlayWithdrawal({ root, ref, tip, reason, env, localOnly: true,
       git: (...args) => { const r = git(args); return { code: r.error ? null : r.status, stdout: r.stdout ?? '' }; } });
     if (proof.action !== 'retire') throw new Error(`${proof.reason}; inspect stacked dependents and restore local tracking refs before retrying withdrawal`);
@@ -616,7 +626,10 @@ export function withdrawRegisteredOverlay({ reason, git, ...options }) {
   if (typeof reason !== 'string' || !reason.trim() || AUTOMATIC_RETIREMENT_REASONS.includes(reason.trim().toLowerCase()))
     throw new Error('explicit operator withdrawal reason required');
   return retireRegistrationTransaction({ ...options, deps: { ...options.deps,
-    prove: () => proveOverlayWithdrawal({ ...options, tip: options.expectedTip, reason, git }),
+    prove: () => {
+      refuseShallowHistory({ ...options, git });
+      return proveOverlayWithdrawal({ ...options, tip: options.expectedTip, reason, git });
+    },
   } }, true);
 }
 

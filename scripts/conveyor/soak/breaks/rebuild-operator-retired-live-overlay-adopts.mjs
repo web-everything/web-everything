@@ -48,7 +48,13 @@ export default {
       addOverlay(scratch, { ref }, { env });
       appendOverlayEvent(scratch, { kind: 'added', ref, at: '2026-11-14T10:00:00Z' }, { env });
       const expectedEntry = readOverlays(scratch, { env }).find((entry) => entry.ref === ref);
-      const removal = await withdrawRegisteredOverlay({ reason, git: (cmd) => ({ code: 0, stdout: cmd === 'ls-remote' ? `${sha}\trefs/heads/${ref}` : '' }), root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
+      // Model complete history through the Git seam; the private scratch has no shallow boundary file.
+      const git = (cmd, ...args) => {
+        if (cmd === 'rev-parse' && args[0] === '--is-shallow-repository') return { code: 0, stdout: 'false\n' };
+        if (cmd === 'rev-parse' && args[0] === '--git-path' && args[1] === 'shallow') return { code: 0, stdout: '.git/shallow\n' };
+        return { code: 0, stdout: cmd === 'ls-remote' ? `${sha}\trefs/heads/${ref}` : '' };
+      };
+      const removal = await withdrawRegisteredOverlay({ reason, git, root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
         deps: { tip: () => sha } });
       const events = readOverlayEventLog(scratch, env);
       const removed = events.at(-1);
