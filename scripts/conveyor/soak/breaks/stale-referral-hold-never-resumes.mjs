@@ -69,6 +69,7 @@ export default {
         }) };
       };
       const asPr = f => ({ number: f.number, headRefOid: f.headRefOid, body: f.body, createdAt: f.createdAt, isDraft: false,
+        rowsComplete: true, rowsHead: f.headRefOid,
         baseRefName: 'main', labels: f.labels.map(name => ({ name })), comments: f.comments,
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'ci' }] });
       const planFor = (f, env) => {
