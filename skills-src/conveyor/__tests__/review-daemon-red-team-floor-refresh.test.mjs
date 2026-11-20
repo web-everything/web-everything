@@ -195,9 +195,9 @@ it('production maintenance retains planner skips while re-keying heads and defer
   writeFileSync(file, JSON.stringify(entries));
   const { cliReviewTickOpts } = await import('../review-daemon.mjs');
   const opts = cliReviewTickOpts({ log, readLivePr: ({ pr }) => {
-    if (pr === 5) return { state: 'OPEN', headRefOid: 'b'.repeat(40) };
+    if (pr === 5) return { state: 'OPEN', comments: [], headRefOid: 'b'.repeat(40) };
     if (pr === 6) return null;
-    return { state: 'OPEN', headRefOid: 'a'.repeat(40) };
+    return { state: 'OPEN', comments: [], headRefOid: 'a'.repeat(40) };
   } });
   opts.reconcileRedTeamQueue({ repo: 'example/project' });
   const persisted = JSON.parse(readFileSync(file, 'utf8'));
