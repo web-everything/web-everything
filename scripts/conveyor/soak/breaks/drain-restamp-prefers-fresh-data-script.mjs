@@ -1,6 +1,6 @@
 /** Drain re-stamps must prefer fresh DATA over a daemon's older CODE checkout.
  * Real Git histories and real toy children exercise the exported production function.
- * Only fetch (no transport) and the CODE fallback launch location use IO seams.
+ * Only fetch (no transport), CODE origin lookup and fallback launch location use IO seams.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -21,7 +21,8 @@ if (process.argv.includes('--soak-stale')) {
 `;
 const PROBE = `
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 const [moduleUrl, code, data, keyOnly] = process.argv.slice(1);
 const { restampAcceptance } = await import(moduleUrl);
 const { classifySkipReason } = await import(new URL('./lib/drain-skip-reasons.mjs', moduleUrl));
@@ -35,12 +36,15 @@ const gitRun = (args, opts) => {
   // Both clones already have origin/main from the immutable local bare origin.
   // Do not perform fetch/push even in fixtures; only the fetch result is injected.
   if (args[0] === 'fetch') return { status: fetchFails ? 1 : 0, stdout: '', stderr: 'fixture transport' };
+  // Map the imported module's CODE identity to the real toy CODE clone, just as
+  // its fallback launch below is mapped. Both toy clones share the bare origin.
+  if (args[0] === 'remote' && opts.cwd === dirname(dirname(fileURLToPath(moduleUrl)))) opts = { ...opts, cwd: code };
   return spawnSync('git', args, opts);
 };
 const invoke = (label, expected) => {
   calls = [];
   const result = restampAcceptance({ pr: 4880, repo: 'soak/we', newHead: 'new-head',
-    cwd: code, freshRoot: data, gitRun,
+    cwd: code, freshRoot: data, gitRun, env: {},
     spawn(cmd, args, opts) {
       calls.push(args[0]);
       check(!Object.hasOwn(opts.env || {}, 'WE_DAEMON_MANAGED_CLONE'),

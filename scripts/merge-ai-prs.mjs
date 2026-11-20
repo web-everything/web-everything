@@ -1592,23 +1592,34 @@ export function spawnReviewSetLabel({ pr, repo, to, cwd, actor, channel, reason,
 }
 
 export function restampAcceptance({ pr, repo, newHead, cwd, freshRoot = process.cwd(),
-  gitRun = (args, opts) => spawnSync('git', args, opts), spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }) }) {
+  gitRun = (args, opts) => spawnSync('git', args, opts), spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }), env = process.env }) {
   try {
     const target = repo || localRepo();
     if (!target) return { ok: false, reason: 'no repo to re-stamp (PR repo unset and the local repo slug unreadable)' };
     let script = new URL('./review-set-label.mjs', import.meta.url).pathname;
     // The daemon code clone may intentionally lag main. Prefer its data checkout only after a fresh
-    // fetch proves it is current; incomplete evidence retains the old path and the child's strict gate.
+    // fetch proves it is exactly main, clean, and from the same origin; incomplete evidence retains
+    // the old path and the child's strict gate.
     try {
       const candidate = join(freshRoot, 'scripts/review-set-label.mjs');
       const opts = { cwd: freshRoot, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 };
-      if (statSync(candidate).isFile()) {
+      if (env.WE_OPERATOR_CLI_FRESH_FALLBACK !== 'off' && statSync(candidate).isFile()) {
         const tree = gitRun(['rev-parse', '--is-inside-work-tree'], opts);
         if (tree.status === 0 && String(tree.stdout).trim() === 'true') {
-          const fetched = gitRun(['fetch', 'origin', 'main'], opts);
-          if (fetched.status === 0) {
-            const behind = gitRun(['rev-list', '--count', 'HEAD..origin/main'], opts);
-            if (behind.status === 0 && String(behind.stdout).trim() === '0') script = candidate;
+          const status = gitRun(['status', '--porcelain', '--untracked-files=no'], opts);
+          if (status.status === 0 && typeof status.stdout === 'string' && status.stdout.trim() === '') {
+            const dataOrigin = gitRun(['remote', 'get-url', 'origin'], opts);
+            const codeOrigin = gitRun(['remote', 'get-url', 'origin'], { ...opts, cwd: dirname(dirname(script)) });
+            if (dataOrigin.status === 0 && codeOrigin.status === 0 && dataOrigin.stdout?.trim()
+              && dataOrigin.stdout.trim() === codeOrigin.stdout?.trim()) {
+              const fetched = gitRun(['fetch', 'origin', 'main'], opts);
+              if (fetched.status === 0) {
+                const head = gitRun(['rev-parse', 'HEAD'], opts);
+                const main = gitRun(['rev-parse', 'origin/main'], opts);
+                if (head.status === 0 && main.status === 0 && head.stdout?.trim()
+                  && head.stdout.trim() === main.stdout?.trim()) script = candidate;
+              }
+            }
           }
         }
       }

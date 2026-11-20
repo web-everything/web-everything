@@ -170,8 +170,59 @@ describe('restampAcceptance fresh data clone selection', () => {
     writeFileSync(script, '// fixture');
     try { test(root, script); } finally { rmSync(root, { recursive: true, force: true }); }
   };
-  const freshGit = (args) => ({ status: 0, stdout: args[0] === 'rev-parse' ? 'true\n' : args[0] === 'rev-list' ? '0\n' : '' });
+  const freshGit = (args) => ({ status: 0, stdout: args[0] === 'remote' ? 'same-origin\n'
+    : args[0] === 'rev-parse' ? (args[1] === '--is-inside-work-tree' ? 'true\n' : 'main-sha\n')
+    : args[0] === 'rev-list' ? '0\n' : '' });
   const fallback = new URL('../review-set-label.mjs', import.meta.url).pathname;
+  const codeRoot = dirname(dirname(fallback));
+
+  it('injected off switch retains the old script without probing the data checkout', () => withDataClone((root) => {
+    const gitRun = vi.fn(freshGit);
+    const spawn = vi.fn(() => ({ status: 0 }));
+    restampAcceptance({ pr: 1, repo: 'owner/we', newHead: 'abc', freshRoot: root,
+      env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' }, gitRun, spawn });
+    expect(spawn.mock.calls[0][1][0]).toBe(fallback);
+    expect(gitRun).not.toHaveBeenCalled();
+  }));
+
+  it('defaults to process.env but an injected env overrides the ambient off switch', () => withDataClone((root, script) => {
+    vi.stubEnv('WE_OPERATOR_CLI_FRESH_FALLBACK', 'off');
+    try {
+      const spawn = vi.fn(() => ({ status: 0 }));
+      const options = { pr: 1, repo: 'owner/we', newHead: 'abc', freshRoot: root, gitRun: freshGit, spawn };
+      restampAcceptance(options);
+      expect(spawn.mock.calls[0][1][0]).toBe(fallback);
+      restampAcceptance({ ...options, env: {} });
+      expect(spawn.mock.calls[1][1][0]).toBe(script);
+    } finally { vi.unstubAllEnvs(); }
+  }));
+
+  it.each(['dirty', 'unreadable-status', 'missing-status-output', 'ahead', 'different-origin', 'unreadable-data-origin', 'unreadable-code-origin', 'empty-origin', 'unreadable-head', 'empty-head', 'unreadable-main'])(
+    '%s evidence retains the old script', (failure) => withDataClone((root) => {
+      const gitRun = vi.fn((args, opts) => {
+        if (args[0] === 'status') {
+          if (failure === 'dirty') return { status: 0, stdout: ' M scripts/review-set-label.mjs\n' };
+          if (failure === 'unreadable-status') return { status: 1 };
+          if (failure === 'missing-status-output') return { status: 0 };
+        }
+        if (args[0] === 'remote') {
+          if (failure === 'different-origin' && opts.cwd === root) return { status: 0, stdout: 'other-origin\n' };
+          if (failure === 'empty-origin') return { status: 0, stdout: '' };
+          if ((failure === 'unreadable-data-origin' && opts.cwd === root)
+            || (failure === 'unreadable-code-origin' && opts.cwd === codeRoot)) return { status: 1 };
+        }
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') {
+          if (failure === 'ahead') return { status: 0, stdout: 'local-commit\n' };
+          if (failure === 'unreadable-head') return { status: 1 };
+          if (failure === 'empty-head') return { status: 0, stdout: '' };
+        }
+        if (failure === 'unreadable-main' && args[1] === 'origin/main') return { status: 1 };
+        return freshGit(args);
+      });
+      const spawn = vi.fn(() => ({ status: 0 }));
+      restampAcceptance({ pr: 1, repo: 'owner/we', newHead: 'abc', freshRoot: root, env: {}, gitRun, spawn });
+      expect(spawn.mock.calls[0][1][0]).toBe(fallback);
+    }));
 
   it('stale code clone uses the fresh data clone script with unchanged argv and no freshness bypass', () => withDataClone((root, script) => {
     const before = process.env.WE_DAEMON_MANAGED_CLONE;
@@ -185,10 +236,13 @@ describe('restampAcceptance fresh data clone selection', () => {
     expect(spawn).toHaveBeenCalledWith(process.execPath, [script, '7204', '--repo=owner/we', '--to=restamp', '--actor=drain', '--channel=drain-rebase',
       "--reason=head moved to abc by this drain's own content-preserving rebase", '--new-head=abc'], { encoding: 'utf8', cwd: undefined });
     expect(gitRun.mock.calls.map(([args]) => args)).toEqual([
-      ['rev-parse', '--is-inside-work-tree'], ['fetch', 'origin', 'main'], ['rev-list', '--count', 'HEAD..origin/main'],
+      ['rev-parse', '--is-inside-work-tree'], ['status', '--porcelain', '--untracked-files=no'],
+      ['remote', 'get-url', 'origin'], ['remote', 'get-url', 'origin'],
+      ['fetch', 'origin', 'main'], ['rev-parse', 'HEAD'], ['rev-parse', 'origin/main'],
     ]);
-    for (const [, opts] of gitRun.mock.calls) {
-      expect(opts.cwd).toBe(root);
+    expect(gitRun.mock.calls[3][1].cwd).toBe(codeRoot);
+    for (const [index, [, opts]] of gitRun.mock.calls.entries()) {
+      expect(opts.cwd).toBe(index === 3 ? codeRoot : root);
       expect(opts.timeout).toBeGreaterThan(0);
       expect(opts.maxBuffer).toBeGreaterThan(0);
       expect(opts.env).toBeUndefined();
@@ -202,17 +256,17 @@ describe('restampAcceptance fresh data clone selection', () => {
     restampAcceptance({ pr: 1, repo: 'frontierui', newHead: 'abc', cwd: '/ws/frontierui', gitRun, spawn });
     expect(spawn.mock.calls[0][1][0]).toBe(join(process.cwd(), 'scripts/review-set-label.mjs'));
     expect(spawn.mock.calls[0][2].cwd).toBe('/ws/frontierui');
-    expect(gitRun.mock.calls.every(([, opts]) => opts.cwd === process.cwd())).toBe(true);
+    expect(gitRun.mock.calls.every(([, opts], index) => opts.cwd === (index === 3 ? codeRoot : process.cwd()))).toBe(true);
   });
 
-  it.each(['stale', 'fetch-failed', 'not-work-tree', 'unreadable-count', 'git-throws', 'missing-script'])(
+  it.each(['stale', 'fetch-failed', 'not-work-tree', 'unreadable-main', 'git-throws', 'missing-script'])(
     '%s data clone falls back and stale refusal remains failed and retryable', (failure) => withDataClone((root, script) => {
       if (failure === 'missing-script') rmSync(script);
       const gitRun = vi.fn((args) => {
         if (failure === 'git-throws') throw new Error('git unavailable');
         if (failure === 'fetch-failed' && args[0] === 'fetch') return { status: 1, stdout: '' };
         if (failure === 'not-work-tree' && args[0] === 'rev-parse') return { status: 0, stdout: 'false' };
-        if (args[0] === 'rev-list') return { status: 0, stdout: failure === 'stale' ? '25' : failure === 'unreadable-count' ? '' : '0' };
+        if (args[1] === 'origin/main') return { status: 0, stdout: failure === 'stale' ? 'new-main-sha' : failure === 'unreadable-main' ? '' : 'main-sha' };
         return freshGit(args);
       });
       const spawn = vi.fn(() => ({ status: 1, stdout: 'some progress', stderr: 'this checkout is 25 commit(s) behind origin/main — STALE code\nlast line' }));
