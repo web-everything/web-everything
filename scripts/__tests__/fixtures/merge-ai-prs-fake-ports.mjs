@@ -1,5 +1,6 @@
 // Function ports and executable shims share the same response code and call logs.
 import * as fs from 'node:fs';
+import { drainScoredGit } from './drain-scored-git.mjs';
 import { openPrPageFixture } from './open-pr-page-fixture.mjs';
 
 function prestageGh(process, fs, page) {
@@ -40,15 +41,14 @@ if (a[0] === 'api') {
 out([]);
 }
 
-function prestageGit(process, fs, page) {
-const a = process.argv.slice(2);
+function prestageGit(process, fs, page, scoredGit) {
+let a = process.argv.slice(2);
+while (a[0] === '-c') a = a.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\n');
-else if (a[0] === 'merge-base' || a[0] === 'rev-parse') process.stdout.write('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
-else if (a[0] === 'diff') {
-  if (a.includes('--name-only')) process.stdout.write('README.md\0');
-  else if (a.includes('--numstat')) process.stdout.write('1\t0\tREADME.md\n');
-  else process.stdout.write('diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n');
+else if (['rev-parse', 'cat-file', 'merge-base', 'diff'].includes(a[0])) {
+  const result = scoredGit(a, { gitDir: process.env.PRESTAGE_PR.replace(/pr\.json$/, '.git'), files: [{ path: 'README.md' }] });
+  if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
 } else if (a[0] === 'ls-tree' && a.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')) process.stdout.write('backlog/xabc123-card.md\n');
 else if (a[0] === 'show') {
   if (a[1] === 'origin/main:scripts/lib/queue-branch-numbering.mjs') process.stdout.write('drain-branch-numbering-ci-v1');
@@ -86,7 +86,7 @@ function capture(port, args, env) {
   try { port(process, { ...fs, writeSync(fd, value) {
     if (fd !== 1) throw new Error(`Unexpected fixture fd ${fd}`);
     write(value); return Buffer.byteLength(value);
-  } }, openPrPageFixture); } catch (error) { if (error !== stopped) throw error; }
+  } }, openPrPageFixture, drainScoredGit); } catch (error) { if (error !== stopped) throw error; }
   return { status, stdout, stderr: '' };
 }
 const port = fn => (args, env) => capture(fn, args, env);
@@ -96,7 +96,7 @@ export const listingPorts = { gh: port(listingGh), git: args => {
   return { status: 128, stdout: '', stderr: 'fatal: no origin or revision' };
 } };
 const scriptFor = fn => `#!/usr/bin/env node
-(${fn.toString()})(process, require('node:fs'), ${openPrPageFixture.toString()});
+(${fn.toString()})(process, require('node:fs'), ${openPrPageFixture.toString()}, ${drainScoredGit.toString()});
 `;
 export const fakeGh = scriptFor(prestageGh);
 export const fakeGit = scriptFor(prestageGit);
