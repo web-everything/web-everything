@@ -301,7 +301,9 @@ export const LOCK_USERS = Object.freeze([
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
   'scripts/conveyor/pr-live-owner-watch-io.mjs',
   // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
-  'scripts/conveyor/timeout-evidence-pool.mjs']);
+  'scripts/conveyor/timeout-evidence-pool.mjs',
+  // The shared stuck-trace queue serializes enqueue, claims and completion through withFileLock.
+  'scripts/conveyor/stuck-trace.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever

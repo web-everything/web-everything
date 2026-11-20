@@ -1108,6 +1108,24 @@ describe('prototype-load', () => {
     const f = fixture({ ready, testCheck: async () => null }); expect((await f.run()).stopReason).toBe('no-ready');
     expect(f.calls).toHaveLength(ready ? 0 : 2); expect(f.records[0].stopReason).toBe('no-ready');
   });
+  it('reports sha-not-branch-tip for the waiver-store SHA after passing CI and audit', async () => {
+    const sha = '71e7a2a4cca30e5d2980a39657e33431d10f4c26';
+    const tip = '9e4265deac224fa579703f2c8c76324c0d114e3a';
+    const f = fixture({ sha, tip });
+    expect(await f.run({ branch: 'lane/waiver-store', dryRun: true })).toMatchObject({
+      ok: false, stopReason: 'no-ready', detail: 'sha-not-branch-tip',
+      canonicalAudit: { ok: true }, gate: { reason: 'sha-not-branch-tip', tip },
+      fallback: expect.stringContaining(tip),
+    });
+    expect(f.readyWrites).toEqual([]);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('names an unreadable branch-tip refresh after passing CI', async () => {
+    const f = fixture({ staleFetchFails: BASE.branch });
+    expect(await f.run()).toMatchObject({ stopReason: 'no-ready', detail: 'branch-tip-unreadable', fallback: expect.any(String) });
+    expect(f.readyWrites).toEqual([]);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
   it('no-ready: a record for another sha is not evidence about this head, so the check-run path decides', async () => {
     // Was pinned as a zero-call refusal (PR #6610 review): that stranded every iterated branch after its first load.
     const stale = JSON.stringify({ ref: BASE.branch, sha: TREE, tests: 'green', audit: 'NOT WEAKENED' });
@@ -1119,7 +1137,7 @@ describe('prototype-load', () => {
     const f = fixture({ ready: '', testCheck: async () => null }); expect((await f.run({ testsRun: 'test-1', audit: 'not weakened' })).ok).toBe(false);
   });
   it('refuses a branch tip mismatch before main checks', async () => {
-    const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r.stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(4);
+    const f = fixture({ tip: TREE }); const r = await f.run(); expect(r.gate.reason).toBe('sha-not-branch-tip'); expect(r).toMatchObject({ stopReason: 'no-ready', detail: 'sha-not-branch-tip', fallback: expect.stringContaining('branch tip') }); expect(f.calls).toHaveLength(4);
   });
   it.each(['lane/../x', '-danger', 'lane/x.lock', 'main'])('bad-input: refuses unsafe ref %s', async (branch) => {
     const f = fixture(); expect((await f.run({ branch })).stopReason).toBe('bad-input'); expect(f.calls).toHaveLength(0);
@@ -1828,14 +1846,14 @@ describe('prototype-load', () => {
   it.each([false, true])('sha-moved stops before add or removal (generated merge: %s)', async (behind) => {
     const f = fixture({ behind, advanceAfterCheck: true, list: ['lane/old'], contained: ['lane/old'] });
     const r = await f.run();
-    expect(r).toMatchObject({ stopReason: 'no-ready', detail: 'sha-moved', registered: false, adopted: false });
+    expect(r).toMatchObject({ stopReason: 'no-ready', detail: 'sha-moved', fallback: expect.any(String), registered: false, adopted: false });
     expect(mutations(f, 'add')).toEqual([]); expect(mutations(f, 'remove')).toEqual([]);
     expect(f.calls.some((c) => c.args[0] === '-C')).toBe(false);
     expect(f.records[0].detail).toBe('sha-moved');
   });
   it('unreadable tip before real add fails closed', async () => {
     const f = fixture({ tipReadFails: true });
-    expect((await f.run()).stopReason).toBe('no-ready');
+    expect(await f.run()).toMatchObject({ stopReason: 'no-ready', detail: 'branch-tip-unreadable', fallback: expect.any(String) });
     expect(mutations(f, 'add')).toEqual([]);
   });
   it('swap-remove-failed never invokes the unsafe removal CLI or rolls back adoption', async () => {
@@ -2240,7 +2258,7 @@ describe('prototype-load', () => {
   it('drain override selects CODE clone without reading plist', async () => { const f = fixture(); const r = await f.run({ daemon: 'drain' }); expect(r.clone).toBe('/home/test/workspace/.lanes/we-drain-daemon/code'); expect(f.calls.some((c) => c.cmd === 'plutil')).toBe(false); });
   it('unknown-daemon records without executing anything', async () => { const f = fixture(); expect((await f.run({ daemon: 'unknown' })).stopReason).toBe('unknown-daemon'); expect(f.calls).toHaveLength(0); expect(f.records).toHaveLength(1); });
   it('unreadable readiness fails closed and records the read failure', async () => {
-    const f = fixture({ readError: true }); expect((await f.run()).stopReason).toBe('no-ready'); expect(f.calls).toHaveLength(0); expect(f.records[0].error).toContain('permission denied');
+    const f = fixture({ readError: true }); expect(await f.run()).toMatchObject({ stopReason: 'no-ready', detail: 'readiness-unreadable', fallback: expect.any(String) }); expect(f.calls).toHaveLength(0); expect(f.records[0].error).toContain('permission denied');
   });
   it.each([{ listRaw: '{}' }, { listRaw: '{broken' }, { checkRaw: '{"check":{"ok":true,"clean":false}}' }])('incomplete loader evidence refuses admission: %j', async (options) => {
     const f = fixture(options); expect((await f.run()).stopReason).toBe('check-unverifiable'); expect(mutations(f, 'add')).toHaveLength(0);
@@ -3276,7 +3294,7 @@ describe('default test check-run reader (production wiring)', () => {
   const run = (o = {}) => ({ id: 1, head_sha: SHA, name: 'test', status: 'completed', conclusion: 'success', app: { id: 15368 }, check_suite: { id: 7 }, ...o });
   const wf = (o = {}) => ({ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml', ...o });
   const conflictPr = { number: 42, state: 'open', head: { sha: SHA, ref: BASE.branch, repo: { full_name: REPO_SLUG } }, mergeable_state: 'dirty', mergeable: false };
-  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, pr = null, listedPr = pr, ...options } = {}) {
+  function ghFixture({ checks = { total_count: 1, check_runs: [run()] }, runs = { total_count: 1, workflow_runs: [wf()] }, fail = null, checksRaw, runsRaw, repositoryRaw, pr = null, listedPr = pr, ...options } = {}) {
     const gh = [];
     const combinedIO = { fs: {},
       handles: (cmd, args) => cmd === 'gh' || (cmd === 'git' && args[0] === 'remote' && args[1] === 'get-url'),
@@ -3284,7 +3302,7 @@ describe('default test check-run reader (production wiring)', () => {
         if (cmd === 'git') return `https://github.com/${REPO_SLUG}.git\n`;
         gh.push(args.join(' '));
         const bad = () => { throw Object.assign(new Error('gh: HTTP 500'), { status: 1, stdout: '', stderr: 'HTTP 500' }); };
-        if (args[0] === 'repo' && args[1] === 'view') return fail === 'repo' ? bad() : JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
+        if (args[0] === 'repo' && args[1] === 'view') return fail === 'repo' ? bad() : repositoryRaw ?? JSON.stringify({ nameWithOwner: REPO_SLUG, url: `https://github.com/${REPO_SLUG}` });
         if (args[1]?.includes('/pulls?')) return JSON.stringify(listedPr ? [listedPr] : []);
         if (args[1]?.endsWith('/pulls/42')) return fail === 'mergeability' ? bad() : JSON.stringify(pr);
         if (args[0] === 'api' && args[1].includes('/check-runs') && fail === 'overflow') throw Object.assign(new Error('maxBuffer exceeded'), { code: 'ENOBUFS' });
@@ -3294,10 +3312,24 @@ describe('default test check-run reader (production wiring)', () => {
       } };
     return { gh, ...fixture({ ready: '', defaultTestCheck: true, combinedIO, ...options }) };
   }
-  const refused = async (f, detail = 'no-passing-test-check') => {
-    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail });
+  const refused = async (f, detail = 'ci-workflow-unbound') => {
+    expect(await f.run()).toMatchObject({ ok: false, stopReason: 'no-ready', detail, fallback: expect.any(String) });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   };
+  it.each([
+    ['repository API unavailable', { fail: 'repo' }, 'ci-api-unavailable'],
+    ['check-runs API unavailable', { fail: 'checks' }, 'ci-checks-unreadable'],
+    ['test check missing', { checks: { total_count: 0, check_runs: [] } }, 'ci-test-check-missing'],
+    ['workflow-runs API unavailable', { fail: 'runs' }, 'ci-workflows-unreadable'],
+    ['workflow unbound', { runs: { total_count: 0, workflow_runs: [] } }, 'ci-workflow-unbound'],
+    ['malformed checks', { checksRaw: '{' }, 'ci-checks-unreadable'],
+    ['malformed workflows', { runsRaw: '{' }, 'ci-workflows-unreadable'],
+  ])('names the non-urgent refusal when %s', async (_, options, detail) => {
+    await refused(ghFixture(options), detail);
+  });
+  it('names an unreadable repository identity', async () => {
+    await refused(ghFixture({ repositoryRaw: '{}' }), 'ci-repository-unreadable');
+  });
   const urgentReceipt = () => {
     const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
     return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
@@ -3319,16 +3351,16 @@ describe('default test check-run reader (production wiring)', () => {
     ['list head mismatch', { pr: conflictPr, listedPr: { ...conflictPr, head: { ...conflictPr.head, sha: TREE } } }],
     ['detail head mismatch', { listedPr: conflictPr, pr: { ...conflictPr, head: { ...conflictPr.head, sha: TREE } } }],
   ])('keeps existing urgent rules without the conflict exception for %s mergeability', async (_, options) => {
+    // Existing rule (receipt fallback only when the CI API is unreachable): a missing test check still refuses.
     const f = ghFixture({ ...options, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] } });
-    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
-    expect(f.readyWrites.at(-1).testCheck).not.toHaveProperty('conflict');
-    expect(f.records.find(r => r.type === 'prototype-load.urgent')).not.toHaveProperty('conflict');
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-check-missing' });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('refuses a conflicting head without a valid receipt and still vetoes completed CI failure', async () => {
     const missing = ghFixture({ pr: conflictPr, checks: { total_count: 0, check_runs: [] } });
     expect(await missing.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
     const failed = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } });
-    expect(await failed.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(await failed.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-failed-urgent' });
     expect(mutations(failed, 'add')).toHaveLength(0);
   });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
@@ -3337,25 +3369,21 @@ describe('default test check-run reader (production wiring)', () => {
         run({ status: 'in_progress', conclusion: null }),
         run({ id: 2, name: 'other-check', app: { id: 1 }, check_suite: { id: 8 }, conclusion }),
       ] } });
-      expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+      expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-failed-urgent' });
       expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
       expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
     });
   it('urgent refuses a failed run even when the workflow-binding read is unavailable', async () => {
     const f = ghFixture({ fail: 'runs', urgentLedger: urgentReceipt(), checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } });
-    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-test-failed' });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-failed-urgent' });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
     // The raw veto happens before the unavailable binding reader can hide the failure.
     expect(f.gh.some(c => c.includes('/actions/runs'))).toBe(false);
   });
   it.each([
     ['unavailable repository API (nonzero)', { fail: 'repo' }],
-    ['unavailable raw checks (API nonzero)', { fail: 'checks' }],
-    ['unavailable workflow binding (API nonzero)', { fail: 'runs' }],
-    ['absent check', { checks: { total_count: 0, check_runs: [] } }],
     ['queued CI', { checks: { total_count: 1, check_runs: [run({ status: 'queued', conclusion: null })] } }],
     ['pending CI', { checks: { total_count: 1, check_runs: [run({ status: 'in_progress', conclusion: null })] } }],
-    ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
   ])('urgent requires a signed receipt with %s', async (_, options) => {
     const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
     expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: true });
@@ -3365,6 +3393,11 @@ describe('default test check-run reader (production wiring)', () => {
     expect(missing.readyWrites).toEqual([]);
   });
   it.each([
+    ['unreadable repository identity', { repositoryRaw: '{}' }],
+    ['unavailable raw checks (API nonzero)', { fail: 'checks' }],
+    ['unavailable workflow binding (API nonzero)', { fail: 'runs' }],
+    ['absent check', { checks: { total_count: 0, check_runs: [] } }],
+    ['a failure on another SHA', { checks: { total_count: 1, check_runs: [run({ head_sha: TREE, conclusion: 'failure' })] } }],
     ['check response buffer overflow', { fail: 'overflow' }],
     ['invalid check JSON', { checksRaw: '{' }],
     ['missing check array', { checks: { total_count: 0 } }],
@@ -3379,7 +3412,12 @@ describe('default test check-run reader (production wiring)', () => {
     ['foreign workflow', { runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }],
   ])('urgent refuses %s before reading a signed receipt', async (_, options) => {
     const f = ghFixture({ ...options, urgentLedger: urgentReceipt() });
-    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-evidence-unreadable', fallback: expect.stringContaining('Repair') });
+    const detail = options.repositoryRaw ? 'ci-repository-unreadable'
+      : options.fail === 'runs' || options.runs || options.runsRaw ? (_.startsWith('foreign') ? 'ci-workflow-unbound' : 'ci-workflows-unreadable')
+      : _ === 'absent check' || options.checks?.check_runs?.[0]?.head_sha === TREE ? 'ci-test-check-missing' : 'ci-checks-unreadable';
+    const recovery = detail === 'ci-workflow-unbound' ? 'Bind every test check suite'
+      : detail === 'ci-test-check-missing' ? 'Complete the GitHub Actions test check' : 'Repair';
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail, fallback: expect.stringContaining(recovery) });
     expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
     expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
   });
@@ -3405,7 +3443,7 @@ describe('default test check-run reader (production wiring)', () => {
     ['a truncated check-runs page', { checks: { total_count: 101, check_runs: [run()] } }],
     ['a check-run from another GitHub app', { checks: { total_count: 1, check_runs: [run({ app: { id: 1 } })] } }],
     ['a failing test check-run', { checks: { total_count: 1, check_runs: [run({ conclusion: 'failure' })] } }],
-  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options), options.checks?.check_runs?.[0]?.conclusion === 'failure' ? 'ci-test-failed' : (options.checks?.total_count > 100 || options.runs?.total_count === 2) ? 'ci-evidence-unreadable' : 'no-passing-test-check'); });
+  ])('refuses on %s', async (_, options) => { await refused(ghFixture(options), options.checks?.check_runs?.[0]?.conclusion === 'failure' ? 'ci-test-failed' : options.fail === 'runs' || options.runs ? 'ci-workflows-unreadable' : options.checks?.check_runs?.[0]?.app?.id === 1 ? 'ci-test-check-missing' : 'ci-checks-unreadable'); });
 });
 
 const shippedRuledSettings = JSON.parse(nodeFs.readFileSync('scripts/settings/prototype-load.json', 'utf8'));

@@ -99,8 +99,10 @@ describe('prep block', () => {
   });
   it('requires headings inside PREP and does not borrow content across a new PREP line', () => {
     expect(prepVerdict(prep.replace('PREP:\n', '')).ok).toBe(false);
-    expect(parsePrep('PREP:\nAcceptance:\nPREP:\nSummary: unrelated text\nlong unrelated prose').empty).toEqual(['Acceptance']);
-    expect(parsePrep('PREP:\nAcceptance:\nprep: another block\n## Summary\nlong unrelated prose').empty).toEqual(['Acceptance']);
+    expect(parsePrep('PREP:\nAcceptance:\nPREP:\nSummary: unrelated text\nlong unrelated prose'))
+      .toMatchObject({ present: true, missing: ['Acceptance', 'Pre-mortem', 'Files', 'Tests'], empty: [] });
+    expect(parsePrep('PREP:\nAcceptance:\nprep: another block\n## Summary\nlong unrelated prose'))
+      .toMatchObject({ present: true, missing: ['Acceptance', 'Pre-mortem', 'Files', 'Tests'], empty: [] });
   });
   it.each(['—', '–', '-'])('accepts a reasoned waiver with %s', (dash) => {
     expect(prepVerdict(`  PREP: waived ${dash} urgent incident`)).toEqual({ ok: true, reason: 'urgent incident', waived: true });
