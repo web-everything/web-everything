@@ -939,3 +939,40 @@ it('a new listed head bypasses the refusal memo and carries the new head identit
   expect(sweepAuthorStamps(seams)[0].headSha).toBe(headRefOid);
   expect(seams.readEdits).toHaveBeenCalledTimes(2);
 });
+
+describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
+  const prBody = 'A hot-patch uses an immutable `hotpatch/<sha>` ref.\n\n<!-- pr-size:begin -->\n<!-- size-admission:29899b -->\n<!-- pr-size:end -->';
+  const dropped = () => [
+    edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
+    edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z'),
+  ];
+  it('restores when snapshots carry backticked placeholder text and non-stamp size comments', () => {
+    expect(plan({ edits: dropped() })).toMatchObject({ action: 'restore', id: ID });
+  });
+  it('restores despite a balanced one-line markdown link in the snapshot', () => {
+    const edits = [edit(`${prBody}\nGenerated with [Claude Code](https://claude.com/claude-code)\n${buildAuthorActorMarker(ID)}`)];
+    expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID });
+  });
+  it('still refuses a backtick on a comment line (not code)', () => {
+    const edits = [edit(`${prBody}\n<!-- \`x\` -->\n${buildAuthorActorMarker(ID)}`)];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses an earlier stamp by a different login', () => {
+    const edits = [edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
+      edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, 'mallory', '2026-11-20T18:39:58Z', 'User')];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('refuses a history whose stamp content was altered between snapshots', () => {
+    const edits = [edit(`${prBody}\n\n${buildAuthorActorMarker(OTHER)}`, AUTHOR, '2026-11-20T19:00:00Z'),
+      edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z')];
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
+  });
+  it('marks lost, never restores, with no earlier stamped snapshot', () => {
+    expect(plan({ edits: [edit(prBody)] })).toMatchObject({ action: 'mark-lost' });
+  });
+  it('refuses arbitrary comments and multiline link destinations', () => {
+    for (const text of ['<!-- anything -->', '[text](\n`<div>`\n)']) {
+      expect(plan({ edits: [edit(`${text}\n${buildAuthorActorMarker(ID)}`)] })).toMatchObject({ action: 'refuse' });
+    }
+  });
+});
