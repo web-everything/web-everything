@@ -58,22 +58,26 @@ on:
         required: false
       FUI_READ_TOKEN:
         required: false
+  schedule:
+    - cron: '23 * * * *'
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'schedule' && 'schedule' || 'events' }}
   # #5000: never cancel a run on main. A merge every few minutes cancelled 85 of 100 main runs (2026-10-03),
   # hiding main's red/green for hours. PR branches still cancel superseded runs.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
+  actions: read
+  checks: read
 
 jobs:
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
   # independent `standards` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
   # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
   # PRs permit cards/docs; merge_group permits only cards against its validated ancestor base.
-  # A push to main, manual dispatch, empty or unreadable diff runs the full suite. Fail closed: if this job fails, `light` is
+  # A proven exact-SHA queue push can also be light; dispatch/schedule and unknown evidence run full CI. Fail closed: if this job fails, `light` is
   # empty (not 'true'), and `test` / `smoke` below fail on `needs.changes.result != 'success'`.
   #
   # REQUIRED CHECKS STILL REPORT FROM REAL RUNNING JOBS: `test` and `smoke` keep running as jobs (they do
@@ -84,10 +88,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      light: ${{ steps.detect.outputs.light }}
+      light: ${{ steps.detect.outputs.light == 'true' || steps.main-skip.outputs.skip == 'true' }}
+      fui-sha: ${{ steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip }}
+      skip: ${{ steps.main-skip.outputs.skip }}
+      skip-reason: ${{ steps.main-skip.outputs.reason }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           fetch-depth: 50
       - name: Is this a card-only PR?
         timeout-minutes: 4
@@ -115,6 +123,87 @@ jobs:
           fi
           node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
 
+      - name: Mint FUI read token (GitHub App)
+        id: fui-app-token
+        if: ${{ github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.WE_APP_ID }}
+          private-key: ${{ secrets.WE_APP_PRIVATE_KEY }}
+          owner: frontier-ui
+          repositories: frontierui
+          permission-contents: read
+      - name: Record queue FUI sibling tip
+        id: fui-tip
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          FUI_TOKEN: ${{ steps.fui-app-token.outputs.token }}
+        run: node scripts/ci/main-push-skip.mjs --record-fui >> "$GITHUB_OUTPUT"
+      - name: Reuse exact-SHA merge queue CI
+        id: main-skip
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FUI_TOKEN: ${{ steps.fui-app-token.outputs.token }}
+          HEAD_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+        run: node scripts/ci/main-push-skip.mjs --sha="$HEAD_SHA" --before="$BEFORE_SHA" --run-id="$RUN_ID" --event="$EVENT_NAME" --ref="$REF" --repo="$REPO" >> "$GITHUB_OUTPUT"
+      - name: Prepare reused sibling record
+        if: ${{ steps.main-skip.outputs.skip == 'true' }}
+        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.main-skip.outputs.skip == 'true' }}
+        with:
+          name: fui-sibling-${{ steps.main-skip.outputs.fui-sha }}
+          path: ${{ runner.temp }}/fui-sibling-record
+
+  # The reusable record certifies full execution, including every job's actual quarantine decision.
+  # Light/unknown/quarantined runs stay successful but publish no reusable queue evidence.
+  queue-reuse-record:
+    needs: [changes, test, smoke, daemon-soak]
+    if: ${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' && needs.changes.outputs.fui-sha != '' && needs.test.result == 'success' && needs.smoke.result == 'success' && needs.daemon-soak.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: quarantine-reuse-*
+          path: ${{ runner.temp }}/quarantine-receipts
+      - name: Require unquarantined test executions
+        id: proof
+        env:
+          RECEIPTS: ${{ runner.temp }}/quarantine-receipts
+          UNIT_SHARDS: '[1,2,3,4,5,6,7,8,9,10]'
+          INTEGRATION_GROUPS: '["scan-chain","sim-scenarios","lane-pool-a","lane-pool-b","parallel"]'
+          SOAK_SHARDS: '[1,2,3,4,5,6,7,8]'
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          let eligible = false;
+          try {
+            eligible = [['unit', 'UNIT_SHARDS'], ['integration', 'INTEGRATION_GROUPS'], ['soak', 'SOAK_SHARDS']]
+              .every(([suite, key]) => JSON.parse(process.env[key]).every(id =>
+                readFileSync(join(process.env.RECEIPTS, `quarantine-reuse-${suite}-${id}`, 'quarantine-reuse'), 'utf8') === 'unquarantined\n'));
+          } catch { /* No complete proof: main pushes will run full CI. */ }
+          appendFileSync(process.env.GITHUB_OUTPUT, `eligible=${eligible}\n`);
+          console.log(eligible ? 'Full unquarantined queue execution proved.' : 'No reusable proof; main push will run full CI.');
+          NODE
+      - name: Prepare sibling record
+        if: ${{ steps.proof.outputs.eligible == 'true' }}
+        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.proof.outputs.eligible == 'true' }}
+        with:
+          name: fui-sibling-${{ needs.changes.outputs.fui-sha }}
+          path: ${{ runner.temp }}/fui-sibling-record
+
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but
   # with its per-shard thresholds disabled (`test:coverage:shard`) — a single shard exercises only
@@ -124,6 +213,7 @@ jobs:
   # FILE, so every file (incl. the poolMatchGlobs singleFork one) lands in exactly one shard.
   # Review can start when standards and the first shard are green.
   standards:
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -131,6 +221,7 @@ jobs:
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           path: web-everything
           fetch-depth: 50 # backlog scope guards compare the PR against origin/main
       - name: Fetch main history (blobless)
@@ -151,6 +242,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -225,6 +317,7 @@ jobs:
         if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           path: web-everything
           fetch-depth: 50 # live-git tests use the HEAD window; main's full history comes from the blobless fetch below
       - name: Fetch main history (blobless)
@@ -247,6 +340,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -325,6 +419,13 @@ jobs:
           path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' }}
+        with:
+          name: quarantine-reuse-unit-${{ matrix.shard }}
+          path: ${{ runner.temp }}/quarantine-reuse
+          if-no-files-found: ignore
+
   # Coverage merging and host-path checks run independently; the required test job only reads results.
   coverage-merge:
     needs: [changes, test-shard]
@@ -340,6 +441,7 @@ jobs:
           fi
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           path: web-everything
       - uses: actions/setup-node@v4
         with:
@@ -365,6 +467,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -381,6 +485,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Gate on shard results
+        env:
+          MAIN_SKIP_REASON: ${{ needs.changes.outputs.skip-reason }}
         run: |
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "::error::Changes detection did not succeed."
@@ -399,7 +505,7 @@ jobs:
             exit 1
           fi
           if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
-            echo "Card-only PR: unit shards and coverage merge intentionally omitted."
+            echo "Light CI: unit shards and coverage merge intentionally omitted. $MAIN_SKIP_REASON"
             exit 0
           fi
           if [ "${{ needs.test-shard.result }}" != "success" ]; then
@@ -460,6 +566,7 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           path: web-everything
           fetch-depth: 50
       - name: Fetch main history (blobless)
@@ -482,6 +589,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -523,6 +631,13 @@ jobs:
         with:
           name: timing-integration-${{ matrix.group }}
           path: web-everything/coverage/timing-integration-${{ matrix.group }}.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' }}
+        with:
+          name: quarantine-reuse-integration-${{ matrix.group }}
+          path: ${{ runner.temp }}/quarantine-reuse
           if-no-files-found: ignore
 
   integration:
@@ -578,7 +693,7 @@ jobs:
   #                 scope job itself failed (fail closed), otherwise red unless EVERY shard succeeded. Full coverage is preserved — sharding only changes WHERE
   #                 each scenario runs, never WHETHER it runs; every scenario still runs on every daemon PR.
   daemon-soak-scope:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -586,6 +701,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           fetch-depth: 50
       - name: Fetch main history (blobless)
         timeout-minutes: 4
@@ -620,9 +736,9 @@ jobs:
   # with the baseline's daemon worlds. `fail-fast: false` mirrors `test-shard`: one shard's break
   # failing must not hide a sibling shard's own result.
   soak-shard:
-    needs: daemon-soak-scope
+    needs: [changes, daemon-soak-scope]
     # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
-    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request'
+    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request' && needs.changes.outputs.skip != 'true'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
@@ -639,6 +755,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
           # (below); quarantine-skip deepens further, or fails closed (runs everything), if the base is unprovable.
           fetch-depth: 50
@@ -656,6 +773,12 @@ jobs:
 
       - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
         run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' }}
+        with:
+          name: quarantine-reuse-soak-${{ matrix.shard }}
+          path: ${{ runner.temp }}/quarantine-reuse
+          if-no-files-found: ignore
 
   # THE required `daemon-soak` check (name unchanged from before the split — see the header above for why that
   # matters). Skips green in ~10s when `daemon-soak-scope` SUCCEEDED and found no daemon code touched, same as the
@@ -664,12 +787,14 @@ jobs:
   # (its `needs` dep failing, or the matrix simply not running) is not `success`, so a broken shard can never
   # silently read as satisfied, same guard the `test` aggregator above uses for `test-shard`.
   daemon-soak:
-    needs: [daemon-soak-scope, soak-shard]
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
+    needs: [changes, daemon-soak-scope, soak-shard]
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Gate on shard results
+        env:
+          MAIN_SKIP_REASON: ${{ needs.changes.outputs.skip-reason }}
         run: |
           # R1068: on a pull_request the soak is deferred to the merge queue (shards do not run there), so the
           # required check succeeds at once. Every other event (merge_group, push, dispatch) falls through to the
@@ -691,6 +816,10 @@ jobs:
             false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.skip }}" = "true" ]; then
+            echo "Reused queue CI: $MAIN_SKIP_REASON"
+            exit 0
+          fi
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
             echo "One or more soak shards did not succeed (soak-shard result: ${{ needs.soak-shard.result }})."
             exit 1
@@ -741,6 +870,7 @@ jobs:
         if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           path: web-everything
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
@@ -757,6 +887,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: frontier-ui/frontierui
+          ref: ${{ needs.changes.outputs.fui-sha || '' }}
           token: ${{ steps.fui-app-token.outputs.token || secrets.FUI_READ_TOKEN }}
           path: frontierui
 
@@ -850,6 +981,7 @@ jobs:
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'schedule' && github.sha || '' }}
           path: web-everything
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
