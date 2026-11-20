@@ -226,7 +226,7 @@ import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.
 import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { resolveRequiredChecks } from './lib/check-state-predicate.mjs';
-import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, resolveStaleGateUpdateBranchMax, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
@@ -6202,6 +6202,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         const held = sendBackReason(live.labels) || redTeamLabelHoldReason(live.labels);
         if (held) throw Error(held);
         if (options.forceRefresh && !hasLabel(live, 'red-team:clear')) throw Error('red-team:clear missing');
+        if (options.forceRefresh && !hasLabel(live, 'review:accepted')) throw Error('review:accepted missing');
         if (mqSameHeadGuard({ repo: v.repo || localSlug, pr: v.num, head: options.expectedHead,
           allowAlreadyQueued: false, dryRun: true }).hold) throw Error('merge-queue history refuses refresh');
         if (!queueHeadMutationAllowed(v, options.expectedHead)) throw Error('queue head mutation authorization refused');
@@ -7842,6 +7843,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }
   if (queueEnqueueMode) {
     const staleMergeGateRefresh = resolveRefreshOnStaleMergeGate();
+    const failedGateLimit = resolveStaleGateUpdateBranchMax({ log: line => process.stderr.write(`${line}\n`) });
+    const failedGateBudget = { remaining: failedGateLimit.value.staleGateUpdateBranchMax };
     if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnStaleMergeGate=${staleMergeGateRefresh.value} (${staleMergeGateRefresh.source})${staleMergeGateRefresh.invalid.length ? ` · ignored invalid: ${staleMergeGateRefresh.invalid.join('; ')}` : ''}\n`);
     for (const c of skipped) {
       const pr = (prsByRepo.get(c.repo) || []).find(p => p.number === c.num);
@@ -7850,7 +7853,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         requiredChecks: queueRequiredChecksOf(c.repo), classifyPr,
         classifyOptions: { requiredCheck: REQUIRED, defaultBranch: defaultBranchOf(c.repo),
           allowPendingReview: (escalationRelief.prs || []).includes(Number(c.num)) || (escalationRelief.passWide && !!label) },
-        setting: staleMergeGateRefresh, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
+        setting: staleMergeGateRefresh, failedGateBudget, dryRun: DRY_RUN, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir,
         tag: repoTag(c.repo), readAcceptance: readDrainAcceptance,
         refreshStalePr: options => refreshApprovedHead(c, options), needsAcceptanceRestamp, restampAcceptance,
         warn: line => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });

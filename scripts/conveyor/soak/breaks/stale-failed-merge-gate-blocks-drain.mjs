@@ -8,7 +8,7 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const SOURCE = 'scripts/lib/merge-queue-enqueue.mjs';
 export default {
   id: 'stale-failed-merge-gate-blocks-drain',
-  title: 'cleared failed merge-gate enters the guarded drain refresh once per head',
+  title: 'cleared failed merge-gate enters the guarded drain refresh with cross-head and pass bounds',
   card: 'PR #7106 / #7117 (2026-11-19)',
   fixedBy: { sha: 'HEAD', where: 'HEAD', paths: [SOURCE, 'scripts/merge-ai-prs.mjs'] },
   fixPresent(root) {
@@ -39,12 +39,21 @@ export default {
         report.groupHolds.push({ role, calls: held.calls, aborted: held.report.revalidationAborted });
       }
       writeFileSync(state, JSON.stringify({ groups: [], failed: {}, lastReconcileAt: Date.now() }));
+      report.disabled = (await run(false, { env: { ...env, WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX: '0' } })).calls;
       const first = await run(false, { env });
       const second = await run(false, { env });
       report.first = first.calls;
       report.second = second.calls;
       report.merged = first.report.merged;
-    });
+      report.laterHeads = [];
+      for (const head of ['b'.repeat(40), 'd'.repeat(40)]) {
+        pr.headRefOid = head;
+        pr.commits[0].oid = head;
+        pr.statusCheckRollup = pr.statusCheckRollup.map(row => ({ ...row, head_sha: head }));
+        pr.comments[0].body = `<!-- reviewed-sha: ${head} -->`;
+        report.laterHeads.push((await run(false, { env })).calls);
+      }
+    }, { slug: 'web-everything/web-everything' });
     return report;
   },
   judge(report) {
@@ -58,6 +67,8 @@ export default {
     if (pushes(report.first).length !== 1 || !report.first.some(a => a[0] === 'git' && a[1] === 'merge-tree'))
       violations.push('failed gate did not rebuild through the production refresh path');
     if (pushes(report.second).length) violations.push('same head refreshed twice');
+    if (pushes(report.disabled).length) violations.push('zero pass budget still refreshed');
+    if (report.laterHeads.some(calls => pushes(calls).length)) violations.push('later head reset the PR refresh bound');
     if (report.merged.length) violations.push('repair changed the original skip into a merge');
     if ([...report.first, ...report.second].some(a => a.includes('PUT') || (a[0] === 'api' && a[1] === 'graphql' && a.some(x => x.startsWith('query=mutation')))))
       violations.push('repair bypassed the refresh path');

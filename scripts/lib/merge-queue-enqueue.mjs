@@ -26,6 +26,7 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { reserve, releaseLockDirIf } from '../readiness/file-locks.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
 
@@ -50,6 +51,17 @@ export const REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT = 'on';
  */
 export const resolveRefreshOnUnsatisfiedWorkflows = options => resolveRefreshSetting('refreshOnUnsatisfiedWorkflows', 'WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS', options);
 export const resolveRefreshOnStaleMergeGate = options => resolveRefreshSetting('refreshOnStaleMergeGate', 'WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE', options);
+
+export function resolveStaleGateUpdateBranchMax({ env = process.env, tool, platform, log = () => {} } = {}) {
+  const raw = env.WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX;
+  const resolved = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readDeclaredSettings().settings.drain), {
+    env, platform, standard: { staleGateUpdateBranchMax: 2 },
+    envValues: { staleGateUpdateBranchMax: raw === undefined ? undefined : /^\d+$/.test(raw) ? Number(raw) : NaN },
+    valid: { staleGateUpdateBranchMax: value => Number.isSafeInteger(value) && value >= 0 && value <= 100 },
+  });
+  log(formatCascadeSourcesLine('drain', resolved));
+  return resolved;
+}
 
 function resolveRefreshSetting(key, envKey, { env = process.env, settings, platform } = {}) {
   const invalid = [];
@@ -558,7 +570,7 @@ function ensureRefreshLedger(path) {
 }
 
 /** Verified startup_failure refresh: ledger preflight, atomic claims, dispatch, produced-head claim. Shared by the stale-gate and the enqueue-refusal routes. */
-async function refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions }) {
+async function refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions, failedGateBudget }) {
   // Fail closed: the once-per-head bound lives in this ledger, so refuse to push anything unless it is readable and writable now.
   try { ensureRefreshLedger(statePath); }
   catch (e) { return { handled: false, reason: `merge-gate refresh ledger unusable: ${errText(e)}` }; }
@@ -616,9 +628,27 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
   }
   let dispatched = false, failed = false, uncertain = Boolean(pending), produced = null;
   const refreshStalePr = async options => {
+    // A new SHA must not replenish a failed-gate mutation attempt. Reserve through the
+    // existing atomic claim store before dispatch; a crash/unknown outcome stays closed.
+    const failedPrClaim = options.forceRefresh ? claimFor('failed-pr', '') : null;
+    if (failedPrClaim) {
+      if (!Number.isSafeInteger(failedGateBudget?.remaining) || failedGateBudget.remaining <= 0)
+        return { ok: false, action: 'held', error: 'failed merge-gate per-pass budget exhausted; retry a later pass or inspect manually' };
+      try { writeClaim(failedPrClaim); }
+      catch (error) {
+        return { ok: false, action: 'held', error: error?.code === 'EEXIST'
+          ? 'failed merge-gate PR attempt already consumed; an operator must inspect before releasing its failed-pr claim'
+          : `failed merge-gate PR claim unusable: ${errText(error)}` };
+      }
+      failedGateBudget.remaining -= 1;
+    }
     dispatched = true;
     try {
       const out = await refreshOptions.refreshStalePr({ ...options, ...(pending ? { gateRefreshPending: pending } : {}) });
+      if (failedPrClaim && !out?.ok && ['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh'].includes(out?.action)) {
+        // These are confirmed pre-mutation refusals. Retain every ambiguous failure.
+        unlinkSync(failedPrClaim);
+      }
       if (out?.state === 'pending-unknown') {
         uncertain = true;
         // Persist uncertainty in the existing claim, never in the success ledger.
@@ -654,7 +684,7 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
   readFailedGate = readFailedMergeGateEvidence, readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
   writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
-  statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
+  statePath = staleMergeGateRefreshStatePath(), failedGateBudget = { remaining: 2 }, ...refreshOptions } = {}) {
   const unchanged = { handled: false };
   if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
     || !c.reason?.startsWith('merge state BLOCKED') || !pr?.headRefOid) return unchanged;
@@ -684,9 +714,12 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
       if (newestRequiredFailedGate(await readFailedGate({ repo: c.repo, headSha,
         branch: classifyOptions.defaultBranch || 'main' }), headSha)) {
         return refreshStartupFailure({ c, headSha, classification: { runId: null, runConclusion: 'failure' },
-          setting, statePath, writeClaim, warn, refreshOptions });
+          setting, statePath, writeClaim, warn, refreshOptions, failedGateBudget });
       }
-    } catch (error) { return { ...unchanged, reason: `failed merge-gate evidence unreadable: ${errText(error)}` }; }
+    } catch (error) {
+      // Unknown evidence refuses this trigger, not the independent legacy verdict path.
+      warn(`failed merge-gate evidence unreadable: ${errText(error)}; trying legacy stale-hold evidence`);
+    }
   }
   const run = latestFailingMergeGate(pr.statusCheckRollup);
   if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;

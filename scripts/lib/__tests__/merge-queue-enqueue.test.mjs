@@ -9,6 +9,7 @@ import { readFailedMergeGateEvidence, classifyStartupFailureGate, handleStaleMer
 import { refreshStalePr as refreshRealStalePr } from '../merge-queue-hook.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
 import { reserve, releaseLockDirIf, readLockEntry } from '../../readiness/file-locks.mjs';
+import * as queueRecovery from '../merge-queue-enqueue.mjs';
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected GitHub IO'); }),
@@ -924,6 +925,53 @@ describe('required-app failed gate uses the existing guarded refresh', () => {
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rebased', newCommit: 'b'.repeat(40) })),
       needsAcceptanceRestamp: () => false, ...extra };
   }
+  it('bounds failed-gate attempts across the produced head and a later independent head', async () => {
+    const o = options();
+    try {
+      await handleStaleMergeGate(o);
+      for (const head of ['b'.repeat(40), 'c'.repeat(40)]) {
+        await handleStaleMergeGate({ ...o, c: { ...o.c, listedHeadSha: head }, pr: { ...o.pr, headRefOid: head },
+          readFailedGate: () => ({ requiredAppId: 1, checkRuns: [failed({ head_sha: head })] }) });
+      }
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it.each([[undefined, 2], [1, 1], [0, 0]])('caps a multi-PR pass with setting %s at %s attempts', async (max, expected) => {
+    const resolved = queueRecovery.resolveStaleGateUpdateBranchMax({ env: {}, platform: {}, tool: max === undefined ? {} : { staleGateUpdateBranchMax: max } });
+    const failedGateBudget = { remaining: resolved.value.staleGateUpdateBranchMax };
+    const o = options();
+    try {
+      for (const num of [7, 8, 9]) await handleStaleMergeGate({ ...o, c: { ...o.c, num }, failedGateBudget });
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(expected);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it('refuses a listing/live head mismatch before reading failed-gate evidence', async () => {
+    const o = options(); o.c.listedHeadSha = 'b'.repeat(40);
+    try {
+      expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
+      expect(o.readFailedGate).not.toHaveBeenCalled();
+      expect(o.refreshStalePr).not.toHaveBeenCalled();
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it.each(['throw', 'lost-ledger', 'concurrent'])('keeps the PR bound through %s', async mode => {
+    const o = options(mode === 'lost-ledger' ? { record: () => { throw Error('disk full'); } } : {});
+    if (mode === 'throw') o.refreshStalePr.mockRejectedValue(Error('unknown push outcome'));
+    try {
+      const later = { ...o, c: { ...o.c, listedHeadSha: 'd'.repeat(40) }, pr: { ...o.pr, headRefOid: 'd'.repeat(40) },
+        readFailedGate: () => ({ requiredAppId: 1, checkRuns: [failed({ head_sha: 'd'.repeat(40) })] }) };
+      if (mode === 'concurrent') await Promise.all([handleStaleMergeGate(o), handleStaleMergeGate(later)]);
+      else { await handleStaleMergeGate(o); await handleStaleMergeGate(later); }
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it('releases a confirmed admission hold for a later pass', async () => {
+    const o = options();
+    o.refreshStalePr.mockResolvedValueOnce({ ok: false, action: 'held', error: 'card group' });
+    try {
+      await handleStaleMergeGate(o); await handleStaleMergeGate(o);
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(2);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
   it('routes the highest check id on the pinned head through refreshStalePr once', async () => {
     const o = options();
     try {

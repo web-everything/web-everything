@@ -130,6 +130,7 @@ export { gitRunner };
  *                                       already runs to shed the manifest also clears an `ids must be unique` dup
  *                                       against `<base>` — otherwise the rebuilt tip stays red and never merges.
  * @param {boolean} [o.forceRefresh=false] Rebuild a current tree for the drain's ledger-bounded failed-gate repair.
+ * @param {string|null} [o.expectedHead=null] Pin the fetched commit and condition the push on this remote head.
  * @param {string} [o.cwd]              run every git invocation in THIS directory instead of `process.cwd()`
  *                                       (#2263) — routes the plumbing through a SIBLING clone (e.g. `../frontierui`)
  *                                       for a remote-repo candidate, so the local-only rebase-drop can rebuild a
@@ -147,6 +148,7 @@ export function rebaseDropManifest({
   tmpIndex = '.git/rebase-drop-index',
   healCollision = false,
   forceRefresh = false,
+  expectedHead = null,
   cwd,
   run = gitRunner,
 } = {}) {
@@ -157,12 +159,19 @@ export function rebaseDropManifest({
   // bare name fail with "not something we can merge" and the whole auto-rebase is inert. Fetch the lane ref
   // first (so the remote-tracking ref is current), then feed the RESOLVED `<remote>/<laneRef>` to the merge
   // inputs. The PUSH still targets the bare `refs/heads/<laneRef>` (that part was always correct).
-  const mergeRef = readRef || `${remote}/${laneRef}`;
+  let mergeRef = readRef || `${remote}/${laneRef}`;
   if (fetch) {
     const f = run('git', ['fetch', remote, laneRef], { cwd });
     if (f.status !== 0) return { action: 'error', reason: `fetch ${laneRef} failed (${(f.stderr || '').split('\n')[0]})` };
   }
 
+  if (expectedHead !== null) {
+    const tip = run('git', ['rev-parse', '--verify', `${mergeRef}^{commit}`], { cwd });
+    if (!/^[0-9a-f]{40}$/.test(expectedHead) || tip.status !== 0 || String(tip.stdout).trim() !== expectedHead)
+      return { action: 'error', reason: 'fetched branch head is not the judged head; re-read before refreshing' };
+    // Use the immutable commit throughout; another fetch must not change the tree under this rebuild.
+    mergeRef = expectedHead;
+  }
   const mt = run('git', ['merge-tree', '--write-tree', base, mergeRef], { cwd });
   let parsed = parseMergeTree(mt.stdout, mt.status);
   if (!parsed.tree) {
@@ -275,7 +284,7 @@ export function rebaseDropManifest({
   if (refusal) return { action: 'error', reason: refusal.message };
 
   // Fast-forward push (newCommit descends from laneRef) to the guard-safe lane/* ref — no checkout.
-  const push = run('git', ['push', remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
+  const push = run('git', ['push', ...(expectedHead ? [`--force-with-lease=refs/heads/${laneRef}:${expectedHead}`] : []), remote, `${newCommit}:refs/heads/${laneRef}`], { cwd });
   if (push.status !== 0) return { action: 'error', reason: `push to ${laneRef} failed (${(push.stderr || '').split('\n')[0]})` };
 
   return { action: 'rebased', newCommit, dropped: disp === 'manifest-only', droppedEvidence, healed, base, laneRef };

@@ -84,6 +84,21 @@ const RESOLVED_PLUMBING = {
 };
 
 describe('rebaseDropManifest', () => {
+  it('pins a forced failed-gate rebuild after fetch and leases the judged head on push', () => {
+    const expectedHead = 'a'.repeat(40);
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      'rev-parse': { stdout: expectedHead + '\n' } });
+    expect(rebaseDropManifest({ laneRef: 'lane/x', forceRefresh: true, expectedHead, run }).action).toBe('rebased');
+    expect(calls.find(c => c.args[0] === 'merge-tree').args).toContain(expectedHead);
+    expect(calls.find(c => c.args[0] === 'commit-tree').args).toContain(expectedHead);
+    expect(calls.find(c => c.args[0] === 'push').args).toContain(`--force-with-lease=refs/heads/lane/x:${expectedHead}`);
+  });
+  it.each(['b'.repeat(40), '', 'bad-sha'])('refuses a moved or unreadable fetched head before a forced rebuild: %s', fetched => {
+    const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+      'rev-parse': { stdout: fetched } });
+    expect(rebaseDropManifest({ laneRef: 'lane/x', forceRefresh: true, expectedHead: 'a'.repeat(40), run }).action).toBe('error');
+    expect(calls.some(c => ['merge-tree', 'commit-tree', 'push'].includes(c.args[0]))).toBe(false);
+  });
   it('a manifest-only conflict → resolves and pushes a rebuilt tip (dropped=true)', () => {
     const { run, calls } = scriptedRun({
       'merge-tree': { status: 1, stdout: conflictOut([LANE_MANIFEST]) },

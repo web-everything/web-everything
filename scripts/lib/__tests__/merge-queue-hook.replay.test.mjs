@@ -649,12 +649,12 @@ describe('refreshStalePr rerun uses the repo REST endpoint, never `gh run`', () 
 });
 
 
-it('failed-gate refresh forces a new head through the existing rebuild, never label toggles or a rerun', async () => {
+it.each([null, { state: 'pending-unknown', confirmed: false }])('failed-gate refresh forces a new head despite an earlier label claim %j', async gateRefreshPending => {
   const refresh = vi.fn((_ref, options) => ({ ok: true, action: options.forceRefresh ? 'rebased' : 'current', newCommit: 'b'.repeat(40) }));
   const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, repo: 'o/r',
-    runConclusion: 'failure', forceRefresh: true, expectedHead: 'a'.repeat(40), readTip: () => 'a'.repeat(40), refresh });
+    runConclusion: 'failure', forceRefresh: true, gateRefreshPending, expectedHead: 'a'.repeat(40), readTip: () => 'a'.repeat(40), refresh });
   expect(out).toMatchObject({ ok: true, action: 'rebased', newCommit: 'b'.repeat(40) });
-  expect(refresh).toHaveBeenCalledWith('lane/x', expect.objectContaining({ forceRefresh: true }));
+  expect(refresh).toHaveBeenCalledWith('lane/x', expect.objectContaining({ forceRefresh: true, expectedHead: 'a'.repeat(40) }));
 });
 
 

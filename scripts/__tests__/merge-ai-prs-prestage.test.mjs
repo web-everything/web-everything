@@ -431,6 +431,20 @@ const repairEnv = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE:'on',
   WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE:'off' };
 const refreshPushes = calls => calls.filter(a => a[0] === 'git' && a[1] === 'push');
 describe('failed-gate trigger through the real drain', () => {
+  it('zero per-pass budget disables the failed-gate rebuild', () => world(async ({pr,run}) => {
+    failedGatePr(pr);
+    const out = await run(false, {env:{...repairEnv,WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX:'0'}});
+    expect(refreshPushes(out.calls)).toEqual([]);
+  }));
+  it.each([false, true])('startup_failure uses shared admission (red-team hold: %s)', held => world(async ({pr,run}) => {
+    pr.startupFailure = true;
+    pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha}];
+    if (held) pr.labels.push({name:'red-team:blocked'});
+    const out = await run(false, {env:repairEnv});
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toHaveLength(held ? 0 : 1);
+    expect(out.report.merged).toEqual([]);
+    expect(out.report.revalidationAborted[0].reason).toContain(held ? 'red-team:blocked' : 'rebased');
+  }));
   it('rebuilds through refreshStalePr and preserves the original BLOCKED skip, once per head', () => world(async ({pr,run,slug}) => {
     failedGatePr(pr);
     const first = await run(false, {env:repairEnv});
@@ -445,6 +459,8 @@ describe('failed-gate trigger through the real drain', () => {
       `--new-head=${'b'.repeat(40)}`,
     ]]);
     expect(refreshPushes(first.calls), JSON.stringify(first.report) + first.stderr).toHaveLength(1);
+    expect(first.calls).toContainEqual(['git', 'ls-remote', 'origin', `refs/heads/${pr.headRefName}`]);
+    expect(refreshPushes(first.calls)[0]).toContain(`--force-with-lease=refs/heads/${pr.headRefName}:${sha}`);
     expect(first.calls.some(a => a[0] === 'git' && a[1] === 'merge-tree')).toBe(true);
     const second = await run(false, {env:repairEnv});
     expect(refreshPushes(second.calls)).toEqual([]);
@@ -452,6 +468,15 @@ describe('failed-gate trigger through the real drain', () => {
     expect(second.report.skipped).toEqual(first.report.skipped);
   }));
   it.each([
+    ['fork', pr => { pr.isCrossRepository = true; }],
+    ['remote head moved after admission', pr => { pr.remoteHead = 'd'.repeat(40); }],
+    ['head moved during fetch', pr => { pr.fetchedHead = 'd'.repeat(40); }],
+    ['non-default base', pr => { pr.baseRefName = 'release'; }],
+    ['missing ready-to-merge', pr => { pr.labels = pr.labels.filter(l => l.name !== 'ready-to-merge'); }],
+    ['missing review:accepted', pr => { pr.labels = pr.labels.filter(l => l.name !== 'review:accepted'); }],
+    ['not MERGEABLE', pr => { pr.mergeable = 'CONFLICTING'; }],
+    ['not BLOCKED', pr => { pr.mergeStateStatus = 'UNSTABLE'; }],
+    ['another required failure', pr => { pr.statusCheckRollup[0].conclusion = 'FAILURE'; }],
     ['red-team:blocked', pr => pr.labels.push({name:'red-team:blocked'})],
     ['red-team:pending', pr => pr.labels.push({name:'red-team:pending'})],
     ['missing red-team:clear', pr => { pr.labels = pr.labels.filter(l => l.name !== 'red-team:clear'); }],

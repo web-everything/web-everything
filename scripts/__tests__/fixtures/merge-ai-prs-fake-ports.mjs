@@ -17,7 +17,7 @@ if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
-  if (path.includes('/rules/branches/') && pr.failedGate) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'},{context:'merge-gate', integration_id:1}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'},{context:'merge-gate', integration_id:1}]}}]);
+  if (path.includes('/rules/branches/') && (pr.failedGate || pr.startupFailure)) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'},{context:'merge-gate', integration_id:1}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'},{context:'merge-gate', integration_id:1}]}}]);
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
   if (path.includes('/comments') && a.includes('--jq')) {
@@ -28,6 +28,7 @@ if (a[0] === 'api') {
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
   if (path.includes('/check-runs') && pr.failedGate) out({total_count:1,check_runs:[{id:20,name:'merge-gate',head_sha:pr.headRefOid,app:{id:1},status:'completed',conclusion:'failure'}]});
+  if (path.includes('/actions/runs') && pr.startupFailure) out({total_count:1,workflow_runs:[{id:123,head_sha:pr.headRefOid,event:'pull_request_target',path:'.github/workflows/merge-gate.yml',status:'completed',conclusion:'startup_failure'}]});
   if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
@@ -53,9 +54,10 @@ function prestageGit(process, fs, page) {
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
 const pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
-if (pr.failedGate) {
+if (pr.failedGate || pr.startupFailure) {
   if (a[0] === 'ls-tree' && a.includes('.lane-manifest.json')) return;
-  if (a[0] === 'ls-remote') { process.stdout.write(pr.headRefOid+'\trefs/heads/'+pr.headRefName+'\n'); return; }
+  if (a[0] === 'ls-remote') { process.stdout.write((pr.remoteHead || pr.headRefOid)+'\trefs/heads/'+pr.headRefName+'\n'); return; }
+  if (a[0] === 'rev-parse' && a[1] === '--verify') { process.stdout.write((pr.fetchedHead || pr.headRefOid)+'\n'); return; }
   if (a[0] === 'merge-tree' || a[0] === 'write-tree') { process.stdout.write('c'.repeat(40)+'\n'); return; }
   if (a[0] === 'commit-tree') { process.stdout.write('b'.repeat(40)+'\n'); return; }
   if (a[0] === 'diff' && a.includes('--name-only') && pr.humanSurface) { process.stdout.write('webeverything.config.json\0'); return; }

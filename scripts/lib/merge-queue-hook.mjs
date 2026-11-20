@@ -363,16 +363,17 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
   if (!Number.isSafeInteger(prNumber)) return { ok: false, action: 'unverified-pr', error: 'no verifiable PR number for the same-repo check' };
   // Pin to the judged head: the refresh works on the branch NAME, so a push since the judgment would otherwise be
   // rebuilt (and its acceptance re-stamped) unjudged. A moved or unreadable tip refuses; the next pass re-judges.
-  // (The rebuild itself pushes a fast-forward of the fetched tip, so a push racing the rebuild is rejected by git.)
+  // Forced gate rebuilding also pins the fetched commit and uses an explicit expected-head push lease.
   if (expectedHead) {
     let tip = null;
     try { tip = (readTip ?? defaultReadTip)(laneRef, root); } catch { tip = null; }
     if (tip !== expectedHead) return { ok: false, action: 'head-moved', error: `branch tip ${tip ? tip.slice(0, 9) : 'unreadable'} is not the judged head ${expectedHead.slice(0, 9)}` };
   }
   const doRefresh = refresh ?? (await import('../conveyor/ci-red-recovery-watch.mjs')).refreshOntoMain;
-  const r = gateRefreshPending ? { ok: true, action: 'current' } : doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo, ...(forceRefresh ? { forceRefresh: true } : {}) });
+  const rereadLabel = gateRefreshPending && !forceRefresh;
+  const r = rereadLabel ? { ok: true, action: 'current' } : doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo, ...(forceRefresh ? { forceRefresh: true, expectedHead } : {}) });
   if (!r?.ok) return { ok: false, action: r?.action ?? 'error', error: r?.error ?? 'refresh failed' };
-  if (!gateRefreshPending && r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
+  if (!rereadLabel && r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
   if (forceRefresh) return { ok: false, action: 'held-current', error: 'failed gate needs a new head; approved head retained — ask an operator to refresh the branch' };
   if (!runId) return { ok: false, action: 'current-no-run', error: 'branch already on main and the required run id is unknown' };
   let call = execGh;

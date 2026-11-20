@@ -16,6 +16,11 @@ const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
 const pr = { number: 5006, headRefOid: head, headRefName: 'lane/test', body: 'A real description', labels: [{ name: 'ready-to-merge' }], mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', statusCheckRollup: [green('test'), { ...green('merge-gate'), conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/123/job/456' }] };
 function options(extra = {}) { return { c: { num: 5006, repo: 'o/r', headRef: 'lane/test', ...classifyPr(pr, { queueRequiredChecks: ['test', 'merge-gate'] }) }, pr, requiredChecks: ['test', 'merge-gate'], classifyPr, setting: 'on', readVerdict: vi.fn(() => verdict([freezeRow])), readFreeze: () => freeze, readAcceptance: vi.fn(), cloneDir: '/clone', statePath: '/unused', readGateRuns: vi.fn(() => []), readFailedGate: vi.fn(() => ({requiredAppId:null,checkRuns:[]})), readState: () => ({}), record: vi.fn(), refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: head })), ...extra }; }
 describe('stale merge-gate refresh', () => {
+  it('falls through to the legacy stale-hold recovery when failed-gate evidence throws', async () => {
+    const o = options({ readFailedGate: () => { throw new Error('throttled'); } });
+    expect((await q.handleStaleMergeGate(o)).reason).toContain('refresh rerun');
+    expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+  });
   it('5006: requires a readable manual freeze clear newer than completion', () => {
     expect(classify([freezeRow]).stale).toBe(true);
     for (const f of [{ ...freeze, frozen: true }, { ...freeze, publishedAt: '2026-10-12T11:00:00Z' }, { error: 'unreadable' }]) expect(classify([freezeRow], { freeze: f }).stale).toBe(false);

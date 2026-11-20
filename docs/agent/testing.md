@@ -5535,11 +5535,33 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `mergeQueue.refreshOnStaleMergeGate` also admits the newest completed-failure check run on the
 pinned head from the live required app. Exercise it through the existing stale-gate refresh and
 real drain CLI, including each queue/review/workflow/group/claim/approved-head hold. The existing
-refresh ledger and atomic claims bound rebuilds per head; no separate repair state is needed.
+refresh ledger and atomic claims bound rebuilds per head. Failed-gate rebuilds also reserve a
+durable PR claim, so a later head cannot reset the attempt budget. A confirmed admission hold
+releases that claim; a successful or uncertain mutation retains it for operator inspection.
+`drain.staleGateUpdateBranchMax` caps attempts per pass (standard 2, 0 disables this trigger),
+resolved through the policy cascade with `WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX` as the env override.
+The setting lives in `scripts/settings/merge-queue.json`; recovery uses the existing
+`merge-queue-enqueue.mjs` / `refreshStalePr` rebuild, not an update-branch API request.
+The judged head is checked against the live branch tip and again after fetch; the rebuild uses
+that immutable commit and pushes its descendant with an explicit expected-head lease.
 A current branch must still produce a new head, since label events cannot refresh this required gate.
 The soak break `stale-failed-merge-gate-blocks-drain` drives that production CLI with private transport
 fixtures; its single source marker detects presence only. Truncated check history or unreadable app
 identity keeps the PR skipped and asks the operator to inspect and refresh the branch manually.
+An evidence-reader exception still permits independently verified legacy stale-hold recovery.
+
+Acceptance coverage: `merge-queue-stale-merge-gate.test.mjs` pins exception fallthrough;
+`merge-queue-enqueue.test.mjs` pins multi-PR default/explicit/zero budgets, cross-head exhaustion,
+listing/live mismatch, required app identity and bounded history; `merge-ai-prs-prestage.test.mjs`
+pins forks, bases, labels, merge states, other failing checks, moved branch tips, card ownership,
+human approval, fix claims, zero-disable wiring and startup-failure admission through the real drain.
+`required-status-checks.test.mjs` pins the ruleset and classic app-ID producers.
+
+Prevention for PR #7184: when adding a recovery arm, test a thrown read falling through to each
+pre-existing arm. A head-mutating retry needs a durable bound independent of the current SHA,
+and the acceptance contract must name both its settings declaration and multi-candidate test.
+Shared admission changes must exercise each existing caller. Run changed test files and their
+soak fixture in the diff-selected verification gate; fixture capability checks must remain real.
 
 ## Failed merge-gate drain refresh fixtures
 

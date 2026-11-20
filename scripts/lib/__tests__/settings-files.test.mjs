@@ -14,7 +14,7 @@ import {
   LEGACY_SETTINGS_LEAVES, LEGACY_SETTINGS_PATH, SETTINGS_DIR, FEATURE_FILE_RE, LEGACY_ONLY_READERS, LEGACY_FILE_GUARD_HINT,
 } from '../settings-files.mjs';
 import { resolveFixerSlotSettings } from '../../conveyor/fixer-slot-rules.mjs';
-import { resolveRefreshOnStaleMergeGate } from '../merge-queue-enqueue.mjs';
+import { resolveRefreshOnStaleMergeGate, resolveStaleGateUpdateBranchMax } from '../merge-queue-enqueue.mjs';
 import { readCostAdmissionSettings } from '../cost-admission-facts.mjs';
 import { resolveHeavyAdmissionCap, resolveCpuIdleMinPct } from '../dispatch-throttle.mjs';
 
@@ -501,8 +501,22 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
 
 
 it('reuses the declared stale merge-gate refresh setting for failed-gate recovery', () => {
+  expect(readSettings().drain.staleGateUpdateBranchMax).toBe(2);
+  expect(readDeclaredSettings().owners['drain.staleGateUpdateBranchMax']).toBe('settings/merge-queue.json');
   expect(readSettings().mergeQueue.refreshOnStaleMergeGate).toBe('on');
   expect(resolveRefreshOnStaleMergeGate({env:{},settings:{},platform:{}})).toMatchObject({value:'on',source:'standard'});
   expect(resolveRefreshOnStaleMergeGate({env:{},settings:{mergeQueue:{refreshOnStaleMergeGate:'off'}},platform:{}}))
     .toMatchObject({value:'off',source:'settings'});
+});
+
+it.each([
+  [{}, {}, {}, 2, 'standard'],
+  [{}, {}, { staleGateUpdateBranchMax: 3 }, 3, 'platform'],
+  [{}, { staleGateUpdateBranchMax: 1 }, { staleGateUpdateBranchMax: 3 }, 1, 'tool'],
+  [{ WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX: '0' }, { staleGateUpdateBranchMax: 1 }, {}, 0, 'env'],
+  [{ WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX: '-1' }, {}, {}, 2, 'standard'],
+])('resolves the failed-gate cap through the shared cascade: %j', (env, tool, platform, value, source) => {
+  const resolved = resolveStaleGateUpdateBranchMax({ env, tool, platform });
+  expect(resolved.value.staleGateUpdateBranchMax).toBe(value);
+  expect(resolved.sources.staleGateUpdateBranchMax).toBe(source);
 });
