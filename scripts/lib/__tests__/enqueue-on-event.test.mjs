@@ -18,6 +18,9 @@ import * as enqueueModule from '../enqueue-on-event.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+import { buildOverlapRows, planLabelDrain } from '../../merge-ai-prs.mjs';
+import { filterEnqueueableOverlapRows } from '../../conveyor/overlap-yield-enqueueable.mjs';
+import { overlapYieldWaits } from '../../conveyor/land-overlap-yield.mjs';
 
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';
@@ -520,6 +523,173 @@ describe('planCatchUp', () => {
   });
   it('never assigns negative room', () => {
     expect(planCatchUp({ prs, queued: 6, capacity: 5, pendingNums: [7] })).toMatchObject({ run: [], later: [3, 4, 5, 8, 9] });
+  });
+});
+
+// Captured gh pr view payloads retain their labels, heads and changed paths.
+// The trimmed captures omit checks; supply green-check evidence for these unit cases.
+const drainLabelPr = (number) => ({
+  statusCheckRollup: structuredClone(READY_PR.statusCheckRollup),
+  ...JSON.parse(readFileSync(join(process.cwd(), 'scripts/lib/__tests__/fixtures', `drain-priority-label-gh-${number}.json`), 'utf8')),
+});
+const labelCandidate = (number, readyAt, extra = {}) => candidate(number, readyAt, { ...drainLabelPr(number), ...extra });
+const labelPlan = (prs, extra = {}) => planCatchUp({
+  prs, queued: 0, capacity: 1, repo: REPO, now: 1000,
+  priority: { mode: 'enforce', agingHours: null }, ...extra,
+});
+
+describe('priority label', () => {
+  it('selects the younger CLEAN urgent PR over the older unlabelled PR with one slot', () => {
+    const plan = labelPlan([labelCandidate(7116, 100), labelCandidate(7183, 200)]);
+    expect(plan.run.map(pr => pr.num)).toEqual([7183]);
+    expect(plan.later).toEqual([7116]);
+    expect(plan.skipped).toEqual([]);
+  });
+
+  it('keeps an incident owner at least equal to urgent, using age within their class', () => {
+    const plan = labelPlan([labelCandidate(7183, 200), labelCandidate(7116, 100)], {
+      mainFix: { repo: 'we', pr: 7116 },
+    });
+    expect(plan.run.map(pr => pr.num)).toEqual([7116]);
+  });
+
+  it.each(['priority:urgent-extra', 'Priority:urgent', 'urgent', 'priority:now'])('does not promote the inexact name %s', name => {
+    const plan = labelPlan([labelCandidate(7116, 100), labelCandidate(7183, 200, {
+      labels: drainLabelPr(7183).labels.map(label => label.name === 'priority:urgent' ? { name } : label),
+    })]);
+    expect(plan.run.map(pr => pr.num)).toEqual([7116]);
+  });
+
+  it('ignores a cached override when the live label is absent', () => {
+    const plan = labelPlan([labelCandidate(7183, 200, {
+      labels: drainLabelPr(7183).labels.filter(label => label.name !== 'priority:urgent'), override: { value: 'urgent', byOperator: true },
+    }), labelCandidate(7116, 100)]);
+    expect(plan.run.map(pr => pr.num)).toEqual([7116]);
+  });
+
+  it.each(['off', 'shadow', 'enforce'])('preserves the existing ranker mode %s', mode => {
+    const plan = labelPlan([labelCandidate(7116, 100), labelCandidate(7183, 200)], {
+      priority: { mode, agingHours: null },
+    });
+    // The shared ranker derives classes in shadow too; catch-up consumes those classes today.
+    expect(plan.run.map(pr => pr.num)).toEqual(mode === 'off' ? [7116] : [7183]);
+  });
+
+  it.each([{ isDraft: true }, { mergeStateStatus: 'DIRTY' }, { labels: [{ name: 'priority:urgent' }, { name: 'review:changes' }] }])('never bypasses existing eligibility with urgent: %j', patch => {
+    const plan = labelPlan([labelCandidate(7183, 0, patch), labelCandidate(7116, 100)]);
+    expect(plan.run.map(pr => pr.num)).toEqual([7116]);
+    expect(plan.skipped.map(pr => pr.num)).toEqual([7183]);
+  });
+});
+
+describe('priority unknown', () => {
+  it.each([null, undefined, {}, [{ name: null }], ['priority:urgent']])('never promotes unreadable labels %j and retains the existing eligibility refusal', labels => {
+    const unknown = labelCandidate(7183, 0, { labels });
+    if (labels === undefined) delete unknown.labels;
+    const plan = labelPlan([unknown, labelCandidate(7116, 100)]);
+    expect(plan.run.map(pr => pr.num)).toEqual([7116]);
+    expect(plan.skipped).toEqual([{ num: 7183, reason: 'labels unreadable' }]);
+  });
+
+  it('keeps a missing priority label plain and breaks equal-age ties by PR number in either input order', () => {
+    const prs = [labelCandidate(7193, 100), labelCandidate(7116, 100)];
+    for (const input of [prs, [...prs].reverse()]) {
+      const plan = labelPlan(input);
+      expect(plan.run.map(pr => pr.num)).toEqual([7116]);
+      expect(plan.later).toEqual([7193]);
+    }
+  });
+});
+
+describe('overlap-yield parked', () => {
+  const accepted = drainLabelPr(7193).labels;
+  const mergeVerdict = num => ({ num, repo: null, decision: 'merge' });
+  function rowsFor({ target = {}, targetVerdict = mergeVerdict(7193), extraPrs = [], extraVerdicts = [] } = {}) {
+    const verdicts = [mergeVerdict(7183), ...(targetVerdict ? [targetVerdict] : []), ...extraVerdicts];
+    vi.stubEnv('WE_DRAIN_OVERLAP_YIELD_ONLY_TO_ENQUEUEABLE', '1');
+    vi.stubEnv('WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE', '1');
+    try {
+      return buildOverlapRows({ candidates: verdicts, verdicts, localSlug: REPO,
+        openPrContext: { prsByRepo: new Map([[null, [drainLabelPr(7183),
+          { ...drainLabelPr(7193), ...target }, ...extraPrs]]]) } });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }
+  const waits = rows => overlapYieldWaits({ candidates: rows.candidateRows, openPrs: rows.openPrRows, nowMs: 1000, ignoreBudget: true });
+  const waitForA = rows => waits(rows).get(`${REPO}#7183`);
+
+  it.each(['review:pending', 'review:held-proof', 'parked', 'hold', 'park:live-proof'])('never defers a ready PR behind overlapping %s even with a merge verdict', parked => {
+    const labels = [...accepted.filter(label => parked !== 'review:pending' || label.name !== 'review:accepted'), { name: parked }];
+    const rows = rowsFor({ target: { labels } });
+    expect(rows.candidateRows.map(pr => pr.number)).toContain(7183);
+    expect(waitForA(rows)).toBeUndefined();
+    expect(rows.openPrRows.map(pr => pr.number)).not.toContain(7193);
+  });
+
+  it('never defers behind a target missing ready-to-merge', () => {
+    expect(waitForA(rowsFor({ target: { labels: [{ name: 'review:accepted' }] } }))).toBeUndefined();
+  });
+
+  it.each(['DIRTY', 'BEHIND', 'UNSTABLE', 'BLOCKED'])('does not wait behind a target whose mergeStateStatus is %s despite green checks', mergeStateStatus => {
+    expect(waitForA(rowsFor({ target: { mergeStateStatus } }))).toBeUndefined();
+  });
+
+  it.each(['batching-deferred', 'deferred', 'skip', 'park'])('A does not wait on B when B is itself deferred: %s verdict despite eligible labels', decision => {
+    const targetVerdict = { num: 7193, repo: null, decision, reason: 'batching-deferred' };
+    const before = structuredClone(targetVerdict);
+    const rows = rowsFor({ targetVerdict });
+    expect(waitForA(rows)).toBeUndefined();
+    expect(rows.openPrRows.map(pr => pr.number)).not.toContain(7193);
+    expect(targetVerdict).toEqual(before);
+  });
+
+  it('A does not wait on B when B is itself deferred by overlap-yielding to C in this pass', () => {
+    // A overlaps B on x; B overlaps C on y; A and C do not overlap.
+    // All three verdicts still say merge: the planner's deferred list is the evidence.
+    // Synthetic deferred chain derived from the real file lists: retain A/B's
+    // shared timing path, add one of C's paths to B, and give C the larger diff.
+    const y = drainLabelPr(7116).files[0].path;
+    const rows = rowsFor({
+      target: { files: [...drainLabelPr(7193).files, { path: y, additions: 100 }] },
+      extraPrs: [{ ...drainLabelPr(7116),
+        labels: drainLabelPr(7116).labels.filter(label => label.name !== 'red-team:pending'),
+        files: drainLabelPr(7116).files.map(file => ({ ...file, additions: 300 })) }],
+      extraVerdicts: [mergeVerdict(7116)],
+    });
+    const overlapContext = waits(rows);
+    expect(overlapContext.get(`${REPO}#7193`)?.yieldTo).toBe(7116);
+    const plan = planLabelDrain([mergeVerdict(7183), mergeVerdict(7193), mergeVerdict(7116)], {
+      overlapContext, overlapLocalSlug: REPO,
+    });
+    expect(plan.deferred.find(pr => pr.num === 7193)).toMatchObject({ waitOn: ['overlap-yield:#7116'] });
+    expect(plan.deferred.map(pr => pr.num)).not.toContain(7183);
+    expect(plan.ready.map(pr => pr.num)).toContain(7183);
+  });
+
+  it('still defers behind a fully eligible CLEAN overlapping B with a merge verdict in this pass', () => {
+    const rows = rowsFor();
+    expect(rows.openPrRows.map(pr => pr.number)).toContain(7193);
+    expect(waitForA(rows)?.yieldTo).toBe(7193);
+  });
+
+  it.each(['blocked', 'ci:failed', 'review:changes', 'red-team:pending', 'red-team:blocked', 'review:human'])('preserves the existing %s exclusion', name => {
+    expect(waitForA(rowsFor({ target: { labels: [...accepted, { name }] } }))).toBeUndefined();
+  });
+
+  it('keeps yielding when the target verdict is unreadable rather than assuming deferred', () => {
+    expect(waitForA(rowsFor({ targetVerdict: null }))?.yieldTo).toBe(7193);
+  });
+
+  it.each([null, undefined])('keeps yielding when target merge state is unreadable: %s', mergeStateStatus => {
+    expect(waitForA(rowsFor({ target: { mergeStateStatus } }))?.yieldTo).toBe(7193);
+  });
+
+  it.each([null, undefined, {}])('does not infer parked from unreadable labels %j when the landable policy is off', labels => {
+    const row = { ...drainLabelPr(7193), repo: REPO, labels, requiredCheckGreen: true };
+    expect(filterEnqueueableOverlapRows({ openPrRows: [row], localSlug: REPO, requiresLandable: false })).toEqual([row]);
+    // The pre-existing landability gate still requires readable ready-label evidence.
+    expect(filterEnqueueableOverlapRows({ openPrRows: [row], localSlug: REPO })).toEqual([]);
   });
 });
 
