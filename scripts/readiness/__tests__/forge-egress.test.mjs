@@ -66,9 +66,11 @@ describe('forge-egress slot user lookup',()=>{
     expect(r.status).not.toBe(0);
     expect(existsSync(join(dir,'called'))).toBe(false);
   }));
-  it('discovers eight slot users by default (forge-exec-1..8)',()=>sandbox(dir=>{
+  it('discovers exactly the explicitly configured slot users when no pool is installed (forge-exec-1..8)',()=>sandbox(dir=>{
+    fake(dir,'getent','exit 0');
     fake(dir,'id','[ "$1" = -u ] || exit 2; echo "$2" >> "$ID_LOG"; echo $((2000 + ${2##*-}))');
-    const r=spawnSync('bash',[script,'render'],{encoding:'utf8',env:{PATH:dir+':'+process.env.PATH,ID_LOG:join(dir,'ids'),...NO_STATE,FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:''}});
+    const isolated=readFileSync(script,'utf8').replaceAll('/srv/forge-exec',join(dir,'pool'));
+    const r=spawnSync('bash',['-c',isolated,script,'render'],{encoding:'utf8',env:{PATH:dir+':'+process.env.PATH,ID_LOG:join(dir,'ids'),...NO_STATE,FORGE_EXEC_SLOTS:'8',FORGE_EGRESS_REGISTRY_V4:'',FORGE_EGRESS_REGISTRY_V6:''}});
     expect(r.status).toBe(0);
     expect(readFileSync(join(dir,'ids'),'utf8').trim().split('\n')).toEqual([1,2,3,4,5,6,7,8].map(n=>`forge-exec-${n}`));
     expect(r.stdout).toContain('meta skuid { 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008 } jump slot_egress');

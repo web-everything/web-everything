@@ -48,7 +48,7 @@ export function tipInMain(git, mainSha, sha) {
 /**
  * PURE: the refs whose applied tip a build must NOT be adopted with, judged against the audit evidence NOW.
  * Mirrors the plan's own exemptions, so a build the live plan would mint is never refused here: a head applied with
- * `pinnedFrom` (the audited adopted head), a tip the running head or main already carries or has (`carries`, `inMain`),
+ * `pinnedFrom` is never an exemption: the applied sha is judged on its own evidence, a tip the running head or main already carries or has (`carries`, `inMain`),
  * and a registration with no adopted history (`auditAdopted` lists the refs that have one; unknown list = fail closed).
  * `held` are the tips the live plan reports as held back (`overlay-unaudited-tip` alerts). No gate (follow mode) = nothing to revoke.
  */
@@ -57,8 +57,10 @@ export function revokedAppliedTips({
 }) {
   return (applied ?? [])
     .filter((a) => {
-      if (!a?.ref || !a.sha || a.pinnedFrom) return false;
+      if (!a?.ref || !a.sha) return false;
+      // A live hold on the applied sha itself always wins over any pin.
       if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
+      // pinnedFrom is the rejected tip, not evidence for the applied sha: it never exempts. The applied sha is judged below.
       if (typeof auditedTip !== 'function') return false;
       if (carries(a.sha, prevHead) || carries(a.sha, mainSha) || inMain(a.sha)) return false;
       if (Array.isArray(auditAdopted) && !auditAdopted.includes(a.ref)) return false; // never adopted: the plan applies it unaudited
