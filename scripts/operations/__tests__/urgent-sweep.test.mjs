@@ -14,7 +14,9 @@ let checkId = 0;
 const check = (name, conclusion = 'success', extra = {}) => ({ id: ++checkId, head_sha: sha, name, app: { id: 15368 }, check_suite: { id: 7 }, status: 'completed', conclusion, ...extra });
 function fixture(rows = required.map(n => check(n))) {
   const state = [], events = [], loads = [load];
-  const d = { loads: () => loads, state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
+  // Existing lifecycle cases start after the registration subprocess returned.
+  const d = { loads: () => [...loads, ...loads.filter(r => r.type === 'prototype-load.urgent')
+    .map(r => ({ ...r, type: 'prototype-load.urgent-registration-complete' }))], state: () => state, now: () => '2026-11-18T12:00:00Z', required: vi.fn(() => required),
     containsOverlay: vi.fn(() => true), mergedOverlay: vi.fn(() => false),
     overlayState: vi.fn(() => ({ corrupt: false, overlays: loads.map(r => ({ ref: r.registration?.ref })) })),
     checks: vi.fn(() => ({ total_count: rows.length, check_runs: rows, workflows })), remove: vi.fn(() => ({ retired: true })),
@@ -623,6 +625,7 @@ describe('urgent CI sweep', () => {
   });
   it('settles a verified absent failed registration intent without cancelling a later attempt', async () => {
     const f = fixture([check('test', 'failure')]);
+    f.d.loads = () => f.loads;
     f.loads[0] = { ...load, trackingId: 'failed-attempt' };
     f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
     f.d.overlayState.mockReturnValueOnce({ corrupt: false, overlays: [] });
@@ -639,6 +642,7 @@ describe('urgent CI sweep', () => {
   });
   it('keeps monitoring a registration-failed intent when its overlay is present and unloads on CI failure', async () => {
     const f = fixture();
+    f.d.loads = () => f.loads;
     f.loads.push({ ...load, type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
     expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
     f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
@@ -647,6 +651,7 @@ describe('urgent CI sweep', () => {
   });
   it.each(['corrupt', 'throws'])('keeps a registration-failed intent tracked when the overlay read %s', async kind => {
     const f = fixture([check('test', 'failure')]);
+    f.d.loads = () => f.loads;
     f.loads.push({ ...load, type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
     if (kind === 'throws') f.d.overlayState.mockImplementationOnce(() => { throw new Error('store unreadable'); });
     else f.d.overlayState.mockReturnValueOnce({ corrupt: true, overlays: [] });
@@ -1047,6 +1052,86 @@ describe('hot-patch sweep (R1100)', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledTimes(1);
   });
+  it('does not settle an intent while registration is pending', async () => {
+    const f = hotFixture();
+    f.d.loads = () => f.loads;
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-unregistered' }] });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: f.loads[0].registration.ref }] });
+    f.d.containsOverlay.mockReturnValue(true);
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledWith(f.loads[0], { ref: f.loads[0].registration.ref });
+  });
+  it.each([['ordinary', false], ['ordinary', true], ['hot-patch', false], ['hot-patch', true]])('retains an absent %s intent until its registration completes (merged=%s)', async (kind, merged) => {
+    const f = kind === 'hot-patch' ? hotFixture() : fixture();
+    f.d.loads = () => f.loads;
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(merged);
+    f.d.mergedOverlay.mockReturnValue(merged);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-unregistered' }] });
+    f.d.now = () => '2026-11-18T12:15:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('Registration completion is unproven') }] });
+    expect(f.d.escalate).toHaveBeenCalledTimes(1);
+    f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-complete' });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unregistered' }] });
+    if (kind === 'hot-patch') expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
+  });
+  it.each(['trackingId', 'ref', 'sha', 'clone', 'registration'])('refuses completion belonging to a different %s', async field => {
+    const f = hotFixture();
+    f.d.loads = () => f.loads;
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    const completion = { ...f.loads[0], type: 'prototype-load.urgent-registration-complete',
+      [field]: field === 'registration' ? { ...f.loads[0].registration, ref: 'lane/other' } : 'other' };
+    f.loads.push(completion);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-unregistered' }] });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+  });
+  it.each([['settled-unregistered', false], ['settled-unregistered', true], ['unloaded-adopted', false], ['unloaded-adopted', true]])('rechecks a historical %s receipt before releasing the singleton (complete=%s)', async (status, complete) => {
+    const f = hotFixture();
+    f.d.loads = () => f.loads;
+    await f.run();
+    const previous = f.settlements()[0];
+    f.state.push({ ...previous, status, ancestryVerified: true, unloadEventSent: true, unloadEscalationSent: true });
+    if (complete) f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-complete' });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+    f.d.checks.mockReturnValue({ total_count: 1, check_runs: [check('test', 'failure')], workflows });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each(['settled-unregistered', 'unloaded-adopted'])('requires matching writer completion as well as a proven %s receipt for the singleton', async status => {
+    const f = hotFixture();
+    f.d.loads = () => f.loads;
+    await f.run();
+    f.state.push({ ...f.settlements()[0], status, ancestryVerified: true, registrationComplete: true });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+    f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-complete' });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
+  });
+  it('does not settle withdrawal during registration and removes a late registration again', async () => {
+    const f = hotFixture([check('test', 'failure')]);
+    f.d.loads = () => f.loads;
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.containsOverlay.mockReturnValue(false);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
+    f.d.now = () => '2026-11-18T12:15:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you', detail: expect.stringContaining('Registration completion is unproven') }] });
+    const escalations = f.d.escalate.mock.calls.length;
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.escalate).toHaveBeenCalledTimes(escalations);
+    f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-complete' });
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [{ ref: f.loads[0].registration.ref }] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(2);
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-adopted' }] });
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
+  });
   it('reads a hot-patch PR from a renamed recorded origin', () => {
     const ghExec = vi.fn((cmd, args, options) => {
       expect(options.env).not.toHaveProperty('GH_REPO');
@@ -1104,15 +1189,16 @@ describe('hot-patch sweep (R1100)', () => {
   });
   it.each(['excluded from HEAD', 'merged into main'])('releases the singleton after failed registration is verified %s', async proof => {
     const f = hotFixture();
+    f.d.loads = () => f.loads;
     f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
     f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
     f.d.containsOverlay.mockReturnValue(proof !== 'excluded from HEAD');
     f.d.mergedOverlay.mockReturnValue(proof === 'merged into main');
-    expect(() => assertHotPatchSingleton(f.loads, f.state)).toThrow('unsettled hot-patch load exists');
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
     expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unregistered' }] });
     expect(f.settlements()).toEqual([expect.objectContaining({ ref: f.loads[0].ref, sha, ancestryVerified: true })]);
     expect(f.d.containsOverlay).toHaveBeenCalledWith(f.loads[0]);
-    expect(() => assertHotPatchSingleton(f.loads, f.state)).not.toThrow();
+    expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
     expect(await f.run()).toMatchObject({ results: [] });
     expect(f.d.containsOverlay).toHaveBeenCalledTimes(1);
     expect(f.d.remove).not.toHaveBeenCalled();
@@ -1121,6 +1207,7 @@ describe('hot-patch sweep (R1100)', () => {
   it.each(['still in HEAD', 'ancestry unknown', 'ancestry throws', 'main unknown', 'state corrupt', 'state throws'])(
     'keeps the singleton blocked after failed registration with %s, then recovers', async kind => {
       const f = hotFixture();
+      f.d.loads = () => f.loads;
       f.loads.push({ ...f.loads[0], type: 'prototype-load.urgent-registration-failed', status: 'registration-failed' });
       f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
       if (kind === 'ancestry unknown') f.d.containsOverlay.mockReturnValue(undefined);
@@ -1129,13 +1216,13 @@ describe('hot-patch sweep (R1100)', () => {
       if (kind === 'state corrupt') f.d.overlayState.mockReturnValue({ corrupt: true, overlays: [] });
       if (kind === 'state throws') f.d.overlayState.mockImplementation(() => { throw Error('state unavailable'); });
       expect(await f.run()).toMatchObject({ results: [{ status: kind === 'still in HEAD' ? 'monitoring-unregistered' : 'needs-you' }] });
-      expect(() => assertHotPatchSingleton(f.loads, f.state)).toThrow('unsettled hot-patch load exists');
+      expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).toThrow('unsettled hot-patch load exists');
       expect(f.state.some(r => r.status === 'settled-unregistered')).toBe(false);
       expect(f.d.remove).not.toHaveBeenCalled();
       f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
       f.d.containsOverlay.mockReturnValue(false);
       expect(await f.run()).toMatchObject({ results: [{ status: 'settled-unregistered' }] });
-      expect(() => assertHotPatchSingleton(f.loads, f.state)).not.toThrow();
+      expect(() => assertHotPatchSingleton(f.d.loads(), f.state)).not.toThrow();
     });
   it.each(['foreign-app', 'malformed'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
     const failed = check(kind === 'unrelated' ? 'daemon-soak' : 'test', 'failure',

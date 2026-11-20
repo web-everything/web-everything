@@ -1,6 +1,6 @@
 /** Urgent evidence permits prototype loading only; merging still requires real CI. */
 import yaml from 'js-yaml';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 export const urgentKeyPath = home => `${home}/workspace/.operations/state/urgent-verify.key`;
@@ -43,6 +43,11 @@ export function urgentSignature(record, key) {
   return createHmac('sha256', key).update(JSON.stringify(Object.fromEntries(fields.map(k => [k, record[k]])))).digest('hex');
 }
 export const urgentLedger = (home, name = 'urgent-full-green') => `${home}/workspace/.operations/coordination/${name}.jsonl`;
+export const urgentLoadIdentity = r => createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
+// These records are appended only after the registration subprocess has returned.
+// Completion proves there is no future registration write from this attempt, not success or absence.
+export const completedUrgentRegistrations = records => new Set(records.filter(r =>
+  ['prototype-load.urgent-registration-complete', 'prototype-load.urgent-registration-failed'].includes(r.type)).map(urgentLoadIdentity));
 export const urgentReason = (reason) => typeof reason === 'string' && reason.trim().length >= 10;
 const fullSha = (sha) => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
 

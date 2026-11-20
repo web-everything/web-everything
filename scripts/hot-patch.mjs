@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** R1100: immutable hot-patch admission; urgent-sweep owns monitoring and rollback. */
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import nodeFs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 import { DAEMON_CLONE_SEED, daemonCloneForLabel } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
-import { urgentLedger } from './operations/urgent-verify-marker.mjs';
+import { urgentLedger, urgentLoadIdentity, completedUrgentRegistrations } from './operations/urgent-verify-marker.mjs';
 const repo = 'web-everything/web-everything', prefix = `repos/${repo}`;
 const shaOK = sha => typeof sha === 'string' && /^[a-f0-9]{40}$/.test(sha);
 export function hotPatchRoot(daemon, cwd) {
@@ -93,9 +93,10 @@ export function reserveHotPatch({ env, fs = nodeFs, inherited = false }) {
 }
 export function assertHotPatchSingleton(records, receipts) {
   const hot = records.filter(r => r.type === 'prototype-load.urgent' && /^hotpatch\/[a-f0-9]{40}/.test(r.ref ?? ''));
+  const complete = completedUrgentRegistrations(records);
   if (hot.some(r => {
-    const id = createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
-    return !receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha
+    const id = urgentLoadIdentity(r);
+    return !complete.has(id) || !receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha && s.registrationComplete === true
       && ((s.status === 'settled-unregistered' && s.ancestryVerified === true) || s.status === 'unloaded-adopted'));
   })) throw Error('unsettled hot-patch load exists; inspect status and settle it before retrying');
 }
