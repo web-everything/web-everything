@@ -5,6 +5,8 @@ import { createFailureCollector } from '../verify-failures.mjs';
 import { applyRevertRedToVerdict } from '../verify-revert-red.mjs';
 import { reachesChanged } from '../red-cause.mjs';
 import * as quarantine from '../verify-quarantine.mjs';
+import { verifyStartBody, verifyFinishBody } from '../lane-verify.mjs';
+import { stableTreeHash } from '../verify-lane-gate.mjs';
 
 const now = Date.parse('2026-11-18T12:00:00Z');
 const file = 'scripts/lib/__tests__/daemon-jobs-runtime.test.mjs';
@@ -20,28 +22,101 @@ const withEntries = entries => ({ ok: true, list: { version: 1, mode: 'quarantin
 const closed = result => expect(result).toMatchObject({ excused: false, files: [], why: expect.any(String) });
 
 // Execute the actual post-gate wiring with real failure collection and dependency reads.
-function runLaneQuarantine(changedFiles, readRepoFile = path => readFileSync(path, 'utf8')) {
+function runLaneQuarantine(changedFiles, readRepoFile = path => readFileSync(path, 'utf8'), options = {}) {
   const source = readFileSync('scripts/verify-lane.mjs', 'utf8');
   const start = source.indexOf('const diffFiles =');
   const end = source.indexOf('// #5466 — the revert-red check, inside', start);
+  const reporting = source.indexOf('const diagnostic =', end);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  expect(reporting).toBeGreaterThan(end);
   const failed = 'scripts/lib/__tests__/operator-override-host-isolation.test.mjs';
+  const files = options.files ?? [failed];
   const collector = createFailureCollector();
-  collector.push(` FAIL ${failed} > isolates the host home\n Test Files  1 failed\n`, 'stderr');
+  files.forEach(file => collector.push(` FAIL ${file} > isolates the host home\n`, 'stderr'));
+  collector.push(` Test Files  ${new Set(files).size} failed\n`, 'stderr');
   const failureDetails = collector.finish();
+  let stderr = '', marker = null, emitted = null, emittedCode = null;
+  let quarantineReads = 0;
+  const terminal = new Error('terminal emit');
   const args = { resolvedGate: { decision: { changedFiles }, standardsCommand: 'standards' }, editedDuringRun: [],
-    tryGit: () => 'base', headSha: 'head', exitCode: 1, signal: null, infrastructureNow: () => null,
+    tryGit: argv => { expect(argv).toEqual(['rev-parse', 'origin/main']); return options.mainTip === undefined ? 'base' : options.mainTip; },
+    headSha: 'head', exitCode: 1, signal: null, infrastructureNow: () => null,
     phaseTimeout: null, failureDetails, quarantineEligible,
-    phaseResults: [phase([failed], { failureDetails }), { phase: 'standards', result: { exitCode: 0 } }],
-    quarantinedVerdict: args => quarantinedVerdict({ ...args, now }), readQuarantine: () => withEntries([entry(failed)]),
-    REPO: '.', runAllPhases: true, reachesChanged, readRepoFile, process: { stderr: { write() {} } }, phasedTestGate: true,
-    quarantineTouchesDiff: quarantine.quarantineTouchesDiff };
-  return new Function(...Object.keys(args), source.slice(start, end) + '; return { exitCode, quarantined };')(...Object.values(args));
+    phaseResults: options.phaseResults ?? [phase(files, { failureDetails }), { phase: 'standards', result: { exitCode: 0 } }],
+    quarantinedVerdict: args => quarantinedVerdict({ ...args, now }),
+    readQuarantine: () => { quarantineReads++; return options.readQuarantine ? options.readQuarantine() : withEntries(files.map(file => entry(file))); },
+    REPO: '.', runAllPhases: true, reachesChanged, readRepoFile, process: { stderr: { write(text) { stderr += text; } } }, phasedTestGate: true,
+    quarantineTouchesDiff: quarantine.quarantineTouchesDiff,
+    // Execute the real reporting/marker statements; keep unrelated retry and red-cause work inert.
+    retryAudit: {}, flakes: [], describeIsolatedRetry: () => '', infrastructure: null,
+    classifyRedCause: () => null, classifyPreExisting: () => null,
+    isolatedRetry: null, retriedFailures: [], baseCandidate: null, baseFailures: null,
+    MODE: options.mode ?? 'request', phases: {}, formatVerifyPhases: () => '', revertRed: null,
+    readMarker: () => verifyStartBody({ sha: 'head', suites: 'gate' }), verifyStartBody, verifyFinishBody,
+    GATE: 'gate', stableTreeHash, currentTreeHash: 'tree', preGateTreeHash: 'tree', treeHashNow: () => 'tree',
+    writeMarker: body => { marker = structuredClone(body); }, overallRunLocation: () => 'local', ranOnPhases: [],
+    maybeRecordGreen: () => {}, recordTerminalVerifyOutcome: () => {}, GIT_DIR: '.',
+    emit: (body, code) => { emitted = body; emittedCode = code; throw terminal; },
+  };
+  try {
+    // Revert-red execution is covered separately below; no real probes or marker IO run here.
+    new Function(...Object.keys(args), source.slice(start, end) + source.slice(reporting))(...Object.values(args));
+  } catch (error) {
+    if (error !== terminal) throw error;
+  }
+  expect(emitted).not.toBeNull();
+  return { exitCode: emitted.exitCode, quarantined: emitted.quarantined ?? null, stderr, marker, emitted, emittedCode, quarantineReads };
 }
 
 describe('verify post-hoc quarantine', () => {
+  it('records every quarantined file in stderr and the finished marker', () => {
+    const files = ['scripts/lib/__tests__/operator-override-host-isolation.test.mjs', other];
+    const result = runLaneQuarantine(['unrelated.mjs'], () => '', { files });
+    expect(result.exitCode).toBe(0);
+    expect(result.emittedCode).toBe(0);
+    expect(result.stderr).toContain(`verify-lane: quarantined (not red): ${files.join(', ')}`);
+    expect(result.marker).toMatchObject({ status: 'green', quarantined: { files } });
+    expect(result.emitted).toMatchObject({ status: 'green', quarantined: { files } });
+    expect(result.emitted.detail).toContain(`quarantined (not red): ${files.join(', ')}`);
+  });
+  it('records every quarantined file in run-mode diagnostics without writing a marker', () => {
+    const files = [file, other];
+    const result = runLaneQuarantine(['unrelated.mjs'], () => '', { files, mode: 'run' });
+    expect(result.emitted).toMatchObject({ status: 'green', exitCode: 0, quarantined: { files } });
+    expect(result.stderr).toContain(`verify-lane: quarantined (not red): ${files.join(', ')}`);
+    expect(result.emitted.detail).toContain(`quarantined (not red): ${files.join(', ')}`);
+    expect(result.emittedCode).toBe(0);
+    expect(result.marker).toBeNull();
+  });
+  it.each([null, ''])('keeps a missing origin/main tip (%j) red through the gate wiring', mainTip => {
+    const result = runLaneQuarantine(['unrelated.mjs'], () => '', { mainTip });
+    expect(result).toMatchObject({ exitCode: 1, quarantined: null, emittedCode: 2, quarantineReads: 1 });
+    expect(result.marker).toMatchObject({ status: 'red', exitCode: 1 });
+    expect(result.marker).not.toHaveProperty('quarantined');
+    expect(result.stderr).not.toContain('quarantined (not red)');
+  });
+  it.each([
+    ['throws', () => { throw new Error('store unreadable'); }],
+    ['returns not-ok', () => ({ ok: false, error: 'store malformed' })],
+  ])('keeps red and writes a terminal marker when readQuarantine %s', (_name, readQuarantine) => {
+    const result = runLaneQuarantine(['unrelated.mjs'], () => '', { readQuarantine });
+    expect(result).toMatchObject({ exitCode: 1, quarantined: null, emittedCode: 2, quarantineReads: 1 });
+    expect(result.marker).toMatchObject({ status: 'red', exitCode: 1 });
+    expect(result.marker).not.toHaveProperty('quarantined');
+    expect(result.stderr).not.toContain('quarantined (not red)');
+  });
+  it.each([{ changedFiles: undefined }, { changedFiles: null }, { changedFiles: [null] }])('keeps missing or malformed diff evidence ($changedFiles) red through the gate wiring', ({ changedFiles }) => {
+    expect(runLaneQuarantine(changedFiles, () => '')).toMatchObject({ exitCode: 1, quarantined: null });
+  });
+  it.each(['scan', 'standards'])('does not read quarantine for a red %s phase through the gate wiring', name => {
+    const result = runLaneQuarantine(['unrelated.mjs'], () => '', { phaseResults: [phase(), { ...phase(), phase: name }] });
+    expect(result).toMatchObject({ exitCode: 1, quarantined: null, quarantineReads: 0 });
+  });
   it.each(['vitest.setup.ts', 'vitest.globalSetup.mjs', 'vitest.config.ts', 'vitest.shared.ts',
     'scripts/lib/test-tmp-root.mjs', 'scripts/test-cache/trace-setup.mjs'])('keeps runner-loaded dependency %s regressions red through the gate wiring', changed => {
-    expect(runLaneQuarantine([changed])).toEqual({ exitCode: 1, quarantined: null });
+    const { exitCode, quarantined } = runLaneQuarantine([changed]);
+    expect({ exitCode, quarantined }).toEqual({ exitCode: 1, quarantined: null });
   });
   it('keeps missing runner configuration evidence red through the gate wiring', () => {
     expect(runLaneQuarantine(['unrelated.mjs'], path => {
