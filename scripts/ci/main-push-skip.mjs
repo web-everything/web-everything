@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-/** Exact-commit queue reuse. Any missing proof runs full CI; no tree/time heuristics. */
+/** Exact-commit queue reuse. Any missing proof runs full CI; no tree heuristics; execution reuse is bounded. */
 import { execFileSyncThrottled as exec } from '../lib/gh-throttle.mjs';
+import { cascadePolicy, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { pathToFileURL } from 'node:url';
 const oid = value => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value) && value.length === 40
   && !/^0+$/.test(value) ? value.toLowerCase() : null;
@@ -9,6 +10,18 @@ const full = reason => ({ skip: false, reason: `${reason}; running full CI` });
 const success = run => run.status === 'completed' && run.conclusion === 'success';
 const queueRun = runs => runs.filter(r => r.path === '.github/workflows/ci.yml'
   && r.event === 'merge_group' && success(r)).sort((a, b) => b.id - a.id)[0];
+
+const MAX_AGE_MS = 2 * 60 * 60 * 1000;
+export function readMainPushSkipPolicy({ env = process.env, platform, tool, log = console.error } = {}) {
+  const resolved = cascadePolicy('mainPushSkip', tool, {
+    env, platform, log: () => {}, standard: { maxAgeMs: MAX_AGE_MS },
+    envValues: { maxAgeMs: env.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS === undefined
+      ? undefined : Number(env.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS) },
+    valid: { maxAgeMs: value => Number.isSafeInteger(value) && value > 0 && value <= MAX_AGE_MS },
+  });
+  log(formatCascadeSourcesLine('mainPushSkip', resolved));
+  return resolved;
+}
 
 export function decideMainPushSkip(input = {}) {
   try {
@@ -28,6 +41,12 @@ export function decideMainPushSkip(input = {}) {
     const others = rows.filter(r => r.id !== currentRunId);
     if (others.some(r => !success(r) || r.id > queue.id && r.check_suite?.app?.id !== 15368)) return full('another run invalidates queue success');
     if (!oid(queueFuiSha) || !oid(fuiTip) || oid(queueFuiSha) !== oid(fuiTip)) return full('FUI sibling proof missing or changed');
+    const { value: { maxAgeMs } } = readMainPushSkipPolicy(input);
+    // Workflow runs expose completion as updated_at, not created_at (reruns retain creation).
+    const completedAt = typeof queue.updated_at === 'string' ? Date.parse(queue.updated_at) : NaN;
+    const now = input.now ?? Date.now();
+    if (!Number.isFinite(now) || !Number.isFinite(completedAt) || completedAt > now || now - completedAt > maxAgeMs)
+      return full('queue execution completion unknown or outside reuse age limit');
     return { skip: true, reason: `exact SHA passed queue run ${queue.id}; FUI sibling unchanged`, fuiSha: oid(queueFuiSha) };
   } catch { return full('unreadable input'); }
 }

@@ -152,6 +152,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
+          WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS: ${{ vars.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS }}
         run: node scripts/ci/main-push-skip.mjs --sha="$HEAD_SHA" --before="$BEFORE_SHA" --run-id="$RUN_ID" --event="$EVENT_NAME" --ref="$REF" --repo="$REPO" >> "$GITHUB_OUTPUT"
       - name: Prepare reused sibling record
         if: ${{ steps.main-skip.outputs.skip == 'true' }}
@@ -161,6 +162,20 @@ jobs:
         with:
           name: fui-sibling-${{ steps.main-skip.outputs.fui-sha }}
           path: ${{ runner.temp }}/fui-sibling-record
+
+  # R1105: drain reads the overall push conclusion as main-green evidence. Reuse
+  # executes no fresh suite, so this NON-REQUIRED job prevents a successful run.
+  # Required test/smoke/daemon-soak checks retain their existing PR/MQ behavior.
+  main-execution:
+    needs: changes
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.result == 'success' && needs.changes.outputs.skip == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: No fresh main execution
+        run: |
+          echo "::notice::Queue CI reused; no fresh main-green evidence. Wait for the hourly backstop or next full CI run."
+          exit 1
 
   # The reusable record certifies full execution, including every job's actual quarantine decision.
   # Light/unknown/quarantined runs stay successful but publish no reusable queue evidence.

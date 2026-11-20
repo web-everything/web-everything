@@ -1,12 +1,43 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 const recorded = JSON.parse(readFileSync(new URL('./fixtures/main-push-runs.json', import.meta.url)));
 const sha = 'a'.repeat(40), fui = 'b'.repeat(40);
 const input = () => ({ sha, before: 'c'.repeat(40), event: 'push', ref: 'refs/heads/main', currentRunId: 101,
-  runs: structuredClone(recorded), queueFuiSha: fui, fuiTip: fui, beforeIsAncestor: true });
+  now: Date.parse('2026-11-20T12:00:00Z'), env: {}, platform: {}, log: () => {}, runs: structuredClone(recorded), queueFuiSha: fui, fuiTip: fui, beforeIsAncestor: true });
 const decide = async value => (await import('../main-push-skip.mjs')).decideMainPushSkip(value);
 describe('exact-SHA main push reuse', () => {
+  it.each([undefined, null, '', 'invalid', '2026-11-20T09:59:59Z', '2026-11-20T12:00:01Z'])(
+    'runs full for old, unknown or future queue completion %s', async stamp => {
+      const x = input(); x.runs.workflow_runs[0].updated_at = stamp;
+      expect(await decide(x)).toMatchObject({ skip: false, reason: expect.stringContaining('full CI') });
+    });
+  it('uses queue completion rather than creation or the current push time', async () => {
+    const x = input(); x.runs.workflow_runs[0].created_at = '2020-01-01T00:00:00Z';
+    expect((await decide(x)).skip).toBe(true);
+    x.runs.workflow_runs[0].updated_at = '2026-11-20T09:00:00Z';
+    x.runs.workflow_runs[1].updated_at = '2026-11-20T12:00:00Z';
+    expect((await decide(x)).skip).toBe(false);
+  });
+  it('allows the two-hour boundary but an environment limit can shorten it', async () => {
+    const x = input(); x.runs.workflow_runs[0].updated_at = '2026-11-20T10:00:00Z';
+    expect((await decide(x)).skip).toBe(true);
+    x.env.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS = '3600000';
+    expect((await decide(x)).skip).toBe(false);
+  });
+  it.each(['7200001', '999999999', 'invalid', '', '0', '-1', 'Infinity', '1.5'])(
+    'rejects invalid or oversized age limit %j and retains two hours', async setting => {
+      const x = input(); x.env.WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS = setting;
+      expect((await decide(x)).skip).toBe(true);
+      x.runs.workflow_runs[0].updated_at = '2026-11-20T09:59:59Z';
+      expect((await decide(x)).skip).toBe(false);
+    });
+  it('applies a shorten-only platform setting', async () => {
+    const x = input(); x.platform = { maxAgeMs: 1 };
+    expect((await decide(x)).skip).toBe(false);
+    x.platform.maxAgeMs = 7200001;
+    expect((await decide(x)).skip).toBe(true);
+  });
   it('skips a proven queue SHA and names its run id', async () => {
     expect(await decide(input())).toMatchObject({ skip: true, reason: expect.stringContaining('100') });
   });
@@ -85,5 +116,25 @@ describe('queue sibling artifact content', () => {
   it.each([true, undefined])('refuses expired or unknown expiry (%s)', async expired => {
     const { readQueueSiblingRecord } = await import('../main-push-skip.mjs');
     expect(() => readQueueSiblingRecord({ queue, artifacts: [{ ...artifact, expired }], download: () => JSON.stringify(record) })).toThrow();
+  });
+});
+
+
+describe('queue reuse age policy', () => {
+  it('resolves standard, platform, tool and environment in order and logs provenance', async () => {
+    const { readMainPushSkipPolicy } = await import('../main-push-skip.mjs');
+    const log = vi.fn();
+    const base = { platform: {}, env: {}, log };
+    expect(readMainPushSkipPolicy(base).value.maxAgeMs).toBe(7200000);
+    expect(readMainPushSkipPolicy({ ...base, platform: { maxAgeMs: 600000 } }).sources.maxAgeMs).toBe('platform');
+    const settings = { ...base, platform: { maxAgeMs: 600000 }, tool: { maxAgeMs: 300000 } };
+    expect(readMainPushSkipPolicy(settings).sources.maxAgeMs).toBe('tool');
+    const result = readMainPushSkipPolicy({ ...settings, env: { WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS: '1000' } });
+    expect(result.value.maxAgeMs).toBe(1000);
+    expect(result.sources.maxAgeMs).toBe('env');
+    expect(log).toHaveBeenLastCalledWith(expect.stringContaining('maxAgeMs=1000 (env)'));
+    const rejected = readMainPushSkipPolicy({ ...base, env: { WE_CI_MAIN_PUSH_SKIP_MAX_AGE_MS: '7200001' } });
+    expect(rejected.value.maxAgeMs).toBe(7200000);
+    expect(rejected.invalid.length).toBeGreaterThan(0);
   });
 });
