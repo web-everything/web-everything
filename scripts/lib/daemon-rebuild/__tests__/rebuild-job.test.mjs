@@ -1,7 +1,8 @@
 /** Rebuild herd spacing: stable identity, bounded additive jitter, and historical settings. */
-import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { loadRebuildAsJobSettings, rebuildJobInterval, rebuildCloneAsJob, REBUILD_JOB_KIND } from '../rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../../daemon-jobs-runtime.mjs';
@@ -101,4 +102,90 @@ it.each(['before-reattach', 'during-reattach'])('never starts or restarts a job 
   expect(store.list().records).toHaveLength(1);
   expect(reattach).toHaveBeenCalledTimes(1); // a non-adopting ready record must not suppress job recovery
   expect(adopt).toHaveBeenCalledTimes(1);
+});
+
+
+describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () => {
+  let hotPatch, env, store, ledger, plan;
+  const finished = 1700000000000;
+  beforeEach(async () => {
+    // Keep the existing suite runnable on main; only these new cases require S2-min.
+    const modulePath = join(process.cwd(), 'scripts/lib/hot-patch.mjs');
+    const moduleUrl = pathToFileURL(modulePath).href;
+    hotPatch = existsSync(modulePath) ? await import(/* @vite-ignore */ moduleUrl) : {};
+    expect(hotPatch.hotPatchWakeDue, 'hotPatchWakeDue is missing').toBeTypeOf('function');
+    env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
+    mkdirSync(env.WE_DAEMON_STATE_DIR);
+    mkdirSync(join(root, 'jobs'));
+    store = createJobStore(join(root, 'jobs'));
+    const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: finished - 1000 });
+    store.update(old.id, r => markSucceeded(r, { at: new Date(finished).toISOString() }));
+    const sha = 'b'.repeat(40);
+    ledger = { sha, pr: 42, branch: 'lane/repair', root, requestPid: process.pid, requestStart: 1,
+      loadedAt: new Date(finished).toISOString(),
+      overlay: { ref: 'lane/repair', pr: 42, pinned: true, reason: 'R1100 hot-patch',
+        addedAt: new Date(finished).toISOString(), addedBy: null },
+      preGood: { head: 'a'.repeat(40), inputsKey: 'c'.repeat(40), mainSha: 'a'.repeat(40), applied: [] } };
+    plan = { finalSha: sha, applied: [{ ref: ledger.branch, sha }] };
+    writeFileSync(hotPatch.hotPatchLedgerPath(env), JSON.stringify(ledger));
+  });
+  const tick = (elapsed = 120000, extra = {}) => rebuildCloneAsJob({
+    root, env, store, entries: ['scripts/review-daemon.mjs'],
+    adopt: async () => ({ reason: 'needs-build', plan }),
+    reattach: async () => ({}), evict: () => ({}), log: { error() {} }, codeSha: 'a'.repeat(40),
+    now: () => finished + elapsed, rng: () => 0,
+    settings: { entries: [], minIntervalMs: 900000, minIntervalJitterPct: 0 }, ...extra,
+  });
+  it('skips the 900000ms cooldown exactly once and persists wokeAt after enqueue', async () => {
+    expect(hotPatch.WAKE_FLOOR_MS).toBe(120000);
+    const create = vi.spyOn(store, 'create');
+    create.mockImplementationOnce(record => {
+      expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
+      // Call the real store on the same directory to observe the persistence boundary.
+      return createJobStore(store.dir).create(record);
+    });
+    expect((await tick()).reason).toBe('rebuild-job-started');
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(hotPatch.readHotPatch(env).wokeAt).toBeTruthy();
+    const queued = store.list().records.find(r => r.id !== create.mock.results[0].value.id);
+    expect(queued).toBeTruthy();
+    const newJob = create.mock.results[0].value;
+    store.update(newJob.id, r => markSucceeded(r, { at: new Date(finished + 120000).toISOString() }));
+    expect((await tick(240000)).reason).toBe('rebuild-job-spaced');
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+  it('never wakes within WAKE_FLOOR_MS of last finish', async () => {
+    expect((await tick(119999)).reason).toBe('rebuild-job-spaced');
+    expect(store.list().records).toHaveLength(1);
+    expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
+  });
+  it('never wakes without a ledger', async () => {
+    rmSync(hotPatch.hotPatchLedgerPath(env));
+    expect((await tick()).reason).toBe('rebuild-job-spaced');
+    expect(store.list().records).toHaveLength(1);
+  });
+  it('never wakes for another sha', async () => {
+    plan = { ...plan, applied: [{ ref: ledger.branch, sha: 'd'.repeat(40) }] };
+    expect((await tick()).reason).toBe('rebuild-job-spaced');
+    expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
+  });
+  it('never wakes for another branch even with the same sha', async () => {
+    plan = { ...plan, applied: [{ ref: 'lane/other', sha: ledger.sha }] };
+    expect((await tick()).reason).toBe('rebuild-job-spaced');
+  });
+  it('unreadable ledger fails closed to the ordinary cooldown', async () => {
+    writeFileSync(hotPatch.hotPatchLedgerPath(env), '{bad');
+    expect((await tick()).reason).toBe('rebuild-job-spaced');
+    expect(store.list().records).toHaveLength(1);
+  });
+  it('enqueue failure leaves wokeAt unset so a later tick can retry', async () => {
+    vi.spyOn(store, 'create').mockImplementationOnce(() => {
+      expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
+      throw Error('disk full');
+    });
+    expect((await tick()).reason).toBe('rebuild-job-queue-failed');
+    expect(hotPatch.readHotPatch(env).wokeAt).toBeUndefined();
+    expect((await tick()).reason).toBe('rebuild-job-started');
+    expect(hotPatch.readHotPatch(env).wokeAt).toBeTruthy();
+  });
 });
