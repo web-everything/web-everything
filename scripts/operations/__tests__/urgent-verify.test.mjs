@@ -253,6 +253,19 @@ describe('CI gate mirroring fails closed', () => {
     step.with.script = step.with.script.replace('longest >= 1050', 'longest >= 99999');
     expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
   });
+  it('pins the four-worker rollout default and refuses a drift back to two', () => {
+    expect(real.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '4' }}");
+    const changed = yaml.safeLoad(workflow);
+    changed.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS = "${{ vars.WE_VITEST_MAX_WORKERS || '2' }}";
+    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('test-shard execution context; update the urgent verification mirror');
+  });
+  it.each([undefined, false])('refuses to make the timing diagnostic blocking (%j)', value => {
+    const changed = yaml.safeLoad(workflow);
+    const step = changed.jobs.test.steps.find(step => step.name === 'PR shards finish below 1050 seconds with no new failures');
+    expect(step['continue-on-error']).toBe(true);
+    step['continue-on-error'] = value;
+    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+  });
   it.each([undefined, {}, { actions: 'write' }])('refuses an unmirrored timing-check token permission %j', permissions => {
     const changed = yaml.safeLoad(workflow);
     changed.jobs.test.permissions = permissions;

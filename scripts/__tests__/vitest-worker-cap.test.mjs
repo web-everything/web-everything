@@ -1,7 +1,7 @@
 /**
  * @file scripts/__tests__/vitest-worker-cap.test.mjs
  * @description Host-overload fix (heavy-enforce): every vitest config reads ONE worker ceiling,
- *   `WE_VITEST_MAX_WORKERS` (positive finite value, rounded down), otherwise max(1, min(4, floor(cpu count / heavy-admission cap))). Pins the
+ *   `WE_VITEST_MAX_WORKERS` (CI integer 1–8; local/Forge positive finite value, rounded down), otherwise max(1, min(4, floor(cpu count / heavy-admission cap))). Pins the
  *   resolver, its parity with heavy-admission's own cap parsing, and that every config file applies it.
  */
 import { describe, it, expect } from 'vitest';
@@ -72,9 +72,13 @@ describe('ci worker count', () => {
     expect(resolveMaxTestWorkers({ CI, WE_VITEST_MAX_WORKERS: '24', FORGE_SLOT_CPUS: '24' }, 4)).toBe(24);
   });
 
-  it.each(['', '  ', '0', '-1', '0.9', 'lots', 'Infinity', 'NaN'])('falls back for invalid CI override %j', (value) => {
+  it.each(['', '  ', '0', '-1', '0.9', '3.9', '8.1', '9', '24', '64', 'lots', 'Infinity', 'NaN'])('falls back for invalid CI override %j', (value) => {
     expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value }, 4)).toBe(2);
     expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value, WE_HEAVY_ADMISSION_CAP: '4' }, 4)).toBe(1);
+  });
+
+  it.each(['', '0', '-1', '3.5', 'NaN', 'Infinity', '8'])('does not exempt an invalid or insufficient Forge grant %j from CI bounds', FORGE_SLOT_CPUS => {
+    expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: '24', FORGE_SLOT_CPUS }, 4)).toBe(2);
   });
 });
 

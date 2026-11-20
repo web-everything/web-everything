@@ -7,17 +7,32 @@ import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 
 const { jobs } = yaml.load(readFileSync(resolve(process.cwd(), '.github/workflows/ci.yml'), 'utf8'));
+// R1104 / PR #7202 Acceptance 2: independent of the workflow and urgent-verify mirror.
+const ACCEPTED_CI_WORKER_DEFAULT = 4;
 
-// Execute the workflow's actual shell, including bash's CI error policy. Only OS probes are stubbed.
-function runStep(step, { start = '1000', now = '1123', memory = '4096', cpu = '4' } = {}) {
+// Execute the workflow's actual shell, including bash's CI error policy. Proc metadata is
+// redirected to fixtures; discovered memory.peak paths are read from the real filesystem.
+function runStep(step, { start = '1000', now = '1123', memory = '4096', cpu = '4',
+  membership = '0::/system.slice/actions.runner.service\n', mountRoot = '/',
+  memoryPath = 'system.slice/actions.runner.service', mountType = 'cgroup2', metadata = true, mountinfoSuffix = '' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'shard-resources-'));
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
+    const mount = join(dir, 'cgroup mount');
+    const memoryDir = join(mount, memoryPath);
+    mkdirSync(memoryDir, { recursive: true });
+    if (memory !== 'unavailable') writeFileSync(join(memoryDir, 'memory.peak'), `${memory}\n`);
+    const cgroupFile = join(dir, 'cgroup'), mountinfoFile = join(dir, 'mountinfo');
+    if (metadata) {
+      writeFileSync(cgroupFile, membership);
+      const escaped = value => value.replace(/ /g, '\\040');
+      writeFileSync(mountinfoFile, `29 23 0:26 ${escaped(mountRoot)} ${escaped(mount)} rw - ${mountType} cgroup rw\n${mountinfoSuffix}`);
+    }
     const commands = {
       date: 'printf "%s\\n" "$TEST_NOW"',
       nproc: 'if [ "$TEST_CPU" = unavailable ]; then exit 1; fi\nprintf "%s\\n" "$TEST_CPU"',
-      cat: 'if [ "$1" != /sys/fs/cgroup/memory.peak ] || [ "$TEST_MEMORY" = unavailable ]; then exit 1; fi\nprintf "%s\\n" "$TEST_MEMORY"',
+      cat: 'case "$1" in\n/proc/self/cgroup) exec /bin/cat "$TEST_CGROUP_FILE" ;;\n/proc/self/mountinfo) exec /bin/cat "$TEST_MOUNTINFO_FILE" ;;\n*) exec /bin/cat "$@" ;;\nesac',
       cut: 'printf "9000\\n"',
     };
     for (const [name, body] of Object.entries(commands)) {
@@ -28,7 +43,8 @@ function runStep(step, { start = '1000', now = '1123', memory = '4096', cpu = '4
     const execution = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', step.run], {
       cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
       env: { PATH: `${bin}:${process.env.PATH}`, GITHUB_STEP_SUMMARY: summary, GITHUB_ENV: envFile,
-        SHARD_START_SECONDS: start, TEST_NOW: now, TEST_MEMORY: memory, TEST_CPU: cpu },
+        SHARD_START_SECONDS: start, TEST_NOW: now, TEST_CPU: cpu,
+        TEST_CGROUP_FILE: cgroupFile, TEST_MOUNTINFO_FILE: mountinfoFile },
     });
     const read = name => existsSync(name) ? readFileSync(name, 'utf8') : '';
     return { status: execution.status, output: execution.stdout + execution.stderr,
@@ -40,7 +56,7 @@ function runStep(step, { start = '1000', now = '1123', memory = '4096', cpu = '4
 
 describe('CI worker count and shard measurements', () => {
   it('sets the test-shard worker override with an operator rollback', () => {
-    expect(jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '2' }}");
+    expect(jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '" + ACCEPTED_CI_WORKER_DEFAULT + "' }}");
   });
 
   describe.each(['test-shard', 'soak-shard'])('%s', (name) => {
@@ -52,7 +68,8 @@ describe('CI worker count and shard measurements', () => {
       expect(measure.if).toContain('always()');
       expect(measure['continue-on-error']).toBe(true);
       expect(measure.run).toContain('nproc');
-      expect(measure.run).toContain('/sys/fs/cgroup/memory.peak');
+      expect(measure.run).toContain('/proc/self/cgroup');
+      expect(measure.run).toContain('/proc/self/mountinfo');
       expect(measure.run).toContain('unavailable');
       expect(measure.run).toContain('GITHUB_STEP_SUMMARY');
       expect(measure.run).toContain('SHARD_START_SECONDS');
@@ -83,6 +100,31 @@ describe('CI worker count and shard measurements', () => {
       expect(r.status, r.output).toBe(0);
       expect(JSON.parse(r.json)).toEqual({ nproc: 4, 'memory.peak': '4096', wall_seconds: 123 });
       expect(r.summary).toBe('nproc: 4\nmemory.peak: 4096\nwall time (seconds): 123\n');
+    });
+
+    it.each([
+      ['host service cgroup', {}],
+      ['subtree mount', { mountRoot: '/system.slice', memoryPath: 'actions.runner.service' }],
+      ['mount root equals membership', { mountRoot: '/system.slice/actions.runner.service', memoryPath: '' }],
+      ['namespace root', { membership: '0::/\n', memoryPath: '' }],
+      ['escaped mount root', { membership: '0::/runner slice/service\n', mountRoot: '/runner slice', memoryPath: 'service' }],
+      ['large mount inventory under pipefail', { mountinfoSuffix: '30 23 0:27 / /other rw - tmpfs tmpfs rw\n'.repeat(4096) }],
+    ])('reads a real memory.peak file for %s with an escaped mount point', (_, options) => {
+      const r = runStep(job.steps.find(step => step.name === 'Measure shard resources'), options);
+      expect(r.status, r.output).toBe(0);
+      expect(JSON.parse(r.json)['memory.peak']).toBe('4096');
+    });
+
+    it.each([
+      ['missing proc metadata', { metadata: false }],
+      ['cgroup v1', { membership: '5:memory:/service\n', mountType: 'cgroup' }],
+      ['missing cgroup2 mount', { mountType: 'tmpfs' }],
+      ['unrelated mount root', { mountRoot: '/different' }],
+      ['mount root prefix collision', { mountRoot: '/system' }],
+    ])('reports unavailable memory without losing telemetry for %s', (_, options) => {
+      const r = runStep(job.steps.find(step => step.name === 'Measure shard resources'), options);
+      expect(r.status, r.output).toBe(0);
+      expect(JSON.parse(r.json)).toEqual({ nproc: 4, 'memory.peak': 'unavailable', wall_seconds: 123 });
     });
 
     it('records zero elapsed seconds when the start and measurement happen in the same second', () => {
@@ -142,15 +184,18 @@ describe('CI worker count and shard measurements', () => {
       return info;
     }
 
-    it('wires a blocking completed-job check into the required aggregator for full PR runs', () => {
+    it('keeps timing diagnostics advisory while test results still block the required aggregator', () => {
       const step = gate();
       expect(step).toBeDefined();
       expect(step.if).toBe("${{ always() && github.event_name == 'pull_request' && needs.changes.outputs.light != 'true' }}");
       expect(step.uses).toBe('actions/github-script@v7');
-      expect(step['continue-on-error']).toBeUndefined();
+      expect(step['continue-on-error']).toBe(true);
       expect(jobs.test['continue-on-error']).toBeUndefined();
       expect(jobs.test.permissions).toEqual({ actions: 'read' });
       expect(jobs.test.needs).toContain('test-shard');
+      const resultChecks = jobs.test.steps.filter(step => step.run);
+      expect(resultChecks.length).toBeGreaterThan(0);
+      expect(resultChecks.every(step => step['continue-on-error'] === undefined)).toBe(true);
     });
 
     it('accepts completed successful shards below the threshold, ignoring unrelated in-progress jobs', async () => {
