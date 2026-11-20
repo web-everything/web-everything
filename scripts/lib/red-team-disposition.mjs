@@ -2,10 +2,9 @@
  *
  * Operator blocks outrank clear-human regardless of recency; recency breaks
  * ties only within a rank. Clear-human clears only keys without a block.
- * Wire-format compatibility: NOT sent back / held lines (including those inside
- * operator-block records) are ordinary gate holds, not ranked operator blocks.
- * The reader retains them as fallback evidence; a release beats an unindexed
- * legacy hold. Only a human operator's send-back line creates a ranked block.
+ * Human-authored indexed held lines and operator send-back lines create ranked
+ * blocks. Automated and unindexed legacy held lines remain ordinary gate holds;
+ * a release beats an unindexed legacy hold.
  * A later indexed gate hold retires earlier releases before ranking (existing
  * cap/send-back/restrictive-line tests), even operator releases. This is a
  * compatibility exception to “automation never overrides an operator rank”:

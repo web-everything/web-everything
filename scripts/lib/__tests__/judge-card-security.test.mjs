@@ -1,4 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+vi.hoisted(() => vi.resetModules());
+vi.mock('node:child_process', async original => {
+  const real = await original();
+  const spawnSync = vi.fn(() => ({ status: 1, stderr: 'offline' }));
+  return { ...real, spawnSync, default: { ...real.default, spawnSync } };
+});
+import { spawnSync } from 'node:child_process';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { readRedTeamDisposition, redTeamGateMarker, redTeamResultId, parseRedTeamComment, CONFIRMED_BREAKS_DEFAULTS, operatorRulingsOnLiveResult, gateOutcomesForHead, liveResultGateState } from '../red-team-gate.mjs';
 import { isRulingComment, operatorBoundComments, isAncestorOfMain } from '../operator-identity.mjs';
@@ -25,10 +32,11 @@ function read(f, over = {}) {
     operatorRulings: { anyState: true }, ...valid, ...over });
 }
 describe('judge card security at the real gate reader', () => {
-  it('default ancestry implementation runs bounded merge-base against origin/main and closes on errors', () => {
+  it('default ancestry refreshes main, runs bounded merge-base against the fresh tip and closes on errors', () => {
     const calls = [];
-    expect(isAncestorOfMain(mainSha, { run: (...args) => { calls.push(args); return { status: 0 }; } })).toBe(true);
-    expect(calls[0]).toMatchObject(['git', ['merge-base', '--is-ancestor', mainSha, 'origin/main'], { timeout: 5000, maxBuffer: 1 << 20 }]);
+    expect(isAncestorOfMain(mainSha, { run: (...args) => { calls.push(args); return { status: 0, stdout: mainSha }; } })).toBe(true);
+    expect(calls[0][1]).toEqual(['fetch', 'origin', 'main']);
+    expect(calls[2]).toMatchObject(['git', ['merge-base', '--is-ancestor', mainSha, mainSha], { timeout: 5000, maxBuffer: 1 << 20 }]);
     for (const result of [{ status: 1 }, { status: null, error: new Error('unreadable') }, { status: 0, error: new Error('overflow') }])
       expect(isAncestorOfMain(mainSha, { run: () => result })).toBe(false);
     expect(isAncestorOfMain(mainSha, { run: () => { throw new Error('unreadable'); } })).toBe(false);
@@ -68,13 +76,15 @@ describe('judge card security at the real gate reader', () => {
     const changed = { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'coverage-or-style': 'fix-now' } };
     expect(read(f, { setting: changed }).held.map(f => f.index)).toEqual([1]);
   });
-  it('every shared reader refuses a release without live evidence dependencies', () => {
+  it('every default reader refuses a release when the fresh evidence read fails', () => {
     const f = fixture();
+    spawnSync.mockClear();
     expect(isRulingComment(f.release, policy)).toBe(false);
     expect(operatorBoundComments(f.comments, { policy })).not.toContain(f.release);
     expect(operatorRulingsOnLiveResult(f.comments, pr, head).carded.size).toBe(0);
     expect(gateOutcomesForHead(f.comments, pr, head).has('operator-card')).toBe(false);
     expect(liveResultGateState(f.comments, pr, head).outcomes.has('operator-card')).toBe(false);
+    expect(spawnSync).toHaveBeenCalledWith('git', ['fetch', 'origin', 'main'], expect.any(Object));
   });
   it('identity filter binds the marker to the live head and validates named findings', () => {
     const f = fixture(), context = { ...valid, findings: f.findings };

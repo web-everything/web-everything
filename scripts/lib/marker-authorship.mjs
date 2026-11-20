@@ -57,7 +57,7 @@
  * `plateau-reviewer[bot]`), with `WE_AUTOMATION_LOGINS` still winning when set.
  */
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
-import { readBotLogins } from './github-app-identity.mjs';
+import { LEGACY_BOT_LOGINS, readBotLogins } from './github-app-identity.mjs';
 
 /**
  * we:scripts/lib/marker-authorship.mjs#AUTOMATION_LOGINS — the GitHub login(s) this repo's own conveyor
@@ -77,6 +77,11 @@ function readLoginList(envVar, fallback) {
 export const AUTOMATION_LOGINS = Object.freeze(
   readLoginList('WE_AUTOMATION_LOGINS', readBotLogins()),
 );
+
+// redTeamWriterEnv pins the judge writer to the legacy WE App. Resolve that ONE identity through the
+// configured delivery bot logins; another role/App in AUTOMATION_LOGINS never inherits judge authority.
+// GraphQL's bare login and REST's [bot] spelling identify the same App, not two principals.
+export const JUDGE_LOGIN = readBotLogins().find(login => login === LEGACY_BOT_LOGINS[0]) ?? '';
 
 /**
  * we:scripts/lib/marker-authorship.mjs#OPERATOR_LOGINS — the repo operator's own GitHub login(s), trusted for
@@ -241,5 +246,5 @@ export function assertJudgeAuthority(read, input) {
   if (supersedes.trim()) throw new Error('judge cannot supersede rulings; operator-only');
 }
 export function isJudgeAuthored(c) {
-  return AUTOMATION_LOGINS.includes(loginOf(c));
+  return JUDGE_LOGIN.length > 0 && loginOf(c).replace(/\[bot\]$/, '') === JUDGE_LOGIN;
 }

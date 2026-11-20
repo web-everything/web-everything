@@ -260,6 +260,7 @@ export function planRedTeamRuling(read, input) {
   }
   if (ruling === 'card') {
     const cardInput = buildRedTeamCardInput({ repo: input.repo, pr, head, findings: selected });
+    if (actor === JUDGE_ACTOR) cardInput.digest += `\n\nRed-team break ids: ${selected.map(f => `${base.resultId}#${f.index}`).join(', ')}`;
     cardInput.digest += `\n\nOperator ruling (${base.actor} via ${base.channel}): carded. Reason: ${sanitizeCardField(reason, 600)}`;
     // No-file findings remain rulable with --card. An empty automatic filing scope
     // must be refused here, before a pending intent can strand the ruling.

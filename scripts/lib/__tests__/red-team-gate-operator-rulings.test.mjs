@@ -105,13 +105,13 @@ describe('operator-block held actions (shared reader)', () => {
     expect(d.sendBack).toEqual([]);
   });
 
-  it.each([['human', human], ['bot', bot]])('keeps a %s-authored held line at ordinary priority', (_author, who) => {
+  it.each([['human', human, [1]], ['bot', bot, []]])('preserves the priority of a %s-authored indexed held line', (_author, who, expected) => {
     const comments = [result,
       gate(who, 'operator-block', '- 1 confirmed break(s) NOT sent back: cap (#1).', '2026-10-21T20:30:00Z'),
       gate(human, 'operator-card', cardLine([1]), '2026-10-21T20:40:00Z')];
     const d = readRedTeamDisposition({ comments, pr: P, head: H, setting: CONFIRMED_BREAKS_DEFAULTS,
       operatorRulings: { anyState: true } });
-    expect(d.held).toEqual([]);
+    expect(d.held.map(f => f.index)).toEqual(expected);
     expect(d.sendBack).toEqual([]);
   });
 

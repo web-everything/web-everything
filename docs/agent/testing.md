@@ -5763,11 +5763,18 @@ main/PR probe evidence after action lines so the gate can read the complete acti
 
 ## Judge card release evidence
 
-`judge-card-security.test.mjs` exercises the real red-team readers with ancestry and card-readability
-ports. Judge card releases require the live head, a readable named card, and a current defer-card class
-policy; a security class (including retained classes) or reachable security always refuses. Missing or
-throwing ports ignore the release. Reader callers must supply these live checks explicitly; a saved
-plan or evidence-shaped prose cannot substitute for them. The writer rereads class policy at each
+`judge-card-r5.test.mjs` exercises default readers and writer read-back with only git/gh subprocesses
+faked. All production readers and writer read-back use `defaultJudgeCardEvidence` lazily, memoized
+within a pass and refreshed on the next pass. A fetch failure never falls back to cached main.
+Judge cards require the live head, fresh main ancestry, and an explicitly open card at the exact
+published path containing each result-qualified break id (`<resultId>#<index>`). PR-only, completed,
+unrelated, missing, oversized or unreadable cards keep the hold. Restore complete published evidence
+and rerun the ruling, or ask the human operator; a saved plan cannot substitute for evidence.
+The designated judge is the single WE App pinned by `redTeamWriterEnv`, resolved through delivery
+bot logins (REST and GraphQL spellings of that same App); other automation Apps have no judge authority.
+Security categories, classes, retained classes and reachable security from any source prevent release,
+as do indexed human holds. `judge-card-security.test.mjs` retains the injectable IO seam tests.
+The writer rereads class policy at each
 effect-time check, and auto-filed judge records name their backing cards. Spool-only completion stays
 held until a backing card can be read. Recovery is to restore the readable card and rerun the probe
 and ruling against the current head/main, or ask a human operator to rule. Keep the named arbitrary-SHA,

@@ -289,8 +289,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     if (head !== p.head) throw new Error(`${what} was posted but PR #${p.pr}'s head moved to ${head}; the ruling binds to ${p.head} only — inspect and re-run on the new head`);
     const policy = passPolicy();
     const evidence = p.actor === JUDGE_ACTOR && p.ruling === 'card'
-      ? judgeCardReaderContext(after.comments, p.pr, head, { findingClasses: readFindingClasses(), isAncestorOfMain: isMainAncestor,
-        cardReadable: ref => { const card = resolveCard(ref, { repo: p.repo, pr: p.pr, head }); return card?.readable === true && card.ref === ref; } }) : {};
+      ? judgeCardReaderContext(after.comments, p.pr, head, { policy, env }) : {};
     const comments = operatorBoundComments(after.comments, { policy, ...evidence });
     const standingRuling = readStandingRulingScope({ repo: p.repo, pr: { ...after, number: p.pr, headRefOid: head } });
     if (liveResultGateState(comments, p.pr, head, p.repo, standingRuling).resultId !== p.resultId) throw new Error(`${what} was posted but the live red-team result changed; inspect the thread before retrying`);

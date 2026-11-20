@@ -1,5 +1,12 @@
 /** Cap-held card rulings: declaration and retry-safe automatic filing, with injected IO. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+const judgeGit = vi.hoisted(() => { vi.resetModules(); return { run: null }; });
+vi.mock('node:child_process', async original => {
+  const real = await original();
+  const spawnSync = (...args) => judgeGit.run ? judgeGit.run(...args) : real.spawnSync(...args);
+  return { ...real, spawnSync, default: { ...real.default, spawnSync } };
+});
+afterEach(() => { judgeGit.run = null; });
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2317,6 +2324,15 @@ describe('R671 v1 acting judge red-team blocks', () => {
     judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
   const judgeInput = (ruling = 'block', over = {}) => input({ actor: 'judge:r10', ruling, card: undefined, ...over });
   const preExisting = { mainSha: 'a'.repeat(40), probe: 'node probe.mjs', mainResult: 'null', prResult: 'null' };
+  const publishedJudgeCard = resultId => {
+    judgeGit.run = (command, args) => {
+      if (command !== 'git') throw new Error('unexpected non-git evidence process');
+      if (args[0] === 'fetch' || args[0] === 'merge-base') return { status: 0, stdout: '' };
+      if (args[0] === 'rev-parse') return { status: 0, stdout: preExisting.mainSha };
+      if (args[0] === 'show') return { status: 0, stdout: `---\nstatus: open\n---\nBreak ${resultId}#1\n` };
+      throw new Error(`unexpected evidence command: ${args.join(' ')}`);
+    };
+  };
   it.each([{ securityReachableToday: true }, { findingClass: 'live-reproduced' },
     { findingClass: 'security-reachable-today' }, { security: true },
     { settingPolicy: { 'coverage-or-style': 'fix-now' } }])('direct judge card sink refuses unsafe finding %j before writes', fields => {
@@ -2364,6 +2380,8 @@ describe('R671 v1 acting judge red-team blocks', () => {
       const actions = createActionStore({ root: coordinationRoot });
       const comments = judgeRead().comments;
       const plan = planRedTeamRuling(judgeRead({ card: null, comments, isMainAncestor: () => true }), judgeInput('card', { repo, preExisting }));
+      expect(plan.cardInput.digest).toContain(`${plan.resultId}#1`);
+      publishedJudgeCard(plan.resultId);
       let binding;
       const sinks = createRecordRedTeamRulingSinks({ actions, coordinationRoot, isMainAncestor: () => true,
         resolveIdentity: () => identity, readStandingRulingScope: () => null,
@@ -2376,7 +2394,7 @@ describe('R671 v1 acting judge red-team blocks', () => {
       expect(sinks[plan.effect](plan)).toMatchObject({ ruling: 'card', indices: [1] });
       expect(comments.at(-1).body).toContain('actor=judge:r10');
       expect(comments.at(-1).body).toContain('Pre-existing on main');
-      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, isAncestorOfMain: () => true, cardReadable: () => true, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
       expect(d.dispositions.get(1).state).toBe('released carded');
     } finally { rmSync(coordinationRoot, { recursive: true, force: true }); }
   });
@@ -2387,6 +2405,7 @@ describe('R671 v1 acting judge red-team blocks', () => {
   });
   it.each([true, false])('full CLI accepts JSON evidence, preview=%s; real sink proves release', async preview => {
     const comments = judgeRead().comments;
+    publishedJudgeCard(liveResultGateState(comments, PR, HEAD).resultId);
     const post = vi.fn((_repo, _pr, body) => comments.push({ author: identity, body, createdAt: '2026-11-07T12:00:00Z' }));
     const declaration = recordRedTeamRulingOperation({ readRulingContext: () => judgeRead({ comments, isMainAncestor: () => true }) });
     const registry = createRegistry(); registry.register(declaration);
@@ -2404,7 +2423,7 @@ describe('R671 v1 acting judge red-team blocks', () => {
       expect(body).toContain('actor=judge:r10');
       expect(body).toContain(attribution);
       expect(body.indexOf('Pre-existing on main')).toBeGreaterThan(body.indexOf('- 1 finding(s) carded'));
-      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, isAncestorOfMain: () => true, cardReadable: () => true, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
       expect(d.held).toEqual([]);
       expect(d.rulings.get(1)).toEqual(expect.arrayContaining([expect.objectContaining({ source: 'operator', kind: 'card' })]));
     }

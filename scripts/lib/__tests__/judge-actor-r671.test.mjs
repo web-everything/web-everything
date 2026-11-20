@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import * as authorship from '../marker-authorship.mjs';
 import { assertHumanOperator, isHumanOperatorComment, isRulingComment, judgePolicyOnce, operatorBoundComments } from '../operator-identity.mjs';
+import * as operatorIdentity from '../operator-identity.mjs';
 import { ignoredRulings, operatorBlockRulings } from '../ruling-ledger.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 
@@ -117,14 +118,22 @@ describe('R671 judge readers bind actor and automation author', () => {
       expect(operatorRulingsOnLiveResult(comments, pr, head, evidenceContext).carded.has(1)).toBe(true);
     }
   });
-  it('judge card refuses malformed SHA, disabled policy, missing attribution and reserved tokens', () => {
+  it.each([
+    ['malformed SHA', c => ({ ...c, body: c.body.replace('b'.repeat(40), 'abc') }), null, 'pre-existing evidence is malformed'],
+    ['disabled policy', c => c, () => ({ enabled: false, actor }), 'judge actor disabled'],
+    ['missing attribution', c => ({ ...c, body: c.body.replace(attribution, '') }), null, 'judge attribution missing'],
+    ['reserved token', c => ({ ...c, body: c.body + '\nreviewed-sha' }), null, 'judge reserved token'],
+    ['empty main result', c => ({ ...c, body: c.body.replace('main=null', 'main= ') }), null, 'pre-existing evidence is malformed'],
+  ])('judge card specifically refuses %s with otherwise valid mandatory context', (_name, change, policy, refusal) => {
     const c = judgeGate('operator-card', '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).'
       + `\nPre-existing on main (${'b'.repeat(40)}): probe node probe.mjs; main=null pr=null`);
-    expect(isRulingComment(c, () => ({ enabled: false, actor }))).toBe(false);
-    expect(isRulingComment({ ...c, body: c.body.replace('b'.repeat(40), 'abc') })).toBe(false);
-    expect(isRulingComment({ ...c, body: c.body.replace(attribution, '') })).toBe(false);
-    expect(isRulingComment({ ...c, body: c.body + '\nreviewed-sha' })).toBe(false);
-    expect(isRulingComment({ ...c, body: c.body.replace('main=null', 'main= ') })).toBe(false);
+    const enabled = () => ({ enabled: true, actor });
+    const context = { head, resultId: rid, findingClasses: {},
+      findings: [{ ...liveResultGateState([result], pr, head).result.findings[0], classBasis: 'missing coverage' }],
+      isAncestorOfMain: sha => sha === 'b'.repeat(40), cardReadable: ref => ref === 'we:backlog/x.md' };
+    expect(isRulingComment(c, enabled, context)).toBe(true);
+    expect(isRulingComment(change(c), policy ?? enabled, context)).toBe(false);
+    expect(operatorIdentity.rulingCommentRefusal(change(c), policy ?? enabled, context)).toBe(refusal);
   });
   it('automation without the judge actor cannot claim an operator card ruling', () => {
     const c = comment(redTeamGateMarker(pr, head, 'operator-card', rid)
