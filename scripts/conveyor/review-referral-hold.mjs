@@ -232,7 +232,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
       // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
       const evidence = reviewRunEvidence(run, { requireVerdict: true });
       reportInvalidRunEntry(path);
-      return evidence ? [{ ...evidence, misnamed: true }] : [];
+      return evidence ? [evidence] : [];
     } catch (error) {
       reportInvalidRunEntry(path, { severity: 'high', reason: error.message });
       return [];
@@ -406,9 +406,8 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  // Completed misnamed evidence retains its hold/verdict authority, but cannot be resumed by id.
-  // Incomplete misnamed evidence spends no-verdict retries without superseding a referral hold.
-  const attempts = runs.filter(r => (!r.misnamed || !r.incomplete) && r.repo === repo && r.pr === Number(pr.number));
+  // Misnamed incomplete evidence spends no-verdict retries, but cannot supersede a referral hold.
+  const attempts = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(attempts);
   const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);

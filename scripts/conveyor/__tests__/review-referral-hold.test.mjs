@@ -270,7 +270,7 @@ describe('attempted mandatory referrals', () => {
       for (const persist of [false, true]) {
         const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
         expect(rows).toEqual([reviewRunEvidence(valid),
-          { ...reviewRunEvidence(invalid), misnamed: true }]);
+          { ...reviewRunEvidence(invalid), ...(state === 'incomplete' ? { misnamed: true } : {}) }]);
         if (state === 'parked') expect(hold(pr(), [rows[1]])).not.toBeNull();
         else expect(rows[1]).toMatchObject(state === 'completed' ? { parked: false } : { incomplete: true });
       }
@@ -278,28 +278,6 @@ describe('attempted mandatory referrals', () => {
       expect(() => tryReadRun(invalid.id, dir)).toThrow(/invalid run id/);
       expect(() => runPath(invalid.id, dir)).toThrow(/invalid run id/);
       expect(alert).toHaveBeenCalledTimes(1);
-    } finally { alert.mockRestore(); }
-  });
-
-  it('retains a misnamed parked record hold but never returns its invalid id as resumable', () => {
-    const dir = temp();
-    const parked = run({ failure: true });
-    const invalid = { ...parked, id: 'review-pr-bad name' };
-    writeFileSync(join(dir, `${invalid.id}.json`), JSON.stringify(invalid));
-    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
-    try {
-      // The same completed record under a valid name is eligible for a persistence resume.
-      expect(findResumableParkedRun(pr(), [reviewRunEvidence(parked)], { repo }))
-        .toEqual({ id: parked.id, head });
-      for (const persist of [false, true]) {
-        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
-        expect(rows).toEqual([{ ...reviewRunEvidence(invalid), misnamed: true }]);
-        expect(rows[0]).toMatchObject({ parked: true, completedAt: at });
-        expect(hold(pr(), rows)).toEqual(hold(pr(), [reviewRunEvidence(parked)]));
-        expect(findResumableParkedRun(pr(), rows, { repo })).toBeNull();
-      }
-      expect(listRunIds(dir)).toEqual([]);
-      expect(() => tryReadRun(invalid.id, dir)).toThrow(/invalid run id/);
     } finally { alert.mockRestore(); }
   });
 

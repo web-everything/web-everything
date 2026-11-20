@@ -41,7 +41,7 @@ export function probe(checkout) {
       const malformed = { ...misnamed, id: 'review-pr-invalid structure', cursor: -1, effects: {} };
       writeFileSync(join(dir, 'review-pr-invalid structure.json'), JSON.stringify(malformed));
       writeFileSync(join(dir, 'review-pr-unparseable name.json'), '{');
-      const expected = [reviewRunEvidence(valid), { ...reviewRunEvidence(misnamed), misnamed: true }];
+      const expected = [valid, misnamed].map(reviewRunEvidence);
       ok(expected.every(row => row?.pr));
       ok(expected[0].parked && !expected[1].parked && expected[1].completedAt);
       deepStrictEqual(expected.map(row => row.pr), [valid.input.pr, misnamed.input.pr]);
