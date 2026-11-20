@@ -636,10 +636,10 @@ describe('urgent-verify signing isolation', () => {
   });
   it('step children get the throwaway HOME, parent-side git calls keep the real one', () => {
     const calls = [], spawnSync = (cmd, args, o) => { calls.push({ args, home: o.env.HOME, cache: o.env.npm_config_cache }); return { status: 0, stdout: '' }; };
-    const d = createUrgentDeps({ cwd: '/r', home: '/home/real', env: { PATH: '/bin', HOME: '/home/real' }, spawnSync, stepHome: '/tmp/step-home' });
+    const d = createUrgentDeps({ cwd: '/r', home: '/home/user', env: { PATH: '/bin', HOME: '/home/user' }, spawnSync, stepHome: '/tmp/step-home' });
     d.standards(); d.head();
-    expect(calls[0]).toMatchObject({ home: '/tmp/step-home', cache: '/home/real/.npm' });
-    expect(calls[1].home).toBe('/home/real');
+    expect(calls[0]).toMatchObject({ home: '/tmp/step-home', cache: '/home/user/.npm' });
+    expect(calls[1].home).toBe('/home/user');
   });
   it('every admission call requires a slot (no-pool / bypass means refusal)', () => {
     const argvs = [], spawnSync = (cmd, args) => { argvs.push(args); return { status: 0, stdout: '' }; };
