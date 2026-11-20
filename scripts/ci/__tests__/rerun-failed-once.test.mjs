@@ -2,6 +2,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseReport, planRetry, retryVerdict, rerunOnce, resolvePolicy } from '../rerun-failed-once.mjs';
 import UnitJsonReporter from '../unit-json-reporter.mjs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const root = '/repo';
 const policy = { enabled: true, maxFiles: 10 };
@@ -123,6 +126,39 @@ describe('single failed-file retry core', () => {
     expect(resolvePolicy({ platform: {}, log, ...input }).enabled).toBe(false);
     expect(log.mock.calls.flat().join('\n')).toMatch(/invalid .*retries disabled/);
   });
+  it.each([
+    { enabled: 'false' }, { enabled: null }, { enabled: {} },
+    { maxFiles: '10' }, { maxFiles: 0 }, { maxFiles: {} },
+  ])('loaded malformed platform settings disable retries even under valid overrides: %j', async platform => {
+    const dir = mkdtempSync(join(tmpdir(), 'unit-rerun-policy-'));
+    const file = join(dir, 'preferences.json');
+    try {
+      writeFileSync(file, JSON.stringify({ ciUnitRerun: platform }));
+      const log = vi.fn();
+      const env = { WE_PLATFORM_PREFERENCES_FILE: file };
+      const loaded = resolvePolicy({ env, log });
+      expect(loaded.enabled).toBe(false);
+      expect(loaded).toEqual(resolvePolicy({ platform, log }));
+      expect(resolvePolicy({ env: { ...env, WE_CI_UNIT_RERUN_ENABLED: 'true', WE_CI_UNIT_RERUN_MAX_FILES: '2' },
+        tool: { enabled: true, maxFiles: 3 }, log }).enabled).toBe(false);
+      expect(log.mock.calls.flat().join('\n')).toMatch(/invalid .*retries disabled/);
+      const io = fixture({ policy: loaded });
+      expect(await rerunOnce(io)).toBe(1);
+      expect(io.run).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it.each([{ enabled: false, maxFiles: 4 }, { enabled: true, maxFiles: 2 }])('loads valid platform settings: %j', platform => {
+    const dir = mkdtempSync(join(tmpdir(), 'unit-rerun-policy-'));
+    const file = join(dir, 'preferences.json');
+    try {
+      writeFileSync(file, JSON.stringify({ ciUnitRerun: platform }));
+      expect(resolvePolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: file }, log: vi.fn() })).toEqual(platform);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 function fixture(overrides = {}) {
@@ -134,6 +170,43 @@ function fixture(overrides = {}) {
 }
 
 describe('retry IO boundary', () => {
+  it.each(['removeSharedDir', 'finishRunTmpRoot', 'leak-verdict', 'success'])('global teardown preserves failure evidence through %s', async failure => {
+    const dir = mkdtempSync(join(tmpdir(), 'unit-rerun-teardown-'));
+    const marker = join(dir, 'teardown-failed-unit-2');
+    const savedEnv = { ...process.env };
+    const savedExit = process.exitCode;
+    const cleanupError = Object.assign(new Error('EACCES: cleanup denied'), { code: 'EACCES' });
+    const cleanup = name => vi.fn(() => {
+      if (failure === name) throw cleanupError;
+      return { failed: failure === 'leak-verdict' };
+    });
+    vi.resetModules();
+    vi.doMock('../../lib/test-tmp-root.mjs', () => ({
+      FAKE_GH_DIR_ENV: 'VITEST_SHARED_FAKE_GH_DIR',
+      sweepStaleRunRoots: vi.fn(), createRunTmpRoot: () => dir, createSharedFakeGh: () => join(dir, 'fake-gh'),
+      removeSharedDir: cleanup('removeSharedDir'), finishRunTmpRoot: cleanup('finishRunTmpRoot'),
+      resolveTmpLeakPolicy: () => ({ mode: 'fail', max: 0 }),
+    }));
+    try {
+      process.env.WE_TEARDOWN_FAILURE_FILE = marker;
+      const { default: setup } = await import('../../../vitest.globalSetup.mjs');
+      const teardown = setup();
+      if (failure === 'removeSharedDir' || failure === 'finishRunTmpRoot') expect(teardown).toThrow(cleanupError);
+      else teardown();
+      expect(existsSync(marker)).toBe(failure !== 'success');
+      expect(process.env.TMPDIR).toBe(savedEnv.TMPDIR);
+      if (failure !== 'success') expect(process.exitCode).toBe(1);
+      const io = fixture({ teardownFailed: () => existsSync(marker) });
+      expect(await rerunOnce(io)).toBe(failure === 'success' ? 0 : 1);
+      expect(io.run).toHaveBeenCalledTimes(failure === 'success' ? 1 : 0);
+    } finally {
+      process.env = savedEnv;
+      process.exitCode = savedExit;
+      vi.doUnmock('../../lib/test-tmp-root.mjs');
+      vi.resetModules();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('runs exactly once without coverage, preserves skip arguments, clears stale evidence and logs each flake', async () => {
     const io = fixture();
     expect(await rerunOnce(io)).toBe(0);
@@ -160,10 +233,8 @@ describe('retry IO boundary', () => {
     expect(io.run).not.toHaveBeenCalled();
     expect(io.error).toHaveBeenCalledWith(expect.stringMatching(/not a plain test failure.*inspect original run/));
   });
-  it('the teardown marker is written by the global teardown and set on both unit steps', async () => {
+  it('the teardown marker is set on both unit steps', async () => {
     const { readFileSync } = await import('node:fs');
-    const setup = readFileSync(new URL('../../../vitest.globalSetup.mjs', import.meta.url), 'utf8');
-    expect(setup).toMatch(/if \(verdict\.failed\) \{[\s\S]*process\.exitCode = 1;[\s\S]*WE_TEARDOWN_FAILURE_FILE[\s\S]*writeFileSync\(marker/);
     const ci = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
     expect(ci.match(/WE_TEARDOWN_FAILURE_FILE="\$PWD\/coverage\/teardown-failed-unit-\$\{\{ matrix\.shard \}\}" npm run test:(coverage:shard|unit) -- /g)).toHaveLength(2);
   });

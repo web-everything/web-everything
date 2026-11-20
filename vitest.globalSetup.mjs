@@ -33,18 +33,23 @@ export default function setup() {
   // One fake `gh` for the whole run (vitest.setup.ts used to write one per test file).
   process.env[FAKE_GH_DIR_ENV] = createSharedFakeGh(root);
   return function teardown() {
-    for (const [key, value] of Object.entries(saved)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    removeSharedDir(root);
-    const verdict = finishRunTmpRoot({ root, policy: resolveTmpLeakPolicy() });
-    if (verdict.failed) {
-      process.exitCode = 1;
-      // CI's unit-shard retry (scripts/ci/rerun-failed-once.mjs) must see a teardown failure: the JSON report is
-      // written before teardown, so without this marker a file retry could erase it.
-      const marker = process.env.WE_TEARDOWN_FAILURE_FILE;
-      if (marker) writeFileSync(marker, 'tmp-leak policy failed in global teardown\n');
+    let failed = true;
+    try {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      removeSharedDir(root);
+      const verdict = finishRunTmpRoot({ root, policy: resolveTmpLeakPolicy() });
+      failed = verdict.failed;
+    } finally {
+      if (failed) {
+        process.exitCode = 1;
+        // The JSON report precedes teardown. Preserve both cleanup exceptions and leak-policy failures
+        // so a passing file retry cannot erase them; exceptions still propagate to Vitest.
+        const marker = process.env.WE_TEARDOWN_FAILURE_FILE;
+        if (marker) writeFileSync(marker, 'cleanup or tmp-leak policy failed in global teardown\n');
+      }
     }
   };
 }

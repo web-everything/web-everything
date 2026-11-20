@@ -19,13 +19,14 @@ export function resolvePolicy({ tool, platform, env = {}, log = console.error } 
     maxFiles: env.WE_CI_UNIT_RERUN_MAX_FILES === undefined ? undefined : Number(env.WE_CI_UNIT_RERUN_MAX_FILES),
   };
   const valid = { enabled: v => typeof v === 'boolean', maxFiles: v => Number.isSafeInteger(v) && v > 0 };
-  const value = cascadePolicy('ciUnitRerun', tool, {
+  const { value, platform: loadedPlatform } = cascadePolicy('ciUnitRerun', tool, {
     standard: { enabled: true, maxFiles: 10 }, platform, operatorOverride: {}, envValues, valid,
     env: { ...env, WE_POLICY_CASCADE_LOG: '1' }, log,
-  }).value;
+  });
   // Fail closed: a malformed setting at any layer (a typo'd disable, a bad cap) turns retries OFF rather than
   // falling back to the permissive default, so a broken config can never grant failure recovery.
-  const invalid = [['platform', platform], ['tool', tool], ['env', envValues]].flatMap(([layer, values]) =>
+  // Validate the same platform snapshot the cascade used, including preferences loaded from disk.
+  const invalid = [['platform', loadedPlatform], ['tool', tool], ['env', envValues]].flatMap(([layer, values]) =>
     Object.entries(values ?? {}).filter(([k, v]) => v !== undefined && valid[k] && !valid[k](v)).map(([k]) => `${k} (${layer})`));
   if (invalid.length) {
     log(`ciUnitRerun: invalid ${invalid.join(', ')}; retries disabled`);
