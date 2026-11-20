@@ -31,6 +31,8 @@
  *   and are unit-tested in we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs.
  */
 
+import { repeatedPrepareRefusals } from '../../scripts/conveyor/prepare-refusal-stop.mjs';
+import { readPrepareRefusals, recordPrepareRefusal } from '../../scripts/conveyor/prepare-refusal-stop-io.mjs';
 import { planPrepareBatches, prepareAheadNums } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import { isLanePreparePrFor, isPreparePrFor, prepareLaunchRefusal, recentMergedPrepare } from '../../scripts/conveyor/prepare-pr-match.mjs';
 import { readBuilderPrCapSettings } from '../../scripts/lib/open-pr-cap-scope.mjs';
@@ -488,6 +490,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(r => r?.num != null && tickNowMs - Date.parse(r.at) < PREPARE_REFUSAL_HOLD_MS
       && !completedPrepares.has(normNum(r.num)) && !released.has(normNum(r.num)));
   const refusalHeldNums = new Set(freshRefusals.map(r => normNum(r.num)));
+  let skippedRepeatRefusal = [], refusalReadError = null;
+  try { skippedRepeatRefusal = repeatedPrepareRefusals(await effects.readPrepareRefusals?.({ now: tickNowMs }) ?? [], { now: tickNowMs }); }
+  catch (error) {
+    refusalReadError = error;
+    console.error(`build-dispatch-daemon: prepare launches held: ${String(error?.message ?? error).replace(/\s+/g, ' ')}`);
+  }
+  const repeatRefusalNums = new Set(skippedRepeatRefusal.map(r => normNum(r.num)));
   // A card refused for its own OPEN lane prepare PR may have no claim, run row, hold or guard left (a restart, a
   // retired claim), so the retirement pass would never look at it. Probe THAT PR once per refusal: a finished-but-
   // unstamped result (sections, no stamp) goes to stamp recovery instead of being refused until the refusal ages out.
@@ -504,7 +513,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   catch { /* the build pass below reads the backoffs again and owns that failure */ }
   // Exclude held candidates BEFORE the tick core allocates its two prepare slots.
   bookkeeping = { ...bookkeeping, prepareHeldNums: [...new Set([...holds.map((h) => normNum(h.num)),
-    ...refusalHeldNums, ...prepareBackoffNums,
+    ...refusalHeldNums, ...repeatRefusalNums, ...prepareBackoffNums,
     ...prepareClaims.filter(c => c.meta?.groupLead != null).map(c => normNum(c.meta.num))])] };
   const tickBookkeeping = bookkeeping;
   // 78b — settle detached launches from earlier ticks BEFORE planning: a launched one keeps its claim (the run-store
@@ -551,6 +560,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     ?? (policy.prepareAheadWindow !== BUILD_DISPATCH_POLICY.prepareAheadWindow))
     ? policy.prepareAheadWindow : (preparePolicy.aheadCount ?? policy.prepareAheadWindow);
   const planConfig = planConfigFrom({ ...policy, prepareAheadWindow: effectivePrepareAheadWindow });
+  if (refusalReadError) planConfig.launchKinds = planConfig.launchKinds.filter(kind => kind !== 'prepare-item');
   let out = await effects.planTick(tickBookkeeping, { config: planConfig });
   const planningSkips = [];
   // The refusal record a planning skip persists (`prepareRefusals`), exactly as the launch guard would write it.
@@ -1066,6 +1076,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { runner, runnerSource, batchSize: preparePolicy.batchSize ?? 6, aheadCount: effectivePrepareAheadWindow, sources: preparePolicy.sources, policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], refused: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.skippedRepeatRefusal = skippedRepeatRefusal;
   prepare.skippedInPlanning = planningSkips;
   prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.refusalHeld = freshRefusals.map(r => ({ num: normNum(r.num), reason: r.reason, since: r.at }));
@@ -1374,13 +1385,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       refusal = { reason: 'prepare PR listing unavailable' };
     }
     if (!refusal) return null;
+    try { await effects.recordPrepareRefusal?.({ num, reason: refusal.reason }, { now: effects.now?.() ?? Date.now() }); }
+    catch (error) { console.error(`build-dispatch-daemon: refusal history write failed; retaining 30-minute hold: ${String(error?.message ?? error).replace(/\s+/g, ' ')}`); }
     refusedPrepares.add(num);
     prepare.refused.push({ num, ...refusal });
     console.error(`build-dispatch-daemon: prepare launch of #${num} refused: ${refusal.reason}${refusal.note ? ` · ${refusal.note}` : ''}`);
     return refusal;
   };
   const prepareAvailable = num => !finishedPrepares.has(normNum(num)) && !heldNums.has(normNum(num))
-    && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
+    && !repeatRefusalNums.has(normNum(num)) && !refusalHeldNums.has(normNum(num)) && !planningSkips.some(r => r.num === normNum(num))
     && !prepareBusy.has(normNum(num)) && !prepareMembers.has(normNum(num))
     && !protectedMembers.has(normNum(num)) && !inFlight.some(r => normNum(r.num) === normNum(num))
     && !sameTickClash(num, scopeByNum.get(normNum(num)));
@@ -1433,7 +1446,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
       if (prepareGroupPlan.absorbed.has(num) || prepareMembers.has(num)
-        || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num)
+        || finishedPrepares.has(num) || heldNums.has(num) || refusedPrepares.has(num) || refusalHeldNums.has(num) || repeatRefusalNums.has(num)
         || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
       const group = prepareGroupPlan.groups.find(g => normNum(g.lead) === num);
       let groupMembers = [];
@@ -2806,6 +2819,7 @@ export function cliEffects() {
   };
   return {
     loadGroupingCards: async () => (await loadRouteInputs()).loadItems(),
+    readPrepareRefusals, recordPrepareRefusal,
     completePrepareFailures,
     releaseDuePrepareRetries: () => {
       let checkedCount = false;
