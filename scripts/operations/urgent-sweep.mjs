@@ -1,7 +1,6 @@
 /** Single bounded pass over urgent loads; unreadable evidence requires operator attention. */
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,13 +10,12 @@ import { readOverlayState } from '../lib/daemon-overlays.mjs';
 import { retireRegistration, recoverDrops } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
 import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
-import { ciGatePlan, urgentLedger, normalizeUrgentRepo, resolveOriginRepo, canonicalUrgentRepo } from './urgent-verify-marker.mjs';
+import { ciGatePlan, urgentLedger, normalizeUrgentRepo, resolveOriginRepo, canonicalUrgentRepo, urgentLoadIdentity as identity, completedUrgentRegistrations } from './urgent-verify-marker.mjs';
 import { readHotPatchVetoPolicy, hotPatchIgnoresCheck, DEFAULT_VETO_IGNORE_CHECKS } from './prototype-load-io.mjs';
 import { writeEscalationPacket } from './land-advance-escalations.mjs';
 
 const failedCheck = (c, sha) => c?.head_sha === sha && c.status === 'completed'
   && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion);
-const identity = r => createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
 export const validateChecks = (data, sha) => {
   if (!Number.isInteger(data?.total_count)
     || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
@@ -174,10 +172,12 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
       throw new Error('unreadable urgent settlement ledger; repair it before sweeping');
     // Historical time-based green receipts never prove an overlay is no longer registered.
     // Old unload receipts prove removal only; resume them through the adoption check too.
+    const records = deps.loads(), complete = completedUrgentRegistrations(records);
     const unloaded = new Map(settlements.filter(r => ['settled-unloaded', 'unloaded-pending-adoption', 'unloaded-adopted'].includes(r.status)).map(r => [r.id, r]));
-    const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered' && r.ancestryVerified === true).map(r => r.id));
+    const settled = new Set(settlements.filter(r => r.status === 'settled-unregistered' && r.ancestryVerified === true
+      && r.registrationComplete === true && complete.has(r.id)).map(r => r.id));
     const absent = new Map(settlements.filter(r => r.status === 'monitoring-unregistered').map(r => [r.id, r]));
-    for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && notificationsComplete(r)) settled.add(id);
+    for (const [id, r] of unloaded) if (r.status === 'unloaded-adopted' && r.registrationComplete === true && complete.has(id) && notificationsComplete(r)) settled.add(id);
     const ciEscalated = new Set();
     const conflictEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.conflictEscalated === true).map(r => r.id));
     const failureEscalated = new Set(settlements.filter(r => r.status === 'monitoring-ci' && r.failureEscalated === true).map(r => r.id));
@@ -194,7 +194,6 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         if (receipt.noVerdictEscalated === true) ciEscalated.add(receipt.id);
       }
     }
-    const records = deps.loads();
     const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
     const entries = [...loads], cursor = settlements.filter(r => r.status === 'sweep-cursor').at(-1)?.id;
     // Use the complete load order so even a cursor load settled last pass remains an anchor.
@@ -215,7 +214,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         let pending = unloaded.get(id);
         if (pending) {
           pending = await notifyUnload(id, r, pending, notificationErrors);
-          if (pending.status === 'unloaded-adopted') {
+          if (pending.status === 'unloaded-adopted' && pending.registrationComplete === true && complete.has(id)) {
             report({ id, status: 'unloaded-adopted' });
             continue;
           }
@@ -225,33 +224,41 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           || overlay.overlays.some(e => !safeRegistrationRef(e?.ref)))
           throw new Error('unreadable overlay state; repair store or inspect registration manually');
         const registered = overlay.overlays.some(e => e.ref === r.registration.ref);
+        // A withdrawal during an unfinished add can precede a later registration write.
+        // Revisit CI if that registration appears, rather than waiting forever for adoption.
+        if (pending && registered && pending.registrationComplete !== true) pending = undefined;
         if (pending) {
           const removedAt = pending.removedAt ?? pending.at, now = Date.parse(deps.now());
           if (!Number.isFinite(Date.parse(removedAt)) || !Number.isFinite(now) || now < Date.parse(removedAt))
             throw new Error('unreadable unload timestamp; inspect the daemon build manually');
           const contains = await deps.containsOverlay(r);
           if (typeof contains !== 'boolean') throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
-          if (!registered && !contains) {
-            await deps.settle({ ...pending, removedAt, at: deps.now(), status: 'unloaded-adopted' });
+          if (!registered && !contains && complete.has(id)) {
+            await deps.settle({ ...pending, removedAt, at: deps.now(), status: 'unloaded-adopted', registrationComplete: true });
             report({ id, status: 'unloaded-adopted' });
-          } else if (!registered && contains && now - Date.parse(removedAt) >= 15 * 60 * 1000) {
-            const detail = `The daemon fell back to a last-good build containing the failed overlay ${r.sha} after registration removal. Inspect and repair the daemon build in ${r.clone}.`;
+          } else if (!registered && (contains || !complete.has(id)) && now - Date.parse(removedAt) >= 15 * 60 * 1000) {
+            const detail = complete.has(id)
+              ? `The daemon fell back to a last-good build containing the failed overlay ${r.sha} after registration removal. Inspect and repair the daemon build in ${r.clone}.`
+              : `Registration completion is unproven for withdrawn urgent overlay ${r.sha}. Inspect the registration writer and daemon build in ${r.clone}.`;
             if (!pending.fallbackEscalated) {
               await escalate(`${id}-fallback`, r.ref, detail);
               await deps.settle({ ...pending, removedAt, status: 'unloaded-pending-adoption', fallbackEscalated: true });
             }
             report({ id, status: 'needs-you', detail });
-          } else report({ id, status: 'unloaded-pending-adoption' });
+          } else {
+            if (pending.status === 'unloaded-adopted') await deps.settle({ ...pending, status: 'unloaded-pending-adoption', registrationComplete: false });
+            report({ id, status: 'unloaded-pending-adoption' });
+          }
           continue;
         }
         if (!registered) {
-          // Failed adds also need ancestry proof before their urgent intent can settle.
+          // Absence is only a snapshot until the registration writer has finished.
           const contains = await deps.containsOverlay(r);
           if (typeof contains !== 'boolean') throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
           const merged = contains ? await deps.mergedOverlay(r) : false;
           if (typeof merged !== 'boolean') throw new Error('unreadable origin/main ancestry; inspect overlay graduation manually');
-          if (!contains || merged) {
-            await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-unregistered', ancestryVerified: true });
+          if (complete.has(id) && (!contains || merged)) {
+            await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'settled-unregistered', ancestryVerified: true, registrationComplete: true });
             results.push({ id, status: 'settled-unregistered' });
             continue;
           }
@@ -265,7 +272,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           const failed = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           if (!failed) validateChecks(data, r.sha);
           const overdue = now - absentAt >= 15 * 60 * 1000;
-          const detail = `The daemon still runs a build containing unmerged urgent overlay ${r.sha} after registration removal${failed ? '; CI failed and unloading is a no-op' : ''}. Inspect and repair the daemon build in ${r.clone}.`;
+          const detail = `${complete.has(id) ? 'The daemon still runs a build containing unmerged urgent overlay' : 'Registration completion is unproven for urgent overlay'} ${r.sha} after registration removal${failed ? '; CI failed and unloading is a no-op' : ''}. Inspect and repair the daemon build in ${r.clone}.`;
           if (failed || overdue) {
             if (!receipt.fallbackEscalated) {
               await escalate(`${id}-fallback`, r.ref, detail);
@@ -411,7 +418,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           const removal = await deps.remove(r, overlay.overlays.find(e => e.ref === r.registration.ref));
           if (!removal || removal.refused || (removal.retired !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);
           const event = { type: 'prototype-load.urgent-unloaded', at: deps.now(), id, ref: r.ref, sha: r.sha, clone: r.clone, registration: r.registration };
-          const receipt = { ...event, ...(unloadReason ? { unloadReason } : {}), removedAt: event.at, status: 'unloaded-pending-adoption', unloadEventSent: false, unloadEscalationSent: false };
+          const receipt = { ...event, ...(unloadReason ? { unloadReason } : {}), removedAt: event.at, status: 'unloaded-pending-adoption', registrationComplete: complete.has(id), unloadEventSent: false, unloadEscalationSent: false };
           await deps.settle(receipt);
           await notifyUnload(id, r, receipt, notificationErrors);
           report({ id, status: 'unloaded-pending-adoption' });

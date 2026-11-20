@@ -15,6 +15,7 @@ import { withBareOrigin } from './helpers/real-repo.mjs';
 import { findingsHash } from '../ruled-weakened-store.mjs';
 import { recordWaivers } from '../ruled-weakened-record.mjs';
 import { createPrototypeLoader, defaultDeps, readHotPatchVetoPolicy } from '../prototype-load-io.mjs';
+import { urgentSweep } from '../urgent-sweep.mjs';
 import { netDiffFingerprint } from '../../lib/net-diff-fingerprint.mjs';
 import { resolveDaemonKey, changedPaths, comparePaths, nextMergeRef, prototypeLoadOperation, PROTOTYPE_LOAD_EFFECT } from '../prototype-load.mjs';
 import { urgentSignature } from '../urgent-verify-marker.mjs';
@@ -153,6 +154,7 @@ function fixture(options = {}) {
         return fail(1);
       }
       if (action === 'add') {
+        options.beforeRegister?.();
         if (options.advanceDuringAdd) remoteTip = TREE;
         const expected = args.find((a) => a.startsWith('--expected-sha='))?.slice(15);
         if (expected && expected !== remoteTip) return fail(3, JSON.stringify({ conflictCheck: { ok: false, reason: 'sha-moved', candSha: remoteTip } }));
@@ -291,6 +293,40 @@ describe('urgent prototype admission', () => {
   const reason = 'Restore critical daemon operation';
   const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: 'https://example.com/org/repo', steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
   marker.sig = urgentSignature(marker, urgentKey);
+  it('keeps monitoring when a sweep runs between intent persistence and registration', async () => {
+    let pausedSweep;
+    const f = fixture({ beforeRegister: () => {
+      const records = f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'));
+      const program = `import { urgentSweep } from './scripts/operations/urgent-sweep.mjs';
+        const receipts = [];
+        const result = await urgentSweep({}, {
+          loads: () => ${JSON.stringify(records)}, state: () => receipts,
+          now: () => new Date(0).toISOString(), settle: r => receipts.push(r),
+          overlayState: () => ({corrupt:false, overlays:[]}), containsOverlay: () => false,
+          checks: () => ({total_count:0, check_runs:[]}), escalate: () => {}
+        });
+        process.stdout.write(JSON.stringify({result, receipts}));`;
+      pausedSweep = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', program], {
+        cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), encoding: 'utf8', timeout: 30000,
+      }));
+    } });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: true });
+    expect(pausedSweep.result).toMatchObject({ results: [{ status: 'monitoring-unregistered' }] });
+    const receipts = pausedSweep.receipts;
+    const removed = vi.fn(() => ({ retired: true }));
+    const intent = f.records.find(r => r.type === 'prototype-load.urgent');
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent-registration-complete', trackingId: intent.trackingId }));
+    const data = { total_count: 1, check_runs: [{ id: 1, name: 'test', head_sha: SHA, app: { id: 15368 },
+      check_suite: { id: 7 }, status: 'completed', conclusion: 'failure' }],
+      workflows: { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml' }] } };
+    expect(await urgentSweep({}, {
+      loads: () => f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl')), state: () => receipts,
+      now: () => new Date(0).toISOString(), settle: r => receipts.push(r),
+      overlayState: () => ({ corrupt: false, overlays: f.admitted }), checks: () => data, required: () => ['test'],
+      remove: removed, event: () => {}, escalate: () => {},
+    })).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(removed).toHaveBeenCalledWith(intent, { ref: intent.registration.ref });
+  });
   it('writes the urgent tracking intent before registering the overlay', async () => {
     const observed = [];
     const f = fixture({ onAppend: (path, record, calls) => {
@@ -304,6 +340,16 @@ describe('urgent prototype admission', () => {
     const f = fixture({ urgentWriteFails: true });
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: false, error: 'urgent ledger unwritable' });
     expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('leaves an urgent intent monitored when completion persistence fails after registration', async () => {
+    const f = fixture({ onAppend: (_path, record) => {
+      if (record.type === 'prototype-load.urgent-registration-complete') throw Error('completion ledger unavailable');
+    } });
+    expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: true, error: 'completion ledger unavailable' });
+    expect(mutations(f, 'add')).toHaveLength(1);
+    expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
+      expect.objectContaining({ type: 'prototype-load.urgent' }),
+    ]);
   });
   it('appends a registration-failed note only when the failed registration is proven absent', async () => {
     const f = fixture({ addFails: true });
@@ -327,6 +373,7 @@ describe('urgent prototype admission', () => {
     expect(readState.mock.calls[0][0]).toBe(f.records.find(r => r.type === 'prototype-load.urgent').registration.clone);
     expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
       expect.objectContaining({ type: 'prototype-load.urgent' }),
+      expect.objectContaining({ type: 'prototype-load.urgent-registration-complete' }),
     ]);
   });
   it('keeps tracking when the registration command persists the overlay before failing', async () => {
@@ -335,6 +382,7 @@ describe('urgent prototype admission', () => {
     expect(f.admitted).toEqual([{ ref: BASE.branch }]);
     expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
       expect.objectContaining({ type: 'prototype-load.urgent' }),
+      expect.objectContaining({ type: 'prototype-load.urgent-registration-complete' }),
     ]);
   });
   it('keeps the intent tracked when registration succeeds but admission evidence is incomplete', async () => {
@@ -342,6 +390,7 @@ describe('urgent prototype admission', () => {
     expect(await f.run({ urgent: true, reason })).toMatchObject({ ok: false, registered: true, detail: 'admitted-sha-unverified' });
     expect(f.records.filter(r => r.path.endsWith('/urgent-loads.jsonl'))).toEqual([
       expect.objectContaining({ type: 'prototype-load.urgent' }),
+      expect.objectContaining({ type: 'prototype-load.urgent-registration-complete' }),
     ]);
   });
   it('logs the urgent event and writes explicit urgent readiness evidence', async () => {

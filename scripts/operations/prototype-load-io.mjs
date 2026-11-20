@@ -1006,7 +1006,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         }
       } finally {
         // The command can fail after persisting the registration (for example, on event append).
-        // Cancel tracking only with readable evidence that this clone/ref is absent.
+        // Record writer completion after it returns, even on ambiguous results. Settlement
+        // still needs readable registration/ancestry proof; completion alone never cancels tracking.
         if (urgentIntent && !out.registered) {
           let absent = false;
           try {
@@ -1016,6 +1017,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           } catch { /* Unknown state keeps the persisted urgent intent monitored. */ }
           if (absent) appendUrgent({ ...urgentIntent,
             type: 'prototype-load.urgent-registration-failed', status: 'registration-failed', at: new Date(now()).toISOString() });
+          else appendUrgent({ ...urgentIntent, type: 'prototype-load.urgent-registration-complete', at: new Date(now()).toISOString() });
+        } else if (urgentIntent) {
+          appendUrgent({ ...urgentIntent, type: 'prototype-load.urgent-registration-complete', at: new Date(now()).toISOString() });
         }
       }
       const readyPath = expand(config.readyRecordPath);
