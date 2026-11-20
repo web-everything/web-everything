@@ -72,12 +72,19 @@ npm run test:unit -- --reporter=default --reporter=json --outputFile.json=covera
 `,
     // Non-failing measurement step (index 3): nproc, memory.peak, wall time. Never gates a shard.
     `
-cpu_count=$(nproc)
+cpu_count=$(nproc) || cpu_count=null
+[[ "$cpu_count" =~ ^[1-9][0-9]{0,5}$ ]] || cpu_count=null
 memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-wall_seconds=$(cut -d. -f1 /proc/uptime)
+[[ "$memory_peak" =~ ^[0-9]+$ ]] || memory_peak=unavailable
+now=$(date +%s) || now=
+wall_seconds=null
+if [[ "$SHARD_START_SECONDS" =~ ^[1-9][0-9]{0,9}$ && "$now" =~ ^[1-9][0-9]{0,9}$ ]] && (( now >= SHARD_START_SECONDS )); then
+wall_seconds=$((now - SHARD_START_SECONDS))
+fi
 printf 'nproc: %s\\nmemory.peak: %s\\nwall time (seconds): %s\\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
 printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 `,
+    'echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"',
   ],
   'coverage-merge': [
     `
@@ -200,7 +207,30 @@ const mirroredActions = {
     { name: undefined, uses: 'actions/checkout@v4', with: undefined },
     { name: undefined, uses: 'actions/setup-node@v4', with: { 'node-version': 22 } },
   ],
-  test: [],
+  test: [{
+    name: 'PR shards finish below 1050 seconds with no new failures',
+    if: "${{ always() && github.event_name == 'pull_request' && needs.changes.outputs.light != 'true' }}",
+    uses: 'actions/github-script@v7',
+    with: { script: `const { data } = await github.rest.actions.listJobsForWorkflowRun({
+  ...context.repo, run_id: context.runId, filter: 'latest', per_page: 100,
+});
+const unavailable = 'Incomplete shard timing evidence; inspect completed jobs and wait for a fresh CI run.';
+if (!Number.isInteger(data.total_count) || data.total_count > 100 || !Array.isArray(data.jobs)
+  || data.jobs.length !== data.total_count || data.jobs.some(job => typeof job?.name !== 'string')) throw new Error(unavailable);
+const expected = Array.from({ length: 10 }, (_, i) => \`test-shard (\${i + 1})\`);
+const shards = data.jobs.filter(job => job.name.startsWith('test-shard'));
+if (shards.length !== expected.length || expected.some(name => shards.filter(job => job.name === name).length !== 1)) throw new Error(unavailable);
+const durations = shards.map(job => {
+  if (job.run_id !== context.runId || job.status !== 'completed' || job.conclusion !== 'success') throw new Error(\`Shard did not succeed in this run: \${job.name}\`);
+  const start = Date.parse(job.started_at), end = Date.parse(job.completed_at);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) throw new Error(unavailable);
+  return (end - start) / 1000;
+});
+const longest = Math.max(...durations);
+core.info(\`PR shard long pole: \${longest} seconds (must be below 1050)\`);
+if (longest >= 1050) throw new Error('PR shard exceeded the 17.5-minute acceptance limit.');
+` },
+  }],
 };
 
 // Execution contexts observed in ci.yml, pinned independently of the input workflow.
@@ -211,15 +241,16 @@ function mirroredRunContext(job, text) {
   const setup = setupRuns.includes(text);
   const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
     : setup || job === 'standards' || (job === 'coverage-merge' && index === 1)
-      || (job === 'test-shard' && index > 0) || (job === 'integration-part' && index === 1) ? 'web-everything' : undefined;
+      || (job === 'test-shard' && [1, 2, 3].includes(index)) || (job === 'integration-part' && index === 1) ? 'web-everything' : undefined;
   const condition = job === 'test-shard' ? (setup ? fullUnit : [
     "${{ needs.changes.outputs.light == 'true' }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
     "${{ always() && needs.changes.outputs.light != 'true' }}",
+    fullUnit,
   ][index]) : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
-    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && index === 3 ? true : undefined,
+    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && [3, 4].includes(index) ? true : undefined,
     env: job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
@@ -289,6 +320,7 @@ export function ciGatePlan(workflow) {
       ? isDeepStrictEqual(jobs[job].env, { WE_VITEST_MAX_WORKERS: "${{ vars.WE_VITEST_MAX_WORKERS || '2' }}" })
       : jobs[job].env === undefined;
     if (jobs[job].defaults?.run !== undefined || !jobEnvOk || jobs[job].container !== undefined
+      || (job === 'test' && !isDeepStrictEqual(jobs[job].permissions, { actions: 'read' }))
       || jobs[job]['continue-on-error'] !== undefined)
       throw new Error(`unreadable-ci-gates: ${job} execution context; update the urgent verification mirror`);
     for (const step of steps.filter(s => 'run' in s)) {

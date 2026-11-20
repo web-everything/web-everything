@@ -205,6 +205,11 @@ jobs:
         # Keep --expect=9 in coverage-merge and the /9 unit-suite divisors in lockstep.
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
+      - name: Record shard start
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        continue-on-error: true
+        run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
+
       # Keep the fast-check name green for an intentionally empty unit-test scope.
       - name: Card-only unit scope receipt
         if: ${{ needs.changes.outputs.light == 'true' }}
@@ -324,9 +329,15 @@ jobs:
         continue-on-error: true
         working-directory: web-everything
         run: |
-          cpu_count=$(nproc)
+          cpu_count=$(nproc) || cpu_count=null
+          [[ "$cpu_count" =~ ^[1-9][0-9]{0,5}$ ]] || cpu_count=null
           memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-          wall_seconds=$(cut -d. -f1 /proc/uptime)
+          [[ "$memory_peak" =~ ^[0-9]+$ ]] || memory_peak=unavailable
+          now=$(date +%s) || now=
+          wall_seconds=null
+          if [[ "$SHARD_START_SECONDS" =~ ^[1-9][0-9]{0,9}$ && "$now" =~ ^[1-9][0-9]{0,9}$ ]] && (( now >= SHARD_START_SECONDS )); then
+            wall_seconds=$((now - SHARD_START_SECONDS))
+          fi
           printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
           printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 
@@ -393,6 +404,8 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Gate on shard results
         run: |
@@ -424,6 +437,31 @@ jobs:
             echo "::error::Coverage merge did not succeed."
             exit 1
           fi
+
+      # Read completed jobs so upload and post-job cleanup count toward the acceptance limit.
+      - name: PR shards finish below 1050 seconds with no new failures
+        if: ${{ always() && github.event_name == 'pull_request' && needs.changes.outputs.light != 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.actions.listJobsForWorkflowRun({
+              ...context.repo, run_id: context.runId, filter: 'latest', per_page: 100,
+            });
+            const unavailable = 'Incomplete shard timing evidence; inspect completed jobs and wait for a fresh CI run.';
+            if (!Number.isInteger(data.total_count) || data.total_count > 100 || !Array.isArray(data.jobs)
+              || data.jobs.length !== data.total_count || data.jobs.some(job => typeof job?.name !== 'string')) throw new Error(unavailable);
+            const expected = Array.from({ length: 10 }, (_, i) => `test-shard (${i + 1})`);
+            const shards = data.jobs.filter(job => job.name.startsWith('test-shard'));
+            if (shards.length !== expected.length || expected.some(name => shards.filter(job => job.name === name).length !== 1)) throw new Error(unavailable);
+            const durations = shards.map(job => {
+              if (job.run_id !== context.runId || job.status !== 'completed' || job.conclusion !== 'success') throw new Error(`Shard did not succeed in this run: ${job.name}`);
+              const start = Date.parse(job.started_at), end = Date.parse(job.completed_at);
+              if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) throw new Error(unavailable);
+              return (end - start) / 1000;
+            });
+            const longest = Math.max(...durations);
+            core.info(`PR shard long pole: ${longest} seconds (must be below 1050)`);
+            if (longest >= 1050) throw new Error('PR shard exceeded the 17.5-minute acceptance limit.');
 
   # TT3: split the real-git/real-subprocess tier into five parallel integration parts.
   # Run 44443900759 (2026-11-18): sim-scenarios 4.5 min, scan-chain 5.6 min, parallel 9.9 min.
@@ -641,6 +679,10 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
+      - name: Record shard start
+        continue-on-error: true
+        run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
@@ -665,9 +707,15 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          cpu_count=$(nproc)
+          cpu_count=$(nproc) || cpu_count=null
+          [[ "$cpu_count" =~ ^[1-9][0-9]{0,5}$ ]] || cpu_count=null
           memory_peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null) || memory_peak=unavailable
-          wall_seconds=$(cut -d. -f1 /proc/uptime)
+          [[ "$memory_peak" =~ ^[0-9]+$ ]] || memory_peak=unavailable
+          now=$(date +%s) || now=
+          wall_seconds=null
+          if [[ "$SHARD_START_SECONDS" =~ ^[1-9][0-9]{0,9}$ && "$now" =~ ^[1-9][0-9]{0,9}$ ]] && (( now >= SHARD_START_SECONDS )); then
+            wall_seconds=$((now - SHARD_START_SECONDS))
+          fi
           printf 'nproc: %s\nmemory.peak: %s\nwall time (seconds): %s\n' "$cpu_count" "$memory_peak" "$wall_seconds" >> "$GITHUB_STEP_SUMMARY"
           printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 

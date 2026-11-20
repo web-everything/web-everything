@@ -22,8 +22,9 @@ export const weAlias = {
 // Each Vitest invocation defaults to max(1, min(4, floor(cpuCount / heavyCap))) workers.
 // The ceiling of 4 keeps the admission wait's fail-open third run at 3×4=12 cores on
 // the 12-core host; cpuCount / heavyCap only lowers that ceiling on small hosts.
-// Only CI=true honors WE_VITEST_MAX_WORKERS: a trimmed integer 1..8; invalid/unset values
-// and local runs retain the cpu/heavy-cap rule above.
+// WE_VITEST_MAX_WORKERS overrides the default in every environment (finite >= 1, floored).
+// Local load limiters and Forge elastic CPU grants share this contract; CI sets its default
+// in the workflow. Invalid/unset values retain the cpu/heavy-cap rule above.
 // Heavy-cap parsing matches heavy-admission.mjs#resolveCap (default 2), without importing
 // the admission module's whole import graph when loading a Vitest config.
 // Shared by the threads and forks pools; existing singleFork correctness pins stay serial.
@@ -37,7 +38,7 @@ function hostCpuCount(): number {
 
 export function resolveMaxTestWorkers(env: Record<string, string | undefined> = process.env, cpuCount: number = hostCpuCount()): number {
   const explicit = Number(env[VITEST_MAX_WORKERS_ENV]?.trim());
-  if (env.CI === 'true' && Number.isInteger(explicit) && explicit >= 1 && explicit <= 8) return explicit;
+  if (Number.isFinite(explicit) && explicit >= 1) return Math.floor(explicit);
   const capRaw = Number(env.WE_HEAVY_ADMISSION_CAP);
   const cap = Number.isFinite(capRaw) && capRaw >= 1 ? Math.floor(capRaw) : HEAVY_ADMISSION_DEFAULT_CAP;
   return Math.max(1, Math.min(DEFAULT_VITEST_MAX_WORKERS, Math.floor((Number(cpuCount) || 0) / cap)));

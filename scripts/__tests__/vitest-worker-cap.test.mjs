@@ -1,12 +1,15 @@
 /**
  * @file scripts/__tests__/vitest-worker-cap.test.mjs
  * @description Host-overload fix (heavy-enforce): every vitest config reads ONE worker ceiling,
- *   `WE_VITEST_MAX_WORKERS` (CI-only integer 1..8), otherwise max(1, min(4, floor(cpu count / heavy-admission cap))). Pins the
+ *   `WE_VITEST_MAX_WORKERS` (positive finite value, rounded down), otherwise max(1, min(4, floor(cpu count / heavy-admission cap))). Pins the
  *   resolver, its parity with heavy-admission's own cap parsing, and that every config file applies it.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import * as fs from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import micromatch from 'micromatch';
 import unitConfig from '../../vitest.config';
 import integrationConfig from '../../vitest.integration.config';
@@ -34,6 +37,8 @@ describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () 
   it('an explicit WE_VITEST_MAX_WORKERS wins', () => {
     expect(VITEST_MAX_WORKERS_ENV).toBe('WE_VITEST_MAX_WORKERS');
     expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: '6' }, 12)).toBe(6);
+    expect(resolveMaxTestWorkers({ WE_VITEST_MAX_WORKERS: '6' }, 12)).toBe(6);
+    expect(resolveMaxTestWorkers({ WE_VITEST_MAX_WORKERS: '3.9' }, 12)).toBe(3);
   });
 
   it('ignores an invalid WE_VITEST_MAX_WORKERS and falls back to the default', () => {
@@ -62,13 +67,60 @@ describe('ci worker count', () => {
     expect(resolveMaxTestWorkers({ CI: 'true', WE_HEAVY_ADMISSION_CAP: '4' }, 4)).toBe(1);
   });
 
-  it.each([undefined, 'false', '1', 'TRUE'])('ignores the local override with CI=%j', (CI) => {
-    expect(resolveMaxTestWorkers({ CI, WE_VITEST_MAX_WORKERS: '8' }, 4)).toBe(2);
+  it.each([undefined, 'false', '1', 'TRUE', 'true'])('honours local load limiters and elastic grants with CI=%j', (CI) => {
+    expect(resolveMaxTestWorkers({ CI, WE_VITEST_MAX_WORKERS: '2' }, 12)).toBe(2);
+    expect(resolveMaxTestWorkers({ CI, WE_VITEST_MAX_WORKERS: '24', FORGE_SLOT_CPUS: '24' }, 4)).toBe(24);
   });
 
-  it.each(['', '  ', '0', '-1', '9', '100', '3.9', 'lots', 'Infinity', 'NaN'])('falls back for invalid CI override %j', (value) => {
+  it.each(['', '  ', '0', '-1', '0.9', 'lots', 'Infinity', 'NaN'])('falls back for invalid CI override %j', (value) => {
     expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value }, 4)).toBe(2);
     expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value, WE_HEAVY_ADMISSION_CAP: '4' }, 4)).toBe(1);
+  });
+});
+
+describe('worker override producer contracts', () => {
+  it('resolves the actual non-CI Forge elastic slot environment to its granted 24 workers', async () => {
+    const { createRunner, digestInput, digestArgv, manifestWire, digestManifest } = await import('../readiness/forge-exec-run.mjs');
+    const hash = value => createHash('sha256').update(value).digest('hex');
+    const root = await fs.mkdtemp(resolve(tmpdir(), 'vitest-forge-workers-'));
+    let runner, prepared;
+    const nonce = 'a'.repeat(32), environments = [];
+    try {
+      await fs.mkdir(resolve(root, 'runs/slot-1'), { recursive: true, mode: 0o710 });
+      runner = createRunner({ testRoot: root, testPath: '/usr/bin:/bin', testWorkerExec: async ({ env }) => {
+        environments.push(env);
+        return { code: 0, stdout: '', stderr: '' };
+      } });
+      prepared = await runner.prepare({ nonce, slotUnits: 3 });
+      const work = resolve(root, 'runs/slot-1', prepared.run, 'work');
+      await fs.writeFile(resolve(work, 'package-lock.json'), 'lock');
+      const manifest = manifestWire({ entries: [{ path: Buffer.from('package-lock.json'), sha256: hash('lock'), executable: false }], excluded: [] });
+      const argv = ['npm', 'run', 'test:unit'];
+      const result = await runner.run({ ...prepared, nonce, argv, env: {}, lock: hash('lock'),
+        manifest, manifestDigest: digestManifest(manifest), inputDigest: await digestInput(work), argvDigest: digestArgv(argv) });
+      expect(result.code).toBe(0);
+      expect(environments.length).toBeGreaterThan(0);
+      // Dependency installation uses CI=true; the task itself retains the non-CI request.
+      expect(environments.some(env => env.CI === undefined)).toBe(true);
+      for (const env of environments) {
+        expect(env).toMatchObject({ WE_VITEST_MAX_WORKERS: '24', FORGE_SLOT_CPUS: '24' });
+        expect(resolveMaxTestWorkers(env, 4)).toBe(24);
+      }
+    } finally {
+      try {
+        if (prepared) await runner.finish({ ...prepared, nonce });
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
+  it('honours the non-CI load limiter forwarded by load-flake reverify', async () => {
+    const { scrubVerifyEnv } = await import('../conveyor/load-flake-reverify.mjs');
+    const env = scrubVerifyEnv({ WE_VITEST_MAX_WORKERS: '2' });
+    expect(env.WE_VITEST_MAX_WORKERS).toBe('2');
+    expect(env.CI).toBeUndefined();
+    expect(resolveMaxTestWorkers(env, 12)).toBe(2);
   });
 });
 
