@@ -8,8 +8,8 @@ describe('pinned changes checks every durable write', () => {
     let liveHead = head;
     const writes = [];
     const stateProvider = {
-      readPrState: () => ({ headRefOid: liveHead, labels: [], comments: [], state: 'OPEN', body: '' }),
-      readLabels: () => [],
+      readPrState: () => ({ headRefOid: liveHead, labels: ['review:accepted', 'ready-to-merge'], comments: [], state: 'OPEN', body: '' }),
+      readLabels: () => ['review:accepted', 'ready-to-merge'],
       postComment: () => { writes.push('comment'); if (step === 'label') liveHead = moved; },
       setLabels: () => writes.push('label'),
     };

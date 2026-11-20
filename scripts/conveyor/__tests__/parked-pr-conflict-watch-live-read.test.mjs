@@ -6,10 +6,79 @@ import { readFileSync } from 'node:fs';
 import * as watch from '../parked-pr-conflict-watch.mjs';
 import { buildReconcileFindingBody } from '../reconcile-finding.mjs';
 import { buildVerdictComment, runReviewLabelCli } from '../../review-set-label.mjs';
+import { createGhProvider } from '../../lib/review-label-provider.mjs';
 
 const head = 'a'.repeat(40), moved = 'b'.repeat(40);
 const pr = { number: 7183, headRefOid: head };
 const repo = 'o/n';
+
+describe('accepted bounce writes the harmful label swap last', () => {
+  it.each(['before-comment', 'before-swap-mergeable', 'before-swap-head', 'swap-pin', 'edit-fails', 'clear-ledger-fails', 'success'])(
+    '%s preserves approval until the final guarded swap and reports partial writes', scenario => {
+      let liveHead = head, mergeable = 'CONFLICTING';
+      let labels = ['review:accepted', 'ready-to-merge'];
+      const thread = [], ledger = [], writes = [], entry = {}, log = vi.fn();
+      const provider = createGhProvider({ exec: argv => {
+        if (argv[0] === 'pr' && argv[1] === 'view') return JSON.stringify({ headRefOid: liveHead,
+          labels, comments: thread, state: 'OPEN', body: '' });
+        if (argv[0] === 'pr' && argv[1] === 'comment') {
+          const body = readFileSync(argv[argv.indexOf('--body-file') + 1], 'utf8');
+          expect(body).toContain('&lt;!-- conflict-watch-bounce:');
+          thread.push({ id: 'IC_test', body, createdAt: new Date().toISOString(), author: { login: 'web-everything' } });
+          writes.push('comment');
+          if (scenario !== 'success') {
+            if (scenario === 'before-swap-head' || scenario === 'swap-pin') liveHead = moved;
+            else mergeable = 'MERGEABLE';
+          }
+          return '';
+        }
+        if (argv[0] === 'pr' && argv[1] === 'edit') {
+          writes.push('label');
+          labels = ['review:changes'];
+          return '';
+        }
+        if (argv[0] === 'api' && argv[1] === 'graphql') {
+          if (scenario === 'edit-fails') throw new Error('edit unavailable');
+          const id = argv.find(a => a.startsWith('id=')).slice(3);
+          const body = readFileSync(argv.find(a => a.startsWith('body=@')).slice(6), 'utf8');
+          thread.find(c => c.id === id).body = body;
+          return '';
+        }
+        throw new Error(`unexpected fake gh: ${JSON.stringify(argv)}`);
+      } });
+      const result = watch.bounceIfStillConflicting({ pr: { ...pr, labels }, judgedHead: head, repo, entry, log,
+        revertBounce: vi.fn(() => { throw new Error('unexpected post-swap rollback'); }),
+        readPrLive: () => ({ headRefOid: scenario === 'swap-pin' ? head : liveHead, mergeable }),
+        postFindingArgs: { provider, listPrComments: () => thread, writerOptions: {
+          signalFix: () => {}, appendVerdict: row => {
+            if (row.reasonCode === 'cleared' && scenario === 'clear-ledger-fails') return { ok: false, errors: ['ledger unavailable'] };
+            ledger.push(row);
+            if (row.reasonCode !== 'cleared') {
+              writes.push('ledger');
+              if (scenario === 'before-comment') mergeable = 'MERGEABLE';
+            }
+            return { ok: true };
+          },
+        } },
+      });
+      if (scenario === 'success') {
+        expect(result).toBe(true);
+        expect(writes).toEqual(['ledger', 'comment', 'label']);
+        expect(labels).toEqual(['review:changes']);
+        return;
+      }
+      expect(result).toBe(false);
+      expect(labels).toEqual(['review:accepted', 'ready-to-merge']);
+      expect(writes).toEqual(scenario === 'before-comment' ? ['ledger'] : ['ledger', 'comment']);
+      expect(entry.error).toMatch(scenario === 'edit-fails' ? /edit unavailable/ : scenario === 'clear-ledger-fails' ? /ledger unavailable/ : /conflict-cleared-before-bounce/);
+      expect(log).toHaveBeenCalledWith(expect.stringMatching(/^\d{4}-.*error/));
+      if (scenario !== 'clear-ledger-fails') expect(ledger).toContainEqual(expect.objectContaining({ reasonCode: 'cleared', type: 'release' }));
+      if (scenario !== 'before-comment' && scenario !== 'edit-fails') {
+        expect(thread[0].body).toBe(`superseded: conflict cleared on ${head}`);
+        expect(watch.hasRecentConflictFindingComment(thread)).toBe(false);
+      }
+    });
+});
 
 describe('default conflict-watch GitHub readers', () => {
   it('reads the live PR using bounded, throttled App-only argv', () => {
@@ -189,7 +258,7 @@ describe('production finding write boundaries', () => {
         };
         expect(watch.bounceIfStillConflicting({ pr, judgedHead: head, repo, readPrLive, log,
           postFindingArgs: { provider, listPrComments: () => thread, writerOptions: { emit: () => {},
-            appendVerdict: () => { writes.push('ledger'); return { ok: true }; }, signalFix: () => {} } },
+            appendVerdict: row => { if (row.reasonCode !== 'cleared') writes.push('ledger'); return { ok: true }; }, signalFix: () => {} } },
         })).toBe(false);
         expect(writes).toEqual(['ledger', 'comment', 'label'].slice(0, index));
         expect(provider.editComment).toHaveBeenCalledTimes(step === 'label' ? 1 : 0);

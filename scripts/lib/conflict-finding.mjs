@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { resolveChildTimeoutMs } from './bounded-child.mjs';
+import { appendVerdict, buildLedgerEvent, EVENT_TYPES } from './verdict-ledger.mjs';
 
 export function buildConflictFindingBody(pr, { appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null } = {}) {
   const ref = pr?.headRefName ? ` (\`${pr.headRefName}\`)` : '';
@@ -82,7 +83,7 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
   ].join('\n');
 }
 
-export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, headRefOid, beforeWrite, provider = createGhProvider(), listPrComments = defaultListPrComments, writerOptions = {} }) {
+export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appendOnlyStatute = false, reviewHumanFixable = false, resync = false, sameLineConflict = false, enqueueRefusal = null, headRefOid, beforeWrite, afterWrite = () => {}, provider = createGhProvider(), listPrComments = defaultListPrComments, writerOptions = {} }) {
   const bodyPath = join(tmpdir(), `reconcile-finding-conflict-${pr?.number}-${randomUUID()}.md`);
   const findingToken = headRefOid ? randomUUID() : null;
   const completed = new Set();
@@ -96,16 +97,30 @@ export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appe
     if (repo) argv.push(`--repo=${repo}`);
     // #x5n4zn3 — was bare (no timeout).
     if (beforeWrite && exec === execFileSync) {
-      runReconcileFindingCli({ writerOptions: { ...writerOptions, throwOnRefusal: true, afterWrite: step => completed.add(step) }, emit: () => {}, argv: argv.slice(1), beforeWrite, provider });
+      runReconcileFindingCli({ writerOptions: { ...writerOptions, throwOnRefusal: true,
+        afterWrite: step => { completed.add(step); afterWrite(step); } }, emit: () => {}, argv: argv.slice(1), beforeWrite, provider });
     } else exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
     return { findingToken };
   } catch (error) {
-    // A comment-first bounce can be stopped after publishing its finding but
-    // before applying review:changes. Retire only that exact trusted receipt:
-    // otherwise deduplication would suppress the next sweep's fix request.
-    // The append-only shadow ledger remains audit history; no label is restored.
-    if (completed.has('comment') && !completed.has('label')) {
-      invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments });
+    // Retire both durable receipts, even if only the ledger landed. Attempt both
+    // compensations independently; neither failure may hide the original refusal.
+    if (completed.size && !completed.has('label')) {
+      const failures = [];
+      if (completed.has('comment')) {
+        try { invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments, superseded: true }); }
+        catch (e) { failures.push(e.message); }
+      }
+      if (completed.has('ledger')) {
+        try {
+          const result = (writerOptions.appendVerdict ?? appendVerdict)(buildLedgerEvent({
+            type: EVENT_TYPES.RELEASE, repo, pr: pr.number, at: new Date().toISOString(),
+            source: 'conflict-watch', reasonCode: 'cleared', holdSource: `conflict-watch:${findingToken}`,
+          }));
+          if (!result?.ok) throw new Error(`conflict cleared ledger append failed: ${(result?.errors ?? ['unreadable receipt']).join('; ')}`);
+        } catch (e) { failures.push(e.message); }
+      }
+      error.conflictBounceDurable = true;
+      if (failures.length) error.conflictBounceCleanupError = failures.join('; ');
     }
     throw error;
   } finally {
@@ -117,14 +132,15 @@ export function defaultPostConflictFinding({ pr, repo, exec = execFileSync, appe
  * Failure retains the bounce and surfaces an error, rather than leaving an accepted
  * PR suppressed by a finding that still counts for deduplication.
  */
-export function invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments }) {
+export function invalidateConflictFinding({ findingToken, pr, repo, headRefOid, provider, listPrComments, superseded = false }) {
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(findingToken ?? '')) throw new Error('conflict finding rollback: invalid receipt');
   const comments = listPrComments({ number: pr.number, repo });
   const matches = Array.isArray(comments) ? comments.filter(comment =>
     isTrustedMarkerAuthor(comment) && typeof comment?.body === 'string' && ownsConflictFindingReceipt(comment.body, findingToken)) : [];
   if (matches.length !== 1 || !matches[0].id) throw new Error('conflict finding rollback: finding unreadable or ambiguous; bounce retained');
   provider.editComment(repo, matches[0].id,
-    `Conflict-watch bounce reverted for head ${headRefOid}: the post-write read did not confirm the judged conflict.`,
+    superseded ? `superseded: conflict cleared on ${headRefOid}`
+      : `Conflict-watch bounce reverted for head ${headRefOid}: the post-write read did not confirm the judged conflict.`,
     { pr: pr.number });
 }
 

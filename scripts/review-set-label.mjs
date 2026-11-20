@@ -2275,7 +2275,9 @@ export function runReviewLabelCli({
   const acceptanceAlreadyLive = hasReviewLabel(currentLabels, REVIEW_LABELS.accepted);
   // Guarded carry leaves the live acceptance label alone; its fresh-state check already ran before the ledger.
   const steps = { comment: postComment, swap: guardedRestamp ? () => {} : applySwap };
-  const order = resumePinnedRearm ? ['comment'] : pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
+  // Committee merge-path line 9: a pinned conflict bounce removes an existing
+  // approval, so its harmful write must follow both receipts and the live guard.
+  const order = pinnedChanges ? ['comment', 'swap'] : resumePinnedRearm ? ['comment'] : pinnedPlainRearm ? ['swap', 'comment'] : writeOrder({ acceptanceAlreadyLive });
   for (const step of order) { steps[step](); }
   const refreshFn = refreshGate ?? (liveGhProviders.has(provider) ? refreshMergeGateAfterRestamp : null);
   const gateRefresh = to === 'restamp' && refreshFn

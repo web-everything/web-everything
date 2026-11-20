@@ -1408,12 +1408,22 @@ export function bounceIfStillConflicting({
     prepare();
     finding = postFinding({ ...postFindingArgs, pr, repo, headRefOid: judgedHead, beforeWrite });
   } catch (error) {
+    if (error.conflictBounceDurable) {
+      entry.routedTo = stopped.message;
+      entry.error = `${stopped.message}: ${error.message}${error.conflictBounceCleanupError ? `; ${error.conflictBounceCleanupError}` : ''}`;
+      log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} error: ${entry.error}`);
+      return false;
+    }
     if (error === stopped) return false;
     throw error;
   }
   let after = null;
   try { after = readPrLive({ pr, repo }); } catch { /* cannot confirm write */ }
   if (after?.headRefOid !== judgedHead || after?.mergeable !== 'CONFLICTING') {
+    // This is the only label-recovery path: the final swap already landed.
+    // Keep the guarded live-state recovery for unreadable post-swap evidence too.
+    entry.error = 'conflict-cleared-before-bounce: post-swap read did not confirm the judged conflict';
+    log(`${new Date(now).toISOString()} parked-pr-conflict-watch #${pr.number} error: ${entry.error}`);
     const skipped = revertBounce({ pr, repo, headRefOid: judgedHead, findingToken: finding?.findingToken });
     entry.routedTo = skipped || (after?.headRefOid !== judgedHead
       ? 'bounce-reverted-head-moved' : 'bounce-reverted-conflict-unconfirmed');

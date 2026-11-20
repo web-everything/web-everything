@@ -131,6 +131,9 @@ export function runReconcileFindingCli({
   beforeWrite,
   writerOptions = {},
 } = {}) {
+  // Preserve --expect-head in argv through the shared writer. Pinned changes
+  // write ledger + rendered finding before the final live guard and label swap,
+  // even when the PR already carries review:accepted / ready-to-merge.
   const fail = (message, code = 2) => { emit(`${JSON.stringify({ error: message })}\n`); process.exit(code); };
   const usage = 'usage: reconcile-finding.mjs <pr> --body-file=<path to the finding write-up> '
     + '[--repo=<owner/name>] [--agent=<calling agent/task name>] [--channel=<surface>]  '
