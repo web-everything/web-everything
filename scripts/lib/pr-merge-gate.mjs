@@ -192,10 +192,15 @@ export function parseUnifiedDiff(diffText) {
  *   - `tests-removed`      — net test CASES removed, excluding unambiguous, body-preserving moves in this diff.
  * Returns `{ tampered, findings, reasons }`, mirroring the manifest-tamper shape the drain's land loop already
  * consumes, so wiring it is a drop-in park. A clean diff (no test file, or only ADDED tests) → `tampered:false`.
- * @param {{diffText?:string, readFile?:(path:string, side:'base'|'head')=>string}} o  the two-tree net diff TEXT (`computeNetDiffText`, merge-ai-prs.mjs).
+ * @param {{diffText?:string, scored?:boolean, readFile?:(path:string, side:'base'|'head')=>string}} o  the two-tree net diff TEXT (`computeNetDiffText`, merge-ai-prs.mjs).
  * @returns {{tampered:boolean, findings:Array<{path:string,kind:string,detail:string}>, reasons:string[]}}
  */
-export function scanTestTampering({ diffText = '', readFile } = {}) {
+export function scanTestTampering({ diffText = '', scored = true, readFile } = {}) {
+  if (!scored || typeof diffText !== 'string' || !diffText.trim() || !/^diff --git /m.test(diffText)) {
+    const detail = 'diff evidence is empty, unscored or unresolved; human review of full diff required';
+    return { tampered: true, findings: [{ path: '(diff)', kind: 'test-evidence-unavailable', detail }],
+      reasons: [`test-evidence-unavailable: ${detail}`] };
+  }
   const findings = [];
   const files = parseUnifiedDiff(diffText);
   // Move evidence is deliberately stricter than ordinary same-file churn: complete parseable hunks,
@@ -259,6 +264,8 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
     if (changedPaths.some((p) => setup.has(p))) complete = false;
   } catch { complete = false; }
   const counts = { removed: new Map(), added: new Map() };
+  const environments = { removed: new Map(), added: new Map() };
+  const registrationPattern = /(?<![.\w])(?:it|test)\s*(?:\.\s*\w+\s*)*(?:\(|`)/;
   const printer = ts.createPrinter({ removeComments: true });
   const print = (n, tree) => printer.printNode(ts.EmitHint.Unspecified, n, tree);
   const signature = (fn, tree) => {
@@ -282,6 +289,15 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
     }
     return null;
   };
+  function staticData(node) {
+    if (ts.isStringLiteralLike(node) || ts.isNumericLiteral(node) ||
+        [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword, ts.SyntaxKind.NullKeyword].includes(node.kind)) return true;
+    if (ts.isPrefixUnaryExpression(node) && [ts.SyntaxKind.PlusToken, ts.SyntaxKind.MinusToken].includes(node.operator))
+      return ts.isNumericLiteral(node.operand);
+    if (ts.isArrayLiteralExpression(node)) return node.elements.every(staticData);
+    return ts.isObjectLiteralExpression(node) && node.properties.every((p) => ts.isPropertyAssignment(p) &&
+      !ts.isComputedPropertyName(p.name) && staticData(p.initializer));
+  }
   function collect(path, lines, side) {
     if (!lines.length) return;
     const text = lines.map((l) => l.text).join('\n');
@@ -360,48 +376,39 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
       ts.forEachChild(n, hiddenHook);
     }
     hiddenHook(tree);
-    const helperEffects = [];
-    const seenHelpers = new Set();
-    function helper(path, depth = 0) {
-      if (depth > 8) { oversized = true; evidenceLimit = 'helper depth 8'; throw new Error('helper depth limit'); }
-      if (seenHelpers.has(path)) throw new Error('cyclic or duplicate helper');
-      seenHelpers.add(path);
-      const source = readFile(path, side === 'removed' ? 'base' : 'head');
-      if (typeof source !== 'string') throw new Error('unreadable helper');
-      if (source.length > 128 * 1024) { oversized = true; evidenceLimit = '128 KiB helper'; throw new Error('helper size limit'); }
-      const t = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true);
-      if (t.parseDiagnostics.length) throw new Error('invalid helper');
-      // Helpers may not supply or patch the protected Vitest bindings.
-      function protect(n) {
-        if (ts.isIdentifier(n) && (protectedNames.has(n.text) || n.text === 'skip')) throw new Error('protected helper');
-        if (ts.isCallExpression(n) && /^(?:beforeEach|afterEach|beforeAll|afterAll|onTestFinished)$/.test(n.expression.getText(t)) &&
-            !ts.isExpressionStatement(n.parent)) throw new Error('hidden helper hook');
-        ts.forEachChild(n, protect);
+    // The destination may only reuse statements already present in the source pre-image.
+    // Token text preserves literal/module bytes; only trivia and comments are discarded.
+    const literals = new Map();
+    function literalRanges(n) {
+      if (ts.isLiteralExpression(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n)) {
+        literals.set(n.getStart(tree), n.end);
+        if (registrationPattern.test(n.getText(tree)) &&
+            (ts.isNoSubstitutionTemplateLiteral(n) || ts.isTemplateHead(n) || ts.isTemplateMiddle(n) || ts.isTemplateTail(n))) complete = false;
       }
-      protect(t);
-      for (const n of t.statements) {
-        if (ts.isImportDeclaration(n) && n.moduleSpecifier.text?.startsWith('.')) {
-          const target = posix.normalize(posix.join(posix.dirname(path), n.moduleSpecifier.text));
-          if (files.some((f) => f.path === target && !f.removed.length && f.added.length)) helper(target, depth + 1);
-        }
-      }
-      for (const n of t.statements) {
-        if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isFunctionDeclaration(n) ||
-            ts.isVariableStatement(n) && (n.declarationList.flags & ts.NodeFlags.Const)) continue;
-        helperEffects.push(print(n, t));
-      }
+      ts.forEachChild(n, literalRanges);
     }
-    if (side === 'added') for (const n of tree.statements) {
-      if (!ts.isImportDeclaration(n) || !n.moduleSpecifier.text?.startsWith('.')) continue;
-      const target = posix.normalize(posix.join(posix.dirname(path), n.moduleSpecifier.text));
-      if (files.some((f) => f.path === target && !f.removed.length && f.added.length)) helper(target);
+    literalRanges(tree);
+    const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, text);
+    const tokens = [], directives = [];
+    for (let kind = scanner.scan(); kind !== ts.SyntaxKind.EndOfFileToken; kind = scanner.scan()) {
+      const start = scanner.getTokenPos();
+      if (literals.has(start)) {
+        const end = literals.get(start);
+        tokens.push({ start, text: text.slice(start, end) });
+        scanner.setTextPos(end);
+      } else if (kind === ts.SyntaxKind.SingleLineCommentTrivia || kind === ts.SyntaxKind.MultiLineCommentTrivia) {
+        // Treat all @ directives conservatively, including Vitest environment/options comments.
+        if (/@[\w-]+/.test(scanner.getTokenText())) directives.push(normalize(scanner.getTokenText()));
+      } else if (kind > ts.SyntaxKind.LastTriviaToken) tokens.push({ start, text: scanner.getTokenText() });
     }
-    // Compatibility with #7140: registration effects may move only in identical order,
-    // including setup/cleanup extracted into a new helper. New or changed hooks retain HOLD.
+    const statements = tree.statements.filter((n) => !(ts.isExpressionStatement(n) &&
+      ts.isCallExpression(n.expression) && /^(?:describe|it|test)(?:\.|$)/.test(n.expression.expression.getText(tree))))
+      .map((n) => tokens.filter((t) => t.start >= n.getStart(tree) && t.start < n.end).map((t) => t.text).join(' '));
+    environments[side].set(path, { statements, directives: directives.join('\n') });
     function effects(container) {
       return container.statements.filter((n) => {
-        if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isFunctionDeclaration(n) ||
-            ts.isVariableStatement(n) && (n.declarationList.flags & ts.NodeFlags.Const)) return false;
+        // Initializers execute in order, including const initializers with side effects.
+        if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n) || ts.isFunctionDeclaration(n)) return false;
         return !(ts.isExpressionStatement(n) && ts.isCallExpression(n.expression) &&
           /^(?:it|test|describe)(?:\.|$)/.test(n.expression.expression.getText(tree)));
       }).map((n) => print(n, tree));
@@ -412,12 +419,20 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
       if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) return true;
       return !!ts.forEachChild(node, hasSuiteExit);
     }
-    function visit(node, parents = [], disabled = false, container = tree, context = [...helperEffects, ...effects(tree)]) {
-      // Parameterized moves require the complete table expression to match as well.
+    function visit(node, parents = [], disabled = false, container = tree, context = effects(tree)) {
+      // Count even unsupported registrations before refusing their evidence. Otherwise an
+      // unknown title/table could disappear from removal accounting beside a valid move.
+      if (ts.isCallExpression(node) && /^(?:it|test)\b/.test(node.expression.getText(tree))) {
+        const start = tree.getLineStarts()[tree.getLineAndCharacterOfPosition(node.getStart(tree)).line];
+        if (changed.has(start)) counts[side].set(path, (counts[side].get(path) || 0) + 1);
+      }
+      // Parameterized moves require a static table and the complete expression to match.
       const parameterized = ts.isCallExpression(node) && ts.isCallExpression(node.expression) &&
         /^(?:it|test)\.each$/.test(node.expression.expression.getText(tree));
       if (ts.isCallExpression(node) && (parameterized || /^(?:describe|it|test)(?:\.(?:skip|todo|only))?$/.test(node.expression.getText(tree)))) {
         if (!ts.isExpressionStatement(node.parent) || node.parent.parent !== container) { complete = false; return; }
+        if (parameterized && (node.expression.arguments.length !== 1 ||
+            !ts.isArrayLiteralExpression(node.expression.arguments[0]) || !staticData(node.expression.arguments[0]))) { complete = false; return; }
         const callee = node.expression.getText(tree);
         const [title, fn] = node.arguments;
         const titleText = staticTitle(title);
@@ -438,7 +453,6 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
         // Compare parsed statements, not whitespace-stripped tokens: `return\nexpect(...)`
         // skips the assertion even though it has the same tokens as `return expect(...)`.
         const body = (parameterized ? print(node.expression, tree) : callee) + signature(fn, tree) + print(fn.body, tree);
-        if (changed.has(start)) counts[side].set(path, (counts[side].get(path) || 0) + 1);
         let assertions = 0;
         let trivial = false;
         function assertion(n) {
@@ -452,9 +466,12 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
         }
         assertion(fn.body);
         remember(side, JSON.stringify(key), { path, changed: changed.has(start),
+          // Text/order equality does not make arbitrary relocated effects safe: e.g.
+          // import.meta.url can select a different implementation in the destination.
           body, context: context.join('\n'), valid: !blocked && context.every((s) =>
             /^(?:beforeEach|afterEach|beforeAll|afterAll)\(/.test(s) || /^vi\.(?:mock|setConfig)\(/.test(s) ||
-            /^process\.env\.WE_BOARD_NOW = NOW;?$/.test(s) || /^let\s/.test(s)) && assertions > 0 && !trivial });
+            /^process\.env\.WE_BOARD_NOW = NOW;?$/.test(s) || /^(?:const|let|var)\s/.test(s)) &&
+            assertions > 0 && !trivial });
         return;
       }
       if (ts.isCallExpression(node) && /^(?:describe|it|test)\b/.test(node.expression.getText(tree))) {
@@ -507,6 +524,14 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
       } catch { complete = false; } // No partial credit: retain the human HOLD on any failed read/parse.
     }
   }
+  // A rejected move still owes an exact removal accounting: unrelated local additions
+  // cannot erase it merely because no destination qualified for a credit.
+  const moveSources = new Set();
+  for (const [key, removed] of records.removed) {
+    const destinations = new Set((records.added.get(key) || []).filter((r) => r.changed).map((r) => r.path));
+    for (const a of removed) if (a.changed && (destinations.size > 1 ||
+        destinations.size === 1 && !destinations.has(a.path))) moveSources.add(a.path);
+  }
   const credits = new Map();
   if (complete && records.removed.size && records.added.size) {
     try {
@@ -517,6 +542,9 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
         if (removed.length !== 1 || added?.length !== 1) continue;
         const [a] = removed, [b] = added;
         if (!a.changed || !b.changed || a.path === b.path || !a.valid || !b.valid || a.body !== b.body || a.context !== b.context) continue;
+        const source = environments.removed.get(a.path), destination = environments.added.get(b.path);
+        if (!source || !destination || source.directives !== destination.directives ||
+            destination.statements.some((statement) => !source.statements.includes(statement))) continue;
         if (!isTestPath(b.path) || /(^|\/)(?:node_modules|\.git|dist|coverage)(\/|$)/.test(b.path) ||
             !micromatch.isMatch(b.path, include) || micromatch.isMatch(b.path, exclude)) continue;
         credits.set(a.path, (credits.get(a.path) || 0) + 1);
@@ -524,7 +552,7 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
     } catch { /* Unreadable/unknown config: no move credits; retain human HOLD. */ }
   }
   const retained = new Map();
-  if (credits.size) {
+  if (complete && moveSources.size) {
     // Once moves are paired, only the same case identity can cancel a local removal.
     // Otherwise an unrelated addition can spend a second cancellation on a genuinely deleted case.
     for (const [key, removed] of records.removed) {
@@ -551,10 +579,14 @@ export function scanTestTampering({ diffText = '', readFile } = {}) {
     if (skipAdds) findings.push({ path: f.path, kind: 'test-skipped', detail: `${skipAdds} skip/only marker(s) added` });
     const removedCases = f.removed.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
     const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
-    const netRemoved = credits.size
-      ? (counts.removed.get(f.path) || 0) - (retained.get(f.path) || 0) - (credits.get(f.path) || 0)
-      : removedCases - addedCases;
-    if (netRemoved > 0) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${netRemoved} test case(s) removed${oversized ? `; move evidence exceeds ${evidenceLimit}: human review of full diff required` : ''}` });
+    // Failed/oversized/non-static evidence cannot be cleared by balancing added lines.
+    // Credits are spendable only against the declarations of their own source file.
+    const netRemoved = !complete
+      ? Math.max(removedCases, counts.removed.get(f.path) || 0, f.removed.filter((l) => registrationPattern.test(l)).length)
+      : moveSources.size
+        ? (counts.removed.get(f.path) || 0) - (retained.get(f.path) || 0) - (credits.get(f.path) || 0)
+        : removedCases - addedCases;
+    if (netRemoved > 0) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${netRemoved} test case(s) removed${oversized ? `; move evidence exceeds ${evidenceLimit}: human review of full diff required` : !complete ? '; incomplete or non-static move evidence: human review of full diff required' : ''}` });
   }
   const reasons = findings.map((x) => `${x.kind}: ${x.path} (${x.detail})`);
   return { tampered: findings.length > 0, findings, reasons };

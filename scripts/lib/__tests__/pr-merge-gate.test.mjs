@@ -232,7 +232,7 @@ describe('full-file move evidence', () => {
   it('clears the #7140 mid-file split of net 14 and 129 cases using exact suite ancestry', () => {
     const input = midFileSplit();
     expect(scanTestTampering({ diffText: input.diffText }).findings.map((f) => f.detail))
-      .toEqual(['net 14 test case(s) removed', 'net 129 test case(s) removed']);
+      .toEqual([14, 129].map((n) => `net ${n} test case(s) removed; incomplete or non-static move evidence: human review of full diff required`));
     expect(scanTestTampering(input).findings).toEqual([]);
   });
 
@@ -278,10 +278,10 @@ describe('full-file declaration shapes from #7140', () => {
     };
   }
 
-  it('keeps parameterized declarations in collision evidence without crediting them', () => {
+  it('holds non-static parameterized registrations even alongside an otherwise valid move', () => {
     const parameterized = "it.each(rows)('parameter %s', () => { expect(actual()).toBe(1); });";
     const moved = testCase('one');
-    expect(scanTestTampering(input(parameterized + '\n' + moved, parameterized, [moved])).findings).toEqual([]);
+    expect(scanTestTampering(input(parameterized + '\n' + moved, parameterized, [moved])).tampered).toBe(true);
     expect(scanTestTampering(input(moved, '', [moved, parameterized.replace('parameter %s', 'one')])).tampered).toBe(true);
   });
 
@@ -385,19 +385,19 @@ describe('move-credit helper bounds and preservation', () => {
     expect(removed(patch(path('big'), suite([one, testCase('two')]),
       suite([one.replace('});', '}, { skip: true });')])), destination([testCase('two')]))).toHaveLength(1);
   });
-  it('holds an oversized extracted helper with a human-review fallback', () => {
+  it('holds an extracted helper import without reading the oversized helper', () => {
     const helper = 'scripts/lib/__tests__/helpers/world.mjs';
     const result = removed(source([one]), patch(path('shard'), '',
       "import { data } from './helpers/world.mjs';\n" + suite([one])),
     patch(helper, '', "export const data = '" + 'x'.repeat(128 * 1024) + "';"));
     expect(result).toHaveLength(1);
-    expect(result[0].detail).toContain('128 KiB helper: human review of full diff required');
+    expect(result[0].detail).toBe('net 1 test case(s) removed');
   });
-  it('holds when an extracted helper exceeds the depth bound', () => {
+  it('holds a new helper import without traversing its dependency chain', () => {
     const helpers = Array.from({ length: 10 }, (_, i) => patch(`scripts/lib/__tests__/helpers/h${i}.mjs`, '',
       (i < 9 ? `import './h${i + 1}.mjs';\n` : '') + 'export const data = 1;'));
     const result = removed(source([one]), patch(path('shard'), '', "import './helpers/h0.mjs';\n" + suite([one])), ...helpers);
-    expect(result[0].detail).toContain('helper depth 8: human review of full diff required');
+    expect(result[0].detail).toBe('net 1 test case(s) removed');
   });
   it('holds a new extracted helper containing a hidden registration hook', () => {
     expect(removed(source([one]), patch(path('shard'), '', "import './helpers/world.mjs';\n" + suite([one])),
@@ -441,4 +441,110 @@ it('keeps extracted helper effects before importer effects in registration order
   expect(removed(patch(path('big'), 'beforeEach(first);\nbeforeEach(second);\n' + suite([one]), suite([])),
     patch(path('shard'), '', "import './helpers/world.mjs';\nbeforeEach(first);\n" + suite([one])),
     patch('scripts/lib/__tests__/helpers/world.mjs', '', "import { beforeEach } from 'vitest';\nbeforeEach(second);"))).toHaveLength(1);
+});
+
+
+describe('final conservative move rule', () => {
+  const one = testCase('one');
+  it.each([
+    ['helper', 'function actual() { return 1; }', 'function actual() { return 2; }'],
+    ['import binding', "import { actual } from './world.mjs';", "import { fake as actual } from './world.mjs';"],
+    ['import module', "import { actual } from './world.mjs';", "import { actual } from './fake.mjs';"],
+    ['const initializer', 'const actual = () => 1;', 'const actual = () => 2;'],
+    ['hook', 'beforeEach(() => reset());', 'beforeEach(() => disable());'],
+    ['directive', '', '// @vitest-' + 'environment jsdom'],
+  ])('holds a new or changed destination %s', (_, before, after) => {
+    expect(removed(patch(path('big'), before + '\n' + suite([one]), suite([])),
+      patch(path('shard'), '', after + '\n' + suite([one])))).toHaveLength(1);
+  });
+  it('credits identical top-level helpers, imports, initializers and directives', () => {
+    const preamble = "// @vitest-environment node\nimport { data } from './world.mjs';\n" +
+      'function actual() { return data; }\nconst enabled = true;\nbeforeEach(() => reset());';
+    expect(scan(patch(path('big'), preamble + '\n' + suite([one]), preamble + '\n' + suite([])),
+      patch(path('shard'), '', preamble + '\n' + suite([one]))).tampered).toBe(false);
+  });
+  it('strips comments and normalizes whitespace without changing import literal bytes', () => {
+    expect(scan(patch(path('big'), 'const actual = () => 1;\n' + suite([one]), suite([])),
+      patch(path('shard'), '', 'const /* unchanged */ actual=()=>1;\n' + suite([one]))).tampered).toBe(false);
+  });
+  it('cannot hide an independent deletion in another file beside a valid move', () => {
+    expect(removed(source([one]), destination([one]),
+      patch(path('independent'), suite([testCase('deleted')]), suite([testCase('replacement')]))))
+      .toEqual([{ path: path('independent'), kind: 'tests-removed', detail: 'net 1 test case(s) removed' }]);
+  });
+  it('cannot hide an independent template deletion beside a valid move', () => {
+    expect(removed(source([one]), destination([one]),
+      patch(path('independent'), "const fixture = `\n" + testCase('deleted') + "\n`;", 'const fixture = ``;'))
+      .some((f) => f.path === path('independent'))).toBe(true);
+  });
+  it('holds an independent non-static registration deletion beside a valid move', () => {
+    const dynamic = "test.each(rows)('value %s', () => { expect(actual()).toBe(1); });";
+    expect(removed(source([one]), destination([one]),
+      patch(path('independent'), suite([dynamic]), suite([testCase('replacement')]))))
+      .toHaveLength(2);
+  });
+  it.each(['unreadable', 'oversized'])('never balances removal lines with %s evidence', (mode) => {
+    const before = suite([one]), after = suite([testCase('replacement')]);
+    const result = scanTestTampering({ diffText: patch(path('big'), before, after),
+      readFile: () => mode === 'unreadable' ? undefined : 'x'.repeat(1024 * 1024 + 1) });
+    expect(result.tampered).toBe(true);
+    expect(result.reasons.join(' ')).toContain('human review of full diff required');
+  });
+  it.each(['', '   ', 'not a diff'])('holds empty or unresolved diff text: %j', (diffText) => {
+    expect(rawScan({ diffText }).findings[0].kind).toBe('test-evidence-unavailable');
+  });
+  it('holds unscored evidence even when the text looks like a legitimate non-test diff', () => {
+    expect(rawScan({ diffText: patch('notes.md', 'old', 'new'), scored: false }).tampered).toBe(true);
+  });
+  it('passes a genuinely scored diff touching no test files', () => {
+    expect(rawScan({ diffText: patch('notes.md', 'old', 'new'), scored: true }).tampered).toBe(false);
+  });
+});
+
+
+it('cannot balance a rejected move with an unrelated local addition', () => {
+  const one = testCase('one');
+  expect(removed(patch(path('big'), suite([one]), suite([testCase('unrelated')])),
+    patch(path('shard'), '', 'const actual = () => 2;\n' + suite([one])))).toHaveLength(1);
+});
+
+it.each(['[...rows]', '[buildRow()]', '[{ value: dynamic }]'])
+  ('refuses a non-static table nested inside an array: %s', (table) => {
+    const one = testCase('one');
+    const dynamic = `test.each(${table})('value %s', () => { expect(actual()).toBe(1); });`;
+    expect(removed(source([one, dynamic]), destination([one]))).toHaveLength(1);
+  });
+
+
+it.each(['const', 'let', 'var'])('holds reordered %s initializers that change a moved test dependency', (kind) => {
+  const declarations = [
+    `${kind} state = { enabled: true };`,
+    `${kind} actual = state.enabled ? real : fake;`,
+    `${kind} disable = (state.enabled = false);`,
+  ];
+  const one = testCase('preserved dependency');
+  const before = declarations.join('\n');
+  const from = patch(path('big'), before + '\n' + suite([one]), before + '\n' + suite([]));
+  expect(scan(from, patch(path('shard'), '', before + '\n' + suite([one]))).tampered).toBe(false);
+  const reordered = [declarations[0], declarations[2], declarations[1]].join('\n');
+  expect(removed(from, patch(path('shard'), '', reordered + '\n' + suite([one]))))
+    .toEqual([{ path: path('big'), kind: 'tests-removed', detail: 'net 1 test case(s) removed' }]);
+});
+
+
+it.each(['file', 'suite'])('holds identical filename-dependent registration effects at %s scope', (scope) => {
+  const effect = "globalThis.actual = import.meta.url.endsWith('/big.test.mjs') ? real : fake;";
+  const one = testCase('preserved body', 'expect(globalThis.actual()).toBe(1);');
+  const content = (cases) => scope === 'file'
+    ? effect + '\n' + suite(cases) : suite([effect, ...cases]);
+  expect(removed(patch(path('big'), content([one]), content([])),
+    patch(path('shard'), '', content([one]))))
+    .toEqual([{ path: path('big'), kind: 'tests-removed', detail: 'net 1 test case(s) removed' }]);
+});
+
+it('holds identical unsupported executable registration effects even without filename reads', () => {
+  const effect = 'activateSkipping();';
+  const one = testCase('preserved body');
+  expect(removed(patch(path('big'), effect + '\n' + suite([one]), effect + '\n' + suite([])),
+    patch(path('shard'), '', effect + '\n' + suite([one])))).toHaveLength(1);
 });

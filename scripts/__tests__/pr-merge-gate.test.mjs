@@ -306,7 +306,7 @@ describe('pr-merge-gate — scanTestTampering (#2440 the deterministic gate)', (
     expect(r.tampered).toBe(true);
     expect(r.findings.some((f) => f.kind === 'tests-removed')).toBe(true);
   });
-  it('does NOT flag test-case churn that nets neutral or positive (refactor/rename)', () => {
+  it('holds balanced test-case churn without readable full-file evidence', () => {
     const diff = [
       'diff --git a/scripts/__tests__/x.test.mjs b/scripts/__tests__/x.test.mjs',
       '@@',
@@ -314,7 +314,9 @@ describe('pr-merge-gate — scanTestTampering (#2440 the deterministic gate)', (
       "+  it('renamed', () => { expect(g()).toBe(2); });",
       "+  it('extra coverage', () => {});",
     ].join('\n');
-    expect(scanTestTampering({ diffText: diff }).tampered).toBe(false);
+    const result = scanTestTampering({ diffText: diff });
+    expect(result.tampered).toBe(true);
+    expect(result.reasons.join(' ')).toContain('human review of full diff required');
   });
   it('ignores removals in NON-test files (deleting product code is not test-gaming)', () => {
     const diff = [

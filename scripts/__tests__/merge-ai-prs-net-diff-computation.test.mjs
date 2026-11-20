@@ -10,7 +10,8 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
+import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals, shouldHoldTestGaming } from '../merge-ai-prs.mjs';
+import { scanTestTampering } from '../lib/pr-merge-gate.mjs';
 import { scoreEscalation, diffHunksFrom } from '../lib/review-escalation.mjs';
 
 
@@ -995,7 +996,21 @@ describe('move-credit commit pins', () => {
   });
   it.each(['origin/lane/moving', baseSha])('refuses move evidence when commit pin is unreadable: %s', (badRef) => {
     const { calls, exec } = runner(badRef);
-    expect(computeNetDiffSignals({ exec, rev: 'lane/moving', pinTrees: true }).netDiffText.scored).toBe(false);
+    const { netDiffText } = computeNetDiffSignals({ exec, rev: 'lane/moving', pinTrees: true });
+    expect(netDiffText.scored).toBe(false);
+    const gaming = scanTestTampering({ diffText: netDiffText.text, scored: netDiffText.scored });
+    expect(gaming.tampered).toBe(true);
+    expect(shouldHoldTestGaming({ gaming, netDiffScored: netDiffText.scored,
+      humanClearedSha: headSha, headSha })).toBe(true);
     expect(calls.some((a) => a[0] === 'diff' && !a.includes('--numstat'))).toBe(false);
   });
+});
+
+
+it('holds an empty scored diff even with clearance, and passes a scored non-test diff', () => {
+  const headSha = '2'.repeat(40);
+  for (const [text, hold] of [['', true], ['diff --git a/notes.md b/notes.md\n@@ -1 +1 @@\n-old\n+new', false]]) {
+    const gaming = scanTestTampering({ diffText: text, scored: true });
+    expect(shouldHoldTestGaming({ gaming, netDiffScored: true, humanClearedSha: headSha, headSha })).toBe(hold);
+  }
 });

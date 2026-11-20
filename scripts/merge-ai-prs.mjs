@@ -3511,6 +3511,12 @@ export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha =
   }
 }
 
+// Unknown diff evidence cannot be waived by a clearance that never scored that evidence.
+export function shouldHoldTestGaming({ gaming, netDiffScored, humanClearedSha, headSha }) {
+  return gaming.findings.some((f) => f.kind === 'test-evidence-unavailable') ||
+    shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored, humanClearedSha, headSha });
+}
+
 /**
  * The drain's anti-test-gaming re-park reason, as the verdict-ledger row AND the park comment spell it. ONE builder so
  * the text `MECHANICAL_PARK_RE` (`accept-carry-forward.mjs`) anchors on is the text the
@@ -6635,13 +6641,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // check is only trustworthy if it wasn't manufactured by GAMING the tests (deleting/`.skip`/`.only`-ing a
       // failing test, or shrinking the case set). Scan this PR's NET diff text for those deterministic,
       // diff-visible tamper forms; on a hit, REFUSE the auto-land and park `review:human` — a test removal is a
-      // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal. Best-
-      // effort like the manifest gate: only when a local/sibling clone is present to read the diff text (no
-      // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
+      // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal.
+      // Missing/unscored diff evidence explicitly holds; only a scored diff can prove no test changes.
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
       const gaming = scanTestTampering({
         diffText: netDiffText.text,
+        scored: netDiffText.scored,
         readFile: diffExec && netDiffText.scored && /^[0-9a-f]{40}$/i.test(netDiffText.base || '') && /^[0-9a-f]{40}$/i.test(netDiffText.rev || '')
           ? (path, side) => diffExec('git', ['show', '--no-ext-diff', '--end-of-options',
             `${side === 'base' ? netDiffText.base : netDiffText.rev}:${path}`],
@@ -6697,7 +6703,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
-      if (!v.workflowHoldRepark && shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
+      if (!v.workflowHoldRepark && shouldHoldTestGaming({ gaming, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;

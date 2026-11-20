@@ -5575,7 +5575,8 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `scanTestTampering` can accept a synchronous `readFile(path, side)` resolver for the net diff's
 base/head trees. Mid-file hunks cannot prove suite ancestry on their own. Full-file parsing keeps
 unchanged declarations in collision checks and only spends changed opener lines as move credit.
-Parameterized declarations contribute static title collisions but earn no move credit; constant
+Non-static registrations (including dynamic tables and registrations inside template fixtures) refuse
+move credit for the file; constant
 string concatenations are resolved as titles. Generator callbacks and suites containing possible
 returns or throws receive no move credit; exits inside nested callbacks/helpers do not exit a suite. A failed read, parse, or evidence-size limit retains
 the existing human HOLD. Replay mid-file splits and failure paths in
@@ -5589,9 +5590,17 @@ its diff. Missing config, dynamic globs/setup paths, default-excluded destinatio
 changes, or mismatched changed lines retain human HOLD. Count changed declarations with the AST
 when spending credits; line counts cannot share that accounting unit.
 
-The #7140 compatibility exception preserves identical registration effects (setup/cleanup hooks,
-`vi.mock`, `vi.setConfig`, and the board clock assignment), including effects and mutable setup declarations extracted into a newly
-added relative helper. Their registration order must match. Unmatched effects, explicit skip/hoist calls and protected bindings refuse
-credit. A test-local `const it` used only for property reads is data; invoking it refuses credit.
+Every destination top-level non-test statement must already appear in the source pre-image,
+byte-identical after stripping comments and normalizing whitespace. This includes imports, helpers,
+initializers and hooks; file directive comments must also match. Extracting a new helper import refuses
+credit without traversing the helper. Registration effects, including executable const/let/var initializers, retain their order;
+identical statement membership alone cannot prove initializer dependencies are preserved.
+Registration effects outside the supported hooks, Vitest mock/config calls, board-clock assignment,
+and variable declarations refuse credit even when text and order match: relocation can change their
+behavior (for example a filename-dependent global assignment). Explicit skip/hoist
+calls and protected bindings refuse credit. A test-local `const it` used only for property reads is data;
+invoking it refuses credit. Credits and retained identities offset only their own source file's removals;
+failed or oversized evidence with removals cannot clear through balanced line counts. Empty or unscored
+diff text holds explicitly, while a scored diff touching no test files passes.
 Parameterized moves also compare their complete table expression. New helper evidence is bounded
 at 128 KiB per helper and depth 8; exceeding either bound asks for human review of the full diff.
