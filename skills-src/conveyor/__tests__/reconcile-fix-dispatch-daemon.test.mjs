@@ -34,6 +34,8 @@ import * as reconcilePass from '../../../scripts/conveyor/reconcile-pass.mjs';
 import { execFileSyncThrottled, withCommandTiming } from '../../../scripts/lib/gh-throttle.mjs';
 import { resolveFixDispatchSettings } from '../../../scripts/conveyor/fix-takeover.mjs';
 import * as ghThrottle from '../../../scripts/lib/gh-throttle.mjs';
+import { readGhSlotHolders } from '../../../scripts/lib/gh-throttle-holders.mjs';
+
 import * as prSnapshot from '../../../scripts/lib/pr-snapshot.mjs';
 import * as ciHealDispatch from '../../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import * as promoteDispatch from '../../../scripts/operations/promote-draft-pr-dispatch.mjs';
@@ -2594,46 +2596,80 @@ describe('fix pass budgets', () => {
   it('timing observer failures preserve command returns and errors', () => {
     const value = Buffer.from('unchanged');
     const failure = new Error('original command error');
-    const context = { now: () => 0, exec: () => value,
+    const context = { now: () => 0,
       record: () => { throw new Error('observer failed'); } };
-    expect(withCommandTiming(context, () => execFileSyncThrottled('gh', ['pr', 'view']))).toBe(value);
-    context.exec = () => { throw failure; };
+    const opts = { throttle: { exec: () => value } };
+    expect(withCommandTiming(context, () => execFileSyncThrottled('gh', ['--version'], opts))).toBe(value);
+    opts.throttle.exec = () => { throw failure; };
     let caught;
-    try { withCommandTiming(context, () => execFileSyncThrottled('git', ['status'])); }
+    try { withCommandTiming(context, () => execFileSyncThrottled('gh', ['--version'], opts)); }
     catch (error) { caught = error; }
     expect(caught).toBe(failure);
     context.now = () => { throw new Error('clock failed'); };
-    context.exec = () => value;
-    expect(withCommandTiming(context, () => execFileSyncThrottled('gh', ['pr', 'view']))).toBe(value);
+    opts.throttle.exec = () => value;
+    expect(withCommandTiming(context, () => execFileSyncThrottled('gh', ['--version'], opts))).toBe(value);
     const recorder = createPassCallRecorder();
     expect(() => recorder.record('fix', 'gh', null, 100)).not.toThrow();
     expect(recorder.snapshot()).toEqual({});
   });
 
+  it('records only allowlisted command words and stops at private arguments', () => {
+    const recorder = createPassCallRecorder();
+    recorder.record('git', 'git', ['show', 'confidential-branch'], 10);
+    recorder.record('gh', 'gh', ['pr', 'view', '12'], 20);
+    recorder.record('private', 'gh', ['pr', 'confidential', 'view'], 30);
+    recorder.record('flags', 'gh', ['--help', 'pr'], 40);
+    expect(recorder.snapshot()).toEqual({
+      git: { name: 'git', ms: 10 }, gh: { name: 'gh pr view', ms: 20 },
+      private: { name: 'gh pr', ms: 30 }, flags: { name: 'gh', ms: 40 },
+    });
+  });
+
+  it('timed gh calls still acquire a throttle slot and record elapsed time', () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'timed-gh-'));
+    let time = 0;
+    const record = vi.fn();
+    const value = Buffer.from('unchanged');
+    const exec = vi.fn(() => {
+      expect(readGhSlotHolders({ lockRoot, cap: 1 })).toHaveLength(1);
+      time += 41000;
+      return value;
+    });
+    try {
+      const result = withCommandTiming({ now: () => time, record }, () =>
+        execFileSyncThrottled('gh', ['pr', 'view', '12'], {
+          throttle: { lockRoot, cap: 1, exec, env: {}, shimRouted: true },
+        }));
+      expect(result).toBe(value);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith('gh', ['pr', 'view', '12'], 41000);
+      expect(readGhSlotHolders({ lockRoot, cap: 1 })).toEqual([]);
+    } finally {
+      rmSync(lockRoot, { recursive: true, force: true });
+    }
+  });
+
   it('pass-timing names every phase', async () => {
     let time = 0;
     const recorder = createPassCallRecorder();
-    const value = Buffer.from('unchanged');
-    const failure = new Error('command failed');
-    const exec = vi.fn((command, args) => {
-      time += command === 'git' ? 12000 : args[1] === 'view' ? 41000 : 5;
-      if (command === 'git') throw failure;
-      return value;
-    });
-    const opts = fixture({ repos: ['a'], now: () => time, callRecorder: recorder, exec,
+    const slowCall = (phase, command, args, ms) => {
+      const start = time;
+      time += ms;
+      recorder.record(phase, command, args, time - start);
+    };
+    const opts = fixture({ repos: ['a'], now: () => time, callRecorder: recorder,
       fixTick: () => {
-        expect(execFileSyncThrottled('gh', ['pr', 'view', '--body', 'private body'])).toBe(value);
-        execFileSyncThrottled('gh', ['pr', 'list', '--token', 'secret']);
+        slowCall('fix', 'gh', ['pr', 'view', '--body', 'private body'], 41000);
+        slowCall('fix', 'gh', ['pr', 'list', '--token', 'secret'], 5);
         return empty();
       },
       ciHealTick: async () => {
         await Promise.resolve();
-        expect(() => execFileSyncThrottled('git', ['remote', 'get-url', 'origin'])).toThrow(failure);
+        slowCall('ci-heal', 'git', ['fetch', 'confidential-branch'], 12000);
         return empty();
       },
     });
     const result = await runTickAllRepos(opts);
-    expect(exec).toHaveBeenCalledTimes(3);
     const phases = ['auth-gate', 'await-verify', 'supersede', 'ruling-stand-down', 'orphan-guard',
       'fix', 'stuck-fixers', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes'];
     expect(Object.keys(result.phaseMs)).toEqual(phases);
@@ -2643,7 +2679,7 @@ describe('fix pass budgets', () => {
     expect(timings).toHaveLength(phases.length);
     for (const phase of phases) {
       const ms = phase === 'fix' ? 41005 : phase === 'ci-heal' ? 12000 : 0;
-      const slowest = phase === 'fix' ? 'gh pr view:41000' : phase === 'ci-heal' ? 'git remote get-url:12000' : 'none';
+      const slowest = phase === 'fix' ? 'gh pr view:41000' : phase === 'ci-heal' ? 'git fetch:12000' : 'none';
       const budgetHit = ms > 1000;
       expect(timings.filter(line => line.includes(`phase=${phase} `))).toEqual([
         `reconcile-fix-dispatch-daemon: pass-timing phase=${phase} ms=${ms} budgetMs=${result.budgets[phase]?.budgetMs ?? 'none'} budgetHit=${budgetHit} prs=0 deferred=0 slowest=${slowest}`,

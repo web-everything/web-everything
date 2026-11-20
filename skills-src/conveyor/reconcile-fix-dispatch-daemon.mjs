@@ -69,6 +69,7 @@ import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promo
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { execFileSyncThrottled, withCommandTiming } from '../../scripts/lib/gh-throttle.mjs';
+import { ghOpLabel } from '../../scripts/lib/gh-throttle-holders.mjs';
 import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
 import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
@@ -1060,6 +1061,8 @@ export async function saveFixPassCursors({ path, rotation, prCursors, write = wr
 // Load once for the daemon defaults; injected state stays independent.
 const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
 
+const gitCommandWords = new Set('fetch push rebase merge status rev-parse log diff worktree checkout reset ls-remote show-ref merge-base branch cherry-pick'.split(' '));
+
 /** Pure, bounded observation: retain only the slowest gh/git call in each phase. */
 export function createPassCallRecorder() {
   let calls = {};
@@ -1071,8 +1074,9 @@ export function createPassCallRecorder() {
         if (!['gh', 'git'].includes(command) || !Number.isFinite(ms) || ms < 0) return;
         // Only command/subcommand words; flags, bodies, credentials and later argv never enter logs.
         const words = [];
-        for (const arg of args.slice(0, 2)) {
-          if (typeof arg !== 'string' || !/^[a-z][a-z0-9-]*$/.test(arg)) break;
+        const allowedGhWords = command === 'gh' ? ghOpLabel(args.slice(0, 2)).split(' ') : [];
+        for (const [index, arg] of args.slice(0, 2).entries()) {
+          if (command === 'gh' ? arg !== allowedGhWords[index] || arg === 'unknown' : !gitCommandWords.has(arg)) break;
           words.push(arg);
         }
         if (!calls[phase] || ms > calls[phase].ms) calls[phase] = { name: [command, ...words].join(' '), ms };
@@ -1153,7 +1157,7 @@ export async function runTickAllRepos({
   readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
-  callRecorder = createPassCallRecorder(), exec,
+  callRecorder = createPassCallRecorder(),
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
@@ -1234,7 +1238,7 @@ export async function runTickAllRepos({
     phaseMs[name] = now() - start;
     if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
   };
-  const observe = (name, fn) => withCommandTiming({ now, exec,
+  const observe = (name, fn) => withCommandTiming({ now,
     record: (command, args, ms) => callRecorder.record(name, command, args, ms) }, fn);
   const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return observe(name, fn); } finally { finishPhase(name, t); } };
   const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await observe(name, fn); } finally { finishPhase(name, t); } };

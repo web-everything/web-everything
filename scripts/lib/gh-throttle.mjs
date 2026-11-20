@@ -2235,7 +2235,6 @@ export function execFileSyncThrottled(file, args, opts = {}) {
   let start;
   try { if (context && (file === 'gh' || file === 'git')) start = context.now(); } catch { /* Observation must not affect IO. */ }
   try {
-    if (context?.exec) return context.exec(file, args, opts);
     if (file === 'gh') return runGhSync(args, opts);
     return execFileSync(file, args, opts);
   } finally {
