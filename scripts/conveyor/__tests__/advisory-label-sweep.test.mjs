@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishStoredRedTeamResult } from '../../lib/red-team-withheld-publish.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   defaultListUnpublishedStatuses, LIST_COMMENTS_CAP, carriesAdvisoryLabel, commentsMayBeTruncated, defaultReadPr, sweepAdvisoryLabels as realSweep,
@@ -495,5 +495,69 @@ describe('red-team label deadlock: accept stand-in needs the live reviews in the
   it('defaultReadPr reads the formal reviews with the live PR', () => {
     const exec = (file, argv) => { expect(argv[argv.indexOf('--json') + 1]).toBe('number,state,labels,headRefOid,reviews'); return JSON.stringify({ reviews: [{ state: 'APPROVED' }] }); };
     expect(defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => [] }).reviews).toEqual([{ state: 'APPROVED' }]);
+  });
+});
+
+
+describe('accepted PR run settlement during sweep', () => {
+  const clearance = (sha = HEAD) => ({
+    id: 'IC_clearance', author: { login: 'chalbert' },
+    body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: chalbert -->`,
+  });
+  function setup({ comments = [clearance()], accepted = true, head = HEAD, ids = ['review-pr-91368953'], dryRun = false, labels = [], reviews = [] } = {}) {
+    const listed = pr(42, ['red-team:clear'], NEW_HEAD, []);
+    const live = { ...pr(42, ['red-team:clear', ...(accepted ? ['review:accepted'] : []), ...labels], head, comments), state: 'OPEN', reviews };
+    const settleRuns = vi.fn(() => ({ closed: ids, failed: [] }));
+    const listRunIds = vi.fn(() => ids);
+    const log = vi.fn();
+    const options = { provider: provider(), listPrs: () => [listed], readPr: () => live,
+      readStatusEvidence: () => ({ scheduled: false, recorded: false, inFlight: false }),
+      settleRuns, listRunIds, log, dryRun };
+    return { options, settleRuns, listRunIds, log };
+  }
+
+  it('accepted PR with a clear-human clearance at the live head settles its stuck runs', () => {
+    const f = setup({ head: HEAD.toUpperCase() });
+    const result = rawSweep(f.options);
+    expect(f.listRunIds).toHaveBeenCalledTimes(1);
+    expect(f.listRunIds).toHaveBeenCalledWith({ repo: 'o/n', pr: 42 });
+    expect(f.settleRuns).toHaveBeenCalledTimes(1);
+    expect(f.settleRuns).toHaveBeenCalledWith({ repo: 'o/n', pr: 42,
+      headSha: HEAD.toUpperCase(), ids: ['review-pr-91368953'] });
+    expect(f.log).toHaveBeenCalledWith('clear-human runs #42: closed=1 failed=0');
+    expect(result).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
+  });
+
+  it.each([
+    ['no clearance record', { comments: [] }],
+    ['clearance at a different head', { comments: [clearance(NEW_HEAD)] }],
+    ['superseding review:human hold', { labels: ['review:human'] }],
+    ['superseding review:changes hold', { labels: ['review:changes'] }],
+    ['superseding CHANGES_REQUESTED review', { reviews: [{ state: 'CHANGES_REQUESTED' }] }],
+    ['missing review:accepted', { accepted: false }],
+    ['dry run', { dryRun: true }],
+    ['empty run index', { ids: [] }],
+    ['short live head', { head: HEAD.slice(0, 12) }],
+    ['invalid live head', { head: 'g'.repeat(40) }],
+    ['untrusted clearance author', { comments: [{ ...clearance(), author: { login: 'mallory' } }] }],
+  ])('does not settle runs with %s', (_name, overrides) => {
+    const f = setup(overrides);
+    rawSweep(f.options);
+    expect(f.settleRuns).not.toHaveBeenCalled();
+    if (!overrides.ids) expect(f.listRunIds).not.toHaveBeenCalled();
+  });
+
+  it.each(['index', 'settlement'])('logs a throwing %s and preserves the sweep plan', stage => {
+    const f = setup();
+    f[stage === 'index' ? 'listRunIds' : 'settleRuns'].mockImplementation(() => { throw Error('unreadable\nrecord'); });
+    expect(rawSweep(f.options)).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
+    expect(f.log).toHaveBeenCalledWith('clear-human runs #42: failed: unreadable record');
+  });
+
+  it('logs failed resumes without changing the sweep plan', () => {
+    const f = setup();
+    f.settleRuns.mockReturnValue({ closed: [], failed: ['review-pr-91368953'] });
+    expect(rawSweep(f.options)).toEqual([{ num: 42, add: null, remove: ['red-team:clear'] }]);
+    expect(f.log).toHaveBeenCalledWith('clear-human runs #42: closed=0 failed=1');
   });
 });
