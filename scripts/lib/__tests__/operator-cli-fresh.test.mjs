@@ -75,13 +75,15 @@ describe('assertOperatorCliFresh (item 113)', () => {
 describe('re-stamp runs from fresh code: accepts the daemon-ADOPTED smoke-passed build (R1099)', () => {
   const now = Date.parse('2026-11-20T16:00:00Z');
   const hoursAgo = (h) => new Date(now - h * 3_600_000).toISOString();
-  const good = (head, h) => ({ adopted: { head, at: hoursAgo(h) }, smokePassed: [{ tree: 't', key: 'k' }] });
+  let headTree = '';
+  const good = (head, h) => ({ adopted: { head, at: hoursAgo(h) }, smokePassed: [{ tree: headTree, key: 'k', passedAt: hoursAgo(h) }] });
   // Behind in a code file, with fallbacks that must never run: a spawn/lane acquire would mean the old path.
   const boom = () => { throw new Error('fallback must not run'); };
   const setup = () => {
     const { clone, land } = pair();
     land('a.mjs', 'export const a = 9;\n');
     const head = git(clone, 'rev-parse', 'HEAD').trim();
+    headTree = git(clone, 'rev-parse', 'HEAD^{tree}').trim();
     return { clone, head };
   };
   const call = (clone, adoptedState, extra = {}) => {
@@ -119,6 +121,24 @@ describe('re-stamp runs from fresh code: accepts the daemon-ADOPTED smoke-passed
       const { clone, head } = setup();
       expect(() => call(clone, () => ({ ...good(head, 1), [key]: key.endsWith('Trees') ? ['t'] : { x: 1 } }))).toThrow(OPERATOR_CLI_STALE_MARKER);
     });
+
+  it.each([['empty object', {}], ['empty array', []], ['empty string', ''], ['zero', 0], ['false', false]])(
+    'refuses when an unsafe marker is present but empty/falsy-looking: %s', (_n, value) => {
+      const { clone, head } = setup();
+      expect(() => call(clone, () => ({ ...good(head, 1), rejected: value }))).toThrow(OPERATOR_CLI_STALE_MARKER);
+    });
+
+  it.each([['null entry', [null]], ['unrelated tree', [{ tree: 'f'.repeat(40), key: 'k', passedAt: '2020-01-01T00:00:00Z' }]],
+    ['no passedAt', 'nopassed']])('refuses when smokePassed has no entry matching the adopted tree: %s', (_n, entries) => {
+    const { clone, head } = setup();
+    const smokePassed = entries === 'nopassed' ? [{ tree: headTree, key: 'k' }] : entries;
+    expect(() => call(clone, () => ({ ...good(head, 1), smokePassed }))).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
+
+  it('refuses a +59s future adoption timestamp', () => {
+    const { clone, head } = setup();
+    expect(() => call(clone, () => ({ ...good(head, 1), adopted: { head, at: new Date(now + 59_000).toISOString() } }))).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
 
   it('refuses when no smoke pass is recorded', () => {
     const { clone, head } = setup();

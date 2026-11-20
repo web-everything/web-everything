@@ -414,7 +414,9 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
       if (knob === undefined) { try { knob = readSettings()?.operatorCli?.freshFallback; } catch { /* absent */ } }
       if (knob !== 'off' && env?.WE_OPERATOR_CLI_FRESH_REEXEC !== '1' && last?.filesKnown === true) {
         const head = readHeadSha(root, run);
-        const verdict = decideAdoptedBuild({ headSha: head, state: adoptedState(root), dirty: codeDirty(root, run),
+        const treeOut = run(['rev-parse', 'HEAD^{tree}'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
+        const headTree = treeOut.status === 0 ? String(treeOut.stdout ?? '').trim() : null;
+        const verdict = decideAdoptedBuild({ headSha: head, headTree, state: adoptedState(root), dirty: codeDirty(root, run),
           nowMs: now(), maxAgeMs: lastGoodMaxAgeMs(env) });
         if (verdict.ok) {
           write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs, but is its daemon's `
@@ -575,22 +577,26 @@ export function selfFastForwardAction({ sameCheckout, codeChanged, armed, reexec
  * Anything missing, unreadable or mismatched refuses (fail closed).
  */
 const ADOPTED_BUILD_MAX_AGE_MS = 24 * 3_600_000; // hard ceiling, whatever the alert knob says
-export function decideAdoptedBuild({ headSha, state, dirty, nowMs, maxAgeMs } = {}) {
+export function decideAdoptedBuild({ headSha, headTree, state, dirty, nowMs, maxAgeMs } = {}) {
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { ok: false, reason: 'head-unreadable' };
   if (state?.adopted?.head !== headSha) return { ok: false, reason: 'head-not-adopted' };
   if (dirty !== false) return { ok: false, reason: 'tree-dirty' };
   const at = Date.parse(state.adopted.at || '');
   if (!Number.isFinite(at) || !Number.isFinite(nowMs) || !(maxAgeMs > 0)) return { ok: false, reason: 'adoption-time-unreadable' };
   const age = nowMs - at;
-  if (age < -60_000) return { ok: false, reason: 'adoption-in-future' };
+  if (age < 0) return { ok: false, reason: 'adoption-in-future' };
   if (age > Math.min(maxAgeMs, ADOPTED_BUILD_MAX_AGE_MS)) return { ok: false, reason: 'adoption-too-old' };
   // Any recorded unsafe or unverified state means the adoption is not a clean smoke-passed build.
   const s = state;
-  const present = (v) => (Array.isArray(v) ? v.length > 0 : !!v && (typeof v !== 'object' || Object.keys(v).length > 0));
+  // Only a STRICTLY absent marker (undefined/null) is absent: an empty object or falsy value is malformed, so refuse.
+  const present = (v) => v !== undefined && v !== null;
   if (['rejected', 'inProgress', 'quarantine', 'unverified', 'building', 'held', 'busySkippedTrees', 'forceUnverifiedTrees'].some((k) => present(s[k]))) {
     return { ok: false, reason: 'unsafe-rebuild-state' };
   }
-  if (!Array.isArray(s.smokePassed) || !s.smokePassed.length) return { ok: false, reason: 'no-smoke-pass-recorded' };
+  // The smoke pass must be FOR this build: an entry whose recorded tree is this HEAD's tree, with a readable passedAt.
+  const smoked = Array.isArray(s.smokePassed) && typeof headTree === 'string' && /^[0-9a-f]{40}$/.test(headTree)
+    && s.smokePassed.some((e) => e && typeof e === 'object' && e.tree === headTree && Number.isFinite(Date.parse(e.passedAt || '')));
+  if (!smoked) return { ok: false, reason: 'no-matching-smoke-pass' };
   return { ok: true, head: headSha, at: state.adopted.at };
 }
 
