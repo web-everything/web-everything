@@ -47,7 +47,7 @@ if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_FREEZE && !fs.exist
 if (a[0] === 'pr' && a[1] === 'list' && process.env.RMH_LATE_GROUP) {
   const [file, n] = process.env.RMH_LATE_GROUP.split('#');
   if (a.includes('lane/leaf-' + n) && !fs.existsSync(file)) {
-    fs.writeFileSync(file, JSON.stringify({ groups: [{ id: 'late', repo: 'fixture/drain-rmh', pr: 4100, branch: 'lane/card-group-late',
+    fs.writeFileSync(file, JSON.stringify({ groups: [{ id: 'late', repo: 'web-everything/web-everything', pr: 4100, branch: 'lane/card-group-late',
       createdAt: Date.now(), files: ['backlog/leaf-' + n + '.md'], sources: [{ num: Number(n), headSha: 'sha-' + n }] }], failed: {} }));
   }
 }
@@ -93,7 +93,7 @@ if (S) {
 }
 const pinned = (${pinnedLeafGitFixture})(a, JSON.parse(require('node:fs').readFileSync(process.env.RMH_FIXTURE, 'utf8')));
 if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-rmh.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
@@ -134,7 +134,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     if (freeze === 'both') writeFileSync(newMarker, JSON.stringify({ ...marker, reason: 'raised at the new path' }));
     if (priorityPrs) writeFileSync(join(coord, 'main-red-priority.json'), JSON.stringify({ repo: 'we', pr: priorityPrs[0], prs: priorityPrs, firstRedSha: 'abc1234567', expiresAt: FUTURE }));
     // xym8nt4 — an open card group (combined #4000, awaiting review) that RESERVES the fix PR's card file.
-    if (cardGroup) writeFileSync(join(coord, 'drain-card-groups.json'), JSON.stringify({ groups: [{ id: 'g', repo: 'fixture/drain-rmh', pr: 4000,
+    if (cardGroup) writeFileSync(join(coord, 'drain-card-groups.json'), JSON.stringify({ groups: [{ id: 'g', repo: 'web-everything/web-everything', pr: 4000,
       branch: 'lane/card-group-g', createdAt: NOW, files: [`backlog/leaf-${FIX}.md`], sources: [{ num: 4001, headSha: 'sha-4001' }] }], failed: {} }));
     if (publishedRed) writeFileSync(join(coord, 'main-ci-red-state.json'), JSON.stringify({ red: true, firstRedSha: 'abc1234567', since: NOW - 60_000, setAt: NOW, expiresAt: FUTURE }));
     // The merge-queue/freshness hook is a separate gate (its own wiring test); with VITEST cleared the live ON file would

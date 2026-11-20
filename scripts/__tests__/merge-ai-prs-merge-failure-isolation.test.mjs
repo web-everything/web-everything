@@ -52,7 +52,7 @@ const prs = JSON.parse(fs.readFileSync(process.env.ISOLATION_FIXTURE, 'utf8'));
 if (a.includes('diff') && process.env.ISOLATION_UNSCORED_FIRST === '1' && a.at(-1) === prs[0].headRefOid) process.exit(1);
 const pinned = (${pinnedLeafGitFixture})(a, prs);
 if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-isolation.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
@@ -158,6 +158,8 @@ describe('#4389 merge failure isolation', () => {
     [{ dup: [1], failed: [], mergedCount: 0 }, 3],
     [{ dup: [1], failed: [{}], mergedCount: 1 }, 3],
     [{ dup: [], failed: [{}], mergedCount: 1 }, 0],
+    [{ dup: null, mergedCount: 0 }, 2],
+    [{ dup: null, mergedCount: 1 }, 2],
     [{ failed: [{}], mergedCount: 0 }, 2],
     [{ failed: [], mergedCount: 0 }, 0],
     [{}, 0],

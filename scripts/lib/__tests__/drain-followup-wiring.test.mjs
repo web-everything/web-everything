@@ -58,7 +58,7 @@ const prs = JSON.parse(fs.readFileSync(process.env.FU_FIXTURE, 'utf8'));
 if (process.env.FU_FAIL_PINNED_FETCH && a[0] === '-c' && a.includes('fetch')) process.exit(1);
 const pinned = (${pinnedLeafGitFixture})(a, prs);
 if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-fu.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 if (a[0] === 'rev-parse' && a[1] === '--git-dir') process.stdout.write('.git\\n');
 if (a[0] === 'rev-parse' && a[1] === '--git-common-dir') process.stdout.write('/fake-common/.git\\n');

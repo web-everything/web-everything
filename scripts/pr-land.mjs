@@ -51,6 +51,7 @@
  *   node scripts/pr-land.mjs --ref=lane/… --no-wait                       # open the PR UNLABELLED, don't wait/merge (CI unconfirmed — the drain won't collect it until labelled)
  *   node scripts/pr-land.mjs --ref=lane/… --park=review:human            # PARK mode (#2622): open the PR WITH the review label already on it and STOP (no wait, no ready-to-merge, no drain) — the first-class held-for-review open, replacing the hash-stranding `gh pr create` bypass. READY for review with the park label.
  *   node scripts/pr-land.mjs --ref=lane/… --park=review:human --no-draft # same; --no-draft is accepted as a harmless no-op
+ *   --verify=ci-only: open modes only, requires measured host saturation; CI test on the exact SHA gates ready-to-merge.
  *   node scripts/pr-land.mjs --ref=lane/… --dry-run                       # print the exact gh command sequence, execute nothing
  *   node scripts/pr-land.mjs --ref=lane/… --fallback-git                  # on gh failure / unmergeable, local git-merge + push instead
  *   node scripts/pr-land.mjs --ref=lane/… --no-heal                       # skip the post-land id-collision self-heal (#2071)
@@ -142,6 +143,8 @@ import { join } from 'node:path';
 import { pushRefusal, callerIdentity, repoKeyForCheckout } from './conveyor/fix-procedure.mjs'; // fix procedure — refuse a push to a branch another fixer holds the fix claim on
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
+import { ciOnlyDecision, recordCiOnly } from './lib/verify-ci-only.mjs';
+import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuck-queued ci.yml window (ciMissingAfterPushMin) for the CI verification source
@@ -750,10 +753,13 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
  *   readMarker: (gitDir: string) => object|null, breakGlass?: boolean, requireVerified?: boolean}} args
  * @returns {{ ok: boolean, status: string, reason: string, detail: string }}
  */
-export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs }) {
+export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs, ciOnly = null }) {
   const verifyRecord = readMarker(gitDir);
   const laneRelevantChangeSinceRecord = laneRelevantChangeSinceForRecord({ record: verifyRecord, headSha, base: `${remote}/${base}`, runGit });
-  return verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs });
+  const verdict = verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs });
+  // R1086: host saturation substitutes CI only for a verify that is missing or still in flight; a red or corrupt marker still refuses.
+  if (ciOnly && !verdict.ok && (verdict.status === 'running' || verdict.status === 'absent')) return ciOnly;
+  return verdict;
 }
 
 /** Preserve the original push error while explaining a rejected lane tip. */
@@ -886,6 +892,9 @@ async function runCli() {
   // it too. A validated `--park` label takes precedence over wait/label-on-green (see planPrLand).
   const PLAN = planPrLand({ wait: WAIT, labelOnGreen: LABEL_ON_GREEN, park: PARK.ok ? PARK.label : null });
 
+  const ciOnly = ciOnlyDecision({ verify: flags.verify, mode: PLAN.mode });
+  if (ciOnly && !ciOnly.ok) emit({ repo: REPO, merged: false, reason: ciOnly.reason, detail: ciOnly.detail }, 3);
+
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
   const refSha = tryGit(['rev-parse', SRC]);
@@ -1017,7 +1026,7 @@ async function runCli() {
     // a real or fake git runner (see `scripts/__tests__/pr-land-finish-guard.test.mjs`), not only via the CLI's
     // own source-text wiring assertions.
     const finishArgs = {
-      gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
+      ciOnly, gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     };
     const gate = resolveFinishGuardVerdict({ ...finishArgs });
@@ -1032,8 +1041,9 @@ async function runCli() {
       verdict = resolveFinishGuardVerdict({ ...finishArgs, ciCheckRuns: readCiCheckRuns({ repo: slug, headSha: refSha }), ciWorkflowRuns: readCiWorkflowRuns({ repo: slug, headSha: refSha }), ciStuckQueuedMs });
       if (verdict.ok && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · verification source: CI ${(verdict.ciSources || []).map((x) => `${x.name} run ${x.runId} @ ${x.sha}`).join(', ')}\n`);
     }
-    const deferredOpen = verdict.ok ? { ok: false } : deferredToCiDecision({ gate: verdict, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode });
+    const deferredOpen = verdict === ciOnly ? ciOnly : (verdict.ok ? { ok: false } : deferredToCiDecision({ gate: verdict, deferred: readDeferredForSha(gitDir, refSha), headSha: refSha, mode: PLAN.mode }));
     if (deferredOpen.ok) {
+      if (verdict === ciOnly) recordCiOnly({ repo: REPO, coordinationRoot: resolveCoordinationRoot(), sha: refSha, reason: ciOnly.hostReason });
       DEFERRED_TO_CI = deferredOpen;
       CREATE_BODY = appendDeferredDisclosure(CREATE_BODY, deferredOpen.disclosure);
       if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · ${deferredOpen.disclosure} - opening only; ready-to-merge needs a green CI test check on ${refSha.slice(0, 8)}\n`);

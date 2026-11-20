@@ -490,7 +490,7 @@ describe('fast-drain round listing snapshot', () => {
 
 describe('round listing freshness at the CLI boundary', () => {
   it('never places round snapshot rows in the live context cache', () => {
-    expect(buildLiveListingsByRepo([{ repo: 'fixture/repo', rows: [{ number: 42 }], listing: 'snapshot' }]).has('fixture/repo')).toBe(false);
+    expect(buildLiveListingsByRepo([{ repo: 'web-everything/web-everything', rows: [{ number: 42 }], listing: 'snapshot' }]).has('web-everything/web-everything')).toBe(false);
   });
 
   const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0 } = {}) => {
@@ -504,7 +504,7 @@ describe('round listing freshness at the CLI boundary', () => {
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
-      writeFileSync(snapshot, JSON.stringify({ repo: 'fixture/repo', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
+      writeFileSync(snapshot, JSON.stringify({ repo: 'web-everything/web-everything', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
       if (sendBack) {
         // Neither PR has a follow-up entry. Only live rows know that manually queued #43 is now held.
         // Keep the target held but selected, so an empty candidate set does not trigger a label-lag re-poll.
@@ -532,7 +532,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
     out = { data: { repository: { mergeQueue: { entries: { nodes: fs.existsSync(process.env.QUEUE_REMOVED) ? [] : [{ pullRequest: { id: 'PR_43', number: 43 } }], pageInfo: { hasNextPage: false } } } } } };
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
-    const local = a.some(v => v.includes('repository(owner:"fixture",name:"repo")'));
+    const local = a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")'));
     const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
     out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
   }
@@ -549,7 +549,7 @@ const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
 const pinned = (${pinnedLeafGitFixture})(a, rows);
 if (pinned !== null) { process.stdout.write(pinned); process.exit(0); }
 if (a[0] === 'remote' && a[1] === 'get-url') {
-  process.stdout.write('https://github.com/fixture/repo.git\\n'); process.exit(0);
+  process.stdout.write('https://github.com/web-everything/web-everything.git\\n'); process.exit(0);
 }
 process.exit(1);
 `);
@@ -572,7 +572,7 @@ process.exit(1);
     const { payload, stderr, calls, gitCalls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     expect(calls.some(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN')))).toBe(true);
-    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('fixture/repo'))).toBe(true);
+    expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '43' && a.includes('web-everything/web-everything'))).toBe(true);
     expect(gitCalls.filter(a => a[0] === '-c' && a.includes('fetch'))).toEqual([
       expect.arrayContaining(['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main']),
     ]);
@@ -583,7 +583,7 @@ process.exit(1);
     const { stderr, calls } = run('snapshot');
     expect(stderr).toContain('served-from-snapshot');
     const localListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(localListings).toHaveLength(1);
     expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
@@ -592,7 +592,7 @@ process.exit(1);
     const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
     expect(stderr).toContain('listed-live');
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(2);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
   });
@@ -618,7 +618,7 @@ process.exit(1);
     expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
     // No second candidate listing is needed when the context already listed this repo live.
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
-      && a.some(v => v.includes('repository(owner:"fixture",name:"repo")') && v.includes('pullRequests(states:OPEN')));
+      && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
     expect(liveListings).toHaveLength(1);
   });
 
