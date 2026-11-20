@@ -29,9 +29,26 @@ export default {
     policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', fallback: [] };
     const now = Date.parse('2026-11-19T12:00:00Z');
     const operator = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
-    const env = reviewSeatLaunchEnv(operator, { WE_REVIEW_SEAT_CAP_CODEX: '80', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' });
+    const env = reviewSeatLaunchEnv(operator, { PATH: 'soak-shim' });
     for (const p of ['codex', 'agy-claude', 'agy-gemini']) {
       if (resolveProviderCap(p, env) !== resolveProviderCap(p, operator)) violations.push(`${p}: cap changed in child`);
+    }
+    for (const cap of ['0', '80']) {
+      const lowered = reviewSeatLaunchEnv(operator, { WE_REVIEW_SEAT_CAP_CODEX: cap });
+      if (resolveProviderCap('codex', lowered) !== Number(cap)) violations.push(`settings overlay cannot lower codex cap to ${cap}`);
+    }
+    const loweredEffects = [];
+    const loweredResult = await speculateRedTeam({ pr: 1, repo: 'example/project', lanePath: 'soak-lane',
+      env: reviewSeatLaunchEnv(operator, { WE_REVIEW_SEAT_CAP_CODEX: '0' }), post: false, record: false,
+      read: { title: 'fix', body: '', diffText: 'diff --git a/x.mjs b/x.mjs\n+1\n',
+        netChangedFiles: ['x.mjs'], netBasis: { rev: 'a'.repeat(40) } } }, {
+      now: () => now, log() {}, readRecords: () => [], cliAvailable: () => true,
+      readRoutingPolicy: () => policy, readAiRouting: () => ({}),
+      reserveCalls() { loweredEffects.push('reserve'); return { used: 0, callIds: [] }; },
+      runSeat() { loweredEffects.push('launch'); },
+    });
+    if (loweredResult.status !== 'skipped' || !loweredResult.deferredByCap || loweredEffects.length) {
+      violations.push('settings overlay zero did not disable codex before reservation');
     }
     for (const deny of [false, true]) {
       const launched = [], reserved = [];

@@ -14,15 +14,14 @@ export const PROVIDER_CAP_ENV = Object.freeze({
   'agy-claude': 'WE_REVIEW_SEAT_CAP_AGY_CLAUDE',
   'agy-gemini': 'WE_REVIEW_SEAT_CAP_AGY_GEMINI',
 });
-/** Preserve explicit operator caps across launcher overlays. Do not materialize defaults:
+/** Valid settings caps take precedence; otherwise preserve valid operator caps. Do not materialize defaults:
  * an unset Gemini cap still permits routing policy's explicit enable control. */
 export function reviewSeatLaunchEnv(env, overlay = {}) {
   const child = { ...env, ...overlay };
+  const validCap = raw => raw !== undefined && raw !== '' && Number.isInteger(Number(raw)) && Number(raw) >= 0;
   for (const key of [DAILY_CAP_ENV, ...Object.values(PROVIDER_CAP_ENV)]) {
-    // Only a valid operator cap is inherited; a garbage value must not displace a good overlay cap.
-    const raw = env?.[key];
-    const n = Number(raw);
-    if (raw !== undefined && raw !== '' && Number.isInteger(n) && n >= 0) child[key] = raw;
+    // A valid overlay may throttle/disable a provider. Invalid overlays cannot erase valid parent caps.
+    if (!validCap(overlay?.[key]) && validCap(env?.[key])) child[key] = env[key];
   }
   return child;
 }
