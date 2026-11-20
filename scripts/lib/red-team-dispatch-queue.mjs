@@ -56,7 +56,14 @@ const transactions = new WeakMap();
 const operatorFloors = new WeakSet();
 const cardOnlyHeads = new Map();
 const MAX_CARD_ONLY_HEADS = 256;
-const MAX_PROBES = 2;
+const DEFAULT_MAX_PROBES = 6;
+const MAX_PROBES_CEILING = 50;
+const probeCap = (value, log) => {
+  if (value === undefined) return DEFAULT_MAX_PROBES;
+  if (Number.isInteger(value) && value >= 0 && value <= MAX_PROBES_CEILING) return value;
+  note(log, 'maxProbesPerTick=0 (source: direct argument; invalid maxProbes; fail closed, probes OFF)');
+  return 0;
+};
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // probed in fair, bounded turns, without occupying a capacity-bound admission.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
@@ -86,8 +93,9 @@ export function loadRedTeamQueueFloor({ env = process.env,
   file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-team-queue.json'), readFile = readFileSync,
   log = () => {} } = {}) {
   let settings;
+  let settingsUnreadable = false;
   try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
-  catch { /* Unavailable settings never create extra capacity. */ }
+  catch { settingsUnreadable = true; }
   const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
   const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
@@ -95,12 +103,38 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const operator = readOperatorPolicy('redTeamQueue', { env, log });
   const operatorMinimum = operator?.minConcurrent;
-  if (operator === null) return { minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  if (operator === null) {
+    // An unreadable operator store cannot prove the operator did not turn probes off, so it never re-enables them.
+    const maxProbesPerTick = 0;
+    note(log, `maxProbesPerTick=0 (source: operator-db-unreadable; fail closed, probes OFF until the operator store is readable)`);
+    return { maxProbesPerTick, minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  }
   const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
+  let maxProbesPerTick;
+  let probeSource;
+  if (settingsUnreadable) {
+    maxProbesPerTick = 0;
+    probeSource = 'scripts/settings/red-team-queue.json; settings unreadable; fail closed, probes OFF';
+  } else if (operator?.maxProbesPerTick !== undefined) {
+    maxProbesPerTick = operator.maxProbesPerTick;
+    probeSource = 'operator-db';
+  } else if (!Object.hasOwn(settings ?? {}, 'maxProbesPerTick')) {
+    maxProbesPerTick = DEFAULT_MAX_PROBES;
+    probeSource = 'default; settings key absent';
+  } else if (!Number.isInteger(settings.maxProbesPerTick)
+    || settings.maxProbesPerTick < 0 || settings.maxProbesPerTick > MAX_PROBES_CEILING) {
+    maxProbesPerTick = 0;
+    probeSource = 'scripts/settings/red-team-queue.json; invalid maxProbesPerTick; fail closed, probes OFF';
+  } else {
+    maxProbesPerTick = settings.maxProbesPerTick;
+    probeSource = 'scripts/settings/red-team-queue.json';
+  }
+  note(log, `maxProbesPerTick=${maxProbesPerTick} (source: ${probeSource}; hard ceiling 50)`);
   const floor = {
+    maxProbesPerTick,
     // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
     minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
       ? Math.min(minimum, operatorMinimum === undefined ? RED_TEAM_QUEUE_MIN_CONCURRENT_CAP : RED_TEAM_QUEUE_MIN_CONCURRENT_MAX) : 0,
@@ -260,7 +294,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    admit(repo, count, { allowProbes = true } = {}) {
+    admit(repo, count, { allowProbes = true, maxProbes } = {}) {
+      const maxProbeCount = probeCap(maxProbes, log);
       const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Least-recently-probed heads get the next bounded turn without using a runnable slot.
@@ -268,7 +303,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key));
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
       const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
-        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, MAX_PROBES);
+        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, maxProbeCount);
       const probes = new Set(selected.map(entry => entry.key));
       if (selected.length) {
         advanceProbeTurns(mine, selected);
@@ -450,7 +485,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity), maxProbes: floor?.maxProbesPerTick });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))

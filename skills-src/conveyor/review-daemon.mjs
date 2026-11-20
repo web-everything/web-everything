@@ -1514,7 +1514,12 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           if (line.startsWith('review-daemon: red-team queue floor minConcurrent=')) floorLine = line;
           else options.log(line);
         } });
-      } catch { /* Unreadable floor evidence disables raises for this tick. */ }
+      } catch {
+        // Unreadable floor evidence disables raises for this tick and fails closed on probes (never the default 6).
+        floor = { maxProbesPerTick: 0 };
+        try { options.log('review-daemon: red-team queue floor loader failed; maxProbesPerTick=0 (probes OFF this tick)'); }
+        catch { /* Diagnostics must not interrupt recovery. */ }
+      }
       if (floorLine !== lastRedTeamQueueFloorLine) {
         if (floorLine !== undefined) {
           try { options.log(floorLine); } catch { /* Diagnostics must not interrupt recovery. */ }
