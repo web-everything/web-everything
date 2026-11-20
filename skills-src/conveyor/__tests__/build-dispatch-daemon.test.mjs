@@ -4,6 +4,7 @@ import { runPrepareBatch } from '../../../scripts/operations/prepare-batch.mjs';
 import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { cliEffects } from '../build-dispatch-daemon.mjs';
+import { readBuildPrioritySettings } from '../../../scripts/lib/build-queue.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -4398,6 +4399,51 @@ describe('grouped PREPARE daemon ticks', () => {
     expect(launches.find(r => r.num === stale.num)).toMatchObject({ launchKind: 'prepare-item', lightRevalidate: true });
     expect(launches.find(r => r.num === stale.num).groupMembers).toBeUndefined();
     expect(launches.find(r => r.num !== stale.num).groupMembers).toHaveLength(3);
+  });
+
+  describe('builder-only mode gates prepares', () => {
+    const only = ids => ({ ids, source: 'runtime', mode: 'only', only: true });
+    const launchedNums = effects => effects.dispatch.mock.calls.flatMap(([a]) => [a.num, ...(a.groupMembers ?? [])]);
+    it('only mode gates prepare launches', async () => {
+      const effects = fixture({ spawns: [rows[0], rows[1]] });
+      effects.readRuntimePriority = () => only(['7202']);
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toEqual(['7202']);
+      expect(tick.prepare.skippedInPlanning).toEqual([{ num: '7201', reason: 'not-in-runtime-only-list' }]);
+    });
+    it('keeps listed ids preparing and leaves non-only modes alone', async () => {
+      const effects = fixture({ spawns: [rows[0]] });
+      effects.readRuntimePriority = () => only(['7201']);
+      await runBuildDispatchTick({ live: true, effects });
+      expect(launchedNums(effects)).toContain('7201');
+    });
+    it('leaves a non-only mode alone', async () => {
+      const lift = fixture({ spawns: [rows[0]] });
+      lift.readRuntimePriority = () => ({ ids: ['7299'], source: 'runtime', mode: 'lift', only: false });
+      await runBuildDispatchTick({ live: true, effects: lift });
+      expect(launchedNums(lift)).toContain('7201');
+    });
+    it('fails closed when the list is unreadable or malformed', async () => {
+      for (const reader of [() => ({ ids: [], source: 'runtime-malformed', only: true, held: true }), () => { throw new Error('boom'); }]) {
+        const effects = fixture({ spawns: [rows[0], rows[1]] });
+        effects.readRuntimePriority = reader;
+        await runBuildDispatchTick({ live: true, effects });
+        expect(effects.dispatch).not.toHaveBeenCalled();
+      }
+    });
+    it('expired runtime list is ignored', async () => {
+      const read = ageHours => readBuildPrioritySettings({ env: {}, read: () => ({}), runtimePath: '/x', now: () => Date.parse('2026-11-20T18:00:00Z'),
+        readRuntime: () => JSON.stringify({ ids: ['7202'], mode: 'only', setBy: 't', at: new Date(Date.parse('2026-11-20T18:00:00Z') - ageHours * 3600e3).toISOString(), ttlHours: 5 }) });
+      expect(read(1)).toMatchObject({ only: true, ids: ['7202'] });
+      const expired = read(10);
+      expect(expired.only).toBeFalsy();
+      expect(expired.runtime.line).toMatch(/^runtime list expired at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} ET/);
+      const effects = fixture({ spawns: [rows[0]] });
+      effects.readRuntimePriority = () => expired;
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try { await runBuildDispatchTick({ live: true, effects }); expect(log.mock.calls.flat().join('\n')).toContain('runtime list expired at'); } finally { log.mockRestore(); }
+      expect(launchedNums(effects)).toContain('7201');
+    });
   });
 
   it('uses enriched minimal queue rows for the per-group prepare pool', async () => {
