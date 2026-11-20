@@ -264,8 +264,13 @@ export function parseArgs(argv) {
 export function waiverFindings(waivers, { ref, sha, ruling }) {
   if (!Array.isArray(waivers)) return { ok: false, error: 'recorded waivers are unreadable' };
   if (!validSha(sha) || typeof ref !== 'string' || typeof ruling !== 'string') return { ok: false, error: 'no recorded waiver: ref, 40-hex sha and auditRuling are required' };
-  const hits = waivers.filter((e) => e && e.ref === ref && validSha(e.sha) && e.sha.toLowerCase() === sha.toLowerCase() && e.ruling === ruling
-    && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim()));
+  // A non-object entry, or a malformed entry naming this ref+sha+ruling, is damaged evidence: refuse, never skip it.
+  if (waivers.some((e) => !e || typeof e !== 'object' || Array.isArray(e))) return { ok: false, error: 'recorded waivers are unreadable: a non-object entry' };
+  const named = waivers.filter((e) => e.ref === ref && typeof e.sha === 'string' && e.sha.toLowerCase() === sha.toLowerCase() && e.ruling === ruling);
+  if (named.some((e) => !Array.isArray(e.findings) || e.findings.length === 0 || !e.findings.every((f) => typeof f === 'string' && f.trim()))) {
+    return { ok: false, error: `recorded waivers are unreadable: a malformed waiver for ${ref}@${sha} ${ruling}` };
+  }
+  const hits = named;
   if (!hits.length) return { ok: false, error: `no recorded waiver for ${ref}@${sha} ${ruling}` };
   const first = JSON.stringify(hits[0].findings);
   if (hits.some((e) => JSON.stringify(e.findings) !== first)) return { ok: false, error: `ambiguous: several recorded waivers for ${ref}@${sha} ${ruling} disagree on findings` };
@@ -276,13 +281,16 @@ function defaultWaivers(env, settingsFile = join(here, '..', 'settings', 'protot
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
   const tool = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
   if (platform.errors.length) throw new Error(`platform preferences unreadable: ${platform.errors[0]}`);
-  const store = readStore({ path: storePath(env), fs, warn: () => {} });
+  // Any warning from the shared readers (malformed store or request line, unreadable log) means damaged evidence: refuse.
+  const refuseOnWarn = (m) => { throw new Error(`waiver evidence damaged: ${m}`); };
+  const store = readStore({ path: storePath(env), fs, warn: refuseOnWarn });
   if (store.error) throw new Error(`ruled-weakened store unreadable: ${store.error}`);
-  const isRevoked = withdrawnRevocations({ fs, env, warn: () => {} });
+  const isRevoked = withdrawnRevocations({ fs, env, warn: refuseOnWarn });
   // Raw, NOT de-duplicated: conflicting entries for one ref+sha+ruling must reach waiverFindings and refuse as ambiguous.
-  const list = (v) => (Array.isArray(v) ? v : []);
-  return [...list(tool.ruledWeakened), ...list(platform.prefs.prototypeLoad?.ruledWeakened), ...store.entries]
-    .filter((e) => e && typeof e === 'object' && !(typeof e.sha === 'string' && isRevoked(e)));
+  // A present layer that is not an array is damaged evidence, never an empty list.
+  const list = (v, name) => { if (v === undefined || v === null) return []; if (!Array.isArray(v)) throw new Error(`${name} ruledWeakened is not an array`); return v; };
+  return [...list(tool.ruledWeakened, 'tool'), ...list(platform.prefs.prototypeLoad?.ruledWeakened, 'platform'), ...store.entries]
+    .filter((e) => !(e && typeof e === 'object' && typeof e.sha === 'string' && isRevoked(e)));
 }
 
 export function main(argv = process.argv.slice(2), deps = {}) {
