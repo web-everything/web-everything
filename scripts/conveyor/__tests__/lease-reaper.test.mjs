@@ -53,9 +53,12 @@ import {
   buildLeaseSignalsFor,
   prTerminalPredatesLease,
   laneIndicesIn,
+  applyReclaimSafety,
+  applyLaneHold,
 } from '../lease-reaper.mjs';
 import { fixDispatchSessionName } from '../fix-claim-store.mjs';
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
+import { probeLaneReclaim } from '../../lib/lane-lease-liveness.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../../operations/dispatch-lane.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -797,6 +800,55 @@ describe('buildLeaseSignalsFor + reapPlan — lane-8 old stopped rounds (PR #584
   });
 });
 
+describe('main — reclaim safety wiring', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/conveyor/lease-reaper.mjs'), 'utf8');
+  const shell = source.slice(source.indexOf('function parseFlags('), source.indexOf('// Run the IO shell only'));
+
+  it.each([true, false])('retains live, dirty and unreadable lanes with dryRun=%s', (dryRun) => {
+    const leases = new Map([1, 2, 3, 4].map(lane => [lane, stale({ session: `fixture-${lane}` })]));
+    const check = vi.fn((dir, lease) => {
+      const lane = Number(dir.match(/lane-(\d+)$/)[1]);
+      expect(lease).toBe(leases.get(lane));
+      return probeLaneReclaim(dir, lease, {
+        host: 'Mac',
+        kill: () => { if (lane !== 1) throw Object.assign(Error('dead'), { code: 'ESRCH' }); },
+        run: () => lane === 3 ? { status: 1 } : { status: 0, stdout: lane === 2 ? '?? work\n' : '' },
+      });
+    });
+    const releaseLane = vi.fn();
+    const logs = [];
+    let stdout = '';
+    runInNewContext(`${shell}\nmain(${JSON.stringify(dryRun ? ['--dry-run', '--json'] : ['--json'])});`, {
+      Date: class extends Date { static now() { return NOW; } },
+      Map, Set, Number, JSON, DEFAULT_LEASE_TTL_MINUTES,
+      POOL_ROOT: '/unused-lease-reaper-fixture', join,
+      log: line => logs.push(line),
+      process: { env: {}, stdout: { write: s => { stdout += s; } }, exit: code => expect(code).toBe(0) },
+      fetchSessionSignals: () => ({ states: null, pidAlive: new Map(), agents: [] }),
+      readWrapperPidsForPass: () => new Map(), listFixDispatchClaims: () => [],
+      claimRunnerPidsBySession, staleTerminalNamesForClaims,
+      poolsToScan: () => ['fixture'], repoKeyForPool: () => null,
+      laneIndicesIn: () => [...leases.keys()], readLease: dir => leases.get(Number(dir.match(/lane-(\d+)$/)[1])),
+      fetchPrStatesForRepo: () => { throw Error('unexpected network lookup'); },
+      buildLeaseSignalsFor, reapPlan,
+      applyLaneHold: (plan, opts) => applyLaneHold(plan, { ...opts, check: () => ({ allowed: true }) }),
+      applyReclaimSafety: plan => applyReclaimSafety(plan, { check }), releaseLane,
+    }, { timeout: 1000 });
+    expect(check).toHaveBeenCalledTimes(4);
+    expect(JSON.parse(stdout)).toMatchObject({ scanned: 4, kept: 3, reaped: dryRun ? 0 : 1, failures: 0 });
+    expect(logs).toContain('  kept fixture/lane-1: stale-but-live');
+    expect(logs).toContain('  kept fixture/lane-2: stale-but-dirty');
+    expect(logs).toContain('  kept fixture/lane-3: stale-but-dirty');
+    if (dryRun) {
+      expect(releaseLane).not.toHaveBeenCalled();
+      expect(JSON.parse(stdout).wouldReap).toEqual([{ pool: 'fixture', lane: 4, reason: 'ttl-stale', session: 'fixture-4' }]);
+    } else {
+      expect(releaseLane).toHaveBeenCalledTimes(1);
+      expect(releaseLane).toHaveBeenCalledWith('fixture', 4, { reason: 'ttl-stale' });
+    }
+  });
+});
+
 describe('main — claim freshness after slow I/O (PR #5846)', () => {
   // Execute the checked-in CLI shell with real claim/signal/reap helpers. Only I/O
   // is replaced, so a stale clock passed by main cannot hide behind a unit fixture.
@@ -845,7 +897,8 @@ describe('main — claim freshness after slow I/O (PR #5846)', () => {
       fetchPrStatesForRepo: () => { throw new Error('no PR lookup expected'); },
       buildLeaseSignalsFor: (opts) => buildLeaseSignalsFor({ ...opts,
         pidCommand: () => 'node fix-run.mjs --session=fix-5806' }),
-      reapPlan, applyLaneHold: (plan) => plan, applyReclaimSafety: (plan) => plan,
+      reapPlan, applyLaneHold: (plan, opts) => applyLaneHold(plan, { ...opts, check: () => ({ allowed: true }) }),
+      applyReclaimSafety: (plan) => applyReclaimSafety(plan, { check: () => ({ safe: true }) }),
       releaseLane: () => { throw new Error('dry-run must never release'); },
     }, { timeout: 1000 });
     return { report: JSON.parse(stdout), logs };

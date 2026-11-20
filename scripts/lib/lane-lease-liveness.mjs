@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
+import { currentBootId } from './proc-identity.mjs';
 import { readLiveCwds, pidsWithCwdIn } from './lane-salvage.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, scrubGitLocationEnv } from './lane-git-hardening.mjs';
 
@@ -22,8 +23,11 @@ export function staleTakeoverHasLiveProcesses(dir, { readCwds = readLiveCwds, jo
 }
 
 // Liveness prevents reclamation; it does not confer ownership.
-export function holderPidAlive(lease, { kill = process.kill, host = hostname() } = {}) {
-  if (lease?.host && lease.host !== host) return null;
+export function holderPidAlive(lease, { kill = process.kill, host = hostname(), bootId = currentBootId } = {}) {
+  if (lease?.bootId) {
+    const localBoot = typeof bootId === 'function' ? bootId() : bootId;
+    if (!localBoot || lease.bootId !== localBoot) return null;
+  } else if (lease?.host && lease.host !== host) return null;
   if (!Number.isSafeInteger(lease?.pid) || lease.pid <= 0) return false;
   try { kill(lease.pid, 0); return true; }
   catch (error) { return error?.code === 'ESRCH' ? false : error?.code === 'EPERM' ? true : null; }

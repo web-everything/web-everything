@@ -22,6 +22,17 @@ it('observes the live holder with kill(pid, 0)', () => {
 it('refuses foreign-host PID evidence', () => {
   expect(holderPidAlive({ pid: 123, host: 'elsewhere' }, { host: 'here' })).toBe(null);
 });
+it('uses the boot identity across a hostname change', () => {
+  const kill = vi.fn();
+  expect(holderPidAlive({ pid: 123, host: 'old-name', bootId: 'same-boot' },
+    { host: 'new-name', bootId: 'same-boot', kill })).toBe(true);
+  expect(kill).toHaveBeenCalledWith(123, 0);
+});
+it.each([null, 'different-boot'])('refuses unknown or foreign boot identity: %s', bootId => {
+  const kill = vi.fn();
+  expect(holderPidAlive({ pid: 123, bootId: 'original-boot' }, { bootId, kill })).toBe(null);
+  expect(kill).not.toHaveBeenCalled();
+});
 it.each([
   () => ({ status: 1, stdout: '' }),
   () => { throw Error('unreadable'); },

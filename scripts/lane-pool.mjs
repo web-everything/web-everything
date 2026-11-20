@@ -177,7 +177,8 @@ import { pickFreshestTip } from './readiness/scope-lease-collect.mjs';
 // import" shape `we:scripts/operations/operator-queue.mjs`'s own header warns about (that warning is about
 // importing `lane-pool.mjs` itself elsewhere — the OPPOSITE direction from this import).
 import { gitStatusSummary, aheadCommits, aheadCommitsPreserved, filePreservedInMain } from './lane-whois.mjs';
-import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal, probeLaneReclaim } from './lib/lane-lease-liveness.mjs';
+import { staleTakeoverHasLiveProcesses, journalLiveProcessRefusal, probeLaneReclaim, holderPidAlive } from './lib/lane-lease-liveness.mjs';
+import { currentBootId } from './lib/proc-identity.mjs';
 import { withLaneLeaseGuard } from './lib/lane-lease-guard.mjs';
 import { guessCardIds } from './lib/lane-whois-core.mjs';
 import { realSalvageIo, redactUrlCredentials, releasePushTarget, salvagePushLane, salvageRefName } from './lib/lane-pool-salvage-push.mjs';
@@ -1041,14 +1042,14 @@ function reclaimSafety(dir, lease) {
   if (!lease) return { safe: true, reason: null };
   const verdict = probeLaneReclaim(dir, lease);
   if (!verdict.safe) {
-    log(`  ${basename(dir)}: ${verdict.reason} — kept; inspect holder/worktree before retrying`);
+    log(`  ${basename(dir)}: ${verdict.reason} — kept; inspect holder/worktree before retrying; after confirming the holder stopped, run: node scripts/lane-pool.mjs release --pool=${basename(dirname(dir))} --lane=${basename(dir).replace('lane-', '')} --force`);
     journalLaneEvent(dir, { action: 'reclaim-refused', reason: verdict.reason });
   }
   return verdict;
 }
 function liveLease(dir, nowMs, ttlMs) {
   const lease = readLease(dir);
-  return lease && !isLeaseStale(lease, nowMs, ttlMs) ? lease : null;
+  return lease && (!isLeaseStale(lease, nowMs, ttlMs) || !reclaimSafety(dir, lease).safe) ? lease : null;
 }
 // #2997 — every OTHER lane's LIVE lease the caller could be confused with. The input to `isContestedLease`,
 // i.e. "is a sibling agent of this lease's session holding a lane right now?". Best-effort: any read failure
@@ -1533,6 +1534,12 @@ function localRemoteShas(dir, fetchedSpecs) {
 // (safe to unmap its stale item mapping, #2139) from a skipped one (still serving its in-flight item).
 function refreshLane(repo, n, { force = false } = {}) {
   const dir = laneDir(repo, n);
+  // Check stale-holder evidence before fetch can quarantine/reclone or mutate the tree.
+  const recordedLease = readLease(dir);
+  if (recordedLease && isLeaseStale(recordedLease, Date.now(), ttlMsFromFlags())
+      && !reclaimSafety(dir, recordedLease).safe) {
+    return { skipped: true, leased: true, dirty: false, uncommitted: 0, ahead: 0 };
+  }
   // Acquire scrubs before ITS fetch; refresh's fetch ran a lane-set credential helper / `core.gitProxy` (PR #5775 self-review).
   scrubClaimedLaneConfig(dir, 'before refresh fetch');
   // xj1vryw — self-healing fetch; may quarantine + re-clone a corrupt lane ONLY when no live lease holds it.
@@ -2041,12 +2048,17 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false, read
   // sessions that merely share an upper process ancestor (terminal / a parallel-lane orchestrator). This is the
   // SOLE ownership signal (r2 removed the pid-ancestry fallback, whose chain overlap over-matched exactly that
   // shared-ancestor topology and so failed open while looking protective — see `isForeignLease`, lane-lease.mjs).
-  // The parent is the long-lived caller; its PID protects liveness, never ownership.
+  // A direct long-lived caller may use its parent PID. A transient command shell or
+  // dispatcher must pass --holder-pid=<worker pid> for the actual worker (including
+  // a sibling); ancestry cannot infer that relationship. This proves liveness only.
+  const holderPid = flags['holder-pid'] === undefined ? process.ppid : Number(flags['holder-pid']);
+  if (flags['holder-pid'] !== undefined && (!/^\d+$/.test(String(flags['holder-pid']))
+      || holderPidAlive({ pid: holderPid }) !== true)) fail('--holder-pid must name a live local worker');
   const mintedHolder = mintHolderSlug(dir, flags.purpose);
   const bodyFor = (holder, workerSession, prior = null) => JSON.stringify(
     leaseBody({
       session, purpose: flags.purpose, acquiredAt: new Date(nowMs).toISOString(), ttlMinutes: ttlMinutesFromFlags(),
-      host: hostname(), pid: process.ppid,
+      host: hostname(), bootId: currentBootId(), pid: holderPid,
       ownerSession: process.env.CLAUDE_CODE_SESSION_ID || null,
       // #2997 — the minted PER-HOLDER slug, stamped on EVERY acquire rather than only on a `workflowLane` one.
       // #2413 built this exact channel but gated it on that marker, so every other concurrent topology (ad-hoc
@@ -2174,7 +2186,7 @@ function deadLeasePlan(repo, nowMs, ttlMs) {
   for (const n of existingLanes(repo)) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
-    if (lease && reclaimSafety(dir, lease).safe) candidates.push({ lane: n, dir, lease });
+    if (lease && isLeaseStale(lease, nowMs, ttlMs) && reclaimSafety(dir, lease).safe) candidates.push({ lane: n, dir, lease });
   }
   if (candidates.length === 0) return { reap: [], keep: [] };
   // PR-terminal axis (best-effort, one `gh pr list`): a merged/closed PR whose head ref `lane/<num>-*` maps
@@ -5881,7 +5893,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
     'usage: lane-pool.mjs <gc|heal-siblings|salvage-unpushed|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
-      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
+      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--holder-pid=<worker-pid>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +

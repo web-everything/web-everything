@@ -35,6 +35,14 @@ export function replayExpiry(root) {
       });
       if (result.error || !result.stderr?.includes(`stale-but-${kind}`) || result.status === 0
           || readFileSync(marker, 'utf8') !== bytes) violations.push(`${kind}: expired lease was not safely retained`);
+      const refresh = spawnSync(process.execPath, [join(root, 'scripts/lane-pool.mjs'), 'refresh',
+        '--lane=1', '--pool=fixture', `--origin=${reference}`, `--reference=${reference}`,
+        '--force', '--no-install'], {
+        cwd: reference, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, LANE_POOL_ROOT: pool, PATH: `${bin}:${process.env.PATH}` },
+      });
+      if (refresh.error || !refresh.stderr?.includes(`stale-but-${kind}`)
+          || readFileSync(marker, 'utf8') !== bytes) violations.push(`${kind}: forced refresh did not retain the expired lease`);
       if (kind === 'dirty' && readFileSync(join(lane, 'work'), 'utf8') !== 'uncommitted work') {
         violations.push('dirty: uncommitted bytes lost');
       }

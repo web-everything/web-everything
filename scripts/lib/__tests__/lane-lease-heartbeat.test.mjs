@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, rmSync, readdirSync, existsSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, renameSync, linkSync, rmSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { renewLaneLease, startLaneLeaseHeartbeat } from '../lane-lease-heartbeat.mjs';
@@ -13,6 +13,63 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'lease-heartbeat-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 describe('lane lease renewal', () => {
+  it('recovers a guard left by a dead writer', () => {
+    const file = join(dir, '.lane-lease');
+    writeFileSync(file, JSON.stringify({ session: 'owner', acquiredAt: '2026-01-01' }));
+    writeFileSync(`${file}.lock`, '2147483646\n');
+    expect(renewLaneLease({ cwd: dir, run: () => ({ status: 0, stdout: dir }) })).toBe(true);
+    // Retaining the dead record prevents two reclaimers unlinking each other's lock.
+    expect(readFileSync(`${file}.lock`, 'utf8')).toBe('2147483646\n');
+    expect(readdirSync(dir).sort()).toEqual(['.lane-lease', '.lane-lease.lock']);
+  });
+
+  it('serializes two writers recovering the same dead guard', async () => {
+    const file = join(dir, '.lane-lease');
+    writeFileSync(`${file}.lock`, '2147483646\n');
+    const script = `import { withLaneLeaseGuard } from ${JSON.stringify(new URL('../lane-lease-guard.mjs', import.meta.url).href)};
+      import { writeFileSync, rmSync } from 'node:fs';
+      withLaneLeaseGuard(${JSON.stringify(file)}, () => {
+        writeFileSync(${JSON.stringify(join(dir, 'busy'))}, 'held', { flag: 'wx' });
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+        rmSync(${JSON.stringify(join(dir, 'busy'))});
+      });`;
+    const run = () => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('exit', code => code === 0 ? resolve() : reject(Error(stderr)));
+    });
+    await Promise.all([run(), run()]);
+    expect(readdirSync(dir)).toEqual(['.lane-lease.lock']);
+  });
+
+  it('bounds crashed generations and reports the stopped-writer recovery procedure', () => {
+    const file = join(dir, '.lane-lease');
+    const work = vi.fn();
+    const link = vi.fn(() => { throw Object.assign(Error('occupied'), { code: 'EEXIST' }); });
+    expect(() => withLaneLeaseGuard(file, work, {
+      linkSync: link, readFileSync: () => '2147483646\n',
+    })).toThrow(/stop all lane writers/);
+    expect(link).toHaveBeenCalledTimes(32);
+    expect(work).not.toHaveBeenCalled();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('retries a short collision with a live writer before running the operation', () => {
+    const file = join(dir, '.lane-lease');
+    const work = vi.fn(() => 'done');
+    const link = vi.fn()
+      .mockImplementationOnce(() => { throw Object.assign(Error('occupied'), { code: 'EEXIST' }); })
+      .mockImplementation(linkSync);
+    expect(withLaneLeaseGuard(file, work, {
+      linkSync: link, readFileSync: () => String(process.ppid),
+    })).toBe('done');
+    expect(link).toHaveBeenCalledTimes(2);
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
   it('resolves the absolute git dir from a subdirectory and preserves lease identity', () => {
     execFileSync('git', ['init', '--quiet', dir]);
     const cwd = join(dir, 'nested');
@@ -62,11 +119,12 @@ describe('lane lease renewal', () => {
     const rename = vi.fn(renameSync);
     const release = vi.fn(() => withLaneLeaseGuard(file, () => rmSync(file)));
     expect(renewLaneLease({ cwd: dir, run: () => ({ status: 0, stdout: dir }), fs: {
-      writeFileSync(path, body, options) {
+      writeFileSync,
+      linkSync(path, target) {
         // The first comparison has succeeded. Release wins the shared guard
         // immediately before renewal acquires it and attempts its rename.
-        if (path === `${file}.lock`) release();
-        writeFileSync(path, body, options);
+        if (target === `${file}.lock`) release();
+        linkSync(path, target);
       },
       renameSync: rename, rmSync,
     } })).toBe(false);

@@ -4697,6 +4697,19 @@ The declared `ruled-weakened-add` CLI uses an array field with `repeatable: true
 ## Lane lease heartbeats
 
 Use `lane-lease-heartbeat.mjs` for best-effort atomic renewal from any lane subdirectory.
+Acquisition defaults to the caller PID only for direct, long-lived callers. Transient shells
+and dispatchers must pass `--holder-pid=<worker-pid>` for the actual local worker; a shared
+daemon PID is not evidence that an individual worker remains alive. PID evidence never
+confers ownership. The sibling-worker case in `lane-pool-lease-expiry.test.mjs` pins this contract.
+New acquire markers record the shared process-identity helper's boot UUID when available,
+so DHCP hostname changes do not invalidate local PID evidence. Legacy or unreadable identity
+remains fail-closed; refusal output gives the explicit `release --force` command for recovery.
+Lease guards publish complete owner records with an atomic hard link and retry live contention
+for up to 250 ms. Dead guard records are retained as immutable pointers to a deterministic
+successor lock, preventing two reclaimers from unlinking a new owner's lock. Only a live owner
+removes its own guard. After 32 crashed generations, the error requires stopping all lane
+writers before removing the marker's `.lock*` records. Unreadable owners also fail closed.
+The heartbeat tests cover dead-owner recovery, concurrent recovery, and release/renewal exclusion.
 Owned `acquire --lane=N --adopt` may skip canonical-origin resolution, but must still
 probe local history without repair; missing ancestors quarantine the lane. Stale-lease
 PID/dirty refusals precede takeover; unleased reclaim retains its preservation-report contract.
@@ -4711,7 +4724,7 @@ synchronous child execution prevents interval renewals. The Codex child runner c
 jobs too. Inject `readAgents`/`readCwds` into liveness fixtures; never probe host processes in unit tests.
 Acquire takeover and explicit reclaim fail closed on unreadable cwd evidence.
 Observed live occupants journal `reclaim-refused-live-process`.
-Provisioning failures stay excluded across acquire poll rounds and allow bounded pool growth.
+Provisioning failures stay excluded across acquire poll rounds and suppress pool growth.
 Review lane setup uses one hardened environment for the config scrub, origin validation and fetch.
 Global and system config point at the same temporary empty file, system config is disabled, and
 inherited indexed config and config-source overrides are removed before applying the hardening

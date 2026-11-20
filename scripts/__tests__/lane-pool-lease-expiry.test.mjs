@@ -1,5 +1,6 @@
 import { it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -42,9 +43,59 @@ it.each(['live', 'dirty'])('stale %s lane refuses takeover and reclaim, even wit
   }
   if (kind === 'dirty') expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
 });
+it.each(['live', 'dirty'])('refresh --force retains a stale %s lease and its tree', kind => {
+  seed(kind === 'live' ? { pid: process.pid, host: hostname() } : {});
+  if (kind === 'dirty') writeFileSync(join(lane, 'work'), 'precious work');
+  const before = readFileSync(marker(), 'utf8');
+  const result = run(['refresh', '--force', '--lane=1', '--pool=fixture', `--origin=${reference}`, `--reference=${reference}`, '--no-install']);
+  expect(result.stderr).toContain(`stale-but-${kind}`);
+  expect(readFileSync(marker(), 'utf8')).toBe(before);
+  if (kind === 'dirty') expect(readFileSync(join(lane, 'work'), 'utf8')).toBe('precious work');
+});
+
+it('a fresh live lease does not log a stale refusal during the reap pass', () => {
+  seed({ acquiredAt: new Date().toISOString(), pid: process.pid, host: hostname() });
+  const result = run(['list', '--acquirable', '--pool=fixture', `--origin=${reference}`, `--reference=${reference}`]);
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).not.toContain('stale-but-');
+  const journal = join(pool, 'fixture', '.lane-journal.jsonl');
+  expect(existsSync(journal) ? readFileSync(journal, 'utf8') : '').not.toContain('reclaim-refused');
+});
+
+it('an exiting wrapper records its live sibling worker through --holder-pid', async () => {
+  seed();
+  const worker = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const exited = once(worker, 'exit');
+  try {
+    const args = [cli, 'acquire', '--lane=1', '--adopt', '--session=owner', '--json', `--holder-pid=${worker.pid}`];
+    const wrapper = spawnSync(process.execPath, ['-e',
+      `require('node:child_process').execFileSync(process.execPath, ${JSON.stringify(args)}, { stdio: 'inherit' });`],
+    { cwd: lane, env, encoding: 'utf8', timeout: 20_000 });
+    expect(wrapper.status, wrapper.stderr).toBe(0);
+    expect(readLease().pid).toBe(worker.pid);
+    seed({ ...readLease(), acquiredAt: '2020-01-01T00:00:00.000Z' });
+    const result = run(['reclaim', '--override', '--lane=1', '--pool=fixture', `--origin=${reference}`, `--reference=${reference}`]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('stale-but-live');
+  } finally {
+    worker.kill();
+    await exited;
+  }
+});
+
+it.each(['0', '-1', '1.5', '2147483646', 'not-pid'])('refuses an invalid or dead explicit worker PID: %s', pid => {
+  seed();
+  const before = readFileSync(marker(), 'utf8');
+  const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', `--holder-pid=${pid}`], lane);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain('--holder-pid must name a live local worker');
+  expect(readFileSync(marker(), 'utf8')).toBe(before);
+});
+
 it('re-adopts an owned lane from its cwd without a canonical origin and preserves dirty work', () => {
   seed({ holder: 'existing-holder', workflowLane: true });
   writeFileSync(join(lane, 'work'), 'precious work');
+  writeFileSync(`${marker()}.lock`, '2147483646\n');
   const result = run(['acquire', '--lane=1', '--adopt', '--session=owner', '--json'], lane);
   expect(result.status, result.stderr).toBe(0);
   expect(readLease().workflowLane).toBe(true);
@@ -86,7 +137,16 @@ it('verify-lane renews its selected cwd lease throughout a failing gate', () => 
     return result;
   }`;
   const preload = `import { register } from 'node:module'; register(${JSON.stringify('data:text/javascript,')} + encodeURIComponent(${JSON.stringify(loader)}));`;
-  const gate = `node -e 'setTimeout(() => process.exit(1), 150)'`;
+  const observation = join(root, 'renewal-observed.json');
+  const gateScript = join(root, 'observe-renewal.cjs');
+  writeFileSync(gateScript, `const fs = require('node:fs');
+    const read = () => JSON.parse(fs.readFileSync(${JSON.stringify(marker())}, 'utf8')).renewedAt;
+    const initial = read();
+    setTimeout(() => {
+      fs.writeFileSync(${JSON.stringify(observation)}, JSON.stringify({ initial, later: read() }));
+      process.exit(1);
+    }, 250);`);
+  const gate = `node '${gateScript.replaceAll("'", "'\\''")}'`;
   const result = spawnSync(process.execPath, [`--import=data:text/javascript,${encodeURIComponent(preload)}`,
     resolve('scripts/verify-lane.mjs'), `--repo=${lane}`, `--gate=${gate}`, '--json'], {
     cwd: reference, encoding: 'utf8', timeout: 20000,
@@ -95,4 +155,19 @@ it('verify-lane renews its selected cwd lease throughout a failing gate', () => 
   expect(result.status, result.stderr).not.toBe(0);
   expect(Date.parse(readLease().renewedAt)).toBeGreaterThan(Date.now() - 20_000);
   expect(readLease().session).toBe('owner');
+  const { initial, later } = JSON.parse(readFileSync(observation, 'utf8'));
+  expect(Date.parse(later)).toBeGreaterThan(Date.parse(initial));
+});
+
+it.each(['check', 'reset', '--dry-run'])('verify-lane %s leaves lease bytes unchanged', mode => {
+  seed();
+  const before = readFileSync(marker(), 'utf8');
+  const result = spawnSync(process.execPath, [resolve('scripts/verify-lane.mjs'), mode,
+    `--repo=${lane}`, '--gate=node -e "process.exit(0)"', '--json'], {
+    cwd: reference, env, encoding: 'utf8', timeout: 20_000,
+  });
+  expect(result.error).toBeUndefined();
+  expect(() => JSON.parse(result.stdout)).not.toThrow();
+  if (mode !== 'check') expect(result.status, result.stderr).toBe(0);
+  expect(readFileSync(marker(), 'utf8')).toBe(before);
 });
