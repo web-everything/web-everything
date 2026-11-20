@@ -109,11 +109,25 @@ export function createCardBranchSink({ root = REPO_ROOT,
           // Fetch the advertised SHA, not an implicitly updated tracking ref (narrow clones work too).
           run(['fetch', '--no-tags', '--no-write-fetch-head', remote, base]);
           if (run(['cat-file', '-t', base]) !== 'commit') throw new Error('remote tip is not a commit');
+          stage = 'reading remote main baseline';
+          // A lane's tracking ref can predate the main commit this batch was built on.
+          // Pin the advertised remote main without changing lane refs or FETCH_HEAD.
+          const mainRef = 'refs/heads/main';
+          const mainFields = run(['ls-remote', '--exit-code', '--refs', remote, mainRef]).split(/\s+/);
+          if (mainFields.length !== 2 || mainFields[1] !== mainRef) throw new Error('incomplete remote main evidence');
+          const remoteMain = sha(mainFields[0]);
+          run(['fetch', '--no-tags', '--no-write-fetch-head', remote, remoteMain]);
           stage = 'validating remote batch history';
-          // Main can advance independently during the day. Validate only the batch side
-          // of its shared history; --all plus sha() refuses missing or ambiguous ancestors.
-          const batchBaseline = sha(run(['merge-base', '--all', baseline, base]));
-          const paths = run(['diff', '--name-only', '-z', batchBaseline, base], undefined, true).split('\0').filter(Boolean);
+          // Validate every batch commit: a tip-only diff hides reverted private content.
+          // Card publication creates a linear chain; refuse merges rather than overlooking
+          // side-parent history. --all plus sha() refuses missing or ambiguous ancestors.
+          const batchBaseline = sha(run(['merge-base', '--all', remoteMain, base]));
+          const range = `${batchBaseline}..${base}`;
+          if (run(['rev-list', '--min-parents=2', '--max-count=1', range])) {
+            throw new Error('remote batch contains merge commits');
+          }
+          const paths = run(['log', '--format=', '--name-only', '--no-renames', '-z', range], undefined, true)
+            .split('\0').filter(Boolean);
           if (paths.some(path => !/^backlog\/[^/\\\x00-\x1f]+\.md$/.test(path))) {
             throw new Error('remote batch contains non-card changes');
           }

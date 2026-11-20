@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCardBranchSink, createFileItemSinks } from '../file-item-io.mjs';
@@ -16,7 +16,7 @@ const EFFECT = 'file-item.card-branch';
 const now = () => new Date('2026-11-20T23:30:00-05:00');
 const ref = 'refs/heads/lane/card-batch-2026-11-21';
 const dirs = [];
-afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); vi.useRealTimers(); dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'file-item-card-branch-'));
@@ -71,6 +71,123 @@ async function file(ctx, title = 'Preserve worker discoveries', input = {}) {
 const remote = (ctx, args) => ctx.git(['--git-dir', ctx.origin, ...args]);
 
 describe('file-item durable card branch (real bare origin, no network)', () => {
+  it.each(['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'])(
+    'ignores inherited Git repository, object and index overrides: %s', async key => {
+      const ctx = fixture();
+      const decoy = fixture();
+      const head = ctx.git(['rev-parse', 'HEAD']);
+      const laneIndex = readFileSync(join(ctx.lane, '.git/index'));
+      const decoyIndex = readFileSync(join(decoy.lane, '.git/index'));
+      const decoyObjects = readdirSync(join(decoy.lane, '.git/objects'), { recursive: true });
+      const rel = 'backlog/isolated-card.md';
+      const content = 'Retain isolated publication';
+      writeFileSync(join(ctx.lane, rel), content);
+      const value = key === 'GIT_WORK_TREE' ? decoy.lane
+        : key === 'GIT_INDEX_FILE' ? join(decoy.lane, '.git/index')
+          : key.includes('OBJECT') ? join(decoy.lane, '.git/objects') : join(decoy.lane, '.git');
+      let calls = 0;
+      const git = (args, options) => {
+        calls++;
+        if (key === 'GIT_INDEX_FILE') {
+          expect(options.env[key]).not.toBe(value);
+          expect(options.env[key]).not.toBe(join(ctx.lane, '.git/index'));
+        } else expect(options.env).not.toHaveProperty(key);
+        return execFileSync('git', args, options);
+      };
+      vi.stubEnv(key, value);
+      const result = await createCardBranchSink({ root: ctx.lane, git })({ rel, content, batchDate: '2026-11-21' });
+      vi.unstubAllEnvs();
+      expect(result.pushed).toBe(true);
+      expect(calls).toBeGreaterThan(0);
+      expect(remote(ctx, ['show', `${ref}:${rel}`])).toBe(content);
+      expect(ctx.git(['rev-parse', 'HEAD'])).toBe(head);
+      expect(readFileSync(join(ctx.lane, '.git/index'))).toEqual(laneIndex);
+      expect(readFileSync(join(decoy.lane, '.git/index'))).toEqual(decoyIndex);
+      expect(readdirSync(join(decoy.lane, '.git/objects'), { recursive: true })).toEqual(decoyObjects);
+      expect(remote(decoy, ['for-each-ref', '--format=%(refname)', 'refs/heads/lane/'])).toBe('');
+    },
+  );
+
+  it('publishes a worker-filed card to origin within sixty seconds', async () => {
+    const ctx = fixture();
+    const started = performance.now();
+    const { card, result } = await file(ctx);
+    expect(remote(ctx, ['show', `${ref}:${card}`])).toContain('Retain');
+    expect(result.pushed).toBe(true);
+    expect(performance.now() - started).toBeLessThan(60_000);
+  }, 60_000);
+
+  it('appends when the lane origin/main is older than the remote batch baseline', async () => {
+    const ctx = fixture();
+    const oldMain = ctx.git(['rev-parse', 'origin/main']);
+    const writer = join(ctx.dir, 'newer-main');
+    ctx.git(['clone', ctx.origin, writer]);
+    writeFileSync(join(writer, 'main-only.txt'), 'Newer main content');
+    ctx.git(['add', 'main-only.txt'], { cwd: writer });
+    ctx.git(['commit', '-m', 'Advance main'], { cwd: writer });
+    ctx.git(['push', 'origin', 'HEAD:main'], { cwd: writer });
+    ctx.git(['fetch', 'origin', 'main']);
+    const first = await file(ctx);
+    ctx.git(['update-ref', 'refs/remotes/origin/main', oldMain]);
+    const second = await file(ctx, 'Card from stale lane');
+    expect(second.result.pushed).toBe(true);
+    expect(remote(ctx, ['show', `${ref}:${first.card}`])).toContain('Retain');
+    expect(remote(ctx, ['show', `${ref}:${second.card}`])).toContain('Retain');
+    expect(ctx.git(['rev-parse', 'origin/main'])).toBe(oldMain);
+  });
+
+  it('refuses a batch with a reverted non-card addition in its intermediate history', async () => {
+    const ctx = fixture();
+    const main = ctx.git(['rev-parse', 'origin/main']);
+    const unsafeTree = ctx.git(['rev-parse', 'HEAD^{tree}']);
+    const unsafe = ctx.git(['commit-tree', unsafeTree, '-p', main, '-m', 'Private content']);
+    const tip = ctx.git(['commit-tree', ctx.git(['rev-parse', `${main}^{tree}`]), '-p', unsafe, '-m', 'Revert private content']);
+    ctx.git(['push', 'origin', `${tip}:${ref}`]);
+    const { card, result } = await file(ctx);
+    expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/validating remote batch history/) });
+    expect(remote(ctx, ['rev-parse', ref])).toBe(tip);
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+  });
+
+  it('refuses a batch merge whose unchanged first-parent tree hides private side-parent history', async () => {
+    const ctx = fixture();
+    const main = ctx.git(['rev-parse', 'origin/main']);
+    const tree = ctx.git(['rev-parse', `${main}^{tree}`]);
+    const safe = ctx.git(['commit-tree', tree, '-p', main, '-m', 'Empty batch commit']);
+    const tip = ctx.git(['commit-tree', tree, '-p', safe, '-p', ctx.git(['rev-parse', 'HEAD']), '-m', 'Hide private side parent']);
+    ctx.git(['push', 'origin', `${tip}:${ref}`]);
+    const { card, result } = await file(ctx);
+    expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/validating remote batch history/) });
+    expect(remote(ctx, ['rev-parse', ref])).toBe(tip);
+    expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+  });
+
+  it.each(['missing', 'malformed', 'unreadable', 'unfetchable'])(
+    'refuses %s remote main evidence without changing the existing batch', async kind => {
+      const ctx = fixture();
+      const first = await file(ctx);
+      const main = ctx.git(['rev-parse', 'origin/main']);
+      let pushes = 0;
+      const git = (args, options) => {
+        if (args.includes('ls-remote') && args.at(-1) === 'refs/heads/main') {
+          if (kind === 'missing') throw Object.assign(new Error('missing main'), { status: 2, stdout: '' });
+          if (kind === 'unreadable') throw Object.assign(new Error('unreadable main'), { status: 128 });
+          if (kind === 'malformed') return `${main}\trefs/heads/other`;
+        }
+        if (kind === 'unfetchable' && args.includes('fetch') && args.at(-1) === main) throw new Error('main fetch failed');
+        if (args.includes('push')) pushes++;
+        return execFileSync('git', args, options);
+      };
+      ctx.sinks[EFFECT] = createCardBranchSink({ root: ctx.lane, git });
+      const { card, result } = await file(ctx, 'Retain card with unknown main');
+      expect(result).toMatchObject({ pushed: false, warning: expect.stringMatching(/reading remote main baseline/) });
+      expect(pushes).toBe(0);
+      expect(remote(ctx, ['rev-parse', ref])).toBe(first.result.sha);
+      expect(readFileSync(join(ctx.lane, card), 'utf8')).toContain('Retain');
+    },
+  );
+
   it('publishes after writing and clearing, with UTC date and untouched lane branch, HEAD and index', async () => {
     const ctx = fixture();
     const head = ctx.git(['rev-parse', 'HEAD']);
@@ -385,7 +502,7 @@ describe('file-item durable card branch (real bare origin, no network)', () => {
     await file(ctx);
     let pushes = 0;
     const git = (args, options) => {
-      if (args.includes('diff')) {
+      if (args.includes('log')) {
         expect(options.maxBuffer).toBe(1024 * 1024);
         throw Object.assign(new Error('output exceeded maxBuffer'), { code: 'ENOBUFS' });
       }
