@@ -11,7 +11,7 @@ import { readOverlayState } from '../lib/daemon-overlays.mjs';
 import { retireRegistration, recoverDrops } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
 import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
-import { ciGatePlan, urgentLedger, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
+import { ciGatePlan, urgentLedger, normalizeUrgentRepo, resolveOriginRepo, canonicalUrgentRepo } from './urgent-verify-marker.mjs';
 import { readHotPatchVetoPolicy, hotPatchIgnoresCheck, DEFAULT_VETO_IGNORE_CHECKS } from './prototype-load-io.mjs';
 import { writeEscalationPacket } from './land-advance-escalations.mjs';
 
@@ -96,10 +96,14 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
       } catch { return { ...data, workflows: null }; }
     },
     pr: r => {
-      if (!Number.isSafeInteger(r.hotPatch?.pr) || r.hotPatch.pr <= 0
-        || normalizeUrgentRepo(r.repo) !== 'https://github.com/web-everything/web-everything')
-        throw Error('unreadable hot-patch PR identity; repair urgent-loads evidence');
       const childEnv = { ...env }; delete childEnv.GH_REPO; delete childEnv.GH_HOST;
+      try {
+        if (!Number.isSafeInteger(r.hotPatch?.pr) || r.hotPatch.pr <= 0
+          || resolveOriginRepo(r.repo, {
+            gh: (args, options) => ghExec('gh', args, { ...options, cwd: r.clone, env: childEnv,
+              throttle: { caller: 'urgent-sweep', exec: (a, o) => exec('gh', a, o) } }),
+          }) !== canonicalUrgentRepo) throw Error('canonical PR repository required');
+      } catch { throw Error('unreadable hot-patch PR identity; repair urgent-loads evidence'); }
       return JSON.parse(String(ghExec('gh', ['api', `repos/web-everything/web-everything/pulls/${r.hotPatch.pr}`],
         { cwd: r.clone, env: childEnv, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
           throttle: { caller: 'urgent-sweep', exec: (a, o) => exec('gh', a, o) } })));

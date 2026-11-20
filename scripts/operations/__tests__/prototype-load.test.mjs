@@ -3679,10 +3679,14 @@ describe('hot-patch urgent admission (R1100)', () => {
     let originalRead;
     const combinedIO = { fs: {}, handles: (cmd, args) => cmd === 'gh' || cmd === 'git' && args[0] === 'remote',
       exec: (cmd, args) => {
-        if (cmd === 'git') return `https://github.com/${repo}.git\n`;
+        if (cmd === 'git') return change.origin ?? `https://github.com/${repo}.git\n`;
         gh.push(args);
         const path = args.find(a => a.startsWith('repos/'));
         if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: repo, url: `https://github.com/${repo}` });
+        if (args.at(-1) === '.full_name') {
+          if (change.originFailure) throw Error('API unavailable');
+          return change.resolvedOrigin ?? repo;
+        }
         if (path?.includes('/check-runs')) {
           const current = ++checkReads > 1 ? change.finalRows ?? rows : rows;
           return JSON.stringify({ total_count: current.length, check_runs: current });
@@ -3706,6 +3710,18 @@ describe('hot-patch urgent admission (R1100)', () => {
     f.fs.readFileSync = (p, ...args) => p.includes('/coordination/') ? lockFs.readFileSync(redirect(p), ...args) : originalRead(p, ...args);
     return { ...f, gh, run: (input = {}) => f.run({ branch, urgent: true, reason: 'R1100 hot-patch PR #42', ...input }) };
   }
+  it('accepts a renamed SSH origin resolved by GitHub', async () => {
+    const f = hotFixture({ origin: 'git@github.com:chalbert/web-everything.git' });
+    expect(await f.run()).toMatchObject({ ok: true });
+    expect(f.gh.filter(args => args.at(-1) === '.full_name')).toHaveLength(1);
+  });
+  it.each([
+    ['foreign', 'evil/fork', false], ['unavailable', undefined, true], ['empty', '', false],
+  ])('refuses %s resolved origin evidence', async (owner, resolvedOrigin, originFailure) => {
+    const f = hotFixture({ origin: `https://github.com/${owner}/web-everything`, resolvedOrigin, originFailure });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-pr-protection' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
   const vetoRun = (name, id, conclusion = 'failure') => ({ id, head_sha: SHA, name, status: 'completed', conclusion,
     app: { id: 15368 }, check_suite: { id: 7 } });
   const pendingTest = () => ({ ...vetoRun('test', 1), status: 'in_progress', conclusion: null });

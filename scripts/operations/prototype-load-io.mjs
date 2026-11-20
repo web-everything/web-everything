@@ -43,7 +43,7 @@ import { safeRef, safeRegistrationRef, validSha, jsonLines, testCheckEvidence, t
 import { DISPATCH_PATH_DEFAULTS, matchDispatchPaths, runRealDispatchSmoke } from '../lib/daemon-load-overlay.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './prototype-retire.mjs';
-import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo } from './urgent-verify-marker.mjs';
+import { ciUnitPlan, urgentLedger, urgentMarker, urgentReason, urgentKeyPath, normalizeUrgentRepo, resolveOriginRepo, canonicalUrgentRepo } from './urgent-verify-marker.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
 // Per-test, hook and teardown bounds mitigate a shell-backed runner outliving its wrapper.
@@ -695,7 +695,11 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
       const readHotPatchPr = async () => {
-        if (normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')) !== 'https://github.com/web-everything/web-everything') throw Error('canonical PR repository required');
+        const resolved = resolveOriginRepo(requireGit('remote', 'get-url', 'origin'), {
+          gh: (args, options) => execFileSyncThrottled('gh', args, { ...options, cwd: gitRepo, env: childEnv,
+            throttle: { caller: 'prototype-load', ...(exec !== execFileSync ? { exec: (a, o) => exec('gh', a, o) } : {}) } }),
+        });
+        if (resolved !== canonicalUrgentRepo) throw Error('canonical PR repository required');
         const prs = await hotGh(['api', `repos/web-everything/web-everything/commits/${input.sha}/pulls`, '--repo', 'web-everything/web-everything']);
         if (!Array.isArray(prs) || prs.length !== 1) throw Error('exactly one open PR required');
         const pr = prs[0];

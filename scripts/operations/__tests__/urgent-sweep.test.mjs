@@ -1026,6 +1026,26 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.pr = vi.fn(() => openPr());
     return f;
   }
+  it('reads a hot-patch PR from a renamed recorded origin', () => {
+    const ghExec = vi.fn((cmd, args, options) => {
+      expect(options.env).not.toHaveProperty('GH_REPO');
+      expect(options.env).not.toHaveProperty('GH_HOST');
+      return args.at(-1) === '.full_name' ? 'web-everything/web-everything\n' : JSON.stringify(openPr());
+    });
+    const deps = createSweepDeps({ ghExec, env: { GH_REPO: 'evil/fork', GH_HOST: 'evil.example' } });
+    expect(deps.pr({ ...load, repo: 'https://github.com/sweep-renamed/web-everything.git', hotPatch: { pr: 42 } })).toEqual(openPr());
+    expect(ghExec.mock.calls[0][1]).toEqual(['api', 'repos/sweep-renamed/web-everything', '-q', '.full_name']);
+  });
+  it.each(['foreign', 'failure', 'empty'])('refuses %s recorded origin resolution before reading the PR', kind => {
+    const ghExec = vi.fn(() => {
+      if (kind === 'failure') throw Error('API unavailable');
+      return kind === 'empty' ? '' : 'evil/fork';
+    });
+    const deps = createSweepDeps({ ghExec });
+    expect(() => deps.pr({ ...load, repo: `git@github.com:sweep-${kind}/web-everything.git`, hotPatch: { pr: 42 } }))
+      .toThrow('unreadable hot-patch PR identity');
+    expect(ghExec).toHaveBeenCalledTimes(1);
+  });
   it.each(['test', 'unknown-job', 'review-gatekeeper', 'prefix-review-gate'])('unloads review-gate red plus failing %s', async name => {
     const f = hotFixture([...required.map(n => check(n)), check('review-gate', 'failure'), check(name, 'failure')]);
     decisionBeforeRemoval(f, 'ci-failed');
