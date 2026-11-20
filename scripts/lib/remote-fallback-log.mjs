@@ -12,6 +12,10 @@ import { refineKind, holderLabel } from '../readiness/heavy-queue-projection.mjs
 const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
+export function unloggedPathReason(caller) {
+  return `unlogged-path:${typeof caller === 'string' && caller.trim() ? bounded(caller.trim()) : 'unknown'}`;
+}
+
 export const ADVISORY_REASONS = new Set(['credential-warn']);
 /** R830/R823: the exact reasons heavy-admission logs for a run that is local by design. Each is a reason, not a failed
  *  remote attempt. Any other reason (a failed load read, an unrouted run, an unknown `local-*`) stays a visible real cause. */

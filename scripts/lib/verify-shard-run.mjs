@@ -12,6 +12,7 @@ export { SHARD_UNSETTLED_EXIT } from './verify-exit-codes.mjs';
 import { startTreeWatchdog } from './tree-watchdog.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { routeNeedsGit } from '../readiness/needs-git-route.mjs';
+import { recordLocalSlotFallback, unloggedPathReason } from './remote-fallback-log.mjs';
 import { acquireSlotBlocking, MAX_RUN_WAIT_MS, releaseOwnedSlot, admissionLockRoot, resolveCap, ADMISSION_HELD_ENV } from '../readiness/heavy-admission.mjs';
 
 const positive = n => Number.isSafeInteger(n) && n > 0;
@@ -137,10 +138,18 @@ export function executeShard({ command, args, env, cwd, timeoutMs, prefix, log, 
   });
 }
 
-async function acquireLocalDefault({ cwd, env, remainingMs }) {
+export async function acquireLocalDefault({ cwd, env, remainingMs }, {
+  acquireSlotBlocking: acquire = acquireSlotBlocking, recordLocalSlotFallback: recordFallback = recordLocalSlotFallback,
+} = {}) {
   const options = { lockRoot: admissionLockRoot(cwd, env), cap: resolveCap(env, cwd), owner: cwd };
-  const acquired = await acquireSlotBlocking({ ...options, env, kind: 'vitest', ceilingMs: remainingMs,
+  const acquired = await acquire({ ...options, env, kind: 'vitest', ceilingMs: remainingMs,
     canDefer: true, waitMs: remainingMs, log: m => process.stderr.write(m) });
+  if (acquired.ok) {
+    try {
+      recordFallback({ lockRoot: options.lockRoot, reason: unloggedPathReason('verify-shard-run'),
+        detail: 'shard vitest takes a local slot', repo: cwd, kind: 'vitest' });
+    } catch { /* Logging must never change slot acquisition or routing. */ }
+  }
   return { ...acquired, options };
 }
 
