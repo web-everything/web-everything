@@ -72,18 +72,18 @@ async function probeHydration(root) {
     baseRefName: 'main', labels: ['review:pending'], comments: [], mergeStateStatus: 'CLEAN',
     statusCheckRollup: rows, rowsComplete: true, rowsHead: HEAD };
   const violations = [];
-  for (const shape of ['complete', 'truncated', 'unreadable-status']) {
+  for (const shape of ['complete', 'truncated', 'unreadable-status', 'short-feed']) {
     let reads = 0;
     const plan = runReconcilePass({ ...options,
       readPrs: () => [{ ...pr, rowsComplete: shape === 'complete' }],
       readChecks: args => defaultReadChecks(args, { exec: (_file, argv) => {
         reads++;
-        if (argv.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ total_count: 100, check_runs: rows }]);
+        if (argv.some(arg => arg.includes('/check-runs'))) return JSON.stringify([{ total_count: shape === 'short-feed' ? 150 : 100, check_runs: rows }]);
         if (shape === 'unreadable-status') throw new Error('status page unavailable');
         return JSON.stringify([{ total_count: 0, statuses: [] }]);
       } }),
     });
-    const expected = shape === 'unreadable-status' ? 0 : 1;
+    const expected = ['unreadable-status', 'short-feed'].includes(shape) ? 0 : 1;
     if (plan.dispatch.filter(d => d.kind === 'review').length !== expected) violations.push(`${shape} 100-row rollup: expected ${expected} reviews`);
     if (reads !== (shape === 'complete' ? 0 : 2)) violations.push(`${shape} 100-row rollup: unexpected hydration read count ${reads}`);
   }
