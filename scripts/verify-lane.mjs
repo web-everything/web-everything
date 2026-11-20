@@ -37,7 +37,7 @@
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs --local              # force every heavy phase to run on THIS host (like `heavy-admission run --local`); marker records local:true. As valid as a remote verify: same suites.
- *     Selected sharded gates keep the shard wrapper (and its executed-file completeness check); every shard runs locally, one at a time, under the parent admission slot.
+ *     Selected sharded gates keep the shard wrapper (and its executed-file completeness check); every shard runs locally, one at a time, under the parent admission slot (refused if admission timed out).
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
  *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
@@ -781,9 +781,8 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
     delete childEnv.WE_FORGE_GATE_DISPATCH;
     childEnv[ADMISSION_HELD_ENV] = '1';
   }
-  // --local: a shard wrapper keeps its inventory check but runs every shard here, under the held slot.
-  if (FORCE_LOCAL) childEnv[SHARD_LOCAL_ENV] = '1';
-  else delete childEnv[SHARD_LOCAL_ENV];
+  // Never inherit forced-local shard routing; --local scopes it to each validated wrapper (timedRunGate).
+  delete childEnv[SHARD_LOCAL_ENV];
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
   const outputTail = createOutputTail();
@@ -906,7 +905,7 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       // Default-gate equivalence deliberately recognizes only generated absolute paths. Local policy
       // must also handle user-supplied relative paths and shell quoting, in every && segment.
       // Shards route through their own admission unless SHARD_LOCAL_ENV reaches them, so only a literal,
-      // unprefixed wrapper (which inherits runGate's env) may run. Never interpret expansions to guess one.
+      // unprefixed wrapper (given a scoped assignment below) may run. Never interpret expansions to guess one.
       const token = /[ \t]+|&&|(?:[^\s'"\\;&|<>$`()#]|'[^']*'|"(?:[^"\\$`]|\\[^\r\n])*"|\\[^\r\n])+/gy;
       const unquote = word => word.replace(/'([^']*)'|"((?:[^"\\]|\\.)*)"|\\(.)/gs,
         (_match, single, double, escaped) => single ?? (double !== undefined ? double.replace(/\\(["\\$`])/g, '$1') : escaped));
@@ -922,8 +921,8 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
       if (offset !== command.length) {
         if (command.includes('verify-shard-run.mjs') || segments.flat().some(t => t.value.includes('verify-shard-run.mjs'))) refusal();
       } else {
-        // Only executable positions count: a quoted test name or echo argument containing
-        // wrapper text is data, never a wrapper to validate.
+        // Apply edits from the end so earlier token offsets remain valid. Only executable positions
+        // count: a quoted test name or echo argument containing wrapper text is data, never edited.
         const commands = segments.reverse().map(words => ({ words, depth: 0 }));
         for (const { words, depth } of commands) {
           const start = words.findIndex(t => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t.value));
@@ -970,8 +969,11 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
           if (keys.length !== 3 || keys.some(key => !key) || new Set(keys).size !== 3
             || words[scriptIndex + 4]?.value !== '--'
             || words.slice(scriptIndex + 5, scriptIndex + 8).map(t => t.value).join(' ') !== 'npx vitest run') refusal();
-          // Run the validated wrapper unchanged: it owns the executed-file completeness check, split retry
-          // and budget. runGate's SHARD_LOCAL_ENV keeps every shard on this host under the held slot.
+          // Keep the validated wrapper: it owns the executed-file completeness check, split retry and
+          // budget. A scoped SHARD_LOCAL_ENV assignment keeps its shards on this host under our slot,
+          // so it requires a slot we actually hold; without one the wrapper would route on its own.
+          if (!currentAdmission.ok) throw new Error('verify-lane: --local shard wrapper needs a held admission slot, but admission timed out; retry when capacity frees');
+          plan.command = `${plan.command.slice(0, words[start].start)}${SHARD_LOCAL_ENV}=1 ${plan.command.slice(words[start].start)}`;
         }
       }
       plan.takeLocalSlot = true;

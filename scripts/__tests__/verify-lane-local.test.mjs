@@ -30,6 +30,9 @@ const shardPathVariants = [
   'scripts/../scripts/lib/verify-shard-run.mjs',
 ];
 const relativeShard = `node scripts/lib/verify-shard-run.mjs --shards=2 --parallel=2 --budget-ms=60000 -- ${selectedTests}`;
+// --local keeps a validated wrapper whole and scopes forced-local routing to that one command.
+const kept = command => `WE_VERIFY_SHARD_LOCAL=1 ${command}`;
+const findingScenario = 'node scripts/lib/verify-shard-run.mjs --shards=2 --parallel=2 --budget-ms=60000 -- npx vitest run scripts/lib/__tests__/verify-selection-log.test.mjs scripts/__tests__/stdout-flush.test.mjs --passWithNoTests';
 const commandShapes = [
   ['npm', 'npm run test:unit -- a.test.mjs'],
   ['vitest', selectedTests],
@@ -41,7 +44,7 @@ const commandShapes = [
   ]),
   ['standards separate file argument is data', "npm run check:standards -- --local --files 'scripts/lib/verify-shard-run.mjs'"],
   ['standards file list is data', "npm run check:standards -- --local --files='scripts/a.mjs,scripts/lib/verify-shard-run.mjs'"],
-  ['standards input before shard execution', `npm run check:standards -- --local --files='scripts/lib/verify-shard-run.mjs' && ${relativeShard}`],
+  ['standards input before shard execution', `npm run check:standards -- --local --files='scripts/lib/verify-shard-run.mjs' && ${relativeShard}`, `npm run check:standards -- --local --files='scripts/lib/verify-shard-run.mjs' && ${kept(relativeShard)}`],
   ['assigned standards input is data', "CI=1 npm run check:standards -- --local --files='scripts/lib/verify-shard-run.mjs'"],
   ['vitest related shard input is data', "npx vitest related 'scripts/lib/verify-shard-run.mjs' --run"],
   ['npm test shard input is data', "npm run test:unit -- 'scripts/lib/verify-shard-run.mjs.test.mjs'"],
@@ -75,15 +78,19 @@ const commandShapes = [
   ]),
   ['nested admission shard input is data', "node scripts/readiness/heavy-admission.mjs run -- npx vitest related scripts/lib/verify-shard-run.mjs --run"],
   ['nested admission standards input is data', "node scripts/readiness/heavy-admission.mjs run -- npm run check:standards -- --files='scripts/lib/verify-shard-run.mjs'"],
-  // A validated wrapper runs unchanged: it keeps its inventory completeness check and runs locally via the env.
-  ['shard wrapper', shardCommand],
+  // A validated wrapper is kept whole (its inventory completeness check still applies) and runs locally.
+  ['shard wrapper', shardCommand, kept(shardCommand)],
   ...shardPathVariants.map(path => [
     `shard path ${path}`, `node ${path} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`,
+    kept(`node ${path} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`),
   ]),
-  ['relative shard after standards', `npm run check:standards && ${relativeShard}`],
-  ['two shard wrappers', `${relativeShard} && ${shardCommand}`],
-  ['reordered shard options and tabs', `node\t./scripts/lib/verify-shard-run.mjs\t--budget-ms=1000 --parallel=2 --shards=2 -- ${selectedTests}`],
-  ['node option terminator', relativeShard.replace('node ', 'node -- ')],
+  ['relative shard after standards', `npm run check:standards && ${relativeShard}`, `npm run check:standards && ${kept(relativeShard)}`],
+  ['two shard wrappers', `${relativeShard} && ${shardCommand}`, `${kept(relativeShard)} && ${kept(shardCommand)}`],
+  ['reordered shard options and tabs', `node\t./scripts/lib/verify-shard-run.mjs\t--budget-ms=1000 --parallel=2 --shards=2 -- ${selectedTests}`,
+    kept(`node\t./scripts/lib/verify-shard-run.mjs\t--budget-ms=1000 --parallel=2 --shards=2 -- ${selectedTests}`)],
+  ['node option terminator', relativeShard.replace('node ', 'node -- '), kept(relativeShard.replace('node ', 'node -- '))],
+  ['leading assignment keeps the scoped local route', `CI=1 ${relativeShard}`, `CI=1 ${kept(relativeShard)}`],
+  ['caller-set shard env is overridden by the scoped route', `WE_VERIFY_SHARD_LOCAL=0 ${relativeShard}`, `WE_VERIFY_SHARD_LOCAL=0 ${kept(relativeShard)}`],
   ...[
     'env', 'command', '/usr/bin/env', 'env --', 'env -i',
     'env WE_HEAVY_ADMISSION_HELD=0', 'command -p', 'command env',
@@ -101,9 +108,10 @@ const commandShapes = [
   ['relative shard malformed options', relativeShard.replace('--parallel=2', '--parallel=bad'), null],
   ['dynamic shard path refuses local execution', `node "$PWD/scripts/lib/verify-shard-run.mjs" --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`, null],
   ['quoted wrapper text stays an argument', `echo '${relativeShard.replaceAll("'", '')}'`],
-  ['whole gate with shard wrapper', `${shardCommand} && npm run check:standards`],
-  ['shard wrapper from quoted requester checkout', `node ${shellQuote("/tmp/requester's -- npx vitest run checkout/scripts/lib/verify-shard-run.mjs")} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`],
-  ['finding scenario: partial execution keeps the wrapper', `node scripts/lib/verify-shard-run.mjs --shards=2 --parallel=2 --budget-ms=60000 -- npx vitest run scripts/lib/__tests__/verify-selection-log.test.mjs scripts/__tests__/stdout-flush.test.mjs --passWithNoTests`],
+  ['whole gate with shard wrapper', `${shardCommand} && npm run check:standards`, `${kept(shardCommand)} && npm run check:standards`],
+  ['shard wrapper from quoted requester checkout', `node ${shellQuote("/tmp/requester's -- npx vitest run checkout/scripts/lib/verify-shard-run.mjs")} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`,
+    kept(`node ${shellQuote("/tmp/requester's -- npx vitest run checkout/scripts/lib/verify-shard-run.mjs")} --shards=2 --parallel=2 --budget-ms=1000 -- ${selectedTests}`)],
+  ['finding scenario: partial execution keeps the wrapper', findingScenario, kept(findingScenario)],
   ['scan', "VERIFY_SCAN_FILES='scripts/a.mjs' npx vitest run scripts/scan.test.mjs"],
   ['empty selection', "echo 'verify-lane: no remaining changed file'"],
   ['unsupported shard command refuses local execution', unsupportedShardCommand],
@@ -233,7 +241,8 @@ describe('verify-lane --local', () => {
   });
 
   it.each(commandShapes)('CLI --local preserves suites and bypasses Forge while default routing remains unchanged: %s', async (_shape, command, localCommand = command) => {
-    for (const local of [false, true]) {
+    // slotOk=false: admission timed out and verify-lane proceeds unslotted.
+    for (const [local, slotOk] of [[false, true], [true, true], [true, false]]) {
       const spawn = vi.fn(() => {
         const child = new EventEmitter();
         child.stdout = new PassThrough();
@@ -248,7 +257,7 @@ describe('verify-lane --local', () => {
         isShardWrapperCommand,
         shouldConfirmRemoteRed, remoteInfrastructureFailure,
         decidePhaseRemote: vi.fn(async () => ({ remote: true, reason: 'test-remote-policy' })),
-        acquireSlotBlocking: vi.fn(async () => ({ ok: true, slot: 0, waitedMs: 0 })),
+        acquireSlotBlocking: vi.fn(async () => (slotOk ? { ok: true, slot: 0, waitedMs: 0 } : { ok: false, timedOut: true, waitedMs: 1000 })),
         recordLocalSlotFallback: vi.fn(), phaseAdmissionKind: () => ({ kind: 'files' }),
         classifyCommandKind: () => 'selected', admissionPhases: {}, laneMatch: null,
         GATE: command, resolvedGate: { decision: {} }, ADMISSION_TIMEOUT_MS: 1000,
@@ -280,7 +289,13 @@ describe('verify-lane --local', () => {
       if (local && (command === unsupportedShardCommand || localCommand === null)) {
         await expect(timedRunGate('vitestMs', command)).rejects.toThrow('--local requires a selected Vitest command');
         expect(spawn).not.toHaveBeenCalled();
-        expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+        if (slotOk) expect(context.releaseOwnedSlot).toHaveBeenCalledTimes(1);
+        continue;
+      }
+      if (local && !slotOk && localCommand.includes(kept(''))) {
+        // Without a held slot the scoped local route would be a false claim; the wrapper would route alone.
+        await expect(timedRunGate('vitestMs', command)).rejects.toThrow('--local shard wrapper needs a held admission slot');
+        expect(spawn).not.toHaveBeenCalled();
         continue;
       }
       const result = await timedRunGate('vitestMs', command);
@@ -288,7 +303,7 @@ describe('verify-lane --local', () => {
       expect(spawn).toHaveBeenCalledTimes(1);
       const [executed, args, options] = spawn.mock.calls[0];
       if (local) {
-        expect(context.admission.ok).toBe(true);
+        expect(context.admission.ok).toBe(slotOk);
         expect(context.admission.remote).not.toBe(true);
         expect(context.acquireSlotBlocking).toHaveBeenCalledTimes(1);
         expect(context.decidePhaseRemote).not.toHaveBeenCalled();
@@ -297,8 +312,8 @@ describe('verify-lane --local', () => {
         expect(args).toEqual([]);
         expect(options.env).not.toHaveProperty('WE_FORGE_GATE_DISPATCH');
         expect(options.env.WE_HEAVY_ADMISSION_HELD).toBe('1');
-        // Any shard wrapper in the gate runs on this host under the held slot (verify-shard-run reads it).
-        expect(options.env[SHARD_LOCAL_ENV]).toBe('1');
+        // Forced-local shard routing is scoped to each kept wrapper, never inherited by other commands.
+        expect(options.env).not.toHaveProperty(SHARD_LOCAL_ENV);
         expect(result.remoteAttempt).toBe(false);
         expect(result.ranOn.location).toBe('local');
         // Also defend the execution boundary against a stale remote admission or confirmation request.

@@ -771,6 +771,8 @@ describe('forced local shards (verify-lane --local)', () => {
       expect(call.args.slice(0, 2)).toEqual(['vitest', 'run']);
       expect(call.args.join(' ')).not.toContain('heavy-admission');
       expect(call.env.WE_HEAVY_ADMISSION_HELD).toBe('1');
+      // Vitest workers must not inherit forced-local routing (tests calling runShards use process.env).
+      expect(call.env).not.toHaveProperty(SHARD_LOCAL_ENV);
     }
   });
 

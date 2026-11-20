@@ -213,6 +213,8 @@ export async function runShards({ argv, shards: count, parallel, budgetMs }, dep
         // `npx vitest` / `npm run` put node_modules/.bin on PATH for the shell; a bare node child does not.
         const childEnv = { ...env, WE_VERIFY_REMOTE_REPORT: remoteReport, PATH: `${join(cwd, 'node_modules', '.bin')}:${env.PATH ?? ''}` };
         delete childEnv[ADMISSION_HELD_ENV];
+        // forceLocal is decided once above; never leak it into Vitest workers (tests that call runShards).
+        delete childEnv[SHARD_LOCAL_ENV];
         let lastResult = null, observedFailure = false, loadDeferred = false;
         let observedUnsettledExit = false, retryReportsPassed = true;
         async function attempt(local, attemptFiles = files, retry = '') {
