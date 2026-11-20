@@ -78,11 +78,14 @@ test('checklist-7: unknown, oversized and malformed classifier evidence refuses 
 test('settings use cascade provenance and retain never-patch floor', fixture(({ env }) => {
   writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ hotPatch: { ticks: 12, wake: false } }));
   const logs = [];
-  const settings = resolveHotPatchSettings({ env: { ...env, WE_HOT_PATCH: '{"ticks":14,"queueExemptionMinutes":60}', WE_POLICY_CASCADE_LOG: '1' },
+  const settings = resolveHotPatchSettings({ env: { ...env, WE_HOT_PATCH: '{"ticks":14,"queueExemptionMinutes":60,"ciUnknownMaxTicks":4}', WE_POLICY_CASCADE_LOG: '1' },
     tool: { owedPrMinutes: 30, neverPatchPaths: ['extra/**'] }, log: line => logs.push(line) });
   assert.equal(settings.ticks, 14); assert.equal(settings.wake, false); assert.equal(settings.owedPrMinutes, 30);
   assert(settings.neverPatchPaths.includes('extra/**')); assert(settings.neverPatchPaths.includes('scripts/guard-*'));
   assert.match(logs.join('\n'), /ticks=14.*env/);
+  assert.equal(settings.ciUnknownMaxTicks, 4);
+  assert.match(logs.join('\n'), /ciUnknownMaxTicks=4.*env/);
+  assert.equal(hotPatchDefaults.ciUnknownMaxTicks, 6);
   assert.equal(hotPatchDefaults.queueExemptionMinutes, 120);
   assert.equal(settings.queueExemptionMinutes, 60);
   assert.match(logs.join('\n'), /queueExemptionMinutes=60.*env/);
@@ -127,7 +130,8 @@ test('matching smoke pass arms 10 ticks AND 15 minutes; old force records still 
   let watch = readForceWatch(root, env);
   assert.equal(watch.ticksLeft, 10); assert.equal(Date.parse(watch.minUntil), at + 15 * 60000);
   for (let i = 0; i < 12; i++) { const v = evaluateForceWatch({ watch, healthy: true, now: at + i }); assert.equal(v.action, 'continue'); watch = v.watch; }
-  assert.equal(evaluateForceWatch({ watch, healthy: true, now: at + 15 * 60000 }).action, 'done');
+  assert.equal(evaluateForceWatch({ watch, healthy: true, now: at + 15 * 60000 }).action, 'continue');
+  assert.equal(evaluateForceWatch({ watch: { ...watch, ciState: 'green' }, healthy: true, now: at + 15 * 60000 }).action, 'done');
   assert.equal(evaluateForceWatch({ watch: { ticksLeft: 2 }, healthy: true, now: at + 10000000 }).action, 'continue');
   assert.equal(evaluateForceWatch({ watch: { ticksLeft: 1 }, healthy: true, now: at }).action, 'done');
   assert.equal(evaluateForceWatch({ watch: { ticksLeft: 0, minUntil: 'bad' }, healthy: true }).action, 'continue');
@@ -163,6 +167,8 @@ test('red verify withdraws overlay, marks watch, rollback failure stays owed, he
 
 test('late red recreates watch after health watch passes; later green cannot waive rollback', fixture(async ({ request, root, env, arm }) => {
   await requestHotPatch(request); arm();
+  verifyMarker(env, sha, 'green');
+  await runOwedTick({ root, env, now: at });
   for (let i = 0; i < 10; i++) await runForceWatchTick({ root, env, currentHead: sha, probe: async () => ({ healthy: true }), now: () => at + 15 * 60000 });
   assert.equal(readForceWatch(root, env), null);
   verifyMarker(env, sha, 'red');
@@ -442,7 +448,7 @@ test('checklist-9: rollbackPending survives a process restart and retries the re
     const root = process.env.FIXTURE_ROOT;
     const git = args => { const r = spawnSync('git', args, {cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 4096});
       if (r.status !== 0) throw new Error(r.stderr); return r.stdout.trim(); };
-    await runOwedTick({root});
+    await runOwedTick({root, runGh: () => '[]'});
     const out = await runForceWatchTick({root, currentHead: () => git(['rev-parse', 'HEAD']),
       probe: async () => ({healthy: true}), rollback: async last => { git(['reset', '--hard', last.head]); return {ok: true}; }});
     if (out.action !== 'rollback' || git(['rev-parse', 'HEAD']) !== process.env.FIXTURE_GOOD) process.exitCode = 1;`;
@@ -635,4 +641,54 @@ test('audit-1: prewritten ledger cannot authorize adoption while registration is
     assert.equal(readForceWatch(root, env), null);
   } });
   assert.equal(out.ok, true); assert.equal(arm().ok, true);
+}));
+
+
+test('owed CI: unknown x7 fails closed through durable rollback, with six ticks of grace', fixture(async ({ root, env, request, arm }) => {
+  await requestHotPatch(request); arm();
+  env.WE_HOT_PATCH = JSON.stringify({ verifyRepo: 'owner/repo' });
+  const runGh = vi.fn(() => { throw new Error('offline'); });
+  for (let i = 1; i <= 7; i++) {
+    await runOwedTick({ root, env, now: at + 20 * 60000, runGh });
+    assert.equal(readHotPatch(root, env).ciUnknownTicks, i);
+    assert.equal(Boolean(readForceWatch(root, env).rollbackPending), i > 6);
+  }
+  assert.equal(runGh.mock.calls.length, 7);
+  assert(runGh.mock.calls.every(([args]) => args.includes(`repos/owner/repo/commits/${sha}/check-runs`)));
+  assert.equal(readHotPatch(root, env).rollbackPending, 'ci-unknown-limit');
+  assert.equal(readOverlays(root, { env }).length, 0);
+  const rollback = vi.fn(async () => ({ ok: true }));
+  assert.equal((await runForceWatchTick({ root, env, currentHead: sha, now: () => at + 20 * 60000,
+    probe: async () => ({ healthy: true }), rollback })).action, 'rollback');
+  assert.equal(rollback.mock.calls[0][0].head, good);
+}));
+
+test('owed CI: unknown x3 then green resets the counter and permits healthy retirement', fixture(async ({ root, env, request, arm }) => {
+  await requestHotPatch(request); arm();
+  env.WE_HOT_PATCH = JSON.stringify({ verifyRepo: 'owner/repo' });
+  const runGh = vi.fn(() => '[]');
+  for (let i = 0; i < 3; i++) await runOwedTick({ root, env, now: at, runGh });
+  assert.equal(readHotPatch(root, env).ciUnknownTicks, 3);
+  verifyMarker(env, sha, 'green');
+  await runOwedTick({ root, env, now: at });
+  assert.equal(readHotPatch(root, env).ciUnknownTicks, 0);
+  assert.equal(readHotPatch(root, env).owed.verify, 'green');
+  let watch = readForceWatch(root, env);
+  assert.equal(watch.rollbackPending, undefined);
+  for (let i = 0; i < 10; i++) {
+    const v = evaluateForceWatch({ watch, healthy: true, now: at + 20 * 60000 });
+    watch = v.watch;
+    assert.equal(v.action, i === 9 ? 'done' : 'continue');
+  }
+}));
+
+test('owed CI: pending resets unknown count and an old watch without CI evidence cannot retire', fixture(async ({ root, env, request, arm }) => {
+  await requestHotPatch(request); arm();
+  env.WE_HOT_PATCH = JSON.stringify({ verifyRepo: 'owner/repo' });
+  await runOwedTick({ root, env, now: at, runGh: () => '[]' });
+  await runOwedTick({ root, env, now: at, runGh: () => JSON.stringify([{ id: 1, name: 'test', head_sha: sha,
+    app: { id: 15368, slug: 'github-actions' }, status: 'in_progress', conclusion: null }]) });
+  assert.equal(readHotPatch(root, env).ciUnknownTicks, 0);
+  const { ciState: _old, ...watch } = readForceWatch(root, env);
+  assert.equal(evaluateForceWatch({ watch: { ...watch, ticksLeft: 0 }, healthy: true, now: at + 20 * 60000 }).action, 'continue');
 }));

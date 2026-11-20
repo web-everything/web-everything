@@ -294,7 +294,7 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
   const ticksLeft = Math.max(0, (watch.ticksLeft ?? 0) - 1);
   // Old force records have no time floor. An unreadable new floor never retires a watch.
   const timePassed = watch.minUntil === undefined || (Number.isFinite(Date.parse(watch.minUntil)) && now >= Date.parse(watch.minUntil));
-  if (ticksLeft <= 0 && timePassed) return { action: 'done', watch: { ...watch, ticksLeft: 0 } };
+  if (ticksLeft <= 0 && timePassed && (!watch.hotPatchSha || watch.ciState === 'green')) return { action: 'done', watch: { ...watch, ticksLeft: 0 } };
   return { action: 'continue', watch: { ...watch, ticksLeft } };
 }
 

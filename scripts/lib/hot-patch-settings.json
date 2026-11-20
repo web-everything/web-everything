@@ -3,6 +3,7 @@
   "verifyAppId": 15368,
   "verifyAppSlug": "github-actions",
   "ticks": 10,
+  "ciUnknownMaxTicks": 6,
   "minMinutes": 15,
   "owedPrMinutes": 120,
   "owedMergeHours": 24,

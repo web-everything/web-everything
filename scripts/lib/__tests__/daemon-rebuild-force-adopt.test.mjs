@@ -152,6 +152,36 @@ function writeHotPatchVerifyMarker(env, base, sha, result = 'green') {
 }
 
 describe('R1100 hot-patch smoke adoption', () => {
+  it('pending then red means rollback with no manual step', async () => {
+    const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
+    const env = forceEnv(initialEnv, base), lastGood = headOf(cloneDir);
+    writeRebuildState(cloneDir, { adopted: { head: lastGood, mainSha: lastGood, inputsKey: 'initial', applied: [] } }, env);
+    const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
+      kind: 'incident', files: ['scripts/lib/daemon-tool.mjs'] });
+    writeHotPatchVerifyMarker(env, base, target);
+    runGhSync.mockReturnValue(JSON.stringify([{ id: 1, name: 'test', head_sha: target,
+      app: { id: 15368, slug: 'github-actions' }, status: 'in_progress', conclusion: null }]));
+    const tick = { root: cloneDir, env, prState: async () => null, lockOpts: LOCK_OPTS,
+      runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }),
+      forceWatchProbe: async () => ({ healthy: true }) };
+    await rebuildClone(tick);
+    const adopted = headOf(cloneDir);
+    expect(adopted).not.toBe(lastGood);
+    // Age the real persisted watch past both floors, without changing its CI evidence.
+    const watch = readForceWatch(cloneDir, env);
+    writeFileSync(watchPath(cloneDir, env), JSON.stringify({ ...watch, ticksLeft: 0,
+      startedAt: new Date(Date.now() - 20 * 60000).toISOString(), minUntil: new Date(Date.now() - 60000).toISOString() }));
+    await rebuildClone(tick);
+    expect(headOf(cloneDir)).toBe(adopted);
+    expect(readForceWatch(cloneDir, env)).toMatchObject({ sha: adopted, ticksLeft: 0 });
+    writeHotPatchVerifyMarker(env, base, target, 'red');
+    await rebuildClone(tick);
+    expect(headOf(cloneDir)).toBe(lastGood);
+    expect(readHotPatch(cloneDir, env)).toBeNull();
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+  });
+
   it.each(['verify-red', 'health-failed'])('rollback withdraws and clears hot-patch through the normal rebuild tick: %s', async (reason) => {
     const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
     const env = forceEnv(initialEnv, base), lastGood = headOf(cloneDir);
@@ -259,7 +289,7 @@ describe('R1099 adoption CI gate', () => {
     expect(runGhSync).not.toHaveBeenCalled();
   });
 
-  it('audit: immediate red refusal stays refused next tick despite a non-red hot-patch ledger', async () => {
+  it('audit: immediate red refusal records a durable CI rollback and stays refused next tick', async () => {
     const { cloneDir, originDir, env, base } = makeFixture();
     const good = headOf(cloneDir);
     const sha = advanceMain(originDir, dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
@@ -271,7 +301,7 @@ describe('R1099 adoption CI gate', () => {
       forceWatchProbe: async () => ({ healthy: true }) };
     expect((await rebuildClone(tick)).adopted).not.toBe(true);
     expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(sha);
-    expect(readHotPatch(cloneDir, env).owed.verify).toBe('pending');
+    expect(readHotPatch(cloneDir, env)).toMatchObject({ owed: { verify: 'red' }, rollbackPending: 'verify-red', ciUnknownTicks: 0 });
     expect((await rebuildClone(tick)).adopted).not.toBe(true);
     expect(headOf(cloneDir)).toBe(good);
     expect(runSmoke).toHaveBeenCalledTimes(1);
@@ -302,7 +332,7 @@ describe('R1099 adoption CI gate', () => {
     expect(headOf(cloneDir)).toBe(armed ? sha : good);
   });
   for (const deferred of [false, true]) {
-    it.each(['red', 'unknown', 'pending'])(`hot-patch candidate gates %s CI (ready=${deferred}) and retries with green`, async (ci) => {
+    it.each(['red', 'unknown', 'pending'])(`hot-patch candidate gates %s CI (ready=${deferred}); red stays owed and unknown retries with green`, async (ci) => {
       const { cloneDir, originDir, env, base } = makeFixture();
       const good = headOf(cloneDir);
       const branch = 'lane/ci-gate';
@@ -333,7 +363,28 @@ describe('R1099 adoption CI gate', () => {
       expect(refused.adopted).not.toBe(true);
       expect(headOf(cloneDir)).toBe(good);
       expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(plan.finalSha);
-      // The non-red hot-patch ledger cannot substitute for fresh CI next tick.
+      if (ci === 'red') {
+        // Red is sticky on the ledger (owed.verify) and in the watch; the ledger itself no longer carries rollbackPending.
+        expect(readHotPatch(cloneDir, env)).toMatchObject({ owed: { verify: 'red' } });
+        expect(readForceWatch(cloneDir, env)).toMatchObject({ hotPatchSha: sha });
+        // The owed tick (not the refusal) arms the durable rollback obligation.
+        const obligation = { owed: { verify: 'red' }, rollbackPending: 'verify-red' };
+        // Observe later CI before the watch pays the rollback by finding HEAD at last-good.
+        for (const state of ['unknown', 'green']) {
+          setCI(state);
+          expect(await hotPatchModule.runOwedTick({ root: cloneDir, env })).toBe('rollback');
+          expect(readHotPatch(cloneDir, env)).toMatchObject(obligation);
+          expect(readForceWatch(cloneDir, env)).toMatchObject({ hotPatchSha: sha, rollbackPending: 'verify-red' });
+          expect(headOf(cloneDir)).toBe(good);
+        }
+        expect((await rebuildClone(tick)).adopted).not.toBe(true);
+        expect(headOf(cloneDir)).toBe(good);
+        // The rollback is now paid; retiring its ledger is correct, even after green CI.
+        expect(readHotPatch(cloneDir, env)).toBeNull();
+        expect(readForceWatch(cloneDir, env)).toBeNull();
+        return;
+      }
+      // A refused candidate is still checked on every ordinary owed tick.
       expect((await rebuildClone(tick)).adopted).not.toBe(true);
       expect(headOf(cloneDir)).toBe(good);
       setCI('green');

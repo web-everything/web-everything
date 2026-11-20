@@ -234,7 +234,7 @@ export function openHotPatchWatch({ root, env = process.env, plan, lastGood, smo
       return { result: { ok: false, reason: 'head-or-record-changed; repair state before adoption' } };
     return { next: { daemon: record.daemon, ruling: 'R1100', sha: plan.finalSha, hotPatchSha: record.sha,
       lastGood: good, ticksLeft: settings.ticks, minUntil: new Date(at + settings.minMinutes * 60_000).toISOString(),
-      bad: 0, startedAt: new Date(at).toISOString() }, result: { ok: true } };
+      ciState: 'pending', bad: 0, startedAt: new Date(at).toISOString() }, result: { ok: true } };
   });
 }
 
@@ -250,17 +250,29 @@ export function removeHotPatchOverlay({ root, env, record }) {
   writeRebuildRequest(root, { reason: 'hot-patch-rollback', ref: record.branch, lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT });
 }
 
-function updateResult({ root, env, sha, result, reason }) {
+function updateResult({ root, env, sha, result, reason, ciState, ciUnknownMaxTicks }) {
   if (typeof sha === 'string') sha = sha.toLowerCase();
   return mutate(root, env, (record, watch, state) => {
     if (!record || record.sha !== sha) return { result: { ok: false, reason: 'hot-patch-sha-mismatch' } };
+    // Count under the metadata mutex. Legacy records start at zero; corrupt counters fail closed.
+    let ciUnknownTicks = record.ciUnknownTicks;
+    if (ciState !== undefined) {
+      const previous = ciUnknownTicks === undefined ? 0 : ciUnknownTicks;
+      ciUnknownTicks = ciState === 'unknown'
+        ? (Number.isSafeInteger(previous) && previous >= 0 ? previous + 1 : ciUnknownMaxTicks + 1) : 0;
+      if (ciUnknownTicks > ciUnknownMaxTicks) reason ??= 'ci-unknown-limit';
+      result = ciState === 'unknown' ? 'pending' : ciState;
+    }
     // A red result is sticky: a later green run cannot cancel an owed rollback.
     const red = result === 'red' || record.owed.verify === 'red';
     reason = record.rollbackPending ?? reason ?? (red ? 'verify-red' : null);
-    const next = { ...record, owed: { ...record.owed, verify: red ? 'red' : result ?? record.owed.verify },
+    const next = { ...record, ...(ciState !== undefined ? { ciUnknownTicks } : {}), owed: { ...record.owed, verify: red ? 'red' : result ?? record.owed.verify },
       ...(reason ? { rollbackPending: reason } : {}) };
     write(root, env, next);
-    if (!reason) return { result: { ok: true } };
+    if (!reason) return {
+      ...(watch?.hotPatchSha === sha && (ciState ?? result) ? { next: { ...watch, ciState: ciState ?? result } } : {}),
+      result: { ok: true } };
+
     if (state === 'unreadable' || (watch && watch.hotPatchSha !== sha)) return { result: {
       ok: false, reason: 'watch-unreadable-or-unrelated; repair state and retry verify-result', record: next } };
     const w = watch ?? (record.lastGood ? { daemon: record.daemon, ruling: 'R1100', sha: record.adoptedSha,
@@ -334,7 +346,7 @@ async function readHotPatchQueue({ root, env, num }) {
   return repo ? readMergeQueueMembership({ repo, num, env }) : { ok: false };
 }
 
-export async function runOwedTick({ root, env = process.env, now = Date.now, readQueue = readHotPatchQueue,
+export async function runOwedTick({ root, env = process.env, now = Date.now, readQueue = readHotPatchQueue, runGh,
   emit = e => appendDaemonEvent(e, { env }), removeOverlay = removeHotPatchOverlay }) {
   try {
     const pending = JSON.parse(readFileSync(pendingPath(root, env), 'utf8'));
@@ -344,7 +356,7 @@ export async function runOwedTick({ root, env = process.env, now = Date.now, rea
     }
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
   rmSync(pendingPath(root, env), { force: true });
-  const record = readHotPatch(root, env);
+  let record = readHotPatch(root, env);
   if (!record) {
     // Only registrations explicitly owned by this path may be reconciled.
     const state = readOverlayState(root, { env });
@@ -356,6 +368,13 @@ export async function runOwedTick({ root, env = process.env, now = Date.now, rea
   }
   const settings = resolveHotPatchSettings({ env });
   const at = typeof now === 'function' ? now() : Number(now);
+  const evidence = ciVerdict({ sha: record.sha, root, env, runGh, settings });
+  // Invalid overrides fall back to the finite standard grace period.
+  const ciUnknownMaxTicks = Number.isSafeInteger(settings.ciUnknownMaxTicks) && settings.ciUnknownMaxTicks >= 0
+    ? settings.ciUnknownMaxTicks : hotPatchDefaults.ciUnknownMaxTicks;
+  const ciUpdate = updateResult({ root, env, sha: record.sha, ciState: evidence.state, ciUnknownMaxTicks });
+  if (!ciUpdate.ok) throw new Error(ciUpdate.reason);
+  record = readHotPatch(root, env);
   let queueVerified = false;
   if (record.inMergeQueue === true && record.owed.pr) {
     try {
@@ -363,13 +382,13 @@ export async function runOwedTick({ root, env = process.env, now = Date.now, rea
       queueVerified = membership?.ok === true && membership.inQueue === true;
     } catch { /* Unreadable membership owes ordinary rollback. */ }
   }
-  const verdict = evaluateOwed({ record, now: at, settings, queueVerified });
+  const verdict = record.rollbackPending ? 'rollback' : evaluateOwed({ record, now: at, settings, queueVerified });
   if (verdict === 'rollback' || record.rollbackPending) {
     // Keep the ledger until the watch actually reverts the running build. A failed rollback remains owed.
     const marked = updateResult({ root, env, sha: record.sha, reason: record.rollbackPending ?? 'owed-merge-deadline' });
     await removeOverlay({ root, env, record });
     if (!marked.ok) throw new Error(marked.reason);
-    if (marked.changed) await emit({ kind: 'hot-patch-rolled-back', daemon: record.daemon, detail: { sha: record.sha, reason: marked.record.rollbackPending, rollbackPending: true } });
+    if (marked.changed || ciUpdate.changed) await emit({ kind: 'hot-patch-rolled-back', daemon: record.daemon, detail: { sha: record.sha, reason: marked.record.rollbackPending, rollbackPending: true } });
   }
   return verdict;
 }
