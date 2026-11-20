@@ -50,7 +50,7 @@ process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-isolation.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:web-everything/web-everything.git\\n');
 if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
@@ -145,6 +145,8 @@ describe('#4389 merge failure isolation', () => {
     [{ dup: [1], failed: [], mergedCount: 0 }, 3],
     [{ dup: [1], failed: [{}], mergedCount: 1 }, 3],
     [{ dup: [], failed: [{}], mergedCount: 1 }, 0],
+    [{ dup: null, mergedCount: 0 }, 2],
+    [{ dup: null, mergedCount: 1 }, 2],
     [{ failed: [{}], mergedCount: 0 }, 2],
     [{ failed: [], mergedCount: 0 }, 0],
     [{}, 0],

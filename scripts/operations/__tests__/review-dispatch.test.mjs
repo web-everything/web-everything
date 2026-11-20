@@ -880,3 +880,10 @@ describe('card 273 advisory CI waiver at session dispatch', () => {
     expect(Boolean(out.skipped)).toBe(state !== 'matching');
   });
 });
+
+it('dispatchReview refuses capability-off before spawning any agent', () => {
+  const spawnAgent = vi.fn();
+  expect(() => dispatchReview({ pr: 1, repo: 'longshoreai/longshore', checkoutExists: () => true, spawnAgent }))
+    .toThrow(/not a constellation repo/);
+  expect(spawnAgent).not.toHaveBeenCalled();
+});
