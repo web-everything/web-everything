@@ -1096,7 +1096,7 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * PR at the SAME head: that run stays `pending` forever and the red-team queue reads it as `review-unfinished` (live
  * #6381 #6595 #6637 #6633). Answer it `abstain` (writes nothing) through the operation's own resume path. A run on another
  * head, another PR, or with any other pending ask is never touched. If the abstain was already recorded but its
- * ledger-events effect was interrupted, resume without another answer, provided no other effect type is open.
+ * pending ledger-events effect records a human attempt, resume without another answer, provided every other effect is applied.
  * Optional ids restrict reads to indexed run files; omitted ids retain the full directory scan.
  * Best effort: a failure never undoes the clearance.
  */
@@ -1131,8 +1131,11 @@ export function closeConfirmRunsAfterClearance({ repo, pr, headSha, ids, dir = r
     if (r.pending?.kind === 'confirm') settle = resume;
     else if (r.pending?.kind === 'effect' && r.pending.step === 'ledgerEvents'
       && r.findings?.confirm === 'abstain' && Array.isArray(r.effects)
-      && r.effects.every(effect => !['pending', 'in-flight', 'refused'].includes(effect?.status)
-        || effect.type === 'review.ledger-events')) settle = resumeEffect;
+      && r.effects.some(effect => effect?.type === 'review.ledger-events' && effect.step === 'ledgerEvents'
+        && effect.status === 'pending' && effect.lastAttemptBy === 'human' && Number(effect.humanAttempts) >= 1)
+      && r.effects.every(effect => effect?.status === 'applied'
+        || (effect?.type === 'review.ledger-events' && effect.step === 'ledgerEvents'
+          && effect.status === 'pending'))) settle = resumeEffect;
     else continue;
     let ok = false;
     try { ok = settle(r.id) === true; } catch { ok = false; }

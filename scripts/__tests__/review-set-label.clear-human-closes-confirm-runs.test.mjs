@@ -15,9 +15,14 @@ const run = (id0, { pr = 7, repo = REPO, rev = HEAD, kind = 'confirm', step = ki
   ...(effects === undefined ? {} : { effects }),
 });
 
+const ledgerEffect = (overrides = {}) => ({
+  type: 'review.ledger-events', status: 'pending', step: 'ledgerEvents',
+  lastAttemptBy: 'human', humanAttempts: 1, ...overrides,
+});
+
 const ledgerRun = (id, options = {}) => run(id, {
   kind: 'effect', step: 'ledgerEvents', confirm: 'abstain',
-  effects: [{ type: 'review.ledger-events', status: 'pending', step: 'ledgerEvents' }],
+  effects: [ledgerEffect()],
   ...options,
 });
 
@@ -72,12 +77,24 @@ describe('clear-human closes open confirm runs (live: #6381 #6595 #6637 #6633)',
     ['non-abstain answer', { confirm: 'accepted' }],
     ['missing answer', { confirm: undefined }],
     ['different pending step', { step: 'advisoryLabel' }],
-    ...['pending', 'in-flight', 'refused'].map(status => [`another ${status} effect type`, {
+    ...['declared', 'failed', 'pending', 'in-flight', 'refused', 'unknown', undefined].map(status => [`another ${status} effect type`, {
       effects: [
-        { type: 'review.ledger-events', status: 'pending', step: 'ledgerEvents' },
+        ledgerEffect(),
         { type: 'review.advisory-label', status },
       ],
     }]),
+    ...[
+      { humanAttempts: 0, lastAttemptBy: 'auto' },
+      { humanAttempts: 0 },
+      { lastAttemptBy: 'auto' },
+      { humanAttempts: undefined, lastAttemptBy: undefined },
+    ].map(proof => [`no human abstain attempt proof ${JSON.stringify(proof)}`, { effects: [ledgerEffect(proof)] }]),
+    ...['in-flight', 'refused', 'applied'].map(status => [`no pending ledger effect (${status})`, {
+      effects: [ledgerEffect({ status })],
+    }]),
+    ['wrong ledger effect step', { effects: [ledgerEffect({ step: 'advisoryLabel' })] }],
+    ['empty effects', { effects: [] }],
+    ['only applied non-ledger effects', { effects: [{ type: 'review.advisory-label', status: 'applied' }] }],
     ['missing effects', { effects: undefined }],
     ['invalid effects', { effects: {} }],
   ])('leaves a ledger effect with %s untouched', (_label, options) => {
@@ -89,9 +106,9 @@ describe('clear-human closes open confirm runs (live: #6381 #6595 #6637 #6633)',
     expect(out).toEqual({ closed: [], failed: [] });
   });
 
-  it.each(['pending', 'in-flight', 'refused'])('settles a %s ledger effect with case-insensitive head matching', status => {
+  it('settles a pending human-attempted ledger effect with applied sibling and case-insensitive head matching', () => {
     put(ledgerRun('retry', { rev: HEAD.toUpperCase(), effects: [
-      { type: 'review.ledger-events', status, step: 'ledgerEvents' },
+      ledgerEffect(),
       { type: 'review.advisory-label', status: 'applied' },
     ] }));
     const calls = [];

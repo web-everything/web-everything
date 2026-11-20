@@ -504,9 +504,9 @@ describe('accepted PR run settlement during sweep', () => {
     id: 'IC_clearance', author: { login: 'chalbert' },
     body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n<!-- cleared-human: chalbert -->`,
   });
-  function setup({ comments = [clearance()], accepted = true, head = HEAD, ids = ['review-pr-91368953'], dryRun = false } = {}) {
+  function setup({ comments = [clearance()], accepted = true, head = HEAD, ids = ['review-pr-91368953'], dryRun = false, labels = [], reviews = [] } = {}) {
     const listed = pr(42, ['red-team:clear'], NEW_HEAD, []);
-    const live = { ...pr(42, ['red-team:clear', ...(accepted ? ['review:accepted'] : [])], head, comments), state: 'OPEN' };
+    const live = { ...pr(42, ['red-team:clear', ...(accepted ? ['review:accepted'] : []), ...labels], head, comments), state: 'OPEN', reviews };
     const settleRuns = vi.fn(() => ({ closed: ids, failed: [] }));
     const listRunIds = vi.fn(() => ids);
     const log = vi.fn();
@@ -531,6 +531,9 @@ describe('accepted PR run settlement during sweep', () => {
   it.each([
     ['no clearance record', { comments: [] }],
     ['clearance at a different head', { comments: [clearance(NEW_HEAD)] }],
+    ['superseding review:human hold', { labels: ['review:human'] }],
+    ['superseding review:changes hold', { labels: ['review:changes'] }],
+    ['superseding CHANGES_REQUESTED review', { reviews: [{ state: 'CHANGES_REQUESTED' }] }],
     ['missing review:accepted', { accepted: false }],
     ['dry run', { dryRun: true }],
     ['empty run index', { ids: [] }],

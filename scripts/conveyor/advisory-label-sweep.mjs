@@ -198,8 +198,11 @@ export function sweepAdvisoryLabels({
       if (!live || (live.state && live.state !== 'OPEN')) continue;
       if (!dryRun) {
         try {
-          const clearance = labelNames(live.labels).includes('review:accepted') ? latestHumanClearance(live.comments) : null;
-          if (clearance && /^[0-9a-f]{40}$/i.test(live.headRefOid ?? '')
+          const liveLabels = labelNames(live.labels);
+          const clearance = liveLabels.includes('review:accepted') ? latestHumanClearance(live.comments) : null;
+          if (clearance && !liveLabels.includes('review:human') && !liveLabels.includes('review:changes')
+            && !(Array.isArray(live.reviews) && live.reviews.some(review => review?.state === 'CHANGES_REQUESTED'))
+            && /^[0-9a-f]{40}$/i.test(live.headRefOid ?? '')
             && clearance.sha.toLowerCase() === live.headRefOid.toLowerCase()) {
             const ids = listRunIds({ repo: resolvedRepo, pr: pr.number });
             if (Array.isArray(ids) && ids.length) {
