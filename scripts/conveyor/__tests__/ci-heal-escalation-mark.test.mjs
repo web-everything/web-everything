@@ -766,11 +766,11 @@ for (const method of ['execFileSync', 'spawnSync', 'execSync', 'exec', 'execFile
     appendFileSync(${JSON.stringify(log)}, JSON.stringify({ method, args: args.slice(0, 2) }) + '\\n');
     if (method === 'execFileSync' && args[0] === 'gh') {
       if (args[1][0] === 'pr' && args[1][1] === 'view') return JSON.stringify(facts);
-      if (args[1][0] === 'api' && args[1].at(-1) === 'repos/web-everything/web-everything/actions/jobs/123') {
       if (args[1][0] === 'api' && args[1].at(-1).includes('/check-runs?'))
         return JSON.stringify([{ check_runs: facts.statusCheckRollup }]);
       if (args[1][0] === 'api' && args[1].at(-1).includes('/status?'))
         return JSON.stringify([{ statuses: [] }]);
+      if (args[1][0] === 'api' && args[1].at(-1) === 'repos/web-everything/web-everything/actions/jobs/123') {
         if (${JSON.stringify(evidence)} === 'unreadable') return 'invalid JSON';
         return JSON.stringify({ head_sha: ${JSON.stringify(evidence === 'other-head' ? 'a'.repeat(40) : HEAD)}, completed_at: '2026-10-29T03:00:00Z' });
       }
@@ -819,7 +819,10 @@ syncBuiltinESMExports();
       expect(reads[0].args).toEqual(['gh', ['pr', 'view', '6042', '--json',
         'number,labels,headRefOid,statusCheckRollup,url', '--repo=web-everything/web-everything']]);
       expect(reads.map(call => call.args[1][0] === 'api' ? call.args[1] : call.args[1].slice(0, 2))).toEqual([
-        ['pr', 'view'], ['api', '--paginate'], ['api', '--paginate'], ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
+        ['pr', 'view'],
+        ['api', '--paginate', '--slurp', `repos/web-everything/web-everything/commits/${HEAD}/check-runs?per_page=100&filter=all`],
+        ['api', '--paginate', '--slurp', `repos/web-everything/web-everything/commits/${HEAD}/status?per_page=100`],
+        ['pr', 'view'], ...(gate === 'merge-gate' && evidence !== 'conflicting-flags' ? [
           ['api', 'repos/web-everything/web-everything/actions/jobs/123'],
           ...(evidence === 'unreadable' ? [] : [['api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/123/logs']]),
         ] : []),
