@@ -1849,6 +1849,7 @@ export function runReconcilePass({
   let fixSettings = {};
   try { fixSettings = loadFixSettings({ env }); } catch { /* No exemption without settings. */ }
   const mainSha = resolveMainSha(defaultBranch);
+  console.error(`fix.conflictFixesPerPass=${fixSettings?.conflictFixesPerPass ?? 0} (source: ${fixSettings?.sources?.conflictFixesPerPass ?? 'unknown'})`);
   const conflictCap = fixSettings?.conflictFixExemptPerPass;
   console.error(`fix.conflictFixExemptPerPass=${conflictCap ?? 0} (source: ${fixSettings?.sources?.conflictFixExemptPerPass ?? 'unknown'})`);
   const conflictPrs = Number.isInteger(conflictCap) && conflictCap > 0

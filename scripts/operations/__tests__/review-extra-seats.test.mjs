@@ -61,6 +61,90 @@ const LOOP_PAYLOAD = {
 const answer = (lenses) => `I reviewed it.\n\n\`\`\`json\n${JSON.stringify({ lenses })}\n\`\`\``;
 const VALID_SEAT_FINDING = { summary: 'Real finding', category: 'failing-input', impactIfUnfixed: 'broken', file: null, line: null, failure_scenario: 'A concrete failure.' };
 
+describe('red-team reservation routing under operator overrides', () => {
+  const run = (io, env) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane',
+    read: LOOP_PAYLOAD.findings.read, env, post: false, record: false }, io);
+  const policyFor = (fallback = []) => {
+    const policy = structuredClone(readRoutingPolicy());
+    policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', fallback };
+    return policy;
+  };
+  const caps = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+  it('uses the codex-only override with both agy providers capped at zero', async () => {
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(),
+      readAiRouting: () => ({}), readHeadMessage: () => '',
+      runSeat: async o => { calls.push(['seat', o]); return { report: { lastMessage: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } }; } });
+    expect((await run(io, caps)).status).toBe('speculated');
+    expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 1, 1]]);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+  });
+  it.each(['0', '300'])('retains codex daily-cap denial when out-of-chain agy capacity is %s', async agyCap => {
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(), readAiRouting: () => ({}),
+      reserveCalls: ({ provider, dailyCap }) => { calls.push(['denied', provider, dailyCap]); return { used: 5000, callIds: [] }; } });
+    const result = await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: agyCap });
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain('daily-cap: 5000/5000 non-Claude seat calls used today for codex');
+    expect(result.reason).not.toContain('no available route');
+    expect(calls.filter(c => c[0] === 'denied')).toEqual([['denied', 'codex', 5000]]);
+    expect(calls).toContainEqual(['log', 'red team deferred: daily-cap: 5000/5000 non-Claude seat calls used today for codex (scorecards + reservation ledger)']);
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+  });
+  it.each([
+    { name: 'explicit caps', env: caps, control: {}, expected: [
+      'codex=5000 (source: WE_REVIEW_SEAT_CAP_CODEX)', 'agy-claude=0 (source: WE_REVIEW_SEAT_CAP_AGY_CLAUDE)',
+      'agy-gemini=0 (source: WE_REVIEW_SEAT_CAP_AGY_GEMINI)'] },
+    { name: 'defaults', env: {}, control: {}, expected: [
+      'codex=80 (source: default)', 'agy-claude=300 (source: default)', 'agy-gemini=0 (source: default)'] },
+    { name: 'legacy cap', env: { [DAILY_CAP_ENV]: '17' }, control: {}, expected: [
+      'codex=17 (source: WE_REVIEW_EXTRA_SEATS_DAILY_CAP)', 'agy-claude=300 (source: default)', 'agy-gemini=0 (source: default)'] },
+    { name: 'routing controls', env: { WE_REVIEW_SEAT_CAP_CODEX: '5000' },
+      control: { disabledProviders: ['codex'], enabledProviders: ['agy-gemini'] }, expected: [
+        'codex=0 (source: routing disabledProviders)', 'agy-claude=300 (source: default)', 'agy-gemini=300 (source: routing/default)'] },
+  ])('logs each resolved provider cap and its source: $name', async ({ env, control, expected }) => {
+    const policy = policyFor();
+    Object.assign(policy.operations['review-seat:red-team'], control);
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policy, readAiRouting: () => ({}),
+      reserveCalls: () => ({ used: 5000, callIds: [] }) });
+    await run(io, env);
+    expect(calls.filter(c => c[0] === 'log' && c[1].startsWith('red-team cap: ')).map(c => c[1]))
+      .toEqual(expected.map(line => `red-team cap: ${line}`));
+  });
+
+  it('defers red team when the scorecard and outstanding ledger union exhausts codex capacity', async () => {
+    const at = new Date(NOW).toISOString();
+    const records = ['shared', 'done-only'].map(callId => ({ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+      provider: 'codex', callId, scoredAt: at }));
+    const ledger = { version: 1, reservations: ['shared', 'outstanding-only'].map(callId => ({ callId, at, provider: 'codex' })) };
+    const newId = vi.fn(() => 'must-not-allocate');
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(), readAiRouting: () => ({}),
+      readRecords: () => records, newId }, { codex: ledger });
+    const result = await run(io, { ...caps, WE_REVIEW_SEAT_CAP_CODEX: '3' });
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain('daily-cap: 3/3 non-Claude seat calls used today for codex');
+    expect(calls).toContainEqual(['reserve', 'codex', 1, 0]);
+    expect(newId).not.toHaveBeenCalled();
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+    expect(calls).toContainEqual(['log', 'red team deferred: daily-cap: 3/3 non-Claude seat calls used today for codex (scorecards + reservation ledger)']);
+  });
+  it('tries a remaining in-chain fallback after codex reservation denial', async () => {
+    const { io, calls } = fakeSeatIo({
+      readRoutingPolicy: () => policyFor([{ provider: 'agy-claude', model: 'sonnet' }]), readAiRouting: () => ({}), readHeadMessage: () => '',
+      runSeat: async o => { calls.push(['seat', o]); return { report: { events: { finalResponse: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } } }; },
+    });
+    const reserve = io.reserveCalls;
+    io.reserveCalls = o => o.provider === 'codex' ? { used: 5000, callIds: [] } : reserve(o);
+    expect((await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' })).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+  });
+  it('never reserves a routing-disabled provider even with a positive environment cap', async () => {
+    const policy = policyFor();
+    policy.operations['review-seat:red-team'].disabledProviders = ['codex'];
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policy, readAiRouting: () => ({}) });
+    expect((await run(io, caps)).status).toBe('skipped');
+    expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
+  });
+});
+
 /** A fake seat io recording every effect. Reservations are kept in ONE ledger PER PROVIDER inside `ledgerBox`
  *  (an object keyed by provider), matching the real io's per-provider ledger files — pass one `ledgerBox` to
  *  several fakes to model concurrent review jobs contending for the SAME provider's budget. */
@@ -790,6 +874,25 @@ describe('#4194 review-job — the seats run AFTER the arc, and can never change
 describe('#4194 reserveSeatCalls — the daily budget is reserved BEFORE a call launches', () => {
   const at = (iso) => ({ callId: iso, at: iso });
   const ids = () => { let n = 0; return () => `r${++n}`; };
+
+  it.each(['codex', 'agy-claude', 'agy-gemini'])(
+    'counts the union of scorecards and outstanding reservation IDs for %s', provider => {
+      const timestamp = new Date(NOW).toISOString();
+      const records = ['shared', 'done-only'].map(callId => ({ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+        provider, callId, scoredAt: timestamp }));
+      const ledger = { version: 1, reservations: [
+        ...['shared', 'outstanding-only'].map(callId => ({ provider, callId, at: timestamp })),
+        { provider, callId: 'yesterday', at: '2026-09-25T12:00:00Z' },
+        { provider: 'another-provider', callId: 'other-provider', at: timestamp },
+      ] };
+      const newId = vi.fn(() => 'new-call');
+      const input = { ledger, records, want: 1, now: NOW, newId, provider };
+      expect(reserveSeatCalls({ ...input, dailyCap: 3 })).toMatchObject({ used: 3, callIds: [] });
+      expect(newId).not.toHaveBeenCalled();
+      // One spare slot proves the overlap counts once and other days/providers do not consume it.
+      expect(reserveSeatCalls({ ...input, dailyCap: 4 })).toMatchObject({ used: 3, callIds: ['new-call'] });
+      expect(newId).toHaveBeenCalledOnce();
+    });
 
   it('grants up to what is left, counting both stored rows and outstanding reservations', () => {
     const records = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, callId: 'done-1', scoredAt: '2026-09-26T14:00:00Z' }];

@@ -1918,6 +1918,13 @@ export async function speculateRedTeam({
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
     const providers = rosterForKey('review-seat:red-team');
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    for (const p of providers) {
+      const source = routingEntry?.disabledProviders?.includes(p) ? 'routing disabledProviders'
+        : env?.[PROVIDER_CAP_ENV[p]] !== undefined ? PROVIDER_CAP_ENV[p]
+          : p === 'codex' && env?.WE_REVIEW_EXTRA_SEATS_DAILY_CAP !== undefined ? 'WE_REVIEW_EXTRA_SEATS_DAILY_CAP'
+            : routingEntry?.enabledProviders?.includes(p) ? 'routing/default' : 'default';
+      io.log(`red-team cap: ${p}=${caps[p]} (source: ${source})`);
+    }
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
@@ -1948,7 +1955,12 @@ export async function speculateRedTeam({
         // A valid overlay can supply a route even when the default chain is exhausted.
         // Without one, preserve the policy failure rather than selecting outside its chain.
         if (routeError && !configuredRoute) throw routeError;
-      } catch (error) { lastReason = error.message; break; }
+      } catch (error) {
+        // Exhausting the configured chain after a reservation denial is a budget
+        // deferral. Out-of-chain roster entries must neither launch nor mask it.
+        lastReason ??= error.message;
+        break;
+      }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
@@ -1962,6 +1974,7 @@ export async function speculateRedTeam({
       else {
         deferredByCap = true;
         lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        io.log(`red team deferred: ${lastReason} (scorecards + reservation ledger)`);
         available = available.filter((x) => x !== pick.provider);
       }
     }
