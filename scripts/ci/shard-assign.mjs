@@ -21,7 +21,7 @@
  *                                    card 12: `covered` = tests that can reach a coverage-counted file, balanced over
  *                                    N shards; `nocov` = the rest (scripts/** tests that never load one), which CI
  *                                    runs WITHOUT --coverage (see coverage-reach.mjs). Use --shard=1/1 for nocov.
- *   node scripts/ci/shard-assign.mjs --suite=unit|soak --update=<vitest-json>[,<vitest-json>...]
+ *   node scripts/ci/shard-assign.mjs --suite=unit|soak|integration --update=<vitest-json>[,<vitest-json>...]
  *                                    rewrite that suite's timings from vitest `--reporter=json` reports
  *                                    (the CI shards upload theirs as `timing-<suite>-<shard>` artifacts)
  */
@@ -37,7 +37,7 @@ export const TIMINGS_FILE = join(HERE, 'test-timings.json');
 
 /** Timings are portable POSIX repository-relative filenames, never checkout paths. */
 export function assertTimingKeys(timings) {
-  for (const map of [timings.unit ?? {}, timings.soak ?? {}]) {
+  for (const map of [timings.unit ?? {}, timings.soak ?? {}, timings.integration ?? {}]) {
     for (const key of Object.keys(map)) {
       if (!key || key.includes('\\') || /^[A-Za-z]:/.test(key) || key.split('/').some(part => !part || part === '.' || part === '..')) {
         throw new Error('Invalid timing key: expected a repository-relative filename without parent traversal. Regenerate timings from reports in the matching checkout.');
@@ -47,10 +47,10 @@ export function assertTimingKeys(timings) {
 }
 
 export function loadTimings(file = TIMINGS_FILE) {
-  if (!existsSync(file)) return { unit: {}, soak: {} };
+  if (!existsSync(file)) return { unit: {}, soak: {}, integration: {} };
   const parsed = JSON.parse(readFileSync(file, 'utf8'));
   assertTimingKeys(parsed);
-  return { unit: parsed.unit ?? {}, soak: parsed.soak ?? {} };
+  return { unit: parsed.unit ?? {}, soak: parsed.soak ?? {}, integration: parsed.integration ?? {} };
 }
 
 export function median(values) {
@@ -78,6 +78,31 @@ export function assignByTime(files, timings, total) {
     best.files.push(f);
   }
   return shards.map((s) => s.files.sort());
+}
+
+/** Slowest shard relative to the mean, using the assignment's median fallback. */
+export function balanceRatio(shards, timings) {
+  const fallback = median(Object.values(timings));
+  const loads = shards.map(files => files.reduce((sum, file) => sum + (Number.isFinite(timings[file]) ? timings[file] : fallback), 0));
+  const mean = loads.reduce((sum, load) => sum + load, 0) / loads.length;
+  if (!Number.isFinite(mean) || mean <= 0) throw new Error('Cannot measure balance without positive shard loads');
+  return Math.max(...loads) / mean;
+}
+
+export function predictedBalance(files, timings, total) {
+  // Without measurements the median fallback makes every shard look equal; refuse that false pass.
+  const measured = files.filter((f) => Number.isFinite(timings[f]) && timings[f] >= 0).length;
+  if (files.some((f) => Number.isFinite(timings[f]) && timings[f] < 0)) throw new Error('shard-assign: negative timing in the stored map; regenerate timings');
+  if (!files.length || measured < files.length) {
+    throw new Error(`shard-assign: only ${measured}/${files.length} files have measured timings (every file needs one); refresh timings before trusting a balance check`);
+  }
+  const shards = assignByTime(files, timings, total);
+  if (shards.some((shard) => !shard.length)) throw new Error('shard-assign: the assignment leaves a shard empty, which CI rejects');
+  return balanceRatio(shards, timings);
+}
+
+export function staleRatio(files, oldTimings, newTimings, total) {
+  return balanceRatio(assignByTime(files, oldTimings, total), newTimings);
 }
 
 export function parseShardArg(argv) {
@@ -147,28 +172,43 @@ export function timingsFromReports(reports, repoRoot = REPO_ROOT) {
   return out;
 }
 
-/** Shared --update format: replace one suite, preserve the other, and sort file keys. */
+/** Shared --update format: replace one suite, preserve the others, and sort file keys. */
 export function formatUpdatedTimings(all, suite, timings) {
   const sorted = Object.fromEntries(Object.entries(timings).sort(([a], [b]) => (a < b ? -1 : 1)));
   assertTimingKeys({ ...all, [suite]: sorted });
-  return `${JSON.stringify({ _doc: 'Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. Refresh with --update.', ...all, [suite]: sorted }, null, 1)}\n`;
+  return `${JSON.stringify({ _doc: 'Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. Refresh with --update.', unit: {}, soak: {}, integration: {}, ...all, [suite]: sorted }, null, 1)}\n`;
 }
 
 async function main(argv) {
   const suite = (argv.find((a) => a.startsWith('--suite=')) ?? '').slice('--suite='.length);
-  if (suite !== 'unit' && suite !== 'soak') throw new Error('usage: shard-assign.mjs --suite=unit|soak (--shard=<i>/<N> | --update=<json,...>)');
+  if (!['unit', 'soak', 'integration'].includes(suite)) throw new Error('usage: shard-assign.mjs --suite=unit|soak (--shard=<i>/<N> | --update=<json,...>); --suite=integration --update=<json,...>');
 
   const update = argv.find((a) => a.startsWith('--update='));
+  if (suite === 'integration' && (!update || argv.some(a => a.startsWith('--shard=') || a.startsWith('--group=')))) {
+    throw new Error('shard-assign: --suite=integration requires --update=<json> and forbids --shard/--group');
+  }
   if (update) {
+    if (!update.slice('--update='.length)) throw new Error('shard-assign: --update requires a JSON report path');
     const reports = update.slice('--update='.length).split(',').filter(Boolean).map((p) => JSON.parse(readFileSync(p, 'utf8')));
     const all = loadTimings();
     const timings = timingsFromReports(reports);
+    // An empty or malformed report must never wipe populated timings.
+    const wellFormed = reports.every((r) => Array.isArray(r?.testResults) && r.testResults.every((t) =>
+      t && typeof t.name === 'string' && Number.isFinite(t.startTime) && Number.isFinite(t.endTime) && t.endTime >= t.startTime));
+    if (!wellFormed || !Object.keys(timings).length) {
+      throw new Error('shard-assign: --update reports hold no timed test files; refusing to overwrite existing timings');
+    }
     writeFileSync(TIMINGS_FILE, formatUpdatedTimings(all, suite, timings));
     process.stdout.write(`updated ${suite}: ${Object.keys(timings).length} files\n`);
     return 0;
   }
 
-  const { shard, total } = parseShardArg(argv);
+  const balance = argv.includes('--balance');
+  if (balance && suite !== 'unit') throw new Error('--balance only applies to --suite=unit');
+  const { shard, total } = balance
+    ? { total: Number((argv.find(a => a.startsWith('--total=')) ?? '').slice(8)) }
+    : parseShardArg(argv);
+  if (!Number.isSafeInteger(total) || total < 1) throw new Error('--total must be a positive integer');
   if (suite === 'soak') {
     if (argv.some((a) => a.startsWith('--group='))) throw new Error('shard-assign: --group only applies to --suite=unit');
     // Use the soak runner's policy, including its exclusive baseline shard.
@@ -187,6 +227,17 @@ async function main(argv) {
     const { classifyTests } = await import('./coverage-reach.mjs');
     const split = await classifyTests(files);
     files = split[group];
+  }
+  if (balance) {
+    const limit = Number((argv.find(a => a.startsWith('--max-ratio=')) ?? '--max-ratio=1.2').slice(12));
+    if (!Number.isFinite(limit) || limit < 1) throw new Error('--max-ratio must be finite and at least 1');
+    // The balance check must not pass an assignment CI's shard command would reject.
+    const bad = ambiguousFilters(files, universe);
+    if (bad.length) throw new Error(`shard-assign: filter is a substring of another test path: ${bad.map(([a, b]) => `${a} in ${b}`).join('; ')}`);
+    if (files.some((f) => /\s/.test(f))) throw new Error('shard-assign: a test path contains whitespace; the workflow cannot pass it as a filter');
+    const ratio = predictedBalance(files, loadTimings().unit, total);
+    process.stdout.write(`predicted slowest/average ${ratio.toFixed(2)}\n`);
+    return ratio > limit ? 3 : 0;
   }
   // Keep the soak CLI and its run-shard caller on the same partition (including baseline isolation).
   const mine = suite === 'soak'

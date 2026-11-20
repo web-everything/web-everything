@@ -12,6 +12,10 @@ import { refineKind, holderLabel } from '../readiness/heavy-queue-projection.mjs
 const MAX_BYTES = 512 * 1024;
 const bounded = value => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '?').slice(0, 4096);
 
+export function unloggedPathReason(caller) {
+  return `unlogged-path:${typeof caller === 'string' && caller.trim() ? bounded(caller.trim()) : 'unknown'}`;
+}
+
 export const ADVISORY_REASONS = new Set(['credential-warn']);
 /** R830/R823: the exact reasons heavy-admission logs for a run that is local by design. Each is a reason, not a failed
  *  remote attempt. Any other reason (a failed load read, an unrouted run, an unknown `local-*`) stays a visible real cause. */
@@ -84,7 +88,11 @@ export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind: 
     const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: detail == null ? null : bounded(detail), lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
     mkdirSync(lockRoot, { recursive: true });
     // Append (atomic for one small write); trim only when oversized, so concurrent writers never rewrite each other.
-    if (existsSync(file) && statSync(file).size > MAX_BYTES) writeFileSync(file, readFileSync(file, 'utf8').slice(-MAX_BYTES / 2), 'utf8');
+    if (existsSync(file) && statSync(file).size > MAX_BYTES) {
+      // Keep whole rows only: drop the partial line the slice may start in.
+      const tail = readFileSync(file, 'utf8').slice(-MAX_BYTES / 2);
+      writeFileSync(file, tail.includes('\n') ? tail.slice(tail.indexOf('\n') + 1) : '', 'utf8');
+    }
     appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');
     return row;
   } catch { return null; }
