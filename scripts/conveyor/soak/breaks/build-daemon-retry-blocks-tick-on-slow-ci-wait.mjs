@@ -32,37 +32,49 @@ export default {
   fixPresent(root) {
     try {
       const src = readFileSync(join(root, 'skills-src/conveyor/build-dispatch-daemon.mjs'), 'utf8');
-      return /INFRA_RETRY_TIMEOUT_MS/.test(src) && /timeout:\s*timeoutMs/.test(src);
+      // The original child bound became the remaining budget of a shared pass deadline.
+      return /INFRA_RETRY_TIMEOUT_MS/.test(src) && /timeout:\s*(?:timeoutMs|remainingMs)\b/.test(src);
     } catch { return false; }
   },
   async run({ log } = {}) {
     const daemon = await import('../../../../skills-src/conveyor/build-dispatch-daemon.mjs');
+    const { withRuntimeAdmission } = await import('../../../lib/runtime-admission.mjs');
     // Models real execFileSync timeout semantics without a real subprocess (see the sibling unit test in
-    // build-dispatch-daemon.test.mjs for the identical helper and rationale).
+    // build-dispatch-daemon.test.mjs for a real process-tree timeout check). Inject the clock too, so
+    // unrelated soak workers cannot turn scheduler delays into a timeout regression.
     const slowMs = 5 * 50; // "5x the daemon's tick budget", scaled down for a fast, deterministic soak run
     const boundMs = 50;
+    let elapsedMs = 0, execCalls = 0;
     const exec = (cmd, args, opts) => {
+      execCalls += 1;
       const bound = opts?.timeout;
-      const boundBites = typeof bound === 'number' && bound < slowMs;
+      const boundBites = typeof bound === 'number' && bound > 0 && bound < slowMs;
       const wait = boundBites ? bound : slowMs;
-      const start = Date.now();
-      while (Date.now() - start < wait) { /* busy-wait: models execFileSync's real blocking wait */ }
+      elapsedMs += wait;
       if (boundBites) { const err = new Error(`command timed out after ${bound}ms`); err.signal = 'SIGTERM'; throw err; }
       return JSON.stringify({ retried: [], resumed: [], surfaced: [], waiting: [] });
     };
-    const start = Date.now();
-    const result = daemon.cliRetryInfraBlocked({ exec, env: {}, home: '/x', timeoutMs: boundMs });
-    const elapsedMs = Date.now() - start;
-    log?.(`build-daemon-retry-blocks-tick-on-slow-ci-wait: elapsedMs=${elapsedMs} slowMs=${slowMs} boundMs=${boundMs} result=${JSON.stringify(result)}`);
+    const entry = { num: '4517', groupMembers: [] };
+    const result = withRuntimeAdmission(entry, 'infra-recovery', () => daemon.cliRetryInfraBlocked({
+      exec, env: {}, home: '/x', timeoutMs: boundMs, now: () => elapsedMs,
+      readEntries: () => [entry],
+    }), { readSettings: () => ({ mode: 'lift' }) });
+    log?.(`build-daemon-retry-blocks-tick-on-slow-ci-wait: elapsedMs=${elapsedMs} slowMs=${slowMs} boundMs=${boundMs} execCalls=${execCalls} result=${JSON.stringify(result)}`);
     const violations = [];
-    if (elapsedMs >= slowMs) {
+    if (elapsedMs > boundMs) {
       violations.push({
         invariant: 'retry-call-bounded',
         detail: `cliRetryInfraBlocked took ${elapsedMs}ms against a retry that would run ${slowMs}ms unbounded — `
           + 'no timeout is reaching exec, so a slow pr-land --label-on-green CI wait can still stall the whole daemon tick',
       });
     }
-    return { violations, elapsedMs, slowMs, boundMs, timedOut: result.timedOut === true };
+    if (execCalls !== 1 || result.timedOut !== true) {
+      violations.push({
+        invariant: 'slow-retry-exercised',
+        detail: `expected one admitted slow retry and timedOut: true; execCalls=${execCalls} result=${JSON.stringify(result)}`,
+      });
+    }
+    return { violations, elapsedMs, slowMs, boundMs, execCalls, timedOut: result.timedOut === true };
   },
   judge(report) {
     return (report.violations || []).map((v) => `[${v.invariant}] ${v.detail}`);

@@ -5490,6 +5490,12 @@ shrink admission. Keep the runtime-admission unit cases and infra-retention soak
 unknown identity without budget changes, and successful subprocess output without a PR as a
 retained infra retry with an attempt bump.
 
+The slow infra-retry soak must inject a stored entry with explicit group membership and
+an admission policy through `withRuntimeAdmission`. Require a child call and `timedOut: true`;
+an empty store or admission refusal cannot prove the child deadline works. Its fix-presence
+probe recognizes both the original child timeout and the remaining pass budget. Use the
+injected clock for modeled delays; the daemon unit suite retains the real process-tree check.
+
 ## Review-run filename discovery (R1099)
 
 `review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
