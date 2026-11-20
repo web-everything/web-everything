@@ -2171,7 +2171,7 @@ ${body.replaceAll('"/srv"', JSON.stringify(srv))}
 assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec'))}).st_ino] == (0, os.getgid())
 assert owners[os.stat(${JSON.stringify(join(srv, 'forge-exec/.cache'))}).st_ino] == (0, os.getgid())
 for k in (1, 2):
-    path = ${JSON.stringify(join(srv, 'forge-exec'))} + '/slot-' + str(k)
+    path = ${JSON.stringify(join(srv, 'forge-exec'))} + '/.disabled-slot-' + str(k)
     assert owners[os.stat(path).st_ino] == (0, 6000+k)
     assert os.stat(path).st_mode & 0o7777 == 0o710`;
   }
