@@ -111,6 +111,55 @@ describe('shadow dependency tracer', () => {
     expect(typeof passed.env.NODE_OPTIONS).toBe('string');
     expect(passed.env.WE_TRACE_TEST).toBe(test);
   });
+  it('never throws when the working directory was deleted; absolute paths still trace', async () => {
+    const f = fixture();
+    f.fs.promises = { readFile: vi.fn(async () => 'result'), readdir: vi.fn(async () => []) };
+    f.tracer.install();
+    const gone = vi.spyOn(process, 'cwd').mockImplementation(() => { throw Object.assign(new Error('uv_cwd'), { code: 'ENOENT' }); });
+    try {
+      expect(() => f.fs.existsSync(resolve(root, 'a.json'))).not.toThrow();
+      expect(() => f.fs.readFileSync(resolve(root, 'b.json'))).not.toThrow();
+      expect(() => f.fs.readFileSync('relative.json')).not.toThrow();
+      await expect(f.fs.promises.readFile(resolve(root, 'c.json'))).resolves.toBe('result');
+      for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
+        expect(() => f.child_process[name]('node', ['script.mjs'], { cwd: resolve(root, 'scripts') })).not.toThrow();
+        expect(() => f.child_process[name]('node', ['script.mjs'], { cwd: 'scripts' })).not.toThrow();
+        expect(f.originals[name]).toHaveBeenCalledTimes(2);
+      }
+    } finally { gone.mockRestore(); }
+    expect(f.tracer.snapshot().edges).toEqual([
+      { file: 'a.json', kind: 'read' }, { file: 'b.json', kind: 'read' }, { file: 'c.json', kind: 'read' },
+      { file: 'scripts/script.mjs', kind: 'spawn' }]);
+  });
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => [
+    ['inherited', () => Object.create({ cwd: 'scripts' })],
+    ['non-enumerable', () => Object.defineProperty({}, 'cwd', { value: 'scripts', enumerable: false })],
+  ].map(([label, make]) => [name, label, make])))('%s keeps an %s cwd visible to Node and to tracing', (name, _label, make) => {
+    const f = fixture();
+    f.child_process[name]('node', ['script.mjs'], make());
+    expect(f.originals[name].mock.calls[0][2].cwd).toBe('scripts');
+    expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
+  });
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'])('%s keeps inherited env keys and falls back on a falsy env like Node', name => {
+    const f = fixture({ env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', NODE_OPTIONS: '--conditions=original', HOME: '/home/probe' } });
+    f.child_process[name]('node', [], { env: Object.create({ FOO_PROBE: 'inherited' }) });
+    expect(f.originals[name].mock.calls[0][2].env).toMatchObject({ FOO_PROBE: 'inherited', WE_TRACE_TEST: test });
+    f.child_process[name]('node', [], { env: false });
+    expect(f.originals[name].mock.calls[1][2].env).toMatchObject({ HOME: '/home/probe', WE_TRACE_TEST: test });
+  });
+  it('resolves URL commands like the path normalizer, and ignores legacy url.parse objects Node rejects', async () => {
+    const { parse } = await import('node:url');
+    const f = fixture();
+    f.child_process.fork(pathToFileURL(resolve(root, 'scripts/script.mjs')));
+    f.fs.readFileSync(parse(pathToFileURL(resolve(root, 'package.json')).href));
+    expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
+  });
+  it('leaves a Symbol NODE_OPTIONS for Node to reject', () => {
+    const f = fixture();
+    const symbol = Symbol('opts');
+    f.child_process.spawn('node', [], { env: { NODE_OPTIONS: symbol } });
+    expect(f.originals.spawn.mock.calls[0][2].env.NODE_OPTIONS).toBe(symbol);
+  });
   it('preserves execFile callback overload and fork options overload', () => {
     const f = fixture();
     const callback = vi.fn();

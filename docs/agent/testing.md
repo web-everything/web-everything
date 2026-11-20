@@ -4921,8 +4921,10 @@ including malformed input and valid overrides. The `honours fallback settings af
 cases in `scripts/ci/__tests__/dep-trace.test.mjs` exercise startup's fallback directly.
 Review lens: the child-process wrappers must never throw where unwrapped Node would not. Every `cwd` form
 Node accepts (string, `Buffer`, file `URL` from any realm) resolves; any other value goes to Node unchanged
-for Node to judge. A non-string `NODE_OPTIONS` is stringified. The `accepts a … cwd` and
-`never throws from tracing` cases pin this.
+for Node to judge. A non-string `NODE_OPTIONS` is stringified. A deleted working directory makes
+`process.cwd()` throw; tracing then resolves absolute paths only. The options object keeps the caller's
+prototype chain, and env is copied with `for…in` and falls back on a falsy value, as Node does. The
+`accepts a … cwd`, `never throws`, `keeps an … cwd` and `inherited env keys` cases pin this.
 ## Workflow-protection review admission
 
 The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged

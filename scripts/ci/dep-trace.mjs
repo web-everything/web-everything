@@ -33,6 +33,8 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     try {
       value = typeof value === 'string' && value.startsWith('file:') ? fileURLToPath(value) : toPath(value);
       if (value === null || value.startsWith('node:')) return null;
+      // No working directory (it was deleted): only an absolute path can be resolved.
+      if (cwd === null) { if (!isAbsolute(value)) return null; cwd = root; }
       const name = relative(root, resolve(cwd, value));
       if (name === '..' || name.startsWith(`..${sep}`) || isAbsolute(name) || name.split(sep).includes('node_modules')) return null;
       return name.split(sep).join('/') || '.';
@@ -56,14 +58,14 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     a.file.localeCompare(b.file) || a.kind.localeCompare(b.kind)) }), install() {
     for (const [name, kind] of Object.entries({ readFileSync: 'read', readFile: 'read', readdirSync: 'list', existsSync: 'read' })) {
       const original = io[name];
-      if (original) io[name] = function (...args) { add(args[0], kind, process.cwd()); return Reflect.apply(original, this, args); };
+      if (original) io[name] = function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); };
     }
     // Promise-based reads (fs/promises) are dependencies too; without this they would look like absent edges.
     const promises = io.promises;
     if (promises) {
       for (const [name, kind] of Object.entries({ readFile: 'read', readdir: 'list' })) {
         const original = promises[name];
-        if (typeof original === 'function') promises[name] = function (...args) { add(args[0], kind, process.cwd()); return Reflect.apply(original, this, args); };
+        if (typeof original === 'function') promises[name] = function (...args) { add(args[0], kind, here()); return Reflect.apply(original, this, args); };
       }
     }
     for (const name of ['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
@@ -76,17 +78,29 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
         const hasOptions = args[index] && typeof args[index] === 'object';
         const options = hasOptions ? args[index] : {};
         // Tracing must never throw: resolve every cwd form Node accepts, and leave any other value for Node to judge.
-        let cwd = process.cwd();
-        try { const given = options.cwd == null ? null : toPath(options.cwd); if (given !== null) cwd = resolve(cwd, given); } catch { /* Node reports it */ }
+        let cwd = here();
+        try {
+          const given = options.cwd == null ? null : toPath(options.cwd);
+          if (given !== null) cwd = isAbsolute(given) ? resolve(given) : cwd === null ? null : resolve(cwd, given);
+        } catch { /* Node reports it */ }
         for (const value of [command, ...(Array.isArray(args[0]) ? args[0] : [])]) {
-          if (path(value, cwd) === null) continue;
-          try { if (exists?.(resolve(cwd, value)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
+          // Stat the same normalized path the edge records (a URL command is a path too).
+          const name = path(value, cwd);
+          if (name === null) continue;
+          try { if (exists?.(resolve(root, name)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
         }
-        const childEnv = { ...(options.env ?? env), ...traceEnv };
-        // Node stringifies env values; a non-string NODE_OPTIONS must not break the wrapper.
-        childEnv.NODE_OPTIONS = inheritOptions(String(childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions ?? ''));
+        // Node falls back to process.env on a falsy env and walks it with for...in (inherited keys included).
+        const childEnv = {};
+        const baseEnv = options.env || env;
+        for (const key in baseEnv) childEnv[key] = baseEnv[key];
+        Object.assign(childEnv, traceEnv);
+        // Node stringifies env values; a non-string NODE_OPTIONS must not break the wrapper. Node rejects a Symbol itself.
+        const nodeOptions = childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions;
+        if (typeof nodeOptions !== 'symbol') childEnv.NODE_OPTIONS = inheritOptions(String(nodeOptions ?? ''));
+        // Node reads options through the prototype chain (an inherited or non-enumerable cwd); keep that view.
+        const wrapped = Object.assign(Object.create(options), options, { env: childEnv });
         // Replace an options placeholder too, so a following callback keeps its position.
-        args.splice(index, hasOptions || (index < args.length && args[index] == null) ? 1 : 0, { ...options, env: childEnv });
+        args.splice(index, hasOptions || (index < args.length && args[index] == null) ? 1 : 0, wrapped);
         return [command, ...args];
       };
       cp[name] = function (command, ...args) { return Reflect.apply(original, this, prepare(command, args)); };
@@ -108,8 +122,15 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
 function toPath(value) {
   if (typeof value === 'string') return value;
   if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
-  if (value !== null && typeof value === 'object' && typeof value.href === 'string' && value.protocol === 'file:') return fileURLToPath(value.href);
+  // Node's own URL test: a legacy url.parse() result (it has auth/path) is not a URL to Node.
+  if (value !== null && typeof value === 'object' && typeof value.href === 'string' && value.protocol === 'file:'
+    && value.auth === undefined && value.path === undefined) return fileURLToPath(value.href);
   return null;
+}
+
+/** process.cwd() throws once the working directory is deleted; tracing then resolves absolute paths only. */
+function here() {
+  try { return process.cwd(); } catch { return null; }
 }
 
 function inheritOptions(options = '') {
