@@ -173,15 +173,24 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
       expectDispatch(sweep(REAL_1920_SNAPSHOT.labels, { isDraft: true }));
     });
 
+    it('unreadable labels (undefined) preserve today\'s dispatch behaviour', () => {
+      expectDispatch(sweep(undefined));
+    });
+
     it.each([
-      ['undefined', undefined],
       ['null entry', [...REAL_1920_SNAPSHOT.labels, withdrawn, null]],
       ['undefined entry', [...REAL_1920_SNAPSHOT.labels, withdrawn, undefined]],
       ['missing name', [...REAL_1920_SNAPSHOT.labels, withdrawn, {}]],
       ['non-string name', [...REAL_1920_SNAPSHOT.labels, withdrawn, { name: 42 }]],
       ['number entry', [...REAL_1920_SNAPSHOT.labels, withdrawn, 42]],
-    ])('unreadable labels (%s) preserve today\'s dispatch behaviour', (_, labels) => {
-      expectDispatch(sweep(labels));
+    ])('an explicit withdrawn label still holds despite a malformed sibling (%s)', (_, labels) => {
+      const run = sweep(labels);
+      expect(run.results).toEqual([]);
+      expect(run.postFinding).not.toHaveBeenCalled();
+    });
+
+    it('a malformed sibling without the withdrawn label dispatches as today', () => {
+      expectDispatch(sweep([...REAL_1920_SNAPSHOT.labels, null]));
     });
 
     it.each([['null', null], ['object', {}], ['string', withdrawn]])('unreadable labels (%s) retain the existing planner error rather than skip', (_, labels) => {

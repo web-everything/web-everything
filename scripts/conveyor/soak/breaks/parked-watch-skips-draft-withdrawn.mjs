@@ -8,24 +8,28 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export function exercise(watchParkedPrConflicts) {
   const violations = [];
   const run = labels => {
-    let dispatched = 0;
-    const provider = { ensureLabel() {}, setLabels() {}, postComment() {} };
+    let dispatched = 0, effects = 0, threw = false, results = null;
+    const eff = () => { effects++; };
+    const provider = { ensureLabel: eff, setLabels: eff, postComment: eff };
     const realWrite = process.stderr.write;
     process.stderr.write = () => true;
     try {
-      watchParkedPrConflicts({
+      results = watchParkedPrConflicts({
         repo: 'web-everything/web-everything', sameLineConflict: 'stand-down',
         listPrs: () => [{ number: 7101, headRefName: 'lane/x', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', labels }],
         inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
-        provider, postFinding: () => { dispatched++; }, postStandDown: () => { dispatched++; }, postRearm: () => { dispatched++; },
+        provider, postFinding: () => { dispatched++; }, postStandDown: () => { effects++; }, postRearm: () => { effects++; },
         listPrFiles: () => ['scripts/example.mjs'], listPrComments: () => [],
         computeConflictingPaths: () => null, computeConflictDisposition: () => null,
       });
-    } catch { /* a throw is not a dispatch */ } finally { process.stderr.write = realWrite; }
-    return dispatched;
+    } catch { threw = true; } finally { process.stderr.write = realWrite; }
+    return { dispatched, effects, threw, results };
   };
-  if (run([{ name: 'review:human' }, { name: 'review-status:draft-withdrawn' }]) !== 0) violations.push('withdrawn PR was dispatched');
-  if (run([{ name: 'review:human' }]) < 1) violations.push('ordinary parked PR no longer dispatched');
+  const w = run([{ name: 'review:human' }, { name: 'review-status:draft-withdrawn' }, null]);
+  if (w.threw) violations.push('withdrawn PR sweep threw');
+  if (w.dispatched !== 0 || w.effects !== 0 || (w.results && w.results.length !== 0)) violations.push('withdrawn PR was dispatched or mutated');
+  const o = run([{ name: 'review:human' }]);
+  if (o.threw || o.dispatched !== 1) violations.push('ordinary parked PR no longer gets its conflict-fix finding');
   return { violations };
 }
 
