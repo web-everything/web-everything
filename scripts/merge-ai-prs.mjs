@@ -5403,7 +5403,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
       return stdout;
     },
-    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry in a new drain process\n`),
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry on the next pass\n`),
   });
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
   // failure): the empty `[]` is a fallback, not a confirmed "no commits", so `fetchPrReadsCached` declines to cache

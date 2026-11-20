@@ -96,14 +96,49 @@ for (const answer of [null, '', 'null', 'main\nother', new Error('fixture gh fai
     let writes = 0, reads = 0;
     const verify = f.verifier({ map, readLive: async () => { reads++; if (answer instanceof Error) throw answer; return answer; },
       writeCache: () => { writes++; }, warn: e => warnings.push(e.message) });
-    assert.equal(await verify(repo), null);
+    assert.deepEqual(await Promise.all([verify(repo), verify(repo)]), [null, null]);
     assert.equal(await verify(repo), null);
     assert.match(defaultBranchHold('main', map.get(repo)), /unresolved live.*deferring merge\/enqueue/);
-    assert.equal(reads, 1);
+    assert.equal(reads, 2);
     assert.equal(writes, 0);
-    assert.equal(warnings.length, 1);
+    assert.equal(warnings.length, 2);
     assert.equal(readDefaultBranchCache(repo, f.options), 'main');
   }));
+}
+
+for (const [kind, fail] of [
+  ['synchronous throw', () => { throw Error('temporary 502'); }],
+  ['asynchronous rejection', async () => { throw Error('temporary 502'); }],
+  ['null', () => null],
+  ['undefined', () => undefined],
+  ['empty', () => ''],
+  ['ambiguous', () => 'main\nother'],
+]) {
+  test(`same reader recovers after ${kind}, sharing each concurrent attempt`, async () => {
+    const map = new Map(), writes = [], warnings = [];
+    let reads = 0;
+    const verify = createLiveDefaultBranchReader({ map,
+      readLive: () => ++reads === 1 ? fail() : 'main\n',
+      writeCache: (r, name) => writes.push([r, name]), warn: e => warnings.push(e.message) });
+    const failed = verify(repo);
+    assert.equal(verify(repo), failed);
+    assert.equal(await failed, null);
+    assert.equal(map.get(repo), null);
+    assert.match(defaultBranchHold('main', map.get(repo)), /unresolved live.*deferring merge\/enqueue/);
+    assert.equal(reads, 1);
+    assert.equal(writes.length, 0);
+    assert.equal(warnings.length, 1);
+
+    const recovered = verify(repo);
+    assert.equal(verify(repo), recovered);
+    assert.equal(await recovered, 'main');
+    assert.equal(map.get(repo), 'main');
+    assert.equal(defaultBranchHold('main', map.get(repo)), null);
+    assert.equal(await verify(repo), 'main');
+    assert.equal(reads, 2);
+    assert.deepEqual(writes, [[repo, 'main']]);
+    assert.equal(warnings.length, 1);
+  });
 }
 
 test('host cache paths are shared across checkouts, repo/host scoped, and never under .git', () => fixture(async f => {

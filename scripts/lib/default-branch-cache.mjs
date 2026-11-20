@@ -1,7 +1,8 @@
 /** Host-wide, advisory default-branch reads. One atomic file per GitHub host/repo,
  * outside checkouts, retained for one hour. Cache failures always leave the live
  * reader available. Hints never authorize a merge: gate-time verification is live,
- * once per repo/process, and failures defer. Test/fake-GitHub processes require an explicit cache directory.
+ * successes retained per repo/process, and failures defer until a later read retries.
+ * Test/fake-GitHub processes require an explicit cache directory.
  */
 import { mkdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -63,8 +64,8 @@ export async function resolveCachedDefaultBranch({ repo, map, key = repo, readRo
   return name;
 }
 
-/** Call only after synchronous listing work. Memoize successes AND failures, so concurrent
- * admissions share one live read per repo/process. This map must never contain cache hints.
+/** Call only after synchronous listing work. Memoize successes and share in-flight reads.
+ * Evict failures after settlement so later watch passes retry. This map must never contain cache hints.
  */
 export function createLiveDefaultBranchReader({ readLive, map = new Map(), writeCache = writeDefaultBranchCache,
   warn = () => {} }) {
@@ -79,13 +80,20 @@ export function createLiveDefaultBranchReader({ readLive, map = new Map(), write
         try { writeCache(repo, name); } catch { /* Cache failure cannot invalidate live evidence. */ }
         return name;
       } catch (e) { map.set(repo, null); warn(e, repo); return null; }
-    })());
+    })().then(name => {
+      // Run after pending.set, even when readLive throws synchronously.
+      if (name === null) pending.delete(repo);
+      return name;
+    }, error => {
+      pending.delete(repo);
+      throw error;
+    }));
     return pending.get(repo);
   };
 }
 
 export function defaultBranchHold(base, liveBranch) {
-  if (!validDefaultBranch(liveBranch)) return 'default branch unresolved live — deferring merge/enqueue; retry in a new drain process';
+  if (!validDefaultBranch(liveBranch)) return 'default branch unresolved live — deferring merge/enqueue; retry on the next pass';
   if (typeof base !== 'string' || !base.trim()) return 'PR base branch unreadable — deferring merge/enqueue; retry with a complete live PR read';
   return base === liveBranch ? null : `base is not ${liveBranch} (${base || 'unreadable'})`;
 }

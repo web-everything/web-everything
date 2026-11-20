@@ -629,17 +629,24 @@ it('shadow policy retains pre-enqueue renaming by default (#6121)', async () => 
 });
 
 
-it('a failed live default-branch gate stays closed in this process; a new process verifies again', async () => {
-  const { createLiveDefaultBranchReader, defaultBranchHold } = await import('../lib/default-branch-cache.mjs');
+it('a failed live default-branch read holds admission, then the same reader recovers on a later sweep', async () => {
+  const { createLiveDefaultBranchReader } = await import('../lib/default-branch-cache.mjs');
   const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure')).mockResolvedValueOnce('trunk\n');
-  const options = { readLive: read, writeCache: () => {} };
-  const firstProcess = createLiveDefaultBranchReader(options);
-  expect(defaultBranchHold('main', await firstProcess('fixture/repo'))).toContain('deferring merge/enqueue');
-  expect(await firstProcess('fixture/repo')).toBeNull();
+  const map = new Map(), repo = 'fixture/repo';
+  const verify = createLiveDefaultBranchReader({ map, readLive: read, writeCache: () => {} });
+  const pr = { number: 12, title: 't', body: 'what changed and why', headRefName: 'lane/12-x',
+    baseRefName: 'trunk', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }],
+    mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }] };
+  const verdict = () => buildDrainVerdicts({ prsByRepo: new Map([[repo, [pr]]]),
+    readOf: () => ({ commits: [{ oid: 'abc' }], manifest: null }), repos: [repo],
+    defaultBranchOf: r => map.get(r) ?? null })[0];
+
+  expect(await verify(repo)).toBeNull();
+  expect(verdict()).toMatchObject({ decision: 'skip', reason: expect.stringContaining('deferring merge/enqueue') });
   expect(read).toHaveBeenCalledOnce();
-  const newProcess = createLiveDefaultBranchReader(options);
-  expect(await newProcess('fixture/repo')).toBe('trunk');
-  expect(await newProcess('fixture/repo')).toBe('trunk');
+  expect(await verify(repo)).toBe('trunk');
+  expect(verdict().decision).toBe('merge');
+  expect(await verify(repo)).toBe('trunk');
   expect(read).toHaveBeenCalledTimes(2);
 });
 

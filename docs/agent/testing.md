@@ -5098,9 +5098,12 @@ and `WE_FAST_DRAIN_LISTING=live` restore the original listing. Default-branch hi
 in-process map, round metadata, then a host-wide one-hour atomic cache under
 `~/.claude/conveyor/default-branches`. Test processes require an explicit
 `WE_DEFAULT_BRANCH_CACHE_DIR`. Neither cache nor parent metadata can authorize merge/enqueue.
-Every admission requires a live default-branch read in the child process, once per repo/process,
-after synchronous listing/context pages finish (prestage verifies before enqueue). Failure defers;
-live evidence overrides hints and rewrites the cache. Parent round metadata preserves the original
+Every admission requires a live default-branch read in the child process, with successes retained per repo/process,
+after synchronous listing/context pages finish (prestage verifies before enqueue). Failure defers and is evicted
+after settlement so later watch passes retry; concurrent callers share each in-flight attempt.
+Keep same-reader recovery coverage for synchronous throws, rejected promises and unreadable responses;
+the drain verdict must hold after failure and admit after a successful retry.
+Live evidence overrides hints and rewrites the cache. Parent round metadata preserves the original
 live observation timestamp; a retained branch never receives fresh evidence timestamps. Branch-only
 records never count as complete PR listings. Keep branch-change, failure, and read-order probes.
 The node:test regression and soak also support the existing Vitest runner; run either through
