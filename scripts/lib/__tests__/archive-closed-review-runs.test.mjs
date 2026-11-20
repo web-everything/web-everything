@@ -37,6 +37,56 @@ function atomicReplace(source, value) {
   renameSync(temporary, source);
 }
 
+it.each([false, true])('keeps keyed filename/payload mismatches live (dryRun=%s)', dryRun => {
+  const id = 'review-pr-pr7-11111111-1111-4111-8111-111111111111';
+  const source = join(runsDir, `${id}.json`);
+  // Model pre-existing invalid evidence; writeRun correctly refuses this identity.
+  writeFileSync(source, JSON.stringify(newRunRecord({ id, op: 'review-pr', input: { repo: 'org/repo', pr: 8 } })));
+  utimesSync(source, 1700000000, 1700000000);
+  const original = readFileSync(source);
+  const prState = vi.fn(() => 'closed');
+  const result = run({ dryRun, minAgeDays: 14, prState });
+  expect(result.archived).toEqual([]);
+  expect(result.kept.mismatch).toEqual([id]);
+  expect(result.errors).toEqual([]);
+  expect(prState).not.toHaveBeenCalled();
+  expect(readFileSync(source)).toEqual(original);
+  expect(listArchivedRunIds({ runsDir })).toEqual([]);
+});
+
+it.each([7, '7'])('archives matching keyed records under the named PR: %s', pr => {
+  const id = 'review-pr-pr7-11111111-1111-4111-8111-111111111111';
+  record(id, { input: { repo: 'org/repo', pr } });
+  const source = join(runsDir, `${id}.json`);
+  utimesSync(source, 1700000000, 1700000000);
+  const original = readFileSync(source);
+  const result = run({ minAgeDays: 14 });
+  expect(result.archived).toEqual([id]);
+  expect(result.kept.mismatch).toEqual([]);
+  expect(result.errors).toEqual([]);
+  expect(existsSync(source)).toBe(false);
+  expect(readFileSync(join(runsDir, 'archive', 'review-pr', 'org', 'repo', '7', `${id}.json`))).toEqual(original);
+});
+
+it('restores a keyed claim whose payload changes to a mismatching PR after claiming', () => {
+  const id = 'review-pr-pr7-11111111-1111-4111-8111-111111111111';
+  const value = record(id, { input: { repo: 'org/repo', pr: 7 } });
+  const mismatched = { ...value, input: { repo: 'org/repo', pr: 8 } };
+  const move = vi.fn();
+  let retained;
+  const result = run({ move, afterClaim: claim => {
+    retained = claim;
+    writeFileSync(claim, JSON.stringify(mismatched));
+  } });
+  expect(result.archived).toEqual([]);
+  expect(result.kept.mismatch).toEqual([id]);
+  expect(move).not.toHaveBeenCalled();
+  expect(result.errors).toEqual([{ id, error: `claim retained at ${retained}` }]);
+  expect(JSON.parse(readFileSync(join(runsDir, `${id}.json`), 'utf8'))).toEqual(mismatched);
+  expect(JSON.parse(readFileSync(retained, 'utf8'))).toEqual(mismatched);
+  expect(listArchivedRunIds({ runsDir })).toEqual([]);
+});
+
 it.each(['before link', 'after link'])('archive preserves an atomic unfinished writer %s after validation', timing => {
   const value = record();
   const source = join(runsDir, `${value.id}.json`);
@@ -450,7 +500,7 @@ it.each([{ args: [] }, { args: ['--apply'] }, { args: ['--json'] }])('CLI report
   });
   expect(output.status, output.stderr).toBe(0);
   if (args.includes('--json')) expect(JSON.parse(output.stdout)).toEqual({
-    scanned: 0, archived: [], kept: { open: [], unfinished: [], unknownState: [], corrupt: [], notReview: [], changed: [], claimed: [], recent: [] }, errors: [],
+    scanned: 0, archived: [], kept: { open: [], unfinished: [], unknownState: [], corrupt: [], notReview: [], mismatch: [], changed: [], claimed: [], recent: [] }, errors: [],
   });
   else {
     expect(output.stdout).toContain(`${args.includes('--apply') ? 'archived' : 'would-archive'}: 0`);
@@ -458,6 +508,20 @@ it.each([{ args: [] }, { args: ['--apply'] }, { args: ['--json'] }])('CLI report
   }
 });
 
+
+it.each([{ args: [] }, { args: ['--apply'] }])('CLI reports mismatch count and ids without resolving mismatched PRs: $args', ({ args }) => {
+  const id = 'review-pr-pr7-11111111-1111-4111-8111-111111111111';
+  const source = join(runsDir, `${id}.json`);
+  writeFileSync(source, JSON.stringify(newRunRecord({ id, op: 'review-pr', input: { repo: 'org/repo', pr: 8 } })));
+  utimesSync(source, 1700000000, 1700000000);
+  const output = spawnSync(process.execPath, [resolve('scripts/lib/archive-closed-review-runs.mjs'), ...args], {
+    env: { ...process.env, PATH: '', WE_SHARED_RUNS_DIR: runsDir }, encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+  expect(output.status, output.stderr).toBe(0);
+  expect(output.stdout).toContain('kept mismatch: 1');
+  expect(output.stdout).toContain(id);
+  expect(existsSync(source)).toBe(true);
+});
 
 it('retains rollback evidence when an atomic writer replaces the recovery back-link', () => {
   const value = record();

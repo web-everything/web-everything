@@ -5190,6 +5190,10 @@ claims and age-gated archives. Run it with `review-run-index.test.mjs`,
 `red-team-skip-settle-r622.test.mjs` through heavy admission.
 
 `writeRun` validates keyed filename/payload identity before atomic publication.
+Archiving keeps keyed filename/payload PR mismatches live in `kept.mismatch`,
+including dry-run proposals. `archive-closed-review-runs.test.mjs` covers old
+mismatched files, matching numeric/string PRs, claim-time mismatch rollback,
+and CLI mismatch counts and IDs. Legacy IDs retain their existing behavior.
 Discovery lists every review-pr ID without name-based exclusion, using the ordinary
 scan order, parse cap and liveness bounds. Every examined candidate is
 parsed; keyed ID, operation or PR disagreement holds through fallback. Compare

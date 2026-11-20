@@ -23,7 +23,7 @@ import { constants, copyFileSync, linkSync, lstatSync, mkdirSync, readdirSync, r
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  isRunRecordTerminal, listRunIds, parseRunRecord, runPath, sharedRunsDir, tryReadRun,
+  NAME_RE, isRunRecordTerminal, listRunIds, parseRunRecord, runPath, sharedRunsDir, tryReadRun,
 } from '../operations/run-store.mjs';
 
 // lstat also refuses a dangling symlink at the destination.
@@ -74,10 +74,16 @@ function returnClaim(claim, source, failure) {
   return claim;
 }
 
-function revalidationFailure(claim, bytes, mtime) {
+function reviewNameMismatch(id, record) {
+  const named = NAME_RE.exec(id);
+  return named !== null && Number(record.input?.pr) !== Number(named[1]);
+}
+
+function revalidationFailure(claim, bytes, mtime, id) {
   try {
     const currentBytes = readFileSync(claim);
     const current = parseRunRecord(currentBytes.toString('utf8'));
+    if (current.ok && reviewNameMismatch(id, current.record)) return 'mismatch';
     if (current.ok && !isRunRecordTerminal(current.record)) return 'unfinished';
     if (current.ok && bytes.equals(currentBytes)
       && statSync(claim, { bigint: true }).mtimeNs === mtime) return null;
@@ -136,7 +142,7 @@ export function archiveClosedReviewRuns({
   const cutoff = now() - minAgeDays * 86_400_000;
   const result = {
     scanned: 0, archived: [],
-    kept: { open: [], unfinished: [], unknownState: [], corrupt: [], notReview: [], changed: [], claimed: [], recent: [] },
+    kept: { open: [], unfinished: [], unknownState: [], corrupt: [], notReview: [], mismatch: [], changed: [], claimed: [], recent: [] },
     errors: [],
   };
   // Claims survive rollback and abrupt exit; never silently hide them from operators.
@@ -179,6 +185,7 @@ export function archiveClosedReviewRuns({
       record = read === tryReadRun ? parseRunRecord(bytes.toString('utf8')).record : read(id, runsDir);
     } catch { /* unreadable evidence is kept */ }
     if (!record) { result.kept.corrupt.push(id); continue; }
+    if (reviewNameMismatch(id, record)) { result.kept.mismatch.push(id); continue; }
     if (record.op !== 'review-pr') { result.kept.notReview.push(id); continue; }
     if (!isRunRecordTerminal(record)) { result.kept.unfinished.push(id); continue; }
     const repo = record.input?.repo;
@@ -212,7 +219,7 @@ export function archiveClosedReviewRuns({
       }, () => {
         beforeMove?.(source, destination);
       }, afterClaim, claim => {
-        const failure = revalidationFailure(claim, bytes, mtime);
+        const failure = revalidationFailure(claim, bytes, mtime, id);
         if (!failure) return true;
         result.kept[failure].push(id);
         return false;
@@ -293,6 +300,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     `unknown: ${result.kept.unknownState.length}`, `corrupt: ${result.kept.corrupt.length}`,
     `not-review: ${result.kept.notReview.length}`, `errors: ${result.errors.length}`,
     `recent: ${result.kept.recent.length}`, `changed: ${result.kept.changed.length}`, `claimed: ${result.kept.claimed.length}`,
+    `kept mismatch: ${result.kept.mismatch.length}`,
+    ...result.kept.mismatch.map(id => `  ${id}`),
   ].join('\n'));
   if (result.errors.length) process.exitCode = 1;
 }
