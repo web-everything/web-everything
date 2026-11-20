@@ -442,6 +442,7 @@ const executableRedirects = [
   'EDITOR', 'VISUAL', 'PAGER', 'MANPAGER', 'BROWSER', 'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS',
   'GIT_ASKPASS', 'GIT_EDITOR', 'GIT_EXEC_PATH', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_PROXY_COMMAND',
   'GIT_SEQUENCE_EDITOR', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_TEMPLATE_DIR', 'WE_GH_THROTTLE_GH_BIN', 'DEVELOPER_DIR',
+  'WE_FUI_ROOT',
 ];
 function executableRedirectDefects(rules) {
   const described = Object.entries(rules).filter(([, rule]) =>
@@ -467,8 +468,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
       class: 'drop', never: true, why: 'Exec redirect: selects a program.',
     } })).toEqual([newRedirect]);
   });
-  it('pre-review finding: WE_GH_THROTTLE_GH_BIN never crosses from ambient, bag or both sources', () => {
-    const name = 'WE_GH_THROTTLE_GH_BIN', selected = join(tmpdir(), 'caller-selected-gh');
+  it.each(['WE_GH_THROTTLE_GH_BIN', 'WE_FUI_ROOT'])('%s executable redirect never crosses from ambient, bag or both sources', name => {
+    const selected = join(tmpdir(), 'caller-selected-executable');
     expect(registry[name]).toMatchObject({ class: 'drop', never: true });
     for (const source of ['ambient', 'bag', 'both']) {
       clearEnv(name);
@@ -477,6 +478,18 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
       expect(env, source).not.toHaveProperty(name);
     }
   });
+  it.each(['WE_DEFAULT_BRANCH_CACHE_DIR', 'WE_FAST_DRAIN_CONTEXT', 'WE_FULL_SUITE_ESCAPE_LOG'])(
+    'CI drift: %s is classified, preserves ambient policy and excludes caller overrides', name => {
+      expect(unclassified(namesIn(`process.env.${name}`))).toEqual([]);
+      expect(registry[name]).toMatchObject({ class: 'drop' });
+      expect(registry[name].never).toBeUndefined();
+      clearEnv(name);
+      expect(childEnv({ [name]: 'caller-selected' })).not.toHaveProperty(name);
+      vi.stubEnv(name, 'parent-selected');
+      for (const bag of [undefined, {}, { [name]: 'caller-selected' }]) {
+        expect(childEnv(bag)[name]).toBe('parent-selected');
+      }
+    });
   it.each(parityRules)('ambient parity: %s reaches the child verbatim', (pattern, rule) => {
     const name = sampleName(pattern);
     // Include raw forms that quantity parsing used to change or silently discard.
@@ -527,7 +540,7 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
       'npm_config_script_shell', 'npm_config_node_options', 'NPM_CONFIG_SCRIPT_SHELL', 'NPM_CONFIG_NODE_OPTIONS',
       'BASH_ENV', 'ENV', 'ZDOTDIR', 'SHELL', 'PS4', 'PROMPT_COMMAND', 'IFS', 'BASH_FUNC_hostile%%',
       'PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'EDITOR', 'VISUAL', 'PAGER', 'MANPAGER', 'BROWSER',
-      'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS', 'WE_GH_THROTTLE_GH_BIN',
+      'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS', 'WE_GH_THROTTLE_GH_BIN', 'WE_FUI_ROOT',
       'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_EXEC_PATH', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'GIT_EXTERNAL_DIFF',
       'GIT_EDITOR', 'GIT_SEQUENCE_EDITOR', 'GIT_PAGER', 'GIT_TEMPLATE_DIR', 'GIT_CONFIG_COUNT',
       'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
