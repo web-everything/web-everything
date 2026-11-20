@@ -669,14 +669,16 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       return hits.length === 1 && hits[0].status === 'passed';
     };
     if (!exactPassed(headRunId, head, headChecks)) return null;
-    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100';
-    const mainPage = json(mainEndpoint), runs = mainPage?.workflow_runs;
+    const mainEndpoint = 'actions/workflows/ci.yml/runs?branch=main&per_page=100';
+    const mainPage = json(mainEndpoint), allRuns = mainPage?.workflow_runs;
+    const runs = Array.isArray(allRuns) ? allRuns.filter(r => ['push', 'schedule'].includes(r?.event)) : allRuns;
     const conclusions = new Set([...passing, 'failure', 'cancelled', 'timed_out', 'startup_failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
-    if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(runs)
-      || runs.length !== Math.min(mainPage.total_count, 100) || new Set(runs.map(r => r?.id)).size !== runs.length
+    if (!Number.isSafeInteger(mainPage?.total_count) || mainPage.total_count < 0 || !Array.isArray(allRuns)
+      || allRuns.length !== Math.min(mainPage.total_count, 100) || allRuns.some(r => typeof r?.event !== 'string')
+      || new Set(runs.map(r => r?.id)).size !== runs.length
       || runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0 || r.path !== '.github/workflows/ci.yml'
-        || r.event !== 'push' || r.head_branch !== 'main' || !mqOid(r.head_sha)
+        || !['push', 'schedule'].includes(r.event) || r.head_branch !== 'main' || !mqOid(r.head_sha)
         || !Number.isFinite(Date.parse(r.created_at))
         || (r.status === 'completed' ? !conclusions.has(r.conclusion) || !Number.isFinite(Date.parse(r.updated_at))
           : !unfinished.has(r.status) || r.conclusion !== null))) return null;
@@ -692,7 +694,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       if (!mainHead || runs.find(run => mqOid(run.head_sha) === mainHead)?.id !== main.id) return null;
     }
     const mainRun = json(`actions/runs/${main.id}`);
-    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || mainRun.event !== 'push'
+    if (mainRun?.id !== main.id || mainRun.path !== '.github/workflows/ci.yml' || mainRun.event !== main.event
       || mainRun.head_branch !== 'main' || mqOid(mainRun.head_sha) !== mqOid(main.head_sha)
       || mainRun.status !== 'completed' || mainRun.conclusion !== 'success'
       || mainRun.created_at !== main.created_at || mainRun.updated_at !== main.updated_at
@@ -982,7 +984,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (attempts.reason) infra = false;
     else if (!logReason && attempts.confirmed) infra = true;
     // These queries need only their first page, regardless of the workflow's history size.
-    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push`;
+    const mainEndpoint = `repos/${repo}/actions/workflows/ci.yml/runs?branch=main`;
     const readRunPage = (endpoint, limit, allowEmpty = false) => {
       if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
       const result = JSON.parse(exec('gh', ['api', endpoint],
@@ -999,14 +1001,15 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           throw new Error('invalid retry evidence identity');
         ids.add(run.id);
       }
-      return runs;
+      if (runs.some(run => typeof run.event !== 'string')) throw new Error('missing retry evidence event');
+      return runs.filter(run => ['push', 'schedule'].includes(run.event));
     };
     const newest = readRunPage(`${mainEndpoint}&per_page=100`, 100, true);
     const runs = readRunPage(`${mainEndpoint}&status=completed&created=<${new Date(removedAt).toISOString()}&per_page=100`, 100, true);
     const conclusions = new Set([...passing, ...infraConclusions, 'failure', 'action_required', 'stale']);
     const unfinished = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
     if ([...newest, ...runs].some(run => run.path !== '.github/workflows/ci.yml' || run.head_branch !== 'main'
-      || run.event !== 'push' || (run.status === 'completed' ? !conclusions.has(run.conclusion)
+      || !['push', 'schedule'].includes(run.event) || (run.status === 'completed' ? !conclusions.has(run.conclusion)
         : !unfinished.has(run.status) || run.conclusion !== null)
       || !Number.isFinite(timestamp(run.created_at))
       || (run.status === 'completed' && !Number.isFinite(timestamp(run.updated_at))))) return null;

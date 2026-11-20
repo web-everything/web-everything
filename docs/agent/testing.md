@@ -1,5 +1,17 @@
 # Testing — Three-Tier Strategy
 
+Main push CI can reuse a successful `ci.yml` merge-group run only for the exact SHA,
+with a trusted check-suite app, no other non-success (including older-id reruns), a proven fast-forward and the
+same recorded FUI SHA. Queue sibling records publish only after full CI and unquarantined
+execution receipts from every unit, integration and soak leg; missing/unknown receipts publish no record.
+Reusing pushes export and record that verified FUI SHA for their remaining sibling checkouts.
+Unknown evidence runs full CI. The hourly schedule is isolated
+from push concurrency and always runs full CI. Light push success is status evidence;
+quarantine readers require full timing artifacts from the same SHA's queue run with a matching
+push sibling record, the queue's own completion after removal, and no other newer or non-success run.
+Timing refresh accepts queue runs only with main ancestry or a matching main push SHA.
+`scripts/ci/__tests__/main-push-skip*.test.mjs` covers the decision, CLI and workflow.
+
 ## Review PR fetch isolation (R37)
 
 Review PR transport runs in a fresh temporary bare repository with empty global/system
@@ -5689,3 +5701,14 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+## Main CI schedules and timing receipts
+
+Merge admission and both same-head retry evidence paths judge main's push and scheduled
+`ci.yml` runs together. A newer scheduled failure invalidates an older push success;
+PR events are excluded even when their head branch is named `main`.
+Queue timing candidates also require `unquarantined` execution receipts from every unit,
+integration and soak matrix leg, matching the queue reuse proof. Missing or unreadable
+receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
+Scoped regressions live in `red-main-freeze-shared.test.mjs`, `drain-mq-retry-main-green.test.mjs`,
+`drain-queue-safety-same-head-retry.test.mjs` and `refresh-timings.test.mjs`.

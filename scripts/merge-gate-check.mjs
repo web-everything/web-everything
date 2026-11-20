@@ -414,14 +414,13 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
   const source = `${workflow}@${defaultBranch}`;
   let runs;
   try {
-    // `--event push`: only runs OF main's own commits. A fork PR whose head branch is also named `main` makes ci.yml
-    // runs with headBranch `main` (from the fork's own, editable workflow file); counting those would let a green
-    // fork run hide a red main.
-    runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--event', 'push', '--limit', String(MAIN_CI_RUNS),
+    // Include push and scheduled CI, excluding fork PR workflows even when their branch is named main.
+    runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--limit', String(MAIN_CI_RUNS),
       '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,attempt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
   } catch (e) { return { source, error: `main CI unreadable: ${firstLine(e)}` }; }
   if (Array.isArray(runs)) {
-    runs = runs.filter((r) => r?.event == null || r.event === 'push'); // belt and braces if a gh version ignores --event
+    if (runs.some(r => typeof r?.event !== 'string')) return { source, error: 'main CI run event missing' };
+    runs = runs.filter((r) => ['push', 'schedule'].includes(r?.event));
     // A RE-RUN puts a finished run back in progress, and an in-progress run is ignored, so the run before it (maybe
     // green) would speak for a commit whose verdict is being redone. Undecided → hold.
     const rerun = runs.find((r) => String(r?.status ?? '').toLowerCase() !== 'completed' && Number(r?.attempt) > 1);

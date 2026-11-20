@@ -45,6 +45,7 @@ function fixture(runs, events = [removal()], mainHead = null) {
     }
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
       const query = new URLSearchParams(endpoint.split('?')[1]);
+      expect(query.has('event')).toBe(false);
       let selected = [...runs].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id);
       if (query.get('status')) selected = selected.filter(item => item.status === query.get('status'));
       const before = query.get('created');
@@ -86,6 +87,26 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
     expect(f.declineLog()).toContain('102');
     expect(f.declineLog()).toContain('failure');
     expect(f.declineLog()).toContain(failedName);
+  });
+
+  it('a newer scheduled failure invalidates an older push success', () => {
+    const f = fixture([{ ...run(103, 'failure'), event: 'schedule' },
+      run(102, 'success', '2026-11-01T13:00:00Z', '2026-11-01T13:10:00Z')]);
+    expect(f.guard().hold).toBe(true);
+    expect(f.declineLog()).toContain('main CI is not green');
+    expect(f.declineLog()).toContain('103');
+  });
+
+  it('fails closed when a newer run has no event, despite older push success', () => {
+    const f = fixture([{ ...run(103, 'failure'), event: undefined }, run(102)]);
+    expect(f.guard().hold).toBe(true);
+    expect(f.retryLog()).toBeUndefined();
+  });
+
+  it('accepts scheduled main success as green evidence', () => {
+    const f = fixture([{ ...run(103), event: 'schedule' }]);
+    expect(f.guard().hold).toBe(false);
+    expect(f.retryLog()).toContain('103');
   });
 
   it.each(['cancelled', 'startup_failure', 'stale', 'action_required'])(

@@ -25,8 +25,8 @@
  *   Test/replay overrides: --event=<name> --ref=<ref> --event-path=<file> --base=<branch> --changed=<a,b> --now=<ms>
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readQuarantine } from '../lib/red-main-quarantine-io.mjs';
 import { decideCiSkip, ciJobContext, RED_MAIN_MODES } from '../lib/red-main-quarantine.mjs';
@@ -90,7 +90,7 @@ export function quarantineSkip({
   const r = read ?? readList(board);
   const published = r.ok && RED_MAIN_MODES.includes(r.list?.mode) ? { value: r.list.mode, source: 'ops/quarantine' } : null;
   mode = mode ?? published ?? { value: 'stop', source: r.ok ? 'no stamp on ops/quarantine' : 'ops/quarantine unreadable' };
-  if (mode.value !== 'quarantine') return { line: '', why: `redMainMode is ${mode.value} (${mode.source}) — running everything` };
+  if (mode.value !== 'quarantine') return { line: '', why: `redMainMode is ${mode.value} (${mode.source}) — running everything`, reuseSafe: r.ok === true };
   let event = null;
   const eventPath = firstSet(flags['event-path'], env.GITHUB_EVENT_PATH);
   try { event = eventPath ? readEvent(eventPath) : null; } catch { event = null; }
@@ -105,10 +105,18 @@ export function quarantineSkip({
   if (flags.nonblocking) return { line: d.skip.join(' '), why, skip: d.skip };
   const { line, refused } = renderExclude(d.skip);
   return {
+    reuseSafe: r.ok === true && ctx.known && Array.isArray(changedFiles) && d.skip.length === 0,
     line: /^soak-shard \(\d+\)$/.test(job) ? d.skip.filter((f) => !refused.includes(f)).map((f) => `--exclude=${f} --quarantined=${f}`).join(' ') : line,
     why: `${why}${refused.length ? `; ${refused.length} file(s) not skipped (unsafe exclude paths; running): ${JSON.stringify(refused)}` : ''}`,
     skip: d.skip.filter((file) => !refused.includes(file)),
   };
+}
+
+/** Each queue test job records its actual decision; absent/unknown/skipped receipts cannot authorize reuse. */
+export function recordQuarantineReuse(out, env = process.env) {
+  if (env.GITHUB_EVENT_NAME === 'merge_group' && env.RUNNER_TEMP) {
+    writeFileSync(join(env.RUNNER_TEMP, 'quarantine-reuse'), out.reuseSafe === true ? 'unquarantined\n' : 'unknown-or-quarantined\n');
+  }
 }
 
 function flagsOf(argv) {
@@ -126,5 +134,7 @@ if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import
     out = { line: '', why: `error (${String(e?.message || e).split('\n')[0]}) — running everything` };
   }
   process.stderr.write(`red-main-quarantine skip: ${out.why}${out.line ? ` → ${out.line}` : ''}\n`);
+  try { recordQuarantineReuse(out); }
+  catch { process.stderr.write('red-main-quarantine skip: reuse receipt unavailable; main push will run full CI\n'); }
   writeAllSync(1, `${out.line}\n`);
 }

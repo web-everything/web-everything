@@ -186,13 +186,15 @@ describe('CI timing refresh workflow permissions and publication', () => {
     expect(workflow.on).toHaveProperty('workflow_dispatch');
   });
 
-  it('refreshes only successful CI main push completions or explicit scheduled/manual runs', () => {
+  it('refreshes successful main push/backstop or queue completions and explicit scheduled/manual runs', () => {
     const ci = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
     expect(workflow.on.workflow_run).toEqual({ workflows: [ci.name], types: ['completed'] });
     expect(workflow.jobs.refresh.if).toBe(
       "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || " +
       "(github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && " +
-      "github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')");
+      "((github.event.workflow_run.head_branch == 'main' && " +
+      "(github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'schedule')) || " +
+      "(github.event.workflow_run.event == 'merge_group' && startsWith(github.event.workflow_run.head_branch, 'gh-readonly-queue/main/'))))");
     expect(download.run).toBe('node scripts/ci/refresh-timings.mjs --runs=5 --min-stale=1.15');
   });
 
