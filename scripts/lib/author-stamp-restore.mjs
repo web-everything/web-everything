@@ -55,7 +55,8 @@ function linkMayEnclose(diff) {
     if (/[\[\]]/.test(l) && (count(l, /\[/g) !== count(l, /\]/g) || count(l, /\(/g) !== count(l, /\)/g))) return true;
     const open = l.match(/^[ \t]{0,3}\[[^\]]*\]:[ \t]*\S*[ \t]*(["'(])(.*)$/)
       ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]{0,3}(["'(])(.*)$/);
-    return !!open && !open[2].includes(TITLE_CLOSE[open[1]]);
+    // A backslash-escaped delimiter does not close the title.
+    return !!open && !open[2].replace(/\\./g, '').includes(TITLE_CLOSE[open[1]]);
   });
 }
 

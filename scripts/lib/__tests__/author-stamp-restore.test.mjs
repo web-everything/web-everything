@@ -984,6 +984,7 @@ describe('planStampRestore — marker inside a markdown link title is not a stam
     ['reference-link title on the next line', `[ref]: https://example.test\n"title\n${'MARK'}\nend"`],
     ['multiline inline-link title', `[text](https://example.test "title\n${'MARK'}\nend")`],
     ['single-line title', `[ref]: https://example.test "title ${'MARK'}"`],
+    ['title closed only by an escaped quote', `[x](https://example.test "title\\")\n\`<path>\`\n${'MARK'}\nend")`],
     ['backtick span', `\`\n${'MARK'}\n\``],
   ])('refuses a marker in a %s', (_n, tpl) => {
     expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
