@@ -43,6 +43,44 @@ describe(`superseded-omits-live-overlay: ${seat} (18:06 ET discard)`, () => {
     expect(m.adopt).toBeTruthy();
     expect(m.rebuildAfter).toEqual([seat]);
   });
+  it.each([{ auditAdopted: undefined }, { auditAdopted: [] }, { auditAdopted: [seat] }])(
+    'refuses to erase live audit history with auditAdopted=$auditAdopted', ({ auditAdopted }) => {
+      // Even a currently audited tip can move after adoption. Neither an empty/missing history list nor
+      // a successful audit of today's tip proves that the next build can recover its adopted identity.
+      const m = matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: () => [],
+        auditedTip: () => true, plan: { ...args().plan, auditAdopted } }));
+      expect(m).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${seat}`, omitted: [seat] });
+    },
+  );
+  it('refuses an empty candidate that would erase a live audit pin', () => {
+    const candidate = ready();
+    candidate.adopt.applied = [];
+    expect(matchReadyCandidate(args({ ...omit, ready: candidate, readdable: () => true, auditedTip: () => false })))
+      .toMatchObject({ adopt: null, omitted: [seat] });
+  });
+  it.each([false, true])('keeps the audit pin across unregister/re-register when main carries A=%s', async (mainCarriesOverlay) => {
+    const { auditPinOmissionViolations } = await import('../../../conveyor/soak/breaks/rebuild-adopt-then-add.mjs');
+    expect(await auditPinOmissionViolations(undefined, { mainCarriesOverlay })).toEqual([]);
+  });
+  it('accepts an audited candidate that retains the live overlay identity', () => {
+    const candidate = ready();
+    candidate.adopt.applied.push(omit.liveApplied[0]);
+    expect(matchReadyCandidate(args({ ...omit, ready: candidate, auditedTip: () => true,
+      carries: (sha) => sha === SHA('b') }))).toMatchObject({ adopt: candidate.adopt, match: 'superseded' });
+  });
+  it('adopts the current plan and its audit identity on a same-tree match', () => {
+    const candidate = ready();
+    candidate.adopt.applied = [];
+    const plan = { ...args().plan, applied: omit.liveApplied };
+    expect(matchReadyCandidate(args({ ...omit, ready: candidate, plan, auditedTip: () => true,
+      treeOf: () => candidate.tree })))
+      .toMatchObject({ adopt: { finalSha: plan.finalSha, applied: omit.liveApplied }, match: 'same-tree' });
+  });
+  it('still permits authenticated retirement of an unregistered overlay with audit enforcement', () => {
+    expect(matchReadyCandidate(args({ ...omit, auditedTip: () => true, registered: () => false,
+      retiredByOperator: () => true })))
+      .toMatchObject({ adopt: ready().adopt, match: 'superseded', retired: [seat] });
+  });
   it('refuses when a carried overlay has no recorded dependency declaration (unknown, not none)', () => {
     expect(matchReadyCandidate(args({ ...omit, readdable: () => true }))).toMatchObject({ adopt: null, omitted: [seat] });
     expect(matchReadyCandidate(args({ ...omit, readdable: () => true, dependsOn: () => null }))).toMatchObject({ adopt: null });

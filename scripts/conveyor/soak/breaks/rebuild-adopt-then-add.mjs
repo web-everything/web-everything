@@ -6,9 +6,11 @@
  * Replay the real matcher: a smoke-passed build is adopted when an applied overlay left for a benign reason (PR merged, no
  * longer wanted) or when a live overlay it omits is still registered (adopt, then rebuild with it added). Controls: a removal for
  * failure/rollback/closed PR/security, an unknown or missing reason, and an omitted overlay a carried overlay depends on all
- * still discard the build.
+ * still discard the build. Audit-enforced omissions also discard: losing adopted merge history would let
+ * an unaudited successor bypass both planning and finalize on the next rebuild (2026-11-20 send-back).
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -27,6 +29,132 @@ const base = (over = {}) => ({
 });
 const gone = { stillWanted: (ref) => ref !== 'lane/a', registered: (ref) => ref !== 'lane/a' };
 const omitsLive = { liveApplied: [{ ref: 'lane/review-seat-fairness-m1', sha: SHA('b') }], carries: () => false };
+
+/** Replay the 2026-11-20 send-back: an omitted registration loses its adopted audit identity.
+ * The small Git DAG is in memory; every plan, provenance check, match and final audit judge is production code. */
+export async function auditPinOmissionViolations(sourceRoot = REPO_ROOT, { mainCarriesOverlay = false } = {}) {
+  const from = (file) => import(pathToFileURL(resolve(sourceRoot, file)).href);
+  const { planRebuild } = await from('scripts/lib/daemon-rebuild/plan.mjs');
+  const { matchReadyCandidate, readyBuildVerified } = await from(ADOPT);
+  const { revokedAppliedTips } = await from('scripts/lib/daemon-rebuild/audited-tip.mjs');
+  const { REBUILD_IDENTITY_ENV } = await from('scripts/lib/daemon-rebuild/shared.mjs');
+  const commits = new Map();
+  const trees = new Map();
+  const refs = new Map();
+  const digest = (value) => createHash('sha1').update(JSON.stringify(value)).digest('hex');
+  const tree = (files) => {
+    const values = [...new Set(files)].sort();
+    const id = digest(values);
+    trees.set(id, values);
+    return id;
+  };
+  const commit = (parents, contents, subject = 'fixture') => {
+    const id = digest([parents, contents, subject]);
+    commits.set(id, { parents, tree: contents, subject });
+    return id;
+  };
+  const ancestors = (sha) => {
+    const found = new Set();
+    const visit = (id) => {
+      if (!id || found.has(id)) return;
+      found.add(id);
+      commits.get(id)?.parents.forEach(visit);
+    };
+    visit(sha);
+    return found;
+  };
+  const carries = (sha, build) => ancestors(build).has(sha);
+  const ok = (stdout = '') => ({ status: 0, stdout });
+  const git = (args) => {
+    if (args[0] === 'rev-parse') {
+      const rev = args.at(-1);
+      const sha = refs.get(rev.replace(/\^\{.*\}$/, '')) ?? rev.replace(/\^\{.*\}$/, '');
+      return commits.has(sha) ? ok(rev.endsWith('^{tree}') ? commits.get(sha).tree : sha) : { status: 1 };
+    }
+    if (args[0] === 'merge-base') {
+      const [a, b] = args.slice(-2);
+      if (args.includes('--is-ancestor')) return { status: carries(a, b) ? 0 : 1 };
+      const common = [...ancestors(a)].find((id) => carries(id, b));
+      return common ? ok(common) : { status: 1 };
+    }
+    if (args[0] === 'merge-tree') {
+      return ok(tree(args.slice(-2).flatMap((id) => trees.get(commits.get(id).tree))));
+    }
+    if (args[0] === 'commit-tree') {
+      const parents = args.flatMap((value, i) => value === '-p' ? [args[i + 1]] : []);
+      return ok(commit(parents, args[1], args[args.indexOf('-m') + 1]));
+    }
+    if (args[0] === 'log') {
+      if (args.includes('--format=%ct')) return ok('1000');
+      const format = args.find((value) => value.startsWith('--format='));
+      const head = args.includes('--not') ? args[args.indexOf('--not') - 1] : args.at(-1);
+      const excluded = args.includes('--not') ? ancestors(args.at(-1)) : new Set();
+      const lines = [];
+      let cur = head;
+      while (cur && !excluded.has(cur)) {
+        const c = commits.get(cur);
+        if (!c) throw new Error(`unknown fixture commit ${cur}`);
+        lines.push(format === '--format=%P%x09%s' ? `${c.parents.join(' ')}\t${c.subject}`
+          : `${c.parents.join(' ')}\t${REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL}\t${c.subject}`);
+        if (args.includes('-1')) break;
+        cur = c.parents[0];
+      }
+      return ok(lines.join('\n'));
+    }
+    if (args[0] === 'rev-list') return ok([args.at(-1), ...commits.get(args.at(-1)).parents].join(' '));
+    if (args[0] === 'cherry') return ok(`+ ${args.at(-1)}`);
+    if (args[0] === 'diff' || args[0] === 'reflog') return ok();
+    throw new Error(`unexpected fixture Git command: ${args.join(' ')}`);
+  };
+  const ref = 'lane/audit-pin';
+  const main = commit([], tree(['base']));
+  const a = commit([main], tree(['base', 'overlay-A']));
+  refs.set('origin/main', main);
+  refs.set(`refs/remotes/origin/${ref}`, a);
+  const auditedTip = (r, sha) => r === ref && sha === a;
+  const options = { git, mainRef: 'origin/main', overlays: [{ ref }], auditedTip, edgeResolve: false };
+  const live = await planRebuild({ ...options, headSha: main });
+  const newerMain = commit([mainCarriesOverlay ? a : main], tree(['base', 'new-main', ...(mainCarriesOverlay ? ['overlay-A'] : [])]));
+  refs.set('origin/main', newerMain);
+  // O was unregistered during candidate preparation, then re-registered at unaudited B before adoption.
+  const candidate = await planRebuild({ ...options, headSha: live.finalSha, overlays: [] });
+  // Keep the current plan's tree different even when main has A; the same-tree path safely adopts
+  // the newly planned identity marker rather than the old candidate and cannot reproduce this bypass.
+  const mainTip = commit([newerMain], tree([...trees.get(commits.get(newerMain).tree), 'later-main']));
+  refs.set('origin/main', mainTip);
+  const b = commit([a], tree(['base', 'overlay-A', 'unaudited-B']));
+  refs.set(`refs/remotes/origin/${ref}`, b);
+  const plan = await planRebuild({ ...options, headSha: live.finalSha });
+  const violations = [];
+  if (!plan.ok || plan.applied[0]?.sha !== a || plan.applied[0]?.pinnedFrom !== b || !plan.auditAdopted.includes(ref)) {
+    violations.push({ invariant: 'audit-pin-precondition', detail: JSON.stringify(plan) });
+  }
+  const verified = readyBuildVerified({ git, adopt: candidate, mainTip, prevHead: live.finalSha });
+  if (!verified) violations.push({ invariant: 'omitted-candidate-verified', detail: 'candidate provenance was refused' });
+  const m = matchReadyCandidate(base({
+    ready: { ...base().ready, prevHead: live.finalSha, adopt: candidate, tree: commits.get(candidate.finalSha).tree },
+    plan, prevHead: live.finalSha, treeOf: (sha) => commits.get(sha).tree,
+    auditedTip, carries, liveApplied: live.applied, readdable: () => true, dependsOn: () => [],
+    verifyBuilt: () => verified,
+  }));
+  if (m.adopt) violations.push({ invariant: 'audit-pin-omission-refused', detail: 'adopted a candidate without the live audit identity' });
+  if (!m.adopt && (m.reason !== `superseded-omits-live-overlay: ${ref}` || !m.omitted?.includes(ref))) {
+    violations.push({ invariant: 'audit-pin-refusal-reason', detail: JSON.stringify(m) });
+  }
+  // Exercise what actually runs next: a refused candidate leaves HEAD in place. The original bug adopts plain
+  // main instead, and BOTH the next plan and finalize judge exempt B as a never-adopted registration.
+  const headSha = m.adopt?.finalSha ?? live.finalSha;
+  const next = await planRebuild({ ...options, headSha });
+  if (!next.ok || next.applied[0]?.sha !== a || next.applied[0]?.pinnedFrom !== b || !next.auditAdopted.includes(ref)) {
+    violations.push({ invariant: 'next-plan-retains-audit-pin', detail: JSON.stringify(next) });
+  }
+  const revoked = revokedAppliedTips({ applied: next.applied, auditedTip, carries, prevHead: headSha,
+    mainSha: mainTip, auditAdopted: next.auditAdopted });
+  if (next.applied.some((entry) => entry.sha === b) && !revoked.includes(ref)) {
+    violations.push({ invariant: 'unaudited-successor-never-runs', detail: `B applied; auditAdopted=${JSON.stringify(next.auditAdopted)}; finalize revoked=${JSON.stringify(revoked)}` });
+  }
+  return violations;
+}
 
 /** Replay the production registration, complete-chain reader and removal writer contracts, rather than
  * declaring independence/authorship in matcher stubs. GitHub IO alone is injected; no network is needed. */
@@ -109,7 +237,10 @@ const m = matchReadyCandidate({
 });
 const { registryContractViolations } = await import(process.argv[2]);
 const contracts = await registryContractViolations(process.argv[3]);
-console.log(m.adopt && contracts.length === 0 ? 'yes' : 'no');
+const { auditPinOmissionViolations } = await import(process.argv[2]);
+const auditPins = [...await auditPinOmissionViolations(process.argv[3]),
+  ...await auditPinOmissionViolations(process.argv[3], { mainCarriesOverlay: true })];
+console.log(m.adopt && contracts.length === 0 && auditPins.length === 0 ? 'yes' : 'no');
 `;
 
 export default {
@@ -130,6 +261,8 @@ export default {
     try {
       const { matchReadyCandidate } = await import(pathToFileURL(resolve(sourceRoot, ADOPT)).href);
       violations.push(...await registryContractViolations(sourceRoot));
+      violations.push(...await auditPinOmissionViolations(sourceRoot),
+        ...await auditPinOmissionViolations(sourceRoot, { mainCarriesOverlay: true }));
       for (const c of CASES) {
         const m = matchReadyCandidate({ ...base(), ...c.args });
         log?.(`${c.id}: ${m.adopt ? 'adopt' : m.reason}`);

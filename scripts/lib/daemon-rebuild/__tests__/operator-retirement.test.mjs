@@ -198,7 +198,8 @@ describe('operator retirement of a live overlay', () => {
       // The real prepare phase reads both registry snapshots and the on-disk audit trail.
       // Git, planning and move/build effects are stubbed; no checkout or network is touched.
       env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'),
-        WE_DAEMON_EVENTS: join(root, 'daemon-events.jsonl'), WE_DAEMON_AUTO_REBASE: '0' };
+        WE_DAEMON_EVENTS: join(root, 'daemon-events.jsonl'), WE_DAEMON_AUTO_REBASE: '0',
+        WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
       const liveHead = 'b'.repeat(40);
       const mainSha = 'c'.repeat(40);
       const candidate = 'd'.repeat(40);
@@ -258,11 +259,8 @@ describe('operator retirement of a live overlay', () => {
       if (removal === 'operator-retired' || removal === 'retirement-recorded-during-plan') {
         expect(result).toMatchObject({ adopt: { finalSha: candidate }, retired: [ref] });
         expect(finalize).toHaveBeenCalledOnce();
-      } else if (removal === 're-registered') {
-        // Adopt the build that passed, then add: the overlay is registered again, so the next rebuild carries it.
-        expect(result).toMatchObject({ adopt: { finalSha: candidate }, rebuildAfter: [ref] });
-        expect(finalize).toHaveBeenCalledOnce();
       } else {
+        // Re-registration under audit enforcement must retain the running overlay's adopted identity.
         refused(result);
         expect(finalize).not.toHaveBeenCalled();
       }
@@ -282,9 +280,10 @@ describe('operator retirement of a live overlay', () => {
   it.each([
     'mainOnly benign removal', 'benign manual removal', 'removed during planning', 'malformed dependsOn',
     'declared dependency', 'stack dependency', 'unknown chain', 'complete production chain', 'snapshot declaration', 'auto-drop contract',
-    'fresh chain dependency', 'malformed fresh chain', 'older carried tip',
+    'fresh chain dependency', 'malformed fresh chain', 'older carried tip', 'audited omission',
   ])('prepareRebuild adapter: %s', async (mode) => {
-    env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0' };
+    env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0',
+      WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'audited omission' ? 'audited-only' : 'follow' };
     const liveHead = 'b'.repeat(40), mainSha = 'c'.repeat(40), candidate = 'd'.repeat(40);
     const carried = 'lane/carried';
     const mainOnly = mode === 'mainOnly benign removal';
@@ -307,6 +306,7 @@ describe('operator retirement of a live overlay', () => {
         source: 'removeRegistration', reason: 'no longer wanted', at: removed.at }, { env });
     }
     const plan = { ok: true, finalSha: 'e'.repeat(40), mainSha, inputsKey: 'new-plan', applied: [], decisions: [], alerts: [] };
+    if (mode === 'audited omission') plan.auditAdopted = [ref];
     if (mode === 'auto-drop contract') plan.decisions.push({ ref: carried, action: 'remove', reason: 'pr-merged' });
     writeRebuildState(root, { adopted: { head: liveHead, mainSha, applied: removedCarried ? [] : [{ ref, sha }] } }, env);
     writeReadyCandidate(root, { kind: 'candidate', prevHead: liveHead, passedAt: '2026-11-15T10:00:00Z', tree: 'candidate-tree',

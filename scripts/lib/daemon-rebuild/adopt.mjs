@@ -157,6 +157,9 @@ export function matchReadyCandidate({
   const uniqueLiveApplied = [...new Map(liveApplied.map((a) => [JSON.stringify([a?.ref, a?.sha]), a])).values()];
   const omitted = uniqueLiveApplied.filter((a) => {
     if (!a?.ref) return false;
+    // Content ancestry alone does not preserve the registration's audit identity (e.g. A reached main
+    // while O was unregistered). Refuse before the content/graduation exemptions can erase its named history.
+    if (typeof auditedTip === 'function' && registered(a.ref) !== false && !applied.some((x) => x.ref === a.ref)) return true;
     if (a.sha && carries(a.sha, ready.adopt.finalSha)) return false;
     if (a.sha && leftForMain(a, ready.adopt.finalSha) === true) return false;
     if (a.sha && removedForMain(a.ref, a.sha) && contentInBuild(a.sha, ready.adopt.finalSha)) { retired.push(a.ref); return false; }
@@ -164,9 +167,12 @@ export function matchReadyCandidate({
     return true;
   });
   // Adopt, then add: a live overlay the candidate omits but that is STILL registered is not lost by adopting; the next
-  // tick's incremental rebuild adds it back. Refused only when something the candidate applies declares it a dependency.
+  // tick's incremental rebuild adds it back in follow mode. With audit enforcement, dropping its merge history
+  // would make its next tip a never-adopted registration and bypass the audit gate. Keep the running build's
+  // identity until a fresh candidate carries it, even if today's tip is audited (it can advance on the next tick).
   const readd = [];
   const blocked = omitted.filter((a) => {
+    if (typeof auditedTip === 'function') return true;
     if (readdable(a.ref) !== true) return true;
     // A carried overlay with no recorded declaration is unknown, not independent: refuse (fail closed).
     const needed = applied.some((x) => {
