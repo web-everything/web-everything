@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = resolve(HERE, '..', 'merge-ai-prs.mjs'); // the REAL entrypoint under test
@@ -34,6 +35,7 @@ const LABEL_REPO_URL = 'https://github.com/web-everything/web-everything';
 const FAKE_GH = `#!/usr/bin/env node
 const fs = require('fs');
 const openPrPageFixture = ${openPrPageFixture};
+const completeCheckReadFixture = ${completeCheckReadFixture};
 const fx = JSON.parse(fs.readFileSync(process.env.GATE_FIXTURE, 'utf8'));
 const a = process.argv.slice(2);
 const ji = a.indexOf('--json');
@@ -53,6 +55,9 @@ function headOf(pr) {
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
   return pr._headRefOid || (tip && tip.oid) || ('0'.repeat(40) + pr.number).slice(-40);
 }
+// Fresh merge revalidation reads both paginated REST feeds for the live head.
+const checkPages = completeCheckReadFixture(fx.prs.map(pr => ({ ...pr, headRefOid: headOf(pr) })), a);
+if (checkPages !== undefined) out(checkPages);
 // Record every 'pr comment' the drain posts (only when a log path is set — dry-run runs never reach here, so the
 // default JSON-reading tests are unaffected). Used by the finding-1 non-dry-run test to prove which park kinds
 // get a durable skip/park comment.

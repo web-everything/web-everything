@@ -29,6 +29,7 @@ export default {
     }));
     const facts = { head, commits: [{ sha: head, parents: ['b'.repeat(40)], authoredAt: at(0), subject: 'original PR work' }] };
     const pr = { number: 6877, headRefOid: head, headRefName: 'lane/wake', baseRefName: 'main', isDraft: false,
+      rowsComplete: true, rowsHead: head,
       createdAt: at(0), labels: [{ name: 'review:pending' }], comments,
       files: [{ path: 'src/a.mjs' }], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', headSha: head }] };
     let reads = 0;

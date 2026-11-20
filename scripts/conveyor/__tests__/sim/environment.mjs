@@ -9,6 +9,10 @@ export function isolatedProcessEnv(root, ambient = process.env) {
     // sharing its budget can leave the next scenario waiting on a window dated 11 minutes ahead.
     WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh-throttle'),
     WE_COORDINATION_ROOT: join(root, 'coordination'),
+    // Review gates require complete head-bound check evidence. Exercise the production paged
+    // reader under Vitest with a private snapshot, never an ambient cache or flattened PR list.
+    WE_PR_SNAPSHOT: '1',
+    WE_PR_SNAPSHOT_DIR: join(root, 'pr-snapshot'),
   };
   for (const key of ['WE_DISPATCH_ROUTING_SNAPSHOT', 'WE_GITHUB_APP_ID',
     'WE_GITHUB_APP_INSTALLATION_ID', 'WE_GITHUB_APP_PRIVATE_KEY_PATH', 'GITHUB_TOKEN']) delete env[key];

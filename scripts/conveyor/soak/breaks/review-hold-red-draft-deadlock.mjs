@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
+import { completeCheckRows } from '../../../lib/__tests__/helpers/complete-check-rows.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATHS = ['scripts/conveyor/reconcile-core.mjs', 'scripts/conveyor/draft-promotion-rule.mjs',
@@ -36,6 +37,7 @@ export default {
       row('review-gate', 'failure'),
     ];
     const pr = { number: 5874, state: 'OPEN', isDraft: true, isCrossRepository: false,
+      rowsComplete: true, rowsHead: HEAD,
       headRefName: 'lane/review-hold-red-draft', headRefOid: HEAD, baseRefName: 'main',
       labels: ['review:pending'], comments: [], mergeStateStatus: 'CLEAN' };
     for (const [name, statusCheckRollup, expected] of [
@@ -81,7 +83,7 @@ export default {
           env: { WE_REVIEW_START_AFTER: 'fast-checks' },
           advisoryCiWaiver: review?.advisoryReview?.ciWaived === true ? { head: review.advisoryReview.head, reason: review.advisoryReview.reason } : null,
           ciGate: args => readReviewCiGate({ ...args, readHead: () => HEAD,
-            readRequired: () => ({ source: 'live', checks: requiredChecks }), readChecks: () => statusCheckRollup }),
+            readRequired: () => ({ source: 'live', checks: requiredChecks }), readChecks: () => completeCheckRows(statusCheckRollup, HEAD) }),
           checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }), stackCheck: () => ({ base: null }),
           readCompletion: () => null, resolveSettingsEnv: () => ({}),
           readBrief: () => 'review {{PR}}', mintSessionId: () => 'soak-review-hold-advisory',

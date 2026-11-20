@@ -37,6 +37,7 @@ const at = Date.parse('2026-10-04T03:50:00Z');
 const evidence = { id: 'review-pr-1', repo, pr: 3771, head, startedAt: at, completedAt: at + 300_000,
   parked: true, pending: ['k'], attempted: true, persistenceFailed: false, count: 1, rulings: [] };
 const basePr = (over = {}) => ({ number: 3771, state: 'OPEN', headRefName: 'lane/xjudge', headRefOid: head,
+  rowsComplete: true, rowsHead: over.headRefOid ?? head,
   labels: [{ name: 'review:human' }, { name: 'advisory:changes' }], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
   comments: [{ body: ADVISORY_NOTE_MARKER + '\\n\\nround 1', author: { login: 'web-everything' } },

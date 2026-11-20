@@ -54,6 +54,7 @@ export default {
     };
     const prs = [5008, 5012, 5020, 5022, 5023, 5024].map(number => ({
       number, state: 'OPEN', headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main',
+      rowsComplete: true, rowsHead: sha,
       labels: [{ name: 'review:pending' }], comments: [], isDraft: number !== 5008,
       statusCheckRollup: [
         ...['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({

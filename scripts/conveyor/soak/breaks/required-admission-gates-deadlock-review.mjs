@@ -30,6 +30,7 @@ export default {
       if (scenario === 'unreadable job') evidence.job = null;
       if (scenario === 'other failed step') evidence.job.steps[0].conclusion = 'failure';
       const pr = { number: 7106, state: 'OPEN', headRefOid: HEAD, headRefName: 'lane/soak-admission',
+        rowsComplete: true, rowsHead: HEAD,
         files: [{ path: '.github/workflows/merge-gate.yml' }],
         mergeStateStatus: 'CLEAN', labels: [{ name: 'review:pending' }], comments: [],
         statusCheckRollup: [workflowRow, { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },

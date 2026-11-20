@@ -5080,6 +5080,11 @@ runs only, without legacy statuses or pending runs; it cannot attest a complete
 check read. Its gate tests inject the live fallback and assert its decision and
 call cost rather than manufacturing completeness for the store.
 
+Soak worlds enable the paged snapshot reader with a private `WE_PR_SNAPSHOT_DIR`
+under each world's cleanup root. Vitest's flattened-list fallback cannot attest
+check completeness. Replays that simulate a push must also model a complete read
+on the new head before expecting a recovery review.
+
 The shared CLI GraphQL page fixture must include the commit `oid` and contexts
 `totalCount`/`pageInfo`; a flattened `gh pr view` response alone never attests
 completeness. Pre-stage's targeted reread and operator landing use the complete

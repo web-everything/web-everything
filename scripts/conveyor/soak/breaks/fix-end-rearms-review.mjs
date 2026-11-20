@@ -147,6 +147,7 @@ export default {
         body: `🔁 review — changes requested\n\nRecorded by chalbert via console.\n\nAt head \`${HEAD}\`: fix the export.` };
       const pr = {
         number: 6360, state: 'OPEN', headRefName: 'lane/r618', headRefOid: HEAD,
+        rowsComplete: true, rowsHead: HEAD,
         labels: ['review:human', 'advisory:changes'], mergeStateStatus: 'CLEAN',
         statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
         comments: [advisory(), end],

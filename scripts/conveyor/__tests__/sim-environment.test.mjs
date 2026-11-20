@@ -4,6 +4,7 @@ import { delimiter, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { acquireGhPointsSync, ghThrottleLockRoot } from '../../lib/gh-throttle.mjs';
 import { isolatedProcessEnv, toolPathDirs } from './sim/environment.mjs';
+import { prSnapshotEnabled } from '../../lib/pr-snapshot-store.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -14,6 +15,18 @@ function worldRoot() {
 }
 
 describe('simulated process environment', () => {
+  it('uses a private paged check snapshot under Vitest instead of an unproven flattened listing', () => {
+    const ambient = { VITEST: 'true', WE_PR_SNAPSHOT: '0', WE_PR_SNAPSHOT_DIR: '/ambient/snapshot' };
+    const firstRoot = worldRoot(), nextRoot = worldRoot();
+    const first = isolatedProcessEnv(firstRoot, ambient);
+    const next = isolatedProcessEnv(nextRoot, ambient);
+    expect(prSnapshotEnabled(first)).toBe(true);
+    expect(first.WE_PR_SNAPSHOT_DIR).toBe(join(firstRoot, 'pr-snapshot'));
+    expect(next.WE_PR_SNAPSHOT_DIR).toBe(join(nextRoot, 'pr-snapshot'));
+    expect(first.WE_PR_SNAPSHOT_DIR).not.toBe(next.WE_PR_SNAPSHOT_DIR);
+    expect(ambient.WE_PR_SNAPSHOT_DIR).toBe('/ambient/snapshot');
+  });
+
   it('keeps a future-dated exhausted budget out of a later world with a fresh clock', () => {
     const ambient = { WE_GH_THROTTLE_LOCK_ROOT: join(worldRoot(), 'per-file-throttle') };
     const first = isolatedProcessEnv(worldRoot(), ambient);
