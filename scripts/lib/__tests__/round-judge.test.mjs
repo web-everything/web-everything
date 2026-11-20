@@ -421,3 +421,22 @@ describe('referral hold settle: audit round 2 negatives', () => {
     expect(detectRoundCap({ comments: [holdFor('unknown'), v], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
   });
 });
+
+describe('referral hold settle: coordinator negatives', () => {
+  const holdFor = (head) => bot(`review paused: head ${head} was already reviewed\n\nWaiting on your ruling (block, card or not-real):\n- \`src/a.mjs:5\` — x\n\n<!-- review-referral-hold: abcdef0123456789 -->`, at());
+  it('any unreadable history entry keeps the hold, even with a qualifying settle', () => {
+    const v = bot(`🔁 review — changes requested\n\nhead ${H(9)}\n- x`, at());
+    expect(detectRoundCap({ comments: [holdFor(H(9)), v], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'review-cap' });
+    for (const junk of [null, { body: 5 }, 'x']) {
+      expect(detectRoundCap({ comments: [holdFor(H(9)), junk, v], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+      expect(detectRoundCap({ comments: [holdFor(H(1)), junk], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+    }
+  });
+  it('a live SHA quoted in prose (not the head field) does not settle', () => {
+    const v = bot(`🔁 review — changes requested\n\nexample: ${H(9)} was seen\n- x`, at());
+    expect(detectRoundCap({ comments: [holdFor(H(9)), v], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+  it('a malformed hold head token does not clear the hold', () => {
+    expect(detectRoundCap({ comments: [holdFor(`${H(1).slice(0, 9)}-unknown`)], pr: PR, head: H(9), state: 'at-round-limit' })).toMatchObject({ trigger: 'referral-hold' });
+  });
+});

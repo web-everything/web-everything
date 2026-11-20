@@ -136,7 +136,9 @@ export function extractRounds(comments, pr) {
  * A hold that names no readable head, or any unreadable input, is NOT settled (the hold stands).
  */
 function holdSettled(list, holdIdx, live) {
-  const named = /^review paused: head ([0-9a-f]{7,40})\b/i.exec(bodyOf(list[holdIdx]).trimStart())?.[1]?.toLowerCase();
+  const named = /^review paused: head ([0-9a-f]{7,40})(?=\s)/i.exec(bodyOf(list[holdIdx]).trimStart())?.[1]?.toLowerCase();
+  // Any unreadable history entry means the hold stands (fail closed): it could conceal unresolved evidence.
+  if (list.some((c) => !c || typeof c !== 'object' || typeof c.body !== 'string')) return false;
   if (!/^[0-9a-f]{40}$/.test(live)) return false; // an unreadable live head never settles
   if (!named) return false; // a hold that names no readable head is never settled
   if (!live.startsWith(named)) return true;
@@ -145,9 +147,9 @@ function holdSettled(list, holdIdx, live) {
     if (!isTrustedMarkerAuthor(c)) return false;
     const b = bodyOf(c).trimStart();
     if (!b.startsWith('🔁 review — changes requested') || /Recorded by /i.test(b.slice(0, 400))) return false;
-    // It must name this head in full, and no other head (any 7+ hex run) at all.
-    const heads = (b.match(/\b[0-9a-f]{7,40}\b/gi) ?? []).map((x) => x.toLowerCase());
-    return heads.includes(live) && heads.every((x) => live.startsWith(x));
+    // Only the comment's own head field counts (a line `head <sha>` or `head: <sha>`); quoted text elsewhere does not.
+    const fields = [...b.matchAll(/^head:? ([^\s]+)[ \t]*$/gim)].map((m) => m[1].toLowerCase());
+    return fields.length > 0 && fields.every((x) => x === live);
   });
 }
 
