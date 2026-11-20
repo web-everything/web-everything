@@ -13,9 +13,14 @@ Tests: <checks to run>
 
 Each heading needs an inline item or continuation/bullet item with at least eight
 non-whitespace characters; placeholders do not count. Headings ignore case and
-accept Markdown prefixes, as does the `PREP:` start marker, which may have trailing
-text. A Markdown heading (`#` through `######` followed by whitespace) other than
-the four PREP headings ends the current section; following prose cannot fill it.
+accept Markdown prefixes. The start marker accepts `PREP:` (with optional trailing
+text) or a whole-line `PREP`, including headings, bold text and list bullets.
+Section names also work on their own line without a colon. `Touch-set` and
+`Touch set` alias Files; `Test plan` aliases Tests. Optional `Threat model`
+starts its own section but is not required and cannot fill another section.
+A Markdown heading (`#` through `######` followed by whitespace) other than
+these PREP headings ends the current section; following prose cannot fill it.
+Section headings before a PREP marker do not count as preparation.
 An operator can explicitly waive prep with
 `prep: waived — <reason>`. Reasons follow the same eight non-whitespace character
 and non-placeholder rules as section items. Waivers append a local audit event to
