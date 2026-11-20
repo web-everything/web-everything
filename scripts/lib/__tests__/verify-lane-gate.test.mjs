@@ -1561,9 +1561,9 @@ describe('related gate routing in a sibling checkout without the WE admission wr
 
 
 describe('S1 static selection composition', () => {
-  const gate = (files, env = TODAY) => {
+  const gate = (files, env = TODAY, relatedMaxTests = 1000) => {
     const git = fakeGit(['scripts/child.mjs']);
-    return resolveDefaultGate({ env, fileConfig: { relatedMaxTests: 1000, relatedDepth: 2 },
+    return resolveDefaultGate({ env, fileConfig: { relatedMaxTests, relatedDepth: 2 },
       runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args),
       readRepoFile: p => files[p] });
   };
@@ -1575,11 +1575,23 @@ describe('S1 static selection composition', () => {
     expect(result.decision.selection).toMatchObject({ partial: false, maxTests: 1000 });
     expect(gate(files, { ...TODAY, CI: 'true' }).decision.selection).toMatchObject({ partial: false, maxTests: 0 });
   });
-  it('blocks oversized supplemental static targets with an explicit operator fallback', () => {
-    const files = { 'scripts/child.mjs': '' };
-    for (let i = 0; i < 500; i++) files[`scripts/${'x'.repeat(90)}${i}.test.mjs`] = "readFileSync('scripts/child.mjs')";
-    const result = gate(files);
-    expect(result.decision.reasons.join(' ')).toMatch(/static selection exceeds command bounds.*explicit affected-test/);
-    expect(result.command).toBeNull();
+  describe.each([
+    ['additionalTests', 1000], ['truncated tests', 1],
+  ])('oversized %s', (_list, relatedMaxTests) => {
+    it.each([
+      ['count', 301, 0], ['bytes', 200, 160], ['count and bytes', 500, 90],
+    ])('falls back to plain vitest related when %s overflows', (_bound, count, padding) => {
+      const files = { 'scripts/child.mjs': '' };
+      Array.from({ length: count }, (_, i) => {
+        files[`scripts/${'x'.repeat(padding)}${i}.test.mjs`] = "readFileSync('scripts/child.mjs')";
+      });
+      const result = gate(files, TODAY, relatedMaxTests);
+      expect(result.command).not.toBeNull();
+      expect(result.testCommand).toBe("npx vitest related 'scripts/child.mjs' --run --passWithNoTests");
+      expect(result.decision.targets).toEqual(['scripts/child.mjs']);
+      expect(result.decision.partial).toBe(false);
+      expect(result.decision.selection).toMatchObject({ status: 'complete', tests: null, additionalTests: [] });
+      expect(result.decision.selection.reason).toContain('list unusable');
+    });
   });
 });

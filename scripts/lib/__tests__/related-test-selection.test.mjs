@@ -3,6 +3,7 @@
  * @description #5128 — bounded selection keeps direct importers; all fixtures live in memory.
  */
 import { describe, expect, it, vi } from 'vitest';
+import { runInNewContext } from 'node:vm';
 import { replaySelections, runReplayCli } from '../../readiness/selection-replay.mjs';
 import { selectTests } from '../../readiness/test-selection.mjs';
 import { buildReverseImportGraph, resolveSpecifier, testDepths, selectRelatedTests, isVitestTestFile, resolvedImportsOf } from '../related-test-selection.mjs';
@@ -68,6 +69,22 @@ describe('#5128 — related import graph', () => {
   ])('resolves %s to %s', (specifier, expected) => {
     expect(resolveSpecifier('src/main.mjs', specifier, new Set(['src/g.mjs', 'src/h.ts', 'src/folder/index.ts', 'src/m.mts', 'src/folder2/index.tsx', 'src/folder3/index.cjs'])))
       .toBe(expected);
+  });
+
+  it.each([
+    'from ', 'import ', 'import (', 'require (', 'vi.mock (', "import ('./x.mjs'",
+  ])('bounds failing specifier gaps after %s to under 50 ms', prefix => {
+    // A VM deadline interrupts a regressed native regexp instead of hanging the test worker.
+    const elapsed = runInNewContext(`
+      const start = performance.now();
+      scan();
+      performance.now() - start;
+    `, { performance, scan: () => {
+      for (const gap of ['/* */'.repeat(60), ' /* */'.repeat(60), ' '.repeat(60)]) {
+        expect(graph({ 'x.mjs': '', 'main.mjs': prefix + gap + 'x' })).toEqual(new Map());
+      }
+    } }, { timeout: 1000 });
+    expect(elapsed).toBeLessThan(50);
   });
 
   it('recognizes Vitest suffixes without mistaking helpers or Playwright specs for tests', () => {

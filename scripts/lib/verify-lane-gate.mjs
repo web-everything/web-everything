@@ -505,11 +505,9 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     }
     // #5128 — a hub module can reach hundreds of tests through `vitest related`'s unbounded walk. Over the limit,
     // run the bounded list (direct importers always kept) and mark the run `selection-truncated`.
-    const selection = relatedSelection({ targets, runGit, readRepoFile, settings, env });
+    const selection = boundedRelatedSelection(targets, relatedSelection({ targets, runGit, readRepoFile, settings, env }));
     if (selection && !selection.partial) {
       targets.push(...(selection.additionalTests ?? []).filter(t => !targets.includes(t)));
-      if (targets.length > MAX_RELATED_TARGETS || Buffer.byteLength(targets.join(' '), 'utf8') > 32_000)
-        return blocked(['static selection exceeds command bounds — narrow the diff or supply an explicit affected-test --gate'], { targets });
     }
     const decision = { ...local, partial: selection?.partial ?? false, changedFiles, standards, settingsSource, relatedMode, testTimeoutFactor, referencedTests, targets,
       ...(selection ? { selection } : {}) };
@@ -545,11 +543,25 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
 
 const graphCache = new WeakMap();
 
+/** Both supplemental command lists share one fallback: keep the original related targets and report why. */
+function boundedRelatedSelection(targets, selection) {
+  if (!selection) return null;
+  const commandTargets = selection.status === 'selection-truncated'
+    ? selection.tests
+    : [...new Set([...targets, ...(selection.additionalTests ?? [])])];
+  if (!commandTargets.length || commandTargets.length > MAX_RELATED_TARGETS
+    || Buffer.byteLength(commandTargets.join(' '), 'utf8') > 32_000) {
+    return { ...selection, status: 'complete', partial: false, tests: null, additionalTests: [],
+      reason: 'supplemental list unusable (empty or exceeds command bounds) — kept vitest related' };
+  }
+  return selection;
+}
+
 /**
  * #5128 — the bounded related-test selection, or null when it does not apply (limit off, no reader injected, no
  * target, or git/graph trouble — null keeps the plain `vitest related` gate, the pre-#5128 behaviour). The graph is
- * cached per injected reader, so the #66 variant matching re-resolves cheaply. A truncated list that is empty or too
- * long for one command line also falls back to `vitest related`.
+ * cached per injected reader, so the #66 variant matching re-resolves cheaply. The caller bounds both supplemental
+ * command lists through boundedRelatedSelection before changing the original related targets.
  */
 function relatedSelection({ targets, runGit, readRepoFile, settings, env }) {
   if (typeof readRepoFile !== 'function' || !(settings.relatedMaxTests > 0) || !targets.length) return null;
@@ -567,10 +579,6 @@ function relatedSelection({ targets, runGit, readRepoFile, settings, env }) {
       maxDepth: settings.relatedDepth, env });
     const oldTests = testDepths(targets, graphs.imports);
     selection.additionalTests = selection.reachableTests.filter(t => !oldTests.has(t));
-    if (selection.status === 'selection-truncated'
-      && (!selection.tests.length || Buffer.byteLength(selection.tests.join(' '), 'utf8') > 32_000)) {
-      return { ...selection, status: 'complete', partial: false, tests: null, reason: `${selection.reason}; list unusable — kept vitest related` };
-    }
     return selection;
   } catch {
     return null;
