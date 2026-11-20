@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs';
 import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
+import { isUnderTest } from './under-test.mjs';
+import { readRedTeamPublicationHoldFact, readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
@@ -14,7 +16,7 @@ function settingsReadable(path) {
   try { JSON.parse(readFileSync(path, 'utf8')); return true; } catch { return false; }
 }
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE } = {}) {
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE, checkClear = false } = {}) {
   // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
   // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
   // pass never plans clear for a conflict it just recorded.
@@ -33,6 +35,13 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     && Array.isArray(headFiles) && headFiles.length > 0 && isCardOnlyDiff(headFiles);
   if (cardOnlyNotOwed) {
     return { add: null, remove: labels.map(l => typeof l === 'string' ? l : l?.name).filter(n => n === 'red-team:pending' || n === 'red-team:clear') };
+  }
+  // The head's own red-team check run proved clear (readCheckClearFact: App-bound, head-bound, id-ordered, no open hold).
+  // Only a strict `true` counts; a recorded break (above) and a publication-pending hold still win. Only pending is swapped.
+  if (checkClear === true && !broken && !pendingOnly) {
+    const have = labels.map(l => typeof l === 'string' ? l : l?.name);
+    if (have.includes('red-team:pending') && !have.includes('red-team:blocked'))
+      return { add: have.includes('red-team:clear') ? null : 'red-team:clear', remove: ['red-team:pending'] };
   }
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
@@ -75,9 +84,21 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
       && !(desired === null && (l === 'red-team:blocked' || (l === 'red-team:pending' && !cardOnlyBypass)))) };
 }
 
+/** Is the head's red-team check run a trusted, completed success with no open publication hold? Every unreadable or
+ * missing input is false (unknown means pending). Reuses the merge gate's own evaluators. */
+export function readCheckClearFact({ repo, pr, head, env = process.env, gh } = {}) {
+  try {
+    const app = resolveWeAppId({ env });
+    if (app.ok !== true) return false;
+    const options = { repo, pr, headSha: head, appId: app.appId, ...(gh ? { gh } : {}) };
+    return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact(options).ok === true;
+  } catch { return false; }
+}
+
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
-  provider = createGhProvider(), log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope } = {}) {
+  provider = createGhProvider(), log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
+  readCheckClear = args => (isUnderTest() || isUnderTest(env) ? false : readCheckClearFact({ ...args, env })) } = {}) {
   if (!readRedTeamProbes({ env, log }).value.statusLabels) return { add: null, remove: [] };
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
@@ -100,7 +121,19 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
       if (provider.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
     } catch { headFiles = null; headVerified = false; }
   }
-  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles, headVerified });
+  // The head's check run settles a held pending label. Read only when pending is live; a throw or non-true is no proof.
+  let checkClear = false;
+  const liveNames = (state.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
+  if (liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked')) {
+    try { checkClear = readCheckClear({ repo, pr, head }) === true; } catch { checkClear = false; }
+  }
+  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles, headVerified, checkClear });
+  // Re-verify the head right before writing a check-derived clear: a moved head refuses.
+  if (checkClear && plan.add === 'red-team:clear' && !dryRun) {
+    let again = null;
+    try { again = provider.readPrState(repo, pr)?.headRefOid; } catch { again = null; }
+    if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };
+  }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
     provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });
