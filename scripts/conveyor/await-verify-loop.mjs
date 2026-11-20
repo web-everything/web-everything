@@ -302,13 +302,23 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
       retry?.unref?.();
     }
     const mine = child;
-    mine?.on?.('error', (e) => log.error(`reconcile-fix-dispatch-daemon: await-verify loop error: ${String(e?.message ?? e)}`));
+    let retryArmed = false;
+    const retry = () => {
+      if (stopped || retryArmed) return;
+      retryArmed = true;
+      const t = setTimer(start, Math.max(0, minGapMs - (now() - lastStart)));
+      t?.unref?.();
+    };
+    mine?.on?.('error', (e) => {
+      if (child === mine) child = null;
+      log.error(`reconcile-fix-dispatch-daemon: await-verify loop error: ${String(e?.message ?? e)}`);
+      retry();
+    });
     mine?.on?.('exit', (code) => {
       if (child === mine) child = null;
       if (stopped || code === 0) return;
       log.error(`reconcile-fix-dispatch-daemon: await-verify loop exited (${code}); the tick runs the pass until it is back`);
-      const t = setTimer(start, Math.max(0, minGapMs - (now() - lastStart)));
-      t?.unref?.();
+      retry();
     });
     return mine;
   };

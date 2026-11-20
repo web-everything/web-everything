@@ -1,5 +1,5 @@
 /** Inactive CI-healing child driver; callers own launching it. */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -43,6 +43,18 @@ export function resolveCiHealInterval({ env = process.env, settings = readSettin
     standard: { intervalSec: DEFAULT_SECONDS }, envValues: { intervalSec: envValue }, valid: validInterval, env,
   });
   return { seconds: resolved.value.intervalSec, source: resolved.sources.intervalSec };
+}
+
+/** `ciHeal.loop` on|off: standard off; env WE_CI_HEAL_LOOP over the settings file; anything unknown is off. */
+export function resolveCiHealLoopEnabled({ env = process.env, settings = readSettings() } = {}) {
+  const pick = value => (value === 'on' || value === 'off' ? value : undefined);
+  return (pick(env.WE_CI_HEAL_LOOP) ?? pick(settings?.ciHeal?.loop) ?? 'off') === 'on';
+}
+
+/** The single spawn point: null (nothing spawned) unless `ciHeal.loop` is on. */
+export function spawnCiHealLoop({ env = process.env, settings, spawnFn = nodeSpawn, parentPid = process.pid } = {}) {
+  if (!resolveCiHealLoopEnabled({ env, ...(settings ? { settings } : {}) })) return null;
+  return spawnFn(process.execPath, [fileURLToPath(import.meta.url), `--parent-pid=${parentPid}`], { stdio: ['ignore', 'inherit', 'inherit'], env });
 }
 
 function cycleLock({ env = process.env, pid = process.pid, now = Date.now } = {}) {
