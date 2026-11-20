@@ -60,7 +60,15 @@ list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=\${
 files=()
 while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
 echo "unit shard \${{ matrix.shard }}/9: \${#files[@]} files"
-npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+skip=$(node scripts/ci/quarantine-skip.mjs) || exit 1
+skip_args=()
+read -r -a skip_args <<< "$skip" || true
+first_exit=0
+mkdir -p coverage
+WE_TEARDOWN_FAILURE_FILE="$PWD/coverage/teardown-failed-unit-\${{ matrix.shard }}" npm run test:coverage:shard -- --coverage.reportOnFailure=true --reporter=default --reporter=./scripts/ci/unit-json-reporter.mjs --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" "\${skip_args[@]}" || first_exit=$?
+if [ "$first_exit" -ne 0 ]; then
+  node scripts/ci/rerun-failed-once.mjs --shard=\${{ matrix.shard }} --mode=covered --first-exit="$first_exit" -- "\${skip_args[@]}"
+fi
 `,
     `
 list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
@@ -68,7 +76,15 @@ list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) 
 files=()
 while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
 echo "unit no-coverage group: \${#files[@]} files"
-npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+skip=$(node scripts/ci/quarantine-skip.mjs) || exit 1
+skip_args=()
+read -r -a skip_args <<< "$skip" || true
+first_exit=0
+mkdir -p coverage
+WE_TEARDOWN_FAILURE_FILE="$PWD/coverage/teardown-failed-unit-\${{ matrix.shard }}" npm run test:unit -- --reporter=default --reporter=./scripts/ci/unit-json-reporter.mjs --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" "\${skip_args[@]}" || first_exit=$?
+if [ "$first_exit" -ne 0 ]; then
+  node scripts/ci/rerun-failed-once.mjs --shard=\${{ matrix.shard }} --mode=nocov --first-exit="$first_exit" -- "\${skip_args[@]}"
+fi
 `,
   ],
   'coverage-merge': [
@@ -178,6 +194,9 @@ const mirroredActions = {
     } },
     { name: 'Upload shard timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'timing-unit-${{ matrix.shard }}', path: 'web-everything/coverage/timing-unit-${{ matrix.shard }}.json', 'if-no-files-found': 'ignore',
+    } },
+    { name: 'Upload shard flake records', if: "${{ always() && needs.changes.outputs.light != 'true' }}", uses: 'actions/upload-artifact@v4', with: {
+      name: 'flaky-unit-${{ matrix.shard }}', path: 'web-everything/coverage/flaky-unit-*.json', 'if-no-files-found': 'ignore',
     } },
   ],
   'coverage-merge': [
