@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-pr-attempts.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-smells/index.mjs", "we:scripts/conveyor/health-smells/repeated-pr-attempts.mjs", "we:scripts/conveyor/__tests__/health-pr-attempts.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/health-smells/__tests__/index.test.mjs", "we:scripts/conveyor/health-smells/__tests__/repeated-pr-attempts.test.mjs"]
+
 dateOpened: "2026-10-01"
 tags: []
 ---
@@ -27,3 +27,12 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-11-20)
+
+The build-dispatch daemon held #4895 with:
+
+> worker-declined: Not prepared: #4895 — could-not-prepare. Guard 4 requires a policy choice: must every consumed probe be required, or may smells declare optional probes? 'we:scripts/conveyor/health-watch-core.mjs:943' skips evaluation when a declared probe is missing. Requiring 'operationRuns' would therefore suppress today’s log-only repeated-attempt detection. Other smells intentionally consume optional evidence, including 'appStatus' in 'we:scripts/conveyor/health-smells/github-app-token.mjs:40'. A strict matching check would change that behavior; preserving it requires an optional-probe contract. I left no d…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
