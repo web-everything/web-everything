@@ -64,7 +64,8 @@ import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1n
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
-import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
+import { GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
+import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
 import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from './timeout-evidence-pool.mjs';
@@ -1526,10 +1527,10 @@ export function formatReport({ dispatch = [], refusals = [], notes = [], owedTri
 
 /** Read the complete exact-head REST feed, including main-red attribution evidence. */
 export function defaultReadChecks({ repo, sha }, { exec = execFileSyncThrottled } = {}) {
-  return parseJsonLines(exec('gh', checksArgv({ repo, sha }), {
+  return readReviewChecks({ repo, headSha: sha, run: args => exec('gh', args, {
     encoding: 'utf8', timeout: GH_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
     throttle: { op: 'pr-status-checks', repo },
-  }));
+  }) });
 }
 
 /**
@@ -1557,14 +1558,17 @@ export function readStackedPrCheckPolicy(env = process.env) {
   return env.WE_STACKED_PR_CHECK_POLICY === 'strict' ? 'strict' : 'await-base';
 }
 
-function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
+export function hydrateChecks(prs,{ repo, requiredChecks, readChecks, defaultBranch }) {
   const cache = new Map();
   const ready = [], refusals = [], notes = [], owedTriggers = [];
   const stackedPolicy = readStackedPrCheckPolicy();
   for (const pr of prs) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
     const missing = withoutImpliedRequiredChecks(requiredChecks ?? [], runs).filter(name => !runs.some(run => run?.name === name));
-    if (runs.length < 100 && !missing.length) { ready.push(pr); continue; }
+    const complete = pr.rowsComplete === true && pr.rowsHead === pr.headRefOid;
+    // A page-sized snapshot is not truncated when its reader already proved completeness.
+    const legacyShortRead = runs.length < 100 && pr.rowsComplete == null && pr.rowsHead == null;
+    if ((complete || legacyShortRead) && !missing.length) { ready.push(pr); continue; }
     if (stackedPolicy === 'await-base' && isStackedPr(pr, defaultBranch)
       && runs.length < 100 && missing.length === (requiredChecks ?? []).length) {
       const basePrNumber = prs.find(candidate => candidate.headRefName === pr.baseRefName)?.number ?? null;
@@ -1590,8 +1594,19 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     if (!cache.has(key)) {
       try {
         if (!isSha(sha)) throw new Error('missing or invalid exact head SHA');
-        const rows = readChecks({ repo, sha });
-        if (!Array.isArray(rows) || rows.some(row => !row || !Number.isSafeInteger(row.id)
+        const read = readChecks({ repo, sha });
+        if (!Array.isArray(read)) throw new Error('malformed check runs');
+        // Keep legacy contexts distinct from check runs while adapting them for the CI reducer.
+        const rows = read.map(row => {
+          if (typeof row?.context !== 'string' || row.status !== undefined) return row;
+          const state = row.state?.toLowerCase();
+          if (!row.context || !['success', 'failure', 'error', 'pending', 'expected'].includes(state)) throw new Error('malformed commit status');
+          return { ...row, __typename: 'StatusContext', name: row.context,
+            status: ['pending', 'expected'].includes(state) ? 'pending' : 'completed',
+            conclusion: ['pending', 'expected'].includes(state) ? null : state === 'error' ? 'failure' : state,
+            detailsUrl: row.target_url ?? null };
+        });
+        if (rows.some(row => !row || (row.__typename !== 'StatusContext' && !Number.isSafeInteger(row.id))
           || typeof row.name !== 'string' || !row.name || typeof row.status !== 'string'
           || !['queued', 'in_progress', 'completed', 'waiting', 'requested', 'pending'].includes(row.status.toLowerCase())
           || (row.conclusion != null && typeof row.conclusion !== 'string')
@@ -1609,7 +1624,8 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
         const absent = withoutImpliedRequiredChecks(requiredChecks ?? [], rows).filter(name => !rows.some(row => row.name === name));
         const observed = collapseRollupToLatestPerName(rows).some(row => (!requiredChecks?.length || requiredChecks.includes(row.name))
           && (row.status.toLowerCase() !== 'completed' || FAILING_CONCLUSIONS.includes(row.conclusion?.toLowerCase())));
-        cache.set(key, { rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
+        cache.set(key, { rowsComplete: read.rowsComplete === true && read.rowsHead === sha,
+          rows: rows.map(row => ({ ...row, status: row.status.toUpperCase(),
           detailsUrl: row.detailsUrl ?? row.details_url ?? row.html_url ?? null,
           conclusion: row.conclusion?.toUpperCase() ?? null, completedAt: row.completed_at ?? null })),
         ...(absent.length && !observed ? { incomplete: `missing required checks: ${absent.join(', ')}` } : {}) });
@@ -1641,9 +1657,14 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
-    // The rows are no longer the GraphQL rollup the evidence describes, so it must not read as complete.
-    ready.push({ ...pr, rowsComplete: false, rowsHead: null, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
-      ...((refused || neverStarted) ? { rollupIncomplete: true } : {}) });
+    // Only the replacement reader can attest its rows; a fallback to known rows carries no new proof.
+    // "CI never started" is its own flag; a complete empty read is still attested (so startBeforeCi + verifyGreen can
+    // dispatch). Fallback to snapshot rows carries no new proof, so that case stays unattested.
+    const rowsComplete = !refused && !(neverStarted && known) && result.rowsComplete === true;
+    ready.push({ ...pr, rowsComplete, rowsHead: rowsComplete ? sha : null,
+      ...(neverStarted ? { ciNeverStarted: true } : {}),
+      statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
+      ...((refused || neverStarted || (!rowsComplete && result.rows)) ? { rollupIncomplete: true } : rowsComplete ? { rollupIncomplete: false } : {}) });
   }
   return { prs: ready, refusals, notes, owedTriggers };
 }

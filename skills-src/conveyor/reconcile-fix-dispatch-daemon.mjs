@@ -629,7 +629,8 @@ export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequir
   if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
   let requiredChecks;
   try { requiredChecks = readRequiredChecks({ repo }); } catch { return null; }
-  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })) return null;
+  if (!ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks, headSha: pr.headRefOid,
+    rowsComplete: pr.rowsComplete, rowsHead: pr.rowsHead })) return null;
   return { ...row, alreadyPosted: false,
     body: buildCiHealVerdictVoidComment({ headSha: head, voids: 'needs-human', cause: 'required-ci-green' }) };
 }
