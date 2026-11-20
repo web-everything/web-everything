@@ -263,13 +263,17 @@ describe('CI gate mirroring fails closed', () => {
     const changed = yaml.safeLoad(workflow);
     const step = changed.jobs.test.steps.find(step => step.name === 'PR shards finish below 1050 seconds with no new failures');
     expect(step['continue-on-error']).toBe(true);
-    step['continue-on-error'] = value;
-    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+    if (value === undefined) delete step['continue-on-error'];
+    else step['continue-on-error'] = value;
+    const mutatedWorkflow = yaml.safeDump(changed);
+    expect(() => ciGatePlan(mutatedWorkflow)).toThrow('update the urgent verification mirror');
   });
   it.each([undefined, {}, { actions: 'write' }])('refuses an unmirrored timing-check token permission %j', permissions => {
     const changed = yaml.safeLoad(workflow);
-    changed.jobs.test.permissions = permissions;
-    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('test execution context; update the urgent verification mirror');
+    if (permissions === undefined) delete changed.jobs.test.permissions;
+    else changed.jobs.test.permissions = permissions;
+    const mutatedWorkflow = yaml.safeDump(changed);
+    expect(() => ciGatePlan(mutatedWorkflow)).toThrow('test execution context; update the urgent verification mirror');
   });
   const mirroredJobs = ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'test', 'standards'];
   it.each([
