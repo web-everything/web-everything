@@ -86,7 +86,7 @@ describe('red-team reservation routing under operator overrides', () => {
     expect(result.reason).toContain('daily-cap: 5000/5000 non-Claude seat calls used today for codex');
     expect(result.reason).not.toContain('no available route');
     expect(calls.filter(c => c[0] === 'denied')).toEqual([['denied', 'codex', 5000]]);
-    expect(calls).toContainEqual(['log', 'red team deferred: daily-cap: 5000/5000 non-Claude seat calls used today for codex (scorecards + reservation ledger)']);
+    expect(calls).toContainEqual(['log', `red team skipped: ${result.reason}`]);
     expect(calls.some(c => c[0] === 'seat')).toBe(false);
   });
   it.each([
@@ -94,12 +94,12 @@ describe('red-team reservation routing under operator overrides', () => {
       'codex=5000 (source: WE_REVIEW_SEAT_CAP_CODEX)', 'agy-claude=0 (source: WE_REVIEW_SEAT_CAP_AGY_CLAUDE)',
       'agy-gemini=0 (source: WE_REVIEW_SEAT_CAP_AGY_GEMINI)'] },
     { name: 'defaults', env: {}, control: {}, expected: [
-      'codex=80 (source: default)', 'agy-claude=300 (source: default)', 'agy-gemini=0 (source: default)'] },
+      'codex=80 (source: settings cascade)', 'agy-claude=10 (source: settings cascade)', 'agy-gemini=0 (source: settings cascade)'] },
     { name: 'legacy cap', env: { [DAILY_CAP_ENV]: '17' }, control: {}, expected: [
-      'codex=17 (source: WE_REVIEW_EXTRA_SEATS_DAILY_CAP)', 'agy-claude=300 (source: default)', 'agy-gemini=0 (source: default)'] },
+      'codex=17 (source: WE_REVIEW_EXTRA_SEATS_DAILY_CAP)', 'agy-claude=10 (source: settings cascade)', 'agy-gemini=0 (source: settings cascade)'] },
     { name: 'routing controls', env: { WE_REVIEW_SEAT_CAP_CODEX: '5000' },
       control: { disabledProviders: ['codex'], enabledProviders: ['agy-gemini'] }, expected: [
-        'codex=0 (source: routing disabledProviders)', 'agy-claude=300 (source: default)', 'agy-gemini=300 (source: routing/default)'] },
+        'codex=0 (source: routing disabledProviders)', 'agy-claude=10 (source: settings cascade)', 'agy-gemini=300 (source: routing/settings cascade)'] },
   ])('logs each resolved provider cap and its source: $name', async ({ env, control, expected }) => {
     const policy = policyFor();
     Object.assign(policy.operations['review-seat:red-team'], control);
@@ -124,7 +124,7 @@ describe('red-team reservation routing under operator overrides', () => {
     expect(calls).toContainEqual(['reserve', 'codex', 1, 0]);
     expect(newId).not.toHaveBeenCalled();
     expect(calls.some(c => c[0] === 'seat')).toBe(false);
-    expect(calls).toContainEqual(['log', 'red team deferred: daily-cap: 3/3 non-Claude seat calls used today for codex (scorecards + reservation ledger)']);
+    expect(calls).toContainEqual(['log', `red team skipped: ${result.reason}`]);
   });
   it('tries a remaining in-chain fallback after codex reservation denial', async () => {
     const { io, calls } = fakeSeatIo({
@@ -154,6 +154,8 @@ function fakeSeatIo(over = {}, ledgerBox = {}) {
   // Keep live, unscored quota evidence separate from the settled rows asserted below.
   const quotaObservations = [];
   const io = {
+    // Standard-layer fixtures must not inherit live tool or host review preferences.
+    readSeatSettings: () => ({ tool: {}, platform: {} }),
     now: () => NOW,
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: (l) => calls.push(['log', l]),
@@ -352,9 +354,10 @@ describe('#4194 cost controls — kill switch, cap, quota', () => {
   });
 
   it('card xn2wf9t — per-provider caps are resolved and counted separately, with codex\'s own legacy fallback', () => {
-    expect(resolveProviderCap('codex', {})).toBe(PROVIDER_CAP_DEFAULT.codex);
+    // The shipped tool setting opts into 600; the code fallback remains 80.
+    expect(resolveProviderCap('codex', {})).toBe(600);
     expect(resolveProviderCap('agy-claude', {})).toBe(PROVIDER_CAP_DEFAULT['agy-claude']);
-    expect(PROVIDER_CAP_DEFAULT).toEqual({ codex: 80, 'agy-claude': 300, 'agy-gemini': 0 });
+    expect(PROVIDER_CAP_DEFAULT).toEqual({ codex: 80, 'agy-claude': 10, 'agy-gemini': 0 });
     expect(resolveProviderCap('agy-gemini', {})).toBe(0);
     expect(resolveProviderCap('agy-gemini', { [PROVIDER_CAP_ENV['agy-gemini']]: '5' })).toBe(5);
     expect(resolveProviderCap('codex', { [PROVIDER_CAP_ENV.codex]: '5' })).toBe(5);
@@ -669,7 +672,7 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls.at(-1)).toEqual(['rm', '/tmp/seat-scratch']);
     expect(renderSeatSummary(r).join('\n')).toMatch(/also raised by Claude/);
     // Card xn2wf9t — per-provider usage is reported, not just a shared total.
-    expect(r.providerUsage.codex).toMatchObject({ usedToday: 1, cap: PROVIDER_CAP_DEFAULT.codex });
+    expect(r.providerUsage.codex).toMatchObject({ usedToday: 1, cap: 600 }); // Explicit shipped tool setting.
     expect(r.providerUsage['agy-claude']).toMatchObject({ usedToday: 1, cap: PROVIDER_CAP_DEFAULT['agy-claude'] });
     expect(r.providerUsage['agy-gemini']).toMatchObject({ usedToday: promoted ? 1 : 0, cap: 5 });
   });

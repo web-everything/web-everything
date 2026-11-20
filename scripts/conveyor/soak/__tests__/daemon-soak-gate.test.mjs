@@ -32,8 +32,9 @@ function gateScript() {
   return body.join('\n');
 }
 
-function runGate({ scopeResult, run, shardResult }) {
+function runGate({ scopeResult, run, shardResult, event = 'merge_group' }) {
   const values = {
+    'github.event_name': event,
     'needs.daemon-soak-scope.result': scopeResult,
     'needs.daemon-soak-scope.outputs.run': run,
     'needs.soak-shard.result': shardResult,
@@ -42,12 +43,33 @@ function runGate({ scopeResult, run, shardResult }) {
     if (!(expr in values)) throw new Error(`gate script reads an unmodelled expression: ${expr}`);
     return values[expr];
   });
-  return spawnSync('bash', ['-e', '-c', script], { encoding: 'utf8' }).status;
+  return spawnSync('bash', ['-e', '-c', script], { encoding: 'utf8', env: { ...process.env, GITHUB_STEP_SUMMARY: '/dev/null' } }).status;
 }
 
 describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
-  it('passes when scope succeeded and found no daemon code (shards skipped)', () => {
-    expect(runGate({ scopeResult: 'success', run: 'false', shardResult: 'skipped' })).toBe(0);
+  // R1068: soak shards run only in merge_group / main push / dispatch; on a pull_request the aggregator succeeds.
+  it('passes on pull_request with no shards, whatever the scope says', () => {
+    for (const run of ['', 'false', 'true']) {
+      for (const scopeResult of ['success', 'failure', 'skipped']) {
+        expect(runGate({ event: 'pull_request', scopeResult, run, shardResult: 'skipped' })).toBe(0);
+      }
+    }
+  });
+
+  it('fails in merge_group / push / dispatch when scope says run=false (soak may not be skipped)', () => {
+    for (const event of ['merge_group', 'push', 'workflow_dispatch']) {
+      expect(runGate({ event, scopeResult: 'success', run: 'false', shardResult: 'skipped' }), event).not.toBe(0);
+    }
+  });
+
+  it('fails in merge_group when the shards are skipped, failed, cancelled or timed out', () => {
+    for (const shardResult of ['skipped', 'failure', 'cancelled', '']) {
+      expect(runGate({ event: 'merge_group', scopeResult: 'success', run: 'true', shardResult }), shardResult).not.toBe(0);
+    }
+  });
+
+  it('the soak-shard job never runs on a pull_request', () => {
+    expect(jobIf('soak-shard')).toMatch(/github\.event_name != 'pull_request'/);
   });
 
   it('passes when scope said run and every shard succeeded', () => {
