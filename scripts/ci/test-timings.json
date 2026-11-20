@@ -2164,6 +2164,7 @@
   "scripts/conveyor/soak/breaks/pinned-overlay-conflict-skipped.soak.test.mjs": 160.75,
   "scripts/conveyor/soak/breaks/pinned-rearm-orphan-marker.soak.test.mjs": 0.76,
   "scripts/conveyor/soak/breaks/pinned-stack-clean-base-order.soak.test.mjs": 24.23,
+  "scripts/conveyor/soak/breaks/pinnedfrom-audited-exemption.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/post-accept-advisory-shadow-replay.soak.test.mjs": 2.91,
   "scripts/conveyor/soak/breaks/postmortem-poison-merge.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/pr-scoped-gate-red-never-healed.soak.test.mjs": 0.64,
