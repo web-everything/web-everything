@@ -104,16 +104,29 @@ export function loadPoolSettings({ env = process.env, read = readPoolSettingsChe
   try { checked = read(); if (!object(checked?.value) || checked.taint?.length) throw Error('resourcePool settings unreadable or tainted'); }
   catch (e) { error = clean(e.message); }
   const standard = { mode: POOL_DEFAULTS.mode, builderFloor: POOL_DEFAULTS.builderFloor, class: POOL_DEFAULTS.classes };
-  const project = p => { if (!p) return p; const { classes, ...rest } = p; return { ...rest, ...(classes ? { class: classes } : {}) }; };
+  const project = p => {
+    if (!p) return p;
+    const { classes, ...rest } = p;
+    const projected = { ...rest, ...(Object.hasOwn(p, 'classes') ? { class: classes } : {}) };
+    // Empty objects have no cascade leaves; reject object-valued bounds before they disappear.
+    if (object(projected.class) && Object.values(projected.class).some(c => object(c)
+      && ['reserve', 'max', 'class1Overdraw'].some(k => Object.hasOwn(c, k) && !integer(c[k]))))
+      error ??= 'invalid resourcePool bounds; shadow unknown';
+    return projected;
+  };
   if (platform === undefined) platform = platformPreference('resourcePool', { env });
   if (operatorOverride === undefined) operatorOverride = readOperatorPolicy('resourcePool');
-  const valid = { mode: v => ['off', 'shadow', 'enforce'].includes(v), builderFloor: integer };
+  // Parent leaves (null, arrays, scalars) must not replace the per-class objects.
+  const valid = { mode: v => ['off', 'shadow', 'enforce'].includes(v), builderFloor: integer, class: v => !!object(v) };
   for (let c = 1; c <= 4; c++) for (const k of ['reserve', 'max', ...(c === 1 ? ['class1Overdraw'] : [])]) valid[`class.${c}.${k}`] = integer;
   const resolved = cascadePolicy('resourcePool', project(checked?.value), { standard,
     platform: project(platform), operatorOverride, env,
     envValues: { mode: env.WE_RESOURCE_POOL_MODE }, valid });
   const { class: classes, ...rest } = resolved.value;
-  const invalid = resolved.invalid?.length || Object.values(classes).some(c => c.reserve > c.max);
+  const invalid = resolved.invalid?.length || !object(classes)
+    || [1, 2, 3, 4].some(c => !object(classes[c]) || !integer(classes[c].reserve)
+      || !integer(classes[c].max) || classes[c].reserve > classes[c].max)
+    || !integer(classes[1].class1Overdraw);
   const unknown = !!error || !!invalid || operatorOverride === null;
   const configuredMode = unknown ? 'shadow' : rest.mode;
   const value = { mode: configuredMode === 'off' ? 'off' : 'shadow', builderFloor: rest.builderFloor, classes };

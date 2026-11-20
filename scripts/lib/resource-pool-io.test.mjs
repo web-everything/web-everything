@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { readPoolSource, SOURCES, collectResourcePool, loadPoolSettings, appendShadowRows, poolSourcePaths, readPoolSettingsChecked, poolPidAlive } from './resource-pool-io.mjs';
 import { liveReviewRoundBudget } from '../../skills-src/conveyor/review-daemon.mjs';
 import { reviewJobsDir } from '../operations/review-job-store.mjs';
-import { resourcePoolOperation } from '../operations/resource-pool.mjs';
+import { resourcePoolOperation, renderResourcePool } from '../operations/resource-pool.mjs';
 import { assessResourceStatus } from '../operations/resource-status.mjs';
 import { lockIdFor } from '../readiness/file-locks.mjs';
 let root, paths;
@@ -130,6 +130,39 @@ it('cascade resolves plural classes, instant singular class overrides, and logs 
     platform: { classes: { 2: { max: 9 } } }, operatorOverride: { 'class.2.max': 12 }, env: {}, log });
   expect(p.value.classes[2].max).toBe(12); expect(p.sources['class.2.max']).toBe('operator-db');
   expect(log).toHaveBeenCalled();
+});
+describe.each(['tool', 'platform'])('%s malformed class settings', layer => {
+  it.each([
+    { classes: { 2: null } }, { classes: { 1: null } }, { classes: { 4: null } },
+    { classes: null }, { classes: false }, { classes: 0 }, { classes: '' },
+    { classes: [] }, { classes: 'invalid' },
+    { classes: { 2: [] } }, { classes: { 2: false } }, { classes: { 2: 8 } },
+    { classes: { 2: 'invalid' } }, { classes: { 2: { reserve: { nested: 2 } } } },
+    { classes: { 1: { class1Overdraw: { nested: 2 } } } },
+    { classes: { 2: { reserve: {} } } }, { classes: { 2: { max: {} } } },
+    { classes: { 1: { class1Overdraw: {} } } },
+    { class: null }, { class: { 2: null } },
+  ])('produces unknown shadow evidence for %j', block => {
+    const dir = join(root, 'settings'); mkdirSync(dir);
+    put(join(dir, 'resource-pool.json'), { resourcePool: { mode: 'off', ...(layer === 'tool' ? block : {}) } });
+    const resolved = loadPoolSettings({
+      read: () => readPoolSettingsChecked({ dir, legacyPath: join(root, 'legacy.json') }),
+      platform: layer === 'platform' ? block : {}, operatorOverride: {}, env: {}, log: () => {},
+    });
+    expect(resolved).toMatchObject({ unknown: true, configuredMode: 'shadow', value: { mode: 'shadow' } });
+    expect(resolved.error).toContain('invalid resourcePool');
+    const declaration = resourcePoolOperation({ collect: () => collectResourcePool({
+      coord: root, paths, settings: resolved, caps: { forge: 14 }, nowMs,
+      readSource: source => ({ source, ok: true, holders: [],
+        ...(source === 'snapshot' ? { budget: { studio: { units: 30 } } } : {}) }),
+    }) });
+    const report = declaration.steps[0].step.fn();
+    expect(report.unknown).toBe(true);
+    expect(report.rows.length).toBeGreaterThan(0);
+    expect(report.rows.every(row => row.poolDecision === 'unknown')).toBe(true);
+    expect(renderResourcePool(report)).toContain('settings: UNKNOWN');
+    expect(report.digest).toContain('studio ?/30u');
+  });
 });
 it('uses existing source path resolvers with explicit private environment roots', () => {
   const env = { WE_COORDINATION_ROOT: root, LANE_POOL_ROOT: join(root, 'lanes'), OPERATION_REVIEW_JOBS_DIR: join(root, 'reviews'),
