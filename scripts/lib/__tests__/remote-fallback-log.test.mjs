@@ -2,7 +2,20 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ADVISORY_REASONS, recordLocalSlotFallback, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+import { ADVISORY_REASONS, recordLocalSlotFallback, unloggedPathReason, summarize, readFallbackLog, readFallbackRows } from '../remote-fallback-log.mjs';
+
+describe('unloggedPathReason', () => {
+  it('names the caller', () => {
+    expect(unloggedPathReason('verify-shard-run')).toBe('unlogged-path:verify-shard-run');
+  });
+  it.each(['', '   ', undefined, null, 42, {}])('uses unknown for an empty or non-string caller: %j', caller => {
+    expect(unloggedPathReason(caller)).toBe('unlogged-path:unknown');
+  });
+  it('trims and bounds callers and removes log controls', () => {
+    expect(unloggedPathReason(' caller\nname ')).toBe('unlogged-path:caller?name');
+    expect(unloggedPathReason('x'.repeat(5000))).toBe(`unlogged-path:${'x'.repeat(4096)}`);
+  });
+});
 
 describe('summarize', () => {
   it('excludes credential warnings from real counts and the top cause', () => {

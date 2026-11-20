@@ -174,6 +174,20 @@ describe('query and gh row shape', () => {
       expect(() => buildOpenPrPageQuery({ repo: bad, pageSize: 20 })).toThrow(TypeError);
     }
   });
+  it('inventory-only pages retain full-list ordering and metadata while omitting all heavy/check fields', () => {
+    const query = buildOpenPrPageQuery({ repo, pageSize: 100, inventoryOnly: true });
+    expect(query).toContain('states:OPEN,first:100,orderBy:{field:CREATED_AT,direction:DESC}');
+    expect(query).toContain('totalCount pageInfo{hasNextPage endCursor} nodes{number headRefOid updatedAt baseRefName isDraft state}');
+    expect(query).not.toMatch(/statusCheckRollup|labels|body|files|commits/);
+    expect(buildOpenPrPageQuery({ repo, pageSize: 100 })).toContain('statusCheckRollup');
+  });
+  it('the shared page parser validates lean metadata without inventing full PR fields', () => {
+    const lean = { number: 1, headRefOid: 'a'.repeat(40), updatedAt: '2026-11-18T00:00:00Z', baseRefName: 'main', isDraft: false, state: 'OPEN' };
+    const raw = JSON.stringify({ data: { repository: { pullRequests: { nodes: [lean], totalCount: 1,
+      pageInfo: { hasNextPage: false, endCursor: null } } } } });
+    expect(parseOpenPrPage(raw, { mapNode: n => n })).toEqual({ rows: [lean], totalCount: 1, hasNextPage: false, endCursor: null });
+    expect(() => parseOpenPrPage(JSON.stringify({ ...JSON.parse(raw), errors: [{ message: 'partial' }] }), { mapNode: n => n })).toThrow('partial');
+  });
   it('maps both check kinds exactly, including nulls and empty connections', () => {
     const check = { __typename: 'CheckRun', name: 'test', status: 'IN_PROGRESS', completedAt: null,
       conclusion: null, startedAt: null, detailsUrl: 'https://example.com/check' };
@@ -519,8 +533,35 @@ describe('paged hydrated listing', () => {
   const list = (exec, extra = {}) => listOpenPrsPagedHydrated({ repo, exec, paging,
     heavyFields: ['body', 'files'], nowMs: 10000, ...extra });
 
+  it('throws on totalCount 2 with only 1 returned row before hydrating or reusing seeds', () => {
+    const exec = vi.fn(() => page([node(1)], false, null, 2));
+    const cache = { 1: cached(row(1)) };
+    const before = structuredClone(cache);
+    expect(() => list(exec, { cache, seed: [{ ...row(1), ...heavy }] }))
+      .toThrow(/1 unique of 2 open PRs/);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(cache).toEqual(before);
+  });
+
+  it.each([undefined, null, -1, 1.5])('throws when page totalCount is missing or invalid (%s)', totalCount => {
+    const data = JSON.parse(page([node(1)]));
+    data.data.repository.pullRequests.totalCount = totalCount;
+    const exec = vi.fn(() => JSON.stringify(data));
+    expect(() => list(exec)).toThrow(PrListUnreadableError);
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns every row of a complete two-page inventory', () => {
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)], true, 'a', 2))
+      .mockReturnValueOnce(page([node(2)], false, null, 2));
+    expect(list(exec, { heavyFields: [] })).toMatchObject({
+      rows: [row(1), row(2)], pages: 2, totalCount: 2, truncated: false,
+    });
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
   it('throws on a repeatedly failing second page without hydrating partial rows', () => {
-    const exec = vi.fn().mockReturnValueOnce(page([node(1)], true, 'a'))
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)], true, 'a', 2))
       .mockImplementation(() => { throw failure(timeout); });
     let error;
     try { list(exec); } catch (e) { error = e; }
@@ -545,7 +586,7 @@ describe('paged hydrated listing', () => {
     const cache = { 2: cached(row(2), { body: 'untouched' }), 99: cached(row(99)) };
     delete cache[2].files;
     const before = structuredClone(cache);
-    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)]))
+    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)], false, null, 2))
       .mockReturnValueOnce(JSON.stringify(heavy));
     const result = list(exec, { cache, needsHeavy: r => r.number === 1, execOpts: { timeout: 123 } });
     expect(result.rows).toEqual([{ ...row(1), body: heavy.body, files: heavy.files }, row(2)]);
@@ -559,7 +600,7 @@ describe('paged hydrated listing', () => {
 
   it('reuses matching snapshot seeds without view calls', () => {
     const seed = [{ ...row(1), ...heavy }, { ...row(2), ...heavy }];
-    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)]));
+    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)], false, null, 2));
     const result = list(exec, { seed });
     expect(result).toMatchObject({ hydrated: 0, reused: 2 });
     expect(result.cache[1]).toEqual({ updatedAt: row(1).updatedAt, headRefOid: row(1).headRefOid,
@@ -572,7 +613,7 @@ describe('paged hydrated listing', () => {
   ])('hydrates a mismatched or incomplete seed (%j)', extra => {
     const seedRow = { ...row(1), ...heavy, ...extra };
     if (extra.files === undefined && Object.hasOwn(extra, 'files')) delete seedRow.files;
-    const exec = vi.fn().mockReturnValueOnce(page([node(1)]))
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1))
       .mockReturnValueOnce(JSON.stringify(heavy));
     expect(list(exec, { seed: [seedRow] })).toMatchObject({ hydrated: 1, reused: 0 });
     expect(exec).toHaveBeenCalledTimes(2);
@@ -582,18 +623,18 @@ describe('paged hydrated listing', () => {
     const seed = [{ ...row(1), ...heavy }];
     for (const entry of [cached(row(1), { fetchedAtMs: 8000 }), cached(row(1), { headRefOid: 'old' }),
       { updatedAt: row(1).updatedAt, headRefOid: row(1).headRefOid, fetchedAtMs: 9500 }]) {
-      const exec = vi.fn().mockReturnValueOnce(page([node(1)]));
+      const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1));
       expect(list(exec, { cache: { 1: entry }, seed }).rows[0].body).toBe(heavy.body);
       expect(exec).toHaveBeenCalledTimes(1);
     }
-    const exec = vi.fn().mockReturnValueOnce(page([node(1)]));
+    const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1));
     expect(list(exec, { cache: { 1: cached(row(1), { body: 'cached' }) }, seed }).rows[0].body).toBe('cached');
   });
 
   it('throws unreadable on a deferred page, including after partial progress', () => {
     const deferred = JSON.stringify({ outcome: 'deferred-low-budget' });
     for (const exec of [vi.fn().mockReturnValueOnce(deferred),
-      vi.fn().mockReturnValueOnce(page([node(1)], true, 'a')).mockReturnValueOnce(deferred)]) {
+      vi.fn().mockReturnValueOnce(page([node(1)], true, 'a', 2)).mockReturnValueOnce(deferred)]) {
       expect(() => list(exec)).toThrow(PrListUnreadableError);
       exec.mockReset().mockReturnValueOnce(deferred);
       expect(() => list(exec)).toThrow('gh deferred the page (low budget)');
@@ -603,7 +644,7 @@ describe('paged hydrated listing', () => {
   it('throws unreadable if heavy hydration fails without mutating caller cache', () => {
     const cache = { 99: cached(row(99)) };
     const before = structuredClone(cache);
-    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)]))
+    const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)], false, null, 2))
       .mockReturnValueOnce(JSON.stringify(heavy)).mockImplementation(() => { throw failure(timeout); });
     let error;
     try { list(exec, { cache }); } catch (e) { error = e; }

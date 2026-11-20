@@ -1,11 +1,12 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
-import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher } from './red-team-check-run.mjs';
+import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, requireRedTeamAppWriter } from './red-team-check-run.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { daemonEventsPath } from './daemon-events.mjs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
@@ -809,6 +810,19 @@ export function recordRedTeamStatus(input, options = {}) {
           if (!result.ok && result.definite) { remoteHold = false; writeHold(); }
           return result;
         };
+        // Fail closed BEFORE any hold: no WE App token means no check run can be created, so a hold would be orphaned.
+        const appWriter = requireRedTeamAppWriter({ gh, env: writerEnv, appWriterProbe: options.appWriterProbe });
+        if (appWriter.ok !== true) {
+          // Loud refusal: an event the daemon (which holds the App token) reacts to by running the round, and a nonzero
+          // exit for an operator-shell CLI. An earlier success on the SAME head stays only until the daemon's round posts.
+          try {
+            appendFileSync(daemonEventsPath({ env: writerEnv }), `${JSON.stringify({ at: new Date().toISOString(),
+              kind: 'red-team-writer-refused-no-app-token', repo: input.repo, pr: input.pr, daemon: 'red-team-writer',
+              detail: { head, status: input.status, reason: safeReason(appWriter.reason) } })}\n`);
+          } catch { /* best effort: the refusal itself is still returned */ }
+          if (!underTest) process.exitCode = 1;
+          return report({ published: false, refused: true, reason: safeReason(appWriter.reason) });
+        }
         if (!remoteHold) preHold = setRemoteHold(`${input.status} round publication in progress`);
         let hold = 'red-team evidence unreadable; inspect the PR thread';
         let sendBack = input.sendBack === true;
