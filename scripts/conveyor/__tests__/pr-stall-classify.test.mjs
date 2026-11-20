@@ -684,3 +684,21 @@ describe('pending red-team watchdog evidence', () => {
     expect(at(state, { redTeam: pending() })).toMatchObject({ lane: 'system', action: 'ask-review-daemon' });
   });
 });
+
+describe('stall classify waits for published findings', () => {
+  const RT = 'ruling-needed:red-team-round-cap';
+  const empty = (age) => at(RT, { verdict: ev('send-back', 'red-team-cap', { latest: [] }), row: { ageMinutes: age } });
+  it('a confirm whose findings are not yet readable is pending (no action), not ruling-needed', () => {
+    expect(empty(2)).toBeNull();
+  });
+  it('a marked but malformed finding still goes to the operator', () => {
+    const r = at(RT, { verdict: ev('send-back', 'red-team-cap', { latest: [{ cls: 'broken' }] }), row: { ageMinutes: 2 } });
+    expect(r).toMatchObject({ lane: 'operator' });
+  });
+  it('findings pending past the bound escalate as findings-stuck', () => {
+    expect(empty(CLASSIFY_DEFAULTS.findingsPendingMinutes + 1)).toMatchObject({ lane: 'operator', action: 'findings-stuck' });
+  });
+  it('an unknown pending age fails closed', () => {
+    expect(empty(undefined)).toMatchObject({ lane: 'operator' });
+  });
+});
