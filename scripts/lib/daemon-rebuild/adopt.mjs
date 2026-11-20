@@ -13,8 +13,11 @@ import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
-import { AUTOMATIC_RETIREMENT_REASONS } from '../../operations/prototype-retire.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
+
+const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
+  'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
+]);
 
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
@@ -160,7 +163,8 @@ export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) 
     const history = events.filter((e) => e?.ref === ref);
     const removed = history.at(-1)?.kind === 'auto-retired' ? history.at(-1) : null; // `removed` never carries authenticated operator evidence; any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
-    if (!removed || removed.operatorReason !== true || AUTOMATIC_RETIREMENT_REASONS.includes(removed.reason?.trim().toLowerCase()) || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+    if (!removed || removed.operatorReason !== true || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+      || AUTOMATIC_RETIREMENT_REASONS.includes(removed.reason.trim().toLowerCase())
       || typeof removed.actor !== 'string' || !OPERATOR_LOGINS.includes(removed.actor.toLowerCase())
       || typeof removed.at !== 'string' || !added.length) return false;
     const removedAt = Date.parse(removed.at);

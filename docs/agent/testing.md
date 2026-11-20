@@ -5070,7 +5070,7 @@ Urgent retirement requires both the matching load and a persisted `unload-decisi
 write failure leaves the registration intact. Decisions bind tracking ID, clone, source ref/SHA
 and registration ref/SHA, with either an exact-source-SHA completed failure or a `ci-expired`
 decision at least 24 hours after loading. A load record alone never authorizes withdrawal.
-Urgent withdrawal uses its own `proveOverlayWithdrawal` guard under the add lock:
+Urgent withdrawal reuses explicit `--remove`'s `proveOverlayWithdrawal` guard under the add lock:
 cached stacked dependents or live ancestry to another registration refuse removal. Unreadable
 dependent evidence also refuses; inspect the stack before unloading manually. Fetch the target
 as well as each potential dependent before comparing ancestry: urgent clones may lack the target's objects.
@@ -5183,18 +5183,3 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
-
-## Explicit overlay withdrawal acknowledgement
-
-Explicit operator withdrawal requires `--accept-omission` (`--accept-uncontained` remains an alias),
-a non-empty non-automatic reason and the exact tip. Unregistered withdrawal additionally verifies the
-ref is absent from the registry and the tip is a live rebuild merge's second parent. Authentication
-still checks the human operator against the declared actor. The event records `operatorReason: true`,
-`acceptedOmission: true` and the authenticated actor. Ordinary in-main retirement never grants
-operator withdrawal authority. Actorless prototype removal still grants no operator authority.
-
-Do not infer withdrawal authority from containment in origin/main or attempt to prove dependent
-independence. The rebuild's merge and smoke gate adoption after explicit withdrawal. The withdrawal
-fixtures cover mandatory acknowledgement even for contained tips, exact live tips, retained identity
-and history refusals, and event fields. The operator-retirement soak uses the explicit acknowledgement;
-it needs no shallow-history seam. Automatic urgent-failure withdrawal retains its separate dependency proof.

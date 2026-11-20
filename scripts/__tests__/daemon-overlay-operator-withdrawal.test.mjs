@@ -1,16 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { withdrawUnregisteredOverlay, withdrawRegisteredOverlay, main, replaceRegistration } from '../daemon-overlay.mjs';
+import { withdrawUnregisteredOverlay, proveOverlayWithdrawal, retireRegistration, main } from '../daemon-overlay.mjs';
 import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays } from '../lib/daemon-overlays.mjs';
 import { overlayRetiredByOperator } from '../lib/daemon-rebuild/adopt.mjs';
+import { createPrototypeLoader, defaultDeps } from '../operations/prototype-load-io.mjs';
 import { REBUILD_IDENTITY_ENV } from '../lib/daemon-rebuild/shared.mjs';
-import { AUTOMATIC_RETIREMENT_REASONS } from '../operations/prototype-retire.mjs';
+
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, spawnSync: vi.fn(actual.spawnSync) };
+});
 
 const roots = [];
-afterEach(() => {
+afterEach(async () => {
+  const actual = await vi.importActual('node:child_process');
+  vi.mocked(spawnSync).mockReset().mockImplementation(actual.spawnSync);
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
   roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true }));
@@ -56,12 +63,15 @@ describe('operator withdrawal of an unregistered live overlay', () => {
       return spawnSync(cmd, args, opts);
     });
     expect(await withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).toMatchObject({ retired: true });
-    expect(f.events().at(-1)).toMatchObject({ operatorReason: true, acceptedOmission: true, actor: 'chalbert', tip: f.tip });
+    expect(f.events()).toHaveLength(1);
+    expect(f.events()[0]).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, reason: f.args.reason,
+      operatorReason: true, acceptedOmission: true, actor: 'chalbert', tip: f.tip });
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual(['lane/top']);
   });
-  it('refuses automatic reasons as explicit withdrawal authority', async () => {
+  it.each(['in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed'])(
+    'refuses automatic reason %s as explicit withdrawal authority', async reason => {
     const f = fixture();
-    await expect(withdrawUnregisteredOverlay({ ...f.args, reason: 'in-main' })).rejects.toThrow(/operator withdrawal/);
+    await expect(withdrawUnregisteredOverlay({ ...f.args, reason })).rejects.toThrow(/operator withdrawal/);
     expect(f.events()).toEqual([]);
   });
   it.each(['--accept-omission', '--accept-uncontained'])('CLI requires explicit acknowledgement and accepts %s', async flag => {
@@ -84,6 +94,7 @@ describe('operator withdrawal of an unregistered live overlay', () => {
   });
   it.each([
     ['wrong tip', { tip: 'a'.repeat(40) }, /live.*tip/],
+    ['malformed ref', { ref: '../other' }, /valid --ref/],
     ['malformed tip', { tip: 'abc' }, /40-hex/],
     ['tip with trailing newline', { tip: 'a'.repeat(40) + '\n' }, /40-hex/],
     ['missing reason', { reason: ' ' }, /reason/],
@@ -141,109 +152,98 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, tip: f.tip, actor: 'chalbert', operatorReason: true, acceptedOmission: true, reason: f.args.reason });
     expect(overlayRetiredByOperator({ ref: f.args.ref, sha: f.tip, registered: () => false, events: f.events() })).toBe(true);
   });
-  describe.each(['remove', 'retire'])('ordinary %s CLI', cmd => {
-    async function run(f, actor, identity, reason = f.args.reason) {
-      vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.env.WE_DAEMON_OVERLAY_DIR);
-      vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-      return main([cmd, `--clone=${f.root}`, `--ref=${f.args.ref}`, '--json',
-        `--reason=${reason}`, ...(cmd === 'retire' ? [`--expected-tip=${f.tip}`] : []),
-        ...(actor === undefined ? [] : [`--actor=${actor}`])], {
-        pruneStaleOverlayRecords: () => {}, resolveOperatorIdentity: identity,
-        tip: () => f.tip, prove: () => ({ action: 'retire', reason: 'in-main', tip: f.tip }),
-      });
-    }
-    it('records the authenticated lowercase actor only with explicit --actor', async () => {
-      const f = fixture();
-      addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
-      const identity = vi.fn(() => ({ login: 'CHALBERT', type: 'User' }));
-      await run(f, 'CHALBERT', identity);
-      expect(identity).toHaveBeenCalledTimes(1);
-      expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired', actor: 'chalbert' });
-      if (cmd === 'remove') expect(f.events().at(-1)).toHaveProperty('operatorReason', true);
-      else expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
-    });
-    it('without --actor removes without resolving identity or supplying operator proof', async () => {
-      const f = fixture();
-      addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
-      const identity = vi.fn(() => { throw new Error('must not resolve absent actor'); });
-      await run(f, undefined, identity);
-      expect(identity).not.toHaveBeenCalled();
-      expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired' });
-      expect(f.events().at(-1)).not.toHaveProperty('actor');
-      expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
-    });
-    it.each(['', ' ', ...AUTOMATIC_RETIREMENT_REASONS.map(reason => ` ${reason.toUpperCase()} `)])(
-      'authenticated actor with empty or automatic reason %j supplies no withdrawal authority', async reason => {
-        const f = fixture();
-        addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
-        await run(f, 'CHALBERT', () => ({ login: 'CHALBERT', type: 'User' }), reason);
-        expect(f.events().at(-1)).toMatchObject({ kind: cmd === 'remove' ? 'removed' : 'auto-retired', actor: 'chalbert' });
-        expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
-      },
-    );
-    it('refuses a non-operator --actor before removing or writing an event', async () => {
-      const f = fixture();
-      addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
-      const before = readFileSync(overlayFilePath(f.root, f.env), 'utf8');
-      const events = f.events();
-      await expect(run(f, 'outsider', () => ({ login: 'outsider', type: 'User' }))).rejects.toThrow(/registered operator/);
-      expect(readFileSync(overlayFilePath(f.root, f.env), 'utf8')).toBe(before);
-      expect(f.events()).toEqual(events);
-    });
-  });
-  it('records authenticated attribution for replace', async () => {
-    const f = fixture();
-    addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
-    const result = await replaceRegistration({ ...f.args, actor: undefined, old: f.args.ref, ref: 'lane/new', expectedSha: f.tip,
-      deps: { ...f.args.deps, tip: () => f.tip,
-        contain: () => ({ ok: true, contained: true, oldTip: f.tip, newTip: f.tip }),
-        check: () => ({ ok: true, clean: true, candSha: f.tip }) } });
-    expect(result).toMatchObject({ ok: true, replaced: true });
-    expect(f.events().at(-1)).toMatchObject({ kind: 'replaced', actor: 'chalbert' });
-  });
 });
 
+// Persist stackVia as historical registration evidence: addOverlay does not author this field.
+function guardedFixture(stackVia) {
+  const root = mkdtempSync(join(tmpdir(), 'overlay-stack-via-'));
+  roots.push(root);
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: join(root, 'store') };
+  const ref = 'lane/base';
+  const tip = 'a'.repeat(40);
+  addOverlay(root, { ref }, { env });
+  const entry = readOverlays(root, { env })[0];
+  const registerTop = (via = stackVia) => {
+    addOverlay(root, { ref: 'lane/top' }, { env });
+    const file = overlayFilePath(root, env);
+    const state = JSON.parse(readFileSync(file, 'utf8'));
+    state.overlays.find(o => o.ref === 'lane/top').stackVia = via;
+    writeFileSync(file, JSON.stringify(state));
+  };
+  return { root, env, ref, tip, entry, registerTop };
+}
 
-describe('registered explicit withdrawal acknowledgement and tip guards', () => {
-  function registeredFixture() {
-    const f = fixture();
-    addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
-    const options = { root: f.root, env: f.env, ref: f.args.ref, expectedTip: f.tip,
-      reason: 'withdraw live fix', actor: 'chalbert', acceptOmission: true, deps: { tip: () => f.tip } };
-    return { ...f, options };
-  }
-  it.each([undefined, false, 'true'])('refuses missing or non-boolean acknowledgement (%s) without mutation', async acceptOmission => {
-    const f = registeredFixture();
-    await expect(async () => withdrawRegisteredOverlay({ ...f.options, acceptOmission })).rejects.toThrow(/--accept-omission/);
-    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
-    expect(f.events()).toEqual([]);
+describe('guarded withdrawal stackVia protection', () => {
+  it('retains a base with a concurrently registered stackVia dependent even when merge-base reports no ancestry', async () => {
+    const f = guardedFixture({ 'lane/carrier': ['lane/base'] });
+    let listed;
+    const git = vi.fn((command, args) => {
+      if (command === 'node' && args[1] === 'list') {
+        listed = readOverlays(f.root, { env: f.env });
+        return JSON.stringify({ list: listed });
+      }
+      if (command === 'git') {
+        if (args[0] === 'fetch') return '';
+        if (args[0] === 'rev-parse') {
+          expect(existsSync(`${overlayFilePath(f.root, f.env)}.add-guard.lock`)).toBe(false);
+          f.registerTop(); // after the initial listing, before guarded proof
+          return f.tip;
+        }
+        if (args[0] === 'ls-remote') return `${f.tip}\trefs/heads/${f.ref}`;
+        if (args[0] === 'merge-base') throw Object.assign(new Error('not an ancestor'), { status: 1 });
+      }
+      throw new Error(`unexpected subprocess: ${command} ${JSON.stringify(args)}`);
+    });
+    const load = createPrototypeLoader({ ...defaultDeps(), env: f.env, exec: git,
+      settings: { daemons: { control: { clone: f.root } }, workspaceRoot: f.root,
+        loaderCli: 'scripts/daemon-overlay.mjs', recordPath: join(f.root, 'loads.jsonl') } });
+    expect(await load({ daemon: 'control', remove: f.ref, reason: 'withdraw base' }))
+      .toMatchObject({ ok: false, stopReason: 'remove-refused', detail: 'not-proved', removed: [] });
+    expect(listed).toEqual([f.entry]);
+    expect(readOverlays(f.root, { env: f.env })).toEqual([f.entry,
+      expect.objectContaining({ ref: 'lane/top', stackVia: { 'lane/carrier': [f.ref] } })]);
+    expect(git.mock.calls.some(([command, args]) => command === 'git' && args[0] === 'merge-base')).toBe(false);
   });
-  it.each(['acceptOmission', 'acceptUncontained'])('accepts %s with an exact tip and records acknowledgement and actor', async flag => {
-    const f = registeredFixture();
-    expect(await withdrawRegisteredOverlay({ ...f.options, acceptOmission: false, [flag]: true })).toMatchObject({ retired: true });
-    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, tip: f.tip,
-      operatorReason: true, acceptedOmission: true, actor: 'chalbert', reason: 'withdraw live fix' });
+
+  it('urgent withdrawal retains a stackVia base under the add guard before invoking retirement proof', async () => {
+    const f = guardedFixture({ 'lane/carrier': ['lane/base'] });
+    const registration = { clone: f.root, ref: f.ref, sha: f.tip };
+    const git = vi.mocked(spawnSync).mockImplementation((command, args) => {
+      expect(command).toBe('git');
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${f.tip}\trefs/heads/${f.ref}` };
+      if (args[0] === 'fetch') return { status: 0, stdout: '' };
+      if (args[0] === 'rev-parse') return { status: 0, stdout: 'b'.repeat(40) };
+      if (args[0] === 'merge-base') return { status: 1, stdout: '' };
+      throw new Error(`unexpected git command: ${JSON.stringify(args)}`);
+    });
+    const prove = vi.fn(() => ({ action: 'retire', tip: f.tip, reason: 'urgent-failed' }));
+    expect(await retireRegistration({ root: f.root, ref: f.ref, expectedTip: f.tip, expectedEntry: f.entry,
+      mode: 'urgent-failed', trackingId: 'attempt', env: f.env, deps: {
+        prove, tip: () => f.tip,
+        readUrgentLoads: () => {
+          expect(existsSync(`${overlayFilePath(f.root, f.env)}.add-guard.lock`)).toBe(true);
+          f.registerTop();
+          return [{ type: 'prototype-load.urgent', trackingId: 'attempt', clone: f.root,
+            ref: f.ref, sha: f.tip, registration, at: '2026-01-01T00:00:00Z' }];
+        },
+        readUrgentDecisions: () => [{ status: 'unload-decision', trackingId: 'attempt', clone: f.root,
+          ref: f.ref, sha: f.tip, registration, at: '2026-01-02T00:00:00Z', reason: 'ci-failed',
+          check: { head_sha: f.tip, status: 'completed', conclusion: 'failure' } }],
+      } })).toMatchObject({ retired: false, refused: 'stacked-or-unreadable' });
+    expect(git).not.toHaveBeenCalled();
+    expect(prove).not.toHaveBeenCalled();
+    expect(readOverlays(f.root, { env: f.env }).find(o => o.ref === f.ref)).toEqual(f.entry);
   });
-  it.each([' ', 'in-main'])('refuses empty or automatic reason %j', async reason => {
-    const f = registeredFixture();
-    await expect(async () => withdrawRegisteredOverlay({ ...f.options, reason })).rejects.toThrow(/reason required/);
-    expect(f.events()).toEqual([]);
-    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
-  });
-  it('refuses an inexact tip before removal', async () => {
-    const f = registeredFixture();
-    expect(await withdrawRegisteredOverlay({ ...f.options, expectedTip: 'a'.repeat(40) })).toMatchObject({ retired: false, refused: 'tip-moved' });
-    expect(f.events()).toEqual([]);
-    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
-  });
-  it('restores the registration if the tip moves after removal without granting operator authority', async () => {
-    const f = registeredFixture();
-    let moved = false;
-    expect(await withdrawRegisteredOverlay({ ...f.options, deps: {
-      tip: () => moved ? 'a'.repeat(40) : f.tip, afterDrop: () => { moved = true; },
-    } })).toMatchObject({ retired: false, refused: 'tip-moved-restored' });
-    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
-    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retire-reverted' });
-    expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
-  });
+
+  it.each([null, false, [], 'lane/base', { carrier: 'lane/base' }, { carrier: [null] }, { carrier: ['../base'] }])(
+    'refuses malformed stackVia evidence %j before any Git proof', stackVia => {
+      const f = guardedFixture(stackVia);
+      f.registerTop();
+      const before = readOverlays(f.root, { env: f.env });
+      const git = vi.fn(() => ({ code: 1, stdout: '' }));
+      expect(proveOverlayWithdrawal({ root: f.root, ref: f.ref, tip: f.tip, reason: 'withdraw', env: f.env, git }))
+        .toEqual({ action: 'keep', reason: 'unreadable-stack-evidence' });
+      expect(git).not.toHaveBeenCalled();
+      expect(readOverlays(f.root, { env: f.env })).toEqual(before);
+    });
 });

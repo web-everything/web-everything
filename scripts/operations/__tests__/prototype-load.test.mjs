@@ -3068,7 +3068,7 @@ describe('refuse-only safety properties P1–P9', () => {
   it('P7 removes exactly one registration via expected-entry/tip guarded retirement', async () => {
     const remove = vi.fn(async () => ({ retired: true }));
     const f = fixture({ list: ['lane/old', 'lane/other'], removeRegistration: remove });
-    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', acceptOmission: true, reason: 'withdraw unaudited' })).toMatchObject({ ok: true, removed: ['lane/old'] });
+    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', reason: 'withdraw unaudited' })).toMatchObject({ ok: true, removed: ['lane/old'] });
     expect(remove).toHaveBeenCalledTimes(1);
     expect(remove).toHaveBeenCalledWith({ root: '/home/test/workspace/wev-control', ref: 'lane/old', expectedTip: 'd'.repeat(39) + '0', expectedEntry: { ref: 'lane/old' }, by: 'tester' });
     expect(f.retirePlanner).not.toHaveBeenCalled(); expect(mutations(f, 'add')).toHaveLength(0);
@@ -3080,7 +3080,7 @@ describe('refuse-only safety properties P1–P9', () => {
   ])('P7 --remove is exclusive: %s is refused with bad-input and nothing is removed', async (_, extra) => {
     const remove = vi.fn(async () => ({ retired: true }));
     const f = fixture({ list: ['lane/old'], removeRegistration: remove });
-    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', acceptOmission: true, reason: 'withdraw', ...extra })).toMatchObject({ ok: false, stopReason: 'bad-input' });
+    expect(await f.run({ branch: '', sha: '', remove: 'lane/old', reason: 'withdraw', ...extra })).toMatchObject({ ok: false, stopReason: 'bad-input' });
     expect(remove).not.toHaveBeenCalled();
     for (const action of ['add', 'remove', 'replace', 'retire']) expect(mutations(f, action)).toHaveLength(0);
   });
@@ -3095,15 +3095,15 @@ describe('refuse-only safety properties P1–P9', () => {
     expect(smoke).toHaveBeenCalledTimes(1);
     expect(mutations(f, 'add')).toHaveLength(0); expect(f.readyWrites).toEqual([]);
   });
-  it('P7 refuses missing acknowledgement, missing reason and changed-entry/tip removal', async () => {
+  it('P7 refuses stacked dependents, missing reason and changed-entry/tip removal', async () => {
     const remove = vi.fn(async () => ({ retired: false, refused: 'tip-moved' }));
     const stacked = JSON.stringify({ list: [{ ref: 'lane/old' }, { ref: 'lane/top', stackBases: ['lane/old'] }] });
     const f = fixture({ listRaw: stacked, removeRegistration: remove });
-    expect(await f.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'accept-omission-required' });
+    expect(await f.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'stacked-dependents' });
     expect(remove).not.toHaveBeenCalled();
     expect(await f.run({ branch: '', remove: 'lane/old' })).toMatchObject({ stopReason: 'bad-input' });
     const moved = fixture({ list: ['lane/old'], removeRegistration: remove });
-    expect(await moved.run({ branch: '', remove: 'lane/old', acceptOmission: true, reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'tip-moved', removed: [] });
+    expect(await moved.run({ branch: '', remove: 'lane/old', reason: 'withdraw' })).toMatchObject({ stopReason: 'remove-refused', detail: 'tip-moved', removed: [] });
   });
   it('P8 produces fix-ready from canonical audit and a passing exact-sha test check, without argument evidence', async () => {
     const f = fixture({ ready: '' });

@@ -17,7 +17,7 @@ import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
-import { retireRegistration, withdrawRegisteredOverlay } from '../daemon-overlay.mjs';
+import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
 import { assertHumanOperator, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOverlayState, cloneKey } from '../lib/daemon-overlays.mjs';
@@ -436,7 +436,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           return stop('bad-input', { detail: '--remove requires --reason and no add/replace/retire' });
         stage = 'remove-refused';
         let actor;
-        if (input.actor !== undefined) {
+        if (input.actor) {
           try { actor = assertHumanOperator(await operatorIdentity({ env }), input.actor); }
           catch (error) {
             return stop('operator-identity-refused', { detail: String(error.message || error),
@@ -445,24 +445,28 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         }
         const listed = listRows();
         if (!listed.ok) return stop('remove-refused', { detail: 'unreadable-registry' });
+        if (listed.rows.some((r) => r.stackBases !== undefined && (!Array.isArray(r.stackBases) || !r.stackBases.every(safeRegistrationRef))))
+          return stop('remove-refused', { detail: 'unreadable-stack-evidence' });
         const targets = listed.rows.filter((r) => r.ref === input.remove);
         if (targets.length !== 1) return stop('remove-refused', { detail: 'expected-one-registration' });
-        if (input.acceptOmission !== true && input.acceptUncontained !== true)
-          return stop('remove-refused', { detail: 'accept-omission-required', fallback: 'Pass --accept-omission to acknowledge content omission.' });
+        const dependents = listed.rows.filter((r) => r.ref !== input.remove &&
+          (r.stackBases?.includes(input.remove) || Object.values(r.stackVia || {}).flat().includes(input.remove)));
+        if (dependents.length) return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
         requireGit('fetch', 'origin', `+refs/heads/${input.remove}:refs/remotes/origin/${input.remove}`);
         const tip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${input.remove}^{commit}`);
         if (!validSha(tip)) return stop('remove-refused', { detail: 'invalid-tip' });
         if (input.dryRun) { out.ok = true; out.wouldRemove = [input.remove]; return out; }
-        const removeOne = removeRegistration || ((args) => withdrawRegisteredOverlay({ ...args, env: childEnv, reason: input.reason, acceptOmission: input.acceptOmission, acceptUncontained: input.acceptUncontained,
+        const removeOne = removeRegistration || ((args) => retireRegistration({ ...args, env: childEnv,
           deps: {
             // Explicit operator withdrawal uses the existing guarded retirement transaction:
             // entry identity, durable drop intent and post-drop tip check all stay enforced.
+            prove: () => proveOverlayWithdrawal({ root: out.clone, ref: input.remove, tip, reason: input.reason, env: childEnv, git }),
             tip: (ref) => requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0],
           } }));
         const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load',
           ...(actor ? { actor } : {}) });
         if (data?.retired !== true) return stop('remove-refused', {
-          detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip, then retry --remove.' });
+          detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip or stacked dependents, then retry --remove.' });
         out.removed = [input.remove]; out.ok = true; return out;
       }
       if (input.retire) {

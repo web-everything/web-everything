@@ -12,7 +12,7 @@ const TOP = 'lane/top';
 const BASE_SHA = 'a'.repeat(40);
 const TOP_SHA = 'b'.repeat(40);
 
-async function removalFixture({ concurrent = false, acceptOmission = true, identity = null, actor }, check) {
+async function removalFixture({ concurrent = false, descendant = true }, check) {
   const root = fs.mkdtempSync(join(tmpdir(), 'prototype-load-remove-'));
   const env = { HOME: root, TMPDIR: root, USER: 'test', WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
   const recordPath = join(root, 'prototype-loads.jsonl');
@@ -42,63 +42,59 @@ async function removalFixture({ concurrent = false, acceptOmission = true, ident
         }
         if (args[0] === 'ls-remote' && args.at(-1) === `refs/heads/${BASE}`)
           return `${BASE_SHA}\trefs/heads/${BASE}\n`;
-
+        if (args[0] === 'merge-base') {
+          ancestry.push({ args, guarded: fs.existsSync(`${overlayFilePath(root, env)}.add-guard.lock`) });
+          if (descendant) return '';
+          throw Object.assign(new Error('not an ancestor'), { status: 1 });
+        }
       }
       throw new Error(`Unexpected subprocess: ${command} ${JSON.stringify(args)}`);
     });
-    const resolveOperatorIdentity = vi.fn(() => { if (!identity) throw new Error('identity unavailable'); return identity; });
     const load = createPrototypeLoader({ ...defaultDeps(), exec, env,
-      resolveOperatorIdentity,
       settings: { daemons: { control: { clone: root } }, workspaceRoot: root,
         loaderCli: 'scripts/daemon-overlay.mjs', recordPath },
     });
-    const result = await load({ daemon: 'control', remove: BASE, reason: 'withdraw base', acceptOmission, ...(actor === undefined ? {} : { actor }) });
-    await check({ result, state: state(), initialBase, listed, ancestry, exec, resolveOperatorIdentity,
-      events: fs.existsSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'))
-        ? fs.readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [],
+    const result = await load({ daemon: 'control', remove: BASE, reason: 'withdraw base' });
+    await check({ result, state: state(), initialBase, listed, ancestry, exec,
       records: fs.readFileSync(recordPath, 'utf8').trim().split('\n').map(JSON.parse) });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 
-describe('prototype-load default guarded removal', () => {
-  it('refuses without explicit omission acknowledgement and retains every registration', async () => {
-    await removalFixture({ acceptOmission: false }, ({ result, state, events }) => {
-      expect(result).toMatchObject({ ok: false, stopReason: 'remove-refused', detail: 'accept-omission-required', removed: [] });
-      expect(state.overlays.map(r => r.ref)).toEqual([BASE, TOP]);
-      expect(events).toEqual([]);
+describe('prototype-load default guarded removal ancestry protection', () => {
+  const retained = ({ result, state, initialBase, ancestry, exec, records }) => {
+    expect(result).toMatchObject({ ok: false, stopReason: 'remove-refused', detail: 'not-proved', removed: [] });
+    expect(state.corrupt).toBe(false);
+    expect(state.overlays.find((r) => r.ref === BASE)).toEqual(initialBase);
+    expect(state.overlays.map((r) => r.ref)).toEqual([BASE, TOP]);
+    expect(state.overlays.every((r) => !Object.hasOwn(r, 'stackBases'))).toBe(true);
+    expect(ancestry).toEqual([{ args: ['merge-base', '--is-ancestor', BASE_SHA, TOP_SHA], guarded: true }]);
+    expect(exec.mock.calls.filter(([command]) => command === 'node')).toHaveLength(1);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ stopReason: 'remove-refused', removed: [] });
+  };
+
+  it('default removal retains a base required by an uncached descendant under the add guard', async () => {
+    await removalFixture({}, (evidence) => {
+      expect(evidence.listed.map((r) => r.ref)).toEqual([BASE, TOP]);
+      retained(evidence);
     });
   });
-  it.each([false, true])('acknowledged withdrawal drops only the base despite a dependent (concurrent: %s)', async concurrent => {
-    await removalFixture({ concurrent }, ({ result, state, ancestry, records, events, exec }) => {
-      expect(result).toMatchObject({ ok: true, removed: [BASE] });
-      expect(state.overlays.map(r => r.ref)).toEqual([TOP]);
-      expect(ancestry).toEqual([]);
-      expect(exec.mock.calls.some(([cmd, args]) => cmd === 'git' && ['merge-base', '--is-shallow-repository', '--git-path'].some(x => args.includes(x)))).toBe(false);
+
+  it('default removal re-reads and protects an uncached descendant registered after listing and before guarded proof', async () => {
+    await removalFixture({ concurrent: true }, (evidence) => {
+      expect(evidence.listed.map((r) => r.ref)).toEqual([BASE]);
+      retained(evidence);
+    });
+  });
+
+  it('default removal drops only the requested base when the other registration is not a descendant', async () => {
+    await removalFixture({ descendant: false }, ({ result, state, ancestry, records }) => {
+      expect(result).toMatchObject({ ok: true, stopReason: null, removed: [BASE] });
+      expect(state.corrupt).toBe(false);
+      expect(state.overlays.map((r) => r.ref)).toEqual([TOP]);
+      expect(ancestry).toEqual([{ args: ['merge-base', '--is-ancestor', BASE_SHA, TOP_SHA], guarded: true }]);
+      expect(records).toHaveLength(1);
       expect(records[0]).toMatchObject({ ok: true, removed: [BASE] });
-      expect(events.at(-1)).not.toHaveProperty('operatorReason');
-    });
-  });
-  it('default removal records the authenticated operator with an explicit actor flag', async () => {
-    await removalFixture({ actor: 'CHALBERT', identity: { login: 'CHALBERT', type: 'User' } }, ({ result, events, resolveOperatorIdentity }) => {
-      expect(result.ok).toBe(true);
-      expect(resolveOperatorIdentity).toHaveBeenCalledTimes(1);
-      expect(events.at(-1)).toMatchObject({ kind: 'auto-retired', actor: 'chalbert', operatorReason: true, acceptedOmission: true, tip: BASE_SHA });
-    });
-  });
-  it('without --actor never resolves an available operator and supplies no operator proof', async () => {
-    await removalFixture({ identity: { login: 'CHALBERT', type: 'User' } }, ({ result, events, resolveOperatorIdentity }) => {
-      expect(result.ok).toBe(true);
-      expect(resolveOperatorIdentity).not.toHaveBeenCalled();
-      expect(events.at(-1)).not.toHaveProperty('actor');
-      expect(events.at(-1)).not.toHaveProperty('operatorReason');
-    });
-  });
-  it('refuses non-operator --actor without changing registrations or events', async () => {
-    await removalFixture({ actor: 'outsider', identity: { login: 'outsider', type: 'User' } }, ({ result, state, events, resolveOperatorIdentity }) => {
-      expect(result).toMatchObject({ ok: false, stopReason: 'operator-identity-refused', removed: [] });
-      expect(resolveOperatorIdentity).toHaveBeenCalledTimes(1);
-      expect(state.overlays.map(r => r.ref)).toEqual([BASE, TOP]);
-      expect(events).toEqual([]);
     });
   });
 });
