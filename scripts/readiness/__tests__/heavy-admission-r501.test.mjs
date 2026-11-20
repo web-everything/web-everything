@@ -1,7 +1,7 @@
 // @vitest-environment node
 /** R501: needs-git local routing and the remote-success record that forgeShare reads. */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { main, decideRemote, runWithRemoteDecision, resolveAdmissionPolicy } from '../heavy-admission.mjs';
 
@@ -49,9 +49,10 @@ describe('R501 needs-git vs host overload', () => {
 });
 
 describe('R501 remote success record', () => {
-  it('main appends a remote-runs row when Forge handled the run', async () => {
+  for (const measured of [false, true]) it(`main preserves remote-runs and logs usage only with resources=${measured}`, async () => {
     const root = mk(); const pool = join(root, 'pool'); mkdirSync(pool);
-    const prefs = join(root, 'preferences.json');
+    mkdirSync(join(root, '.claude'));
+    const prefs = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always' } } }));
     const exited = new Error('test exit');
     vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
@@ -59,9 +60,15 @@ describe('R501 remote success record', () => {
     for (const [k, v] of Object.entries({ LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: prefs, CI: '', WE_HEAVY_ADMISSION: 'on',
       WE_HEAVY_ADMISSION_HELD: '', WE_FORGE_GATE_DISPATCH: '', WE_HEAVY_ADMISSION_RUN_WAIT_MS: '0',
       WE_VERIFY_REMOTE_REPORT: join(root, 'report.jsonl') })) vi.stubEnv(k, v);
-    const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0, receiptId: 'rcpt-1' }));
-    await expect(main(['run', `--repo=${root}`, '--', 'npm', 'run', 'test:unit', '--', 'plain.test.mjs'], { remoteExec, readTelemetry: healthy })).rejects.toBe(exited);
+    const resources={cpuUsec:120,memoryPeakBytes:300,throttledUsec:12,nrThrottled:2,oomKills:0};
+    const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0, receiptId: 'rcpt-1',...(measured?{resources:{...resources,slotCpus:5},runMs:25}: {}) }));
+    await expect(main(['run', `--repo=${root}`, '--', 'npm', 'run', 'test:unit', '--', 'plain.test.mjs'], { home: root, remoteExec, readTelemetry: healthy })).rejects.toBe(exited);
     const file = join(pool, '.admission', 'heavy', 'remote-runs.jsonl');
-    expect(JSON.parse(readFileSync(file, 'utf8').trim())).toMatchObject({ receiptId: 'rcpt-1', kind: expect.any(String) });
+    expect(JSON.parse(readFileSync(file, 'utf8').trim())).toEqual({ ts:expect.any(String),ms:expect.any(Number),receiptId:'rcpt-1',kind:expect.any(String) });
+    const usage=join(pool,'.admission','heavy','remote-usage.jsonl');
+    expect(existsSync(usage)).toBe(measured);
+    if(measured)expect(JSON.parse(readFileSync(usage,'utf8').trim())).toEqual({ts:expect.any(String),kind:expect.any(String),
+      key:'npm run test:unit --',threadsGranted:5,
+      memGranted:null,...resources,runMs:25,code:0,backend:'systemd-scope'});
   });
 });

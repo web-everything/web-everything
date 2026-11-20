@@ -4,11 +4,13 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { buildShadowRow, compareShadowAnswers, summarizeCarbonPromotion } from '../review-shadow-agreement.mjs';
 import { runAgyReviewJuror, stateChangingToolCalls } from '../agy-review-juror.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-const transcript = (steps) => steps.map((step_update) => JSON.stringify({ event: 'step_update', step_update })).join('\n');
+const transcript = (steps) => [...steps.map(step_update => ({ event: 'step_update', step_update })),
+  { event: 'result', result: { status: 'SUCCESS' } }].map(event => JSON.stringify(event)).join('\n');
 const tool = (path, extra = {}) => ({
   step_type: 'tool', step_index: 1, conversation_id: 'own-id', state: 'DONE', tool_name: 'view_file',
   tool_info: { parameters: { AbsolutePath: path } }, ...extra,
@@ -49,10 +51,10 @@ function fixture() {
       spawnJudge: async ({ cwd }) => {
         act(cwd);
         mutated = true;
-        if (options.spawnError) throw new Error('failed without transcript');
+        if (options.spawnError) { const error = new Error('failed without transcript'); error.telemetry = options.telemetry; throw error; }
         const t = join(root, 'transcript.jsonl');
         writeFileSync(t, options.transcriptText ?? transcript(steps(cwd)));
-        return { value: { summary: 'review', findings: [] }, sessionId: 'own-id', transcriptFile: t };
+        return { value: options.value ?? { summary: 'review', findings: [] }, servedModel: 'gemini-4-carbon-high', sessionId: 'own-id', transcriptFile: t };
       },
       readFile: (p) => { if (options.unreadableTranscript) throw new Error('unreadable transcript'); return readFileSync(p, 'utf8'); },
       removeDir: (p) => rmSync(p, { recursive: true, force: true }),
@@ -120,6 +122,60 @@ describe('shared checkouts correlate changes with every transcript tool update',
     const out = await fx.run(() => writeFileSync(join(fx.shared, 'file.txt'), 'changed\n'), undefined, { transcriptText });
     expect(out.reasons).toContain(touchedReason);
     expect(out.status).toBe('voided');
+  });
+
+  it('a plain read_file read (Gemini 4 Carbon) inside the lane is not a state change, outside it still voids', async () => {
+    const fx = fixture();
+    const inside = await fx.run(undefined, (cwd) => [tool(join(cwd, 'file.txt'), { tool_name: 'read_file' })]);
+    expect(inside.reasons.join(' ')).not.toMatch(/state-changing/);
+    const fx2 = fixture();
+    const outside = await fx2.run(undefined, () => [tool(join(fx2.shared, 'file.txt'), { tool_name: 'read_file' })]);
+    expect(outside.status).toBe('voided');
+  });
+
+  it.each(['{truncated', 'not json\n{"event":"result"}'])('a malformed transcript voids the run even with no shared change (%j)', async (transcriptText) => {
+    const fx = fixture();
+    const out = await fx.run(undefined, undefined, { transcriptText });
+    expect(out.status).toBe('voided');
+    expect(out.reasons).toContain('transcript malformed — escape check incomplete');
+  });
+
+  it('a later update that swaps a view_file path to /etc/passwd voids (every update is judged)', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { state: 'ACTIVE' }),
+      tool('/etc/passwd', { state: 'DONE' }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('read outside the juror lane');
+  });
+
+  it('conflicting names inside ONE update (tool_name read_file, tool_info.name run_command) void', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { tool_name: 'read_file', tool_info: { name: 'run_command', parameters: { AbsolutePath: join(cwd, 'file.txt') } } }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('tool changed mid-step');
+  });
+
+  it('a step that names run_command under an unknown step_type is still a tool call and voids', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { step_type: 'mystery', tool_name: 'run_command' }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('run_command');
+  });
+
+  it('a later update that renames the same step to run_command voids even with a valid in-lane path', async () => {
+    const fx = fixture();
+    const out = await fx.run(undefined, (cwd) => [
+      tool(join(cwd, 'file.txt'), { tool_name: 'read_file', state: 'ACTIVE' }),
+      tool(join(cwd, 'file.txt'), { tool_name: 'run_command' }),
+    ]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('tool changed mid-step');
   });
 
   it('opaque errored parameters alone do not imply a shared change', async () => {
@@ -355,4 +411,88 @@ describe('own brain reads extend only the read allowlist', () => {
       allowedRoots: [fx.lane], home: fx.home, sessionId: 'own-id',
     })).toEqual(['view_file (read outside the juror lane)']);
   });
+});
+
+describe('raw juror findings remain invalid shadow evidence', () => {
+  it.each([undefined, null, {}, 'bad', [null], ['bad'], [{}], [{ summary: 'defect', file: 42 }], [{ summary: 'defect', line: -1 }]])
+  ('malformed findings %j survive the juror and make the PR invalid', async findings => {
+    const fx = fixture();
+    const value = findings === undefined ? { summary: 'review' } : { summary: 'review', findings };
+    const agyRun = await fx.run(undefined, undefined, { value });
+    expect(agyRun.status).toBe('ok');
+    expect(agyRun.value.findings).toEqual(findings);
+    const claudeAnswer = { summary: 'review', findings: [] };
+    const row = buildShadowRow({ repo: 'o/r', pr: 1, model: 'gemini-4-carbon-high', agyRun,
+      claudeAnswer, agyAnswer: agyRun.value,
+      comparison: compareShadowAnswers({ claude: claudeAnswer, agy: agyRun.value }),
+    });
+    expect(row).toMatchObject({ claudeValid: true, agyValid: false });
+    expect(summarizeCarbonPromotion([row])).toEqual({ agree: 0, disagree: 0, invalid: 1, prs: 1, threshold: 10 });
+  });
+});
+
+it.each([undefined, {}, { path: '' }, { path: '   ' }, { path: 7 }, { path: null },
+  { path: ['file.txt'] }, ['file.txt'], { options: { path: 'file.txt' } }])
+  ('read_file refuses missing, empty, non-string, array and nested-only paths: %j', async parameters => {
+    const fx = fixture();
+    const out = await fx.run(undefined, () => [tool('', { tool_name: 'read_file', tool_info: { parameters } })]);
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  });
+it.each(['outside', 'missing', 'empty', 'non-string', 'changed', 'symlink', 'nested outside', 'consistent'])
+  ('read_file validates every update and the path union: %s', async kind => {
+    const fx = fixture();
+    const out = await fx.run(undefined, cwd => {
+      if (kind === 'symlink') symlinkSync(fx.shared, join(cwd, 'escape')); // only this case may touch the lane
+      const path = join(cwd, 'file.txt');
+      const parameters = {
+        outside: { AbsolutePath: '/etc/passwd' }, missing: {}, empty: { AbsolutePath: '' },
+        'non-string': { AbsolutePath: 1 }, changed: { AbsolutePath: join(cwd, 'untouched.txt') },
+        symlink: { AbsolutePath: join(cwd, 'escape', 'file.txt') },
+        'nested outside': { AbsolutePath: path, options: { path: '/etc/passwd' } },
+        consistent: { AbsolutePath: path },
+      }[kind];
+      return [tool(path, { tool_name: 'read_file', state: 'ACTIVE' }),
+        tool('', { tool_name: 'read_file', tool_info: { parameters } })];
+    });
+    expect(out.status).toBe(kind === 'consistent' ? 'ok' : 'voided');
+    if (kind !== 'consistent') expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  });
+it('read_file refuses a symlink escape and accepts a direct in-lane read', async () => {
+  const fx = fixture();
+  symlinkSync(fx.shared, join(fx.home, 'escape'));
+  const outside = await fx.run(undefined, () => [tool(join(fx.home, 'escape', 'file.txt'), { tool_name: 'read_file' })]);
+  expect(outside.status).toBe('voided');
+  expect(outside.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  const accepted = await fx.run(undefined, cwd => [tool(join(cwd, 'file.txt'), { tool_name: 'read_file' })]);
+  expect(accepted.status).toBe('ok');
+});
+it.each(['', '   \n\t', '{"a":1}', 'null', '[]', '42', '"text"',
+  '{"event":"hello"}', '{"event":"result","result":{"status":"ERROR"}}',
+  '{"event":"step_update","step_update":{"step_type":"message"}}'])
+  ('empty, unrelated or incomplete transcript voids an unchanged run: %j', async transcriptText => {
+    const fx = fixture();
+    const out = await fx.run(undefined, undefined, { transcriptText });
+    expect(out.status).toBe('voided');
+    expect(out.reasons.join(' ')).toMatch(/transcript (empty\/unrelated|malformed) — escape check incomplete/);
+  });
+it('a realistic tool transcript with a successful terminal result is ok', async () => {
+  const fx = fixture();
+  expect((await fx.run()).status).toBe('ok');
+});
+
+it('read_file realpath containment refuses a link inside the lane targeting outside it', () => {
+  const fx = fixture();
+  symlinkSync(fx.shared, join(fx.lane, 'escape'));
+  const evidence = transcript([tool('escape/file.txt', { tool_name: 'read_file' })]);
+  expect(stateChangingToolCalls(evidence, { allowedRoots: [fx.lane] }))
+    .toEqual(['read_file (missing or invalid in-lane path)']);
+});
+
+it('preserves first-output failure telemetry for the advisory skip boundary', async () => {
+  const f = fixture();
+  const telemetry = { quotaState: 'provider-unresponsive', fallbackDecision: 'skip-provider-unresponsive', firstOutputMs: 15, cooldownMs: 1000 };
+  const run = await f.run(() => {}, undefined, { spawnError: true, telemetry });
+  expect(run.status).toBe('failed');
+  expect(run.telemetry).toMatchObject(telemetry);
 });

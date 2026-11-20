@@ -24,7 +24,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -60,6 +60,18 @@ export function resolveSmokeReuse(env = process.env) {
 
 export function smokePassTtlMs(env = process.env) {
   return resolveSmokeReuse(env).reuseHours * 60 * 60_000;
+}
+
+/** External reachability evidence expires quickly; zero forces fresh probes on every tree. */
+export const GH_ROW_REUSE_MAX_AGE_MS = 10 * 60_000;
+export function resolveGhRowReuse(env = process.env) {
+  const raw = env.WE_SMOKE_GH_ROW_REUSE_MAX_AGE_MS;
+  const r = cascadePolicy('rebuildSmoke', readDeclaredSettings().settings?.rebuildSmoke, {
+    env, standard: { ghRowReuseMaxAgeMs: GH_ROW_REUSE_MAX_AGE_MS },
+    envValues: { ghRowReuseMaxAgeMs: raw != null && String(raw).trim() !== '' ? Number(raw) : undefined },
+    valid: { ghRowReuseMaxAgeMs: v => Number.isFinite(v) && v >= 0 },
+  });
+  return { ...r.value, sources: r.sources };
 }
 
 /** Only a full, successful, unskipped table is durable evidence. */
@@ -220,20 +232,20 @@ export function resolveRebuildSmokeBudget(env = process.env, { settingsPath = RE
 export function smokeCheckOfChild(cmd, args = []) {
   if (cmd !== 'node' || !Array.isArray(args)) return null;
   if (String(args[0] ?? '').endsWith('scripts/conveyor/reconcile-pass.mjs')) return 'reconcile-dry-run';
-  if (args[0] === '--input-type=module' && args[1] === '-e') return 'dispatch-dry-run';
+  if (args[0] === '--input-type=module' && args[1] === '-e' && isDispatchDryRunScript(args[2])) return 'dispatch-dry-run';
   return null;
 }
 
 /**
  * The `runChild` every smoke of one build gets: each child's timeout capped at the time left before `deadline`, no
- * child started once less than the per-call `opts.minChildMs` (default `minChildMs`) is left, and — when `failFast` names checks — every child after one of
- * them fails is refused at once. Exposes `deadline` / `failFast` for the caller's log and tests.
+ * child started once less than the per-call `opts.minChildMs` (default `minChildMs`) is left, and — when
+ * `failFast` names checks — only later children of those checks are refused after one of them fails. Exposes `deadline` / `failFast` for the caller's log and tests.
  */
 export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.now, failFast = [], minChildMs = 1_000 }) {
   const ff = new Set(failFast || []);
   let stopped = null;
   const run = async (cmd, args = [], opts = {}) => {
-    if (stopped) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
+    if (stopped && ff.has(smokeCheckOfChild(cmd, args))) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
     const { minChildMs: childFloor = minChildMs, ...childOpts } = opts;
     const left = deadline - now();
     if (!(left >= childFloor)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
@@ -455,10 +467,13 @@ export async function smokeAndAdopt({
     return d.status === 0 ? String(d.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean) : null;
   };
 
+  const ghRowReuse = resolveGhRowReuse(env);
+  log.error?.(`daemon-rebuild: smoke-gh-row-reuse ${JSON.stringify(ghRowReuse)}`);
+  let firstSmoke = null;
+  let fallbackEnv = smokeEnv;
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
-    // Recovery compares failures in this run. Historical passes (including unchanged-code skips)
-    // cannot distinguish a healthy fallback from a harness that has since broken on every tree.
+    // Recovery uses only evidence collected in this run, never historical passing trees.
     const freshComparison = label != null;
     if (freshComparison) changedFiles = null;
     const identity = smokePassIdentity(git, sha, cloneKind);
@@ -479,7 +494,28 @@ export async function smokeAndAdopt({
     const t0 = now();
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
-      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles: proven ? null : changedFiles, reuseCode: !!proven, runChild });
+      let reuseRows = [];
+      if (freshComparison && firstSmoke) {
+        // Only external reachability probes are independent of the candidate tree. Every check
+        // executing candidate code must run again, regardless of its kind or import closure.
+        reuseRows = (firstSmoke.smoke?.results || []).filter(row => {
+          const age = now() - row.completedAt;
+          return Number.isFinite(row.completedAt) && age >= 0 && age < ghRowReuse.ghRowReuseMaxAgeMs
+            && row.ok === true && !row.skipped && !row.skipReason
+            && ['gh-api-repo', 'gh-pr-list'].includes(row.name);
+        });
+        log.error?.(`daemon-rebuild: smoke-fallback-reuse ${JSON.stringify({ candidate: label, checks: reuseRows.map(row => row.name), budgets: Object.fromEntries(Object.values(SMOKE_BUDGET_ENV).map(key => [key, fallbackEnv[key]])) })}`);
+      }
+      smokeResult = await runSmoke({ root: candidate.path, env: freshComparison ? fallbackEnv : smokeEnv,
+        changedFiles: proven ? null : changedFiles, reuseCode: !!proven, reuseRows, runChild, clock: now });
+      if (!freshComparison) {
+        firstSmoke = smokeResult;
+        const base = resolveSmokeBudgets(smokeEnv);
+        fallbackEnv = { ...smokeEnv };
+        for (const [key, name] of Object.entries(SMOKE_BUDGET_ENV)) {
+          fallbackEnv[name] = String(Math.max(base[key], smokeResult?.smoke?.budgets?.[key] || 0));
+        }
+      }
     } catch (e) {
       threw = e;
     }

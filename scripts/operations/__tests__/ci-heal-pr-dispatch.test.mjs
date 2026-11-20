@@ -327,14 +327,22 @@ describe('dispatchCiHeal (#3852)', () => {
 // composition (read the reconcile plan → capability-gate → lane → dispatch), same durable `unsupported-repo`
 // ledger, one dispatch kind over.
 describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo slice 7)', () => {
-  it('a repo whose profile has `ciHeal:false` refuses every planned ci-heal `unsupported-repo`, never touching a lane or dispatch sink', async () => {
+  it.each([false, true])('ciHeal:false refuses fixers while timeout reruns and lifecycle flushes survive (timeout-only=%s)', async (timeoutOnly) => {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusals-'));
     const unsupportedPath = join(dir, 'rows.json');
     const calls = [];
     try {
       const options = {
         root: '/repo', repo: 'plateauapp/plateau-app', unsupportedPath,
-        reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }, { kind: 'fix', prNumber: 51 }], refusals: [] }),
+        flushOwed: () => { calls.push('flush'); return {}; },
+        flushTimeouts: async () => { calls.push('timeouts'); return []; },
+        pollAttempts: () => [],
+        reconcile: () => ({ dispatch: [
+          ...(!timeoutOnly ? [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }] : []),
+          { kind: 'ci-timeout-rerun', prNumber: 52, timeoutRetry: { eligible: true, jobs: [{ run: 10, job: 20 }] } },
+          { kind: 'fix', prNumber: 51 },
+        ], refusals: [] }),
+        retryTimeout: () => { calls.push('rerun'); return { status: 'requested' }; },
         pickFreeLanes: () => { calls.push('pool'); return [2]; },
         dispatch: () => { calls.push('dispatch'); },
         resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -344,10 +352,12 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
         checkStaleness: FRESH,
       };
       const result = await runReconcileCiHealDispatch(options);
-      expect(result.dispatched).toEqual([]);
-      expect(result.refusals).toEqual([{ kind: 'unsupported-repo', repo: 'plateau-app', prNumber: 50, action: 'ci-heal', why: expect.any(String) }]);
-      expect(calls).toEqual([]); // never touched the lane pool or a dispatch sink — only `fix` was in the plan's non-ci-heal row
-      expect(readUnsupported({ path: unsupportedPath })).toHaveLength(1);
+      expect(result.dispatched).toEqual([{status: 'requested', kind: 'ci-timeout-rerun', pr: 52}]);
+      expect(result.refusals).toEqual((timeoutOnly ? [] : [50]).map(prNumber => ({
+        kind: 'unsupported-repo', repo: 'plateau-app', prNumber, action: 'ci-heal', why: expect.any(String),
+      })));
+      expect(calls).toEqual(['flush', 'timeouts', 'rerun']); // Timeout recovery is lifecycle work.
+      expect(readUnsupported({ path: unsupportedPath })).toHaveLength(timeoutOnly ? 0 : 1);
       await expect(runReconcileCiHealDispatch({ repo: 'unknown/repo' })).rejects.toThrow(/not a constellation repo/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1008,6 +1018,46 @@ describe('CI-heal salvage before agent dispatch', () => {
     currentBuild: () => 'b'.repeat(40), readSessionLog: () => '', ...overrides });
   const rows = () => Array.from({ length: 3 }, () => ({ v: 1, at: new Date(Date.now() - 1000).toISOString(), repo: 'we',
     pr: entry.prNumber, head: entry.headRefOid, kind: 'ci-heal', build: 'b'.repeat(40), session: 'ci-heal-3895' }));
+
+  it.each([
+    ['unsettled worker', 'heal-unsettled'],
+    ['unconfirmed accounting', 'heal-accounting-owed'],
+    ['loop hold', 'fix-loop-hold'],
+    ['loop park', 'fix-loop-parked'],
+    ['already parked', 'fix-loop-parked'],
+  ])('log-unreadable bounced PR still respects the ci-heal %s guard', async (guard, refusal) => {
+    const plan = planReconcile({ requiredChecks: ['test'], agents: [], prs: [{
+      number: entry.prNumber, state: 'OPEN', headRefName: entry.headRefName, headRefOid: entry.headRefOid,
+      labels: [{ name: 'review:changes' }],
+      comments: [{ body: '🔁 human review — changes requested\n\nFix the failing test.' }],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+      timeoutRetry: { eligible: false, reason: 'log-unreadable' },
+    }] });
+    expect(plan.dispatch).toEqual([expect.objectContaining({
+      kind: 'ci-heal', phase: 'bounced', ciLogEvidenceReason: 'log-unreadable',
+    })]);
+    const evidence = guard === 'loop hold' ? rows()
+      : guard === 'loop park' ? [...rows(), ...rows()].slice(0, 5)
+        : guard === 'already parked' ? [{ ...rows()[0], kind: 'park', reason: 'raw per-head repair session ceiling reached' }] : [];
+    const ledger = loop({ readRows: () => evidence });
+    const postParkComment = vi.fn(), salvage = vi.fn(() => null);
+    const { result, dispatch } = await exercise(salvage, {
+      reconcile: () => plan,
+      pollAttempts: () => guard === 'unsettled worker' ? [{ pr: entry.prNumber, status: 'running' }] : [],
+      flushOwed: () => guard === 'unconfirmed accounting' ? { kept: [{ pr: entry.prNumber }] } : {},
+      fixLoop: ledger, fixConfig: { maxSessions: 3, windowHours: 6, hold: true }, postParkComment,
+    });
+    expect(result.handled).toBe(1);
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toEqual([expect.objectContaining({ kind: refusal })]);
+    expect(dispatch).not.toHaveBeenCalled();
+    if (guard === 'unsettled worker' || guard === 'unconfirmed accounting') expect(salvage).not.toHaveBeenCalled();
+    expect(postParkComment).toHaveBeenCalledTimes(guard === 'loop park' ? 1 : 0);
+    if (guard === 'loop park') {
+      expect(ledger.append).toHaveBeenCalledTimes(1);
+      expect(ledger.append).toHaveBeenCalledWith(expect.objectContaining({ kind: 'park' }));
+    } else expect(ledger.append).not.toHaveBeenCalled();
+  });
 
   it('discounts three infrastructure refusals and dispatches on Claude', async () => {
     const ledger = loop({ readRows: rows, readSessionLog: () =>

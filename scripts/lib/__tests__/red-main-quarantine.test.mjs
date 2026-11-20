@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  QUARANTINE_REF, validateQuarantineList, canWriteQuarantine, addEntries, pruneOnGreen, testsToSkip,
+  QUARANTINE_REF, validateQuarantineList, canWriteQuarantine, addEntries, removeEntries, pruneOnGreen, setMode, setFixPrs, testsToSkip,
   classifyQuarantinedFailure, decideQuarantineHold, testArea, vitestExcludeArgs, resolveFixFiles, listedPrFiles, QUARANTINE_MAX_TTL_MS, QUARANTINE_DEFAULT_TTL_MS,
 } from '../red-main-quarantine.mjs';
 import { redMainSignal, resolveRedMainMode } from '../red-main-hold.mjs';
@@ -33,6 +33,14 @@ describe('quarantine — who may write, and where', () => {
     expect(canWriteQuarantine('operator')).toBe(true);
     expect(canWriteQuarantine('pr-4613')).toBe(false);
     expect(addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'x', reason: 'y', actor: 'some-pr', now: NOW }).ok).toBe(false);
+  });
+
+  it('the cap of live files is global across jobs, for operator adds too', () => {
+    const add = (list, tests, job) => addEntries(list, { tests, brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, job });
+    let list = add(null, ['a.test.mjs', 'b.test.mjs', 'c.test.mjs'], 'soak-shard (1)').list;
+    list = add(list, ['d.test.mjs', 'e.test.mjs'], 'integration').list;
+    expect(add(list, ['f.test.mjs'], 'soak-shard (2)')).toMatchObject({ ok: false });
+    expect(add(list, ['a.test.mjs'], 'integration').ok).toBe(true);
   });
   it('the push-ref guard allows exactly refs/heads/ops/quarantine', () => {
     expect(assertPushRef('ops/quarantine', QUARANTINE_REF)).toBe(QUARANTINE_REF);
@@ -235,5 +243,59 @@ describe('quarantine — latestRedSha keying and re-keying', () => {
     const l = addEntries(base(SHA), { tests: ['a/__tests__/b.test.mjs'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).list;
     const r = addEntries(l, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r2', actor: 'operator', now: NOW + 1 });
     expect(r.list.entries.find((e) => e.test === 'a/__tests__/b.test.mjs').brokenSha).toBe(SHA);
+  });
+});
+
+
+describe('orchestrator quarantine authority', () => {
+  const options = { tests: [TEST], brokenSha: SHA, owner: 'owner', reason: 'red', actor: 'orchestrator', now: NOW };
+  it.each([undefined, false, 'true', 1])('denies add, remove and prune unless authority is boolean true (%s)', orchestratorAuthority => {
+    expect(canWriteQuarantine('orchestrator', { orchestratorAuthority })).toBe(false);
+    for (const result of [addEntries(null, { ...options, orchestratorAuthority }),
+      removeEntries(listWith([TEST]), { ...options, orchestratorAuthority }),
+      pruneOnGreen(listWith([TEST]), { ...options, mainGreen: true, orchestratorAuthority })]) {
+      expect(result).toMatchObject({ ok: false, error: expect.stringContaining('orchestrator.authority.redMainQuarantine') });
+    }
+  });
+  it.each([
+    ['setMode', setMode, { mode: 'stop' }],
+    ['setFixPrs', setFixPrs, { fixPrs: [99] }],
+  ])('%s refuses orchestrator even with authority enabled', (_, change, value) => {
+    const list = { ...listWith([TEST]), mode: 'quarantine', fixPrs: [12] };
+    const before = structuredClone(list);
+    expect(change(list, { ...options, ...value, orchestratorAuthority: true })).toMatchObject({ ok: false, error: expect.stringContaining('refused') });
+    expect(list).toEqual(before);
+    for (const actor of ['red-main-safety-net', 'operator']) {
+      expect(change(list, { ...options, ...value, actor }).ok).toBe(true);
+    }
+  });
+  it('allows authorized adds and removals with the orchestrator audit actor', () => {
+    const added = addEntries(null, { ...options, orchestratorAuthority: true });
+    expect(added.ok).toBe(true);
+    expect(added.events[0]).toMatchObject({ actor: 'orchestrator', type: 'quarantine-added' });
+    const removed = removeEntries(added.list, { ...options, orchestratorAuthority: true });
+    expect(removed.list.entries).toEqual([]);
+    expect(removed.events[0]).toMatchObject({ actor: 'orchestrator', type: 'quarantine-removed' });
+    expect(pruneOnGreen(added.list, { ...options, orchestratorAuthority: true, mainGreen: true }).events[0].actor).toBe('orchestrator');
+  });
+  it('removes only selected ids and audits clearing the last repair PRs', () => {
+    const list = { ...listWith([TEST, 'other.test.mjs']), mode: 'quarantine', fixPrs: [12] };
+    const first = removeEntries(list, { ...options, orchestratorAuthority: true });
+    expect(first.list).toMatchObject({ mode: 'quarantine', fixPrs: [12], entries: [{ test: 'other.test.mjs' }] });
+    const last = removeEntries(first.list, { ...options, tests: ['other.test.mjs'], orchestratorAuthority: true });
+    expect(last.list.fixPrs).toEqual([]);
+    expect(last.events.at(-1)).toMatchObject({ type: 'quarantine-fix-prs', actor: 'orchestrator', fixPrs: [] });
+    expect(removeEntries(list, { ...options, tests: [], orchestratorAuthority: true })).toMatchObject({ ok: false, error: 'tests required for removal' });
+  });
+  it('keeps the owner requirement and maximum TTL for authorized orchestrator adds', () => {
+    expect(addEntries(null, { ...options, owner: '', orchestratorAuthority: true })).toMatchObject({ ok: false, error: expect.stringContaining('owner required') });
+    const added = addEntries(null, { ...options, ttlMs: QUARANTINE_MAX_TTL_MS * 100, orchestratorAuthority: true });
+    expect(added.list.entries[0].expiresAt).toBe(NOW + QUARANTINE_MAX_TTL_MS);
+  });
+  it.each(['operator', 'red-main-safety-net'])('preserves unconditional authority for %s', actor => {
+    expect(canWriteQuarantine(actor, { orchestratorAuthority: false })).toBe(true);
+    const added = addEntries(null, { ...options, actor });
+    expect(added.ok).toBe(true);
+    expect(removeEntries(added.list, { ...options, actor }).ok).toBe(true);
   });
 });

@@ -28,6 +28,23 @@ const prEvent = (n) => ({ pull_request: { number: n, base: { ref: 'main' } } });
 
 const run = (o) => quarantineSkip({ env: {}, now: NOW, mode: Q, read: READ, changed: [], readEvent: () => o.event, flags: { event: 'pull_request', ref: `refs/pull/${o.pr}/merge`, 'event-path': '/e.json' }, ...o });
 
+it.each(['named', 'untagged-named', 'changed', 'main', 'fix', 'multiple-named', 'file', 'multiple-files', 'untagged-file', 'wrong-job', 'expired'])('soak excludes only active job-matched file entries: %s', (scenario) => {
+  const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs', job = 'soak-shard (1)';
+  const whole = ['file', 'multiple-files', 'untagged-file', 'wrong-job', 'expired'].includes(scenario);
+  const entry = { ...LIST.entries[0], test: whole ? file : `${file}::50 real daemon ticks`,
+    ...(!scenario.startsWith('untagged-') ? { job: scenario === 'wrong-job' ? 'soak-shard (2)' : job } : {}),
+    ...(scenario === 'expired' ? { expiresAt: NOW } : {}) };
+  const read = { ok: true, list: { ...LIST, entries: [entry] } };
+  const other = 'other.soak.test.mjs';
+  if (scenario.startsWith('multiple-')) read.list.entries.push({ ...entry, test: whole ? other : `${other}::case` });
+  const result = run({ read, changed: scenario === 'changed' ? [file] : [], flags: { job,
+    event: scenario === 'main' ? 'push' : 'pull_request', ref: scenario === 'main' ? 'refs/heads/main' : `refs/pull/${scenario === 'fix' ? FIX_PR : 4990}/merge` } });
+  const expected = scenario === 'file' ? [file] : scenario === 'multiple-files' ? [file, other] : [];
+  expect(result.skip).toEqual(expected);
+  expect(result.line).toBe(expected.map((f) => `--exclude=${f} --quarantined=${f}`).join(' '));
+  if (['named', 'multiple-named'].includes(scenario)) expect(result.why).toContain('name-qualified');
+});
+
 describe('renderExclude — one exact Vitest exclude argument', () => {
   it('renders no files as an empty line', () => {
     expect(renderExclude([])).toEqual({ line: '', refused: [] });
@@ -255,7 +272,7 @@ describe('job-specific and nonblocking output', () => {
   const selected = (job, extra = {}) => run({ pr: 4990, event: prEvent(4990), read, flags: { event: 'pull_request', ref: 'refs/pull/4990/merge', job, ...extra } });
   it('selects only this job; legacy entries remain unit shard entries', () => {
     expect(selected('integration').line).toBe('--exclude=scripts/integration.test.mjs');
-    expect(selected('soak-shard (1)').line).toBe('--exclude=scripts/soak.test.mjs');
+    expect(selected('soak-shard (1)').line).toBe('--exclude=scripts/soak.test.mjs --quarantined=scripts/soak.test.mjs');
     expect(selected('test-shard (2)').skip).toEqual([TEST_FILE, 'scripts/shard.test.mjs']);
     expect(selected('test-shard (1)').skip).toEqual([TEST_FILE]);
     expect(selected('test').line).toBe('');

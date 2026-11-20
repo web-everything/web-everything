@@ -6,7 +6,7 @@
  *   While main is red on KNOWN failing test(s), those tests go on a quarantine list and other PRs keep landing:
  *   CI skips only the listed tests (read fresh from the `ops/quarantine` branch at job start), so a PR needs a CI
  *   re-run, never a rebase. Guards:
- *     - only the red-main safety net or the operator may write the list ({@link QUARANTINE_WRITERS}); the list lives
+ *     - the red-main safety net, operator, or setting-authorized orchestrator may write the list ({@link QUARANTINE_WRITERS}); the list lives
  *       on its own ops ref, so a PR's own tree can never add an entry for itself;
  *     - the main-fix PR always RUNS the quarantined tests ({@link testsToSkip} returns nothing for it);
  *     - every entry expires; entries for a broken commit are removed when main's CI is green ({@link pruneOnGreen});
@@ -27,7 +27,7 @@ export const QUARANTINE_BRANCH = 'ops/quarantine';
 export const QUARANTINE_REF = `refs/heads/${QUARANTINE_BRANCH}`;
 export const QUARANTINE_LIST_PATH = 'quarantine.json';
 export const QUARANTINE_EVENTS_PATH = 'events.jsonl';
-export const QUARANTINE_WRITERS = Object.freeze(['red-main-safety-net', 'operator']);
+export const QUARANTINE_WRITERS = Object.freeze(['red-main-safety-net', 'operator', 'orchestrator']);
 export const QUARANTINE_DEFAULT_TTL_MS = 6 * 60 * 60 * 1000;
 export const QUARANTINE_MAX_TTL_MS = 24 * 60 * 60 * 1000; // an entry can never outlive a day, whatever `--ttl-min` says
 export const RED_MAIN_MODES = Object.freeze(['stop', 'quarantine']);
@@ -55,7 +55,14 @@ export function validateQuarantineList(list) {
 }
 
 /** Is this writer allowed to change the list? PURE. */
-export function canWriteQuarantine(actor) { return QUARANTINE_WRITERS.includes(String(actor ?? '')); }
+export function canWriteQuarantine(actor, { orchestratorAuthority = false } = {}) {
+  const writer = String(actor ?? '');
+  return writer === 'orchestrator' ? orchestratorAuthority === true : QUARANTINE_WRITERS.includes(writer);
+}
+
+export function quarantineWriterError(actor) {
+  return `writer "${actor}" refused: may not change the quarantine list (allowed: red-main-safety-net, operator; orchestrator requires orchestrator.authority.redMainQuarantine=true)`;
+}
 
 /** Entries not yet expired at `now`. PURE. */
 export function activeEntries(list, { now }) {
@@ -93,8 +100,8 @@ function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
  * Add entries (idempotent per test and job) — returns the new list and the audit events. Refuses an unknown writer. PURE.
  * @returns {{ok:boolean, list?:object, events?:object[], error?:string}}
  */
-export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null, job, proof }) {
-  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs = QUARANTINE_DEFAULT_TTL_MS, area = null, job, proof, orchestratorAuthority = false }) {
+  if (!canWriteQuarantine(actor, { orchestratorAuthority })) return { ok: false, error: quarantineWriterError(actor) };
   job = localJobName(job);
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   const entries = [...base.entries];
@@ -119,15 +126,18 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}), ...(base.mode !== undefined ? { mode: base.mode } : {}) };
   const v = validateQuarantineList(next);
   if (!v.ok) return { ok: false, error: v.errors.join('; ') };
+  // The cap is global across every live entry and job, for manual adds as well as the safety net.
+  const liveFiles = new Set(activeEntries(next, { now }).map((e) => testFileOf(e.test)));
+  if (liveFiles.size > QUARANTINE_SAFETY_NET_DEFAULTS.maxTests) return { ok: false, error: `quarantine cap ${QUARANTINE_SAFETY_NET_DEFAULTS.maxTests} reached (${liveFiles.size} live files)` };
   return { ok: true, list: next, events };
 }
 
 /**
  * Publish the red-main mode the writer resolved on the list, so CI (which reads ONLY this list) applies the same mode
- * as the daemon. Only a writer may set it. Unchanged ⇒ no event. PURE.
+ * as the daemon. Only the safety net or operator may set it. Unchanged ⇒ no event. PURE.
  */
 export function setMode(list, { mode, actor, now }) {
-  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" refused: only red-main-safety-net or operator may set mode` };
   if (!RED_MAIN_MODES.includes(mode)) return { ok: false, error: `mode "${mode}" is not a red-main mode` };
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   if (base.mode === mode) return { ok: true, list: base, events: [] };
@@ -139,7 +149,8 @@ export function setMode(list, { mode, actor, now }) {
  * Drop expired entries, and EVERY entry once main's CI is green again. `mainGreen` must be a real green read;
  * `null` (unknown) removes only expired entries. PURE.
  */
-export function pruneOnGreen(list, { mainGreen, now, actor = 'red-main-safety-net' }) {
+export function pruneOnGreen(list, { mainGreen, now, actor = 'red-main-safety-net', orchestratorAuthority = false }) {
+  if (!canWriteQuarantine(actor, { orchestratorAuthority })) return { ok: false, error: quarantineWriterError(actor) };
   const keep = [];
   const events = [];
   for (const e of list?.entries ?? []) {
@@ -153,13 +164,24 @@ export function pruneOnGreen(list, { mainGreen, now, actor = 'red-main-safety-ne
   return { list: { version: 1, entries: keep, ...fixPrs, ...(list?.mode !== undefined ? { mode: list.mode } : {}) }, events };
 }
 
+/** Remove selected test ids, preserving the audit actor and remaining list metadata. PURE. */
+export function removeEntries(list, { tests = [], actor, now, orchestratorAuthority = false }) {
+  if (!canWriteQuarantine(actor, { orchestratorAuthority })) return { ok: false, error: quarantineWriterError(actor) };
+  if (!tests.length) return { ok: false, error: 'tests required for removal' };
+  const removed = (list?.entries ?? []).filter(e => tests.includes(e.test));
+  const entries = (list?.entries ?? []).filter(e => !tests.includes(e.test));
+  const events = removed.map(e => ({ type: 'quarantine-removed', at: now, actor, test: e.test, brokenSha: e.brokenSha, why: 'manual' }));
+  if (!entries.length && list?.fixPrs?.length) events.push({ type: 'quarantine-fix-prs', at: now, actor, fixPrs: [] });
+  return { ok: true, list: { ...list, version: 1, entries, ...(!entries.length && list?.fixPrs ? { fixPrs: [] } : {}) }, events };
+}
+
 /**
  * Record the main-fix PR numbers on the list, so CI (which reads ONLY the list's ops ref) can run the quarantined
- * tests for them. Only a writer may set it; the numbers come from the safety net's owner-PR recognition
+ * tests for them. Only the safety net or operator may set it; the numbers come from the safety net's owner-PR recognition
  * (`main-ci-red-core.mjs#findOwnerPrs`), never from a PR's own tree. PURE.
  */
 export function setFixPrs(list, { fixPrs, actor, now }) {
-  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" refused: only red-main-safety-net or operator may set fix PRs` };
   const base = list && list.version === 1 ? list : { version: 1, entries: [] };
   const nums = [...new Set((fixPrs ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
   const next = { ...base, version: 1, entries: [...base.entries], fixPrs: nums };
@@ -383,6 +405,7 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now, job = 
   const changed = new Set(changedFiles);
   const touched = tests.filter((t) => changed.has(testFileOf(t)));
   const rest = tests.filter((t) => !changed.has(testFileOf(t)));
+  // Every shard uses file exclusions: named cases must run rather than suppress unrelated assertions.
   const { args, unsupported } = vitestExcludeArgs(rest);
   const skip = args.map((a) => a.slice('--exclude='.length));
   return { skip, unsupported, why: `skipping ${skip.length} quarantined test file(s)${touched.length ? `; running ${touched.length} this PR changes` : ''}` };

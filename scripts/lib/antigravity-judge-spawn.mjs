@@ -133,6 +133,7 @@
  * `markdown-it`/ephemeral-clone-CLI-test regression that discipline exists to prevent).
  */
 
+import { resolveExternalJurorSettings } from './review-seat-settings.mjs';
 import { agyRunEvidence, readAgyHold, saveAgyHold, agyEvidenceError } from './antigravity-run-evidence.mjs';
 import { hasAntigravityEffortSuffix } from './antigravity-model-effort.mjs';
 import { spawn as nodeSpawn } from 'node:child_process';
@@ -158,8 +159,8 @@ export const ANTIGRAVITY_CLI = 'agy';
  * resolves implicitly (#3633 probe 9 — the CLI's own undocumented default self-reports as "Gemini 3.8 Flash"
  * with NO exposed effort tier, so a run record could not even stamp what it actually asked for).
  *
- * `gemini-4-argon-high` is an effort-suffixed id from the current `agy models` roster; no bare
- * `gemini-4-argon` id is available. High effort is baked into the model id. agy accepts effort as a
+ * `gemini-4-carbon-high` is an effort-suffixed id from the current `agy models` roster; no bare
+ * `gemini-4-carbon` id is available. High effort is baked into the model id. agy accepts effort as a
  * model-id suffix OR the `--effort` flag, never both, so the argv builder omits the flag for suffixed ids.
  *
  * NO LIVE COST/QUALITY COMPARISON HAS BEEN RUN across `agy`'s ten models for this role, unlike the Codex fourth
@@ -168,7 +169,7 @@ export const ANTIGRAVITY_CLI = 'agy';
  * `model-probation.json`'s own entry for this identity), not a benchmarked choice. Revisit once probation data
  * (#3649's run-quality recorder) accumulates.
  */
-export const ANTIGRAVITY_MODEL = 'gemini-4-argon-high';
+export const ANTIGRAVITY_MODEL = 'gemini-4-carbon-high';
 
 /**
  * The shared care→rigor dial's effort enum (`judge-spawn.mjs#EFFORT_LEVELS`) does not match `agy`'s own
@@ -188,7 +189,7 @@ export const ANTIGRAVITY_EFFORT_MAP = Object.freeze({
 /**
  * Legacy bare-model restrictions, layered under the CLI-level effort map. Historical callers of
  * `gemini-3.1-pro` still need medium clamped to high (agy only accepted low/high for that model).
- * The current Argon pin carries effort in its suffix and needs no override or separate effort flag.
+ * The current Carbon pin carries effort in its suffix and needs no override or separate effort flag.
  */
 export const ANTIGRAVITY_MODEL_EFFORT_OVERRIDES = Object.freeze({
   'gemini-3.1-pro': Object.freeze({ medium: 'high' }),
@@ -626,6 +627,8 @@ export async function antigravityJudgeSpawn({
   env = process.env,
   cli = ANTIGRAVITY_CLI,
   timeoutMs = JUDGE_TIMEOUT_MS,
+  firstOutputMs,
+  cooldownMs,
   spawnFn = nodeSpawn,
   mkTempDir = (prefix) => mkdtempSync(prefix),
   writeFile = writeFileSync,
@@ -644,6 +647,14 @@ export async function antigravityJudgeSpawn({
   toolPolicy = 'none',
   role = 'advisory-review',
 } = {}) {
+  if (firstOutputMs === undefined || cooldownMs === undefined) {
+    const settings = resolveExternalJurorSettings({ env }).value;
+    if (firstOutputMs === undefined) firstOutputMs = settings.firstOutputMs;
+    if (cooldownMs === undefined) cooldownMs = settings.cooldownMs;
+  }
+  if (!Number.isSafeInteger(firstOutputMs) || firstOutputMs < 0 || !Number.isSafeInteger(cooldownMs) || cooldownMs <= 0) {
+    throw new TypeError('antigravity-judge-spawn: invalid firstOutputMs/cooldownMs');
+  }
   if (toolPolicy !== 'none' && toolPolicy !== 'read-cwd') {
     throw new TypeError(`antigravity-judge-spawn: \`toolPolicy\` must be none|read-cwd, got ${JSON.stringify(toolPolicy)}`);
   }
@@ -694,11 +705,13 @@ export async function antigravityJudgeSpawn({
       let err = '';
       let timer = null;
       let grace = null;
+      let firstTimer = null;
       let killed = false;
       let settled = false;
       const settle = (r) => {
         if (settled) return;
         settled = true;
+        if (firstTimer) clearTimeout(firstTimer);
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
         resolve(r);
@@ -716,9 +729,24 @@ export async function antigravityJudgeSpawn({
         }, timeoutMs);
         if (typeof timer.unref === 'function') timer.unref();
       }
-      child.stdout?.on('data', (d) => { out += d; });
-      child.stderr?.on('data', (d) => { err += d; });
+      if (firstOutputMs > 0) {
+        const arm = remaining => {
+          // Node timers overflow above 2^31-1; safe-integer settings still mean the requested window.
+          const chunk = Math.min(remaining, 2 ** 31 - 1);
+          firstTimer = setTimeout(() => {
+            if (remaining > chunk) { arm(remaining - chunk); return; }
+            // Settle before kill: fake and real children may report close immediately.
+            settle({ stdout: out, stderr: err, code: null, unresponsive: true });
+            try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          }, chunk);
+        };
+        arm(firstOutputMs);
+      }
+      const observe = d => { if (d.length > 0 && firstTimer) { clearTimeout(firstTimer); firstTimer = null; } };
+      child.stdout?.on('data', (d) => { observe(d); out += d; });
+      child.stderr?.on('data', (d) => { observe(d); err += d; });
       child.on('error', (e) => {
+        if (firstTimer) clearTimeout(firstTimer);
         if (timer) clearTimeout(timer);
         if (grace) clearTimeout(grace);
         reject(new Error(`antigravity-judge-spawn: \`${cli}\` failed to run: ${e.message}`));
@@ -755,7 +783,9 @@ export async function antigravityJudgeSpawn({
   // unparseable run is recorded too — exactly the run most worth capturing. Best-effort, never throws
   // (`recordAntigravityRunScorecard`'s own header) — a recording failure can never turn an otherwise-completed
   // judge call into a failed one.
-  const evidence = { ...agyRunEvidence({ ...result, requestedModel: model }), effort: effectiveEffort };
+  const evidence = { ...agyRunEvidence({ ...result, requestedModel: model }), effort: effectiveEffort,
+    ...(result.unresponsive ? { quotaState: 'provider-unresponsive', fallbackDecision: 'skip-provider-unresponsive',
+      firstOutputMs, cooldownMs, quotaResetsAt: new Date(Math.min(8640000000000000, Date.now() + cooldownMs)).toISOString() } : {}) };
   let holdError;
   try { saveHold(evidence); } catch (error) { holdError = error; }
   recordScorecard({

@@ -18,7 +18,7 @@ import {
   tryAcquireSlot, releaseOwnedSlot, heldSlots, probeSlotHolderLiveness,
   markWaiting, clearWaiting, listWaiting,
   acquireSlotBlocking, admissionStatus, isOldestLiveWaiter, isDeadOwnerWaiter,
-  runUnderAdmission, runWithRemoteDecision, shellQuoteWord,
+  runUnderAdmission, runWithRemoteDecision, decideRemote, shellQuoteWord,
   WAITING_TTL_MINUTES, ADMISSION_HELD_ENV, classifyWaiter, reapStaleWaiters, reapHistory, waiterRepo,
   admissionLockRoot, admissionBypassReason, poolRootOf, admittedArgv, admittedShellCommand, HEAVY_ADMISSION_CLI,
   DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, LOAD_ADMISSION_BACKSTOP_PER_CORE_ENV, LOAD_ADMISSION_SWITCH_ENV,
@@ -951,6 +951,59 @@ describe('stale-waiter reap (xaipsbs)', () => {
 // "Test plan (each fails before the fix)" bullets.
 
 describe('loadAdmissionDecision (pure)', () => {
+  it('admits sticky warn with 45% free and flat swap, exposing all decision inputs', () => {
+    expect(loadAdmissionDecision({ idlePctSamples: [81], pressureLevel: 2, freePct: 45, swapGrowthMb: 0 }))
+      .toMatchObject({ held: false, freePct: 45, swapGrowthMb: 0, warnMinFreePct: 20, warnSwapGrowthMb: 256 });
+  });
+
+  it('holds warn with low free memory and logs both corroborators', () => {
+    const d = loadAdmissionDecision({ idlePctSamples: [81], pressureLevel: 2, freePct: 10, swapGrowthMb: 0 });
+    expect(d.held).toBe(true);
+    expect(d.reason).toBe('mem pressure 2 (>=2) corroborated: free 10% (<20%), swap +0MB (<=256MB)');
+  });
+
+  it('holds warn with swap growth above the threshold despite plenty of free memory', () => {
+    const d = loadAdmissionDecision({ pressureLevel: 2, freePct: 45, swapGrowthMb: 512 });
+    expect(d.held).toBe(true);
+    expect(d.reason).toContain('swap +512MB (>256MB)');
+  });
+
+  it('critical always holds even with 45% free and flat swap', () => {
+    expect(loadAdmissionDecision({ pressureLevel: 4, freePct: 45, swapGrowthMb: 0 })).toMatchObject({ held: true });
+  });
+
+  it.each([{}, { freePct: NaN, swapGrowthMb: NaN }, { freePct: 101 }, { freePct: -1 }])
+    ('warn fails closed when both corroborators are unreadable: %j', (inputs) => {
+      const d = loadAdmissionDecision({ pressureLevel: 2, ...inputs });
+      expect(d.held).toBe(true);
+      expect(d.reason).toContain('warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)');
+    });
+
+  it.each([{ freePct: 45 }, { freePct: 45, swapGrowthMb: NaN }, { freePct: 20, swapGrowthMb: 256 }, { freePct: 45, swapGrowthMb: -512 }])
+    ('readable clean free memory suffices, including unknown swap, exact thresholds and shrinking swap: %j', (inputs) => {
+      expect(loadAdmissionDecision({ pressureLevel: 2, ...inputs }).held).toBe(false);
+    });
+  it.each([undefined, null, NaN, -1, 101])('warn holds unreadable free percent %s despite clean swap', freePct => {
+    expect(loadAdmissionDecision({ pressureLevel: 2, freePct, swapGrowthMb: 0 }).held).toBe(true);
+  });
+  it.each([3, 4, 5, 2.5])('non-warn pressure %s holds despite clean free memory and swap', pressureLevel => {
+    expect(loadAdmissionDecision({ pressureLevel, freePct: 45, swapGrowthMb: 0 }).held).toBe(true);
+  });
+  it('warn holds unrounded 19.96% free at a 20% threshold', () => {
+    expect(loadAdmissionDecision({ pressureLevel: 2, freePct: 19.96, swapGrowthMb: 0 }).held).toBe(true);
+  });
+
+  it('uncorroborated warn continues to the load backstop and CPU checks', () => {
+    const inputs = { pressureLevel: 2, freePct: 45, swapGrowthMb: 0 };
+    expect(loadAdmissionDecision({ ...inputs, load1: 60, cores: 12 }).reason).toContain('backstop');
+    expect(loadAdmissionDecision({ ...inputs, idlePctSamples: [5] }).reason).toContain('cpu idle');
+  });
+
+  it('respects pure threshold overrides', () => {
+    expect(loadAdmissionDecision({ pressureLevel: 2, freePct: 10, swapGrowthMb: 512,
+      warnMinFreePct: 5, warnSwapGrowthMb: 1024 })).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+  });
+
   it.each([
     [[null, undefined, 40], { held: false, idlePct: 40 }],
     [[null, undefined], { held: false, idlePct: null, reason: 'no-sample' }],
@@ -974,7 +1027,7 @@ describe('loadAdmissionDecision (pure)', () => {
     expect(d.reason).toMatch(/idle/i);
   });
 
-  it('holds on elevated memory pressure alone, even with comfortable idle (#4343 test-plan case 3)', () => {
+  it('holds warn without corroboration data, even with comfortable idle (fail-safe)', () => {
     const d = loadAdmissionDecision({ idlePctSamples: [50], pressureLevel: 2 });
     expect(d.held).toBe(true);
     expect(d.reason).toMatch(/pressure/i);
@@ -1143,6 +1196,118 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
   });
   afterEach(() => { rmSync(telemetryRoot, { recursive: true, force: true }); });
 
+  const seedMemory = ({ available = 45, free = 1, swaps = [0, 100, 100, 100, 100] } = {}) => {
+    writeFileSync(join(telemetryRoot, `${dayKey}.jsonl`), [
+      busyLine(81, NOW.toISOString()),
+      metricLine('host.mem.pressure_level', 2, NOW.toISOString()),
+      metricLine('host.mem.total_bytes', 100, NOW.toISOString()),
+      ...(available === null ? [] : [metricLine('host.mem.available_bytes', available, NOW.toISOString())]),
+      metricLine('host.mem.free_bytes', free, NOW.toISOString()),
+      // Deliberately reverse input order to prove oldest/latest are selected by timestamp.
+      ...swaps.map((mb, i) => metricLine('host.mem.swap_used_bytes', mb * 1024 * 1024,
+        new Date(NOW.getTime() - (swaps.length - i) * 1000).toISOString())).reverse(),
+    ].join(''));
+  };
+
+  it('reads latest available percent and windowed swap growth, admitting sticky warn', () => {
+    seedMemory();
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 4 })).toMatchObject({ freePct: 45, swapGrowthMb: 0 });
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 5 })).toMatchObject({ swapGrowthMb: 100 });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: false, freePct: 45, swapGrowthMb: 0 });
+  });
+
+  it('falls back to free_bytes and holds low free memory', () => {
+    seedMemory({ available: null, free: 10 });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, freePct: 10 });
+  });
+
+  it('holds on windowed swap growth and keeps a single swap sample unknown', () => {
+    seedMemory({ swaps: [100, 100, 100, 100, 612] });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, swapGrowthMb: 512 });
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW, window: 1 }).swapGrowthMb).toBeNull();
+  });
+  it('telemetry warn holds missing free-memory evidence despite flat swap', () => {
+    seedMemory({ available: null, free: null });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, freePct: null, swapGrowthMb: 0 });
+  });
+  it('telemetry warn admits readable clean free memory with only one swap sample', () => {
+    seedMemory({ swaps: [100] });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: false, freePct: 45, swapGrowthMb: null });
+  });
+  it('telemetry preserves the bytes ratio: 19.96% holds at the 20% threshold', () => {
+    seedMemory({ available: 19.96 });
+    expect(resolveLoadAdmission({ env: {}, root: telemetryRoot, now: NOW })).toMatchObject({ held: true, freePct: 19.96 });
+  });
+
+  it('uses the admission settings cascade, environment and validated call overrides', () => {
+    seedMemory({ available: 10, swaps: [100, 612] });
+    const platform = join(telemetryRoot, 'preferences.json');
+    writeFileSync(platform, JSON.stringify({ heavyAdmission: { warnMinFreePct: 5, warnSwapGrowthMb: 1024 } }));
+    const env = { WE_PLATFORM_PREFERENCES: platform };
+    const options = { env, root: telemetryRoot, now: NOW };
+    expect(resolveLoadAdmission(options)).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+    expect(resolveLoadAdmission({ ...options, env: { ...env, WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } })).toMatchObject({ held: true, warnMinFreePct: 15 });
+    expect(resolveLoadAdmission({ ...options, warnSwapGrowthMb: 256 })).toMatchObject({ held: true, warnSwapGrowthMb: 256 });
+    expect(resolveLoadAdmission({ ...options, warnMinFreePct: NaN, warnSwapGrowthMb: -1 })).toMatchObject({ held: false, warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 5, warnSwapGrowthMb: 2048 }, tool: { warnSwapGrowthMb: 1024 }, env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15' } });
+    expect(formatAdmissionPolicy(p)).toContain('warnMinFreePct=15 (env WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT)');
+    expect(formatAdmissionPolicy(p)).toContain('warnSwapGrowthMb=1024 (tool)');
+    expect(resolveAdmissionPolicy({ platform: { warnMinFreePct: 101, warnSwapGrowthMb: -1 } }).invalid).toHaveLength(2);
+  });
+  it.each([
+    [{ warnMinFreePct: 5, warnSwapGrowthMb: 1024 }, 20, 256, 'platform'],
+    [{ warnMinFreePct: 25, warnSwapGrowthMb: 128 }, 25, 128, 'tool'],
+    [{ warnMinFreePct: 20, warnSwapGrowthMb: 256 }, 20, 256, 'tool'],
+    [{ warnMinFreePct: NaN, warnSwapGrowthMb: -1 }, 20, 256, 'platform'],
+  ])('checkout-local warn overrides only tighten shared settings: %j', (tool, min, growth, source) => {
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 20, warnSwapGrowthMb: 256 }, tool });
+    expect(p.settings).toMatchObject({ warnMinFreePct: min, warnSwapGrowthMb: growth });
+    expect(p.sources).toMatchObject({ warnMinFreePct: source, warnSwapGrowthMb: source });
+    if (source === 'platform' && Number.isFinite(tool.warnMinFreePct)) {
+      expect(p.ignored).toHaveLength(2);
+      expect(formatAdmissionPolicy(p)).toContain('may only tighten shared setting');
+    }
+  });
+  it('per-call warn overrides only tighten resolved operator settings and preserve valid env on invalid input', () => {
+    seedMemory({ available: 10, swaps: [100, 612] });
+    const options = { env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '15', WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB: '400' }, root: telemetryRoot, now: NOW };
+    for (const overrides of [{ warnMinFreePct: 5, warnSwapGrowthMb: 1024 }, { warnMinFreePct: NaN, warnSwapGrowthMb: -1 }]) {
+      expect(resolveLoadAdmission({ ...options, ...overrides })).toMatchObject({ held: true, warnMinFreePct: 15, warnSwapGrowthMb: 400 });
+    }
+    expect(resolveLoadAdmission({ ...options, warnMinFreePct: 25, warnSwapGrowthMb: 128 }))
+      .toMatchObject({ held: true, warnMinFreePct: 25, warnSwapGrowthMb: 128 });
+  });
+  it('environment remains the operator settings layer and may loosen the platform thresholds', () => {
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 20, warnSwapGrowthMb: 256 },
+      env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '5', WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB: '1024' } });
+    expect(p.settings).toMatchObject({ warnMinFreePct: 5, warnSwapGrowthMb: 1024 });
+    expect(p.sources).toMatchObject({ warnMinFreePct: 'env WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT', warnSwapGrowthMb: 'env WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB' });
+  });
+
+  it('the real shared admit({kind}) path uses the same settings and corroboration in enforce mode', async () => {
+    const { admit } = await vi.importActual('../../lib/resource-admission.mjs');
+    seedMemory();
+    mkdirSync(join(telemetryRoot, 'resource'));
+    const snapshot = { sampledAt: NOW.toISOString(), freshUntil: new Date(NOW.getTime() + 10000).toISOString(),
+      cpu: { idlePct: 81, loadAvg: [1] }, memory: { pressureLevel: 2, freePct: 45, swapGrowthMb: 0 } };
+    const decide = (env = {}, overrides = {}) => resolveLoadAdmission({ env, ...overrides, root: telemetryRoot, now: NOW, mode: 'enforce', shadow: () => undefined,
+      admitFn: (args) => admit({ ...args, root: telemetryRoot }) });
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide()).toMatchObject({ held: false, resourceAdmission: { decidedBy: 'admit', legacyHeld: false } });
+    expect(decide({ WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '50' })).toMatchObject({ held: true, resourceAdmission: { legacyHeld: true } });
+    expect(decide({}, { warnMinFreePct: 50 })).toMatchObject({ held: true, resourceAdmission: { legacyHeld: true } });
+    snapshot.memory = { pressureLevel: 2, freePct: 10, swapGrowthMb: 512 };
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide({}, { warnMinFreePct: 5, warnSwapGrowthMb: 1024 }))
+      .toMatchObject({ held: true, warnMinFreePct: 20, warnSwapGrowthMb: 256, resourceAdmission: { decidedBy: 'admit' } });
+    snapshot.memory = { pressureLevel: 3, freePct: 45, swapGrowthMb: 512 };
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide().reason).toContain('swap +512MB (>256MB)');
+    snapshot.memory = { pressureLevel: 2 };
+    writeFileSync(join(telemetryRoot, 'resource/snapshot.json'), JSON.stringify(snapshot));
+    expect(decide().reason).toContain('warn corroboration unavailable');
+  });
+
   it('reads idle_pct off the busy_pct ATTRIBUTE, truncated to the last `window` samples by timestamp — an older 5th sample outside the window is excluded', () => {
     const file = join(telemetryRoot, `${dayKey}.jsonl`);
     writeFileSync(file, [
@@ -1247,7 +1412,7 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
   });
 
   it('a missing day file reads as all-null/empty — not a read error', () => {
-    expect(readLatestLoad({ root: telemetryRoot, now: NOW })).toEqual({ idlePctSamples: [], pressureLevel: null, load1: null, cores: null });
+    expect(readLatestLoad({ root: telemetryRoot, now: NOW })).toEqual({ idlePctSamples: [], pressureLevel: null, load1: null, cores: null, freePct: null, swapGrowthMb: null });
   });
 
   it('THE LIVE BEFORE/AFTER CONTRACT: the SAME real sampled idle% reading is admitted under one floor and held under a stricter one — proves the gate reacts to the actual numbers, not a canned verdict', () => {
@@ -1308,7 +1473,7 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
 
   it('WE_LOAD_ADMISSION=off bypasses the read entirely (admits, no fixture file needed)', () => {
     const r = resolveLoadAdmission({ env: { [LOAD_ADMISSION_SWITCH_ENV]: 'off' }, root: telemetryRoot, now: NOW });
-    expect(r).toEqual({ held: false, idlePct: null, minIdlePct: DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, pressureLevel: null, minPressureLevel: DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL, load1: null, cores: null, perCore: null, backstopPerCore: DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, bypassed: 'off' });
+    expect(r).toEqual({ held: false, idlePct: null, minIdlePct: DEFAULT_LOAD_ADMISSION_MIN_IDLE_PCT, pressureLevel: null, minPressureLevel: DEFAULT_LOAD_ADMISSION_MIN_PRESSURE_LEVEL, load1: null, cores: null, perCore: null, backstopPerCore: DEFAULT_LOAD_ADMISSION_BACKSTOP_PER_CORE, bypassed: 'off', freePct: null, swapGrowthMb: null, warnMinFreePct: 20, warnSwapGrowthMb: 256 });
   });
 
   it('a knob param can never arm/disarm the off/CI bypass switches — the switches read the REAL env only, ignoring any param passed alongside them', () => {
@@ -1330,10 +1495,10 @@ describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable roo
 describe('the `load-status` CLI mode as a real process (#4343)', () => {
   it.each([
     [null, 1, null, 'admitted — mem pressure 1 (threshold 2)'],
-    [null, 2, null, 'HELD — mem pressure 2 (>=2)'],
+    [null, 2, null, 'HELD — mem pressure 2 (>=2) warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)'],
     [40, 1, null, 'admitted — cpu idle 40.0% (min 15%)'],
     [null, 1, 4, 'admitted — mem pressure 1 (threshold 2)'],
-    [40, 2, 4, 'HELD — mem pressure 2 (>=2)'],
+    [40, 2, 4, 'HELD — mem pressure 2 (>=2) warn corroboration unavailable: free ?% (?20%), swap ?MB (?256MB)'],
     [null, 1, 20, 'HELD — load1 20.00/4 cores (5.00 > backstop 4)'],
   ])('reports pressure and preserves held/idle/backstop precedence: idle=%j pressure=%j load1=%j', (idle, pressure, load1, text) => {
     const telemetryRoot = mkdtempSync(join(tmpdir(), 'load-admission-cli-test-'));
@@ -1834,11 +1999,20 @@ describe('resolveAdmissionPolicy — the one cascade every process reads (standa
     expect(p.invalid.join('\n').includes(key)).toBe(!ok);
   });
 
-  it('formatAdmissionPolicy names every value with its source (the logged line)', () => {
+  it('formatAdmissionPolicy names logged values with their sources', () => {
     const line = formatAdmissionPolicy(resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_CAP: '4' } }));
     expect(line).toMatch(/cap=2 \(standard\)/);
     expect(line).toMatch(/onTimeout=defer \(standard\)/);
     expect(line).toMatch(/ignored: .*WE_HEAVY_ADMISSION_CAP=4/);
+  });
+
+  it('omits standard warn defaults but logs explicit default-valued overrides with their sources', () => {
+    const baseline = resolveAdmissionPolicy({ env: {} });
+    expect(formatAdmissionPolicy(baseline)).not.toContain('warnMinFreePct=');
+    expect(formatAdmissionPolicy(baseline)).not.toContain('warnSwapGrowthMb=');
+    const explicit = resolveAdmissionPolicy({ platform: { warnMinFreePct: 20, warnSwapGrowthMb: 256 }, env: {} });
+    expect(formatAdmissionPolicy(explicit)).toContain('warnMinFreePct=20 (platform)');
+    expect(formatAdmissionPolicy(explicit)).toContain('warnSwapGrowthMb=256 (platform)');
   });
 });
 
@@ -1938,20 +2112,23 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
       const prefs = join(lockRoot, 'torn.json'); const env = { WE_PLATFORM_PREFERENCES: prefs };
+      const home = join(lockRoot, 'host');
+      mkdirSync(join(home, '.claude'), { recursive: true });
+      writeFileSync(join(home, '.claude', 'platform-preferences.json'), '{}');
       writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3, priority: { mode: 'off', repairPatterns: [] } } }));
-      const initial = loadAdmissionPolicy({ env });
+      const initial = loadAdmissionPolicy({ env, home });
       expect(initial.settings.cap).toBe(3);
       expect(initial.settings.priority).toEqual({ mode: 'off', repairPatterns: [] });
-      expect(loadAdmissionPolicy({ env })).toBe(initial);
+      expect(loadAdmissionPolicy({ env, home })).toBe(initial);
       vi.setSystemTime(Date.now() + 11_000);
       writeFileSync(prefs, '{"heavyAdmission": {"cap"');
-      const torn = loadAdmissionPolicy({ env });
+      const torn = loadAdmissionPolicy({ env, home });
       expect(torn.settings.cap).toBe(3);
       expect(torn.settings.priority).toEqual(initial.settings.priority);
       expect(torn.sources['priority.mode']).toBe('platform');
       expect(torn.invalid.join('\n')).toMatch(/platform:/);
       writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 5, priority: { mode: 'enforce', repairPatterns: ['^revert-red-42$'] } } }));
-      const replacement = loadAdmissionPolicy({ env });
+      const replacement = loadAdmissionPolicy({ env, home });
       expect(replacement.settings.cap).toBe(5);
       expect(replacement.settings.priority).toEqual({ mode: 'enforce', repairPatterns: ['^revert-red-42$'] });
       expect(replacement.sources['priority.repairPatterns']).toBe('platform');
@@ -2969,5 +3146,138 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     expect(await go(f)).toEqual({ handled: false });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.state.sleeps).toHaveLength(0);
+  });
+});
+
+
+describe('canonical host manifest policy', () => {
+  function preferences(home, remote) {
+    const path = join(home, '.claude', 'platform-preferences.json');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ heavyAdmission: { remote } }));
+    return path;
+  }
+
+  it.each(['shared', 'private'])('redirected legacy cannot downgrade canonical tracked in a %s pool', pool => {
+    const home = join(lockRoot, 'host');
+    preferences(home, { manifest: 'tracked' });
+    const redirected = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy', enabled: true, mode: 'always' });
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env: {
+      WE_PLATFORM_PREFERENCES: redirected,
+      ...(pool === 'private' ? { LANE_POOL_ROOT: join(lockRoot, 'private') } : {}),
+    } });
+    expect(policy.settings.remote).toMatchObject({ manifest: 'tracked', enabled: true, mode: 'always' });
+    expect(policy.sources['remote.manifest']).toBe('platform');
+    expect(policy.ignored).toContainEqual(expect.stringContaining('platform.remote.manifest="legacy"'));
+    expect(formatAdmissionPolicy(policy)).toContain('remote.manifest=tracked (platform)');
+  });
+
+  it('keeps the canonical manifest path in the policy cache identity', () => {
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy' });
+    const trackedHome = join(lockRoot, 'tracked'), legacyHome = join(lockRoot, 'legacy');
+    preferences(trackedHome, { manifest: 'tracked' });
+    preferences(legacyHome, { manifest: 'legacy' });
+    const options = { repoRoot: lockRoot, env: { WE_PLATFORM_PREFERENCES: redirect } };
+    expect(loadAdmissionPolicy({ ...options, home: trackedHome }).settings.remote.manifest).toBe('tracked');
+    expect(loadAdmissionPolicy({ ...options, home: legacyHome }).settings.remote.manifest).toBe('legacy');
+  });
+
+  it.each(['direct', 'redirected'].flatMap(mode =>
+    ['missing', 'malformed', 'oversized', 'unreadable', 'invalid root', 'invalid admission', 'invalid remote']
+      .map(fault => [mode, fault])))('requires local execution when %s canonical evidence is %s', async (mode, fault) => {
+    const home = join(lockRoot, 'host');
+    const host = preferences(home, { manifest: 'tracked' });
+    // Prime last-good host evidence: neither caller may use it after a failed read.
+    loadAdmissionPolicy({ home, repoRoot: lockRoot, env: {} });
+    rmSync(host);
+    if (fault === 'malformed') writeFileSync(host, '{');
+    if (fault === 'oversized') writeFileSync(host, JSON.stringify({ padding: 'x'.repeat(4 * 1024 * 1024 + 1) }));
+    if (fault === 'unreadable') mkdirSync(host);
+    if (fault === 'invalid root') writeFileSync(host, 'null');
+    if (fault === 'invalid admission') writeFileSync(host, JSON.stringify({ heavyAdmission: [] }));
+    if (fault === 'invalid remote') writeFileSync(host, JSON.stringify({ heavyAdmission: { remote: false } }));
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'tracked', enabled: true, mode: 'always' });
+    const env = { ...(mode === 'redirected' ? { WE_PLATFORM_PREFERENCES: redirect } : {}),
+      LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true' };
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env });
+    expect(policy.manifestFailClosed).toBe(true);
+    expect(policy.settings.remote).toMatchObject({ manifest: 'legacy', enabled: false });
+    expect(policy.sources['remote.manifest']).toBe('standard');
+    expect(policy.invalid).toContainEqual(expect.stringContaining('canonical platform manifest:'));
+    if (fault === 'oversized') expect(policy.invalid).toContainEqual(expect.stringContaining('file larger than 4194304 bytes'));
+    expect(policy.sources['remote.enabled']).toBe('platform (canonical remote.manifest unavailable; local execution required)');
+    const remoteExec = vi.fn(), log = vi.fn();
+    expect(await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'fixture.test.mjs'],
+      cwd: lockRoot, lockRoot, env, policy, remoteExec, log, loadPerCore: () => 0 })).toEqual({ handled: false });
+    expect(remoteExec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('local (remote.enabled=false (platform (canonical remote.manifest unavailable; local execution required)))'));
+    // Failed canonical reads must not pin local execution after the host file is repaired.
+    rmSync(host, { recursive: true, force: true });
+    preferences(home, { manifest: 'tracked', enabled: true });
+    expect(loadAdmissionPolicy({ home, repoRoot: lockRoot, env }).settings.remote).toMatchObject({ enabled: true, manifest: 'tracked' });
+  });
+
+  it('deleting a previously tracked canonical policy fails closed after cache expiry and retries after repair', () => {
+    const home = join(lockRoot, 'host');
+    const host = preferences(home, { manifest: 'tracked', enabled: true, mode: 'always' });
+    const options = { home, repoRoot: lockRoot, env: {} };
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(T0);
+    try {
+      const initial = loadAdmissionPolicy(options);
+      expect(initial.settings.remote).toMatchObject({ manifest: 'tracked', enabled: true });
+      rmSync(host);
+      expect(loadAdmissionPolicy(options)).toBe(initial);
+      clock.mockReturnValue(T0 + 10_001);
+      const missing = loadAdmissionPolicy(options);
+      expect(missing.manifestFailClosed).toBe(true);
+      expect(missing.settings.remote.enabled).toBe(false);
+      expect(missing.invalid).toContainEqual(expect.stringContaining('ENOENT'));
+      preferences(home, { manifest: 'tracked', enabled: true });
+      expect(loadAdmissionPolicy(options).settings.remote).toMatchObject({ manifest: 'tracked', enabled: true });
+    } finally { clock.mockRestore(); }
+  });
+
+  it.each(['direct', 'redirected'].flatMap(mode =>
+    [{}, { heavyAdmission: {} }, { heavyAdmission: { remote: {} } },
+      { heavyAdmission: { remote: { enabled: true, mode: 'always' } } }].map(hostSettings => [mode, hostSettings])))('valid %s canonical preferences without a manifest use the standard default (%j)', (mode, hostSettings) => {
+    const home = join(lockRoot, 'host');
+    const host = preferences(home, {});
+    writeFileSync(host, JSON.stringify(hostSettings));
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'tracked', enabled: true });
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env: mode === 'redirected' ? { WE_PLATFORM_PREFERENCES: redirect } : {} });
+    expect(policy.manifestFailClosed).toBeUndefined();
+    expect(policy.settings.remote.manifest).toBe('legacy');
+    if (mode === 'redirected') expect(policy.settings.remote.enabled).toBe(true);
+    if (hostSettings.heavyAdmission?.remote?.enabled) {
+      expect(decideRemote({ policy, argv: ['npm', 'run', 'build'], cwd: lockRoot, loadPerCore: 10 }).remote).toBe(true);
+    }
+    expect(policy.sources['remote.manifest']).toBe('standard');
+    expect(policy.invalid).toEqual([]);
+  });
+
+  it.each(['direct', 'redirected'].flatMap(mode => ['trackd', null, false, 1, [], {}].map(value => [mode, value])))('invalid canonical remote.manifest disables remote execution for %s preferences (%j)', async (mode, value) => {
+    const home = join(lockRoot, 'host');
+    preferences(home, { manifest: value, enabled: true, mode: 'always' });
+    const redirect = preferences(join(lockRoot, 'redirected'), { manifest: 'legacy', enabled: true, mode: 'always' });
+    const env = { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true',
+      ...(mode === 'redirected' ? { WE_PLATFORM_PREFERENCES: redirect } : {}) };
+    const policy = loadAdmissionPolicy({ home, repoRoot: lockRoot, env });
+    expect(policy.manifestFailClosed).toBe(true);
+    expect(policy.settings.remote.enabled).toBe(false);
+    expect(policy.invalid).toContain(`platform.remote.manifest=${JSON.stringify(value)}`);
+    expect(policy.sources['remote.enabled']).toBe('platform (invalid remote.manifest; local execution required)');
+    const remoteExec = vi.fn(), log = vi.fn();
+    expect(await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'fixture.test.mjs'],
+      cwd: lockRoot, lockRoot, env, policy, remoteExec, log, loadPerCore: () => 0 })).toEqual({ handled: false });
+    expect(remoteExec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('local (remote.enabled=false (platform (invalid remote.manifest; local execution required)))'));
+  });
+
+  it('private tool and environment enablement cannot undo an invalid platform manifest', () => {
+    const policy = resolveAdmissionPolicy({ platform: { remote: { manifest: 'trackd', enabled: true } },
+      tool: { remote: { enabled: true, manifest: 'legacy' } },
+      env: { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true' } });
+    expect(policy.settings.remote.enabled).toBe(false);
+    expect(formatAdmissionPolicy(policy)).toContain('invalid remote.manifest; local execution required');
   });
 });

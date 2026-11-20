@@ -206,8 +206,11 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       if (typeof run !== 'string' || !RUN.test(run)) throw new Error('Invalid reserved run');
       const records = [];
       for (const suffix of ['prepared', 'running', 'receipt']) {
-        try { records.push({suffix, record: await readJson(join(receipts, `${run}.${suffix}`))}); }
+        const path = join(receipts, `${run}.${suffix}`);
+        let record;
+        try { record = await readJson(path); }
         catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+        records.push({suffix, record, mtimeMs: (await fs.lstat(path)).mtimeMs});
       }
       if (!records.length) throw new Error('Missing reserved run record');
       // The run writer used to omit `lock` from `.running`: take it from whichever
@@ -221,17 +224,29 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
       }
       // A reservation whose run already wrote its final receipt and outlived the
       // maximum runtime leaked: nothing can still be using its profile. Only a
-      // leased writer qualifies, and every present lock/digest must still be valid.
-      const finalReceipt = records.find(r => r.suffix === 'receipt')?.record;
-      const leaked = writerGuard === 1 && finalReceipt?.run === run
+      // leased writer with a complete, newest receipt qualifies; every present
+      // lock/digest must still be valid and asserted profiles must resolve.
+      const final = records.find(r => r.suffix === 'receipt');
+      const finalReceipt = final?.record;
+      const leaked = writerGuard === 1 && finalReceipt?.v === 1 && finalReceipt.run === run
+        && typeof finalReceipt.phase === 'string' && finalReceipt.phase.trim() !== '' && finalReceipt.phase.length <= 64
+        && Number.isInteger(finalReceipt.code) && finalReceipt.code >= 0 && finalReceipt.code <= 255
+        && typeof finalReceipt.lock === 'string' && HEX.test(finalReceipt.lock)
+        && typeof finalReceipt.inputDigest === 'string' && HEX.test(finalReceipt.inputDigest)
+        && typeof finalReceipt.manifestDigest === 'string' && HEX.test(finalReceipt.manifestDigest)
+        && final.mtimeMs <= now && records.every(r => r.mtimeMs <= final.mtimeMs)
         && now - (await fs.lstat(reservationFile)).mtimeMs >= MAX_RUNTIME_MS;
       if (lock === undefined && !leaked) throw new Error('Invalid reserved lock evidence');
-      let latestKnown = false;
-      // A record carrying no profile field at all (the legacy `.running` shape) says nothing about
-      // profiles; every record that does carry some must be known for it to count as latest.
-      const carries = r => ['manifest', 'siblings', 'manifestDigest', 'inputDigest', 'siblingShas'].some(k => r.record[k] !== undefined);
-      const latest = ['receipt', 'running', 'prepared'].find(x => records.some(r => r.suffix === x && carries(r)));
-      for (const {suffix, record} of records) {
+      let latestKnown = false, unresolvedProfile = false;
+      // Greatest file mtime wins across ALL present records, including fieldless
+      // ones. Phase rank only breaks ties; an older receipt cannot hide a newer
+      // unknown profile and narrow protection from the whole lock.
+      const phaseRank = {prepared: 0, running: 1, receipt: 2};
+      const latest = records.reduce((newest, candidate) => candidate.mtimeMs > newest.mtimeMs
+        || (candidate.mtimeMs === newest.mtimeMs && phaseRank[candidate.suffix] > phaseRank[newest.suffix])
+        ? candidate : newest);
+      for (const evidence of records) {
+        const {suffix, record} = evidence;
         // Validate both fields independently of sibling selection, including on
         // the leaked-reservation path before it can drop profile protection.
         for (const field of ['inputDigest', 'manifestDigest']) {
@@ -239,24 +254,52 @@ export async function readLiveEvidence({receipts, now = Date.now()}) {
             throw new Error('Invalid reserved profile evidence');
           }
         }
-        const manifestKnown = record.manifest && typeof record.manifest === 'object' && !Array.isArray(record.manifest);
+        const manifestPresent = record.manifest !== undefined;
+        const manifestKnown = manifestPresent && record.manifest !== null && typeof record.manifest === 'object'
+          && Object.getPrototypeOf(record.manifest) === Object.prototype;
+        const manifestSiblings = manifestKnown ? record.manifest.siblings : undefined;
+        const manifestSiblingsObject = manifestSiblings !== null && typeof manifestSiblings === 'object'
+          && Object.getPrototypeOf(manifestSiblings) === Object.prototype;
         // A final receipt has no manifest: its siblingShas say which digest names the profile.
-        const siblings = manifestKnown ? !!record.manifest.siblings
-          : typeof record.siblings === 'boolean' ? record.siblings
-            : suffix === 'receipt' ? record.siblingShas !== undefined : undefined;
+        // The writer omits this field without siblings and otherwise emits a nonempty SHA map.
+        const invalidSiblingShas = record.siblingShas !== undefined
+          && !(record.siblingShas !== null && typeof record.siblingShas === 'object'
+            && Object.getPrototypeOf(record.siblingShas) === Object.prototype
+            && Object.keys(record.siblingShas).length > 0
+            && Object.values(record.siblingShas).every(sha => typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha)));
+        // Any present but invalid selector makes this record unresolved, even if
+        // another selector agrees or the receipt fallback could select a digest.
+        const invalidSelector = (record.siblings !== undefined && typeof record.siblings !== 'boolean')
+          || (manifestPresent && !manifestKnown)
+          || (manifestSiblings !== undefined && typeof manifestSiblings !== 'boolean' && !manifestSiblingsObject)
+          || invalidSiblingShas;
+        // Explicit signals must agree before any digest can narrow lock protection.
+        // An omitted receipt siblingShas is only the fallback, not a contrary signal.
+        const siblingSignals = [];
+        // The runner omits siblings for none; any object is truthy in its profile selector.
+        if (manifestKnown) siblingSignals.push(!!manifestSiblings);
+        if (typeof record.siblings === 'boolean') siblingSignals.push(record.siblings);
+        if (suffix === 'receipt' && record.siblingShas !== undefined && !invalidSiblingShas) siblingSignals.push(true);
+        const conflictingSiblings = siblingSignals.some(signal => signal !== siblingSignals[0]);
+        const siblings = invalidSelector || conflictingSiblings ? undefined
+          : siblingSignals.length ? siblingSignals[0] : suffix === 'receipt' ? false : undefined;
         const digest = siblings === undefined ? undefined : (siblings ? record.manifestDigest : record.inputDigest);
         const profileKnown = typeof digest === 'string' && HEX.test(digest);
         // Keep refusing corrupt digests, even though the known lock is protected.
         if (digest !== undefined && !profileKnown) throw new Error('Invalid reserved profile evidence');
-        if (leaked) continue;
-        if (profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
-        // The most advanced phase decides: an earlier known profile must not mask a later unknown one.
-        if (suffix === latest) latestKnown = profileKnown;
+        if (!leaked && profileKnown) profiles.add(`${lock}/dev-v5-${digest}`);
+        // Evidence asserting a profile must resolve even when a newer record is known.
+        if (invalidSelector || (!profileKnown && (record.inputDigest !== undefined || record.manifestDigest !== undefined
+          || record.siblings !== undefined || manifestPresent || record.siblingShas !== undefined))) {
+          unresolvedProfile = true;
+        }
+        // The newest record decides: an older known profile must not mask a later unknown one.
+        if (evidence === latest) latestKnown = profileKnown;
       }
-      if (leaked) continue;
+      if (leaked && !unresolvedProfile) continue;
       // A legacy writer can change profiles without taking a lease. Missing
       // profile evidence is likewise safe only at the whole-lock boundary.
-      if (writerGuard !== 1 || !latestKnown) locks.add(lock);
+      if (writerGuard !== 1 || !latestKnown || unresolvedProfile) locks.add(lock);
     }
     return {complete: true, profiles, locks};
   } catch (error) {

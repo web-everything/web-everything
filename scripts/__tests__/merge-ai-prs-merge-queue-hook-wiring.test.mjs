@@ -31,10 +31,14 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   const query = a.find(v => v.startsWith('query=')) || '';
   if (query.includes('comments{totalCount}')) {
     const p = prs.find(p => 'n=' + p.number === a.find(v => v.startsWith('n=')));
-    if (!p || !a.includes('owner=fixture') || !a.includes('name=drain-mq')) process.exit(1);
+    if (!p || !(a.includes('owner=web-everything') && a.includes('name=web-everything'))) process.exit(1);
     out({ data: { repository: { pullRequest: { comments: { totalCount: p.comments.length } } } } });
   }
-  out(openPrPageFixture(prs.filter(p => !landed(p.number)), query));
+  const page = openPrPageFixture(prs.filter(p => !landed(p.number)), query);
+  if (process.env.MQ_QUEUE_EVIDENCE === 'incomplete-listing') {
+    for (const p of page.data.repository.pullRequests.nodes) delete p.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo;
+  }
+  out(page);
 }
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
@@ -60,8 +64,17 @@ if (a[0] === 'api') {
     process.stdout.write(prs[0].comments[0].body.split(String.fromCharCode(10)).join(String.fromCharCode(92) + 'n') + '\t' + new Date().toISOString() + '\tchalbert\tIC_fixture');
     process.exit(0);
   }
-  const path = a[1];
+  const path = a.find(v => v.startsWith('repos/')) || a[1];
   fs.appendFileSync(F + '.api', path + '\\n');
+  if (process.env.MQ_APPROVED_HEAD) {
+    // Supply both live sources: the queue requires their union, not just the primary test check.
+    if (/\\/rules\\/branches\\/main(?:\\?|$)/.test(path)) {
+      if (process.env.MQ_QUEUE_EVIDENCE === 'unreadable-roster') process.exit(1);
+      out([{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'test' }] } }]);
+    }
+    if (/\\/branches\\/main$/.test(path)) out({ sha: 'tip', protected: true,
+      protection: { required_status_checks: { contexts: ['smoke'] } } });
+  }
   let m;
   if ((m = /commits\\/(sha-\\d+)\\/check-runs/.exec(path))) {
     const p = prs.find(p => p.headRefOid === m[1]);
@@ -88,13 +101,13 @@ if (process.env.MQ_APPROVED_HEAD) {
 process.exit(0);
 `;
 
-function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', approvedHeadPlan = null, env: extraEnv = {} }) {
+function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, mergeStateStatus = 'CLEAN', approvedHeadPlan = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
     // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
-    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
+    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     const head = number => approvedHeadPlan ? 'a'.repeat(40) : `sha-${number}`;
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
@@ -108,7 +121,9 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
       baseRefName: 'main', headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
-      statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
+      statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' },
+        ...(approvedHeadPlan && extraEnv.MQ_QUEUE_EVIDENCE !== 'missing-secondary'
+          ? [{ name: 'smoke', conclusion: 'SUCCESS', status: 'COMPLETED' }] : [])],
       labels: [{ name: 'ready-to-merge' }, ...(approvedHeadPlan ? [{ name: 'review:accepted' }] : [])], comments, passAt: iso(age),
       commits: [{ oid: head(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: approvedHeadPlan ? '.github/workflows/test.yml' : `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
@@ -126,16 +141,22 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
     const mainFixFile = join(dir, 'main-red-priority.json');
     if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'we', pr: mainFixPr, prs: [mainFixPr], firstRedSha: 'red', reason: 'owns the red-main fix', setAt: NOW, expiresAt: NOW + 3_600_000 }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
+    const appEnv = daemonAppEnv(dir);
+    if (capabilityOff) appEnv.WE_GITHUB_APP_INSTALLATIONS = JSON.stringify({
+      ...JSON.parse(appEnv.WE_GITHUB_APP_INSTALLATIONS), longshoreai: appEnv.WE_GITHUB_APP_INSTALLATION_ID,
+    });
     const r = spawnSync(process.execPath, ['--import', preload, script, approvedHeadPlan?.repo ? `--repos=${approvedHeadPlan.repo}` : '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', ...(approvedHeadPlan ? ['--dry-run'] : ['--json'])], {
       cwd, encoding: 'utf8', timeout: 30_000 * TIMEOUT_SCALE,
-      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
+      env: { ...process.env, ...appEnv, WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
         WE_COORDINATION_ROOT: coord,
         // Exercise real retries without spending the production 20-second wait per UNKNOWN read.
         WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0',
-        ...(approvedHeadPlan ? { MQ_APPROVED_HEAD: '1', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', WE_DRAIN_MERGE_STRATEGY: approvedHeadPlan.strategy } : {}), ...extraEnv },
+        // Isolate the approval hold from the separate manifest-free conflict-only bypass, including on proof failure.
+        ...(approvedHeadPlan ? { MQ_APPROVED_HEAD: '1', WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on',
+          WE_DRAIN_REBASE_BEFORE_ENQUEUE: 'always', WE_DRAIN_MERGE_STRATEGY: approvedHeadPlan.strategy } : {}), ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
@@ -153,12 +174,25 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     ['direct', 'drain-direct', null, false],
     ['sibling repo', 'github-merge-queue', 'frontier-ui/frontierui', false],
   ])('%s: a BEHIND approved human head is held only when the queue owns freshness', (_mode, strategy, repo, held) => {
-    const { stderr } = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND', approvedHeadPlan: { strategy, repo } });
+    const { stderr, api } = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND', approvedHeadPlan: { strategy, repo } });
     expect(stderr).not.toContain('approved-head proof unreadable');
     expect(stderr.includes('approved human-surface head retained; merge queue owns freshness')).toBe(held);
     expect(stderr.includes('would rebase-drop manifest')).toBe(!held);
-    if (held) expect(stderr).toMatch(/would ENQUEUE .*#3001/);
+    if (held) {
+      expect(stderr).toContain('all required checks green (smoke, test)');
+      expect(api.some(path => path.includes('/rules/branches/main'))).toBe(true);
+      expect(api.some(path => path.endsWith('/branches/main'))).toBe(true);
+      expect(stderr).toMatch(/would ENQUEUE .*#3001/);
+    }
   }, 30_000 * TIMEOUT_SCALE);
+  it.each(['unreadable-roster', 'incomplete-listing', 'missing-secondary'])(
+    'a BEHIND approved human head is not enqueued with %s evidence', evidence => {
+      const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND',
+        approvedHeadPlan: { strategy: 'github-merge-queue' }, env: { MQ_QUEUE_EVIDENCE: evidence } });
+      expect(out.stderr).toContain('would ENQUEUE (none)');
+      expect(out.stderr).not.toMatch(/would ENQUEUE .*#3001/);
+      expect(out.attempts).toEqual([]);
+    }, 30_000 * TIMEOUT_SCALE);
   const throwingProof = { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'on', MQ_PROOF_THROWS: '1' };
   it('an unreadable queue approval proof still reaches legacy rebase-drop', () => {
     const out = runCli({ hookOn: false, ages: [[3001, 5]], mergeStateStatus: 'BEHIND',
@@ -205,7 +239,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
 
   // The record a refresh writes: the head AND the pass it was requested against (the fixture's check-run id is 7 and
   // its pass completed at `iso(120)`), plus when it was requested.
-  const seedFor = (over = {}) => Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k,
+  const seedFor = (over = {}) => Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k,
     { head: 'sha-3002', checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
 
   it('once per pass: a head refreshed against the pass still in force waits — no second refresh, no merge', () => {
@@ -223,7 +257,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   }, 30_000 * TIMEOUT_SCALE);
 
   it('a legacy head-only record (key → head) does not park the head either', () => {
-    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
+    const seed = Object.fromEntries(['web-everything/web-everything#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
     const { stderr } = runCli({ hookOn: true, seedRefreshed: seed });
     expect(stderr).not.toMatch(/refresh-already-requested/);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);

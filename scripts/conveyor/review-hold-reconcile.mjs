@@ -79,6 +79,7 @@ import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { LIST_COMMENTS_CAP, defaultListPrs, defaultReadPr } from './advisory-label-sweep.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
+import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { sweepAuthorStamps } from '../lib/author-stamp-restore.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -178,7 +179,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 export function sweepReviewHoldLabels({
   repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
-  numberingRestamp = restampAfterNumbering, restoreStamps, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
+  numberingRestamp = restampAfterNumbering, restoreStamps, publishNeedsYou = publishAttention, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
   // The ONE source of the accept-carry setting (WE_ACCEPT_CARRY_FORWARD > settings/accept-carry-forward.json >
   // default), read once per sweep and logged with its source. No timing setting (review.skipDrainMechanical) governs it.
@@ -200,6 +201,23 @@ export function sweepReviewHoldLabels({
       for (const r of (restoreStamps ?? sweepAuthorStamps)({ repo: repoOf(), dryRun, log })) {
         if (r.action === 'skip') continue; // a stamped PR is the normal case: no result, no log line
         results.push({ num: r.num, stampRestore: r.action, detail: r.detail });
+        if (r.action === 'refuse' && r.detail?.contentRefusal && !dryRun) {
+          // One failing publish must not hide later PRs: fall through to the plain per-pass refusal line.
+          try {
+            if (!/^[a-f0-9]{40}$/i.test(r.headSha ?? '')) throw new Error('missing head sha');
+            // Event-only kind: report polling cannot resolve this independently owned condition.
+            // publishAttention's locked open keys dedupe across passes and process restarts.
+            const key = `author-stamp:${r.num}:${r.headSha}`;
+            const published = publishNeedsYou({ repo: repoOf(), pr: r.num, head: r.headSha, kind: 'author-stamp', key,
+              reason: 'Author stamp content refused; inspect PR edit history',
+              snapshotId: r.detail.snapshotId, offender: r.detail.offender,
+              pick: `PR #${r.num} head ${r.headSha}; snapshot ${r.detail.snapshotId}; offender ${r.detail.offender}. Inspect that edit in the PR history and decide with the operator; do not hand-edit the stamp without verifying author provenance.` });
+            log(`  PR #${r.num}: author stamp ${published.lines.length ? 'NEEDS-YOU published' : 'already reported'}`);
+            continue;
+          } catch (publishError) {
+            log(`  PR #${r.num}: author stamp NEEDS-YOU publish failed: ${String(publishError?.message ?? publishError).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
+          }
+        }
         log(`  PR #${r.num}: author stamp ${r.action} — ${String(r.detail?.reason ?? '').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')}`);
       }
     } catch (e) {
