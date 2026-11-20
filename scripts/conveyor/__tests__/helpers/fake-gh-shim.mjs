@@ -25,6 +25,7 @@
  * `scripts/review-set-label.mjs`):
  *
  *   - `auth status`                                                          → exit 0 unconditionally
+ *   - `repo view [R] --json url,defaultBranchRef [--jq Q]`                (configured repository state)
  *   - `pr list [--repo R] [--state open|closed|merged|all] [--limit N]
  *              [--head B] [--base B] [--label L] --json FIELDS [--jq Q]`
  *   - `pr view <n> [--repo R] --json FIELDS [--jq Q]`
@@ -102,10 +103,10 @@ const HTTP_406_TOO_LARGE = 'could not find pull request diff: HTTP 406: Sorry, t
 // scenario could not drive the real daemon code through a genuinely Go-shaped network fault without one.
 const GO_NETWORK_ERROR = 'error connecting to api.github.com\ndial tcp 140.82.112.6:443: i/o timeout\n';
 
-/** `argv[0] argv[1]` when `argv[0]` has subcommands (`pr`, `label`) and `argv[1]` is one of them; otherwise
+/** `argv[0] argv[1]` when `argv[0]` has subcommands (`pr`, `label`, `repo`) and `argv[1]` is one of them; otherwise
  *  just `argv[0]` (`api`, `auth`). Matches the `verb` shape `createFakeGithub().fault({verb, ...})` takes. */
 function callVerb() {
-  if ((argv[0] === 'pr' || argv[0] === 'label') && argv[1] && !argv[1].startsWith('-')) return `${argv[0]} ${argv[1]}`;
+  if (['pr', 'label', 'repo'].includes(argv[0]) && argv[1] && !argv[1].startsWith('-')) return `${argv[0]} ${argv[1]}`;
   return argv[0];
 }
 
@@ -228,6 +229,19 @@ function jsonResult(value, jq, opts) {
 // -------------------------------------------------------------------------------------------------------
 // Verb handlers. Each returns `{stdout?, stderr?, exitCode?}` (default exitCode 0).
 // -------------------------------------------------------------------------------------------------------
+
+function handleRepoView(store, rest) {
+  return guarded(() => {
+    const repo = rest[0] && !rest[0].startsWith('-') ? rest[0] : null;
+    const repoState = requireRepo(store, resolveRepoSlug(store, repo));
+    const fields = flagValue(rest, '--json');
+    if (!fields || parseFieldsCsv(fields).some(field => !['url', 'defaultBranchRef'].includes(field))) {
+      return { stderr: 'fake-gh: unsupported repo view fields\n', exitCode: 1 };
+    }
+    return jsonResult(pickFields({ url: `https://github.com/${repoState.slug}`,
+      defaultBranchRef: { name: repoState.defaultBranch } }, fields), flagValue(rest, '--jq'));
+  });
+}
 
 function handlePrList(store, rest) {
   return guarded(() => {
@@ -671,6 +685,7 @@ function handleApi(store, rest) {
 
 function dispatch(store) {
   if (argv[0] === 'auth' && argv[1] === 'status') return { stdout: 'logged in to github.com\n' };
+  if (argv[0] === 'repo' && argv[1] === 'view') return handleRepoView(store, argv.slice(2));
   if (argv[0] === 'pr') {
     const sub = argv[1]; const rest = argv.slice(2);
     if (sub === 'list') return handlePrList(store, rest);

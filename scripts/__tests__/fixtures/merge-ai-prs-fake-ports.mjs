@@ -8,7 +8,10 @@ const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRE
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\n\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
-if (a[0] === 'repo') out('main');
+if (a[0] === 'repo') {
+  if (process.env.PRESTAGE_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture live default branch unreadable'); process.exit(1); }
+  out(process.env.PRESTAGE_DEFAULT_BRANCH ?? 'main');
+}
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
 if (a[0] === 'pr' && a[1] === 'list') out([pr]);
@@ -77,17 +80,18 @@ process.exit(0);
 }
 
 function capture(port, args, env) {
-  let stdout = '';
+  let stdout = '', stderr = '';
   const stopped = {};
   let status = 0;
   const write = value => { stdout += String(value); return true; };
   const process = { argv: ['node', 'fixture', ...args], env, stdout: { write },
     exit(code = 0) { status = code; throw stopped; } };
   try { port(process, { ...fs, writeSync(fd, value) {
+    if (fd === 2) { stderr += String(value); return Buffer.byteLength(value); }
     if (fd !== 1) throw new Error(`Unexpected fixture fd ${fd}`);
     write(value); return Buffer.byteLength(value);
   } }, openPrPageFixture, drainScoredGit); } catch (error) { if (error !== stopped) throw error; }
-  return { status, stdout, stderr: '' };
+  return { status, stdout, stderr };
 }
 const port = fn => (args, env) => capture(fn, args, env);
 export const prestagePorts = { gh: port(prestageGh), git: port(prestageGit) };

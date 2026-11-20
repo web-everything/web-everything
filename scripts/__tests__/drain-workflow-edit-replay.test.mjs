@@ -15,7 +15,7 @@ function replay(pr, { setting, clearance, author = 'chalbert', ...extra } = {}) 
   const comments = [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }];
   if (clearance) comments.push({ author: { login: author }, body: `<!-- reviewed-sha: ${clearance} -->\n<!-- cleared-human: operator -->` });
   const repo = 'web-everything/web-everything';
-  const [v] = buildDrainVerdicts({ prsByRepo: new Map([[repo, [pr]]]), repos: [repo], readOf: () => ({}) });
+  const [v] = buildDrainVerdicts({ defaultBranchOf: () => 'main', prsByRepo: new Map([[repo, [pr]]]), repos: [repo], readOf: () => ({}) });
   return decideDrainReviewGate({ labels: v.prLabels, escalate: true }, {
     pr: pr.number, repo, local: true, cwd: '/fixture', defaultBranch: 'trunk', files: v.listedFiles, filesComplete: v.listedFilesComplete,
     workflowEditSetting: setting, listedHeadSha: v.listedHeadSha,
@@ -24,13 +24,13 @@ function replay(pr, { setting, clearance, author = 'chalbert', ...extra } = {}) 
   });
 }
 describe('live workflow-edit replay', () => {
-  const blockedPr = (extra = {}) => ({ ...fixtures[1], body: 'Workflow update', mergeable: 'MERGEABLE',
+  const blockedPr = (extra = {}) => ({ baseRefName: 'main', ...fixtures[1], body: 'Workflow update', mergeable: 'MERGEABLE',
     mergeStateStatus: 'BLOCKED', statusCheckRollup: [
       { name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' },
     ], ...extra });
   it.each(['test', 'merge-gate'])('admits skipped accepted workflow PRs for repark (required %s)', (requiredCheck) => {
     const pr = blockedPr();
-    expect(classifyPr(pr, { requiredCheck })).toMatchObject({ decision: 'skip', workflowHoldRepark: true });
+    expect(classifyPr(pr, { defaultBranch: 'main', requiredCheck })).toMatchObject({ decision: 'skip', workflowHoldRepark: true });
     expect(replay(pr)).toMatchObject({ action: 'park', workflowEditHold: true, applyLabel: 'review:human' });
     const cleared = replay(pr, { clearance: pr.headRefOid });
     expect(cleared.action).toBe('merge');
@@ -46,7 +46,7 @@ describe('live workflow-edit replay', () => {
     { baseRefName: 'lane/stack' },
     { requiredCheckReadError: 'unreadable checks' },
   ])('does not broaden other skip paths: %j', (extra) => {
-    expect(classifyPr(blockedPr(extra)).workflowHoldRepark).toBeUndefined();
+    expect(classifyPr(blockedPr(extra), { defaultBranch: 'main' }).workflowHoldRepark).toBeUndefined();
   });
   for (const requiredCheck of ['test', 'merge-gate']) {
     it.each([
@@ -72,7 +72,7 @@ describe('live workflow-edit replay', () => {
         { name: 'CodeQL', conclusion: 'FAILURE' },
       ] }],
     ])(`classifyPr refuses repark for %s (required ${requiredCheck})`, (_name, extra) => {
-      const verdict = classifyPr(blockedPr(extra), { requiredCheck, defaultBranch: 'trunk', blockOnCodeQL: true });
+      const verdict = classifyPr(blockedPr({ baseRefName: 'trunk', ...extra }), { requiredCheck, defaultBranch: 'trunk', blockOnCodeQL: true });
       expect(verdict.decision).toBe('skip');
       expect(verdict.workflowHoldRepark).toBeUndefined();
       if (requiredCheck === 'merge-gate' && !['merge-gate passing'].includes(_name)) {
@@ -81,7 +81,7 @@ describe('live workflow-edit replay', () => {
     });
     it(`requires every additional required check to pass (required ${requiredCheck})`, () => {
       const pr = blockedPr();
-      const options = { requiredCheck, queueRequiredChecks: ['test', 'merge-gate', 'smoke'] };
+      const options = { defaultBranch: 'main', requiredCheck, queueRequiredChecks: ['test', 'merge-gate', 'smoke'] };
       expect(classifyPr(pr, options).workflowHoldRepark).toBeUndefined();
       pr.statusCheckRollup.push({ name: 'smoke', conclusion: 'FAILURE' });
       expect(classifyPr(pr, options).workflowHoldRepark).toBeUndefined();
