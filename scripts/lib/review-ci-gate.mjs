@@ -29,10 +29,14 @@ export function reviewCiPrerequisites({ headSha, requiredChecks, checks }) {
   return { latest, wrongHeads, needed: [...new Set([...wrongHeadNames, ...needed])] };
 }
 
+/** Rows are attested only when complete AND stamped with the same non-empty head string. undefined===undefined never passes. */
+export const rowsProvenOnHead = ({ rowsComplete, rowsHead } = {}, headSha) =>
+  rowsComplete === true && typeof headSha === 'string' && headSha.trim() !== '' && rowsHead === headSha;
+
 export function reviewCiGate({ headSha, requiredChecks, checks, rowsHead, rowsComplete } = {}) {
   const refuse = (reason, affected = []) => ({ allowed: false, headSha: headSha ?? null, reason, affected });
   if (typeof headSha !== 'string' || !headSha.trim()) return refuse('missing-head');
-  if (rowsComplete !== true || rowsHead !== headSha)
+  if (!rowsProvenOnHead({ rowsComplete, rowsHead }, headSha))
     return { ...refuse('rows-incomplete'), unknown: true };
   if (!Array.isArray(requiredChecks) || !requiredChecks.length
       || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return refuse('unknown-required-set');

@@ -134,8 +134,8 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
   expect(readReviewHead({ repo: 'other/product', pr: 3432, run: runHead })).toBe(headSha);
   expect(runHead).toHaveBeenCalledWith(['pr', 'view', '3432', '--repo', 'other/product', '--json', 'headRefOid']);
   const runChecks = vi.fn(argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ statuses: [{ context: 'legacy', state: 'success', id: 9 }] }, { statuses: [] }]
-    : [{ check_runs: [{ id: 2 }] }, { check_runs: [{ id: 1 }] }]));
+    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success', id: 9 }] }, { total_count: 1, statuses: [] }]
+    : [{ total_count: 2, check_runs: [{ id: 2 }] }, { total_count: 2, check_runs: [{ id: 1 }] }]));
   const rows = readReviewChecks({ repo: 'other/product', headSha, run: runChecks });
   expect(rows).toEqual([{ id: 2 }, { id: 1 }, { context: 'legacy', state: 'success' }]);
   expect(rows).toMatchObject({ rowsComplete: true, rowsHead: headSha });
@@ -147,7 +147,7 @@ it('production read argv is repo/SHA-explicit and fetches every page and rerun',
 
 it('admits successful required commit statuses', () => {
   const run = argv => JSON.stringify(argv[3].includes('/status?')
-    ? [{ statuses: [{ context: 'legacy', state: 'success' }] }] : [{ check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
+    ? [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success' }] }] : [{ total_count: 1, check_runs: [{ name: 'custom', status: 'completed', conclusion: 'success' }] }]);
   expect(readReviewCiGate(fixture({ readRequired: () => ({ source: 'live', checks: ['custom', 'legacy'] }),
     readChecks: ({ repo, headSha }) => readReviewChecks({ repo, headSha, run }) }))).toMatchObject({ allowed: true });
 });
@@ -269,4 +269,18 @@ it.each([
   const checks = Object.assign([{ name: 'custom', status: 'completed', conclusion: 'success' }], provenance);
   expect(readReviewCiGate(fixture({ readChecks: () => checks })))
     .toMatchObject({ allowed: false, reason: 'rows-incomplete', unknown: true });
+});
+
+it('attests rows only when delivered rows equal total_count for both check runs and statuses', () => {
+  const headSha = 'c'.repeat(40);
+  const runs = n => Array.from({ length: n }, (_, i) => ({ id: i, name: `c${i}`, status: 'completed', conclusion: 'success' }));
+  const mk = (claimed, delivered) => argv => JSON.stringify(argv[3].includes('/status?')
+    ? [{ total_count: 0, statuses: [] }] : [{ total_count: claimed, check_runs: runs(delivered) }]);
+  const short = readReviewChecks({ repo: 'o/p', headSha, run: mk(150, 100) });
+  expect(short.rowsComplete).toBe(false);
+  expect(readReviewCiGate({ repo: 'o/p', pr: 1, readHead: () => headSha, readRequired: () => ({ source: 'live', checks: ['c0'] }),
+    readChecks: () => short })).toMatchObject({ allowed: false, reason: 'rows-incomplete' });
+  expect(readReviewChecks({ repo: 'o/p', headSha, run: mk(100, 100) }).rowsComplete).toBe(true);
+  const noTotal = readReviewChecks({ repo: 'o/p', headSha, run: argv => JSON.stringify(argv[3].includes('/status?') ? [{ total_count: 0, statuses: [] }] : [{ check_runs: [] }]) });
+  expect(noTotal.rowsComplete).toBe(false);
 });

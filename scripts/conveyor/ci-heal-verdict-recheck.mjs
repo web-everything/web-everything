@@ -24,7 +24,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withoutImpliedRequiredChecks } from '../lib/required-check-implication.mjs';
-import { reviewCiPrerequisites } from '../lib/review-ci-gate.mjs';
+import { reviewCiPrerequisites, rowsProvenOnHead } from '../lib/review-ci-gate.mjs';
 import { classifyCheck, summarize } from '../lib/check-state-predicate.mjs';
 import { CODEQL_CHECK_NAME } from '../lib/codeql-gate.mjs';
 
@@ -74,7 +74,7 @@ export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
 
 /** No known required set means no evidence that CI is green. Pure. */
 export function ciGreenForEscalation({ rollup, requiredChecks, headSha, rowsHead, rowsComplete, rosterSource }) {
-  if (rowsComplete !== true || rowsHead !== headSha) return false;
+  if (!rowsProvenOnHead({ rowsComplete, rowsHead }, headSha)) return false;
   if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
   // Aggregate hydration metadata cannot override a row explicitly bound to another head.
   const rows = Array.isArray(rollup) ? rollup : [];

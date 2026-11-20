@@ -1558,7 +1558,7 @@ export function readStackedPrCheckPolicy(env = process.env) {
   return env.WE_STACKED_PR_CHECK_POLICY === 'strict' ? 'strict' : 'await-base';
 }
 
-function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
+export function hydrateChecks(prs,{ repo, requiredChecks, readChecks, defaultBranch }) {
   const cache = new Map();
   const ready = [], refusals = [], notes = [], owedTriggers = [];
   const stackedPolicy = readStackedPrCheckPolicy();
@@ -1658,8 +1658,11 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     // A refused or never-started read leaves a rollup that may miss a live run (past the page limit, or unread):
     // flag it so a mechanical re-run, which GitHub rejects against a live run, holds instead of guessing.
     // Only the replacement reader can attest its rows; a fallback to known rows carries no new proof.
-    const rowsComplete = !refused && !neverStarted && result.rowsComplete === true;
+    // "CI never started" is its own flag; a complete empty read is still attested (so startBeforeCi + verifyGreen can
+    // dispatch). Fallback to snapshot rows carries no new proof, so that case stays unattested.
+    const rowsComplete = !refused && !(neverStarted && known) && result.rowsComplete === true;
     ready.push({ ...pr, rowsComplete, rowsHead: rowsComplete ? sha : null,
+      ...(neverStarted ? { ciNeverStarted: true } : {}),
       statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows,
       ...((refused || neverStarted) ? { rollupIncomplete: true } : rowsComplete ? { rollupIncomplete: false } : {}) });
   }

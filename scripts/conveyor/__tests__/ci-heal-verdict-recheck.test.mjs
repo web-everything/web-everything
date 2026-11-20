@@ -811,3 +811,11 @@ describe('hydrated CI evidence for escalation retirement', () => {
     expect(ciGreenForEscalation({ ...complete, ...evidence })).toBe(false);
   });
 });
+
+describe('rowsProvenOnHead fail-closed default', () => {
+  it('both heads undefined with rowsComplete true is not proof of green', () => {
+    const rollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+    expect(ciGreenForEscalation({ rowsComplete: true, headSha: undefined, rowsHead: undefined, rollup, requiredChecks: ['test'] })).toBe(false);
+    expect(ciGreenForEscalation({ rowsComplete: true, headSha: '', rowsHead: '', rollup, requiredChecks: ['test'] })).toBe(false);
+  });
+});

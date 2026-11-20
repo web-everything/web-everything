@@ -21,20 +21,27 @@ export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(ru
  * The combined-status endpoint already reports only the latest state per context.
  * Attest only after both paginated reads finish. Non-enumerable provenance preserves the rows array API.
  */
-export const readReviewChecks = ({ repo, headSha, run = gh }) => Object.defineProperties([
-  ...JSON.parse(run([
+export const readReviewChecks = ({ repo, headSha, run = gh }) => {
+  const runPages = JSON.parse(run([
     'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all`,
-  ])).flatMap(page => {
+  ]));
+  const statusPages = JSON.parse(run([
+    'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
+  ]));
+  const runs = runPages.flatMap(page => {
     if (!Array.isArray(page.check_runs)) throw new Error('unreadable check runs');
     return page.check_runs;
-  }),
-  ...JSON.parse(run([
-    'api', '--paginate', '--slurp', `repos/${repo}/commits/${headSha}/status?per_page=100`,
-  ])).flatMap(page => {
+  });
+  const statuses = statusPages.flatMap(page => {
     if (!Array.isArray(page.statuses)) throw new Error('unreadable commit statuses');
     return page.statuses.map(({ context, state, target_url }) => ({ context, state, target_url }));
-  }),
-], { rowsComplete: { value: true }, rowsHead: { value: headSha } });
+  });
+  // Partial means not attested: the delivered rows must equal the server's claimed total for BOTH feeds.
+  const delivered = (pages, rows) => pages.length > 0 && pages.every(page => Number.isSafeInteger(page.total_count))
+    && rows.length === pages[0].total_count;
+  const rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses);
+  return Object.defineProperties([...runs, ...statuses], { rowsComplete: { value: rowsComplete }, rowsHead: { value: headSha } });
+};
 
 export function readReviewCiGate({ repo, pr, readHead, readLabels,
   readHeadAndLabels = readReviewHeadAndLabels,

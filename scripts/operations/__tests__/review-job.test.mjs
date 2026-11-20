@@ -531,8 +531,8 @@ describe('dispatch mode', () => {
 describe('complete review check reader evidence', () => {
   const headSha = 'a'.repeat(40);
   const pages = {
-    runs: [{ check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] }, { check_runs: [] }],
-    statuses: [{ statuses: [{ context: 'legacy', state: 'success' }] }],
+    runs: [{ total_count: 1, check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] }, { total_count: 1, check_runs: [] }],
+    statuses: [{ total_count: 1, statuses: [{ context: 'legacy', state: 'success' }] }],
   };
   const gate = run => readReviewCiGate({ repo: REPO, pr: 3432,
     policy: { startAfter: 'ci-green', startEarly: 'off' }, readHead: () => headSha,

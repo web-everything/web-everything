@@ -2274,3 +2274,15 @@ it('runs the file-based synchronous pool with real child processes and cleans it
     expect(evidenceExists(folder)).toBe(false);
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
+
+it('never-started CI keeps its own flag and the complete empty read is attested, so startBeforeCi + verifyGreen dispatches a review', async () => {
+  const { hydrateChecks } = await import('../reconcile-pass.mjs');
+  const readChecks = () => Object.defineProperties([], { rowsComplete: { value: true }, rowsHead: { value: XX_HEAD } });
+  const pr = { number: 7, state: 'OPEN', headRefOid: XX_HEAD, headRefName: 'lane/xabc-test', verifyGreen: true,
+    labels: [{ name: 'review:pending' }], comments: [], files: [{ path: 'scripts/example.mjs' }], statusCheckRollup: [] };
+  const out = hydrateChecks([pr], { repo: 'we', requiredChecks: ['test'], readChecks, defaultBranch: 'main' });
+  expect(out.owedTriggers).toHaveLength(1);
+  expect(out.prs[0]).toMatchObject({ ciNeverStarted: true, rowsComplete: true, rowsHead: XX_HEAD });
+  const plan = timeoutPlanReconcile({ prs: out.prs, requiredChecks: ['test'], now: Date.now(), reviewTiming: { startBeforeCi: true } });
+  expect(plan.dispatch.map(d => d.kind)).toContain('review');
+});
