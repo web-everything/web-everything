@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';import { stripComments, staticEdgesOf, shadowSelection, MAX_INPUT_BYTES } from '../static-selection-edges.mjs';
 import { resolvedImportsOf } from '../related-test-selection.mjs';
-import { selectTests, SELECTION_FLAG } from '../../readiness/test-selection.mjs';
+import { selectTests, SELECTION_FLAG, validateVitestReport } from '../../readiness/test-selection.mjs';
 
 const FILES = new Set(['scripts/lib/x.mjs', 'scripts/lib/a.mjs', 'scripts/lib/b.mjs', 'scripts/cli/run.mjs']);
 
@@ -148,8 +148,39 @@ describe('audit regressions: regex literals and aliases', () => {
   });
 });
 
+describe('validateVitestReport — fail closed on incomplete evidence', () => {
+  it.each([
+    ['missing report', undefined],
+    ['null report', null],
+    ['non-object report', 'text'],
+    ['array report', []],
+    ['missing testResults', {}],
+    ['non-array testResults', { testResults: {} }],
+    ['empty testResults', { testResults: [] }],
+    ['entry without name and status', { testResults: [{}] }],
+    ['null entry', { testResults: [null] }],
+    ['malformed entry after a good entry', { testResults: [{ name: 'a.test.mjs', status: 'passed' }, {}] }],
+    ['non-string name', { testResults: [{ name: 1, status: 'passed' }] }],
+    ['missing status', { testResults: [{ name: 'a.test.mjs' }] }],
+    ['non-string status', { testResults: [{ name: 'a.test.mjs', status: false }] }],
+    ['report runtime error', { testResults: [{ name: 'a.test.mjs', status: 'passed' }], numRuntimeErrorTestSuites: 1 }],
+    ['entry runtime error', { testResults: [{ name: 'a.test.mjs', status: 'passed', runtimeError: { message: 'crash' } }] }],
+    ['entry runtime error count', { testResults: [{ name: 'a.test.mjs', status: 'passed', numRuntimeErrorTestSuites: 1 }] }],
+    ['suite execution error', { testResults: [{ name: 'a.test.mjs', status: 'failed', testExecError: { message: 'crash' } }] }],
+    ['unhandled report error', { testResults: [{ name: 'a.test.mjs', status: 'passed' }], unhandledErrors: [{ message: 'crash' }] }],
+  ])('rejects %s with a reason', (_label, report) => {
+    expect(validateVitestReport(report)).toEqual({ ok: false, reason: expect.any(String) });
+    expect(validateVitestReport(report).reason.length).toBeGreaterThan(0);
+  });
+
+  it.each(['passed', 'failed'])('accepts a named %s entry without assertionResults', (status) => {
+    expect(validateVitestReport({ testResults: [{ name: 'a.test.mjs', status }], numRuntimeErrorTestSuites: 0 }))
+      .toEqual({ ok: true, reason: null });
+  });
+});
+
 describe('audit regression: measure CLI report evidence', () => {
-  it('fails closed for missing or malformed reports and preserves mode/tests with valid reports', async () => {
+  it.each(['0', '1'])('fails closed and preserves mode/tests with selection flag=%s', async (flag) => {
     const { vi } = await import('vitest');
     const { resolve } = await import('node:path');
     const cliPath = resolve('scripts/readiness/test-selection.mjs');
@@ -157,14 +188,16 @@ describe('audit regression: measure CLI report evidence', () => {
     let output;
     let recorded;
     let reportText;
+    const historical = [{ falseGreen: true }, { falseGreen: false }, { falseGreen: null, status: 'report-invalid' }];
+    let persisted = [...historical];
     vi.stubEnv('WE_STATIC_EDGES_SHADOW', '1');
-    vi.stubEnv(SELECTION_FLAG, '0');
+    vi.stubEnv(SELECTION_FLAG, flag);
     vi.doMock('node:child_process', async () => {
       const actual = await vi.importActual('node:child_process');
       const execFileSync = (file, args) => {
         if (file !== 'git') throw new Error('unexpected child process');
         if (args[0] === 'merge-base') return 'abc\n';
-        if (args[0] === 'diff') return 'scripts/lib/x.mjs\n';
+        if (args[0] === 'diff') return 'docs/a.md\n';
         if (args[0] === 'ls-files') return 'scripts/lib/x.mjs\0';
         throw new Error(`unexpected git command: ${args[0]}`);
       };
@@ -178,11 +211,12 @@ describe('audit regression: measure CLI report evidence', () => {
           if (reportText === undefined) throw new Error('ENOENT');
           return reportText;
         }
+        if (String(path).endsWith('/false-green-log.json')) return JSON.stringify(persisted);
         if (String(path).endsWith('/scripts/lib/x.mjs')) return '';
         return actual.readFileSync(path, ...rest);
       },
       mkdirSync: () => {},
-      writeFileSync: (_path, text) => { recorded = JSON.parse(text).at(-1); },
+      writeFileSync: (_path, text) => { persisted = JSON.parse(text); recorded = persisted.at(-1); },
       renameSync: () => {},
       };
       return { ...actual, ...fixture, default: { ...actual.default, ...fixture } };
@@ -192,15 +226,30 @@ describe('audit regression: measure CLI report evidence', () => {
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => {});
     try {
       let baseline;
-      const reports = [undefined, null, '{invalid', '{}', '[]', '"text"', '{"testResults":{}}', '{"testResults":[]}', '{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}'];
-      for (const report of reports) {
+      const reports = [
+        [undefined, false], [null, false], ['{invalid', false], ['{}', false], ['[]', false], ['"text"', false],
+        ['{"testResults":{}}', false], ['{"testResults":[]}', false], ['{"testResults":[{}]}', false],
+        ['{"testResults":[{"name":"a.test.mjs","status":"passed"}],"numRuntimeErrorTestSuites":1}', false],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', true],
+        ['{"testResults":[{"name":"a.test.mjs","status":"passed"}]}', true],
+      ];
+      for (const [report, valid] of reports) {
         reportText = report ?? undefined;
         vi.resetModules();
         process.argv = [argv[0], cliPath, '--measure', '--no-related', ...(report === undefined ? [] : ['--vitest-json=audit-report.json'])];
         await import('../../readiness/test-selection.mjs');
-        const valid = report?.startsWith('{"testResults":[') === true;
+        expect(exit).toHaveBeenLastCalledWith(valid ? 0 : 1);
         expect(output.recorded).toEqual(recorded);
         expect(recorded.hadReport).toBe(valid);
+        if (!valid) {
+          expect(recorded).toMatchObject({ falseGreen: null, status: 'report-invalid', failedCount: null, escaped: null });
+          expect(output.falseGreen).toMatchObject({ falseGreen: null, failedCount: null, escaped: null });
+        } else {
+          expect(recorded.falseGreen).toBe(flag === '1' && report.includes('escaped.test.mjs'));
+          expect(recorded.failedCount).toBe(report.includes('escaped.test.mjs') ? 1 : 0);
+          expect(recorded.escaped).toEqual(flag === '1' && report.includes('escaped.test.mjs') ? ['escaped.test.mjs'] : []);
+          expect(recorded.status).toBeUndefined();
+        }
         expect(output.shadow.partial).toBe(!valid);
         expect(output.decision.shadow).toEqual(output.shadow);
         expect(output.shadowEscaped).toEqual(valid ? (report.includes('escaped.test.mjs') ? ['escaped.test.mjs'] : []) : null);
@@ -209,6 +258,12 @@ describe('audit regression: measure CLI report evidence', () => {
         baseline ??= decision;
         expect(decision).toEqual(baseline);
       }
+      // The recorder retains unknown measurements alongside historical boolean samples.
+      expect(persisted).toHaveLength(historical.length + reports.length);
+      expect(persisted.slice(0, historical.length)).toEqual(historical);
+      expect(persisted.slice(historical.length).map((row) => row.falseGreen)).toEqual(
+        reports.map(([report, valid]) => valid ? flag === '1' && report.includes('escaped.test.mjs') : null),
+      );
       expect(exit).toHaveBeenCalledTimes(reports.length);
     } finally {
       process.argv = argv;

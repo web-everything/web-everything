@@ -492,6 +492,29 @@ export function assessFalseGreen({ failedTestFiles = [], selectedTestFiles = [],
   };
 }
 
+/**
+ * Validate full-run evidence before measuring false greens. A named failed suite is valid even without
+ * assertions; declared runtime errors leave the run incomplete. Pure.
+ * @returns {{ok: boolean, reason: string|null}}
+ */
+export function validateVitestReport(report) {
+  const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (!isObject(report)) return { ok: false, reason: 'report must be an object' };
+  if (!Array.isArray(report.testResults) || report.testResults.length === 0) {
+    return { ok: false, reason: 'testResults must be a non-empty array' };
+  }
+  const hasRuntimeErrors = (value) => value.numRuntimeErrorTestSuites > 0 || Boolean(value.runtimeError)
+    || Boolean(value.testExecError) || (Array.isArray(value.unhandledErrors) && value.unhandledErrors.length > 0);
+  if (hasRuntimeErrors(report)) return { ok: false, reason: 'report declares runtime errors' };
+  for (const entry of report.testResults) {
+    if (!isObject(entry) || typeof entry.name !== 'string' || typeof entry.status !== 'string') {
+      return { ok: false, reason: 'every test result must have a string name and status' };
+    }
+    if (hasRuntimeErrors(entry)) return { ok: false, reason: 'test result declares runtime errors' };
+  }
+  return { ok: true, reason: null };
+}
+
 /** Normalize a path for set-membership: strip a leading `./`, collapse backslashes. Pure. */
 function normalizePath(p) {
   return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').trim();
@@ -600,15 +623,16 @@ function runCli(argv) {
   // A false-green = a full-suite FAILURE that falls OUTSIDE what `vitest related` on the diff would have run.
   if (flags.measure) {
     const report = typeof flags['vitest-json'] === 'string' ? readJsonFile(flags['vitest-json'], null) : null;
-    const hadReport = report !== null && typeof report === 'object' && !Array.isArray(report) && Array.isArray(report.testResults);
-    const failedTestFiles = failedFilesFromVitestJson(report);
+    const validation = validateVitestReport(report);
+    const hadReport = validation.ok;
+    const failedTestFiles = hadReport ? failedFilesFromVitestJson(report) : [];
     // The TRUE selected set is the TEST files `vitest related <changedFiles>` resolves — not the changed source
     // files. Prefer a caller-supplied `--selected-json` (a vitest-related report), else compute it here, else
     // fall back to the changed-file approximation (conservatively biased — it over-reports escapes, never under)
     // and flag it `approx`. Only meaningful for a SHRINK decision; a FULL decision covers everything (no escape).
     let selectedTestFiles = [];
     let approx = false;
-    if (decision.mode === 'shrink') {
+    if (hadReport && decision.mode === 'shrink') {
       const selReport = typeof flags['selected-json'] === 'string' ? readJsonFile(flags['selected-json'], null) : null;
       if (selReport) selectedTestFiles = allFilesFromVitestJson(selReport);
       else {
@@ -617,7 +641,9 @@ function runCli(argv) {
         else { selectedTestFiles = decision.selectedFiles; approx = true; }
       }
     }
-    const fg = assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode });
+    const fg = hadReport
+      ? assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode })
+      : { falseGreen: null, failedCount: null, escaped: null, selectedCount: selectedTestFiles.length, mode: decision.mode };
     if (decision.shadow && !hadReport) decision.shadow.partial = true;
     const shadowFields = decision.shadow ? {
       shadow: decision.shadow,
@@ -633,12 +659,14 @@ function runCli(argv) {
       falseGreen: fg.falseGreen,
       escaped: fg.escaped,
       hadReport,
+      ...(!hadReport ? { status: 'report-invalid', reason: validation.reason } : {}),
       ...shadowFields,
       approx, // true ⇒ selectedTestFiles is the changed-file approximation, not the real `vitest related` set
     };
     recordFalseGreen(sample);
     writeAllSync(1, JSON.stringify({ decision, falseGreen: fg, ...shadowFields, recorded: sample }, null, 2) + '\n');
-    process.exit(0);
+    process.exit(hadReport ? 0 : 1);
+    return;
   }
 
   // --decide (default): print the decision as JSON (CI / callers consume this).
