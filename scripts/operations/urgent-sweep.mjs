@@ -64,6 +64,15 @@ export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync
         return { ...data, workflows: runs.code === 0 ? JSON.parse(runs.stdout) : null, testWorkflowPath: config.testWorkflowPath };
       } catch { return { ...data, workflows: null }; }
     },
+    pr: r => {
+      if (!Number.isSafeInteger(r.hotPatch?.pr) || r.hotPatch.pr <= 0
+        || normalizeUrgentRepo(r.repo) !== 'https://github.com/web-everything/web-everything')
+        throw Error('unreadable hot-patch PR identity; repair urgent-loads evidence');
+      const childEnv = { ...env }; delete childEnv.GH_REPO; delete childEnv.GH_HOST;
+      return JSON.parse(String(ghExec('gh', ['api', `repos/web-everything/web-everything/pulls/${r.hotPatch.pr}`],
+        { cwd: r.clone, env: childEnv, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+          throttle: { caller: 'urgent-sweep', exec: (a, o) => exec('gh', a, o) } })));
+    },
     overlayState: r => readState(r.clone, { env }),
     containsOverlay: r => {
       try {
@@ -161,7 +170,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const batch = [...entries.slice(start), ...entries.slice(0, start)].filter(([id]) => !settled.has(id)).slice(0, 32);
     // Persist before readers/escalations: an unreadable or pending batch must not monopolize later ticks.
     if (batch.length) await deps.settle({ id: batch.at(-1)[0], status: 'sweep-cursor', at: deps.now() });
-    // Three GitHub reads per load, at most 96 per tick. Remaining entries wait for the next orchestrator tick.
+    // Up to four GitHub reads per hot-patch load, at most 128 per tick. Remaining entries wait for the next orchestrator tick.
     for (const [id, r] of batch) {
       const notificationErrors = [];
       const report = result => results.push(notificationErrors.length
@@ -238,10 +247,13 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
         if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
           throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
+        const hotPatch = /^hotpatch\/[0-9a-f]{40}/.test(r.ref);
+        let decisionReason, prEvidence, hotFailure;
         let age = now - loadedAt;
         let data, boundFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
         try {
           data = await deps.checks(r);
+          if (hotPatch) hotFailure = data?.check_runs?.find(c => c?.app?.id === TEST_CHECK_APP_ID && failedCheck(c, r.sha));
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           validateChecks(data, r.sha);
           // GitHub cannot run CI without a merge ref. Resume normal monitoring as soon as checks appear.
@@ -284,7 +296,24 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             }
           }
         } catch (e) { evidenceError = e; }
-        if (!requiredSucceeded && everGreen.has(id)) {
+        if (hotPatch) {
+          if (!testWorkflowBound(testCheckEvidence(data ?? {}, r.sha), data?.workflows, r.sha, data?.testWorkflowPath))
+            evidenceError ||= Error('unreadable hot-patch CI binding; repair workflow evidence or unload manually');
+          try {
+            prEvidence = await deps.pr(r);
+            if (!Number.isSafeInteger(r.hotPatch?.pr) || r.hotPatch.pr <= 0 || prEvidence?.number !== r.hotPatch.pr
+              || !['open', 'closed'].includes(prEvidence.state) || typeof prEvidence.merged !== 'boolean'
+              || !validSha(prEvidence.head?.sha)) throw Error('unreadable hot-patch PR evidence; repair reader or unload manually');
+            if (prEvidence.head.sha !== r.sha) decisionReason = 'pr-head-moved';
+            else if (prEvidence.state === 'closed' && !prEvidence.merged) decisionReason = 'pr-closed';
+            else if (!prEvidence.merged && age >= 24 * 60 * 60 * 1000) decisionReason = 'expired';
+          } catch (e) { evidenceError = e; }
+          if (hotFailure) { boundFailure = hotFailure; decisionReason = 'ci-failed'; }
+          else if (!decisionReason && evidenceError && age >= 30 * 60 * 1000) decisionReason = 'ci-unknown';
+          unload = Boolean(decisionReason);
+          if (unload && decisionReason !== 'ci-failed') unloadReason = `Unloaded ${r.sha}: ${decisionReason}. Inspect evidence and repair before reloading.`;
+        }
+        if (!hotPatch && !requiredSucceeded && everGreen.has(id)) {
           // A historical pass cannot authorize today's incomplete or failing evidence.
           // Persist before notifications so restarts cannot extend this verdict deadline.
           if (!nonGreen.has(id)) {
@@ -297,7 +326,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             throw new Error('unreadable non-green timestamp; inspect CI or unload manually');
           age = now - since;
         }
-        if (!unload && !requiredSucceeded) {
+        if (!hotPatch && !unload && !requiredSucceeded) {
           if (!anyFailure && age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
             await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
             await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
@@ -328,7 +357,8 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           const failed = boundFailure;
           await deps.settle({ id, status: 'unload-decision', at: deps.now(), trackingId: r.trackingId,
             clone: r.clone, ref: r.ref, sha: r.sha, registration: r.registration,
-            reason: unloadReason ? 'ci-expired' : 'ci-failed',
+            reason: decisionReason ?? (unloadReason ? 'ci-expired' : 'ci-failed'),
+            ...(prEvidence ? { pr: prEvidence } : {}),
             ...(unloadReason ? {} : { check: { head_sha: failed.head_sha, status: failed.status, conclusion: failed.conclusion } }) });
           const removal = await deps.remove(r, overlay.overlays.find(e => e.ref === r.registration.ref));
           if (!removal || removal.refused || (removal.retired !== true && (!Array.isArray(removal.list) || removal.list.some(e => e.ref === r.registration.ref)))) throw new Error(`overlay removal refused: ${removal?.refused ?? 'unreadable result'}`);

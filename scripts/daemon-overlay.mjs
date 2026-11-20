@@ -578,10 +578,21 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       const at = Date.parse(decision?.at), loadedAt = Date.parse(load.at);
       const matches = decision?.clone === root && decision.ref === load.ref && decision.sha === load.sha
         && isDeepStrictEqual(decision.registration, load.registration);
-      const negative = decision?.reason === 'ci-failed'
+      // Only immutable hot-patch loads may use the shorter unknown clock or PR lifecycle evidence.
+      const hotPatch = typeof load.ref === 'string' && /^hotpatch\/[0-9a-f]{40}/.test(load.ref);
+      const pr = decision?.pr;
+      const prMatches = Number.isSafeInteger(load.hotPatch?.pr) && load.hotPatch.pr > 0
+        && pr?.number === load.hotPatch.pr && ['open', 'closed'].includes(pr.state)
+        && typeof pr.head?.sha === 'string' && /^[a-f0-9]{40}$/.test(pr.head.sha);
+      const hotNegative = hotPatch && (
+        decision?.reason === 'ci-unknown' && at - loadedAt >= 30 * 60 * 1000
+        || decision?.reason === 'expired' && at - loadedAt >= 24 * 60 * 60 * 1000
+        || prMatches && (decision?.reason === 'pr-head-moved' && pr.head.sha !== load.sha
+          || decision?.reason === 'pr-closed' && pr.state === 'closed' && pr.merged === false));
+      const negative = hotNegative || (decision?.reason === 'ci-failed'
         ? decision.check?.head_sha === load.sha && decision.check.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(decision.check.conclusion)
-        : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000;
+        : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000);
       if (!matches || !/^[a-f0-9]{40}$/.test(load.sha ?? '') || typeof load.ref !== 'string'
         || !Number.isFinite(loadedAt) || !Number.isFinite(at) || at < loadedAt || at > Date.now() || !negative) return refuse('urgent-decision-required');
       let withdrawal;
