@@ -99,6 +99,16 @@ function overlayStateFile(overlayDir, cloneDir) {
 }
 
 describe('daemon-overlay.mjs add — expected SHA admission', () => {
+  it('stores --expected-sha on the registered entry when added with --pinned', () => {
+    const f = makeFixture();
+    const ref = 'lane/exact-pin';
+    pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'approved.txt', 'approved\n'));
+    const expectedSha = gitOk(f.originDir, ['rev-parse', `refs/heads/${ref}`]).trim();
+    const r = runCli(['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, '--pinned', `--expected-sha=${expectedSha}`, '--json'], { ...f.env, WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(0);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir).overlays).toContainEqual(expect.objectContaining({ ref, pinned: true, expectedSha }));
+  });
+
   it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {
     const f = makeFixture();
     const ref = 'lane/sha-bound';

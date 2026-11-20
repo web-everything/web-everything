@@ -153,6 +153,26 @@ describe('writeOverlays', () => {
 });
 
 describe('addOverlay', () => {
+  it('persists the exact expectedSha on a pinned registration', () => {
+    const expectedSha = 'a'.repeat(40);
+    const list = addOverlay(cloneRoot, { ref: 'lane/exact', pinned: true, expectedSha }, { env: env() });
+    expect(list[0]).toMatchObject({ ref: 'lane/exact', pinned: true, expectedSha });
+    expect(readOverlays(cloneRoot, { env: env() })[0]).toMatchObject({ expectedSha });
+    expect(JSON.parse(readFileSync(overlayFilePath(cloneRoot, env()), 'utf8')).overlays[0].expectedSha).toBe(expectedSha);
+  });
+
+  it.each(['', 'abc123', 'a'.repeat(39), 'a'.repeat(41), 'g'.repeat(40)])('refuses non-40-hex expectedSha without writing: %s', (expectedSha) => {
+    expect(() => addOverlay(cloneRoot, { ref: 'lane/exact', pinned: true, expectedSha }, { env: env() })).toThrow();
+    expect(readOverlays(cloneRoot, { env: env() })).toEqual([]);
+  });
+
+  it('refuses re-adding the same ref with a different expectedSha and preserves the registration', () => {
+    addOverlay(cloneRoot, { ref: 'lane/exact', pinned: true, expectedSha: 'a'.repeat(40) }, { env: env() });
+    const before = readFileSync(overlayFilePath(cloneRoot, env()), 'utf8');
+    expect(() => addOverlay(cloneRoot, { ref: 'lane/exact', pinned: true, expectedSha: 'b'.repeat(40) }, { env: env() })).toThrow();
+    expect(readFileSync(overlayFilePath(cloneRoot, env()), 'utf8')).toBe(before);
+  });
+
   it('adds a new entry', () => {
     const list = addOverlay(cloneRoot, { ref: 'lane/foo', pr: 12, addedBy: 'nic', reason: 'fix' }, { env: env() });
     expect(list).toEqual([{ ref: 'lane/foo', pr: 12, addedAt: expect.any(String), addedBy: 'nic', reason: 'fix' }]);
