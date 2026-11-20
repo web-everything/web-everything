@@ -633,7 +633,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
           validateChecks(checks, load.sha);
           currentFailure = Boolean(latestActionFailure(checks, load.sha));
           const required = await (deps.readUrgentRequired ?? ((r, path) => readers().required(r, path)))(load, checks.testWorkflowPath);
-          hotPatchCiEvidence(checks, load.sha, required);
+          hotPatchCiEvidence(checks, load.sha, required, Date.now());
         } catch { unknown = true; }
         try {
           pr = await (deps.readUrgentPr ?? (r => readers().pr(r)))(load);

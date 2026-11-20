@@ -46,7 +46,7 @@ export function hotPatchCiEvidence(data, sha, required, now) {
     if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
   }
   if ([...latest.values()].some(c => c.app.id === TEST_CHECK_APP_ID
-    && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && now - Date.parse(c.completed_at) >= 30 * 60_000))
+    && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && (!Number.isFinite(Date.parse(c.completed_at)) || now - Date.parse(c.completed_at) >= 30 * 60_000)))
     throw Error('unknown hot-patch CI conclusion; inspect checks or unload manually');
   if (!testWorkflowBound(testCheckEvidence(data, sha), data.workflows, sha, data.testWorkflowPath))
     throw Error('unreadable hot-patch CI binding');

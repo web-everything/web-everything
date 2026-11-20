@@ -1114,6 +1114,14 @@ describe('hot-patch sweep (R1100)', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
     expect(f.d.remove).not.toHaveBeenCalled();
   });
+  it.each([undefined, 'garbage'])('unloads a superseded failure with missing or invalid completed_at (%s) and a queued rerun', async completedAt => {
+    const f = hotFixture([check('test', 'failure', completedAt === undefined ? {} : { completed_at: completedAt }),
+      ...required.map(n => check(n, n === 'test' ? null : 'success', n === 'test' ? { status: 'queued' } : {}))]);
+    f.d.now = () => new Date(Date.parse(load.at) + 30 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
   it('keeps the six-hour escalation for a seven-hour pending hot patch', async () => {
     const f = hotFixture(required.map(n => check(n, null, { status: 'in_progress' })));
     f.d.now = () => new Date(Date.parse(load.at) + 7 * 3600_000).toISOString();

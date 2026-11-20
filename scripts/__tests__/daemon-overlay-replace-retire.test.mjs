@@ -841,6 +841,20 @@ describe('hot-patch retirement decision authorization', () => {
     expect(await retireRegistration(args)).toMatchObject(age ? { retired: true } : { retired: false, refused: 'urgent-decision-required' });
     expect(f.list()).toEqual(age ? [] : [ref]);
   });
+  it('guarded revalidation accepts withdrawal for an overdue failure with a pending newer rerun', async () => {
+    const { f, args } = retirement('ci-unknown', 31 * 60_000, null);
+    const checks = boundChecks('failure');
+    checks.check_runs[0].completed_at = '2026-01-01T00:00:00Z';
+    checks.check_runs.push({ ...checks.check_runs[0], id: 92, status: 'queued', conclusion: null, completed_at: null });
+    checks.total_count = 2;
+    args.deps.readUrgentChecks = () => checks;
+    args.deps.readUrgentRequired = () => ['test'];
+    args.deps.readUrgentPr = () => ({ number: 42, state: 'open', merged: false, head: { sha: tip } });
+    expect(await retireRegistration(args)).toMatchObject({ retired: true, refused: null, reason: 'urgent-failed' });
+    expect(f.list()).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', reason: 'urgent-failed' });
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
   it('refuses hot-patch withdrawal with cached dependents and emits NEEDS-YOU without touching registrations', async () => {
     const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
     addOverlay(f.clone, { ref: 'lane/top', stackBases: [ref] }, { env: f.env });
