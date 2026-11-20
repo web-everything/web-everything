@@ -22,7 +22,7 @@ import {
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh, defaultReadNotesForRepo, runReconcileNotesAllRepos,
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
-  resolveFixPassBudgets, formatPassPhaseTiming,
+  resolveFixPassBudgets, formatPassPhaseTiming, createPassCallRecorder,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
@@ -31,9 +31,11 @@ import * as recovery from '../../../scripts/conveyor/ci-red-recovery-watch.mjs';
 import * as netScope from '../../../scripts/conveyor/net-scope.mjs';
 import * as prStack from '../../../scripts/conveyor/pr-stack.mjs';
 import * as reconcilePass from '../../../scripts/conveyor/reconcile-pass.mjs';
-import { execFileSyncThrottled } from '../../../scripts/lib/gh-throttle.mjs';
+import { execFileSyncThrottled, withCommandTiming } from '../../../scripts/lib/gh-throttle.mjs';
 import { resolveFixDispatchSettings } from '../../../scripts/conveyor/fix-takeover.mjs';
 import * as ghThrottle from '../../../scripts/lib/gh-throttle.mjs';
+import { readGhSlotHolders } from '../../../scripts/lib/gh-throttle-holders.mjs';
+
 import * as prSnapshot from '../../../scripts/lib/pr-snapshot.mjs';
 import * as ciHealDispatch from '../../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import * as promoteDispatch from '../../../scripts/operations/promote-draft-pr-dispatch.mjs';
@@ -2591,6 +2593,103 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
 
 
 describe('fix pass budgets', () => {
+  it('timing observer failures preserve command returns and errors', () => {
+    const value = Buffer.from('unchanged');
+    const failure = new Error('original command error');
+    const context = { now: () => 0,
+      record: () => { throw new Error('observer failed'); } };
+    const opts = { throttle: { exec: () => value } };
+    expect(withCommandTiming(context, () => execFileSyncThrottled('gh', ['--version'], opts))).toBe(value);
+    opts.throttle.exec = () => { throw failure; };
+    let caught;
+    try { withCommandTiming(context, () => execFileSyncThrottled('gh', ['--version'], opts)); }
+    catch (error) { caught = error; }
+    expect(caught).toBe(failure);
+    context.now = () => { throw new Error('clock failed'); };
+    opts.throttle.exec = () => value;
+    expect(withCommandTiming(context, () => execFileSyncThrottled('gh', ['--version'], opts))).toBe(value);
+    const recorder = createPassCallRecorder();
+    expect(() => recorder.record('fix', 'gh', null, 100)).not.toThrow();
+    expect(recorder.snapshot()).toEqual({});
+  });
+
+  it('records only allowlisted command words and stops at private arguments', () => {
+    const recorder = createPassCallRecorder();
+    recorder.record('git', 'git', ['show', 'confidential-branch'], 10);
+    recorder.record('gh', 'gh', ['pr', 'view', '12'], 20);
+    recorder.record('private', 'gh', ['pr', 'confidential', 'view'], 30);
+    recorder.record('flags', 'gh', ['--help', 'pr'], 40);
+    expect(recorder.snapshot()).toEqual({
+      git: { name: 'git', ms: 10 }, gh: { name: 'gh pr view', ms: 20 },
+      private: { name: 'gh pr', ms: 30 }, flags: { name: 'gh', ms: 40 },
+    });
+  });
+
+  it('timed gh calls still acquire a throttle slot and record elapsed time', () => {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'timed-gh-'));
+    let time = 0;
+    const record = vi.fn();
+    const value = Buffer.from('unchanged');
+    const exec = vi.fn(() => {
+      expect(readGhSlotHolders({ lockRoot, cap: 1 })).toHaveLength(1);
+      time += 41000;
+      return value;
+    });
+    try {
+      const result = withCommandTiming({ now: () => time, record }, () =>
+        execFileSyncThrottled('gh', ['pr', 'view', '12'], {
+          throttle: { lockRoot, cap: 1, exec, env: {}, shimRouted: true },
+        }));
+      expect(result).toBe(value);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith('gh', ['pr', 'view', '12'], 41000);
+      expect(readGhSlotHolders({ lockRoot, cap: 1 })).toEqual([]);
+    } finally {
+      rmSync(lockRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('pass-timing names every phase', async () => {
+    let time = 0;
+    const recorder = createPassCallRecorder();
+    const slowCall = (phase, command, args, ms) => {
+      const start = time;
+      time += ms;
+      recorder.record(phase, command, args, time - start);
+    };
+    const opts = fixture({ repos: ['a'], now: () => time, callRecorder: recorder,
+      fixTick: () => {
+        slowCall('fix', 'gh', ['pr', 'view', '--body', 'private body'], 41000);
+        slowCall('fix', 'gh', ['pr', 'list', '--token', 'secret'], 5);
+        return empty();
+      },
+      ciHealTick: async () => {
+        await Promise.resolve();
+        slowCall('ci-heal', 'git', ['fetch', 'confidential-branch'], 12000);
+        return empty();
+      },
+    });
+    const result = await runTickAllRepos(opts);
+    const phases = ['auth-gate', 'await-verify', 'supersede', 'ruling-stand-down', 'orphan-guard',
+      'fix', 'stuck-fixers', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes'];
+    expect(Object.keys(result.phaseMs)).toEqual(phases);
+    const lines = [];
+    buildCliDaemonEffects({ owner: 't', log: { error: line => lines.push(line) } }).onTick(result);
+    const timings = lines.filter(line => line.includes('pass-timing phase='));
+    expect(timings).toHaveLength(phases.length);
+    for (const phase of phases) {
+      const ms = phase === 'fix' ? 41005 : phase === 'ci-heal' ? 12000 : 0;
+      const slowest = phase === 'fix' ? 'gh pr view:41000' : phase === 'ci-heal' ? 'git fetch:12000' : 'none';
+      const budgetHit = ms > 1000;
+      expect(timings.filter(line => line.includes(`phase=${phase} `))).toEqual([
+        `reconcile-fix-dispatch-daemon: pass-timing phase=${phase} ms=${ms} budgetMs=${result.budgets[phase]?.budgetMs ?? 'none'} budgetHit=${budgetHit} prs=0 deferred=0 slowest=${slowest}`,
+      ]);
+    }
+    const second = await runTickAllRepos({ ...opts, fixTick: empty, ciHealTick: async () => empty() });
+    expect(formatPassPhaseTiming(second).every(line => line.endsWith(' slowest=none'))).toBe(true);
+  });
+
+
   const empty = () => ({ dispatched: [], refusals: [] });
   const fixture = extra => ({ repos: ['a', 'b', 'c'], fixTick: empty,
     ciHealTick: async () => empty(), promoteDraftTick: empty,
@@ -2611,7 +2710,7 @@ describe('fix pass budgets', () => {
       [{ fix: 'fixTick', 'ci-heal': 'ciHealTick', 'promote-draft': 'promoteDraftTick' }[phase]]: tick });
     const first = await runTickAllRepos(opts);
     expect(first.budgets[phase]).toMatchObject({ hit: true, skipped: [42, 43] });
-    expect(formatPassPhaseTiming(first)).toContain(`pass-timing phase=${phase} ms=0 budgetMs=1000 budgetHit=true prs=1 deferred=2`);
+    expect(formatPassPhaseTiming(first)).toContain(`pass-timing phase=${phase} ms=0 budgetMs=1000 budgetHit=true prs=1 deferred=2 slowest=none`);
     await runTickAllRepos(opts);
     await runTickAllRepos(opts);
     expect(calls).toEqual([
@@ -2809,7 +2908,7 @@ describe('fix pass budgets', () => {
     expect(result.ciHeal.repos).toHaveLength(3);
     const lines = [];
     buildCliDaemonEffects({ owner: 't', log: { error: line => lines.push(line) } }).onTick(result);
-    expect(lines).toContain('reconcile-fix-dispatch-daemon: pass-timing phase=stuck-fixers ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0');
+    expect(lines).toContain('reconcile-fix-dispatch-daemon: pass-timing phase=stuck-fixers ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0 slowest=none');
     expect(lines.filter(line => line.includes('fix-pass-budget'))).toHaveLength(1);
   });
 
@@ -2855,8 +2954,8 @@ describe('fix pass budgets', () => {
   it('formats one finite phase line including budgets and unbudgeted phases', () => {
     expect(formatPassPhaseTiming({ phaseMs: { fix: 20, 'ci-heal': 1001, bad: NaN },
       budgets: { 'ci-heal': { budgetMs: 1000, hit: true } },
-    })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false prs=0 deferred=0',
-      'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0']);
+    })).toEqual(['pass-timing phase=fix ms=20 budgetMs=none budgetHit=false prs=0 deferred=0 slowest=none',
+      'pass-timing phase=ci-heal ms=1001 budgetMs=1000 budgetHit=true prs=0 deferred=0 slowest=none']);
   });
 });
 
