@@ -45,24 +45,28 @@ function outsideInlineCode(line) {
   return delimiter ? undefined : plain + line.slice(start);
 }
 
-// Conservative: true when any line could leave a markdown link open (unbalanced brackets or parens beside a link,
-// a reference-definition or inline-link title whose closing quote/paren is missing, or a title-looking line start).
-// Such a snapshot cannot prove a standalone marker is outside a link title, so a marker in it is refused.
-const TITLE_CLOSE = { '"': '"', "'": "'", '(': ')' };
+// Conservative, not a parser: a marker is refused when any link-syntax region may leave a title or destination
+// open. Regions are the text after each `](`, the rest of a reference definition, and a title-looking line that
+// directly follows a reference definition. A region is "closed" only when its unescaped quotes are even per type
+// and its parens close (the inline-link `)` included). Ordinary prose elsewhere (an apostrophe in link text, a
+// line starting with `(` or `"`) is never treated as a link. Unsure means refuse.
 function linkMayEnclose(diff) {
   const count = (s, re) => (s.match(re) ?? []).length;
+  const unclosed = (region, closers) => {
+    const bare = region.replace(/\\./g, '');
+    return count(bare, /"/g) % 2 === 1 || count(bare, /'/g) % 2 === 1
+      || count(bare, /\)/g) < count(bare, /\(/g) + closers;
+  };
+  let prevDef = false;
   return diff.split(/\r\n|[\r\n]/).some((l) => {
-    if (/[\[\]]/.test(l) && (count(l, /\[/g) !== count(l, /\]/g) || count(l, /\(/g) !== count(l, /\)/g))) return true;
-    // Reference title continuation lines may have more than three spaces (or tabs) of indentation.
-    const open = l.match(/^[ \t]{0,3}\[[^\]]*\]:[ \t]*\S*[ \t]*(["'(])(.*)$/)
-      ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]*(["'(])(.*)$/);
-    // Any link-syntax line with an odd count of unescaped quotes may leave a title open, wherever it starts.
-    if (/\]\(|^[ \t]{0,3}\[[^\]]*\]:/.test(l)) {
-      const bare = l.replace(/\\./g, '');
-      if (count(bare, /"/g) % 2 || count(bare, /'/g) % 2) return true;
-    }
-    // A backslash-escaped delimiter does not close the title.
-    return !!open && !open[2].replace(/\\./g, '').includes(TITLE_CLOSE[open[1]]);
+    const wasDef = prevDef;
+    const def = l.match(/^[ \t]{0,3}\[[^\]]*\]:(.*)$/);
+    prevDef = !!def || (wasDef && !l.trim());
+    if (/[\[\]]/.test(l) && count(l, /\[/g) !== count(l, /\]/g)) return true;
+    if (def && unclosed(def[1], 0)) return true;
+    if (wasDef && /^[ \t]*["'(]/.test(l) && unclosed(l, 0)) return true;
+    const parts = l.split('](');
+    return parts.slice(1).some((tail) => unclosed(tail, 1));
   });
 }
 

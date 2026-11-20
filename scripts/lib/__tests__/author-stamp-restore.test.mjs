@@ -1044,3 +1044,18 @@ describe('reference titles containing inline code cannot supply author stamps', 
       .toMatchObject({ action: 'restore', id: ID });
   });
 });
+
+describe('planStampRestore — conservative link handling (judge R10 round 2)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  it("refuses a marker inside a second link's multiline title", () => {
+    const snapshot = `[a](https://example.test "closed") [b "](https://example.test "open )\n\`<div>\`\n${m()}\nend")`;
+    expect(plan({ edits: [edit(snapshot)] })).toMatchObject({ action: 'refuse' });
+  });
+  it.each([
+    ['apostrophe in link text', `[Author's guide](https://example.test)\n${'MARK'}`],
+    ['paren prose across lines', `Intro\n(see below\nmore)\n${'MARK'}`],
+    ['quoted prose across lines', `He said:\n"hello\nworld"\n${'MARK'}`],
+  ])('benign prose still restores: %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'restore', id: ID });
+  });
+});
