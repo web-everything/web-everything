@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment, REVIEW_LABEL_TARGETS } from '../review-set-label.mjs';
-import { gateOutcomesForHead, sendBackStepOutcome, gateRoundGrants, GATE_OUTCOMES, redTeamGateMarker, liveResultGateState } from '../lib/red-team-gate.mjs';
+import { gateOutcomesForHead, sendBackStepOutcome, gateRoundGrants, GATE_OUTCOMES, redTeamGateMarker, liveResultGateState, redTeamBreaksAgree } from '../lib/red-team-gate.mjs';
 import { renderRedTeamComment } from '../operations/review-extra-seats.mjs';
 import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
@@ -62,10 +62,10 @@ function expectRefused(result, labels = ['review:changes']) {
   expect(result.result.decision?.reason ?? result.result.error).toMatch(/send.back|unreadable|head changed|malformed|unavailable/i);
 }
 
-function operatorReleaseThread({ count = 1, releaseLine } = {}) {
+function operatorReleaseThread({ count = 1, releaseLine, summary = 'confirmed break' } = {}) {
   const result = { author: { login: 'web-everything' }, body: renderRedTeamComment({
     pr: PR, rev: HEAD, provider: 'codex', model: 'gpt-6.1-sol', recheckStatus: 'ok', foldedVerdict: 'changes',
-    findings: Array.from({ length: count }, (_, i) => ({ summary: `confirmed break ${i + 1}`, category: 'edge-case', impactIfUnfixed: 'broken',
+    findings: Array.from({ length: count }, (_, i) => ({ summary: `${summary} ${i + 1}`, category: 'edge-case', impactIfUnfixed: 'broken',
       file: 'scripts/review-set-label.mjs', line: 1521 + i, confirmedByRecheck: true })),
   }) };
   const resultId = liveResultGateState([result], PR, HEAD).resultId;
@@ -78,6 +78,75 @@ function operatorReleaseThread({ count = 1, releaseLine } = {}) {
 }
 
 describe('accept refuses a red-team send-back without writes', () => {
+  it.each(['initial', 'fresh', 'post-comment', 'paginated'])('accepts independently released same-head results on the %s read', stage => {
+    const first = operatorReleaseThread({ summary: 'first break' });
+    const second = operatorReleaseThread({ summary: 'second break' });
+    expect(accept({ comments: first }).exitCode).toBe(0);
+    expect(accept({ comments: second }).exitCode).toBe(0);
+    const comments = [...first, ...second];
+    const page = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ body: `ordinary ${i}` }));
+    const accepted = accept(stage === 'initial' ? { comments }
+      : stage === 'fresh' ? { comments: [], freshComments: comments }
+        : stage === 'post-comment' ? { comments: [], postCommentState: { comments } }
+          : { comments: page, readComments: () => [...page, ...comments] });
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.labels).toEqual(['review:accepted']);
+    expect(accepted.setLabels).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['bound', 'legacy'])('accepts delayed releases for both results with %s send-backs', binding => {
+    const first = operatorReleaseThread({ summary: 'first break' });
+    const second = operatorReleaseThread({ summary: 'second break' });
+    if (binding === 'legacy') {
+      first[1].body = first[1].body.replace(/ result=[a-f0-9]{16}/, '');
+      second[1].body = second[1].body.replace(/ result=[a-f0-9]{16}/, '');
+    }
+    const accepted = accept({ comments: [...first.slice(0, 2), ...second, first[2]] });
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.labels).toEqual(['review:accepted']);
+  });
+
+  it.each(['older', 'newer'])('keeps the %s result held when only the other result is released', missing => {
+    const first = operatorReleaseThread({ summary: 'first break' });
+    const second = operatorReleaseThread({ summary: 'second break' });
+    expectRefused(accept({ comments: missing === 'older'
+      ? [...first.slice(0, 2), ...second] : [...first, ...second.slice(0, 2)] }));
+  });
+
+  it.each(['partial', 'forged', 'blocked', 'renewed', 'reposted'])('keeps an older %s result held despite a released newer result', variant => {
+    const first = operatorReleaseThread({ summary: 'first break', count: variant === 'partial' ? 2 : 1 });
+    const second = operatorReleaseThread({ summary: 'second break' });
+    if (variant === 'partial') first[2].body = first[2].body.replace('(#1, #2)', '(#1)');
+    if (variant === 'forged') first[2].author.login = 'mallory';
+    if (variant === 'blocked') first.push({ author: { login: OPERATOR_LOGINS[0] }, body: first[1].body.replace('outcome=sent-back', 'outcome=operator-block') });
+    if (variant === 'renewed') first.push(first[1]);
+    if (variant === 'reposted') first.push(first[0]);
+    expectRefused(accept({ comments: [...first, ...second] }));
+  });
+
+  it.each(['matching', 'conflicting', 'unreadable'])('checks the %s head seal against the full thread when historical results are released', seal => {
+    const first = operatorReleaseThread({ summary: 'first break' });
+    const second = operatorReleaseThread({ summary: 'second break' });
+    const comments = [...first, ...second];
+    const root = mkdtempSync(join(tmpdir(), 'accept-sendback-history-seal-'));
+    vi.stubEnv('WE_SHARED_RUNS_DIR', join(root, 'runs'));
+    try {
+      const path = sealedStatusPath({ repo: 'o/n', pr: PR, head: HEAD });
+      mkdirSync(dirname(path), { recursive: true });
+      const sealedBreaks = redTeamBreaksAgree({ comments: seal === 'matching' ? second : first, pr: PR, head: HEAD, breaks: [] }).keys;
+      expect(sealedBreaks).toHaveLength(1);
+      writeFileSync(path, seal === 'unreadable' ? '{unreadable' : JSON.stringify({ repo: 'o/n', pr: PR, head: HEAD, sealedBreaks }));
+      if (seal === 'matching') {
+        const accepted = accept({ comments });
+        expect(accepted.exitCode).toBe(0);
+        expect(accepted.labels).toEqual(['review:accepted']);
+      } else expectRefused(accept({ comments }));
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['initial', 'fresh', 'post-comment', 'paginated'])('accepts after an authorized operator cards the same-head sent-back finding on the %s read', stage => {
     const comments = operatorReleaseThread();
     expectRefused(accept({ comments: comments.slice(0, 2) }));
