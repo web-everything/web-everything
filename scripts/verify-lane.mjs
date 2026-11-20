@@ -37,6 +37,7 @@
  *   node scripts/verify-lane.mjs --gate="npm run test:unit"   # override the suite command (skips diff-driven selection entirely)
  *   node scripts/verify-lane.mjs --repo=~/workspace/.lanes/web-everything/lane-3   # verify a specific lane clone
  *   node scripts/verify-lane.mjs --local              # force every heavy phase to run on THIS host (like `heavy-admission run --local`); marker records local:true. As valid as a remote verify: same suites.
+ *     Selected sharded gates run as one local Vitest command with the same test files and flags, under the parent admission slot.
  *   node scripts/verify-lane.mjs run                  # xpnhz4o — run the SAME default gate foreground, but record NO marker (the fix/ci-heal gate)
  *   node scripts/verify-lane.mjs --json              # machine-readable {sha, status, exitCode} on stdout
  *   node scripts/verify-lane.mjs check               # READ-ONLY: print the current marker's gate verdict for HEAD, run nothing
@@ -699,7 +700,7 @@ async function acquireAdmission(phase, command) {
   } else {
     process.stderr.write(`verify-lane: local admission (${decision.reason})\n`);
   }
-  const plan = phaseAdmissionPlan({ command, cwd: REPO, decision });
+  const plan = FORCE_LOCAL ? { takeLocalSlot: true } : phaseAdmissionPlan({ command, cwd: REPO, decision });
   if (!plan.takeLocalSlot) return { ok: false, waitedMs: 0, remote: true, ...plan };
   const routing = phaseAdmission ? phaseAdmissionKind({
     phase, decision: resolvedGate.decision, standardsScoped: resolvedGate.decision.standards?.scoped, env: process.env,
@@ -719,7 +720,7 @@ async function acquireAdmission(phase, command) {
     admissionPhases[phase] = { ...routing, waitedMs: (previous?.waitedMs ?? 0) + acquired.waitedMs,
       slot: acquired.slot, timedOut: Boolean(previous?.timedOut || acquired.timedOut) };
   }
-  return acquired;
+  return FORCE_LOCAL ? { ...acquired, forceLocal: true } : acquired;
 }
 const admission = await acquireAdmission('vitest', phasedTestGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
 let currentAdmission = admission;
@@ -768,6 +769,7 @@ let baseFailures = null;
 // The final exit code alone cannot say whether a 124 came from an unconfirmed remote attempt; the phases recorded it.
 const infrastructureNow = (exitCode, signal, failureDetails) => verificationInfrastructureFailure({ exitCode, signal, failureDetails }) ?? (remoteUnconfirmed ? { ...REMOTE_TERMINATION_UNCONFIRMED } : null);
 async function runGate(command, args, { forgeDispatch = false } = {}) {
+  forgeDispatch = !FORCE_LOCAL && forgeDispatch;
   const reportDir = mkdtempSync(join(tmpdir(), 'verify-remote-report-'));
   const reportFile = join(reportDir, 'report.jsonl');
   const childEnv = { ...process.env, WE_VERIFY_REMOTE_REPORT: reportFile };
@@ -896,6 +898,17 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
   try {
     // Admission may span the whole gate; a command rewrite belongs only to this phase.
     const plan = phaseAdmissionPlan({ command, cwd: REPO, decision: { remote: currentAdmission.remote === true } });
+    if (currentAdmission.forceLocal) {
+      if (isShardWrapperCommand(command)) {
+        // Shards drop the parent's held slot and choose remote policy independently. Run the exact selected
+        // Vitest command under our local slot instead; retain all test paths, flags and timeout settings.
+        const selected = command.replace(/^node '(?:[^']|'\\'')*' --shards=\d+ --parallel=\d+ --budget-ms=\d+ -- (?=npx vitest run )/, '');
+        if (selected === command) throw new Error('verify-lane: --local requires a selected Vitest command in the shard wrapper');
+        plan.command = selected;
+      }
+      plan.takeLocalSlot = true;
+      plan.setHeld = true;
+    }
     let result = await runGate(args ? command : plan.command, args, { forgeDispatch: !plan.takeLocalSlot });
     if (shouldConfirmRemoteRed({ plan, ...result })) {
       process.stderr.write(`verify-lane: remote phase red (exit ${result.exitCode}) - confirming on Forge\n`);
