@@ -8,6 +8,37 @@ import { spawnSync } from 'node:child_process';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const SOURCE = 'scripts/conveyor/pr-stall-sweep.mjs';
 
+// Presence is independent of the real-judge scenario: a known non-granting stub must be forwarded.
+// A regression in scenario.run/judgeRound must remain a required failure, never flip to it.fails.
+export async function probeFix(sourceRoot = ROOT, sweepOverride) {
+  const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
+  const { runStallSweep, STALL_SWEEP_DEFAULTS } = await load(SOURCE);
+  const { AUTOMATION_LOGINS } = await load('scripts/lib/marker-authorship.mjs');
+  const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'soak-judge-presence-'));
+  const now = Date.parse('2026-11-12T18:00:00Z');
+  const old = new Date(now - 3 * 3600_000).toISOString();
+  let calls = 0;
+  try {
+    const out = await (sweepOverride ?? runStallSweep)({ now, env: {}, dir, log: () => {},
+      settings: { value: { ...STALL_SWEEP_DEFAULTS, mode: 'shadow' }, sources: { mode: 'soak' }, errors: [] },
+      gh: () => { throw Error('unexpected GitHub call'); },
+      readFiles: () => ['src/probe.mjs'],
+      judge: args => {
+        if (args.trigger === 'review-cap') calls++;
+        return { verdict: 'escalate', reasons: ['independent-presence-probe'],
+          evidence: { rounds: 1, trigger: args.trigger, head: args.head.slice(0, 12) } };
+      },
+      read: () => ({ now, unreadable: [], liveJobs: [], drainSkips: [], prs: [{ repo: CONSTELLATION_REPOS.we.slug,
+        number: 14, title: 'presence probe', state: 'OPEN', isDraft: false, headRefOid: 'a'.repeat(40),
+        updatedAt: old, createdAt: old, headCommittedAt: old, body: '', labels: [{ name: 'status:at-round-limit' }],
+        statusCheckRollup: [], labelEvents: [], comments: [{ author: { login: AUTOMATION_LOGINS[0] }, createdAt: new Date(now - 4 * 3600_000).toISOString(),
+          body: 'review paused: 1 referral needs a ruling\n\nWaiting on your ruling (block, card or not-real):\n\n<!-- review-referral-hold: abcdef0123456789 -->' }] }] }) });
+    return calls === 1 && out.items?.length === 1 && out.items[0].verdict === 'escalate'
+      && out.items[0].reason.includes('independent-presence-probe') && !out.errors.length && !out.act.length;
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
 export default {
   id: 'judge-runs-on-cap-trigger-mismatch',
   title: 'a cap trigger mismatch runs the judge for the state trigger or reports an explicit fail-closed mismatch',
@@ -15,8 +46,8 @@ export default {
   fixedBy: { sha: 'pending', where: 'working tree', paths: [SOURCE] },
   fixPresent(root) {
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
-      const { default: scenario } = await import(process.argv[1]);
-      process.exitCode = scenario.judge(await scenario.run({ sourceRoot: process.argv[2] })).length ? 1 : 0;
+      const { probeFix } = await import(process.argv[1]);
+      process.exitCode = await probeFix(process.argv[2]) ? 0 : 1;
     `, import.meta.url, root], { cwd: root, env: process.env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
     return !probe.error && probe.status === 0;
   },

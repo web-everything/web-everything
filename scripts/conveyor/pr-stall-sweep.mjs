@@ -308,8 +308,13 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         if (cap && cap.trigger !== trigger) mismatchReason = `cap-trigger-mismatch: state=${trigger} record=${cap.trigger}`;
         // A PR in a judged state whose thread shows no cap record (e.g. a findings-less settled referral notice) still gets the judge, run for the state's own trigger with NO thread evidence (an unmatched thread may hold already-ruled findings); the judge fails closed on no evidence, never null (null = the classifier's "not an object" operator park).
         verdict = judge({ pr: row.number, repo: row.repo, head, trigger, comments: cap ? pr.comments : [], files: list, setting: breaks.value, maxGrants: judgeCfg.maxGrants });
-        // Preserve malformed-output diagnostics; a mismatch needs real evidence for the state's trigger.
-        if (mismatchReason && validateVerdict(verdict).ok && (verdict.evidence?.failClosed || verdict.evidence?.rounds === 0)) verdict = mismatchVerdict();
+        // Preserve malformed-output diagnostics. Mismatched history can never authorize a loosening verdict.
+        if (mismatchReason && validateVerdict(verdict).ok) {
+          const evidence = verdict.evidence;
+          if (!['escalate', 'send-back', 'suggest-split', 'non-converging'].includes(verdict.verdict)
+            || !evidence || typeof evidence !== 'object' || Array.isArray(evidence) || evidence.failClosed
+            || !Number.isInteger(evidence.rounds) || evidence.rounds <= 0) verdict = mismatchVerdict();
+        }
       } catch (e) {
         base.errors.push(`judge ${row.repo}#${row.number}: ${msg(e)}`); readFailed = true;
         if (e?.code === 'file-list-over-cap') fileListFailure = e.fileList;

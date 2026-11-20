@@ -304,6 +304,36 @@ describe('the shadow pass', () => {
       expect(out.items[0].reason).not.toContain('not an object');
       expect(out.act).toEqual([]);
     });
+    it('never grants on a mismatch even when historical review rounds are grantable', async () => {
+      const prior = comment(review.body.replace('- `scripts/review.mjs:5` — review finding',
+        '- `src/a.mjs:1` — alpha parser drops the trailing record\n- `src/b.mjs:2` — beta cache never expires entries\n- `src/c.mjs:3` — gamma retry loop spins forever'), 7);
+      const latest = comment(review.body.replace('- `scripts/review.mjs:5` — review finding',
+        '- `src/d.mjs:4` — delta timeout unit mismatch in header'), 6);
+      // The other source's broken finding is older than the judge's seven-day window.
+      const staleHold = comment(hold.body, 200);
+      const { out, judge } = await run([staleHold, prior, latest]);
+      expect(judge.mock.results[0].value).toMatchObject({ verdict: 'grant', evidence: { rounds: 2 } });
+      expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'escalate', reason: expect.stringContaining('cap-trigger-mismatch: state=review-cap record=referral-hold') });
+      expect(out.act).toEqual([]);
+    });
+    it.each(['grant', 'card-the-rest', 'not-real-verified'])('never loosens a mismatch with %s', async verdict => {
+      const { out } = await run([review, hold], vi.fn(() => ({ verdict, reasons: ['historical findings'],
+        evidence: { rounds: 1 }, ...(verdict === 'grant' ? { k: 1 } : {}), ...(verdict === 'not-real-verified' ? { proof: ['refuted'] } : {}) })));
+      expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'escalate', reason: expect.stringContaining('cap-trigger-mismatch: state=review-cap record=referral-hold') });
+      expect(out.act).toEqual([]);
+    });
+    it.each([undefined, null, [], 'evidence', {}, { rounds: 0 }, { rounds: -1 }, { rounds: 1.5 },
+      { rounds: '1' }, { rounds: NaN }, { rounds: Infinity }, { rounds: 1, failClosed: true }])('fails closed on mismatch with invalid round evidence %j', async evidence => {
+      const { out } = await run([review, hold], vi.fn(() => ({ verdict: 'send-back', reasons: ['test'], evidence })));
+      expect(out.items[0]).toMatchObject({ lane: 'operator', verdict: 'escalate', reason: expect.stringContaining('cap-trigger-mismatch: state=review-cap record=referral-hold') });
+      expect(out.act).toEqual([]);
+    });
+    it.each(['escalate', 'send-back', 'suggest-split', 'non-converging'])('preserves non-granting mismatch verdict %s with positive integer rounds', async verdict => {
+      const { out } = await run([review, hold], vi.fn(args => ({ ...judgeRound(args), verdict, reasons: ['test'] })));
+      expect(out.items[0].verdict).toBe(verdict);
+      expect(out.items[0].reason).not.toContain('cap-trigger-mismatch');
+      expect(out.act).toEqual([]);
+    });
     it('fails closed with an explicit mismatch reason when the judge throws', async () => {
       const { out, judge } = await run([review, hold], vi.fn(() => { throw new Error('judge unavailable'); }));
       expect(judge).toHaveBeenCalledOnce();
