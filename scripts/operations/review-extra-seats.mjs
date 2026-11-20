@@ -1872,6 +1872,13 @@ export async function speculateRedTeam({
     const providers = rosterForKey('review-seat:red-team');
     const capped = new Set();
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry, readSeatSettings)]));
+    for (const p of providers) {
+      const source = routingEntry?.disabledProviders?.includes(p) ? 'routing disabledProviders'
+        : env?.[PROVIDER_CAP_ENV[p]] !== undefined ? PROVIDER_CAP_ENV[p]
+          : p === 'codex' && env?.WE_REVIEW_EXTRA_SEATS_DAILY_CAP !== undefined ? 'WE_REVIEW_EXTRA_SEATS_DAILY_CAP'
+            : routingEntry?.enabledProviders?.includes(p) ? 'routing/settings cascade' : 'settings cascade';
+      io.log(`red-team cap: ${p}=${caps[p]} (source: ${source})`);
+    }
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
       if (usedByProvider[p] >= caps[p]) {
@@ -1895,9 +1902,9 @@ export async function speculateRedTeam({
     let lastReason = null;
     let configuredRoute = null;
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
-      // agy-claude is eligible only after both ordinary providers exhaust their budgets.
+      // Default selection reserves agy-claude for emergencies; explicit operator chains may use it.
       const emergency = ['codex', 'agy-gemini'].every(p => capped.has(p));
-      const candidates = available.filter(p => p !== 'agy-claude' || emergency);
+      const candidates = available.filter(p => p !== 'agy-claude' || operatorRoute || emergency);
       if (!candidates.length) break;
       let routeError = null;
       try {
@@ -1921,7 +1928,12 @@ export async function speculateRedTeam({
         configuredRoute = aiSeatRoute('red-team', configuredRoute, { env, io, available: candidates,
           operation: 'review-seat', taskType: RED_TEAM_SEAT.key, policy: routingPolicy, operatorKeys });
         if (routeError && !configuredRoute) throw routeError;
-      } catch (error) { lastReason = error.message; break; }
+      } catch (error) {
+        // Exhausting the configured chain after a reservation denial is a budget
+        // deferral. Out-of-chain roster entries must neither launch nor mask it.
+        lastReason ??= error.message;
+        break;
+      }
       let pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       // Check the resolved model, including builder/AI overrides, before spending its budget.
@@ -1950,7 +1962,9 @@ export async function speculateRedTeam({
         }
       }
       if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
-      if (pick.provider === 'agy-claude') io.log('red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
+      if (pick.provider === 'agy-claude') io.log(operatorRoute
+        ? 'red team: explicit operator route to agy-claude'
+        : 'red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
       if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');
       let reservation;
       try {

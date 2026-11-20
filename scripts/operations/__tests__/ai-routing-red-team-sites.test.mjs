@@ -486,6 +486,55 @@ test('builder preference preserves policy model and effort in both directions', 
   }
 });
 
+test.each(['review-seat:red-team', 'review-seat', '*'])('explicit %s operator route admits agy-claude before emergency', async key => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  if (key !== 'review-seat:red-team') delete policy.operations['review-seat:red-team'];
+  if (key === '*') delete policy.operations['review-seat'];
+  const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(policy),
+    preferences: () => ({ errors: [], prefs: { routingOverrides: {
+      [key]: { provider: 'agy-claude', model: 'sonnet', effort: 'high', fallback: [] },
+    } } }), emit: () => {},
+  });
+  const actual = await builderSeat('claude', { readRoutingPolicy });
+  assert.deepEqual(readRoutingPolicy.operatorKeys(), [key]);
+  assert.equal(actual.result.status, 'speculated', actual.result.reason);
+  assert.deepEqual(actual.reservations, ['agy-claude']);
+  assert.deepEqual([actual.calls[0].provider, actual.calls[0].model, actual.calls[0].effort],
+    ['agy-claude', policy.aliases['agy-claude'].sonnet, 'high']);
+  assert.ok(!actual.logs.some(line => line.includes('emergency fallback')));
+});
+
+test('explicit operator fallback admits agy-claude when Codex CLI is absent but its budget remains', async () => {
+  const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ errors: [], prefs: { routingOverrides: {
+      'review-seat:red-team': { provider: 'codex', model: 'sol', effort: 'high',
+        fallback: [{ provider: 'agy-claude', model: 'sonnet', effort: 'high' }] },
+    } } }), emit: () => {},
+  });
+  const actual = await builderSeat('claude', { readRoutingPolicy, cliAvailable: provider => provider !== 'codex' });
+  assert.equal(actual.result.status, 'speculated', actual.result.reason);
+  assert.deepEqual(actual.reservations, ['agy-claude']);
+  assert.equal(actual.calls[0].provider, 'agy-claude');
+});
+
+test.each(['cap', 'CLI', 'quota', 'reservation'])('explicit agy-claude operator route still refuses %s without escaping its chain', async blocked => {
+  const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ errors: [], prefs: { routingOverrides: {
+      'review-seat:red-team': { provider: 'agy-claude', model: 'sonnet', effort: 'high', fallback: [] },
+    } } }), emit: () => {},
+  });
+  const actual = await builderSeat('claude', { readRoutingPolicy,
+    ...(blocked === 'CLI' ? { cliAvailable: provider => provider !== 'agy-claude' }
+      : blocked === 'quota' ? { readRecords: () => [{ dispatchKind: 'review-seat', provider: 'agy-claude',
+        scoredAt: new Date(NOW).toISOString(), callStatus: 'quota', quotaUsedPercent: 100,
+        quotaResetsAt: new Date(NOW + 3600000).toISOString() }] }
+      : blocked === 'reservation' ? { reserveCalls: () => ({ used: 10, callIds: [] }) } : {}),
+  }, blocked === 'cap' ? { WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0' } : {});
+  assert.equal(actual.result.status, 'skipped');
+  assert.deepEqual(actual.calls, []);
+  if (blocked !== 'reservation') assert.deepEqual(actual.reservations, []);
+});
+
 test('operator review-seat:red-team override wins over builder preference', async () => {
   const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
     preferences: () => ({ errors: [], prefs: { routingOverrides: {

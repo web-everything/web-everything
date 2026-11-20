@@ -78,6 +78,17 @@ export const PROVIDER_CAP_ENV = Object.freeze({
   'agy-claude': 'WE_REVIEW_SEAT_CAP_AGY_CLAUDE',
   'agy-gemini': 'WE_REVIEW_SEAT_CAP_AGY_GEMINI',
 });
+/** Valid settings caps take precedence; otherwise preserve valid operator caps. Do not materialize defaults:
+ * an unset Gemini cap still permits routing policy's explicit enable control. */
+export function reviewSeatLaunchEnv(env, overlay = {}) {
+  const child = { ...env, ...overlay };
+  const validCap = raw => raw !== undefined && raw !== '' && Number.isInteger(Number(raw)) && Number(raw) >= 0;
+  for (const key of [DAILY_CAP_ENV, ...Object.values(PROVIDER_CAP_ENV)]) {
+    // A valid overlay may throttle/disable a provider. Invalid overlays cannot erase valid parent caps.
+    if (!validCap(overlay?.[key]) && validCap(env?.[key])) child[key] = env[key];
+  }
+  return child;
+}
 /** Independent Carbon shadow seat switch; zero disables only Carbon in shadow mode. */
 export const CARBON_SHADOW_CAP_ENV = 'WE_REVIEW_SEAT_CAP_CARBON_SHADOW';
 export function resolveCarbonShadowCap(env = process.env) {
