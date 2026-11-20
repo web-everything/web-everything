@@ -125,7 +125,7 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
 /** Search past light successes. At most 100 candidates/20 artifact reads; explicit --run is the fallback. */
 async function fullTimingRuns(count, exec, error) {
   const options = { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 };
-  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch'], options));
+  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--status=success', '--limit=100', '--json=databaseId,event,headBranch,headSha'], options));
   if (!Array.isArray(found) || !found.length || found.length > 100
     || found.some(r => !Number.isSafeInteger(r?.databaseId) || r.databaseId <= 0 || typeof r.event !== 'string' || typeof r.headBranch !== 'string')
     || new Set(found.map(r => r.databaseId)).size !== found.length) throw new Error(error);
@@ -134,6 +134,13 @@ async function fullTimingRuns(count, exec, error) {
   for (const run of found.sort((a, b) => b.databaseId - a.databaseId)) {
     if (!(['push', 'schedule'].includes(run.event) && run.headBranch === 'main')
       && !(run.event === 'merge_group' && run.headBranch.startsWith('gh-readonly-queue/main/'))) continue;
+    if (run.event === 'merge_group') {
+      if (typeof run.headSha !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/i.test(run.headSha) || /^0+$/.test(run.headSha)) continue;
+      if (!found.some(r => r.event === 'push' && r.headBranch === 'main' && r.headSha === run.headSha)) {
+        try { exec('git', ['merge-base', '--is-ancestor', run.headSha, 'origin/main'], { ...options, env: { ...process.env, GIT_NO_LAZY_FETCH: '1' } }); }
+        catch { continue; } // Unknown/unlanded queue heads never contribute timings.
+      }
+    }
     if (++reads > 20) throw new Error(`${error}; search bound reached; supply --run=<id>`);
     const page = JSON.parse(exec('gh', ['api', `repos/{owner}/{repo}/actions/runs/${run.databaseId}/artifacts?per_page=100`], options));
     if (!Array.isArray(page?.artifacts) || page.total_count !== page.artifacts.length || page.total_count > 100) throw new Error(error);

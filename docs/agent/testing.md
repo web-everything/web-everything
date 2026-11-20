@@ -1,11 +1,16 @@
 # Testing — Three-Tier Strategy
 
 Main push CI can reuse a successful `ci.yml` merge-group run only for the exact SHA,
-with a trusted check-suite app, no newer non-success, a proven fast-forward and the
-same recorded FUI SHA. Unknown evidence runs full CI. The hourly schedule is isolated
+with a trusted check-suite app, no other non-success (including older-id reruns), a proven fast-forward and the
+same recorded FUI SHA. Queue sibling records publish only after full CI and unquarantined
+execution receipts from every unit, integration and soak leg; missing/unknown receipts publish no record.
+Reusing pushes export and record that verified FUI SHA for their remaining sibling checkouts.
+Unknown evidence runs full CI. The hourly schedule is isolated
 from push concurrency and always runs full CI. Light push success is status evidence;
-timing/quarantine readers require full timing artifacts from that SHA's queue/backstop
-run. `scripts/ci/__tests__/main-push-skip*.test.mjs` covers the decision, CLI and workflow.
+quarantine readers require full timing artifacts from the same SHA's queue run with a matching
+push sibling record, the queue's own completion after removal, and no other newer or non-success run.
+Timing refresh accepts queue runs only with main ancestry or a matching main push SHA.
+`scripts/ci/__tests__/main-push-skip*.test.mjs` covers the decision, CLI and workflow.
 
 ## Review PR fetch isolation (R37)
 

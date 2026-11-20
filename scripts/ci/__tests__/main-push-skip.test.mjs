@@ -48,4 +48,16 @@ describe('exact-SHA main push reuse', () => {
     expect((await decide(input())).skip).toBe(true);
     const x = input(); x.currentRunId = 999; expect((await decide(x)).skip).toBe(false);
   });
+  it.each(['merge_group', 'push', 'workflow_dispatch', 'pull_request'])('runs full for an older-id failed or unfinished %s rerun (finding 3)', async event => {
+    for (const status of ['completed', 'in_progress']) {
+      const x = input();
+      x.runs.workflow_runs.push({ ...x.runs.workflow_runs[0], id: 99, event, run_attempt: 2,
+        status, conclusion: status === 'completed' ? 'failure' : null });
+      x.runs.total_count++;
+      expect((await decide(x)).skip).toBe(false);
+    }
+  });
+  it('exports the verified FUI SHA for the remaining push checkouts (finding 4)', async () => {
+    expect(await decide(input())).toMatchObject({ skip: true, fuiSha: fui });
+  });
 });

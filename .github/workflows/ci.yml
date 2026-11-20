@@ -81,7 +81,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       light: ${{ steps.detect.outputs.light == 'true' || steps.main-skip.outputs.skip == 'true' }}
-      fui-sha: ${{ steps.fui-tip.outputs.tip }}
+      fui-sha: ${{ steps.main-skip.outputs.fui-sha || steps.fui-tip.outputs.tip }}
       skip: ${{ steps.main-skip.outputs.skip }}
       skip-reason: ${{ steps.main-skip.outputs.reason }}
     steps:
@@ -131,14 +131,6 @@ jobs:
         env:
           FUI_TOKEN: ${{ steps.fui-app-token.outputs.token }}
         run: node scripts/ci/main-push-skip.mjs --record-fui >> "$GITHUB_OUTPUT"
-      - name: Prepare sibling record
-        if: ${{ github.event_name == 'merge_group' && steps.fui-tip.outputs.tip != '' }}
-        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
-      - uses: actions/upload-artifact@v4
-        if: ${{ github.event_name == 'merge_group' && steps.fui-tip.outputs.tip != '' }}
-        with:
-          name: fui-sibling-${{ steps.fui-tip.outputs.tip }}
-          path: ${{ runner.temp }}/fui-sibling-record
       - name: Reuse exact-SHA merge queue CI
         id: main-skip
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -152,6 +144,56 @@ jobs:
           REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
         run: node scripts/ci/main-push-skip.mjs --sha="$HEAD_SHA" --before="$BEFORE_SHA" --run-id="$RUN_ID" --event="$EVENT_NAME" --ref="$REF" --repo="$REPO" >> "$GITHUB_OUTPUT"
+      - name: Prepare reused sibling record
+        if: ${{ steps.main-skip.outputs.skip == 'true' }}
+        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.main-skip.outputs.skip == 'true' }}
+        with:
+          name: fui-sibling-${{ steps.main-skip.outputs.fui-sha }}
+          path: ${{ runner.temp }}/fui-sibling-record
+
+  # The reusable record certifies full execution, including every job's actual quarantine decision.
+  # Light/unknown/quarantined runs stay successful but publish no reusable queue evidence.
+  queue-reuse-record:
+    needs: [changes, test, smoke, daemon-soak]
+    if: ${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' && needs.changes.outputs.fui-sha != '' && needs.test.result == 'success' && needs.smoke.result == 'success' && needs.daemon-soak.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: quarantine-reuse-*
+          path: ${{ runner.temp }}/quarantine-receipts
+      - name: Require unquarantined test executions
+        id: proof
+        env:
+          RECEIPTS: ${{ runner.temp }}/quarantine-receipts
+          UNIT_SHARDS: '[1,2,3,4,5,6,7,8,9,10]'
+          INTEGRATION_GROUPS: '["scan-chain","sim-scenarios","lane-pool-a","lane-pool-b","parallel"]'
+          SOAK_SHARDS: '[1,2,3,4,5,6,7,8]'
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          let eligible = false;
+          try {
+            eligible = [['unit', 'UNIT_SHARDS'], ['integration', 'INTEGRATION_GROUPS'], ['soak', 'SOAK_SHARDS']]
+              .every(([suite, key]) => JSON.parse(process.env[key]).every(id =>
+                readFileSync(join(process.env.RECEIPTS, `quarantine-reuse-${suite}-${id}`, 'quarantine-reuse'), 'utf8') === 'unquarantined\n'));
+          } catch { /* No complete proof: main pushes will run full CI. */ }
+          appendFileSync(process.env.GITHUB_OUTPUT, `eligible=${eligible}\n`);
+          console.log(eligible ? 'Full unquarantined queue execution proved.' : 'No reusable proof; main push will run full CI.');
+          NODE
+      - name: Prepare sibling record
+        if: ${{ steps.proof.outputs.eligible == 'true' }}
+        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
+      - uses: actions/upload-artifact@v4
+        if: ${{ steps.proof.outputs.eligible == 'true' }}
+        with:
+          name: fui-sibling-${{ needs.changes.outputs.fui-sha }}
+          path: ${{ runner.temp }}/fui-sibling-record
 
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but
@@ -366,6 +408,13 @@ jobs:
           path: web-everything/coverage/timing-unit-${{ matrix.shard }}.json
           if-no-files-found: ignore
 
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' }}
+        with:
+          name: quarantine-reuse-unit-${{ matrix.shard }}
+          path: ${{ runner.temp }}/quarantine-reuse
+          if-no-files-found: ignore
+
   # Coverage merging and host-path checks run independently; the required test job only reads results.
   coverage-merge:
     needs: [changes, test-shard]
@@ -569,6 +618,13 @@ jobs:
           path: web-everything/coverage/timing-integration-${{ matrix.group }}.json
           if-no-files-found: ignore
 
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' && needs.changes.outputs.light != 'true' }}
+        with:
+          name: quarantine-reuse-integration-${{ matrix.group }}
+          path: ${{ runner.temp }}/quarantine-reuse
+          if-no-files-found: ignore
+
   integration:
     needs: [changes, integration-part]
     if: ${{ always() }}
@@ -700,6 +756,12 @@ jobs:
 
       - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
         run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'merge_group' }}
+        with:
+          name: quarantine-reuse-soak-${{ matrix.shard }}
+          path: ${{ runner.temp }}/quarantine-reuse
+          if-no-files-found: ignore
 
   # THE required `daemon-soak` check (name unchanged from before the split — see the header above for why that
   # matters). Skips green in ~10s when `daemon-soak-scope` SUCCEEDED and found no daemon code touched, same as the
@@ -732,15 +794,15 @@ jobs:
             echo "daemon-soak-scope did not succeed (result: ${{ needs.daemon-soak-scope.result }}) — cannot tell whether daemon code was touched."
             exit 1
           fi
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.skip }}" = "true" ]; then
-            echo "Reused queue CI: $MAIN_SKIP_REASON"
-            exit 0
-          fi
           case "${{ needs.daemon-soak-scope.outputs.run }}" in
             true) ;;
             false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.skip }}" = "true" ]; then
+            echo "Reused queue CI: $MAIN_SKIP_REASON"
+            exit 0
+          fi
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
             echo "One or more soak shards did not succeed (soak-shard result: ${{ needs.soak-shard.result }})."
             exit 1

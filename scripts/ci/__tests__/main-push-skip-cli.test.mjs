@@ -31,9 +31,16 @@ else process.exit(process.env.BAD_ANCESTRY ? 1 : 0);
       encoding: 'utf8', timeout: 20000, env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, RUN_FIXTURE: join(dir, 'runs.json'),
         FUI_TOKEN: 'fixture-token', WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), ...env } });
     const good = run(); expect(good.status, good.stderr).toBe(0);
-    expect(good.stdout).toMatch(/^skip=true\nreason=[^\n]*100[^\n]*\n$/);
+    expect(good.stdout).toMatch(new RegExp(`^skip=true\\nreason=[^\\n]*100[^\\n]*\\nfui-sha=${fui}\\n$`));
     for (const [extra, env] of [[['--unknown=yes'], {}], [['--sha=bad'], {}], [[], { API_ERROR: '1' }], [[], { MULTIPLE: '1' }], [[], { BAD_ANCESTRY: '1' }], [[], { OVERSIZED: '1' }], [[], { TRUNCATED: '1' }], [[], { BAD_TIP: '1' }]]) {
       const result = run(extra, env); expect(result.stdout).toMatch(/^skip=false\nreason=[^\n]+\n$/);
     }
+    // Probe a later rerun of an older run: the run id stays below the passing queue's id.
+    const rerun = JSON.parse(recorded);
+    rerun.workflow_runs.push({ ...rerun.workflow_runs[0], id: 99, run_attempt: 2, event: 'workflow_dispatch',
+      status: 'in_progress', conclusion: null });
+    rerun.total_count++;
+    writeFileSync(join(dir, 'runs.json'), JSON.stringify(rerun));
+    expect(run().stdout).toMatch(/^skip=false\nreason=[^\n]+\n$/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 60000);

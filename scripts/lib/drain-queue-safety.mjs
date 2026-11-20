@@ -21,28 +21,45 @@ const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
 
-/** A light main success proves the SHA; full test evidence may live on its queue/backstop run. */
-function fullMainEvidenceRun(main, json, completeArtifacts = null) {
+/** A light main success proves the SHA; replacement test evidence must be linked to its queue sibling. */
+function fullMainEvidenceRun(main, json, completeArtifacts = null, removedAt, now) {
   const artifacts = completeArtifacts ?? json(`actions/runs/${main.id}/artifacts?per_page=100`);
   if (!Array.isArray(artifacts?.artifacts) || artifacts.total_count !== artifacts.artifacts.length
     || artifacts.total_count > 500) throw new Error('incomplete main artifacts; operator must inspect main CI');
   if (artifacts.artifacts.some(a => typeof a?.name === 'string' && a.name.startsWith('timing-unit-'))) return main;
-  const page = json(`actions/workflows/ci.yml/runs?head_sha=${main.head_sha}&per_page=100`);
+  const sibling = rows => {
+    if (rows.some(a => typeof a?.name !== 'string')) return null;
+    const records = rows.filter(a => a.name.startsWith('fui-sibling-'));
+    const sha = records.length === 1 ? mqOid(records[0].name.slice('fui-sibling-'.length)) : null;
+    return sha && !/^0+$/.test(sha) ? sha : null;
+  };
+  const fui = sibling(artifacts.artifacts);
+  if (!fui) throw new Error('no recorded push sibling; wait for full main CI');
+  const page = json(`actions/runs?head_sha=${main.head_sha}&per_page=100`);
   if (!Array.isArray(page?.workflow_runs) || page.total_count !== page.workflow_runs.length || page.total_count > 100
-    || new Set(page.workflow_runs.map(r => r?.id)).size !== page.workflow_runs.length)
+    || new Set(page.workflow_runs.map(r => r?.id)).size !== page.workflow_runs.length
+    || page.workflow_runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0
+      || mqOid(r.head_sha) !== mqOid(main.head_sha) || typeof r.path !== 'string'
+      || typeof r.event !== 'string' || typeof r.head_branch !== 'string'))
     throw new Error('incomplete same-SHA evidence; operator must inspect full CI');
   const sources = page.workflow_runs.filter(r => Number.isSafeInteger(r?.id) && r.id > 0
     && r.path === '.github/workflows/ci.yml' && mqOid(r.head_sha) === mqOid(main.head_sha)
     && r.status === 'completed' && r.conclusion === 'success'
-    && ((r.event === 'merge_group' && r.head_branch?.startsWith('gh-readonly-queue/main/'))
-      || (r.event === 'schedule' && r.head_branch === 'main'))).sort((a, b) => b.id - a.id);
+    && r.event === 'merge_group' && r.head_branch?.startsWith('gh-readonly-queue/main/')).sort((a, b) => b.id - a.id);
   for (const source of sources.slice(0, 5)) {
+    if (page.workflow_runs.some(r => r.id !== main.id && (r.id > source.id
+      || r.status !== 'completed' || r.conclusion !== 'success')))
+      throw new Error('conflicting same-SHA run; wait for full main CI');
+    if (!Number.isFinite(removedAt) || !Number.isFinite(now) || !Number.isFinite(Date.parse(source.updated_at))
+      || Date.parse(source.updated_at) <= removedAt || Date.parse(source.updated_at) > now)
+      throw new Error('full CI did not complete after removal; wait for fresh full CI');
     const inventory = json(`actions/runs/${source.id}/artifacts?per_page=100`);
     if (!Array.isArray(inventory?.artifacts) || inventory.total_count !== inventory.artifacts.length || inventory.total_count > 100)
       throw new Error('incomplete full CI artifacts; operator must inspect full CI');
     if (!inventory.artifacts.some(a => typeof a?.name === 'string' && a.name.startsWith('timing-unit-'))) continue;
+    if (sibling(inventory.artifacts) !== fui) throw new Error('full CI sibling differs from push record; wait for full main CI');
     const detail = json(`actions/runs/${source.id}`);
-    if (['id', 'path', 'head_sha', 'event', 'head_branch', 'status', 'conclusion'].some(key => detail?.[key] !== source[key]))
+    if (['id', 'path', 'head_sha', 'event', 'head_branch', 'status', 'conclusion', 'updated_at'].some(key => detail?.[key] !== source[key]))
       throw new Error('unreadable full CI identity');
     return detail;
   }
@@ -728,7 +745,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
       || mainRun.created_at !== main.created_at || mainRun.updated_at !== main.updated_at
       || readMqMergeState({ repo, pr, head, exec }) !== 'CLEAN') return null;
     const rows = pages(`actions/runs/${main.id}/artifacts`, 'artifacts');
-    const full = fullMainEvidenceRun(mainRun, json, { total_count: rows.length, artifacts: rows });
+    const full = fullMainEvidenceRun(mainRun, json, { total_count: rows.length, artifacts: rows }, removedAt, now);
     if (!exactPassed(full.id, mqOid(main.head_sha))) return null;
     return { mainGreen: true, mainRunId: main.id, infra: 'exact-test', failedNames: failed.map(c => c.name), mergeState: 'CLEAN' };
   } catch { return null; }
@@ -1138,7 +1155,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             return JSON.parse(exec('gh', ['api', `repos/${repo}/${endpoint}`],
               { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
                 stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
-          });
+          }, null, removedAt, now);
           flaky = readQuarantineCover({ repo, commit: oid, failed, exec, flake: { passed: (file, name, check) => {
             const shard = shardArtifact(check);
             const headRuns = [newestSuccess.get(localJob(check.name))].filter(Boolean);

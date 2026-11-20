@@ -25,10 +25,10 @@ export function decideMainPushSkip(input = {}) {
     const queue = queueRun(rows);
     if (!queue || !queue.head_branch.startsWith('gh-readonly-queue/main/')
       || queue.check_suite?.app?.id !== 15368) return full('no trusted successful queue run');
-    const newer = rows.filter(r => r.id > queue.id && r.id !== currentRunId);
-    if (newer.some(r => !success(r) || r.check_suite?.app?.id !== 15368)) return full('newer run invalidates queue success');
+    const others = rows.filter(r => r.id !== currentRunId);
+    if (others.some(r => !success(r) || r.id > queue.id && r.check_suite?.app?.id !== 15368)) return full('another run invalidates queue success');
     if (!oid(queueFuiSha) || !oid(fuiTip) || oid(queueFuiSha) !== oid(fuiTip)) return full('FUI sibling proof missing or changed');
-    return { skip: true, reason: `exact SHA passed queue run ${queue.id}; FUI sibling unchanged` };
+    return { skip: true, reason: `exact SHA passed queue run ${queue.id}; FUI sibling unchanged`, fuiSha: oid(queueFuiSha) };
   } catch { return full('unreadable input'); }
 }
 
@@ -94,5 +94,5 @@ export function main(argv) {
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const result = main(process.argv.slice(2));
-  process.stdout.write(typeof result === 'string' ? result : `skip=${result.skip}\nreason=${result.reason}\n`);
+  process.stdout.write(typeof result === 'string' ? result : `skip=${result.skip}\nreason=${result.reason}\n${result.skip ? `fui-sha=${result.fuiSha}\n` : ''}`);
 }

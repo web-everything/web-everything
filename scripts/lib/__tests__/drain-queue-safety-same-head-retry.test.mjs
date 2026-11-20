@@ -166,13 +166,18 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
       if (/\/actions\/jobs\/41$/.test(endpoint)) return JSON.stringify({ id: 41, run_id: f.headJobRunId ?? 7, name: 'test-shard (5)', head_sha: head });
       if (command === 'funzip') return opts.input ?? '';
       const art = /\/actions\/runs\/(7|890|900)\/artifacts/.exec(endpoint);
-      if (art && art[1] === '900' && f.fullRuns) return JSON.stringify({ total_count: 0, artifacts: [] });
-      if (art) return JSON.stringify({ total_count: 1, artifacts: [{ id: art[1] === '7' ? 701 : 9001, name: (/name=(timing-unit-\d)/.exec(endpoint)?.[1] ?? 'timing-unit-5'), expired: false,
-        workflow_run: { id: Number(art[1]), head_sha: art[1] === '7' ? (f.artifactHeadSha ?? head) : mainSha } }] });
+      const record = { id: 9900, name: `fui-sibling-${'e'.repeat(40)}` };
+      if (art && art[1] === '900' && f.fullRuns) return JSON.stringify({ total_count: 1, artifacts: [record] });
+      if (art) {
+        const artifacts = [{ id: art[1] === '7' ? 701 : 9001, name: (/name=(timing-unit-\d)/.exec(endpoint)?.[1] ?? 'timing-unit-5'), expired: false,
+          workflow_run: { id: Number(art[1]), head_sha: art[1] === '7' ? (f.artifactHeadSha ?? head) : mainSha } },
+        ...(art[1] === '890' ? [record] : [])];
+        return JSON.stringify({ total_count: artifacts.length, artifacts });
+      }
       if (endpoint.endsWith('/actions/artifacts/701/zip')) return JSON.stringify(f.headJson);
       if (endpoint.endsWith('/actions/artifacts/9001/zip')) return JSON.stringify(f.mainJson);
       if (endpoint.endsWith('/actions/runs/890')) return JSON.stringify(f.fullRuns[0]);
-      if (endpoint.includes('/actions/workflows/ci.yml/runs')) {
+      if (endpoint.includes('/actions/workflows/ci.yml/runs') || endpoint.includes('/actions/runs?head_sha=')) {
         const runs = endpoint.includes('head_sha=') ? f.fullRuns : endpoint.includes('created=<') ? [] : f.mainRuns;
         return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
       }
@@ -185,7 +190,8 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
   });
 
   it.each(['merge_group', 'schedule'])('uses full %s same-SHA reports for flake proof behind a light push', event => setup(f => {
-    expect(f.guard().hold).toBe(false);
+    // A schedule has no queue reuse record: only the linked queue is reusable evidence.
+    expect(f.guard().hold).toBe(event !== 'merge_group');
   }, f => { f.fullRuns = [{ ...f.mainRuns[0], id: 890, event,
     head_branch: event === 'merge_group' ? 'gh-readonly-queue/main/pr-1' : 'main' }]; }));
 
@@ -377,7 +383,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         return page(endpoint, 'check_runs', f.mqChecks);
       if (path === `repos/${repo}/commits/${head}/check-runs`)
         return page(endpoint, 'check_runs', f.headChecks);
-      if (path.endsWith('/actions/workflows/ci.yml/runs')) {
+      if (path.endsWith('/actions/workflows/ci.yml/runs') || path.endsWith('/actions/runs') && endpoint.includes('head_sha=')) {
         const query = new URLSearchParams(endpoint.split('?')[1]);
         const runs = (query.has('head_sha') ? (f.evidenceRuns ?? []) : f.mainRuns).filter(r => (!query.has('status') || r.status === query.get('status'))
           && (!query.has('created') || Date.parse(r.created_at) < Date.parse(query.get('created').slice(1))));
@@ -419,14 +425,47 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     test(f);
   }
 
-  it.each(['merge_group', 'schedule'])('uses same-SHA %s timing artifacts behind a skipped-success push', event => exactFixture(f => {
+  function lightQueue(f, event = 'merge_group') {
     f.runs[890] = { ...f.runs[900], id: 890, event,
       head_branch: event === 'merge_group' ? 'gh-readonly-queue/main/pr-1' : 'main' };
-    f.evidenceRuns = [f.runs[890]];
+    f.evidenceRuns = [f.runs[890], f.runs[900]];
     f.artifacts[890] = f.artifacts[900].map(a => ({ ...a, workflow_run: { ...a.workflow_run, id: 890 } }));
-    delete f.artifacts[900];
+    const record = { id: 9900, name: `fui-sibling-${'e'.repeat(40)}` };
+    f.artifacts[900] = [record];
+    f.artifacts[890].push({ ...record, id: 9901 });
     f.runJobs[890] = f.runJobs[900].map(j => ({ ...j, run_id: 890 }));
+  }
+
+  it('uses linked same-SHA queue timing artifacts behind a skipped-success push', () => exactFixture(f => {
+    lightQueue(f);
     expectExtraRetry(f);
+  }));
+
+  it.each([removedAt - 1, removedAt, NaN])('refuses replacement evidence completed at %s before/at removal or unknown (finding 6)', stamp => exactFixture(f => {
+    lightQueue(f);
+    f.runs[890].created_at = iso(removedAt - 600_000);
+    f.runs[890].updated_at = Number.isNaN(stamp) ? null : iso(stamp);
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it.each([
+    [889, 'workflow_dispatch', 'completed', 'failure', 2],
+    [889, 'pull_request', 'in_progress', null, 2],
+    [891, 'schedule', 'completed', 'success', 1],
+    [901, 'push', 'queued', null, 1],
+  ])('refuses conflicting same-SHA run %s/%s/%s/%s attempt %s (finding 7)', (id, event, status, conclusion, run_attempt) => exactFixture(f => {
+    lightQueue(f);
+    f.evidenceRuns.push({ ...f.runs[890], id, event, status, conclusion, run_attempt });
+    expect(f.guard().hold).toBe(true);
+  }));
+
+  it.each(['push missing', 'queue missing', 'changed FUI', 'ambiguous', 'schedule'])('refuses unlinked replacement: %s (finding 8)', kind => exactFixture(f => {
+    lightQueue(f, kind === 'schedule' ? 'schedule' : 'merge_group');
+    if (kind === 'push missing') f.artifacts[900] = [];
+    if (kind === 'queue missing') f.artifacts[890].pop();
+    if (kind === 'changed FUI') f.artifacts[890][2].name = `fui-sibling-${'f'.repeat(40)}`;
+    if (kind === 'ambiguous') f.artifacts[900].push({ id: 9902, name: `fui-sibling-${'e'.repeat(40)}` });
+    expect(f.guard().hold).toBe(true);
   }));
 
   it('holds on oversized same-SHA full-run evidence rather than accepting a partial inventory', () => exactFixture(f => {
@@ -435,13 +474,13 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.guard().hold).toBe(true);
   }));
 
-  it('bounds same-SHA full-source searches to five; an unseen sixth source cannot clear the hold', () => exactFixture(f => {
-    f.evidenceRuns = Array.from({ length: 6 }, (_, n) => ({ ...f.runs[900], id: 890 + n, event: 'schedule' }));
-    f.artifacts[890] = f.artifacts[900];
-    f.artifacts[900] = [];
+  it('a newer successful same-SHA run blocks falling back to an older full source', () => exactFixture(f => {
+    lightQueue(f);
+    f.evidenceRuns.push({ ...f.runs[890], id: 895 });
+    f.artifacts[895] = [];
     expect(f.guard().hold).toBe(true);
     const reads = f.exec.mock.calls.flatMap(([, args]) => args.filter(a => /runs\/89[0-5]\/artifacts/.test(a)));
-    expect(reads).toHaveLength(5);
+    expect(reads).toHaveLength(1);
     expect(reads.some(a => a.includes('/890/'))).toBe(false);
   }));
 

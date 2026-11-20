@@ -13,8 +13,9 @@ it('timings selects full queue/schedule runs past a skipped-success push, for la
     if (args[1] === 'list') return JSON.stringify([
       { databaseId: 103, event: 'push', headBranch: 'main' },
       { databaseId: 102, event: 'schedule', headBranch: 'main' },
-      { databaseId: 101, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1' },
+      { databaseId: 101, event: 'merge_group', headBranch: 'gh-readonly-queue/main/pr-1', headSha: 'a'.repeat(40) },
     ]);
+    if (args[0] === 'merge-base') return '';
     if (args[0] === 'api') { const id = Number(/runs\/(\d+)/.exec(args[1])[1]);
       return JSON.stringify({ total_count: id === 103 ? 0 : expectedUnitShards().length, artifacts: id === 103 ? [] : expectedUnitShards().map(n => ({ name: `timing-unit-${n}`, expired: false })) }); }
     if (args[1] === 'download') { downloads.push(args[2]); return ''; }
