@@ -3,6 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
+
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 
 export function exercise(watchParkedPrConflicts) {
@@ -15,7 +17,7 @@ export function exercise(watchParkedPrConflicts) {
     process.stderr.write = () => true;
     try {
       results = watchParkedPrConflicts({
-        repo: 'web-everything/web-everything', sameLineConflict: 'stand-down',
+        repo: ghRepoSlug('we'), sameLineConflict: 'stand-down',
         listPrs: () => [{ number: 7101, headRefName: 'lane/x', mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY', labels }],
         inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
         provider, postFinding: () => { dispatched++; }, postStandDown: () => { effects++; }, postRearm: () => { effects++; },
