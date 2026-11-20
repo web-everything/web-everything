@@ -114,6 +114,15 @@ function readCarriedCheckMarker(path) {
   } catch (error) { return { exists: error.code !== 'ENOENT', remoteHold: error.code !== 'ENOENT', attempt: null }; }
 }
 
+/** Is a local publication hold (`.unpublished`) or a carried-check outbox marker (an unconfirmed publish or its hold)
+ * present for this head? Unreadable counts as present. */
+export function carriedCheckMarkerPresent({ repo, pr, head, env = process.env } = {}) {
+  try {
+    return readRedTeamPublicationHold({ repo, pr, head, env }) !== null
+      || readCarriedCheckMarker(carriedCheckOutboxPath({ repo, pr, head }, env)).exists;
+  } catch { return true; }
+}
+
 const safeText = value => String(value?.message ?? value).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
 
 /** Publish a carried check through `publish(hooks)`, keeping the outbox marker until it is confirmed. A marker that
