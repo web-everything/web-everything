@@ -338,8 +338,8 @@ export function deriveWaitingOn(pr, ctx) {
   if (has('review:human') && has('advisory:accepted')) return done('human-review', 'operator', labelAt('advisory:accepted', 'review:human'),
     'advisory review accepted; the human review is owed', actions.humanReview, ['labels review:human + advisory:accepted']);
   if (has('review:human')) return done('human-review-pending-advisory', 'reviewer', moved('review:human'), 'review:human with no accepted advisory yet', actions.rerunReview, ['label review:human']);
-  if (has('review:pending') || has('status:awaiting-review') || has('review-status:reviewing')) {
-    return done('awaiting-review', 'reviewer', moved('review:pending', 'status:awaiting-review', 'review-status:reviewing'), 'an independent review is owed', actions.rerunReview, ['review label']);
+  if (has('review:pending') || has('review:awaiting-advisory') || has('status:awaiting-review') || has('review-status:reviewing')) {
+    return done('awaiting-review', 'reviewer', moved('review:pending', 'review:awaiting-advisory', 'status:awaiting-review', 'review-status:reviewing'), 'an independent review is owed', actions.rerunReview, ['review label']);
   }
 
   const enqueued = sorted(pr.comments).filter((e) => trusted(e) && ENQUEUE_RE.test(bodyOf(e.c)) && bodyOf(e.c).includes(head ?? '\0')).pop();

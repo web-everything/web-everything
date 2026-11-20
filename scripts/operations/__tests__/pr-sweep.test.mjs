@@ -624,3 +624,17 @@ describe('humanReviewHold: the gate behind "your review" (#5768)', () => {
     expect(humanReviewHold({ ...base, comments: [claim, c('plateau-worker[bot]', '2026-10-21T14:32:00Z', '🔓 conveyor fix-end — fix claim released')] }, at)).toEqual([]);
   });
 });
+
+describe('awaiting-advisory waits on the review daemon', () => {
+  it('review:awaiting-advisory with no status label is the reviewer\'s wait, not unclassified', () => {
+    const r = sweep([mkPr({ labels: L('review:awaiting-advisory') })]).prs[0];
+    expect(r).toMatchObject({ waitingOn: 'awaiting-review', actor: 'reviewer' });
+  });
+  it('past the threshold it is stalled on the reviewer (escalates), never an operator unclassified', () => {
+    const r = sweep([mkPr({ labels: L('review:awaiting-advisory'), updatedAt: '2026-10-20T01:00:00Z' })]).prs[0];
+    expect(r).toMatchObject({ waitingOn: 'awaiting-review', actor: 'reviewer', stalled: true });
+  });
+  it('an unknown review label still stays unclassified (no silent widening)', () => {
+    expect(sweep([mkPr({ labels: L('review:awaiting-whatever') })]).prs[0].waitingOn).toBe('unclassified');
+  });
+});
