@@ -6,7 +6,7 @@ import yaml from 'js-yaml';
 const { jobs } = yaml.load(readFileSync(
   new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8',
 ));
-const fuiJobs = ['standards', 'test-shard', 'integration', 'smoke'];
+const fuiJobs = ['standards', 'test-shard', 'integration-part', 'smoke'];
 const lightGuard = "needs.changes.outputs.light != 'true'";
 const integrationGuard = "steps.gate.outputs.run == 'true'";
 const paths = (value) => String(value ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
@@ -42,7 +42,7 @@ describe('ci.yml caches beyond the npm download cache', () => {
       expect(build['working-directory']).toBe('frontierui');
       expect(build.run.trim()).toBe('npm ci\nnpm run build:tools');
       const guard = name === 'standards' ? undefined
-        : name === 'integration' ? integrationGuard : lightGuard;
+        : name === 'integration-part' ? integrationGuard : lightGuard;
       expect(build.if?.replace(/^\$\{\{\s*|\s*\}\}$/g, '').trim()).toBe(guard);
       expect(build.if).toBe(checkout.if);
     });
@@ -62,7 +62,7 @@ describe('ci.yml caches beyond the npm download cache', () => {
     expect(install['working-directory']).toBe('web-everything');
     expect(install.run.trim()).toBe('npm ci');
     const guard = name === 'standards' ? undefined
-      : name === 'integration' ? integrationGuard : lightGuard;
+      : name === 'integration-part' ? integrationGuard : lightGuard;
     expect(install.if?.replace(/^\$\{\{\s*|\s*\}\}$/g, '').trim()).toBe(guard);
   });
 
