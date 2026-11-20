@@ -91,7 +91,32 @@ const sha = result => {
 const transientGit = result => result?.error?.code === 'ETIMEDOUT'
   || ((result?.status !== 0 || result?.error)
     && /ETIMEDOUT|timed out/i.test(`${result?.stderr ?? ''} ${result?.error?.message ?? ''}`));
-function retryGit(run, args, opts, deps = {}, cleanup = () => {}) {
+// Transient network classes for fetch only. Auth denial and unknown errors are never retried (escalate at once).
+const AUTH_FAILURE = /permission denied|authentication failed|could not read from remote repository|repository not found|host key verification/i;
+const NETWORK_TRANSIENT = /could not resolve host|connection reset|connection refused|connection closed by|ssh: connect to host|\b50[23]\b|bad gateway|service unavailable/i;
+export const networkTransientGit = result => (result?.status !== 0 || result?.error)
+  && !AUTH_FAILURE.test(`${result?.stderr ?? ''}`) && NETWORK_TRANSIENT.test(`${result?.stderr ?? ''} ${result?.error?.message ?? ''}`);
+const NETWORK_BACKOFF_MS = [5_000, 15_000, 45_000];
+function networkBackoffMs(deps) {
+  if (deps.networkBackoffMs) return deps.networkBackoffMs;
+  const parsed = (process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS ?? '').split(',').map(Number);
+  return parsed.length && parsed.every(n => Number.isFinite(n) && n >= 0) && process.env.WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS ? parsed : NETWORK_BACKOFF_MS;
+}
+export function retryGit(run, args, opts, deps = {}, cleanup = () => {}) {
+  if (args[0] === 'fetch') {
+    const first = run(args, opts);
+    if (networkTransientGit(first) && !transientGit(first)) {
+      const delays = networkBackoffMs(deps), sleep = deps.gitBackoff ?? (ms => Atomics.wait(transactionWait, 0, 0, ms));
+      let result = first, attempts = 1;
+      while (networkTransientGit(result) && attempts <= delays.length) { sleep(delays[attempts - 1]); result = run(args, opts); attempts++; }
+      if (networkTransientGit(result)) throw Object.assign(new Error(`fetch: command failed after ${attempts} attempts; operator review required: ${stderrTail(result)}`), { step: 'fetch', stderrTail: stderrTail(result), failedTests: [] });
+      return { ...result, step: 'fetch' };
+    }
+    if (!transientGit(first)) return { ...first, step: 'fetch' };
+    let pending = first; // reuse the first result so the timeout loop does not run fetch an extra time
+    const reuse = run;
+    run = (a, o) => { if (pending) { const r = pending; pending = null; return r; } return reuse(a, o); };
+  }
   for (let attempt = 0; attempt < 3; attempt++) {
     let result;
     try { result = run(args, opts); }

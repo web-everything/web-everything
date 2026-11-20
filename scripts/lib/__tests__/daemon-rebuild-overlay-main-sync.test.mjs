@@ -604,6 +604,36 @@ describe('overlay main sync', () => {
     expect(tries).toBe(3); expect(alerts(f)).toEqual([]);
   });
 
+  const flakyFetch = (f, stderr, failures) => {
+    const git = f.deps.git, calls = { fetch: 0 }, sleeps = [];
+    f.deps.gitBackoff = ms => sleeps.push(ms);
+    f.deps.git = (args, opts) => args[0] === 'fetch' && ++calls.fetch <= failures
+      ? { status: 128, stdout: '', stderr } : git(args, opts);
+    return { calls, sleeps };
+  };
+  it('transient fetch retries with backoff', async () => {
+    for (const stderr of ['ssh: Could not resolve host: github.com', 'Connection reset by peer', 'error: RPC failed; HTTP 503', 'HTTP 502 Bad Gateway']) {
+      const f = fixture(), seen = flakyFetch(f, stderr, 3);
+      expect(await job(f)).toMatchObject({ pushed: true });
+      expect(seen.calls.fetch).toBe(4); expect(seen.sleeps).toEqual([5000, 15000, 45000]); expect(alerts(f)).toEqual([]);
+    }
+  });
+  it('an auth failure is never retried', async () => {
+    const f = fixture(), seen = flakyFetch(f, 'git@host: Permission denied (publickey). Connection reset', 99);
+    await expect(job(f)).rejects.toMatchObject({ step: 'fetch' });
+    expect(seen.calls.fetch).toBe(1); expect(seen.sleeps).toEqual([]);
+  });
+  it('an unknown error class is not retried', async () => {
+    const f = fixture(), seen = flakyFetch(f, 'fatal: something odd', 99);
+    await expect(job(f)).rejects.toMatchObject({ step: 'fetch' });
+    expect(seen.calls.fetch).toBe(1);
+  });
+  it('all transient fetch retries failing escalates with the attempt count', async () => {
+    const f = fixture(), seen = flakyFetch(f, 'Connection reset by peer', 99);
+    await expect(job(f)).rejects.toMatchObject({ step: 'fetch', message: expect.stringContaining('after 4 attempts') });
+    expect(seen.calls.fetch).toBe(4);
+  });
+
   it('clone lock excludes a concurrent different ref and kick without running Git', async () => {
     const f = fixture(), passing = f.deps.testRunner, other = 'lane/other', outcomes = [];
     addOverlay(f.root, { ref: other }, { env: f.env });
