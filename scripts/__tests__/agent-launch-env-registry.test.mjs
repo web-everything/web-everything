@@ -441,7 +441,7 @@ const parityRules = Object.entries(registry).filter(([, rule]) => !rule.never
 const executableRedirects = [
   'EDITOR', 'VISUAL', 'PAGER', 'MANPAGER', 'BROWSER', 'LESSOPEN', 'LESSCLOSE', 'SSH_ASKPASS', 'SUDO_ASKPASS',
   'GIT_ASKPASS', 'GIT_EDITOR', 'GIT_EXEC_PATH', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_PROXY_COMMAND',
-  'GIT_SEQUENCE_EDITOR', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_TEMPLATE_DIR', 'WE_GH_THROTTLE_GH_BIN',
+  'GIT_SEQUENCE_EDITOR', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_TEMPLATE_DIR', 'WE_GH_THROTTLE_GH_BIN', 'DEVELOPER_DIR',
 ];
 function executableRedirectDefects(rules) {
   const described = Object.entries(rules).filter(([, rule]) =>
