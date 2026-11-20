@@ -1559,28 +1559,26 @@ describe('live red-team queue reconciliation', () => {
 });
 
 // Persist the production queue shape and reopen it, including legacy entries without probe turns.
-function savedProbeQueue({ count = 10, readLivePr, turns, runnable = [] } = {}) {
-  const f = fixture({ readLivePr });
-  f.readPartialPr = key => ({ number: key.pr, labels: [], comments: [],
-    ...(readLivePr ? readLivePr(key) : { state: 'OPEN', headRefOid: head(key.pr) }) });
+function savedProbeQueue({ count = 10, turns } = {}) {
+  const f = fixture();
   const ids = Array.from({ length: count }, (_, index) => index + 1);
-  f.files.set(f.file, JSON.stringify(candidates([...ids, ...runnable]).map(c => ({
+  f.files.set(f.file, JSON.stringify(candidates(ids).map(c => ({
     key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head, enqueuedAt: 1, attempts: 0,
-    ...(!runnable.includes(c.pr) ? { blocked: c.pr % 2 ? 'review-unfinished' : 'planner-skip' } : {}),
+    blocked: c.pr % 2 ? 'review-unfinished' : 'planner-skip',
     ...(turns ? { lastProbeTurn: turns(c.pr) } : {}),
   }))));
   f.queue = f.open();
   return f;
 }
 
-function probeTick(f, floor, extra = {}) {
+function probeTick(f, floor) {
   const run = vi.fn(options => ({
     rows: options.plan.refusals.map(row => ({ prNumber: row.prNumber, action: 'skip', why: 'review-unfinished' })),
     dispatched: [],
     notStarted: options.plan.refusals.map(row => ({ prNumber: row.prNumber, reason: 'review-unfinished' })),
   }));
   runWithRedTeamQueue({ queue: f.queue, ...inputs(numbers(f.queue.entries())),
-    capacity: capacity(1), floor, log: f.log, readPartialPr: f.readPartialPr, ...extra, run });
+    capacity: capacity(1), floor, log: f.log, run });
   expect(run).toHaveBeenCalledOnce();
   return run.mock.calls[0][0].plan.refusals;
 }
@@ -1707,15 +1705,15 @@ describe('settings probe cap availability', () => {
     expect(messages).toContain('settings unreadable');
   });
 
-  it.each([0, 9, 50])('valid operator cap %i overrides unreadable settings', cap => {
+  it.each([0, 9, 50])('unreadable settings disables probes even with valid operator cap %i', cap => {
     const store = join(operatorRoot, 'probe-settings-unreadable.json');
     writeFileSync(store, JSON.stringify({ 'redTeamQueue.maxProbesPerTick': cap }));
     const log = vi.fn();
     const floor = loadRedTeamQueueFloor({ env: operatorEnv(store), file: 'probe-settings.json',
       readFile: () => { throw new Error('read failed'); }, log });
-    expect(floor.maxProbesPerTick).toBe(cap);
-    expect(probeTick(savedProbeQueue({ count: 60 }), floor)).toHaveLength(cap);
-    expect(log.mock.calls.flat().join(' ')).toContain('source: operator-db');
+    expect(floor.maxProbesPerTick).toBe(0);
+    expect(probeTick(savedProbeQueue({ count: 60 }), floor)).toHaveLength(0);
+    expect(log.mock.calls.flat().join(' ')).toContain('probes OFF');
   });
 
   it.each([1, 6, 50])('valid settings cap %i supplies that many probes', cap => {
@@ -1726,15 +1724,17 @@ describe('settings probe cap availability', () => {
     expect(log.mock.calls.flat().join(' ')).toContain('source: scripts/settings/red-team-queue.json');
   });
 
-  it('direct floor oversized cap still clamps at 50 and absent cap still defaults to six', () => {
-    expect(probeTick(savedProbeQueue({ count: 60 }), { maxProbesPerTick: 500 })).toHaveLength(50);
+  it('direct floor oversized cap disables probes and absent cap defaults to six', () => {
+    const f = savedProbeQueue({ count: 60 });
+    expect(probeTick(f, { maxProbesPerTick: 500 })).toHaveLength(0);
+    expect(f.logs.join(' ')).toContain('probes OFF');
     expect(probeTick(savedProbeQueue(), {})).toHaveLength(6);
   });
 });
 
 describe('invalid probe cap', () => {
-  const invalid = [-1, 2.5, '7', NaN, Infinity, null, true];
-  const invalidSettings = [...invalid, 500];
+  const invalid = [-1, 2.5, 51, 500, '7', NaN, Infinity, null, true, false, {}, []];
+  const invalidSettings = invalid;
   describe.each([
     ['file', 'fails closed to zero probes', 0],
     ['operator', 'fails closed to zero probes', 0],
@@ -1749,8 +1749,21 @@ describe('invalid probe cap', () => {
       expect(messages).toMatch(/invalid/i);
     });
   });
-  it.each(invalid)('raw floor value %s also falls back to six probes', value => {
-    expect(probeTick(savedProbeQueue(), { maxProbesPerTick: value })).toHaveLength(6);
+  it.each(invalid)('raw floor value %s disables probes and logs loudly', value => {
+    const f = savedProbeQueue();
+    expect(probeTick(f, { maxProbesPerTick: value })).toHaveLength(0);
+    expect(f.logs.join(' ')).toContain('probes OFF');
+  });
+  it.each(invalid)('direct admission value %s disables probes and logs loudly', maxProbes => {
+    const f = savedProbeQueue();
+    const before = f.queue.entries();
+    expect(f.queue.admit(repo, 0, { maxProbes })).toEqual([]);
+    expect(f.open().entries()).toEqual(before);
+    expect(f.logs.join(' ')).toContain('probes OFF');
+  });
+  it.each([undefined, 0, 1, 6, 50])('direct admission value %s uses the default or valid cap', maxProbes => {
+    const f = savedProbeQueue({ count: 60 });
+    expect(f.queue.admit(repo, 0, { maxProbes })).toHaveLength(maxProbes ?? 6);
   });
   it.each([0, 1, 6, 50])('an unreadable operator store means 0 probes whatever the settings cap (%i) and logs loudly', cap => {
     const store = join(operatorRoot, 'restrictive-probe-store.json');
@@ -1775,76 +1788,6 @@ describe('invalid probe cap', () => {
   });
 });
 
-describe('list read partial', () => {
-  it('never fabricates recovery refusals when the planner supplied none', () => {
-    const f = savedProbeQueue({ count: 3 });
-    expect(probeTick(f, undefined, { listPartial: true, plan: { refusals: [] } })).toEqual([]);
-    expect(numbers(f.open().entries())).toEqual([1, 2, 3]);
-  });
-
-  it('retains persisted known entries and probes only planner-provided head-bound refusal rows', () => {
-    const f = savedProbeQueue({ count: 3, runnable: [4] });
-    const stored = f.queue.entries();
-    const rows = probeTick(f, undefined, { listPartial: true });
-    expect(rows).toEqual([1, 2, 3].map(prNumber => ({
-      prNumber, kind: 'already-reviewed-head', headSha: stored.find(entry => entry.pr === prNumber).head,
-    })));
-    expect(numbers(f.open().entries())).toEqual([1, 2, 3, 4]);
-  });
-
-  it('fails closed on unknown PR admission and does not admit known runnable entries', () => {
-    const f = savedProbeQueue({ count: 3, runnable: [4] });
-    const rows = probeTick(f, undefined, { ...inputs([1, 2, 3, 4, 99]), listPartial: true });
-    expect(rows.map(row => row.prNumber)).toEqual([1, 2, 3]);
-    expect(numbers(f.open().entries())).toEqual([1, 2, 3, 4]);
-    expect(f.logs.some(line => line.includes('enqueue example/project#99'))).toBe(false);
-  });
-
-  it.each(['CLOSED', 'MERGED', 'head-moved'])('does not probe a known %s entry', state => {
-    const readLivePr = vi.fn(({ pr }) => ({
-      state: pr === 3 && state !== 'head-moved' ? state : 'OPEN',
-      headRefOid: pr === 3 && state === 'head-moved' ? head(300) : head(pr),
-    }));
-    const f = savedProbeQueue({ count: 3, readLivePr });
-    const rows = probeTick(f, undefined, { listPartial: true });
-    expect(rows.map(row => row.prNumber)).toEqual([1, 2]);
-    expect(readLivePr).toHaveBeenCalledWith({ repo, pr: 3 });
-  });
-
-  it.each([undefined, false])('listPartial=%s keeps complete-list eviction and admission behavior', listPartial => {
-    const f = savedProbeQueue({ count: 3, runnable: [4] });
-    const rows = probeTick(f, undefined, { ...inputs([99]), ...(listPartial === undefined ? {} : { listPartial }) });
-    expect(rows).toEqual([{ prNumber: 99, kind: 'already-reviewed-head', headSha: head(99) }]);
-    expect(numbers(f.open().entries())).toEqual([99]);
-  });
-});
-
-describe('partial inventory recovery safety', () => {
-  it.each(['unreadable', 'throw', 'missing-head'])('partial inventory retains entries and refuses %s live evidence', mode => {
-    const readLivePr = vi.fn(() => {
-      if (mode === 'throw') throw new Error('offline');
-      return mode === 'missing-head' ? { state: 'OPEN' } : null;
-    });
-    const f = savedProbeQueue({ count: 3, runnable: [4], readLivePr });
-    const before = f.queue.entries();
-    expect(probeTick(f, undefined, { listPartial: true })).toEqual([]);
-    expect(f.open().entries()).toEqual(before);
-    expect(readLivePr.mock.calls.map(([input]) => input.pr)).toEqual([1, 2, 3]);
-  });
-
-  it('partial inventory runner receives only raw PRs from matching live reads', () => {
-    const f = savedProbeQueue({ count: 3, runnable: [4] });
-    const readPartialPr = vi.fn(({ pr }) => ({ number: pr, labels: [], comments: [], state: pr === 3 ? 'CLOSED' : 'OPEN', headRefOid: head(pr), title: `live ${pr}` }));
-    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 99]), listPartial: true, readPartialPr,
-      capacity: capacity(1), run: options => {
-        expect(options.rawPrs).toEqual([1, 2].map(pr => ({ number: pr, labels: [], comments: [], state: 'OPEN', headRefOid: head(pr), title: `live ${pr}` })));
-        return { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'review-unfinished' })) };
-      } });
-    expect(readPartialPr.mock.calls.map(([input]) => input.pr)).toEqual([1, 2, 3]);
-    expect(numbers(f.open().entries())).toEqual([1, 2, 3, 4]);
-  });
-});
-
 describe('decided red-team queue heads', () => {
   const published = {
     readStatus: () => null, readCarry: () => null, readCarriedCheck: () => false,
@@ -1855,26 +1798,6 @@ describe('decided red-team queue heads', () => {
     body: `<!-- we:red-team-advisory pr=${pr} rev=${rev} -->
 Advisory only: recorded result · recorded verdict \`${blocked ? 'changes' : 'accept'}\`.
 ${blocked ? '1. [**confirmed**] (edge-case, broken) `src/example.mjs:1` — Fix required.' : 'The red team tried to break this change and reported nothing.'}`,
-  });
-  it('partial inventory preserves settled, terminal and changed-head entries without reading other repositories', () => {
-    const f = savedProbeQueue({ count: 4, runnable: [5] });
-    f.queue.sync(otherRepo, candidates([6]));
-    const before = f.open().entries();
-    const readPartialPr = vi.fn(({ pr }) => ({
-      number: pr, state: pr === 2 ? 'CLOSED' : pr === 3 ? 'MERGED' : 'OPEN',
-      headRefOid: head(pr === 4 ? 40 : pr), labels: [], comments: [result(pr, head(pr))],
-    }));
-    const readCheckFact = vi.fn(() => ({ ok: true }));
-    runWithRedTeamQueue({ queue: f.queue, ...inputs([1, 2, 3, 4, 5, 99]), listPartial: true,
-      readPartialPr, ...published, readCheckFact, run: options => {
-        expect(options.plan.refusals.map(row => row.prNumber)).toEqual([1]);
-        expect(options.rawPrs.map(pr => pr.number)).toEqual([1]);
-        return refused(1, 'review-unfinished');
-      } });
-    expect(readPartialPr.mock.calls.map(([key]) => key)).toEqual([1, 2, 3, 4].map(pr => ({ repo, pr })));
-    expect(readCheckFact).not.toHaveBeenCalled();
-    expect(f.open().entries()).toEqual(before.map(entry => entry.repo === repo && entry.pr === 1
-      ? { ...entry, attempts: 1, lastProbeTurn: 1 } : entry));
   });
   it('forwards per-run recovery readers to reconcile so a fully settled head stays evicted', () => {
     const f = fixture({ readCheckFact: () => ({ ok: false, reason: 'unreadable' }) });

@@ -7,7 +7,8 @@ const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATH = 'scripts/lib/red-team-dispatch-queue.mjs';
 export function probeCapFixPresent(source) {
   return !/\b(?:const|let|var)\s+MAX_PROBES\s*=\s*2\b/.test(source)
-    && /\.slice\(0,\s*probeCap\(maxProbes\)\)/.test(source)
+    && /\.slice\(0,\s*maxProbeCount\)/.test(source)
+    && /const\s+maxProbeCount\s*=\s*probeCap\(maxProbes,\s*log\)/.test(source)
     && /const\s+DEFAULT_MAX_PROBES\s*=\s*6\s*;/.test(source)
     && /const\s+MAX_PROBES_CEILING\s*=\s*50\s*;/.test(source);
 }
