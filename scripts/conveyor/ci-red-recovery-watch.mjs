@@ -379,7 +379,7 @@ function* sweepCiRedRecoverySteps({
     // slow deferrals are bounded by the budget (review round 3 of #6340: they used to run until the 300 s pass deadline
     // killed the sweep). There is deliberately no count cap on deferrals: instant ones (a cross-repo PR) are free, and
     // a count cap would let a stable run of them at the head of the queue starve every later PR on every tick.
-    let started = 0;
+    let started = 0, examined = 0;
     const applyStartedAt = now();
     const floorGraceMs = Math.min(applyBudgetMs, APPLY_FLOOR_GRACE_MS);
     // Fairness across ticks (review round 4 of #6340): least-recently-attempted first, never-attempted before any
@@ -403,12 +403,13 @@ function* sweepCiRedRecoverySteps({
       // comment reads) can by itself outlast the budget, and without the floor every tick would defer everything.
       // Deferrals do not spend the floor, but they may only hunt for that refresh for `floorGraceMs` of loop time.
       const overBudget = now() - tickStartedAt >= applyBudgetMs;
-      if ((deadlineAt != null && now() >= deadlineAt) || started >= maxApplyPerTick
-        || (overBudget && (started >= 1 || now() - applyStartedAt >= floorGraceMs))) {
+      if ((deadlineAt != null && now() >= deadlineAt && started >= 1) || started >= maxApplyPerTick
+        || (overBudget && (started >= 1 || (examined >= 1 && now() - applyStartedAt >= floorGraceMs)))) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, budgetExhausted: true,
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
       }
+      examined += 1;
       const held = checkClaim({ repo, branch: d.headRefName });
       if (!held && applyLedger) {
         // Re-read and merge (max per key) just before writing: a sweep that overlapped this one (a manual run, or a

@@ -11,6 +11,8 @@ tags: []
 
 Audit of lane/ci-heal-own-loop found pre-existing fail-open paths: tolerant claim reads in we:scripts/operations/ci-heal-pr-dispatch.mjs (reserve fallback treats read failure as zero holders, empty-scope unfenced dispatch fallback), we:scripts/lib/fix-slot-borrow.mjs (unreadable failure history, throwing host gate and stale-base gate admit, zero occupancy on claim-read failure), we:scripts/conveyor/fix-claim-store.mjs (strict validation checks truthiness not timestamp validity), we:scripts/conveyor/unsupported-repo.mjs (corrupt store reads as empty queue). Every unreadable input must refuse, not admit.
 
+Also in scope (pre-existing on main): we:scripts/lib/resource-gate.mjs:399 uses Math.max(local reservations, observed claims), which does not preserve their combined occupancy, so overlapping unpublished reservations and sibling claims can launch above the cap. Also we:scripts/lib/ci-heal-reserve.mjs (claim-read failure counts as zero holders; throwing host gate keeps admit:true) and the we:scripts/operations/ci-heal-pr-dispatch.mjs failed accounting writes and empty fix-loop history.
+
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.

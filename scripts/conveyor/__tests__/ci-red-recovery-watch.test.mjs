@@ -298,6 +298,21 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(result.applied[1]).toMatchObject({ deferred: true, ok: false, budgetExhausted: true });
   });
 
+  it.each(['entry', 'discovery', 'slice', 'refresh', 'zero-budget'])('absolute deadline expired during %s preserves one refresh then stops', async expiredDuring => {
+    let time = expiredDuring === 'entry' ? 200 : 0;
+    const refresh = vi.fn(() => { time = 200; return { ok: true, action: 'current' }; });
+    const result = await sweepCiRedRecovery({
+      readOpenPrs: () => { if (expiredDuring === 'discovery') time = 200;
+        return [2635, 2636].map(number => ({ ...PR_2635, number, headRefName: `lane/${number}` })); },
+      readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
+      maybeCiHealSlice: async () => { if (expiredDuring === 'slice') time = 20000; },
+      refresh, postComment: vi.fn(), apply: true, now: () => time, deadlineAt: 100,
+      applyBudgetMs: expiredDuring === 'zero-budget' ? 0 : 10000, maxApplyPerTick: 10,
+    });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(result.applied[1]).toMatchObject({ deferred: true, budgetExhausted: true });
+  });
+
   // Review round 2 of #6340: `started` was bumped before the refresh ran, so a refresh that came back deferred
   // (no work done) still spent the floor and the cap, and every later PR in the tick was starved.
   it.each([

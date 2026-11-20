@@ -250,7 +250,7 @@ describe('runTickAllRepos wiring', () => {
     const order = [];
     const empty = () => ({ dispatched: [], refusals: [] });
     const result = await runTickAllRepos({
-      repos: ['web-everything/web-everything'],
+      repos: ['web-everything/web-everything'], fenceOk: () => true,
       authGateOverride: () => ({ paused: false, reason: null }),
       awaitVerifyTick: async () => { order.push('await'); return { rows: [] }; },
       stuckFixerTick: async () => { order.push('reclaim'); return { rows: [{ pr: 4453, decision: 'reclaim', result: 'reclaimed' }] }; },

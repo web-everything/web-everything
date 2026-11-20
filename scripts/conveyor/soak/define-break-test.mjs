@@ -13,7 +13,7 @@ import { describe, expect, it } from 'vitest';
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..');
 
 export function defineBreakTest(b) {
-  const present = b.fixPresent(REPO_ROOT);
+  const present = b.required === true || b.fixPresent(REPO_ROOT);
   const title = present
     ? `${b.title} — stays fixed (fix ${b.fixedBy.sha})`
     : `[EXPECTED-FAIL: fix ${b.fixedBy.sha} (${b.fixedBy.where}) is not in this tree — ${b.card}] ${b.title}`;

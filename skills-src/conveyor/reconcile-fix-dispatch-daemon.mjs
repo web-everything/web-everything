@@ -1115,7 +1115,11 @@ export function createCiHealSlicer({ runSlice, now = Date.now, intervalMs = 1200
       if (!owned) { emit('ci-heal-slice-skipped lease'); return; }
       lastSlice = now();
       emit('ci-heal-pr-dispatch: gate slice');
-      try { await runSlice(); }
+      try {
+        const result = await runSlice();
+        const outcome = result?.dispatched?.length ? 'admitted' : result?.refusals?.length ? 'refused' : 'done';
+        emit(`ci-heal-pr-dispatch: gate slice ${outcome}`);
+      }
       catch (error) { emit(`ci-heal-slice-failed ${redactedFirstLine(error)}`); }
     } finally { running = false; }
   };
@@ -1363,6 +1367,7 @@ export async function runTickAllRepos({
     for (const key of ['repos', 'dispatched', 'refusals', 'reconcileRefusals']) ciHeal[key].push(...(part[key] ?? []));
     ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
     planCache?.markTouched(part);
+    return part;
   } });
   // Keep short passes' historical phase order; long passes yield once the first interval is due.
   maybeCiHealSlice = async options => {

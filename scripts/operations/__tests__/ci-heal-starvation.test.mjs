@@ -246,7 +246,7 @@ describe('fix-pass cursor persistence', () => {
       const recovery = () => ({ dispatch: [], refusals: [], applied: [] });
       const visited = [];
       await daemon.runTickAllRepos({
-        repos: ['we', 'frontierui'], now: () => 0, authGateOverride: () => ({ paused: false }),
+        repos: ['we', 'frontierui'], now: () => 0, fenceOk: () => true, authGateOverride: () => ({ paused: false }),
         fixTick: empty, promoteDraftTick: empty, hungCiTick: recovery, mainRedRebaseTick: recovery,
         missingRunTick: recovery, notesTick: () => ({ notes: [], prsByNumber: new Map() }),
         awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
@@ -379,7 +379,7 @@ describe('fix-pass persistence failure recovery', () => {
     const recovery = () => ({ dispatch: [], refusals: [], applied: [] });
 
     const out = await daemon.runTickAllRepos({
-      repos: ['we'], now: () => 0, authGateOverride: () => ({ paused: false }),
+      repos: ['we'], now: () => 0, fenceOk: () => true, authGateOverride: () => ({ paused: false }),
       fixTick: empty, ciHealTick: () => runReconcileCiHealDispatch(f.options),
       promoteDraftTick: empty, hungCiTick: recovery, mainRedRebaseTick: recovery,
       missingRunTick: recovery, notesTick: () => ({ notes: [], prsByNumber: new Map() }),

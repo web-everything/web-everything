@@ -69,6 +69,24 @@ describe('cooperative ci-heal slices', () => {
     await maybe();
     expect(count).toBe(2);
     expect(logs.some(line => line.includes('ci-heal-slice-failed') && line.includes('broken'))).toBe(true);
+    expect(logs.filter(line => /gate slice (done|admitted|refused) at=/.test(line))).toHaveLength(1);
+  });
+
+  it.each([
+    [{ dispatched: [{}], refusals: [] }, 'admitted'],
+    [{ dispatched: [], refusals: [{}] }, 'refused'],
+    [{ dispatched: [], refusals: [] }, 'done'],
+  ])('logs completion outcome only after dispatch resolves (%j)', async (result, outcome) => {
+    const logs = [];
+    let finish;
+    const maybe = daemon.createCiHealSlicer({ fenceOk: () => true, now: () => 0,
+      log: line => logs.push(line), runSlice: () => new Promise(resolve => { finish = resolve; }) });
+    const pending = maybe();
+    await Promise.resolve();
+    expect(logs.filter(line => /gate slice (done|admitted|refused) at=/.test(line))).toEqual([]);
+    finish(result);
+    await pending;
+    expect(logs.at(-1)).toContain(`gate slice ${outcome} at=`);
   });
 
   it('main-red-rebase honors budgetMs and reports budgetHit', async () => {

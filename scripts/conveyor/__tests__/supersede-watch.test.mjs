@@ -125,7 +125,7 @@ describe('runSupersedeWatch', () => {
 
 const noopDispatch = () => ({ dispatched: [], refusals: [] });
 const noopRecovery = () => ({ dispatch: [], refusals: [], applied: [] });
-const tickFakes = () => ({ repos: [repo], fixTick: noopDispatch, ciHealTick: async () => noopDispatch(),
+const tickFakes = () => ({ repos: [repo], fenceOk: () => true, fixTick: noopDispatch, ciHealTick: async () => noopDispatch(),
   hungCiTick: noopRecovery, mainRedRebaseTick: noopRecovery, missingRunTick: noopRecovery,
   promoteDraftTick: noopDispatch, notesTick: () => ({ notes: [], prsByNumber: new Map() }),
   awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }), notesDryRun: true });

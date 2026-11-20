@@ -95,7 +95,7 @@ export default {
       const answerRepos = [];
       const fixSettings = resolveFixSettings({ env: {}, platform: {},
         read: () => JSON.stringify({ fix: { standDownAutoProceed: setting } }) });
-      const result = await runTickAllRepos({ repos: [weSlug, frontierSlug], fixSettings,
+      const result = await runTickAllRepos({ repos: [weSlug, frontierSlug], fixSettings, fenceOk: () => true,
         ...(override === undefined ? {} : { allowStandDownAutoProceed: override }),
         fixTick: input => runReconcileFixDispatch({ ...dispatchOptions, ...input,
           reconcile: input => runReconcilePass({ ...options, ...input,

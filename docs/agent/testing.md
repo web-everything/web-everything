@@ -5533,9 +5533,12 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 
 `reconcile-fix-dispatch-daemon-ci-heal-slice.test.mjs` uses a fake clock to cover two-hour cadence,
 lease-loss/unknown/read-error refusal, nested calls, retry after a thrown slice, and the main-red-rebase
-budget. The `ci-heal-own-loop-cadence` soak runs the real daemon with slow injected phases and judges
-emitted gate timestamps; its serial control must expose a gap over ten minutes. Keep this soak a required
-`it`, since `defineBreakTest` turns an absent fix into `it.fails` and would mask a cadence regression.
+budget. The `ci-heal-own-loop-cadence` soak runs real daemon phases and per-PR fix, recovery, promotion and notes loops with stubbed IO advancing
+a fake clock. Judge only post-dispatch `gate slice done|admitted|refused` timestamps; pre-dispatch and
+failed-slice logs are not completion evidence. Dropping the hook from the real recovery loop must fail
+the cadence judgement. Set `required: true` so `defineBreakTest` cannot mask a regression as `it.fails`.
+Recovery preserves its first-refresh progress floor even when discovery or a slice exhausts the absolute
+deadline, then defers later refreshes.
 Slices are cooperative: a single blocking read or PR action cannot be interrupted; inspect timestamp gaps
 and the phase timing logs when an individual action exceeds the interval. Run only scoped suites through
 the host heavy-admission queue.
