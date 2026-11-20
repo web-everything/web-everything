@@ -3638,7 +3638,7 @@ integration case that runs prune as root then reserves every slot as the operato
 
 ### Remote diff coverage inputs
 
-Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+Legacy remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
 then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
@@ -3649,7 +3649,7 @@ projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY
 and the complete target corpus; reject unsafe links or incomplete inputs before
 transfer. These projected inputs require full shipping.
 
-For remote `check:standards`, observe both output streams for skipped gates,
+For legacy remote `check:standards`, observe both output streams for skipped gates,
 `no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
 remote result to fall back through local admission; an invalid receipt keeps the
 result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
@@ -3958,7 +3958,7 @@ Remote transport stubs must answer the worktree-binding probe before inventory o
 use `fixtures/forge-bound-git.mjs` in injected-Git fixtures so transport-failure tests
 reach their intended run/finish branch. Keep their exact dispatch and no-local-rerun assertions.
 
-Coverage report rewrites must restore the timestamp captured from the open source file.
+Legacy coverage report rewrites must restore the timestamp captured from the open source file.
 Re-reading the staged timestamp and converting it again can truncate another microsecond,
 making coverage older than a source with the same original mtime. The absolute-path coverage
 table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
@@ -5087,6 +5087,14 @@ graceful skips require an existing explicit `fallbackDecision` skip decision; ab
 or `none` evidence must propagate validation and tool-denial errors. The #3481 replay in
 `review-pr-io.test.mjs` checks that unset-env probation retains unruled referral holds.
 
+## Forge pool grow failure fixtures
+
+`forge-slots.test.mjs` executes setup's account/directory preparation and final
+enable transaction with host IO stubbed. New directories use `.disabled-slot-N`:
+old and new runners discover only `slot-N`. Sudoers is prepared privately and
+published only after the installed runner verifies every target UID's egress.
+Keep failure cases before runner replacement as well as during final publication;
+restoring an old refresh timer must never make the staged slots discoverable.
 
 ## Verify failed-file recovery
 
@@ -5254,6 +5262,66 @@ persisted drop intent at interruption, and recovery confirming or restoring the 
 never creates operator retirement evidence. Both CLI `recover-drops` and sweep recovery use the
 same locked library helper; recovery failure must prevent retirement and unload receipts.
 
+### Audit-waiver compaction and host preference bounds
+
+New audit waivers belong in the ops JSONL store; legacy platform/tool waivers remain readable.
+The audited-tip gate uses the same union as prototype-load. Pruning retains entries on lookup errors;
+run `node scripts/operations/ruled-weakened-prune.mjs --dry-run` before applying compaction.
+The CLI uses remote heads and local commit objects against `origin/main`; refresh those objects
+separately before pruning. New recorder entries carry a repository ownership key derived from
+the selected checkout's origin. Pruning only removes entries with that same key; foreign entries
+and legacy entries without ownership survive even if their branch is absent or collides with a
+local branch. Origin aliases conservatively retain entries, and an unreadable origin retains all.
+Legacy ownership is never inferred from a branch name or retroactively assigned by replay;
+inspect the original repository before manually retiring those entries.
+Host platform-preference reads default to 2 MiB, independently of other
+bounded reads. An oversized file names its path and byte count; prune waivers or set
+`WE_HOST_OVERLOAD_PREFS_MAX_BYTES` to an explicit larger bound and retry.
+
+Waiver append and pruning share the ledger writer lock, keyed by the store parent's realpath
+and filename. Pruning holds it from the initial read through git probes and atomic replacement;
+lock contention refuses mutation with retry guidance. The process-interleaving regression in
+`scripts/operations/__tests__/ruled-weakened-concurrency.test.mjs` pauses pruning after its snapshot,
+proves a concurrent append waits, then verifies the new ruling survives compaction.
+
+Pruning also retains a waiver when either its recorded or current-head net-diff fingerprint is
+unavailable. The prune CLI regression injects each missing fingerprint separately and forces
+compaction of another entry, proving the retained ruling survives the rewrite. Unknown carry
+evidence is distinct from two readable, unequal fingerprints, which still drop a stale waiver.
+
+
+The repo-owned `scripts/operations/ruled-weakened-record.mjs` replaces approval replay in the
+external handoff recorder. Run it from the target repository: it checks current origin heads
+with one bounded `ls-remote` lookup and permits older approved heads only with the shared
+net-diff carry proof. Approvals supply rulings and `findingsHash` (SHA-256 of
+`JSON.stringify(findings)`); the latest canonical WEAKENED audit supplies verbatim findings,
+and WITHDRAWN requests veto recording. Replays deduplicate `(repository, ref, sha, ruling)`
+inside the append/prune lock. Unreadable evidence refuses writes; inputs above 16 MiB require
+archiving old records before retrying. Hermetic recorder proofs live in
+`scripts/operations/__tests__/ruled-weakened-record.test.mjs`.
+
+Prototype-load requires a fix-ready record carrying the waiver's ruling and verbatim disclosure
+before admitting a canonical WEAKENED audit. A waiver alone refuses and names
+`scripts/operations/fix-ready-record.mjs` as the recovery step. These regressions live in
+`scripts/operations/__tests__/prototype-load.test.mjs`.
+The recorder, store and load gate share the handoff R-number shape, including one lowercase
+letter suffix such as `R1063a` and combined rulings joined by `+`.
+
+
+Carry recording must persist the proof consumed by admission. The recorder's injected
+`carries(entry, head)` returns the proven net-diff fingerprint (not just `true`); the CLI
+returns it only after the shared `carriesAcross` comparison succeeds. The store accepts and
+preserves this optional 64-hex fingerprint, while legacy entries without it remain readable
+and malformed fingerprints refuse validation. Exact-head recording also saves available proof
+for future rebases. A replay can enrich a duplicate missing that proof only after the current
+head, canonical audit and approved verbatim findings validate again. The locked store rewrite
+preserves the original approval timestamp, findings and repository ownership; repeated or stale
+snapshots do not add duplicate rows. The recorder tests cover readiness before and after an
+unchanged rebase, legacy replay, changed code and cross-repository pruning through the real store.
+The named `recorder-to-load same-diff waiver
+admission` regression records an old approval through the real append/read store path, then
+loads the equivalent live head with matching carried fix-ready evidence. It also rejects changed code
+and changed canonical findings; an added-count assertion alone does not prove usable carry.
 ## Review capability admission at maintenance boundaries
 
 Same-tick draft promotion and follow-up cards can start work before ordinary review dispatch.
@@ -5283,6 +5351,77 @@ so settlement order cannot let an older clean call clear a newer exhaustion hold
 `review-extra-seats-discard-quota-order.test.mjs` covers both timestamp sources and append orders,
 including a newer clean call clearing an older hold. Replaying an old discarded call must not
 re-arm the probe interval; a fresh exhausted call does.
+## Forge tracked-at-HEAD manifests (S1)
+
+`remote.manifest` defaults to `legacy`; `tracked` binds shipped regular files to the
+pinned HEAD blob and executable mode. Resolve it from the standard and platform preferences
+only; checkout settings and `WE_HEAVY_ADMISSION_REMOTE_MANIFEST` cannot override it, even
+in private pools. The policy log includes its source.
+Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
+Tracked transport is always rsync: Git bundles contain history outside the validated
+leaf manifest. Git-dependent tests refuse with `bundle-local`, including needsGit
+routing with a cached bundle capability and the host-overload route. Tracked rsync uses
+the same route plus full-selection proof as legacy bundles: a readable pure-test filter
+can also select a Git-dependent test by substring, and must fall back locally. Record the refusal
+in the manifest log before local execution. Presync resolves the same canonical policy
+as admission and skips tracked or manifest-related fail-closed policies before any Git,
+SSH, rsync, lock or cache-state operation. Its legacy delta behavior is unchanged.
+The explicit remote CLI may force enablement only when manifest policy has not failed
+closed; retain and log the canonical refusal reason when entering local admission.
+Tracked admission refuses external client overrides before importing them: an older
+installed client may ignore the manifest option. The built-in client enforces the boundary.
+Coverage is never shipped in tracked mode, including `coverage/coverage-final.json` when
+ignored, untracked, staged or committed. Structure validation cannot bind coverage counters
+to genuine execution or HEAD. Commands that consume coverage input (`check:standards` or
+an explicitly supplied `DIFF_COVERAGE_BASE`, the existing standards/Git-input signal) refuse
+with `coverage-local` and run locally, even if the report is absent. Ordinary test commands
+omit the report without reading it. Generating coverage with `--coverage` does not itself
+consume a local coverage report. Legacy coverage inclusion, portability rewriting and
+full-ship selection remain unchanged.
+Sibling snapshots keep their existing index-based selection and identity checks; tracked
+runs bind every shipped sibling file's bytes and executable bit to the sibling's pinned HEAD
+tree, independently of the index and `core.fileMode`. Mode or content mismatches refuse as
+`dirty` before the final sibling status check. They also apply the path+oid size exceptions
+and binary allowlist, and count sibling bytes
+against the main manifest's total cap. Size/type refusals keep their manifest reason and
+are logged; operators can run locally or review a path+oid size exception.
+
+`remote.manifest` comes only from the canonical host preferences path, including when
+`WE_PLATFORM_PREFERENCES` redirects other settings for a private pool or test. Inject `home`
+into `loadAdmissionPolicy` to test that path without reading the real home file. Missing,
+unreadable, oversized, malformed or structurally invalid canonical evidence disables remote
+execution for every caller, with a policy source explaining the local fallback. A valid,
+existing canonical object without `remote.manifest` uses the standard manifest default.
+Direct `ENOENT` also fails closed, including after a previously tracked policy's cache expires.
+Remote-capable fixtures must inject an existing canonical preferences file via `home`.
+Neither CLI enablement nor last-good settings may override that manifest refusal.
+The shared `loadAdmissionPolicy` resolver is
+the only canonical manifest source for admission, the explicit CLI and presync. Failed reads
+are retried on the next call; they never use the redirected manifest or a cached last-good
+host manifest. An invalid
+platform manifest value disables remote execution with a policy source explaining the local
+execution requirement, even if private tool/environment settings enable remote execution.
+
+Every tracked refusal and every legacy shadow verdict appends metadata only to
+`~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.
+`buildManifest` takes an explicit `shadow` option, default false. `runRemote` selects
+it once from the original options, before `bindGit` wraps the executor, and carries
+it through delta assembly and full retries. Shadow evaluation runs only when the
+caller supplied no executor, filesystem or inventory (`listFiles`); injected callers
+retain the legacy exec/fs call sequence.
+`FORGE_MANIFEST_SHADOW=0` disables the default-on shadow for costly trees. Logging and
+shadow failures never alter legacy admission. Tests must point the log at their temp root.
+The real-Git `runRemote` regression replaces only SSH/rsync executables on PATH and
+asserts a completed legacy run still ships an untracked file while logging its
+shadow refusal; the injected-executor case compares calls against shadow disabled.
+`forge-manifest-tracked.test.mjs` exercises local fallback without remote dispatch,
+HEAD hashes, size bounds, binary extensions, coverage omission and setting provenance.
+`heavy-admission.test.mjs` covers canonical manifest authority and invalid-policy local execution.
+For the non-UTF-8 refusal-log case, inject the raw Git inventory record: filesystem
+sandboxes may deny creating such filenames before the manifest code can observe them.
+The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a
+temporary Git repository. Run these scoped tests through heavy admission; the soak
+file needs `--config vitest.soak.config.ts`.
 ## Negative review-run proofs
 
 `headNeverReviewedFromRuns` may bypass its 400-run scan only through
