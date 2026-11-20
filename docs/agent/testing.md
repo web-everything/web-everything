@@ -5780,6 +5780,7 @@ The tip required-check fallback also requires the completed `main-execution` mar
 (success or conditional skip). A failed or absent marker supplies no fresh push evidence.
 Hourly evidence is restricted to the live main head SHA; an unreadable head retains the hold.
 `main-red-evidence-regressions.test.mjs` covers these negative paths and attempt-start expiry.
+
 ## File-item batch history and warning coverage
 
 Existing batch validation must use the advertised remote main commit without updating the lane's
