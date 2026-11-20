@@ -62,6 +62,17 @@ describe('rebuild request failure budget and retention', () => {
     expect(pending()).toMatchObject({ id: req.id });
     expect(fs.existsSync(failureFile())).toBe(false);
   });
+  it('state-unreadable holds the tick and counts exactly one rebuild-request failure', async () => {
+    maxFailures('2'); const req = publish();
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'state-unreadable' }));
+    const w = owner(rebuild);
+    await expect(w.synced.tickOnce()).resolves.toMatchObject({ skipped: true, reason: 'state-unreadable' });
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(w.tick).not.toHaveBeenCalled();
+    expect(pending()).toMatchObject({ id: req.id });
+    expect(JSON.parse(fs.readFileSync(failureFile(), 'utf8'))).toMatchObject({ failures: 1 });
+    expect(w.log.error).toHaveBeenCalledWith(expect.stringContaining('state-unreadable'));
+  });
   it('an unspecified result cannot spend the failure budget through the ledger API', () => {
     maxFailures('1'); const req = publish();
     lock.recordRebuildRequestResult(root, { id: req.id, lockRoot, env, nowMs });

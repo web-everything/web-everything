@@ -884,9 +884,7 @@ describe('unaudited-tip wiring', () => {
     }
     expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-pinned '))).toHaveLength(1);
     expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-unaudited-tip '))).toHaveLength(1);
-  // Six real rebuild ticks plus repository setup: retain the requested two-minute
-  // integration budget when the host is busy, without changing any audit assertions.
-  }, 120_000);
+  }, 60_000);
 });
 
 describe('unaudited-tip evidence and policy', () => {

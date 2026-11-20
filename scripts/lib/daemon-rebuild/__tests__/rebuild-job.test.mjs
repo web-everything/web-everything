@@ -388,7 +388,8 @@ it.each([['early', true], ['recovery', true], ['tick-start', true], ['tick-start
       emitEvent, run, log: { error } });
     expect(result.reason).toBe('state-unreadable');
     expect(readFileSync(file)).toEqual(original);
-    expect(emitEvent).not.toHaveBeenCalled();
+    expect(emitEvent).toHaveBeenCalledTimes(1);
+    expect(emitEvent.mock.calls[0][0]).toMatchObject({ kind: 'rebuild-failed', detail: { reason: 'state-unreadable' } });
     expect(run).not.toHaveBeenCalled();
     expect(pending).not.toHaveBeenCalled();
     expect(watch).toHaveBeenCalledTimes(launchedBy === 'tick-start' ? 1 : 0);
@@ -397,7 +398,7 @@ it.each([['early', true], ['recovery', true], ['tick-start', true], ['tick-start
 
 it.each(['early', 'recovery'].flatMap(launchedBy =>
   ['state-unreadable', 'still-rejected', 'smoke-failed', 'future-refusal', 'rebuild-job-running'].map(reason => [launchedBy, reason])))(
-  '%s launchOnly %s skips pending rewrites, failure alerts and force-watch', async (launchedBy, reason) => {
+  '%s launchOnly %s preserves pending/watch state and accounts for unreadable evidence', async (launchedBy, reason) => {
     const refused = { moved: false, reason, ...(reason === 'rebuild-job-running' ? { unknownJobState: true } : {}) };
     vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockResolvedValue(refused);
     const pending = vi.spyOn(overlayAdoption, 'checkPendingAdoptions').mockResolvedValue([]);
@@ -407,7 +408,10 @@ it.each(['early', 'recovery'].flatMap(launchedBy =>
       launchedBy, emitEvent, log: { error() {} } })).toEqual(refused);
     expect(pending).not.toHaveBeenCalled();
     expect(watch).not.toHaveBeenCalled();
-    expect(emitEvent).not.toHaveBeenCalled();
+    if (reason === 'state-unreadable') {
+      expect(emitEvent).toHaveBeenCalledTimes(1);
+      expect(emitEvent.mock.calls[0][0]).toMatchObject({ kind: 'rebuild-failed', detail: { reason } });
+    } else expect(emitEvent).not.toHaveBeenCalled();
   });
 
 it.each(['still-rejected', 'state-unreadable', 'future-refusal'])(

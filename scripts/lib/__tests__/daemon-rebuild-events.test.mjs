@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,9 @@ import * as rebuild from '../daemon-rebuild/rebuild.mjs';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
-import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
+import { pendingAdoptionPath } from '../overlay-adoption.mjs';
+import { rebuildStatePath, writeRebuildState } from '../daemon-rebuild/state.mjs';
 
 const sha = 'b'.repeat(40);
 const { FAILURE_REASONS, rebuildClone } = rebuild;
@@ -63,6 +65,40 @@ function expectEvent(kind, detail) {
 }
 
 describe('rebuildClone coordination events', () => {
+  it.each([
+    ['tick-start', { launchedBy: 'tick-start', asJob: false }],
+    ['early', { launchedBy: 'early', launchOnly: true, asJob: true }],
+    ['recovery', { launchedBy: 'recovery', launchOnly: true, asJob: true }],
+    ['inline', { asJob: false }],
+    ['inline early', { launchedBy: 'early', asJob: false }],
+    ['inline recovery', { launchedBy: 'recovery', asJob: false }],
+    ['as-job', { launchedBy: 'tick-start', asJob: true }],
+  ].flatMap(([provenance, flags]) => ['EIO', 'EACCES', 'corrupt', 'shape'].map(fault => [provenance, fault, flags])))(
+    '%s %s evidence refusal emits exactly one failure and preserves state/pending bytes', async (_provenance, fault, flags) => {
+      writeRebuildState(options.root, {}, options.env);
+      const file = rebuildStatePath(options.root, options.env);
+      if (fault === 'corrupt' || fault === 'shape') writeFileSync(file, fault === 'corrupt' ? '{broken' : '{}');
+      const pending = pendingAdoptionPath(options.root, options.env);
+      mkdirSync(dirname(pending), { recursive: true });
+      writeFileSync(pending, JSON.stringify([{ ref: 'lane/overdue', sha, at: new Date(0).toISOString() }]) + '\n');
+      const stateBytes = readFileSync(file), pendingBytes = readFileSync(pending);
+      options.emitEvent.mockImplementation(appendDaemonEvent);
+      const evidenceRead = (path, ...args) => {
+        if (path === file && ['EIO', 'EACCES'].includes(fault)) throw Object.assign(new Error(fault), { code: fault });
+        return readFileSync(path, ...args);
+      };
+      expect(await rebuildClone({ ...options, ...flags, evidenceRead })).toEqual({ moved: false, reason: 'state-unreadable' });
+      expectEvent('rebuild-failed', { reason: 'state-unreadable' });
+      expect(readFileSync(options.env.WE_DAEMON_EVENTS, 'utf8').trim().split('\n').map(JSON.parse)).toEqual([
+        expect.objectContaining({ kind: 'rebuild-failed', detail: { reason: 'state-unreadable' } }),
+      ]);
+      expect(readFileSync(file)).toEqual(stateBytes);
+      expect(readFileSync(pending)).toEqual(pendingBytes);
+      expect(prepareRebuild).not.toHaveBeenCalled();
+      expect(options.run).not.toHaveBeenCalled();
+    },
+  );
+
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
     const result = { moved: true, adopted: true, head: sha, prevHead, plan: { finalSha: sha }, alerts: [] };
     smokeAndAdopt.mockResolvedValue(result);
@@ -280,7 +316,7 @@ describe('rebuildClone coordination events', () => {
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',
       'ready-audit-revoked', 'rejected-since', 'root-changed-during-smoke', 'skipped-unrelated', 'smoke-backoff',
       'smoke-env-load', 'smoke-env-timeout-backoff', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'smoke-queue-timeout', 'stack-base-moved',
-      'stack-contained', 'state-file-busy', 'state-unreadable', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
+      'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unaudited-tip-held', 'unknown', 'unsafe-ref',
       'untracked-collision', 'unverified-build', 'up-to-date',
     ]);

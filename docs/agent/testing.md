@@ -5286,6 +5286,19 @@ timeout and a later passing smoke on unchanged inputs; the soak fixture checks q
 
 ### Detached rebuild evidence policy
 
+Evidence refusals emit exactly one `rebuild-failed` coordination event with reason
+`state-unreadable` for every launch provenance, including between-tick launches.
+The event never authorizes pending-adoption or rebuild-state rewrites. Keep the
+fault/provenance matrix in `daemon-rebuild-events.test.mjs` and the request-failure
+ledger regression in `daemon-rebuild-request-failures.test.mjs` in the affected gate.
+`withSelfSync` uses the strict state reader for quarantine checks: ENOENT allows a
+normal tick; read, parse or shape errors visibly skip with `state-unreadable` and
+preserve the file. A rebuild returning that reason also skips before restarting
+or ticking. `daemon-self-sync.test.mjs` pins these holds and real daemon loggers.
+Its maintenance descendant assertions accept a reaped PID only when `kill(pid, 0)`
+returns ESRCH; live PIDs still require the existing `ps` stopped/zombie proof, and
+permission failures never count as proof of exit.
+
 Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
 recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
 `rebuildClone` installs the same strict evidence policy for every provenance, including tick-start and inline rebuilds.

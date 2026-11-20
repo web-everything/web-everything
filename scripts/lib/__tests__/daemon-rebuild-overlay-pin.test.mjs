@@ -82,7 +82,7 @@ function fixture() {
 }
 
 // Real Git setup and multiple rebuild ticks share each test's wall-clock budget. Match the
-// requested 120-second integration budget so busy shards retain the same assertions.
+// existing 60-second cases so the remaining scenarios have the same headroom on CI shards.
 describe('overlay-pin — a moving overlay whose new tip conflicts stays at its adopted head', () => {
   it('holds without a pin alert or persisted notice when the pin commit-tree fails', async () => {
     const f = fixture();
@@ -111,7 +111,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(readRebuildState(f.clone, f.env).pinnedNotified?.['lane/moving']).toBeUndefined();
     expect(f.head()).toBe(head);
     expect(f.smoke).not.toHaveBeenCalled();
-  }, 120_000);
+  }, 60_000);
 
   it('persists pin notices before a later overlay refuses the plan and deduplicates repeated refused ticks', async () => {
     const f = fixture();
@@ -145,7 +145,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(isAncestor(f.clone, f.mOld, f.head())).toBe(true);
     expect(readOverlays(f.clone, { env: f.env }).map(o => o.ref).sort())
       .toEqual(registered.filter(o => o.ref !== 'lane/refusal').map(o => o.ref).sort());
-  }, 120_000);
+  }, 60_000);
 
   it('refuses to pin when the adopted head also conflicts', async () => {
     const f = fixture();
@@ -179,7 +179,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(readRebuildState(f.clone, f.env).held).toMatchObject({ reason: 'established-overlay-conflict', lastGood: live });
     expect(readFileSync(join(f.clone, 'moving.txt'), 'utf8')).toBe('v1\n');
     expect(readOverlays(f.clone, { env: f.env })).toEqual(registered);
-  }, 120_000);
+  }, 60_000);
 
   it('logs one overlay-pinned alert over three unchanged ticks for __proto__', async () => {
     const f = fixture();
@@ -193,7 +193,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     const notified = readRebuildState(f.clone, f.env).pinnedNotified;
     expect(Object.hasOwn(notified, '__proto__')).toBe(true);
     expect(notified.__proto__).toBe(tip);
-  }, 120_000);
+  }, 60_000);
 
   it('an adopted head already carried by a sibling overlay produces no content-free pin or overlay-pinned alert', async () => {
     const f = fixture();
@@ -262,7 +262,7 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(f.head()).toBe(live);
     expect(isAncestor(f.clone, pinned, f.head())).toBe(true);
     expect(readOverlays(f.clone, { env: f.env }).map((o) => o.ref)).toEqual(['lane/pinned', 'lane/repair', 'lane/good']);
-  }, 120_000);
+  }, 60_000);
 
   it.each([
     { name: 'retryable pin first', order: ['lane/a', 'lane/b', 'lane/c'], joint: false },
@@ -407,4 +407,4 @@ describe('overlay-pin — a moving overlay whose new tip conflicts stays at its 
     expect(isAncestor(f.clone, u, f.head())).toBe(true);
     expect(readRebuildState(f.clone, f.env).held ?? null).toBeNull();
   });
-}, 120_000);
+}, 60_000);

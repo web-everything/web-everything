@@ -222,7 +222,7 @@ describe('the Git proof of omitted content in the candidate build', () => {
         expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(main);
         expect(smoke).toHaveBeenCalledTimes(1);
       }
-    }, 120_000,
+    }, 20_000,
   );
 });
 

@@ -313,7 +313,7 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
       .mockResolvedValue({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
     await tick(cloneDir, env, { runSmoke: failThenPass });
     expect(readRebuildState(cloneDir, env).rejected).toMatchObject({ reason: 'daemon-entries-boot' });
-    expect(readRebuildState(cloneDir, env).rejected.retryAt ?? null).toBeNull(); // sticky rejection: no retry deadline (absent in the legacy shape)
+    expect(readRebuildState(cloneDir, env).rejected.retryAt).toBeUndefined(); // sticky: no retryAt for a non-external failure
     const held = failing();
     expect((await tick(cloneDir, env, { runSmoke: held })).reason).toBe('still-rejected'); // control: no request, no smoke
     expect(held).not.toHaveBeenCalled();

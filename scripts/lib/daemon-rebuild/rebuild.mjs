@@ -48,7 +48,7 @@ export const FAILURE_REASONS = new Set([
   'reader-wait-timeout', 'rebuild-threw', 'remote-termination-unconfirmed', 'reset-failed', 'reset-rollback-failed', 'restore-failed',
   'rev-parse-failed', 'rollback-failed', 'save-failed', 'scratch-init-failed',
   'smoke-failed', 'smoke-harness-broken', 'smoke-rejected', 'smoke-retry',
-  'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable',
+  'smoke-reused-env-failed', 'smoke-threw', 'state-file-unparsable', 'state-file-unreadable', 'state-unreadable',
   'status-failed', 'status-unreadable', 'still-rejected', 'swap-failed', 'switch-failed',
   'worktree-add-failed', 'error',
 ]);
@@ -116,9 +116,10 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
   const readers = createRebuildReaders({ strict: true, read: options.evidenceRead });
   return withRebuildReaders(readers, async () => {
     const startedAtMs = Date.now();
+    let result;
     try {
       readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
-      return await rebuildCloneWithReaders(emitEvent, options);
+      result = await rebuildCloneWithReaders(emitEvent, options);
     } catch (error) {
       if (!(error instanceof RebuildEvidenceError)) throw error;
       (options.log ?? console).error?.(error.message);
@@ -129,28 +130,18 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
           (options.log ?? console).error?.(watchError.message);
         }
       }
-      return { moved: false, reason: 'state-unreadable' };
+      result = { moved: false, reason: 'state-unreadable' };
     }
+    await emitRebuildResult(emitEvent, options, result);
+    return result;
   });
 }
 
-async function rebuildCloneWithReaders(emitEvent, options) {
-  const startedAtMs = Date.now();
-  const result = await rebuildCloneInternal(options);
-  const { waitInFlightTickMs, waitSmokeSlotMs } = result;
-  // Keep the caller's enumerable result contract stable. The CLI explicitly serializes this record
-  // for the detached job; ordinary equality checks, spreads and JSON retain the legacy shape.
-  if (waitInFlightTickMs !== undefined || waitSmokeSlotMs !== undefined) {
-    delete result.waitInFlightTickMs;
-    delete result.waitSmokeSlotMs;
-    Object.defineProperty(result, 'timing', { value: { waitInFlightTickMs, waitSmokeSlotMs } });
-  }
-  // A refused between-tick launch must preserve evidence for operator repair, including
-  // pending adoptions, event/alert state and any force-watch rollback bookkeeping.
-  if (result.reason === 'state-unreadable') {
-    (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
-  }
-  if (isBetweenTickLaunch(options)) return result;
+// Account for the final outcome once, including evidence errors and between-tick refusals.
+// This writes only the coordination feed; pending/state housekeeping remains below.
+async function emitRebuildResult(emitEvent, options, result) {
+  // Between-tick launch housekeeping stays deferred; unreadable evidence must still be accounted for.
+  if (isBetweenTickLaunch(options) && result.reason !== 'state-unreadable') return;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -166,6 +157,28 @@ async function rebuildCloneWithReaders(emitEvent, options) {
         kind: 'rebuild-failed', daemon: basename(options.root), detail: { reason: result.reason },
       }, eventOptions);
     }
+  } catch { /* Event failures must never change the rebuild outcome. */ }
+}
+
+async function rebuildCloneWithReaders(emitEvent, options) {
+  const startedAtMs = Date.now();
+  const result = await rebuildCloneInternal(options);
+  const { waitInFlightTickMs, waitSmokeSlotMs } = result;
+  // Keep the caller's enumerable result contract stable. The CLI explicitly serializes this record
+  // for the detached job; ordinary equality checks, spreads and JSON retain the legacy shape.
+  if (waitInFlightTickMs !== undefined || waitSmokeSlotMs !== undefined) {
+    delete result.waitInFlightTickMs;
+    delete result.waitSmokeSlotMs;
+    Object.defineProperty(result, 'timing', { value: { waitInFlightTickMs, waitSmokeSlotMs } });
+  }
+  // A refused between-tick launch must preserve evidence for operator repair, including
+  // pending adoptions, alert state and any force-watch rollback bookkeeping.
+  if (result.reason === 'state-unreadable') {
+    (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
+  }
+  if (isBetweenTickLaunch(options)) return result;
+  try {
+    const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // The rebuild path announces adoption of overlays that prototype-load registered and returned from.
     if (result.reason !== 'state-unreadable') await checkPendingAdoptions({
       overdueMs: resolveRecovery({ env: options.env, log: m => options.log?.error?.(m) }).overlayOverdueMs,

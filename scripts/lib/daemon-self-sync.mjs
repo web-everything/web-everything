@@ -84,7 +84,7 @@
  *   2. Otherwise, acquire the clone's READ lock (`acquireRead`, Module A). Refused (a writer — i.e. a rebuild,
  *      possibly a SIBLING process's — is active) ⇒ log and return `{skipped:true, reason}`: skip this tick
  *      entirely rather than ever read a tree mid-move.
- *   3. Under the read lock: if the rebuild state (`readState`, defaults to `readRebuildState`) shows the clone
+ *   3. Under the read lock: if the rebuild state (`readState`, defaults to `readRebuildStateStrict`) shows the clone
  *      quarantined ⇒ release the lock and skip the tick (never run children off a rejected tree, never
  *      restart onto it). Else if `HEAD` has moved since this process's own boot (#3383 bug 2's drift check,
  *      unchanged in spirit) ⇒ release the lock FIRST, then `onRestart({reason:'head-moved'})` — safe because
@@ -125,9 +125,9 @@ import { collectImportClosure, closureHits } from './import-closure.mjs';
 
 export { collectImportClosure };
 import { gateMergedCommit } from './daemon-live-smoke.mjs';
-import { rebuildClone, readRebuildState } from './daemon-rebuild.mjs';
+import { rebuildClone } from './daemon-rebuild.mjs';
 import { FAILURE_REASONS } from './daemon-rebuild/rebuild.mjs';
-import { readReadyCandidate } from './daemon-rebuild/state.mjs';
+import { readReadyCandidate, readRebuildStateStrict } from './daemon-rebuild/state.mjs';
 import { createEarlyLaunchWatcher, createMainMoveReader, resolveEarlyLaunch } from './daemon-rebuild-early-watch.mjs';
 import { createAdoptYieldProbe } from './daemon-rebuild/adopt-yield.mjs';
 import { resolveVersionedContext, isInsideVersions, currentVersion } from './daemon-version-runtime.mjs';
@@ -801,13 +801,13 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
  *   base?:string, pocBranch?:string, env?:NodeJS.ProcessEnv, log?:Console, timeoutMs?:number,
  *   readHead?:typeof readHeadSha, readOriginRef?:typeof readOriginRefSha, hasStaleRefusal?:(tickResult:any)=>boolean,
  *   gate?:typeof gateMergedCommit, mainOnly?:boolean, rebuild?:(o?:object)=>Promise<object>,
- *   acquireRead?:typeof acquireReadLock, releaseRead?:typeof releaseReadLock, readState?:typeof readRebuildState,
+ *   acquireRead?:typeof acquireReadLock, releaseRead?:typeof releaseReadLock, readState?:typeof readRebuildStateStrict,
  *   readReady?:typeof readReadyCandidate, maxAdoptWaitTicks?:number}} o
  */
 export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
-  mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
+  mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildStateStrict,
   readReady = readReadyCandidate, maxAdoptWaitTicks: maxAdoptWaitTicksOpt,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
@@ -832,6 +832,10 @@ export function withSelfSync(effects, {
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
   const tick = effects.tickOnce;
+  const unreadableHold = () => {
+    log.error?.('daemon-self-sync: state-unreadable — skipping this tick; repair persisted evidence before retrying');
+    return skippedTick('state-unreadable');
+  };
   const realIo = rebuildOpt === undefined;
   const adoptWait = maxAdoptWaitTicksOpt === undefined
     ? resolveMaxAdoptWaitTicks(env, loadAdoptWaitSettings())
@@ -1007,6 +1011,7 @@ export function withSelfSync(effects, {
   const inVersion = !!vctx && isInsideVersions(vctx, root);
   const versionedTick = async (args) => {
     const rebuildResult = await rebuild();
+    if (rebuildResult?.reason === 'state-unreadable') return unreadableHold();
     if (rebuildResult && rebuildResult.moved && rebuildResult.adopted) {
       const cur = versionApi.currentVersion(vctx);
       if (inVersion && cur && restartGate(rebuildResult.head, { diffRoot: cur.dir }).restart) {
@@ -1212,6 +1217,7 @@ export function withSelfSync(effects, {
       //    side — adopt a smoke-passed candidate, else queue or watch the detached job; it never smokes here. An
       //    adopted build restarts INSTEAD of ticking — the read lock below is never even acquired for this tick.
       const rebuildResult = await rebuild();
+      if (rebuildResult?.reason === 'state-unreadable') return unreadableHold();
       if (rebuildResult?.moved) {
         readyIdentity = null;
         adoptWaitTicks = 0;
@@ -1327,7 +1333,9 @@ export function withSelfSync(effects, {
           if (recloneBlocks()) { releaseOnce(); return recloneSkip(); }
 
           // 3. Under the read lock: a quarantined clone never runs children, never restarts onto it.
-          const rebuildState = readState(root, env);
+          let rebuildState;
+          try { rebuildState = readState(root, env); }
+          catch { return unreadableHold(); }
           if (rebuildState.quarantine) {
             releaseOnce();
             log.error?.('daemon-self-sync: the clone is quarantined (#4044) — skipping this tick, never running children off a rejected tree');
