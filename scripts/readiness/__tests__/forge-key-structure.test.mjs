@@ -1,5 +1,5 @@
 // @vitest-environment node
-import {createPrivateKey,generateKeyPairSync,sign,verify} from 'node:crypto';
+import {createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {inspect} from 'node:util';
 import {runInNewContext} from 'node:vm';
 import {describe,expect,it} from 'vitest';
@@ -38,6 +38,23 @@ const blocked=content=>{
 };
 
 describe('Forge key structure slice 1',()=>{
+  it.each(['\\x6bty','k\\x74y','kt\\x79','\\x6b\\x74\\x79','\\x6B\\u0074y','\\u{6b}t\\x79',
+    'kt\\y','\\kt\\y',...['\n','\r','\r\n','\u2028','\u2029'].map(end=>'k\\'+end+'ty')])(
+    'finds a private JWK with member %j after stray prose quotes',name=>{
+      const privateKey=createPrivateKey({key:Buffer.from('302e020100300506032b657004220420'+'01'.repeat(32),'hex'),format:'der',type:'pkcs8'});
+      const publicKey=createPublicKey(privateKey);
+      const message=Buffer.from('hex member regression');
+      for(const quote of ['"',"'"]) {
+        const render=key=>JSON.stringify(key.export({format:'jwk'})).replace(keyType,name).replaceAll('"',quote);
+        const object=render(privateKey);
+        const reconstructed=createPrivateKey({key:runInNewContext('('+object+')'),format:'jwk'});
+        expect(verify(null,message,publicKey,sign(null,message,reconstructed))).toBe(true);
+        for(const lead of ['', 'a stray " ', "a stray ' ",'a stray "\n','a stray "\r','a stray "\u2028','a stray "\u2029']) {
+          blocked(Buffer.from(lead+object));
+          expect(keyStructureFinding(Buffer.from(lead+render(publicKey)))).toBeNull();
+        }
+      }
+    });
   it.each(['\n','\r','\r\n','\u2028','\u2029'])('ends JavaScript line comments at %j before scanning private JWK members',lineEnd=>{
     const {privateKey,publicKey}=generateKeyPairSync('ed25519');
     const json=JSON.stringify(privateKey.export({format:'jwk'}));

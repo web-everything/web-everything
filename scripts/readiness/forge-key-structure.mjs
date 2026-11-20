@@ -100,10 +100,10 @@ function afterTrivia(text,index) {
 const codePoint=hex=>{const value=parseInt(hex,16);return value>0x10ffff?'�':String.fromCodePoint(value);};
 function stringValue(token) {
   if(token[0]!=='"'&&token[0]!=="'")return null;
-  return token.slice(1,-1).replace(/\\(?:u(?:([\da-f]{4})|\{([\da-f]+)\})|x([\da-f]{2})|\r\n|([\s\S]))/gi,(_,unicode,braced,hex,char)=>{
+  return token.slice(1,-1).replace(/\\(?:u(?:([\da-f]{4})|\{([\da-f]+)\})|x([\da-f]{2})|(\r\n|[\s\S]))/gi,(_,unicode,braced,hex,char)=>{
     if(braced)return codePoint(braced);
     if(unicode||hex)return String.fromCharCode(parseInt(unicode||hex,16));
-    return ({n:'\n',r:'\r',t:'\t',b:'\b',f:'\f',v:'\v','0':'\0','\n':'','\r':'','\u2028':'','\u2029':''})[char]??char;
+    return ({n:'\n',r:'\r',t:'\t',b:'\b',f:'\f',v:'\v','0':'\0','\n':'','\r':'','\r\n':'','\u2028':'','\u2029':''})[char]??char;
   });
 }
 
@@ -208,8 +208,8 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // Independent object candidates: global quote pairing above can be thrown off by stray double quotes in prose
   // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
   // from that brace only, bounded in length, so nothing before it can hide the object.
-  // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
-  if(/kty|\\u/i.test(text)) {
+  // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
+  if(/kty|\\/i.test(text)) {
     const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
