@@ -97,6 +97,61 @@ const fixtures=()=>{
 };
 
 describe('Forge key structure consumer compatibility',()=>{
+  it('I2 blocks the consumer-importable UTF8String fragment through manifest admission',()=>{
+    const bytes=Buffer.from('3030020100300506032b657024240c220420'+'01'.repeat(32),'hex');
+    const imported=createPrivateKey({key:bytes,format:'der',type:'pkcs8'});
+    expect(imported.asymmetricKeyType).toBe('ed25519');
+    for(const view of wrappers(bytes)) {
+      expect.soft(keyStructurePrecheck(view)).toBe(true);
+      expect.soft(keyStructureFinding(view,{precheck:false})).toBe(FINDING);
+      expect.soft(keyStructureFinding(view)).toBe(FINDING);
+      expect.soft(credentialBufferFinding(view)).toBe(FINDING);
+    }
+    for(const encoding of ['base64','hex']) {
+      expect.soft(()=>manifestEntry(Buffer.from('docs/token.md'),Buffer.from(bytes.toString(encoding)),false,true))
+        .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(FINDING)}));
+    }
+  });
+
+  it.each(['pkcs8','sec1','encrypted pkcs8'])(
+    'I2 %s imports arbitrary constructed-octet fragment tags and blocks manifest admission',kind=>{
+      const type=kind==='sec1'?'sec1':'pkcs8';
+      const {privateKey}=kind==='sec1'?generateKeyPairSync('ec',{namedCurve:'prime256v1'}):
+        generateKeyPairSync('ed25519');
+      const passphrase=kind==='encrypted pkcs8'?'test':undefined;
+      const canonical=privateKey.export({format:'der',type});
+      const primitive=passphrase?privateKey.export({format:'der',type,cipher:'aes-256-cbc',passphrase}):canonical;
+      const field=kind==='pkcs8'?2:1;
+      const payload=parts(read(primitive).body)[field].body;
+      // OpenSSL collects primitive payloads irrespective of tag/class, and recurses
+      // on the constructed bit. Include zero and high-numbered tags, not just UTF8String.
+      for(const tag of [[0],[2],[3],[5],[6],[12],[22],[64],[128],[192],[31,31],[31,129,0],
+        [159,31],[32],[44],[48],[160],[191,31]])for(const indefinite of [false,true]) {
+        const split=Math.ceil(payload.length/2);
+        const fragment=body=>{
+          const constructed=Boolean(tag[0]&32);
+          const encoded=encode(tag[0],constructed?encode(12,body):body,constructed&&indefinite);
+          return Buffer.concat([Buffer.from(tag),encoded.subarray(1)]);
+        };
+        const replacement=encode(36,Buffer.concat([fragment(payload.subarray(0,split)),
+          fragment(payload.subarray(split)),...(tag[0]===0?[]:[fragment(Buffer.alloc(0))])]),indefinite);
+        const bytes=replaceField(primitive,field,replacement);
+        const witness=`${kind} tag=${tag.join(',')} indefinite=${indefinite}`;
+        const imported=createPrivateKey({key:bytes,format:'der',type,passphrase});
+        expect(imported.export({format:'der',type}),witness).toEqual(canonical);
+        for(const view of wrappers(bytes)) {
+          expect.soft(keyStructurePrecheck(view),witness).toBe(true);
+          expect.soft(keyStructureFinding(view,{precheck:false}),witness).toBe(FINDING);
+          expect.soft(keyStructureFinding(view),witness).toBe(FINDING);
+          expect.soft(credentialBufferFinding(view),witness).toBe(FINDING);
+        }
+        for(const encoding of ['base64','hex']) {
+          expect.soft(()=>manifestEntry(Buffer.from('docs/token.md'),Buffer.from(bytes.toString(encoding)),false,true),witness)
+            .toThrow(expect.objectContaining({code:'excluded-source-file',message:expect.stringContaining(FINDING)}));
+        }
+      }
+    });
+
   it.each(['primitive','constructed','indefinite constructed','nested fragments','indefinite nested fragments'])(
     'I2 encrypted PKCS8 %s ciphertext imports and is blocked through manifest admission',variant=>{
       const {privateKey}=generateKeyPairSync('ed25519');
@@ -127,7 +182,9 @@ describe('Forge key structure consumer compatibility',()=>{
   it('I2 encrypted PKCS8 rejects empty or malformed constructed ciphertext',()=>{
     const algorithm=encode(48,Buffer.concat([encode(6,Buffer.from([42,3])),encode(48,Buffer.alloc(0))]));
     for(const ciphertext of [encode(36,Buffer.alloc(0)),encode(36,encode(4,Buffer.alloc(0))),
-      encode(36,encode(2,Buffer.from([7]))),encode(36,Buffer.from([4,2,7])),
+      encode(2,Buffer.from([7])),encode(36,Buffer.from([4,2,7])),
+      encode(36,Buffer.from([31,128])),encode(36,Buffer.from([31,31,4,7])),
+      encode(36,Buffer.from([0,0])),encode(36,Buffer.from([12,128,7,0,0])),
       encode(36,encode(4,Buffer.from([7])),true).subarray(0,-1)]) {
       const bytes=encode(48,Buffer.concat([algorithm,ciphertext]));
       expect(keyStructureFinding(bytes,{precheck:false})).toBeNull();
@@ -135,10 +192,11 @@ describe('Forge key structure consumer compatibility',()=>{
     }
   });
 
-  it('I2 encrypted PKCS8 excessive constructed ciphertext nesting fails closed',()=>{
+  it.each([36,48,160])('I2 encrypted PKCS8 excessive fragment nesting (tag %s) fails closed',tag=>{
     const algorithm=encode(48,Buffer.concat([encode(6,Buffer.from([42,3])),encode(48,Buffer.alloc(0))]));
     let ciphertext=encode(4,Buffer.from([7]));
-    for(let depth=0;depth<66;depth++)ciphertext=encode(36,ciphertext);
+    for(let depth=0;depth<66;depth++)ciphertext=encode(tag,ciphertext);
+    ciphertext=encode(36,ciphertext);
     const bytes=encode(48,Buffer.concat([algorithm,ciphertext]));
     const exhausted='private-key-scan-budget-exhausted-use-local';
     expect(keyStructureFinding(bytes,{precheck:false})).toBe(exhausted);
@@ -178,10 +236,10 @@ describe('Forge key structure consumer compatibility',()=>{
       expect(keyStructureFinding(view),name).toBe(FINDING);
   });
 
-  it('I2 rejects incomplete BER, misplaced EOC, primitive indefinite and non-octet fragments',()=>{
+  it('I2 rejects incomplete BER, misplaced EOC, primitive indefinite and non-octet outer fields',()=>{
     const scalar=encode(48,Buffer.concat([encode(2,Buffer.from([1])),encode(4,Buffer.from([7]))]),true);
     const badOctets=encode(48,Buffer.concat([encode(2,Buffer.from([1])),
-      encode(36,encode(2,Buffer.from([7])),true)]),true);
+      encode(2,Buffer.from([7]))]),true);
     for(const bytes of [scalar.subarray(0,-1),scalar.subarray(0,-2),badOctets,
       Buffer.from([48,128,2,1,1,4,128,7,0,0,0,0]),
       Buffer.from([48,128,2,1,1,0,0,4,1,7,0,0])])
