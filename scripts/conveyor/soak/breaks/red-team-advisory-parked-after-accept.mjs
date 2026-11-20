@@ -19,7 +19,7 @@ export default {
       const { planRedTeamOnSkip } = await load('scripts/lib/review-red-team-on-skip.mjs');
       const repo = 'web-everything/web-everything', pr = 7116, head = 'a'.repeat(40), id = 'review-pr-parked';
       const runsDir = join(dir, 'runs'), env = { WE_SHARED_RUNS_DIR: runsDir, OPERATION_RUNS_DIR: runsDir };
-      const key = { repo, pr, head, runsDir, env, readScorecards: () => [] };
+      const key = { repo, pr, head, runsDir, env, now: Date.now() + 2 * 60 * 60_000, readScorecards: () => [] };
       const make = (id, at) => ({ ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
         verdict: { verdict: 'accept' }, findings: { read: { repo, pr, netBasis: { rev: head } } },
         stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(at).toISOString() }] });
@@ -32,18 +32,23 @@ export default {
         refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
         rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }],
         setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
-        readEvidence: () => held, readStatus: () => null, headNeverReviewed: () => false,
+        readEvidence: () => readDrainRedTeamEvidence(key), readStatus: () => null, headNeverReviewed: () => false,
         readReviewRuns: () => [{ id, repo, pr, head }] })[0];
       const refused = plan();
       // A person resolves the unknown advisory outcome before a safe fresh panel is permitted.
       writeRun({ ...make(id, 2000), pending: { kind: 'effect', step: 'advise', stepIndex: 1 },
         effects: [{ key: 'note', type: 'review.note', stepIndex: 1, index: 0, status: 'failed', attempts: 2, unknownAttempts: 0 }] }, runsDir);
+      markRunAbandoned({ id, dir: runsDir, reason: 'legacy unbound owner', by: 'soak', probes: { owner: 'dead' } });
+      const legacy = plan();
+      // Replace the legacy sidecar with a proof bound to the current record.
+      rmSync(join(runsDir, `${id}.abandoned.json`));
       markRunAbandoned({ id, dir: runsDir, reason: 'owner dead', by: 'soak',
         probes: { owner: 'dead', recordVersion: runRecordVersion(statSync(join(runsDir, `${id}.json`))) } });
       const decision = plan();
       writeRun(make('review-pr-fresh-accept', 3000), runsDir);
       const released = readDrainRedTeamEvidence(key);
       const checks = {
+        unboundTombstoneEscalates: legacy.action === 'skip' && legacy.escalate === true,
         unknownWriteEscalates: refused.action === 'skip' && refused.escalate === true,
         tombstoneAloneHolds: held.ok === false && held.reason === 'review-unfinished',
         plannerDispatchesReview: decision.action === 'review'

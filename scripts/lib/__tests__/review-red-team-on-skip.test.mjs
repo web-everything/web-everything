@@ -20,7 +20,7 @@ import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublica
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -64,7 +64,7 @@ describe('unfinished CI-held record retry', () => {
     const o = runFixture(options(saved(attempts)));
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
       why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
   });
   it.each([
     ['off at zero', () => options(saved(), 0)],
@@ -109,7 +109,7 @@ describe('unfinished retryable record effect', () => {
     const o = runFixture(options([row]));
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
       why: 'unfinished review has only a retryable pre-write effect; resume it' });
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
   });
   it.each([
     ['not retryable', [{ ...row, retryableRecordEffect: false }]],
@@ -412,7 +412,7 @@ describe('#6345 — resume a stored needs-human review after its refused referra
       why: 'stored review needs-human only on referrals now ruled; resume the parked run' });
     expect(o.readReviewRuns).toHaveBeenCalled();
     expect(o.dispatch).toHaveBeenCalledTimes(1);
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
   });
 
   it.each([
@@ -1537,7 +1537,7 @@ describe('runRedTeamOnSkip', () => {
   });
   it('dispatches the existing job, spends capacity and records cooldown only for starts', () => {
     const log = vi.fn(), o = runFixture({ log, preferLane: 7 }); const out = runRedTeamOnSkip(o);
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7 });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7, expectedHead: head });
     expect(out.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
     expect(o.capacity).toEqual({ lanes: 0, budget: { left: 0 } }); expect(o.lastDispatch.size).toBe(1);
     expect(log).toHaveBeenCalledTimes(1); expect(log.mock.calls[0][0]).toContain('dispatched (fresh)');
@@ -1723,7 +1723,7 @@ describe('card-only head move recovery', () => {
       now: () => 2_000_000, readEvidence: oldEvidence, proveMove: () => ({ ok: true }),
       capacity: { lanes: 1 }, dispatch });
     expect(out.dispatched).toHaveLength(1);
-    expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh', expectedHead: head });
   });
   it('runner default move proof forwards exec, cwd and mainRef to the numbering proof', () => {
     const exec = vi.fn(), cwd = '/fixture/checkout', mainRef = 'fixture/main';
@@ -1735,7 +1735,7 @@ describe('card-only head move recovery', () => {
         capacity: { lanes: 1 }, dispatch, lastDispatch: new Map() });
       expect(out.dispatched).toHaveLength(1);
       expect(detector).toHaveBeenCalledWith({ exec, cwd, mainRef, fromSha, toSha: head });
-      expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh' });
+      expect(dispatch).toHaveBeenCalledWith({ repo, pr, redTeamOnly: true, redTeamMode: 'fresh', expectedHead: head });
     } finally { detector.mockRestore(); }
   });
   it('runner default move proof executes the card-path proof with its supplied cwd', () => {
@@ -2393,7 +2393,7 @@ describe('unprovable accepted head move — fresh full review', () => {
     if (kind === 'no-prior-clear') o.rawPrs[0].comments.pop();
     if (kind === 'absent') o.readEvidence = () => ({ inFlight: false, recorded: false, seatRecorded: false });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
-    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
     expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
     expect(o.log).toHaveBeenCalledWith(`review-daemon: ${repo}#${pr} already-reviewed-head — fresh review dispatched for unprovable head move ${head.slice(0, 12)}`);
     o.capacity = { lanes: 1, budget: { left: 1 } };
@@ -2425,7 +2425,7 @@ describe('unprovable accepted head move — fresh full review', () => {
     const o = moved({ readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }) });
     o.rawPrs[0].comments = [];
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', head });
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
   });
   it.each([
     '🔁 review — changes requested\n\nFix the guard.',
@@ -2450,7 +2450,7 @@ describe('unprovable accepted head move — fresh full review', () => {
   it('R640 (operator ruling): a lone red-team:pending does not block the full review', () => {
     const o = moved(); o.rawPrs[0].labels.push('red-team:pending');
     expect(runRedTeamOnSkip(o).rows[0].action).toBe('review');
-    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
     expect(o.rawPrs[0].labels).toContain('red-team:pending');
   });
   it.each(['inFlight', 'queued', 'recorded', 'seatRecorded', 'completedRecorded', 'status', 'unknown'])(
@@ -2492,7 +2492,7 @@ describe('unprovable accepted head move — fresh full review', () => {
   it('keeps the red-team-only dispatch for an owed stored payload at the live head', () => {
     const o = moved({ readEvidence: () => ({ loopPayload: payload(), inFlight: false, recorded: false, seatRecorded: false }) });
     expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'dispatch', mode: 'fresh' });
-    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(o.dispatch).toHaveBeenCalledTimes(1); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, redTeamOnly: true, redTeamMode: 'fresh', expectedHead: head });
   });
 });
 
@@ -3174,13 +3174,68 @@ it('a recovered result check settles the next pass without a recovery seat', () 
 describe('D: dead unfinished review starts a fresh panel', () => {
   const id = 'review-pr-dead';
   const record = { id, op: 'review-pr', input: { repo, pr }, effects: [], pending: null,
-    findings: { read: { netBasis: { rev: head } } }, verdict: { verdict: 'needs-human', pendingReferrals: [] } };
+    stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1).toISOString() }],
+    findings: { read: { repo, pr, netBasis: { rev: head } } }, verdict: { verdict: 'needs-human', pendingReferrals: [] } };
   const hints = [{ id, repo, pr, head }];
-  const options = over => ({ readEvidence: () => ({ ok: false, reason: 'review-unfinished', unfinishedId: id, completeHeadRead: true }),
+  const options = over => ({ rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }], readEvidence: () => ({ ok: false, reason: 'review-unfinished', unfinishedId: id, completeHeadRead: true }),
     headNeverReviewed: () => false, readReviewRuns: () => hints,
     readReviewRun: () => record, isRunAbandoned: () => true,
-    readReviewInventory: () => [record], readAbandonment: () => ({ probes: { owner: 'dead' } }),
+    readReviewInventory: () => [record], readAbandonment: () => ({ probes: { owner: 'dead', recordVersion: 'v1' } }),
     readRecordVersion: () => 'v1', ...over });
+  it.each([
+    ['formal hold', { reviews: [{ state: 'CHANGES_REQUESTED' }] }],
+    ['unreadable reviews', { reviews: null }],
+    ['unreadable labels', { labels: null }],
+    ['label conflict', { labels: ['review:human'] }],
+    ['thread hold', { comments: [{ body: '🔁 review — changes requested' }] }],
+  ])('fresh review shares full-review guards: %s', (_name, patch) => {
+    expect(decide(options({ rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [], ...patch }] })).action).toBe('skip');
+  });
+  it.each([
+    ['unbound legacy', { readAbandonment: () => ({ probes: { owner: 'dead' } }) }],
+    ['wrong binding', { readAbandonment: () => ({ probes: { owner: 'dead', recordVersion: 'v0' } }) }],
+    ['no dead owner', { readAbandonment: () => ({ probes: { recordVersion: 'v1' } }) }],
+    ['confirm kind', { readReviewRun: () => ({ ...record, pending: { kind: 'confirm' } }) }],
+    ['accept malformed referrals', { readReviewRun: () => ({ ...record, verdict: { verdict: 'accept', pendingReferrals: {} } }) }],
+    ['saved changes', { readReviewRun: () => ({ ...record, resumeOf: { verdict: { verdict: 'changes' } } }) }],
+    ['saved referrals', { readReviewRun: () => ({ ...record, findings: { ...record.findings, referralVerdict: { verdict: 'accept', pendingReferrals: ['open'] } } }) }],
+    ['spent record retry budget', { readReviewRun: () => ({ ...record,
+      pending: { kind: 'effect', step: 'record' }, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS,
+      effects: [{ type: 'review.label-swap', status: 'pending', unknownAttempts: 0, idempotent: true,
+        error: '--body-file=x is empty — pass the verdict write-up' }] }) }],
+    ['blocked complete read', { readEvidence: () => ({ ok: false, reason: 'review-unfinished', unfinishedId: id,
+      completeHeadRead: () => ({ complete: true, blocked: true }) }) }],
+  ])('round 3 escalates: %s', (_name, over) => {
+    expect(decide(options(over))).toMatchObject({ action: 'skip', escalate: true });
+  });
+  it('raw inventory includes review records with custom operation ids', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'D-custom-'));
+    try {
+      writeRun({ ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }), ...record }, dir);
+      writeRun({ ...newRunRecord({ id: 'custom-review', op: 'review-pr', input: { repo, pr } }), ...record, id: 'custom-review' }, dir);
+      expect(decide(options({ runsDir: dir, readReviewInventory: undefined }))).toMatchObject({ action: 'skip', escalate: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['head', 'record', 'tombstone', 'unchanged'])('dispatch revalidates %s and pins expectedHead', async change => {
+    const { markRunAbandoned, runRecordVersion } = await import('../run-abandoned.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'D-dispatch-'));
+    try {
+      writeRun({ ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }), ...record }, dir);
+      markRunAbandoned({ id, dir, reason: 'dead', by: 'test', probes: { owner: 'dead',
+        recordVersion: runRecordVersion(statSync(join(dir, `${id}.json`))) } });
+      const f = fixture(options());
+      const live = f.rawPrs[0], dispatch = vi.fn(() => ({ jobPid: 123 }));
+      const result = runRedTeamOnSkip({ ...f, env: { OPERATION_RUNS_DIR: dir }, plan: { refusals: f.refusals },
+        now: () => 2_000_000, lastDispatch: new Map(), capacity: { lanes: 1 }, dispatch,
+        provider: { readPrState: () => {
+          if (change === 'record') writeFileSync(join(dir, `${id}.json`), '{}');
+          if (change === 'tombstone') rmSync(join(dir, `${id}.abandoned.json`));
+          return { ...live, headRefOid: change === 'head' ? 'b'.repeat(40) : head };
+        } } });
+      if (change === 'unchanged') expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ expectedHead: head }));
+      else { expect(dispatch).not.toHaveBeenCalled(); expect(result.dispatched).toHaveLength(0); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('dispatches a fresh review for a proven dead blocking owner', () => {
     expect(decide(options())).toMatchObject({ action: 'review',
       why: 'unfinished review owner proven dead (R755); fresh review on live head' });
@@ -3202,6 +3257,20 @@ describe('D: dead unfinished review starts a fresh panel', () => {
   it.each([2, 3])('escalates when %s owners on the live head have died', count => {
     expect(decide(options({ readReviewInventory: () => Array.from({ length: count }, (_, i) => ({ ...record, id: i ? `${id}-${i}` : id })) })))
       .toMatchObject({ action: 'skip', escalate: true, escalationContext: expect.stringContaining('re-review owners keep dying') });
+  });
+  it.each([
+    ['bound', { owner: 'dead', recordVersion: 'v1' }],
+    ['legacy without recordVersion', { owner: 'dead' }],
+    ['without dead-owner probes', { recordVersion: 'v1' }],
+  ])('weakening a prior same-head tombstone to %s cannot increase recovery capacity', (_name, priorProbes) => {
+    const prior = { ...record, id: 'review-pr-prior-dead' };
+    expect(decide(options({
+      readReviewInventory: () => [prior, record],
+      isRunAbandoned: () => true,
+      readAbandonment: runId => ({ probes: runId === id
+        ? { owner: 'dead', recordVersion: 'v1' } : priorProbes }),
+    }))).toMatchObject({ action: 'skip', escalate: true,
+      escalationContext: expect.stringContaining('re-review owners keep dying') });
   });
   it('does not count old-head tombstones toward the live-head cap', () => {
     expect(decide(options({ readReviewInventory: () => [record, { ...record, id: 'review-pr-old', findings: { read: { netBasis: { rev: 'b'.repeat(40) } } } }] })).action).toBe('review');

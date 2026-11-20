@@ -2343,7 +2343,35 @@ it('default review-loop minting keys the persisted run by its parsed PR', async 
 
 
 describe('D: tombstoned advisory resume selection', () => {
-  it.each([false, true])('stale tombstone=%s resumes only a rewritten record', async stale => {
+  it.each(['safe', 'unknown-write', 'record-budget', 'referral-budget'])(
+    'tombstone preserves saved-run safeguards: %s', async scenario => {
+      const { declaration, registry } = registryFor({ rev: HEAD_A });
+      const store = createMemoryRunStore();
+      const initial = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'saved-D' });
+      const record = { ...initial.run, cursor: declaration.steps.findIndex(s => s.name === 'advise'),
+        pending: { kind: 'effect', step: 'advise' },
+        stepTimings: [...initial.run.stepTimings.filter(t => t.step !== 'advise')],
+        resumeOf: { verdict: { verdict: 'accept', pendingReferrals: [] }, attempts: 1,
+          adviseAttempts: scenario === 'unknown-write' ? RESUME_MAX_ATTEMPTS : 0 },
+        effects: scenario === 'unknown-write' ? [{ step: 'advise', status: 'pending', idempotent: false }] : [] };
+      if (scenario === 'record-budget') Object.assign(record, { resumeOf: null,
+        pending: { kind: 'effect', step: 'record' }, recordEffectResumeAttempts: RESUME_MAX_ATTEMPTS,
+        effects: [{ type: 'review.label-swap', status: 'pending', unknownAttempts: 0, error: '--body-file=x is empty — pass the verdict write-up' }] });
+      if (scenario === 'referral-budget') Object.assign(record, { resumeOf: null,
+        pending: { kind: 'effect', step: 'mandatoryReferrals' }, referralEffectResumeAttempts: RESUME_MAX_ATTEMPTS });
+      record.pending.stepIndex = record.cursor;
+      record.effects = record.effects.map((e, i) => ({ key: `D-${i}`, type: 'review.note', stepIndex: record.cursor, index: i, ...e }));
+      store.write(record);
+      const fresh = vi.fn(() => 'fresh-D');
+      const result = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
+        sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: fresh,
+        findResumableRun: () => record.id, isAbandoned: () => true });
+      if (scenario === 'safe') { expect(result.run.id).toBe('fresh-D'); expect(fresh).toHaveBeenCalledOnce(); }
+      else { expect(result.stopped).toBe('refused'); expect(fresh).not.toHaveBeenCalled(); }
+    });
+
+  it.each([false, true])('stale tombstone=%s retains candidate for saved-run safeguards', async stale => {
     const { markRunAbandoned } = await import('../../lib/run-abandoned.mjs');
     const dir = mkdtempSync(join(tmpdir(), 'D-resume-'));
     const id = 'review-pr-advisory', repo = 'web-everything/web-everything', pr = 7116, head = 'a'.repeat(40);
@@ -2354,7 +2382,7 @@ describe('D: tombstoned advisory resume selection', () => {
       expect(defaultFindResumableRun({ repo, pr }, { runsDir: dir,
         readPr: () => ({ headRefOid: head, comments: [] }),
         readRuns: () => [{ id, repo, pr, head, startedAt: 1, completedAt: 2, resumeAdvise: true }] }))
-        .toBe(stale ? id : null);
+        .toBe(id);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

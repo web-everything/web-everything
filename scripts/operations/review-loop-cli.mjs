@@ -82,7 +82,7 @@ import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPo
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, savedReviewRetryRefusal, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -404,14 +404,13 @@ export { RESUME_MAX_ATTEMPTS } from '../conveyor/review-referral-hold.mjs';
  * unreadable PR or store answers `null`, which means "start a fresh review" exactly as before this existed.
  * @returns {string|null} the run id to resume.
  */
-export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env,
-  runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env), isAbandoned = isRunAbandoned } = {}) {
+export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
   try {
     const view = readPr({ repo, pr });
     if (!view?.headRefOid) return null;
     const id = findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
       ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
-    return id && isAbandoned(id, runsDir) ? null : id;
+    return id;
   } catch { return null; }
 }
 
@@ -587,6 +586,7 @@ export async function runReviewLoopOnce({
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
   findFiledRoundCards = findFiledRoundCardsCard,
+  isAbandoned = id => isRunAbandoned(id, process.env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(process.env)),
   redTeamOnSkipSettings = resolveReviewRedTeamOnSkip,
   // `review.parallelSeats` — start every independent juror seat at once (`./parallel-judges.mjs`); `seatLanes` gives a
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
@@ -729,7 +729,6 @@ export async function runReviewLoopOnce({
     }
     // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
     let rewound = null;
-    let persistSpent = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
       // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
@@ -767,29 +766,17 @@ export async function runReviewLoopOnce({
       }
       const resumeAdvise = parkedEvidence?.resumeAdvise === true;
       const adviseAttempts = Math.max(0, Number(parked?.resumeOf?.adviseAttempts) || 0);
-      // A fresh-panel fallback cannot resolve an unknown external write. Keep its non-idempotent replay fence
-      // even after the advisory retry budget is spent; a person must resolve the saved effect outcome.
-      if (resumeAdvise && adviseAttempts >= RESUME_MAX_ATTEMPTS
-        && parked.effects?.some(e => e.step === 'advise' && e.status === 'pending' && !e.idempotent)) {
-        return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} has an unresolved advisory effect; `
-          + 'automatic retries are spent and no fresh panel is started. Resolve the saved effect outcome first.'] };
-      }
-      if (suspendedEffect && effectAttempts >= RESUME_MAX_ATTEMPTS) {
-        return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} suspended referral resume attempts spent; inspect run store and ruling.`] };
-      }
-      if (retryableRecordEffect && !ciHeldRecordRetry && recordAttempts >= RESUME_MAX_ATTEMPTS) {
-        return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} record effect resume attempts spent; inspect run store and body-file refusal before retrying.`] };
-      }
-      if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
-        persistSpent = parked.id;
-      } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
+      const retryRefusal = savedReviewRetryRefusal(parked, parkedEvidence);
+      if (retryRefusal) return { code: 2, run: parked, stopped: 'refused',
+        lines: [`error: run ${parked.id} ${retryRefusal}`] };
+      if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect || retryableRecordEffect)) {
         const prepared = ciHeldRecordRetry ? resumeCiHeldRecord(parked, ciHeldRecordRetryMax) : null;
         if (prepared?.refusal) return prepared.refusal;
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.
-        rewound = prepared ? prepared.run : retryableRecordEffect ? { ...parked, resumedAt: now(), recordEffectResumeAttempts: recordAttempts + 1 }
+        rewound = isAbandoned(parked.id) ? null : prepared ? prepared.run : retryableRecordEffect ? { ...parked, resumedAt: now(), recordEffectResumeAttempts: recordAttempts + 1 }
           : suspendedEffect ? { ...parked, resumedAt: now(), referralEffectResumeAttempts: effectAttempts + 1 } : resumeAdvise ? { ...parked, resumedAt: now() }
           : rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
@@ -801,7 +788,7 @@ export async function runReviewLoopOnce({
         // budget too, never reach the RESUME_MAX_ATTEMPTS fresh-panel fallback with the budget unspent.
         const persistRetries = Math.max(0, Number(parked.resumeOf?.persistRetries) || 0)
           + (reviewRunEvidence(parked)?.persistenceFailed ? 1 : 0);
-        if (!suspendedEffect && !retryableRecordEffect) rewound = { ...rewound, resumeOf: unfinishedResume
+        if (rewound && !suspendedEffect && !retryableRecordEffect) rewound = { ...rewound, resumeOf: unfinishedResume
           ? { ...parked.resumeOf, attempts: attempts + 1, ...(persistRetries ? { persistRetries } : {}),
             ...(resumeAdvise ? { adviseAttempts: adviseAttempts + 1 } : {}) }
           : { verdict: parked.findings?.referralVerdict ?? parked.verdict ?? null,
@@ -810,11 +797,6 @@ export async function runReviewLoopOnce({
             ...(persistRetries ? { persistRetries } : {}) } };
       }
     } catch { rewound = null; }
-    if (persistSpent) {
-      return { code: 2, run: null, stopped: 'refused', lines: [`error: run ${persistSpent} failed to persist its mandatory `
-        + 'referrals and its automatic persist retries are spent; no fresh panel is started in its place. It waits on the '
-        + 'operator (needs-you via the exhausted referral hold) or a new push.'] };
-    }
     if (rewound) {
       run = rewound;
       store.write(run);

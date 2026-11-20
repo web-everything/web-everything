@@ -325,6 +325,31 @@ function operatorWakeTime(pr, run) {
   return Math.max(0, ...wakeEvents(pr, run).filter(e => e.operator).map(e => e.at));
 }
 
+/** Saved-run fences shared by resume and fresh dead-owner recovery. A new panel cannot settle these writes. */
+export function savedReviewRetryRefusal(run, evidence = reviewRunEvidence(run)) {
+  const unfinished = Boolean(run?.resumeOf) && !run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
+  const suspended = !run?.resumeOf && run?.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
+  const adviseAttempts = Math.max(0, Number(run?.resumeOf?.adviseAttempts) || 0);
+  if (evidence?.resumeAdvise && adviseAttempts >= RESUME_MAX_ATTEMPTS
+    && run.effects?.some(e => e.step === 'advise' && e.status === 'pending' && !e.idempotent)) {
+    return 'has an unresolved advisory effect; automatic retries are spent and no fresh panel is started. Resolve the saved effect outcome first.';
+  }
+  if (suspended && Math.max(0, Number(run?.referralEffectResumeAttempts) || 0) >= RESUME_MAX_ATTEMPTS) {
+    return 'suspended referral resume attempts spent; inspect run store and ruling.';
+  }
+  if (evidence?.retryableRecordEffect && !evidence.ciHeldRecordRetry
+    && Math.max(0, Number(run?.recordEffectResumeAttempts) || 0) >= RESUME_MAX_ATTEMPTS) {
+    return 'record effect resume attempts spent; inspect run store and body-file refusal before retrying.';
+  }
+  const attempts = suspended ? Math.max(0, Number(run.referralEffectResumeAttempts) || 0)
+    : unfinished ? Number(run.resumeOf.attempts) || 1 : 0;
+  if (evidence?.persistenceFailed && (persistRetryBudgetSpent(evidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
+    return 'failed to persist its mandatory referrals and its automatic persist retries are spent; no fresh panel is started in its place. '
+      + 'It waits on the operator (needs-you via the exhausted referral hold) or a new push.';
+  }
+  return null;
+}
+
 /** Has this run, on its own, spent the persist-retry budget? Its failed pass plus each resume that retried it. Pure. */
 export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;

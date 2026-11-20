@@ -40,7 +40,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readSealedStatus, sealedFromStatus, sealedStatusPath } from './red-team-sealed-status.mjs';
 import { publishStoredRedTeamResult } from './red-team-withheld-publish.mjs';
 import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
-import { RESUME_MAX_ATTEMPTS, readReviewRunEvidence, refusedReferralsAreRuled, findResumableParkedRun } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, savedReviewRetryRefusal, readReviewRunEvidence, refusedReferralsAreRuled, findResumableParkedRun } from '../conveyor/review-referral-hold.mjs';
 
 // The shared reader returns reviewRunEvidence projections, not raw run records.
 const defaultReadReviewRuns = () => isUnderTest() ? [] : readReviewRunEvidence();
@@ -411,14 +411,15 @@ function* reviewRuns({ runsDir, list, read, stat }) {
 // Unlike resume hints, this inventory must retain headless/start-less records.
 function readFreshReviewInventory({ repo, pr, runsDir, blocking }) {
   const ids = readCompleteReviewRunsForPr(runsDir, repo, pr, { list: strictListRuns })
-    ?? strictListRuns(runsDir).filter(id => id.startsWith('review-pr-'));
-  if (ids.length > 400) throw Error('re-review inventory capped; human inspection required');
-  return ids.map(id => {
+    ?? [];
+  const candidates = [...new Set([...ids, ...strictListRuns(runsDir)])];
+  if (candidates.length > 400) throw Error('re-review inventory capped; human inspection required');
+  return candidates.map(id => {
     const run = id === blocking.id ? blocking : readRun(id, runsDir);
     assertReviewRunEvidence(run);
     if (run.id !== id) throw Error('review identity mismatch');
     return run;
-  });
+  }).filter(run => run.op === 'review-pr');
 }
 
 /** Complete bounded proof; unknown state never establishes a never-reviewed head. */
@@ -555,6 +556,26 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');
       return { ...row, ...decision };
     };
+    // All fresh full reviews use the same live holds and cooldown, including dead-owner recovery.
+    const guardedFullReview = (why, context = null, extra = {}) => {
+      const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+      const guard = context ?? { labels: rawPr.labels, acceptance: latestAcceptRecord(rawPr.comments, reviews),
+        comments: rawPr.comments, reviews, settlesPending: true };
+      const refusal = publishableClearGuard(guard);
+      if (refusal) return guardedSkip(refusal);
+      if (guard.reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
+      if (laterReviewHold(guard.reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
+      return dispatchDecision({ action: 'review', why, ...extra });
+    };
+    const boundDeadRun = (id, version = readRecordVersion(id, runsDir)) => {
+      if (isRunAbandoned(id, runsDir) !== true) return null;
+      const tombstone = readAbandonment(id, runsDir);
+      const probes = tombstone?.probes;
+      return typeof version === 'string' && version.length > 0 && probes?.recordVersion === version
+        && (probes.owner === 'dead' || (probes.reviewJobs === 'dead' && probes.handles === 'dead'
+          && probes.writers === 'dead' && probes.leases === 'absent' && probes.sessions === 'absent'))
+        && isRunAbandoned(id, runsDir) === true ? tombstone : null;
+    };
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
         try {
@@ -584,9 +605,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           if (abandoned === true) {
             const bounds = result.settleBounds ?? result;
             if (Object.hasOwn(bounds, 'unreadBoundaryAt')) return refused();
-            const complete = typeof bounds.completeHeadRead === 'function'
-              ? bounds.completeHeadRead({ pr, head, at: now })?.complete : bounds.completeHeadRead;
-            if (complete !== true) return refused();
+            const scan = typeof bounds.completeHeadRead === 'function'
+              ? bounds.completeHeadRead({ pr, head, at: now }) : { complete: bounds.completeHeadRead, blocked: bounds.blocked };
+            if (scan?.complete !== true || scan.blocked) return refused();
             const version = readRecordVersion(blockingId, runsDir);
             if (typeof version !== 'string' || !version) return refused();
             const blocking = readReviewRun(blockingId, runsDir);
@@ -596,16 +617,23 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             if (blocking.id !== blockingId || blocking.op !== 'review-pr'
               || blocking.input?.repo !== repo || Number(blocking.input?.pr) !== pr
               || (blocking.verdict != null && !Object.values(VERDICTS).includes(blocking.verdict?.verdict))) return refused();
-            const tombstone = readAbandonment(blockingId, runsDir);
-            if (!tombstone?.probes || typeof tombstone.probes !== 'object' || Array.isArray(tombstone.probes)
-              || Object.keys(tombstone.probes).length === 0) return refused();
-            if (blocking.verdict?.verdict === 'needs-human' && !Array.isArray(blocking.verdict.pendingReferrals)) return refused();
+            const tombstone = boundDeadRun(blockingId, version);
+            if (!tombstone) return refused();
+            // A rewind may have saved an earlier verdict; no payload can mask another's hold.
+            for (const verdict of [blocking.verdict, blocking.resumeOf?.verdict, blocking.findings?.referralVerdict]) {
+              if (verdict == null) continue;
+              if (!Object.values(VERDICTS).includes(verdict.verdict)
+                || (verdict.pendingReferrals !== undefined && !Array.isArray(verdict.pendingReferrals))
+                || (verdict.verdict === 'needs-human' && !Array.isArray(verdict.pendingReferrals))
+                || verdict.pendingReferrals?.some(item => typeof item !== 'string' || !item.trim())
+                || verdict.pendingReferrals?.length > 0 || verdict.verdict === 'changes') return refused();
+            }
+            if (savedReviewRetryRefusal(blocking)) return refused();
             const pending = blocking.pending;
-            if (blocking.verdict?.verdict === 'changes'
+            if (pending?.kind === 'confirm'
               || (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of')))
               || pending?.step === 'mandatoryReferrals'
-              || blocking.effects.some(e => ['pending', 'in-flight'].includes(e?.status) && e.step === 'mandatoryReferrals')
-              || blocking.verdict?.pendingReferrals?.length > 0) return refused();
+              || blocking.effects.some(e => ['pending', 'in-flight'].includes(e?.status) && e.step === 'mandatoryReferrals')) return refused();
             // A fresh panel cannot resolve an unknown external write. Preserve the CLI's advisory fence,
             // including failed writes with unknown outcomes and malformed effect evidence.
             if (blocking.effects.some(e => !e || (e.idempotent !== true
@@ -620,6 +648,8 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
               if (run.input.repo === repo && Number(run.input.pr) === pr) {
                 const rev = run.findings?.read?.netBasis?.rev;
                 // Unknown heads count conservatively; missing start times never omit a run.
+                // Attempt accounting is conservative: a legacy tombstone still spends capacity,
+                // even though only a bound dead-owner proof can authorize the current recovery.
                 if (!isRealHead(rev) || (rev === head && isRunAbandoned(run.id, runsDir) === true)) dead.add(run.id);
               }
             }
@@ -628,24 +658,15 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             if (readRecordVersion(blockingId, runsDir) !== version
               || JSON.stringify(readAbandonment(blockingId, runsDir)) !== JSON.stringify(tombstone)
               || isRunAbandoned(blockingId, runsDir) !== true) return refused();
-            return dispatchDecision({ action: 'review', why: 'unfinished review owner proven dead (R755); fresh review on live head' });
+            return guardedFullReview('unfinished review owner proven dead (R755); fresh review on live head', null,
+              { abandonedReview: { id: blockingId, recordVersion: version, tombstone } });
           }
         } catch {
           return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
         }
         let neverReviewed = false;
         try { neverReviewed = headNeverReviewed({ repo, pr, head }) === true; } catch { /* Unknown scan keeps escalation. */ }
-        if (neverReviewed) {
-          const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
-          const acceptance = latestAcceptRecord(rawPr.comments, reviews);
-          const refusal = publishableClearGuard({ labels: rawPr.labels, acceptance,
-            comments: rawPr.comments, reviews, settlesPending: true });
-          if (refusal) return guardedSkip(refusal);
-          if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-          if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-          // R640: a review is always allowed here; a red team still needs a finished review.
-          return dispatchDecision({ action: 'review', why: 'head never reviewed; a review is always allowed' });
-        }
+        if (neverReviewed) return guardedFullReview('head never reviewed; a review is always allowed');
         return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
       }
       return skip(result.reason);
@@ -762,13 +783,7 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
         const guardAcceptance = referralsRuled ? (accepted ? latestAcceptRecord(guardComments, reviews) : null) : acceptance;
         const context = { labels: rawPr.labels, acceptance: guardAcceptance, comments: guardComments, reviews,
           settlesPending: true, settlesReviewPending: referralsRuled };
-        const refusal = publishableClearGuard(context);
-        if (refusal) return guardedSkip(refusal);
-        // Formal holds apply even without an acceptance comment. No timestamp
-        // floor: a missing acceptance cannot establish that a review was cleared.
-        if (reviews === null) return skip('PR reviews unreadable; inspect formal reviews before full review');
-        if (laterReviewHold(reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
-        return dispatchDecision({ action: 'review', why });
+        return guardedFullReview(why, context);
       };
       if (needsReview) return fullReviewDecision('unprovable head move needs a full review');
       if (verdict === VERDICTS.NEEDS_HUMAN && storedHead === head) {
@@ -1225,7 +1240,19 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           if (reserved) budget.left--;
           try {
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
-            const result = dispatch({ pr: row.prNumber, repo,
+            if (row.abandonedReview) {
+              // Re-run the same planner guards against live PR evidence, then bind to the exact planned record.
+              try {
+                if (!freshSettlement(row)) throw new PreStartDispatchRefusalError('dead review evidence changed');
+                const proof = row.abandonedReview, dir = runsDirectory(env);
+                if (runRecordVersion(statSync(join(dir, `${proof.id}.json`))) !== proof.recordVersion
+                  || !defaultIsRunAbandoned(proof.id, dir)
+                  || JSON.stringify(JSON.parse(readFileSync(abandonedPath(proof.id, dir), 'utf8'))) !== JSON.stringify(proof.tombstone)) {
+                  throw new PreStartDispatchRefusalError('dead review binding changed before dispatch');
+                }
+              } catch (error) { throw new PreStartDispatchRefusalError(safeErrorText(error)); }
+            }
+            const result = dispatch({ pr: row.prNumber, repo, expectedHead: row.head,
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {
