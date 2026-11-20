@@ -83,7 +83,20 @@ export function quarantinedVerdict({ phaseResults, read, changedFiles, now, touc
     if (changedFiles.length && (typeof touchesDiff !== 'function' || !files.every(f => touchesDiff(f) === false))) {
       return no('failing test reaches changed source or dependency evidence is unknown — keeping red');
     }
-    return { excused: true, files, why: decision.why };
+    // Bind the green to the entries that actually cover these failures. Reuse CI's
+    // selection per entry so other jobs, named cases and expired entries cannot
+    // supply (or extend) the lifetime of this excuse. `test` is the store's test id.
+    const excusing = read.list.entries.filter(entry => files.includes(entry.test)
+      && decideCiSkip({ mode: read.list.mode,
+        read: { ...read, list: { ...read.list, entries: [entry] } }, changedFiles, now,
+        ctx: { known: true, onMain, prNumber: null }, job: null }).skip.includes(entry.test));
+    if (!files.every(file => excusing.some(entry => entry.test === file))
+      || excusing.some(entry => !Number.isFinite(entry.expiresAt) || !(entry.expiresAt > now))) {
+      return no('excusing quarantine entry expiry missing or invalid — keeping red');
+    }
+    const expiresAt = excusing.reduce((earliest, entry) => Math.min(earliest, entry.expiresAt), Infinity);
+    return { excused: true, files, why: decision.why, expiresAt,
+      entries: [...new Set(excusing.map(entry => entry.test))] };
   } catch {
     return no('quarantine evidence unreadable or malformed');
   }

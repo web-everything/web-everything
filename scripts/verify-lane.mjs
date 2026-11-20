@@ -582,6 +582,9 @@ const treeHashNow = () => computeWorkingTreeHash({ runGit: git, fileMode: (f) =>
 const currentTreeHash = MODE === 'run' ? null : treeHashNow();
 const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
   && preStart.status === 'green'
+  // A quarantine excuse must still be live, even for an identical tree and gate.
+  && !(preStart.quarantined && (!Number.isFinite(preStart.quarantined.expiresAt)
+    || !(preStart.quarantined.expiresAt > Date.now())))
   && preStart.sha === headSha
   && currentTreeHash != null && preStart.treeHash === currentTreeHash
   && preStart.suites === GATE
@@ -1139,7 +1142,7 @@ if (exitCode !== 0 && !signal && !infrastructureNow(exitCode, signal, failureDet
       // Runner-loaded setup/config dependencies affect every test, even without a test-file import.
       touchesDiff: (file) => quarantineTouchesDiff({ testFile: file, changedFiles: diffFiles, readFile: readRepoFile }) });
     if (verdict.excused) {
-      quarantined = { files: verdict.files, why: verdict.why };
+      quarantined = { files: verdict.files, why: verdict.why, expiresAt: verdict.expiresAt, entries: verdict.entries };
       exitCode = 0;
       process.stderr.write(`verify-lane: quarantined (not red): ${verdict.files.join(', ')}\n`);
     }

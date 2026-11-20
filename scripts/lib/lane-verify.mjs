@@ -613,6 +613,13 @@ export function verifyGateDecision({ record, headSha, nowMs = Date.now(), ttlMs 
     : '';
 
   if (matches && rec.status === 'green') {
+    // Exact-sha and carried-forward greens both depend on the original excuse
+    // remaining live. Legacy markers without a finite expiry need a fresh run.
+    if (rec.quarantined && (!Number.isFinite(rec.quarantined.expiresAt)
+      || !(rec.quarantined.expiresAt > nowMs))) {
+      return { ok: false, status: 'absent', reason: 'unverified',
+        detail: 'the recorded green relies on a quarantine whose expiry has passed or is missing/invalid — needs fresh verification; re-run `node scripts/verify-lane.mjs` to record a fresh result.' };
+    }
     return { ok: true, status: 'green', reason: 'verified',
       ...retryAuditOf(rec),
       detail: `lane verified green for ${String(headSha).slice(0, 8)}${carriedForwardNote} (suites: ${rec.suites || 'recorded'}).${describeIsolatedRetry(rec)}` };

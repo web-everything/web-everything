@@ -5,7 +5,7 @@ import { createFailureCollector } from '../verify-failures.mjs';
 import { applyRevertRedToVerdict } from '../verify-revert-red.mjs';
 import { reachesChanged } from '../red-cause.mjs';
 import * as quarantine from '../verify-quarantine.mjs';
-import { verifyStartBody, verifyFinishBody } from '../lane-verify.mjs';
+import { verifyStartBody, verifyFinishBody, verifyGateDecision } from '../lane-verify.mjs';
 import { stableTreeHash } from '../verify-lane-gate.mjs';
 
 const now = Date.parse('2026-11-18T12:00:00Z');
@@ -70,6 +70,58 @@ function runLaneQuarantine(changedFiles, readRepoFile = path => readFileSync(pat
 }
 
 describe('verify post-hoc quarantine', () => {
+  it('binds the verdict to the earliest excusing entry expiry and its test ids', () => {
+    expect(verdict({ phaseResults: [phase([file, other])], read: withEntries([
+      entry(file, { expiresAt: now + 4000 }), entry(other, { expiresAt: now + 2000 }),
+      entry('unrelated.test.mjs', { expiresAt: now + 1 }),
+      entry(file, { job: 'e2e', expiresAt: now + 2 }),
+      entry(`${file}::named`, { expiresAt: now + 3 }),
+      entry(file, { expiresAt: now - 1 }),
+      entry(file, { job: 'test-shard (1)', expiresAt: now + 3000 }),
+    ]) })).toMatchObject({ excused: true, expiresAt: now + 2000, entries: [file, other] });
+  });
+  it.each([undefined, null, NaN, Infinity, 'tomorrow'])('refuses an entry with unusable expiry %s', expiresAt => {
+    closed(verdict({ read: withEntries([entry(file, { expiresAt })]) }));
+  });
+  it('uses the earliest duplicate whole-file entry, including unit-shard entries', () => {
+    expect(verdict({ read: withEntries([entry(), entry(file, { job: 'test-shard (1)', expiresAt: now + 500 })]) }))
+      .toMatchObject({ excused: true, expiresAt: now + 500, entries: [file] });
+  });
+  it.each([-1, 0, 86_400_000])('expires the actual green marker at T (offset %s)', offset => {
+    const { marker } = runLaneQuarantine(['unrelated.mjs'], () => '');
+    const expiresAt = now + 1000;
+    expect(marker.quarantined).toMatchObject({ expiresAt, entries: marker.quarantined.files });
+    const result = verifyGateDecision({ record: marker, headSha: 'head', nowMs: expiresAt + offset });
+    expect(result).toMatchObject(offset < 0
+      ? { ok: true, status: 'green', reason: 'verified' }
+      : { ok: false, status: 'absent', reason: 'unverified' });
+    expect(verifyGateDecision({ record: marker, headSha: 'next-head', laneRelevantChangeSince: [], nowMs: expiresAt + offset }).ok)
+      .toBe(offset < 0);
+    if (offset >= 0) expect(result.detail).toMatch(/quarantine.*expir/i);
+  });
+  it.each([undefined, null, NaN, Infinity, 'Infinity', 'tomorrow', {}, [now + 1000]])('rejects legacy or invalid marker expiry %j, including carry-forward', expiresAt => {
+    const record = { sha: 'head', status: 'green', quarantined: { files: [file], expiresAt } };
+    expect(verifyGateDecision({ record, headSha: 'head', nowMs: now })).toMatchObject({ ok: false, reason: 'unverified' });
+    expect(verifyGateDecision({ record, headSha: 'new', laneRelevantChangeSince: [], nowMs: now }))
+      .toMatchObject({ ok: false, reason: 'unverified' });
+  });
+  it.each(['request', 'verify'])('checks expiry before reusing the same sha/tree/gate in %s mode', MODE => {
+    const source = readFileSync('scripts/verify-lane.mjs', 'utf8');
+    const start = source.indexOf('const cacheHit =');
+    const end = source.indexOf('\nif (cacheHit)', start);
+    const cacheHit = new Function('MODE', 'preStart', 'headSha', 'currentTreeHash', 'GATE', 'resolvedGate', 'Date',
+      source.slice(start, end) + '\nreturn cacheHit;');
+    const preStart = { sha: 'head', treeHash: 'tree', suites: 'gate', executedGate: 'gate', status: 'green' };
+    const hit = (quarantined, at) => cacheHit(MODE, { ...preStart, quarantined }, 'head', 'tree', 'gate', {}, { now: () => at });
+    const expiresAt = now + 1000;
+    expect(hit({ expiresAt }, expiresAt - 1)).toBe(true);
+    expect(hit({ expiresAt }, expiresAt)).toBe(false);
+    expect(hit({ expiresAt }, expiresAt + 86_400_000)).toBe(false);
+    expect(hit({}, now)).toBe(false);
+    expect(hit({ expiresAt: 'Infinity' }, now)).toBe(false);
+    expect(hit({ expiresAt: [expiresAt] }, now)).toBe(false);
+    expect(hit(undefined, expiresAt + 86_400_000)).toBe(true);
+  });
   it('records every quarantined file in stderr and the finished marker', () => {
     const files = ['scripts/lib/__tests__/operator-override-host-isolation.test.mjs', other];
     const result = runLaneQuarantine(['unrelated.mjs'], () => '', { files });
@@ -77,7 +129,7 @@ describe('verify post-hoc quarantine', () => {
     expect(result.emittedCode).toBe(0);
     expect(result.stderr).toContain(`verify-lane: quarantined (not red): ${files.join(', ')}`);
     expect(result.marker).toMatchObject({ status: 'green', quarantined: { files } });
-    expect(result.emitted).toMatchObject({ status: 'green', quarantined: { files } });
+    expect(result.emitted).toMatchObject({ status: 'green', quarantined: { files, expiresAt: now + 1000, entries: files } });
     expect(result.emitted.detail).toContain(`quarantined (not red): ${files.join(', ')}`);
   });
   it('records every quarantined file in run-mode diagnostics without writing a marker', () => {
@@ -165,6 +217,7 @@ describe('verify post-hoc quarantine', () => {
     expect(verdict({ phaseResults: [phase([file, file]), phase([other]), { phase: 'scan', result: { exitCode: 0 } }],
       read: withEntries([entry(), entry(other)]) })).toEqual({
       excused: true, files: [file, other], why: expect.stringContaining('skipping 2'),
+      expiresAt: now + 1000, entries: [file, other],
     });
   });
   it('keeps every branch red while a published main-fix PR is open', () => {
