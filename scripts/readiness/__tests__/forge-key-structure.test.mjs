@@ -415,4 +415,12 @@ describe('Forge key structure rescope: DSA and linear scan',()=>{
     for(const content of ['/* '+keyType+' '+'{/*'.repeat(30000)+'*/','{/* '.repeat(30000)])
       expect(timeOf(Buffer.from(content))).toBeLessThan(4000);
   });
+  it('blocks a private JWK member spelled with a braced unicode escape',()=>{
+    blocked(Buffer.from('{"'+keyType+'":"OKP","\\u{64}":"abcdefghijklmn"}'));
+    blocked(Buffer.from('{"'+keyType+'":"oct","\\u{6b}":"abcdefghijklmn"}'));
+  });
+  it('blocks base64-wrapped PGP private key armor',()=>{
+    const armor='-----BEGIN PGP '+['PRIVATE','KEY','BLOCK'].join(' ')+'-----\nabc\n';
+    blocked(Buffer.from(Buffer.from(armor).toString('base64')));
+  });
 });

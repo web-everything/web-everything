@@ -96,9 +96,11 @@ function afterTrivia(text,index) {
 }
 
 // Decode literals without evaluating JavaScript. The single-quote form covers JSON5 and util.inspect output.
+const codePoint=hex=>{const value=parseInt(hex,16);return value>0x10ffff?'�':String.fromCodePoint(value);};
 function stringValue(token) {
   if(token[0]!=='"'&&token[0]!=="'")return null;
-  return token.slice(1,-1).replace(/\\(?:u([\da-f]{4})|x([\da-f]{2})|\r\n|([\s\S]))/gi,(_,unicode,hex,char)=>{
+  return token.slice(1,-1).replace(/\\(?:u(?:([\da-f]{4})|\{([\da-f]+)\})|x([\da-f]{2})|\r\n|([\s\S]))/gi,(_,unicode,braced,hex,char)=>{
+    if(braced)return codePoint(braced);
     if(unicode||hex)return String.fromCharCode(parseInt(unicode||hex,16));
     return ({n:'\n',r:'\r',t:'\t',b:'\b',f:'\f',v:'\v','0':'\0','\n':'','\r':'','\u2028':'','\u2029':''})[char]??char;
   });
@@ -107,7 +109,7 @@ function stringValue(token) {
 function startsObjectMember(text,index) {
   const start=afterTrivia(text,index);
   if(start<0)return false;
-  const member=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|(?:[A-Za-z_$]|\\u[\da-f]{4})(?:[\w$]|\\u[\da-f]{4})*/iy;
+  const member=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|(?:[A-Za-z_$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))(?:[\w$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))*/iy;
   member.lastIndex=start;
   return member.test(text)&&text[afterTrivia(text,member.lastIndex)]===':';
 }
@@ -116,7 +118,7 @@ function jwkFinding(bytes) {
   const text=bytes.toString('utf8');
   if(!text.trimStart().startsWith('{'))return false;
   let depth=0,key=null,pending=null,anyKty=false,octKty=false,oct=false,priv=false;
-  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|(?:[A-Za-z_$]|\\u[\da-f]{4})(?:[\w$]|\\u[\da-f]{4})*|[{}\[\]:,]/gi)) {
+  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|(?:[A-Za-z_$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))(?:[\w$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))*|[{}\[\]:,]/gi)) {
     const token=match[0];
     if(token[0]==='/')continue;
     if(token==='{'||token==='[') {
@@ -133,7 +135,7 @@ function jwkFinding(bytes) {
     else if(depth!==1)continue;
     else if(token===':') {key=pending;pending=null;}
     else if(token===',') {key=pending=null;}
-    else if(key===null)pending=stringValue(token)??token.replace(/\\u([\da-f]{4})/gi,(_,hex)=>String.fromCharCode(parseInt(hex,16)));
+    else if(key===null)pending=stringValue(token)??token.replace(/\\u(?:([\da-f]{4})|\{([\da-f]+)\})/gi,(_,hex,braced)=>codePoint(hex||braced));
     else {
       const value=stringValue(token);
       if(key==='kty'&&typeof value==='string') {anyKty=true;octKty||=value==='oct';}
@@ -149,9 +151,9 @@ function jwkFinding(bytes) {
 function encodedText(text) {
   // Require a plausible representation prefix, rather than unrelated punctuation
   // anywhere in a binary/UTF-16 view. Detectors have already visited its bytes.
-  return /\{\s*(?:["'/]|[A-Za-z_$]|\\u[\da-f]{4})/.test(text)
+  return /\{\s*(?:["'/]|[A-Za-z_$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))/.test(text)
     ||/\[\s*(?:[\[\]{"'/\d-]|true\b|false\b|null\b)/.test(text)
-    ||/\\(?:["'\\/bfnrtv0]|u[\da-f]{4}|x[\da-f]{2})/i.test(text)
+    ||/\\(?:["'\\/bfnrtv0]|u(?:[\da-f]{4}|\{[\da-f]+\})|x[\da-f]{2})/i.test(text)
     ||/[\[{](?:\s*[\[{]){63}/.test(text)
     ||/\\x[\da-f]{2}|%[\da-f]{2}|[\da-f]{2}:[\da-f]{2}/i.test(text)
     ||/&(?:#\d+|#x[\da-f]+|quot|amp|lt|gt|apos);/i.test(text)
@@ -331,7 +333,7 @@ export function keyStructureFinding(buffer) {
     if((total+=bytes.length)>LIMITS.bytes)throw EXHAUSTED;
     // Every decoded view reaches the byte detectors, including views with no more encodings.
     if(bytes.includes(Buffer.from(['openssh','key','v1'].join('-')+'\0'))
-      ||/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/.test(bytes.toString('utf8'))
+      ||/-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/.test(bytes.toString('utf8'))
       ||derFinding(bytes,tick)||jwkFinding(bytes))throw FINDING;
     if(options.expand===false)return;
     // The shortest DER structure is eight bytes (already detected above); its
