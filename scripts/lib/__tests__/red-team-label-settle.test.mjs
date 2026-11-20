@@ -50,7 +50,36 @@ describe('red-team label settles from the head\'s check', () => {
     const hold = { id: 5, context: 'red-team/publication #42', state: 'pending', creator: { login: 'x' }, description: 'hold' };
     expect(readCheckClearFact({ ...input, gh: ghFor([run()], { statuses: [hold] }) })).toBe(false);
   });
+  it('the check never overrides unreadable, in-flight, scheduled, conflict or changes evidence', () => {
+    const changes = { status: 'finished', result: { foldedVerdict: 'changes' } };
+    for (const evidence of [{ ok: false }, { inFlight: true }, { scheduled: true }, { carryConflict: true }, { status: changes }])
+      expect(planRedTeamStatusLabels({ ...input, evidence, checkClear: true }).add).not.toBe('red-team:clear');
+  });
   describe('sync', () => {
+    it('production wiring: the default reader runs the real fact over the injected gh', () => {
+      const live2 = { headRefOid: head, labels: ['red-team:pending'] };
+      const mk = gh => {
+        const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live2), readPrFiles: vi.fn(() => null) };
+        syncRedTeamStatusLabels({ ...input, live: live2, provider, gh, standingRuling: null });
+        return provider;
+      };
+      expect(mk(ghFor([run()])).setLabels).toHaveBeenCalledWith('o/n', 42, { add: 'red-team:clear', remove: ['red-team:pending'] });
+      expect(mk(ghFor([run({ conclusion: 'failure' })])).setLabels).not.toHaveBeenCalled();
+    });
+    it('the drain-scan rollback disables the check as evidence', () => {
+      const reader = vi.fn(() => true);
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live0), readPrFiles: vi.fn(() => null) };
+      const live0 = { headRefOid: head, labels: ['red-team:pending'] };
+      syncRedTeamStatusLabels({ ...input, env: { ...input.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' }, live: live0, provider, readCheckClear: reader, standingRuling: null });
+      expect(reader).not.toHaveBeenCalled();
+    });
+    it('re-verifies the head before removing pending when clear already coexists', () => {
+      const both = { headRefOid: head, labels: ['red-team:pending', 'red-team:clear'] };
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => both), readPrFiles: vi.fn(() => null) };
+      syncRedTeamStatusLabels({ ...input, labels: both.labels, live: both, provider, standingRuling: null,
+        readCheckClear: () => { provider.readPrState.mockReturnValue({ headRefOid: old, labels: both.labels }); return true; } });
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
     const live = { headRefOid: head, labels: ['red-team:pending'] };
     const make = readCheckClear => {
       const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live), readPrFiles: vi.fn(() => null) };

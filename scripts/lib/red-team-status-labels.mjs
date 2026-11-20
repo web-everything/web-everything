@@ -5,7 +5,7 @@ import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs
 import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
-import { readRedTeamPublicationHoldFact, readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
+import { redTeamCheckRunIsEvidence, readRedTeamPublicationHoldFact, readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
@@ -38,7 +38,9 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   }
   // The head's own red-team check run proved clear (readCheckClearFact: App-bound, head-bound, id-ordered, no open hold).
   // Only a strict `true` counts; a recorded break (above) and a publication-pending hold still win. Only pending is swapped.
-  if (checkClear === true && !broken && !pendingOnly) {
+  // Unreadable evidence, a running/scheduled pass, a carry conflict or a stored `changes` verdict keep their own (stricter) paths.
+  if (checkClear === true && !broken && !pendingOnly && evidence.ok !== false && !evidence.inFlight && !evidence.scheduled
+    && !evidence.carryConflict && !(evidence.status?.status === 'finished' && evidence.status.result?.foldedVerdict === 'changes')) {
     const have = labels.map(l => typeof l === 'string' ? l : l?.name);
     if (have.includes('red-team:pending') && !have.includes('red-team:blocked'))
       return { add: have.includes('red-team:clear') ? null : 'red-team:clear', remove: ['red-team:pending'] };
@@ -98,7 +100,7 @@ export function readCheckClearFact({ repo, pr, head, env = process.env, gh } = {
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
   provider = createGhProvider(), log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
-  readCheckClear = args => (isUnderTest() || isUnderTest(env) ? false : readCheckClearFact({ ...args, env })) } = {}) {
+  gh, readCheckClear = args => (!gh && (isUnderTest() || isUnderTest(env)) ? false : readCheckClearFact({ ...args, env, gh })) } = {}) {
   if (!readRedTeamProbes({ env, log }).value.statusLabels) return { add: null, remove: [] };
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
@@ -124,12 +126,13 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   // The head's check run settles a held pending label. Read only when pending is live; a throw or non-true is no proof.
   let checkClear = false;
   const liveNames = (state.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
-  if (liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked')) {
+  // The check run is evidence only when the configured gate source says so (the `drain-scan` rollback disables it).
+  if (liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked') && redTeamCheckRunIsEvidence({ env })) {
     try { checkClear = readCheckClear({ repo, pr, head }) === true; } catch { checkClear = false; }
   }
   const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles, headVerified, checkClear });
   // Re-verify the head right before writing a check-derived clear: a moved head refuses.
-  if (checkClear && plan.add === 'red-team:clear' && !dryRun) {
+  if (checkClear && (plan.add || plan.remove.length) && !dryRun) {
     let again = null;
     try { again = provider.readPrState(repo, pr)?.headRefOid; } catch { again = null; }
     if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };
