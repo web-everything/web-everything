@@ -10,6 +10,8 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validSha, jsonLines } from './prototype-load.mjs';
+import { loadRuledWeakened } from './prototype-load-io.mjs';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { loadAdoptionMatrixSettingsFile } from '../lib/adoption-matrix-settings.mjs';
 
 const RULING = /^R\d+(?:\+R\d+)*$/;
@@ -250,13 +252,48 @@ export function writeReadyRecord(input, { file = readyRecordPath(), fsApi = fs, 
 
 export function parseArgs(argv) {
   const a = {};
-  for (const arg of argv) { const m = /^--([^=]+)=(.*)$/s.exec(arg); if (m) a[m[1]] = m[2]; }
+  for (const arg of argv) {
+    if (arg === '--from-waiver') { a['from-waiver'] = true; continue; }
+    const m = /^--([^=]+)=(.*)$/s.exec(arg); if (m) a[m[1]] = m[2];
+  }
   return a;
+}
+
+/** The findings of the ONE recorded waiver for ref+sha+ruling, exactly as stored. Anything unknown, unreadable,
+ *  malformed or ambiguous is a refusal with a named reason, never a pass. */
+export function waiverFindings(waivers, { ref, sha, ruling }) {
+  if (!Array.isArray(waivers)) return { ok: false, error: 'recorded waivers are unreadable' };
+  if (!validSha(sha) || typeof ref !== 'string' || typeof ruling !== 'string') return { ok: false, error: 'no recorded waiver: ref, 40-hex sha and auditRuling are required' };
+  const hits = waivers.filter((e) => e && e.ref === ref && validSha(e.sha) && e.sha.toLowerCase() === sha.toLowerCase() && e.ruling === ruling
+    && Array.isArray(e.findings) && e.findings.length > 0 && e.findings.every((f) => typeof f === 'string' && f.trim()));
+  if (!hits.length) return { ok: false, error: `no recorded waiver for ${ref}@${sha} ${ruling}` };
+  const first = JSON.stringify(hits[0].findings);
+  if (hits.some((e) => JSON.stringify(e.findings) !== first)) return { ok: false, error: `ambiguous: several recorded waivers for ${ref}@${sha} ${ruling} disagree on findings` };
+  return { ok: true, findings: [...hits[0].findings] };
+}
+
+function defaultWaivers(env) {
+  const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
+  const tool = JSON.parse(fs.readFileSync(join(here, '..', 'settings', 'prototype-load.json'), 'utf8'));
+  return loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env });
 }
 
 export function main(argv = process.argv.slice(2), deps = {}) {
   const a = parseArgs(argv);
   let auditDisclosed;
+  const wantWaiver = a['from-waiver'] === true || (a.audit === 'WEAKENED' && a['auditDisclosed-file'] === undefined);
+  if (a['from-waiver'] === true && (a['auditDisclosed-file'] !== undefined || a.audit !== 'WEAKENED')) {
+    console.error('fix-ready-record: refused: --from-waiver needs --audit=WEAKENED and no --auditDisclosed-file');
+    return 1;
+  }
+  if (wantWaiver) {
+    let waivers;
+    try { waivers = deps.waivers !== undefined ? deps.waivers : defaultWaivers(deps.env ?? { ...process.env, HOME: process.env.HOME || homedir() }); }
+    catch (e) { console.error(`fix-ready-record: refused: recorded waivers are unreadable: ${e.message}`); return 1; }
+    const w = waiverFindings(waivers, { ref: a.ref, sha: a.sha, ruling: a.auditRuling });
+    if (!w.ok) { console.error(`fix-ready-record: refused: ${w.error}`); return 1; }
+    auditDisclosed = w.findings;
+  }
   if (a['auditDisclosed-file'] !== undefined) {
     try { auditDisclosed = JSON.parse(fs.readFileSync(a['auditDisclosed-file'], 'utf8')); }
     catch (e) { console.error(`fix-ready-record: cannot read auditDisclosed-file: ${e.message}`); return 2; }

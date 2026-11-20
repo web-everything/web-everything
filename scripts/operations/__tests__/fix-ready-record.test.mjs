@@ -662,3 +662,51 @@ describe('fix-ready-record main()', () => {
     expect(err.mock.calls[1][0]).toMatch(/duplicate/);
   });
 });
+
+describe('fix-ready takes findings from the recorded waiver', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const w = { ref, sha, ruling: 'R816', findings };
+  const argv = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816'];
+  const run = (args, waivers, file = tmp()) => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    return { code: main(args, { file, waivers }), file, err };
+  };
+  it('writes the waiver findings byte-identical and in order, so the load match passes', () => {
+    const { code, file } = run(argv, [w]);
+    expect(code).toBe(0);
+    const rec = jsonLines(readFileSync(file, 'utf8'))[0];
+    expect(rec.auditDisclosed).toEqual(findings);
+    expect(readyEvidence([rec], { branch: ref, sha }, [w]).source).toBe('ready-record');
+  });
+  it('--from-waiver is accepted explicitly', () => {
+    expect(run([...argv, '--from-waiver'], [w]).code).toBe(0);
+  });
+  it.each([
+    ['no waivers at all', []],
+    ['unreadable waivers (not an array)', null],
+    ['other ref', [{ ...w, ref: 'lane/other' }]],
+    ['other sha', [{ ...w, sha: 'a'.repeat(40) }]],
+    ['other ruling', [{ ...w, ruling: 'R999' }]],
+    ['empty findings', [{ ...w, findings: [] }]],
+    ['blank finding', [{ ...w, findings: ['x', ' '] }]],
+    ['two waivers with different findings', [w, { ...w, findings: ['z'] }]],
+  ])('refuses with a named reason and writes nothing: %s', (_n, waivers) => {
+    const { code, file, err } = run(argv, waivers);
+    expect(code).toBe(1);
+    expect(err.mock.calls[0][0]).toMatch(/no recorded waiver|ambiguous|unreadable/);
+    expect(existsSync(file)).toBe(false);
+  });
+  it('refuses passing findings together with --from-waiver', () => {
+    const d = tmp(); writeFileSync(d, JSON.stringify(findings));
+    const { code } = run([...argv, '--from-waiver', `--auditDisclosed-file=${d}`], [w]);
+    expect(code).toBe(1);
+  });
+  it('explicit findings still work unchanged (no waiver lookup)', () => {
+    const d = tmp(); writeFileSync(d, JSON.stringify(findings));
+    expect(run([...argv, `--auditDisclosed-file=${d}`], []).code).toBe(0);
+  });
+  it('--from-waiver on a NOT-WEAKENED audit is refused', () => {
+    expect(run([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED', '--from-waiver'], [w]).code).toBe(1);
+  });
+});
