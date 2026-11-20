@@ -251,10 +251,16 @@ describe('operator retirement of a live overlay', () => {
         mainOnly: false, adoptOnly: true, prBaseChain: () => [] });
       expect(matching).toHaveBeenCalledOnce();
       expect(matching.mock.calls[0][0].liveApplied).toEqual([{ ref, sha }]);
-      expect(retirement).toHaveBeenCalledOnce();
-      // A same-tick drop clears registeredRefs but must retain overlaysBefore's veto.
-      expect(retirement.mock.calls[0][0].registered(ref))
-        .toBe(removal === 're-registered' || removal === 'removed-by-plan');
+      if (removal === 're-registered') {
+        // Audit enforcement preserves the registered overlay's identity before retirement exemptions.
+        expect(matching.mock.calls[0][0].auditedTip).toBeTypeOf('function');
+        expect(matching.mock.calls[0][0].registered(ref)).toBe(true);
+        expect(retirement).not.toHaveBeenCalled();
+      } else {
+        expect(retirement).toHaveBeenCalledOnce();
+        // A same-tick drop clears registeredRefs but must retain overlaysBefore's veto.
+        expect(retirement.mock.calls[0][0].registered(ref)).toBe(removal === 'removed-by-plan');
+      }
       const result = matching.mock.results[0].value;
       if (removal === 'operator-retired' || removal === 'retirement-recorded-during-plan') {
         expect(result).toMatchObject({ adopt: { finalSha: candidate }, retired: [ref] });
