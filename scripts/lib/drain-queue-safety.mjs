@@ -538,7 +538,14 @@ export function readMainExecutionEvidence({ run, readJson, now, maxAgeMs }) {
     if (jobs.some(job => typeof job?.name !== 'string')) throw Error('invalid main execution jobs');
     const shards = jobs.filter(job => /^test-shard \([1-9][0-9]*\)$/.test(job.name));
     if (new Set(shards.map(job => job.name)).size !== shards.length) throw Error('ambiguous main execution shards');
-    return shards.length > 0 && shards.every(job => job.status === 'completed' && job.conclusion === 'success');
+    return shards.length > 0 && shards.every(job => {
+      if (job.status !== 'completed' || job.conclusion !== 'success' || !Array.isArray(job.steps)) return false;
+      // Light shards succeed via a receipt while their test steps are skipped. Job success alone is not execution.
+      if (job.steps.some(step => step?.name === 'Card-only unit scope receipt' && step.conclusion !== 'skipped')) return false;
+      const tests = job.steps.filter(step => /^Unit suite (?:shard [1-9][0-9]*\/[1-9][0-9]* |no-coverage group \()/.test(step?.name));
+      return tests.some(step => step.status === 'completed' && step.conclusion === 'success')
+        && tests.every(step => step.status === 'completed' && ['success', 'skipped'].includes(step.conclusion));
+    });
   };
   if (executed(run)) return run;
   if (!mqOid(run.head_sha)) throw Error('light push has no resolvable queue SHA');
@@ -1283,7 +1290,7 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
     env, platform, standard: { mqReusedMainGreenMaxAgeMs: MQ_MAIN_GREEN_MAX_AGE_MS, mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { mqReusedMainGreenMaxAgeMs: positive, mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    valid: { mqReusedMainGreenMaxAgeMs: v => positive(v) && v <= MQ_MAIN_GREEN_MAX_AGE_MS, mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
     envValues: { mqReusedMainGreenMaxAgeMs: numberEnv('WE_DRAIN_MQ_REUSED_MAIN_GREEN_MAX_AGE_MS'), mqAggregateJobs, mqInfraSignatures, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));

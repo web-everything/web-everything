@@ -26,7 +26,7 @@ const localName = name => name.split(' / ').at(-1);
 function fixture({ checks = [shard, ...aggregates], jobData = new Map(), logs = new Map() } = {}) {
   const jobReads = [], logReads = [];
   const exec = vi.fn((command, args, options) => {
-    if (args.some(arg => arg.includes('/jobs?filter=latest'))) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }] });
+    if (args.some(arg => arg.includes('/jobs?filter=latest'))) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
     const response = pullRequest => JSON.stringify({ data: { repository: { pullRequest } } });
     if (args.some(arg => arg.includes('isInMergeQueue')))

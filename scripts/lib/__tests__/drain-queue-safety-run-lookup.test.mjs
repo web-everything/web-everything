@@ -20,7 +20,7 @@ function fixture({ failQuery, latest, before, mergeState = 'BEHIND', checks } = 
   };
   const log = vi.fn();
   const exec = vi.fn((command, args) => {
-    if (args.some(arg => arg.includes('/jobs?filter=latest'))) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }] });
+    if (args.some(arg => arg.includes('/jobs?filter=latest'))) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
     if (args.some(arg => arg.includes('isInMergeQueue')))
       return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });

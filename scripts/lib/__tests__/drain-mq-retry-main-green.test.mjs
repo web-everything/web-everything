@@ -36,7 +36,11 @@ function fixture(runs, events = [removal()], mainHead = null) {
       return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
     }
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
-    if (endpoint?.includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: runs[0]?.light ? 'skipped' : 'success' }] });
+    if (endpoint?.includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [
+      { name: 'Card-only unit scope receipt', status: 'completed', conclusion: runs[0]?.light ? 'success' : 'skipped' },
+      { name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: runs[0]?.light ? 'skipped' : 'success' },
+      { name: 'Unit suite no-coverage group (scripts tests that cannot reach a covered file)', status: 'completed', conclusion: 'skipped' },
+    ] }] });
     if (endpoint?.includes('head_sha=')) return JSON.stringify({ total_count: 1, workflow_runs: [{ ...run(90, 'success', '2026-11-01T09:00:00Z', '2026-11-01T09:30:00Z'), head_sha: 'd'.repeat(40), head_branch: 'gh-readonly-queue/main/pr-1', event: 'merge_group' }] });
     if (endpoint === `repos/${repo}/git/ref/heads/main` && mainHead) return JSON.stringify({ object: { sha: mainHead } });
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {

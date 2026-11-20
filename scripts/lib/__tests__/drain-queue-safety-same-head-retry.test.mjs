@@ -160,7 +160,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     const base = f.exec;
     f.exec = vi.fn((command, args, opts) => {
       const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
-      if (endpoint.includes('/actions/runs/900/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (5)', status: 'completed', conclusion: 'success' }] });
+      if (endpoint.includes('/actions/runs/900/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (5)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
       if (/\/actions\/runs\/7$/.test(endpoint)) return JSON.stringify({ id: 7, path: f.headRunPath ?? '.github/workflows/ci.yml', head_sha: head });
       if (/\/actions\/jobs\/44$/.test(endpoint)) return JSON.stringify({ id: 44, run_id: 7, name: 'test-shard (2)', head_sha: f.job44Sha ?? head });
@@ -357,7 +357,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     f.reports[902] = report('passed', 'an unrelated test');
     f.runJobs = { 7: f.headChecks.filter(c => c.name.startsWith('test-shard')).map(c => f.jobs[c.id]),
       900: [1, 2].map(n => ({ id: 950 + n, run_id: 900, name: `test-shard (${n})`, head_sha: mainSha,
-        status: 'completed', conclusion: 'success' })) };
+        status: 'completed', conclusion: 'success', steps: [{ name: `Unit suite shard ${n}/9 (coverage, no per-shard bar)`, status: 'completed', conclusion: 'success' }] })) };
     const page = (endpoint, key, rows) => {
       const query = new URLSearchParams(endpoint.split('?')[1]);
       const start = (Number(query.get('page') ?? 1) - 1) * 100;
@@ -450,7 +450,10 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
   };
 
   it('exact-test retry refuses a light push backed by stale queue execution', () => exactFixture(f => {
-    f.runJobs[900].forEach(job => { job.conclusion = 'skipped'; });
+    f.runJobs[900].forEach(job => {
+      job.steps[0].conclusion = 'skipped';
+      job.steps.push({ name: 'Card-only unit scope receipt', status: 'completed', conclusion: 'success' });
+    });
     const base = f.exec;
     const queue = { ...f.runs[900], id: 850, event: 'merge_group', head_branch: 'gh-readonly-queue/main/pr-1',
       created_at: iso(removedAt - 4 * 3_600_000), updated_at: iso(removedAt - 3 * 3_600_000) };
@@ -735,7 +738,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
         f.artifacts[runId].push(artifact(id, n, runId, sha));
         f.reports[id] = report('passed', `unrelated test ${n}`);
         f.runJobs[runId].push({ id, name: `test-shard (${n})`, run_id: runId, head_sha: sha,
-          status: 'completed', conclusion: 'success' });
+          status: 'completed', conclusion: 'success', steps: [{ name: `Unit suite shard ${n}/9 (coverage, no per-shard bar)`, status: 'completed', conclusion: 'success' }] });
       }
     }
     for (const rows of [f.mqChecks, f.headChecks]) {

@@ -27,7 +27,7 @@ function probe({ count = 1, text = signature, clean = 'CLEAN', main = 'success',
     } });
     if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ headRefOid: head, mergeStateStatus: clean });
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
-    if (endpoint?.includes('/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }] });
+    if (endpoint?.includes('/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: [{ name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: 'success' }] }] });
     if (endpoint?.includes('/check-runs?')) return JSON.stringify({ total_count: count, check_runs: checks });
     if (endpoint?.includes('/actions/workflows/ci.yml/runs?')) {
       const selected = endpoint.includes('created=<') ? runs.slice(1) : runs;

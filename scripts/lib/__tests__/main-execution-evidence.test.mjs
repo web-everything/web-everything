@@ -9,12 +9,17 @@ const push = { id: 102, event: 'push', head_sha: sha, conclusion: 'success',
 const queue = { id: 90, event: 'merge_group', path: '.github/workflows/ci.yml', head_sha: sha,
   head_branch: 'gh-readonly-queue/main/pr-1', status: 'completed', conclusion: 'success',
   created_at: '2026-11-01T11:55:00Z', updated_at: '2026-11-01T12:00:00Z' };
+const steps = (light = false) => [
+  { name: 'Card-only unit scope receipt', status: 'completed', conclusion: light ? 'success' : 'skipped' },
+  { name: 'Unit suite shard 1/9 (coverage, no per-shard bar)', status: 'completed', conclusion: light ? 'skipped' : 'success' },
+  { name: 'Unit suite no-coverage group (scripts tests that cannot reach a covered file)', status: 'completed', conclusion: 'skipped' },
+];
 const page = (key, rows) => ({ total_count: rows.length, [key]: rows });
 function fixture() {
   const replies = {
-    'actions/runs/102/jobs?filter=latest&per_page=100': page('jobs', [{ name: 'test-shard (1)', status: 'completed', conclusion: 'skipped' }]),
+    'actions/runs/102/jobs?filter=latest&per_page=100': page('jobs', [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: steps(true) }]),
     [`actions/workflows/ci.yml/runs?event=merge_group&head_sha=${sha}&per_page=100`]: page('workflow_runs', [{ ...queue }]),
-    'actions/runs/90/jobs?filter=latest&per_page=100': page('jobs', [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }]),
+    'actions/runs/90/jobs?filter=latest&per_page=100': page('jobs', [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success', steps: steps() }]),
   };
   const readJson = vi.fn(endpoint => {
     if (!(endpoint in replies)) throw Error('unreadable evidence');
@@ -60,12 +65,40 @@ describe('light push main execution evidence', () => {
       if (kind === 'queue skipped tests') f.replies['actions/runs/90/jobs?filter=latest&per_page=100'].jobs[0].conclusion = 'skipped';
       expect(() => f.read()).toThrow();
     });
-  it('permits reuse beyond two hours when the resolved setting allows it', () => {
-    expect(fixture().read({ now: now + 1, maxAgeMs: maxAgeMs + 1 })).toEqual({ ...queue, reusedQueue: true });
+  it.each(['missing steps', 'empty steps', 'unknown steps', 'unfinished test', 'failed test', 'receipt only'])(
+    'does not count %s as fresh main-green', kind => {
+      const f = fixture();
+      const job = f.replies['actions/runs/102/jobs?filter=latest&per_page=100'].jobs[0];
+      job.steps = steps();
+      if (kind === 'missing steps') delete job.steps;
+      if (kind === 'empty steps') job.steps = [];
+      if (kind === 'unknown steps') job.steps = [{ name: 'Setup', status: 'completed', conclusion: 'success' }];
+      if (kind === 'unfinished test') job.steps[1].status = 'in_progress';
+      if (kind === 'failed test') job.steps[1].conclusion = 'failure';
+      if (kind === 'receipt only') job.steps = [steps(true)[0]];
+      expect(() => f.read({ now: now + 1 })).toThrow(/fresh main CI or inspect manually/);
+    });
+  it('rejects queue success without test-step evidence', () => {
+    const f = fixture();
+    delete f.replies['actions/runs/90/jobs?filter=latest&per_page=100'].jobs[0].steps;
+    expect(() => f.read()).toThrow();
+  });
+  it('recognizes skipped tests even without the receipt marker', () => {
+    const f = fixture();
+    f.replies['actions/runs/102/jobs?filter=latest&per_page=100'].jobs[0].steps.shift();
+    expect(() => f.read({ now: now + 1 })).toThrow(/fresh main CI or inspect manually/);
+  });
+  it('accepts the no-coverage test leg as executed evidence', () => {
+    const f = fixture();
+    const job = f.replies['actions/runs/102/jobs?filter=latest&per_page=100'].jobs[0];
+    job.steps = steps();
+    job.steps[1].conclusion = 'skipped';
+    job.steps[2].conclusion = 'success';
+    expect(f.read()).toBe(push);
   });
   it('retains timestamps for a push that actually executed tests', () => {
     const f = fixture();
-    f.replies['actions/runs/102/jobs?filter=latest&per_page=100'].jobs[0].conclusion = 'success';
+    f.replies['actions/runs/102/jobs?filter=latest&per_page=100'].jobs[0].steps = steps();
     expect(f.read()).toBe(push);
     expect(f.readJson).toHaveBeenCalledTimes(1);
   });
@@ -82,6 +115,16 @@ describe('reused main-green age policy', () => {
     expect(readDrainQueueSafety({ env, tool, platform, log })).toMatchObject({
       value: { mqReusedMainGreenMaxAgeMs: value }, sources: { mqReusedMainGreenMaxAgeMs: source } });
     expect(log.mock.calls.flat().join('\n')).toContain(`mqReusedMainGreenMaxAgeMs=${value} (${source})`);
+  });
+  it.each(['env', 'tool', 'platform'])('rejects an oversized %s age and logs the retained two-hour bound', source => {
+    const log = vi.fn();
+    const options = { env: {}, tool: {}, platform: {}, log };
+    if (source === 'env') options.env.WE_DRAIN_MQ_REUSED_MAIN_GREEN_MAX_AGE_MS = String(maxAgeMs + 1);
+    else options[source].mqReusedMainGreenMaxAgeMs = maxAgeMs + 1;
+    expect(readDrainQueueSafety(options)).toMatchObject({
+      value: { mqReusedMainGreenMaxAgeMs: maxAgeMs }, sources: { mqReusedMainGreenMaxAgeMs: 'standard' } });
+    expect(log.mock.calls.flat().join('\n')).toContain(`mqReusedMainGreenMaxAgeMs=${maxAgeMs} (standard)`);
+    expect(log.mock.calls.flat().join('\n')).toContain(`ignored invalid: ${source}.mqReusedMainGreenMaxAgeMs=${maxAgeMs + 1}`);
   });
   it.each([0, -1, NaN, Infinity, 'bad'])('rejects invalid age %s and retains the standard bound', value => {
     expect(readDrainQueueSafety({ env: {}, tool: { mqReusedMainGreenMaxAgeMs: value }, platform: {} })).toMatchObject({

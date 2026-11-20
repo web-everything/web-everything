@@ -5718,3 +5718,13 @@ integration and soak matrix leg, matching the queue reuse proof. Missing or unre
 receipts skip the candidate; the bounded search retains the explicit `--run=<id>` fallback.
 Scoped regressions live in `red-main-freeze-shared.test.mjs`, `drain-mq-retry-main-green.test.mjs`,
 `drain-queue-safety-same-head-retry.test.mjs` and `refresh-timings.test.mjs`.
+
+## Main-green execution proof (PR #7224)
+
+Successful unit-shard jobs alone do not prove tests ran: light pushes report success via
+`Card-only unit scope receipt` while unit steps are skipped. Drain readers require successful
+unit-step evidence on every shard; missing or unknown steps use the same-SHA queue evidence
+path and its age bound. The reused-main-green age setting may only shorten the two-hour
+standard; oversized values are ignored and logged by the policy cascade. Keep production-shaped
+light fixtures and negative age tests in `main-execution-evidence.test.mjs` and
+`drain-mq-retry-main-green.test.mjs`.
