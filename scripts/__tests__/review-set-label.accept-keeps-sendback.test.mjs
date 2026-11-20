@@ -78,6 +78,64 @@ function operatorReleaseThread({ count = 1, releaseLine, summary = 'confirmed br
 }
 
 describe('accept refuses a red-team send-back without writes', () => {
+  describe.each([
+    ['legacy', false, false],
+    ['bound', true, true],
+    ['legacy send-back and bound cap', false, true],
+    ['bound send-back and legacy cap', true, false],
+  ])('%s result grouping', (_binding, bindSendBack, bindCap) => {
+    function gatesFor(first, second) {
+      const sendBack = bindSendBack ? first[1] : record();
+      const cap = bindCap
+        ? { ...second[1], body: second[1].body.replace('outcome=sent-back', 'outcome=round-cap') }
+        : record(GATE_OUTCOMES.ROUND_CAP);
+      return { sendBack, cap };
+    }
+
+    it.each(['initial', 'fresh', 'post-comment', 'paginated'])('a later result cap cannot cancel an unreleased send-back on the %s read', stage => {
+      const first = operatorReleaseThread({ summary: 'first confirmed break' });
+      const second = operatorReleaseThread({ summary: 'second confirmed break' });
+      const { sendBack, cap } = gatesFor(first, second);
+      const comments = [first[0], sendBack, second[0], cap];
+      const page = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ body: `ordinary ${i}` }));
+      const result = accept(stage === 'initial' ? { comments }
+        : stage === 'fresh' ? { comments: [], freshComments: comments }
+          : stage === 'post-comment' ? { comments: [], postCommentState: { comments } }
+            : { comments: page, readComments: () => [...page, ...comments] });
+      if (stage === 'post-comment') {
+        expect(result.exitCode).toBe(1);
+        expect(result.result.error).toMatch(/same-head red-team send-back/i);
+        expect(result.labels).toEqual(['review:changes']);
+        expect(result.setLabels).not.toHaveBeenCalled();
+        expect(result.signalFix).not.toHaveBeenCalled();
+        expect(result.posted).toHaveLength(1);
+        expect(result.appendLedgerVerdict).toHaveBeenCalledTimes(1);
+      } else expectRefused(result);
+    });
+
+    it('still lets a cap supersede a send-back for the same result', () => {
+      const first = operatorReleaseThread();
+      const { sendBack, cap } = gatesFor(first, first);
+      const result = accept({ comments: [first[0], sendBack, cap] });
+      expect(result.exitCode).toBe(0);
+      expect(result.labels).toEqual(['review:accepted']);
+    });
+
+    it('honors a delayed release of the older send-back after the newer capped result is released', () => {
+      const first = operatorReleaseThread({ summary: 'first confirmed break' });
+      const second = operatorReleaseThread({ summary: 'second confirmed break' });
+      const { sendBack, cap } = gatesFor(first, second);
+      const result = accept({ comments: [first[0], sendBack, second[0], cap, second[2], first[2]] });
+      expect(result.exitCode).toBe(0);
+      expect(result.labels).toEqual(['review:accepted']);
+    });
+  });
+
+  it('a legacy cap with a result cannot cancel an orphan legacy send-back', () => {
+    const [result] = operatorReleaseThread();
+    expectRefused(accept({ comments: [record(), result, record(GATE_OUTCOMES.ROUND_CAP)] }));
+  });
+
   it.each(['initial', 'fresh', 'post-comment', 'paginated'])('accepts independently released same-head results on the %s read', stage => {
     const first = operatorReleaseThread({ summary: 'first break' });
     const second = operatorReleaseThread({ summary: 'second break' });

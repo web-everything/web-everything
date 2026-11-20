@@ -1509,7 +1509,7 @@ export function runReviewLabelCli({
       const standingRuling = readGrantScope({ repo, pr: { number: Number(pr), headRefOid: head, comments: thread } }) ?? null;
       const grants = gateRoundGrants(thread, pr, repo, standingRuling);
       // Resolve each result separately: a cap for another result cannot cancel its send-back.
-      // Legacy unbound gate records share their own step, preserving their raced-cap semantics.
+      // Legacy gates decide their preceding result; only gates without one share the null step.
       const steps = new Map();
       const resultPositions = new Map();
       const resultComments = new Set();
@@ -1525,9 +1525,9 @@ export function runReviewLabelCli({
         if (!gateOutcomesForHead([c], pr, head).size) return;
         const gate = parseRedTeamGateMarker(c.body);
         if (!gate.result) legacyBindings.set(at, precedingResultId);
-        const key = gate.result ?? null;
+        const key = gate.result ?? precedingResultId;
         if (!steps.has(key)) steps.set(key, []);
-        steps.get(key).push({ at, i: at, ts: 0, gate, resultId: gate.result ?? precedingResultId });
+        steps.get(key).push({ at, i: at, ts: 0, gate, resultId: key });
       });
       const sentBackSteps = [...steps].filter(([, gates]) => sendBackStepState(gates, grants).outcome === GATE_OUTCOMES.SENT_BACK);
       if (!sentBackSteps.length) return false;
