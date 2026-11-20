@@ -5491,22 +5491,29 @@ verifies persisted events and commit messages against a temporary local Git orig
 
 `headNeverReviewedFromRuns` proves absence through `readNamedCandidates`, independently
 of the full-review index. Archive evidence, archive claims, unreadable listings or
-records, malformed legacy evidence, and missing/non-40-hex subject heads retain the
-hold. Named ids for other PRs are skipped; legacy ids and this PR's named ids are
-validated with `assertReviewRunEvidence`. An unfinished review on an older head
+records, malformed evidence, and missing/non-40-hex subject heads retain the
+hold. Every candidate, including ids named for other PRs, is read and validated with
+`assertReviewRunEvidence` on a cache miss. Payload repo/PR determines relevance
+regardless of the filename's PR; corrupt or unreadable unrelated records refuse proof.
+Independently list the directory before and after parsing: any review-like JSON file
+omitted by candidate discovery refuses proof. Known `.abandoned.json` tombstones and
+temporary files ending in `.tmp` remain excluded. Operators must inspect and repair
+omitted or malformed evidence before retrying. An unfinished review on an older head
 permits a fresh full review (R640); any live-head review prevents this proof.
 
-A process-local summary cache binds each directory/id to mtime, size and inode.
+A process-local summary cache binds each directory/id to mtimeMs, ctimeMs, device,
+size and inode; a difference in any field forces a fresh read and validation.
 Only cache misses consume `runs.scan.maxParses`, resolved through the shared settings
 cascade. Reaching the limit returns false while retaining verified summaries for the
 next tick. Operators can wait for subsequent ticks, inspect omitted evidence, or
 explicitly raise the setting; a partial scan never authorizes a dispatch. Rewritten
 records are reparsed. Before returning true, re-read the candidate snapshot and
-recheck every relevant file identity; changed or unreadable evidence returns false.
+recheck every candidate's file identity; changed or unreadable evidence returns false.
 
 Keep the ten Tier-1 regressions in `redteam-pending-settle.test.mjs`: over-400 legacy
 success and live-head refusal, unreadable heads, unrelated malformed records,
-PR-named selection, bounded cache resumption, rewritten identities, listing races,
+other-PR payload validation and cached reuse, bounded cache resumption, rewritten
+identities (including ctime/device), omitted review filenames, listing races,
 null candidate discovery, and planner cooldown/formal-review/publishability holds.
 Keep index integrity/backfill tests in `review-run-index.test.mjs`; index corruption,
 poison, overflow or eviction alone no longer determines the never-reviewed proof.

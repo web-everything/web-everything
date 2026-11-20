@@ -370,7 +370,7 @@ function negativeFixture() {
   let reads = [], listings = 0;
   const io = { list: () => { listings++; return records.map(r => r.id); },
     readdir: () => records.map(r => `${r.id}.json`),
-    stat: path => ({ mtimeMs: 2000, ino: 1,
+    stat: path => ({ mtimeMs: 2000, ctimeMs: 2000, dev: 1, ino: 1,
       size: JSON.stringify(records.find(r => path === r.id || path.endsWith(`/${r.id}.json`))).length }),
     read: id => { reads.push(id); return records.find(r => r.id === id); } };
   const fill = () => backfillAllReviewRuns({ ...f, ...io, maxParsesPerCall: 200 });
@@ -414,7 +414,8 @@ it.each(['missing', 'corrupt', 'poisoned', 'watermark absent', 'open only', 'new
     if (kind === 'overflow') { index.fullReviewRuns.entries['o/r#7'] = []; writeFileSync(path, JSON.stringify(index)); }
     if (kind === 'evicted') { delete index.fullReviewRuns.entries['o/r#7']; index.fullReviewRuns.evicted.push('o/r#7'); writeFileSync(path, JSON.stringify(index)); }
     if (kind.includes('unindexed')) { n.records.push({ ...n.f.run, id: 'review-pr-lost' });
-      n.io.stat = () => ({ mtimeMs: kind === 'old unindexed' ? 1000 : 3000, size: 100, ino: 1 }); }
+      n.io.stat = () => ({ mtimeMs: kind === 'old unindexed' ? 1000 : 3000,
+        ctimeMs: 3000, dev: 1, size: 100, ino: 1 }); }
     if (kind === 'listing failure') n.io.list = () => { throw Error('listing unavailable'); };
     if (kind === 'stat failure') n.io.stat = () => { throw Error('stat unavailable'); };
     expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();

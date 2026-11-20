@@ -660,7 +660,7 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     return { repo, pr, head, runsDir: `fixture-runs-${++fixtureNumber}`,
       list: vi.fn(() => Object.keys(records)), readdir: vi.fn(() => Object.keys(records).map(id => `${id}.json`)),
       scanSettings: { file: { runs: { scan: { maxParses: 5000 } } }, platform: {}, env: {} },
-      read: vi.fn(id => records[id] && ({ id, ...records[id] })), stat: vi.fn(() => ({ mtimeMs: acceptedAt, size: 100, ino: 1 })) };
+      read: vi.fn(id => records[id] && ({ id, ...records[id] })), stat: vi.fn(() => ({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 })) };
   }
   const legacyRecords = () => Object.fromEntries(Array.from({ length: 401 }, (_, i) => [`review-pr-${i}`, run()]));
   function scan(f) {
@@ -731,13 +731,51 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
   it('Tier-1 4: an unrelated malformed legacy record refuses proof', () => {
     expect(scan(scanFixture({ 'review-pr-other': run({ input: { repo: 'else/where', pr: 1 }, verdict: {} }) }))).toBe(false);
   });
-  it('Tier-1 5: other named PR ids are never parsed and this PR named ids are parsed', () => {
+  it('Tier-1 5: all named PR ids are validated once, then cached reads are free', () => {
     const own = `review-pr-pr${pr}-00000000-0000-0000-0000-000000000000`;
     const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
-    const f = scanFixture({ [own]: run(), [other]: {} });
+    const f = scanFixture({ [own]: run(), [other]: run({ input: { repo, pr: pr + 1 } }) });
+    f.scanSettings.file.runs.scan.maxParses = 1;
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
     expect(scan(f)).toBe(true);
-    expect(f.read.mock.calls.map(([id]) => id)).toEqual([own]);
-    expect(f.stat.mock.calls.every(([path]) => path.endsWith(`${own}.json`))).toBe(true);
+    expect(f.read.mock.calls.map(([id]) => id)).toEqual([own, other]);
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(2);
+  });
+  it.each(['live head', 'corrupt', 'unreadable'])('another PR filename with %s payload refuses proof', kind => {
+    const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
+    const f = scanFixture({ [other]: kind === 'corrupt' ? {} : run(payload('accept')) });
+    if (kind === 'unreadable') f.read.mockImplementation(() => { throw Error('unreadable payload'); });
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it('payload repo and PR determine relevance regardless of the named PR', () => {
+    const other = `review-pr-pr${pr + 1}-00000000-0000-0000-0000-000000000000`;
+    const f = scanFixture({ [other]: run() });
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it.each(['review-pr-invalid!.json', 'review-other.json'])('omitted review-like file %s refuses proof', name => {
+    const f = scanFixture();
+    f.readdir.mockReturnValue([name]);
+    expect(scan(f)).toBe(false);
+    expect(f.read).not.toHaveBeenCalled();
+  });
+  it('an invalid review filename appearing after parsing refuses proof', () => {
+    const f = scanFixture({ 'review-pr-old': run() });
+    f.read.mockImplementation(id => {
+      f.readdir.mockReturnValue(['review-pr-old.json', 'review-pr-invalid!.json']);
+      return { id, ...run() };
+    });
+    expect(scan(f)).toBe(false);
+  });
+  it('known abandoned and temporary files do not prevent an empty proof', () => {
+    const f = scanFixture();
+    f.readdir.mockReturnValue(['review-pr-old.abandoned.json', 'review-pr-old.json.123.tmp']);
+    expect(scan(f)).toBe(true);
   });
   it('Tier-1 6: parse misses above the setting hold with bounded reads and resume on the next call', () => {
     const f = scanFixture({ 'review-pr-1': run(), 'review-pr-2': run(), 'review-pr-3': run() });
@@ -746,11 +784,11 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(3);
     expect(scan(f)).toBe(true); expect(f.read).toHaveBeenCalledTimes(3);
   });
-  it.each(['mtimeMs', 'size', 'ino'])('Tier-1 7: cached record rewritten to live head with changed %s refuses proof', key => {
+  it.each(['mtimeMs', 'ctimeMs', 'dev', 'size', 'ino'])('Tier-1 7: cached record rewritten to live head with changed %s refuses proof', key => {
     const records = { 'review-pr-old': run() }, f = scanFixture(records);
     expect(scan(f)).toBe(true);
     records['review-pr-old'] = run(payload('accept'));
-    f.stat = vi.fn(() => ({ mtimeMs: acceptedAt, size: 100, ino: 1, [key]: 200 }));
+    f.stat = vi.fn(() => ({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1, [key]: 200 }));
     expect(scan(f)).toBe(false); expect(f.read).toHaveBeenCalledTimes(2);
   });
   it('Tier-1 8: a candidate listing changed between snapshots refuses proof', () => {
@@ -778,12 +816,12 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
   });
   it('an identity changed during a payload read refuses proof', () => {
     const f = scanFixture({ 'review-pr-old': run() });
-    f.stat.mockReturnValueOnce({ mtimeMs: acceptedAt, size: 100, ino: 1 }).mockReturnValue({ mtimeMs: acceptedAt, size: 101, ino: 1 });
+    f.stat.mockReturnValueOnce({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 }).mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
     expect(scan(f)).toBe(false);
   });
-  it.each(['mtimeMs', 'size', 'ino'])('missing %s metadata refuses proof', key => {
+  it.each(['mtimeMs', 'ctimeMs', 'dev', 'size', 'ino'])('missing %s metadata refuses proof', key => {
     const f = scanFixture({ 'review-pr-old': run() });
-    const identity = { mtimeMs: acceptedAt, size: 100, ino: 1 }; delete identity[key];
+    const identity = { mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 }; delete identity[key];
     f.stat.mockReturnValue(identity);
     expect(scan(f)).toBe(false);
   });
