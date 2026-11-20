@@ -14,7 +14,12 @@ Checkout subprocesses in we:scripts/operations/urgent-verify.mjs run as the sign
 
 ## Acceptance
 
-- [A1] **Executable baseline** — `npm run test:unit -- scripts/operations/__tests__/urgent-verify.test.mjs`: preserve the named tests `a step cannot read the signing key`, `step children get the throwaway HOME, parent-side git calls keep the real one`, `keeps the throwaway HOME present for wrapper children and removes it after exit %s`, `the real wrapper admits an isolated step into the parent temporary pool with the exact wrapper env`, and `every admission call requires a slot (no-pool / bypass means refusal)`.
+- [A1] **Executable baseline** — Run the command below for we:scripts/operations/__tests__/urgent-verify.test.mjs; preserve the named tests `a step cannot read the signing key`, `step children get the throwaway HOME, parent-side git calls keep the real one`, `keeps the throwaway HOME present for wrapper children and removes it after exit %s`, `the real wrapper admits an isolated step into the parent temporary pool with the exact wrapper env`, and `every admission call requires a slot (no-pool / bypass means refusal)`.
+
+  ```sh
+  npm run test:unit -- scripts/operations/__tests__/urgent-verify.test.mjs
+  ```
+
 - [A2] **Required closure regression** — Add a step that chmods, reads, and restores the key mode; it must fail to obtain the key under a separate uid or sandbox. The existing plain-read test alone cannot close this card.
 - [A3] **Required closure regression** — Plant checkout `.git/config` fsmonitor and hook commands; parent status/ls-files inspection must not execute them. Pin the parent's Git config and env at every inspection call.
 - [A4] **Must refuse** — Missing isolation support, unreadable signing state or bypassed admission produces no green receipt. Treat checkout scripts, config, docs and data as equally untrusted. Keep signing and ledger writes in the trusted parent.
