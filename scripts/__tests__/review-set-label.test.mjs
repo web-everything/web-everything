@@ -5008,6 +5008,27 @@ describe('#5649 — approval rows at the label home', () => {
     expect(p.calls).toEqual([]);
   });
 
+  it('daemon clear-human refuses a throwing verdict append before any write', () => {
+    const p = stubProvider(['review:human']);
+    const appendLedgerVerdict = vi.fn(() => { throw new Error('ledger unavailable'); });
+    const appendApproval = vi.fn();
+    const { exitCode, payload } = run(p, [...CLEAR, '--channel=daemon', `--expect-head=${'a'.repeat(40)}`],
+      { appendLedgerVerdict, appendApproval });
+    expect(appendLedgerVerdict).toHaveBeenCalledOnce();
+    expect(exitCode).toBe(1);
+    expect(payload.error).toMatch(/F4.*ledger unavailable.*retry/);
+    expect(appendApproval).not.toHaveBeenCalled();
+    expect(p.calls).toEqual([]);
+    expect(rows()).toEqual([]);
+  });
+
+  it('clear-human on any channel refuses a throwing verdict append before any write', () => {
+    const p = stubProvider(['review:human']);
+    const { exitCode } = run(p, CLEAR, { appendLedgerVerdict: () => { throw new Error('ledger unavailable'); } });
+    expect(exitCode).toBe(1);
+    expect(p.calls).toEqual([]);
+  });
+
   it('a throwing approval append also blocks the swap', () => {
     const p = stubProvider(['review:human']);
     const { exitCode } = run(p, CLEAR, { appendApproval: () => { throw new Error('disk gone'); } });
