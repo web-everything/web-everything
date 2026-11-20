@@ -1,7 +1,7 @@
 /** Mechanical tests only. Supplied live agy 1.2.2 streams are literal fixtures; real git regressions; no real agy processes. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync, openSync, constants } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
@@ -531,6 +531,79 @@ function fakeExec(calls = []) {
 }
 
 describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', () => {
+  it('kills the exclusive worker group on exit and waits for pipe close', async () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const { fn, seen } = fakeSpawn('', { hang: true });
+    let resolved = false;
+    const dir = tempDir();
+    const pending = runAgyDirectExec({ dir, task: 't', logFile: join(dir, 'log'),
+      exclusiveLog: true, spawnFn: fn, stream: false }).then(result => { resolved = true; return result; });
+    seen.child.pid = 987654;
+    seen.child.emit('exit', 0);
+    expect(kill).toHaveBeenCalledWith(-987654, 'SIGKILL');
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    seen.child.emit('close', 0);
+    expect(await pending).toMatchObject({ code: 0 });
+    expect(seen.opts.detached).toBe(true);
+  });
+  it('fails closed when exclusive worker group termination fails', async () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    const { fn, seen } = fakeSpawn('', { hang: true });
+    const dir = tempDir();
+    const pending = runAgyDirectExec({ dir, task: 't', logFile: join(dir, 'log'),
+      exclusiveLog: true, spawnFn: fn, stream: false });
+    seen.child.pid = 987654;
+    seen.child.emit('exit', 0);
+    seen.child.emit('close', 0);
+    expect(await pending).toMatchObject({ code: null, stderr: expect.stringContaining('worker group cleanup failed') });
+  });
+  it.each(['hold', 'success', 'spawn throw', 'spawn error', 'timeout'])('closes the exclusive transcript fd on %s', async mode => {
+    const dir = tempDir();
+    const logFile = join(dir, 'exclusive.jsonl');
+    // Observe the real open through the runner's IO seam, independent of builtin module mocking.
+    const openLogFn = vi.fn((...args) => openSync(...args));
+    let liveStat;
+    const readHold = vi.fn(() => {
+      liveStat = fstatSync(openLogFn.mock.results[0].value);
+      return mode === 'hold' ? { fallbackDecision: 'skip-quota-hold' } : null;
+    });
+    const { fn } = fakeSpawn('recorded\n', { hang: mode === 'timeout', error: mode === 'spawn error' ? 'ENOENT' : null });
+    const spawnFn = mode === 'spawn throw' ? vi.fn(() => { throw new Error('ENOENT'); }) : fn;
+    const result = await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, stream: false,
+      timeoutMs: 20, spawnFn, openLogFn, readHold });
+    expect(openLogFn).toHaveBeenCalledOnce();
+    expect(openLogFn).toHaveBeenCalledWith(logFile,
+      constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    expect(readHold).toHaveBeenCalledOnce();
+    expect(liveStat?.isFile()).toBe(true);
+    const fd = openLogFn.mock.results[0].value;
+    expect(() => fstatSync(fd)).toThrow(/EBADF/);
+    expect(result.code).toBe(mode === 'hold' ? 1 : mode === 'success' ? 0 : null);
+    expect(result.timedOut).toBe(mode === 'timeout');
+    expect(statSync(logFile).isFile()).toBe(true);
+    if (mode === 'hold') {
+      expect(spawnFn).not.toHaveBeenCalled();
+      expect(readFileSync(logFile, 'utf8')).toBe('');
+    }
+  });
+  it('rejects resume of an exclusive transcript before spawning', async () => {
+    const spawnFn = vi.fn();
+    expect(await runAgyDirectExec({ dir: tempDir(), task: 't', logFile: join(tempDir(), 'log'),
+      exclusiveLog: true, resumeConversationId: 'conversation-123', spawnFn }))
+      .toMatchObject({ code: null, stderr: 'exclusive transcript cannot be resumed' });
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
+  it('rejects EEXIST without truncating a pre-existing exclusive transcript', async () => {
+    const dir = tempDir();
+    const logFile = join(dir, 'log');
+    writeFileSync(logFile, 'preserved');
+    const spawnFn = vi.fn();
+    expect(await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, spawnFn }))
+      .toMatchObject({ code: null, stderr: expect.stringContaining('EEXIST') });
+    expect(readFileSync(logFile, 'utf8')).toBe('preserved');
+    expect(spawnFn).not.toHaveBeenCalled();
+  });
   it('isolates injected processes from persisted host quota reads and writes', async () => {
     const dir = tempDir();
     vi.stubEnv('ANTIGRAVITY_QUOTA_DIR', join(dir, 'quota'));
