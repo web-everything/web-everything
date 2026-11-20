@@ -364,10 +364,14 @@ it.each(['deleted key', 'append after deleted key', 'missing row', 'deleted evic
 function negativeFixture() {
   const f = fixture();
   f.run.findings.read.netBasis.rev = 'b'.repeat(40);
+  f.scanSettings = { file: { runs: { scan: { maxParses: 5000 } } }, platform: {}, env: {} };
   const records = [f.run, ...Array.from({ length: 401 }, (_, i) => ({ ...f.run,
     id: `review-pr-unrelated-${i}`, input: { repo: 'else/where', pr: i + 1 } }))];
   let reads = [], listings = 0;
-  const io = { list: () => { listings++; return records.map(r => r.id); }, stat: () => ({ mtimeMs: 2000 }),
+  const io = { list: () => { listings++; return records.map(r => r.id); },
+    readdir: () => records.map(r => `${r.id}.json`),
+    stat: path => ({ mtimeMs: 2000, ino: 1,
+      size: JSON.stringify(records.find(r => path === r.id || path.endsWith(`/${r.id}.json`))).length }),
     read: id => { reads.push(id); return records.find(r => r.id === id); } };
   const fill = () => backfillAllReviewRuns({ ...f, ...io, maxParsesPerCall: 200 });
   return { f, io, records, fill, reads, listings: () => listings, reset: () => { reads.length = 0; listings = 0; } };
@@ -391,14 +395,14 @@ it('full backfill resumes from the index in bounded batches and stamps only a co
   expect(n.reads).toHaveLength(0);
   expect(readCompleteReviewRunsForPr(n.f.runsDir, 'else/where', 401, n.io)).toEqual(['review-pr-unrelated-400']);
 });
-it('complete index proves never reviewed beyond 400 ids parsing only this PR', () => {
+it('named-candidate proof beyond 400 parses all legacy ids independently of the complete index', () => {
   const n = negativeFixture(); fullNegativeIndex(n);
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
-  expect(n.reads).toEqual([n.f.run.id]);
+  expect(n.reads).toEqual(n.records.map(r => r.id).sort());
   expect(readCompleteReviewRunsForPr(n.f.runsDir, 'absent/repo', 99, n.io)).toEqual([]);
 });
 it.each(['missing', 'corrupt', 'poisoned', 'watermark absent', 'open only', 'new unindexed', 'old unindexed', 'listing failure', 'stat failure', 'overflow', 'evicted'])(
-  '%s full proof falls back to the unchanged capped scan', kind => {
+  '%s index proof does not control the independent named-candidate proof', kind => {
     const n = negativeFixture(); fullNegativeIndex(n);
     const path = reviewRunIndexPath(n.f.runsDir);
     const index = JSON.parse(readFileSync(path));
@@ -410,15 +414,16 @@ it.each(['missing', 'corrupt', 'poisoned', 'watermark absent', 'open only', 'new
     if (kind === 'overflow') { index.fullReviewRuns.entries['o/r#7'] = []; writeFileSync(path, JSON.stringify(index)); }
     if (kind === 'evicted') { delete index.fullReviewRuns.entries['o/r#7']; index.fullReviewRuns.evicted.push('o/r#7'); writeFileSync(path, JSON.stringify(index)); }
     if (kind.includes('unindexed')) { n.records.push({ ...n.f.run, id: 'review-pr-lost' });
-      n.io.stat = () => ({ mtimeMs: kind === 'old unindexed' ? 1000 : 3000 }); }
+      n.io.stat = () => ({ mtimeMs: kind === 'old unindexed' ? 1000 : 3000, size: 100, ino: 1 }); }
     if (kind === 'listing failure') n.io.list = () => { throw Error('listing unavailable'); };
     if (kind === 'stat failure') n.io.stat = () => { throw Error('stat unavailable'); };
     expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
-    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
-    expect(n.reads).toHaveLength(0);
+    const unreadable = ['listing failure', 'stat failure'].includes(kind);
+    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(!unreadable);
+    expect(n.reads).toHaveLength(unreadable ? 0 : n.records.length);
   });
 it.each(['same head', 'unknown head', 'wrong PR', 'wrong repo', 'wrong op', 'missing', 'bad evidence', 'wrong id'])(
-  'indexed %s cannot establish never reviewed', kind => {
+  'named proof validates %s evidence independently of indexed subject keys', kind => {
     const n = negativeFixture(); fullNegativeIndex(n);
     if (kind === 'same head') n.f.run.findings.read.netBasis.rev = n.f.head;
     if (kind === 'unknown head') delete n.f.run.findings.read.netBasis.rev;
@@ -428,8 +433,11 @@ it.each(['same head', 'unknown head', 'wrong PR', 'wrong repo', 'wrong op', 'mis
     if (kind === 'bad evidence') delete n.f.run.effects;
     if (kind === 'missing') n.io.read = () => { throw Error('missing'); };
     if (kind === 'wrong id') n.io.read = () => ({ ...n.f.run, id: 'review-pr-wrong' });
-    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
-    if (!['same head', 'unknown head'].includes(kind)) expect(n.listings()).toBe(2);
+    // Legacy records with a valid different subject/op no longer belong to this PR.
+    // Missing/malformed identity, a mismatched id, and live/unknown subject heads still hold.
+    const unrelated = ['wrong PR', 'wrong repo', 'wrong op'].includes(kind);
+    expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(unrelated);
+    expect(n.listings()).toBe(unrelated ? 2 : 1);
   });
 it('open-PR refresh preserves full-backfill progress and its completed proof', () => {
   const n = negativeFixture();
@@ -440,7 +448,7 @@ it('open-PR refresh preserves full-backfill progress and its completed proof', (
   expect(n.fill().complete).toBe(true);
   open(); open(); n.reset();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
-  expect(n.reads).toEqual([n.f.run.id]);
+  expect(n.reads).toEqual(n.records.map(r => r.id).sort());
 });
 
 it('full backfill uses the default parser and refuses corrupt payloads without stamping completeness', () => {
@@ -519,14 +527,14 @@ it.each(['completed', 'staged'])('legacy %s full backfill revalidates records be
   n.reset();
   expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
 });
-it('full backfill eviction cannot turn a lost key into a proof of absence', () => {
+it('full backfill eviction refuses index absence while an independent complete scan can prove it', () => {
   const n = negativeFixture();
   n.records.push(...Array.from({ length: 112 }, (_, i) => ({ ...n.f.run,
     id: `review-pr-z-${i}`, input: { repo: 'extra/repo', pr: i + 1 } })));
   n.fill(); n.fill();
   expect(n.fill().complete).toBe(true);
   expect(readCompleteReviewRunsForPr(n.f.runsDir, n.f.repo, n.f.pr, n.io)).toBeNull();
-  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(false);
+  expect(headNeverReviewedFromRuns({ ...n.f, ...n.io })).toBe(true);
 });
 it('full backfill retains verified progress if a file appears behind its cursor and publishes no partial proof', () => {
   const n = negativeFixture(); n.fill();
