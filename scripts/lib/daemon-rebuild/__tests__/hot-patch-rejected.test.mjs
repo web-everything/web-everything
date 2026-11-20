@@ -34,9 +34,9 @@ it('R3.9 after rollback, origin/main merging rejected SHA is refused with HEAD u
     const preGood = { head: good, mainSha: good, inputsKey: 'c'.repeat(40), applied: [] };
     writeRebuildState(root, { adopted: { head: sha, mainSha: good, inputsKey: 'd'.repeat(40), applied: [] } }, env);
     mkdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true });
-    const overlay = { ref: 'lane/repair', pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
-      expectedSha: sha, addedAt: new Date().toISOString(), addedBy: null };
-    writeFileSync(hotPatchLedgerPath(env), JSON.stringify({ sha, pr: 42, branch: overlay.ref, root,
+    const overlay = { ref: `hotpatch/${sha}`, pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
+      addedAt: new Date().toISOString(), addedBy: null };
+    writeFileSync(hotPatchLedgerPath(env), JSON.stringify({ sha, pr: 42, branch: overlay.ref, prBranch: 'lane/repair', root,
       requestPid: process.pid, requestStart: 1, loadedAt: overlay.addedAt, overlay, preGood }));
     let overlays = [overlay];
     await runHotPatchTick({ root, env, startTimeOf: () => 2,

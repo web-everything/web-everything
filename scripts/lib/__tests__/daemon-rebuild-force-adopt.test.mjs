@@ -24,6 +24,7 @@ import { gitRun } from '../main-staleness.mjs';
 import { withWriteLock, cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { rollbackToGood } from '../daemon-rebuild/rebuild.mjs';
 import * as hotPatchModule from '../hot-patch.mjs';
+import * as prepareModule from '../daemon-rebuild/prepare.mjs';
 import { hotPatchLedgerPath, readHotPatch, HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON } from '../hot-patch.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -961,29 +962,22 @@ describe('shared hot-patch rollback wiring', () => {
     const requestPid = Number(child.stdout);
     expect(() => process.kill(requestPid, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }));
     writeRebuildState(cloneDir, { ...readRebuildState(cloneDir, env), adopted: {
-      head: sha, inputsKey: 'd'.repeat(40), mainSha: good, applied: [{ ref: 'lane/repair', sha }],
+      head: sha, inputsKey: 'd'.repeat(40), mainSha: good, applied: [{ ref: `hotpatch/${sha}`, sha }],
       at: new Date().toISOString(),
     } }, env);
     const loadedAt = new Date(Date.now() - HOT_PATCH_MAX_OPEN_MS).toISOString();
-    addOverlay(cloneDir, { ref: 'lane/repair', pr: 42, pinned: true,
+    addOverlay(cloneDir, { ref: `hotpatch/${sha}`, pr: 42, pinned: true,
       reason: HOT_PATCH_OVERLAY_REASON, now: loadedAt }, { env });
     const overlay = readOverlays(cloneDir, { env })[0];
-    const ledger = { sha, pr: 42, branch: overlay.ref, root: cloneDir, requestPid, requestStart: 1,
+    const ledger = { sha, pr: 42, branch: overlay.ref, prBranch: 'lane/repair', root: cloneDir, requestPid, requestStart: 1,
       loadedAt, overlay, preGood: { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] } };
     writeFileSync(hotPatchLedgerPath(env), JSON.stringify(ledger));
     expect(readHotPatch(env)).toEqual(ledger);
-    return { cloneDir, env, sha, overlay };
+    return { cloneDir, env, sha, good, overlay };
   };
 
   it('corrupt ledger reaches orphan-overlay cleanup through the real rebuildClone wrapper', async () => {
     const { cloneDir, env } = isolationFixture();
-    const tagged = { ...readOverlays(cloneDir, { env })[0], expectedSha: headOf(cloneDir),
-      hotPatch: { sha: headOf(cloneDir), loadedAt: readHotPatch(env).loadedAt, ledgerKey: cloneKeyOf(hotPatchLedgerPath(env)) } };
-    const { overlayFilePath } = await import('../daemon-overlays.mjs');
-    const file = overlayFilePath(cloneDir, env);
-    const state = JSON.parse(readFileSync(file, 'utf8'));
-    state.overlays = [tagged];
-    writeFileSync(file, JSON.stringify(state));
     writeFileSync(hotPatchLedgerPath(env), '{corrupt');
     const emitEvent = vi.fn(async () => true);
     await tick(cloneDir, env, { versions: {}, adoptOnly: true, emitEvent });
@@ -992,6 +986,35 @@ describe('shared hot-patch rollback wiring', () => {
     expect(JSON.parse(readFileSync(requestPath, 'utf8'))).toMatchObject({ reason: HOT_PATCH_OVERLAY_REASON });
     expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'hot-patch-needs-you' }), expect.anything());
     expect(readFileSync(hotPatchLedgerPath(env), 'utf8')).toBe('{corrupt');
+  });
+
+  it('remote immutable SHA movement rolls back through the wrapper before prepareRebuild', async () => {
+    const { cloneDir, env, sha, good } = isolationFixture();
+    const record = readHotPatch(env);
+    // Avoid the independent deadline decision so only the remote SHA probe can cause this rollback.
+    writeFileSync(hotPatchLedgerPath(env), JSON.stringify({ ...record, loadedAt: new Date().toISOString() }));
+    gitOk(cloneDir, ['update-ref', `refs/remotes/origin/${record.branch}`, sha]);
+    const actualTick = hotPatchModule.runHotPatchTick, probes = [];
+    const watch = vi.spyOn(hotPatchModule, 'runHotPatchTick').mockImplementation(options => actualTick({
+      ...options, ciVerdict: async () => ({ state: 'pending' }),
+      prState: async () => ({ state: 'OPEN', headRefOid: sha }),
+      run: (cmd, args, opts) => {
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          probes.push(args); return { status: 0, stdout: `${good}\trefs/heads/${record.branch}\n`, stderr: '' };
+        }
+        return spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+      },
+    }));
+    const prepare = vi.spyOn(prepareModule, 'prepareRebuild').mockImplementation(() => {
+      expect(probes).toHaveLength(1);
+      expect(headOf(cloneDir)).toBe(good);
+      expect(readOverlays(cloneDir, { env })).toEqual([]);
+      return { terminal: true, result: { reason: 'test-prepare-boundary' } };
+    });
+    try {
+      await tick(cloneDir, env, { versions: null, adoptOnly: true, emitEvent: async () => true });
+      expect(prepare).toHaveBeenCalledTimes(1);
+    } finally { watch.mockRestore(); prepare.mockRestore(); }
   });
 
   it('a foreign clone leaves both HEADs, overlays, and the global hot-patch ledger unchanged', async () => {
@@ -1041,13 +1064,13 @@ describe('shared hot-patch rollback wiring', () => {
     const requestPid = Number(child.stdout);
     expect(() => process.kill(requestPid, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }));
     writeRebuildState(cloneDir, { ...readRebuildState(cloneDir, env), adopted: {
-      head: sha, inputsKey: 'd'.repeat(40), mainSha: good, applied: [{ ref: 'lane/repair', sha }],
+      head: sha, inputsKey: 'd'.repeat(40), mainSha: good, applied: [{ ref: `hotpatch/${sha}`, sha }],
       at: new Date().toISOString(),
     } }, env);
     const loadedAt = Date.now() - HOT_PATCH_MAX_OPEN_MS;
-    writeFileSync(hotPatchLedgerPath(env), JSON.stringify({ sha, pr: 42, branch: 'lane/repair', root: cloneDir,
+    writeFileSync(hotPatchLedgerPath(env), JSON.stringify({ sha, pr: 42, branch: `hotpatch/${sha}`, prBranch: 'lane/repair', root: cloneDir,
       requestPid, requestStart: 1, loadedAt: new Date(loadedAt).toISOString(),
-      overlay: { ref: 'lane/repair', pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
+      overlay: { ref: `hotpatch/${sha}`, pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
         addedAt: new Date(loadedAt).toISOString(), addedBy: null },
       preGood: { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] } }));
     const result = await tick(cloneDir, env, { versions: {}, adoptOnly: true, emitEvent: async () => true });
@@ -1070,12 +1093,12 @@ describe('shared hot-patch rollback wiring', () => {
   });
 });
 
-it('R3.11 wrapper reports a thrown hot-patch tick in result, event file, and ET log without changing adoption', async () => {
+it('R3.11 wrapper alerts on unreadable hot-patch ls-remote in result, event file, and ET log without changing adoption', async () => {
   const { cloneDir, base, env: original } = makeFixture();
   const env = { ...original, WE_DAEMON_EVENTS: join(base, 'events.jsonl') };
   const before = headOf(cloneDir);
   const log = { error: vi.fn(), log: vi.fn() };
-  const spy = vi.spyOn(hotPatchModule, 'runHotPatchTick').mockRejectedValue(Error('injected tick failure'));
+  const spy = vi.spyOn(hotPatchModule, 'runHotPatchTick').mockRejectedValue(Error('hot-patch ls-remote evidence unreadable; retry required'));
   let result;
   try { result = await tick(cloneDir, env, { versions: {}, adoptOnly: true, log }); }
   finally { spy.mockRestore(); }

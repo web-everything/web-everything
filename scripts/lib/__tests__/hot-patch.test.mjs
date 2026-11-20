@@ -7,7 +7,8 @@ import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { HOT_PATCH_ALLOWLIST, hotPatchLedgerPath, readHotPatch, requestHotPatch } from '../hot-patch.mjs';
 import { forceBlockedReason } from '../daemon-force-adopt.mjs';
-import { cloneKey } from '../daemon-overlays.mjs';
+import { cloneKey, overlayFilePath } from '../daemon-overlays.mjs';
+import * as hotPatch from '../hot-patch.mjs';
 
 const at = 1700000000000;
 // Ported from origin/lane/hot-patch-s2: real origin + clone; no old settings/watch machinery.
@@ -39,8 +40,10 @@ const fixture = fn => async () => {
     WE_DAEMON_EVENTS: join(home, 'events.jsonl'), WE_POLICY_CASCADE_LOG: '0' };
   mkdirSync(env.WE_DAEMON_STATE_DIR);
   const preGood = { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] };
-  const overlay = { ref: 'lane/repair', pr: 42, pinned: true, reason: 'R1100 hot-patch',
-    addedAt: new Date(at).toISOString(), addedBy: null, expectedSha: sha };
+  const ref = `hotpatch/${sha}`;
+  git(['update-ref', `refs/remotes/origin/${ref}`, sha]);
+  const overlay = { ref, pr: 42, pinned: true, reason: 'R1100 hot-patch',
+    addedAt: new Date(at).toISOString(), addedBy: null };
   const calls = [], effects = [];
   const run = (cmd, args, opts) => {
     calls.push({ cmd, args, opts });
@@ -50,7 +53,18 @@ const fixture = fn => async () => {
     return spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
   };
   const request = { root, pr: 42, sha, branch: 'lane/repair', env, run, now: () => at, startTimeOf: () => at,
-    ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }),
+    ghJson: async args => {
+      calls.push({ cmd: 'gh', args });
+      if (args[0] === 'pr') return { baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' };
+      const endpoint = args.find(a => a.startsWith('repos/'));
+      if (endpoint === `repos/web-everything/web-everything/rules/branches/${ref}`)
+        return ['update', 'deletion', 'non_fast_forward'].map(type => ({ type, ruleset_id: 27726920 }));
+      if (endpoint === 'repos/web-everything/web-everything/rulesets/27726920')
+        return { id: 27726920, enforcement: 'active', current_user_can_bypass: 'never' };
+      if (endpoint === 'repos/web-everything/web-everything/git/refs' || endpoint === `repos/web-everything/web-everything/git/ref/heads/${ref}`)
+        return { ref: `refs/heads/${ref}`, object: { sha } };
+      assert.fail(`unexpected gh call: ${args}`);
+    },
     lock: async (...args) => { effects.push('lock'); return args.findLast(a => typeof a === 'function')(() => true); },
     readRebuildState: () => ({ adopted: preGood }),
     addOverlay: async (...args) => { calls.push({ cmd: 'addOverlay', args }); assert(existsSync(hotPatchLedgerPath(env)), 'ledger armed before overlay'); effects.push('overlay'); return overlay; },
@@ -91,7 +105,7 @@ test('one non-merge commit whose parent is reachable from target origin/main suc
   const result = await requestHotPatch({ ...f.request, writeRebuildRequest: async (root, options) => {
     rebuilds++;
     assert.equal(root, f.root);
-    assert.equal(options.ref, f.request.branch);
+    assert.equal(options.ref, `hotpatch/${f.sha}`);
     assert.equal(readHotPatch(f.env).sha, f.sha);
     assert.deepEqual(readHotPatch(f.env).overlay, f.overlay);
     await f.request.writeRebuildRequest(root, options);
@@ -124,7 +138,7 @@ for (const change of [{ pr: undefined }, { state: 'CLOSED' }, { state: 'MERGED' 
   }));
 }
 test('any existing global ledger refuses, including one for another clone', fixture(async f => {
-  const original = JSON.stringify({ sha: f.sha, pr: 42, branch: 'lane/repair', root: join(f.home, 'other-clone'),
+  const original = JSON.stringify({ sha: f.sha, pr: 42, branch: `hotpatch/${f.sha}`, prBranch: 'lane/repair', root: join(f.home, 'other-clone'),
     requestPid: process.pid, requestStart: 1, loadedAt: new Date(at).toISOString(), overlay: f.overlay, preGood: f.preGood });
   writeFileSync(hotPatchLedgerPath(f.env), original);
   await refused(f.request);
@@ -226,7 +240,8 @@ test('lost request write lock preserves armed intent and does not persist regist
   }), /write lock lost/);
   const record = readHotPatch(f.env);
   assert.equal(record.overlay, null);
-  assert.equal(record.overlayIntent.expectedSha, f.sha);
+  assert.equal(record.overlayIntent.ref, `hotpatch/${f.sha}`);
+  assert.equal(Object.hasOwn(record.overlayIntent, 'expectedSha'), false);
   assert(!f.effects.includes('rebuild'));
 }));
 test('lock lost before reservation makes no ledger or overlay mutation', fixture(async f => {
@@ -238,7 +253,7 @@ test('intended overlay identity is durable before registration starts', fixture(
   await requestHotPatch({ ...f.request, addOverlay: async () => {
     const r = readHotPatch(f.env);
     assert.equal(r.overlay, null);
-    assert.deepEqual(r.overlayIntent, { ...f.overlay, expectedSha: f.sha });
+    assert.deepEqual(r.overlayIntent, f.overlay);
     return f.overlay;
   } });
 }));
@@ -256,8 +271,13 @@ test('force-watch opening during registration still blocks our verified reservat
 test('R3.3 hostile GH_REPO cannot redirect admission and is stripped from child env', fixture(async f => {
   const ghCalls = [];
   await requestHotPatch({ ...f.request, env: { ...f.env, GH_REPO: 'evil/fork', GH_HOST: 'evil.test', GH_ENTERPRISE_TOKEN: 'fixture' },
-    ghJson: async args => { ghCalls.push(args); return { baseRefName: 'main', state: 'OPEN', headRefOid: f.sha, headRefName: 'lane/repair' }; } });
-  assert.equal(ghCalls.length, 1);
+    ghJson: async args => { ghCalls.push(args); return f.request.ghJson(args); } });
+  assert(ghCalls.length >= 4, 'PR, effective rules, named ruleset, and ref creation');
+  for (const args of ghCalls.filter(a => a[0] === 'api')) {
+    const path = args.find(a => a.startsWith('repos/'));
+    assert(path?.startsWith('repos/web-everything/web-everything/'));
+    assert(!args.some(a => /\{owner\}|\{repo\}/.test(a)));
+  }
   assert.equal(ghCalls[0][ghCalls[0].indexOf('--repo') + 1], 'web-everything/web-everything');
   for (const call of f.calls.filter(c => c.opts)) {
     for (const key of ['GH_REPO', 'GH_HOST', 'GH_ENTERPRISE_TOKEN']) assert.equal(call.opts.env[key], undefined, key);
@@ -284,4 +304,191 @@ test('guard seam exempts only our verified ledger during overlay registration', 
   } });
   assert.equal(result.ok, true);
   assert(f.effects.includes('rebuild'));
+}));
+
+
+test('hotPatchRef uses the entire SHA as immutable identity', () => {
+  assert.equal(typeof hotPatch.hotPatchRef, 'function');
+  const sha = 'a'.repeat(40);
+  assert.equal(hotPatch.hotPatchRef(sha), `hotpatch/${sha}`);
+});
+const ledgerFor = f => ({ sha: f.sha, pr: 42, branch: `hotpatch/${f.sha}`, prBranch: 'lane/repair',
+  root: f.root, requestPid: process.pid, requestStart: at, loadedAt: new Date(at).toISOString(),
+  overlay: f.overlay, preGood: f.preGood });
+test('readHotPatch accepts immutable ref and prBranch without persisted expectedSha or tag', fixture(async f => {
+  const record = ledgerFor(f); f.save(record);
+  assert.deepEqual(readHotPatch(f.env), record);
+}));
+for (const change of [{ branch: 'lane/repair' }, { branch: `hotpatch/${'b'.repeat(40)}` },
+  { branch: 'hotpatch/abcdef123456' }, { prBranch: undefined }, { prBranch: '' }]) {
+  test(`readHotPatch refuses noncanonical ref or missing PR branch: ${JSON.stringify(change)}`, fixture(async f => {
+    const record = { ...ledgerFor(f), ...change };
+    record.overlay = { ...record.overlay, ref: record.branch };
+    f.save(record);
+    assert.throws(() => readHotPatch(f.env));
+  }));
+}
+test('request stores immutable branch and original PR branch, with admission-only expected SHA', fixture(async f => {
+  const result = await requestHotPatch({ ...f.request, addOverlay: async (...args) => {
+    // Check the producer at the registration boundary, before legacy metadata checks can mask it.
+    assert.equal(args[1].ref, `hotpatch/${f.sha}`, 'registration must never receive the mutable PR branch');
+    const armed = readHotPatch(f.env);
+    assert.equal(armed.branch, args[1].ref);
+    assert.equal(armed.overlayIntent.ref, args[1].ref);
+    assert.equal(armed.prBranch, 'lane/repair');
+    return f.request.addOverlay(...args);
+  } });
+  assert.equal(result.record.branch, `hotpatch/${f.sha}`);
+  assert.equal(result.record.prBranch, 'lane/repair');
+  assert.equal(Object.hasOwn(result.record.overlay, 'expectedSha'), false);
+  const add = f.calls.find(c => c.cmd === 'addOverlay');
+  assert.equal(add.args[1].ref, `hotpatch/${f.sha}`);
+  assert.equal(add.args[1].expectedSha, f.sha);
+  assert.equal(add.args[1].pinned, true);
+  assert.equal(add.args[1].pr, 42);
+}));
+for (const missing of ['update', 'deletion', 'non_fast_forward']) {
+  test(`ruleset admission refuses missing ${missing} protection`, fixture(async f => {
+    await refused({ ...f.request, ghJson: async args => {
+      if (args.some(a => a.includes('/rules/branches/')))
+        return ['update', 'deletion', 'non_fast_forward'].filter(type => type !== missing).map(type => ({ type, ruleset_id: 27726920 }));
+      return f.request.ghJson(args);
+    } });
+    assert(!f.effects.includes('overlay')); assert(!f.effects.includes('rebuild'));
+  }));
+}
+for (const bad of [null, {}, { enforcement: 'disabled', current_user_can_bypass: 'never' },
+  { enforcement: 'evaluate', current_user_can_bypass: 'never' },
+  { enforcement: 'active', current_user_can_bypass: 'always' },
+  { enforcement: 'active', current_user_can_bypass: 'pull_requests_only' }]) {
+  test(`ruleset admission refuses incomplete, inactive or bypassable evidence ${JSON.stringify(bad)}`, fixture(async f => {
+    await refused({ ...f.request, ghJson: async args => args.some(a => a.includes('/rulesets/')) ? bad : f.request.ghJson(args) });
+    assert(!f.effects.includes('overlay'));
+  }));
+}
+for (const phase of ['/rules/branches/', '/rulesets/']) {
+  test(`ruleset admission refuses unreadable ${phase}`, fixture(async f => {
+    await refused({ ...f.request, ghJson: async args => {
+      if (args.some(a => a.includes(phase))) throw Error('offline');
+      return f.request.ghJson(args);
+    } });
+    assert(!f.effects.includes('overlay'));
+  }));
+}
+test('every named ruleset must be active and never bypassable', fixture(async f => {
+  await refused({ ...f.request, ghJson: async args => {
+    if (args.some(a => a.includes('/rules/branches/'))) return [
+      { type: 'update', ruleset_id: 27726920 }, { type: 'deletion', ruleset_id: 27726920 },
+      { type: 'non_fast_forward', ruleset_id: 999 }];
+    if (args.includes('repos/web-everything/web-everything/rulesets/999'))
+      return { id: 999, enforcement: 'active', current_user_can_bypass: 'always' };
+    return f.request.ghJson(args);
+  } });
+  assert(!f.effects.includes('overlay'));
+}));
+test('creates literal repository immutable ref, then fetches and verifies before registration', fixture(async f => {
+  await requestHotPatch(f.request);
+  const create = f.calls.findIndex(c => c.cmd === 'gh' && c.args.includes('POST'));
+  assert(create >= 0, 'must create remote ref');
+  assert.deepEqual(f.calls[create].args, ['api', '-X', 'POST', 'repos/web-everything/web-everything/git/refs',
+    '-f', `ref=refs/heads/hotpatch/${f.sha}`, '-f', `sha=${f.sha}`]);
+  const fetched = f.calls.findIndex((c, i) => i > create && c.cmd === 'git' && c.args.includes('fetch') && c.args.some(a => a.includes(`hotpatch/${f.sha}`)));
+  const verified = f.calls.findIndex((c, i) => i > fetched && c.cmd === 'git' && c.args.includes('rev-parse') && c.args.some(a => a.includes(`refs/remotes/origin/hotpatch/${f.sha}`)));
+  const added = f.calls.findIndex(c => c.cmd === 'addOverlay');
+  assert(fetched > create); assert(verified > fetched); assert(added > verified);
+}));
+for (const readback of ['same', 'other', 'unreadable']) {
+  test(`422 already-exists ref readback ${readback}`, fixture(async f => {
+    let reads = 0;
+    const request = { ...f.request, ghJson: async args => {
+      if (args.includes('POST')) throw Object.assign(Error('HTTP 422: Reference already exists'), { status: 422 });
+      if (args.some(a => a.includes('/git/ref/heads/'))) {
+        reads++;
+        if (readback === 'unreadable') throw Error('offline');
+        return { ref: `refs/heads/hotpatch/${f.sha}`, object: { sha: readback === 'same' ? f.sha : f.good } };
+      }
+      return f.request.ghJson(args);
+    } };
+    if (readback === 'same') assert.equal((await requestHotPatch(request)).ok, true);
+    else { await refused(request); assert(!f.effects.includes('overlay')); }
+    assert.equal(reads, 1);
+  }));
+}
+for (const entry of [{ ref: 'lane/repair', pr: 99 }, { ref: 'lane/another-ref', pr: 42 }]) {
+  test(`refuses already registered PR head or same PR on another ref: ${JSON.stringify(entry)}`, fixture(async f => {
+    mkdirSync(f.env.WE_DAEMON_OVERLAY_DIR, { recursive: true });
+    writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify({ clone: f.root, overlays: [entry] }));
+    await refused(f.request); assert(!f.effects.includes('overlay')); assert(!f.effects.includes('rebuild'));
+  }));
+}
+test('default registration CLI admits immutable ref with PR, pin and expected SHA, never allow-no-pr', fixture(async f => {
+  const request = { ...f.request, run: (cmd, args, opts) => {
+    if (cmd !== process.execPath) return f.request.run(cmd, args, opts);
+    f.calls.push({ cmd, args, opts });
+    assert(args[0].endsWith('/daemon-overlay.mjs'));
+    assert(args.includes('add')); assert(args.includes(`--ref=hotpatch/${f.sha}`));
+    assert(args.includes('--pr=42')); assert(args.includes('--pinned'));
+    assert(args.includes(`--expected-sha=${f.sha}`));
+    assert(!args.includes('--allow-no-pr'));
+    mkdirSync(f.env.WE_DAEMON_OVERLAY_DIR, { recursive: true });
+    writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify({ clone: f.root, overlays: [f.overlay] }));
+    return { status: 0, stdout: '', stderr: '' };
+  } };
+  delete request.addOverlay;
+  assert.equal((await requestHotPatch(request)).ok, true);
+  assert.equal(f.calls.filter(c => c.cmd === process.execPath).length, 1);
+}));
+
+for (const phase of ['fetch', 'verify']) {
+  test(`request refuses immutable ref ${phase} failure before overlay registration`, fixture(async f => {
+    let reached = false;
+    await refused({ ...f.request, run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.some(a => a.includes(`hotpatch/${f.sha}`))
+        && args.includes(phase === 'fetch' ? 'fetch' : 'rev-parse')) {
+        reached = true;
+        return phase === 'fetch' ? { status: 128, stdout: '', stderr: 'offline' }
+          : { status: 0, stdout: `${f.good}\n`, stderr: '' };
+      }
+      return f.request.run(cmd, args, opts);
+    } });
+    assert(reached); assert(!f.effects.includes('overlay')); assert(!f.effects.includes('rebuild'));
+  }));
+}
+test('a rule without a named ruleset cannot prove immutable protection', fixture(async f => {
+  await refused({ ...f.request, ghJson: async args => args.some(a => a.includes('/rules/branches/'))
+    ? ['update', 'deletion', 'non_fast_forward'].map(type => ({ type })) : f.request.ghJson(args) });
+  assert(!f.effects.includes('overlay'));
+}));
+
+
+test('request registration composes A after the actual PR branch advances to B', fixture(async f => {
+  let registered;
+  const result = await requestHotPatch({ ...f.request, addOverlay: async (...args) => {
+    registered = { ref: args[1].ref, pr: args[1].pr, pinned: args[1].pinned };
+    assert.equal(registered.ref, `hotpatch/${f.sha}`, 'request must register the immutable ref before any rebuild');
+    return f.request.addOverlay(...args);
+  } });
+  assert.equal(result.ok, true);
+  assert.deepEqual(registered, { ref: `hotpatch/${f.sha}`, pr: 42, pinned: true });
+
+  // Advance the real PR branch and its tracking ref locally, without network IO.
+  writeFileSync(join(f.root, 'only-in-B'), 'unapproved PR successor\n');
+  f.git(['add', 'only-in-B']); f.git(['commit', '-qm', 'PR advances to B after request']);
+  const b = f.git(['rev-parse', 'HEAD']);
+  f.git(['update-ref', 'refs/remotes/origin/lane/repair', b]);
+  assert.equal(f.git(['rev-parse', 'refs/heads/lane/repair']), b);
+  assert.notEqual(b, f.sha);
+
+  // Exercise the planner's ref-resolution/composition inputs using the registration output.
+  // Running the full plan.mjs pipeline is outside this tests-only contract.
+  f.git(['checkout', '--detach', f.good]);
+  const applied = [{ ref: registered.ref,
+    sha: f.git(['rev-parse', `refs/remotes/origin/${registered.ref}`]) }];
+  f.git(['merge', '--ff-only', applied[0].sha]);
+  assert.deepEqual(applied, [{ ref: `hotpatch/${f.sha}`, sha: f.sha }]);
+  assert.equal(f.git(['rev-parse', 'HEAD']), f.sha);
+  assert.equal(existsSync(join(f.root, 'only-in-B')), false);
+  const containsB = spawnSync('git', ['merge-base', '--is-ancestor', b, 'HEAD'],
+    { cwd: f.root, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+  assert.equal(containsB.status, 1, containsB.stderr);
 }));

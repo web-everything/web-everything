@@ -445,6 +445,38 @@ describe('established overlay auto rebase', () => {
     expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual([ref, replacement.ref]);
   });
 
+  it('conflicting immutable hot-patch explicit pin refuses before establishedLost and never kicks auto-rebase', async () => {
+    const f = fixture();
+    const hotRef = `hotpatch/${f.oldSha}`;
+    ok(f.origin, ['update-ref', `refs/heads/${hotRef}`, f.oldSha]);
+    const pinned = { ref: hotRef, pr: 123, pinned: true, reason: 'R1100 hot-patch' };
+    ok(f.root, ['update-ref', `refs/remotes/origin/${hotRef}`, f.oldSha]);
+    removeOverlay(f.root, ref, { env: f.env });
+    addOverlay(f.root, pinned, { env: f.env });
+    const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }),
+      headSha: f.baseSha, mainRef: 'origin/main', overlays: [pinned] });
+    expect(live.ok).toBe(true);
+    expect(live.applied).toEqual(expect.arrayContaining([expect.objectContaining({ ref: hotRef, sha: f.oldSha })]));
+    f.moveMain(); ok(f.root, ['reset', '--hard', live.finalSha]);
+    writeRebuildState(f.root, { adopted: { head: live.finalSha, applied: live.applied } }, f.env);
+    const kick = vi.fn(), cleanup = vi.fn();
+    const options = { git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: live.finalSha,
+      mainRef: 'origin/main', overlays: [pinned], prState: async () => 'OPEN' };
+    const plan = await planRebuild(options);
+    expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict',
+      detail: { ref: hotRef, pinnedBy: 'flag', skipRefusedBecause: 'explicit-pin' } });
+    expect(plan.establishedLost ?? []).toEqual([]);
+    const before = readOverlays(f.root, { env: f.env });
+    const result = await prepareRebuild({ root: f.root, env: f.env, run, log: {}, now: Date.now,
+      prState: async () => 'OPEN', prBaseChain: async () => null,
+      autoRebase: { resolveAutoRebaseSwitch: () => ({ enabled: true, source: 'env' }),
+        kickAutoRebase: kick, finishPendingSwaps: cleanup } });
+    expect(result.result.reason).toBe('pinned-overlay-conflict');
+    expect(kick).not.toHaveBeenCalled();
+    expect(readOverlays(f.root, { env: f.env })).toEqual(before);
+    expect(ok(f.root, ['rev-parse', 'HEAD'])).toBe(live.finalSha);
+  });
+
   it.each([undefined, '0', '1'])('requires explicit auto-rebase opt-in under Vitest (switch %s)', async setting => {
     const f = fixture();
     const live = await planRebuild({ git: (a, o) => run(a, { cwd: f.root, ...o }), headSha: f.baseSha, mainRef: 'origin/main', overlays: [overlay] });

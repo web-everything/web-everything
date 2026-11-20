@@ -9,7 +9,6 @@ import { hotPatchLedgerPath, readHotPatch, runHotPatchTick, CI_UNKNOWN_MS,
   HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON, HOT_PATCH_ALLOWLIST, WAKE_FLOOR_MS } from '../hot-patch.mjs';
 import * as hotPatch from '../hot-patch.mjs';
 import { overlayFilePath, readOverlays as diskOverlays, removeOverlay as diskRemove } from '../daemon-overlays.mjs';
-import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { hotPatchCiVerdict } from '../hot-patch-ci.mjs';
 import { readRebuildRequest } from '../daemon-clone-lock.mjs';
 
@@ -34,18 +33,23 @@ const fixture = fn => async () => {
   git(['checkout', '-qb', 'lane/repair']);
   writeFileSync(join(root, HOT_PATCH_ALLOWLIST[0]), '// patch\n'); git(['commit', '-qam', 'patch']);
   const sha = git(['rev-parse', 'HEAD']);
-  git(['update-ref', 'refs/remotes/origin/lane/repair', sha]);
+  const ref = `hotpatch/${sha}`;
+  const remote = join(home, 'evidence.git');
+  git(['clone', '--bare', '-q', root, remote], home);
+  git(['update-ref', `refs/heads/${ref}`, sha], remote);
+  git(['remote', 'set-url', 'origin', remote]);
+  git(['update-ref', `refs/remotes/origin/${ref}`, sha]);
   const env = { ...gitEnv, HOME: home, WE_DAEMON_STATE_DIR: join(home, 'state'),
     WE_DAEMON_OVERLAY_DIR: join(home, 'overlays'), WE_DAEMON_CLONE_LOCK_ROOT: join(home, 'locks'),
     WE_DAEMON_EVENTS: join(home, 'events.jsonl') };
   mkdirSync(env.WE_DAEMON_STATE_DIR);
   const preGood = { head: good, inputsKey: 'c'.repeat(40), mainSha: good, applied: [] };
-  const overlay = { ref: 'lane/repair', pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
-    addedAt: new Date(at).toISOString(), addedBy: null, expectedSha: sha };
+  const overlay = { ref, pr: 42, pinned: true, reason: HOT_PATCH_OVERLAY_REASON,
+    addedAt: new Date(at).toISOString(), addedBy: null };
   // Current pid with a provably different start denotes a completed/reused requester, never a guessed dead pid.
   const start = at;
   assert(Number.isFinite(start));
-  const record = { sha, pr: 42, branch: 'lane/repair', root, requestPid: process.pid,
+  const record = { sha, pr: 42, branch: ref, prBranch: 'lane/repair', root, requestPid: process.pid,
     requestStart: start - 60000, loadedAt: new Date(at).toISOString(), overlay, preGood };
   const save = value => writeFileSync(hotPatchLedgerPath(env), JSON.stringify(value));
   save(record);
@@ -57,6 +61,8 @@ const fixture = fn => async () => {
     assert([0, 1].includes(r.status), r.stderr); return r.status === 0;
   };
   const tick = overrides => runHotPatchTick({ root, env, now: () => at + 1, startTimeOf: () => start,
+    run: (cmd, args, opts) => spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 }),
+    readRebuildState: () => ({ adopted: { head: sha, applied: [{ ref, sha }] } }),
     ciVerdict: async () => { order.push('ci'); return { state: 'pending', reason: 'running' }; },
     prState: async () => { order.push('pr'); return { state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }; },
     readOverlays: () => structuredClone(overlays),
@@ -70,9 +76,9 @@ const fixture = fn => async () => {
     },
     emit: async event => { events.push(event); return true; },
     ...overrides });
-  try { await fn({ root, env, git, sha, good, preGood, overlay, record, save, tick,
+  try { await fn({ root, remote, home, env, git, sha, good, preGood, overlay, record, save, tick,
     contains, order, rollbacks, events, start,
-    overlays: () => structuredClone(overlays), replaceOverlay: entry => { overlays = [entry]; } }); }
+    overlays: () => structuredClone(overlays), clearOverlays: () => { overlays = []; }, replaceOverlay: entry => { overlays = [entry]; } }); }
   finally { rmSync(home, { recursive: true, force: true }); }
 };
 const red = { ciVerdict: async () => ({ state: 'red', reason: 'daemon-soak failed' }) };
@@ -151,13 +157,12 @@ test('no action while request pid and start are still alive', fixture(async f =>
   assert.deepEqual(f.order, []); assert.deepEqual(f.rollbacks, []);
   assert.equal(readHotPatch(f.env).requestStart, f.start);
 }));
-test('R3.10 unreadable ledger preserves reason-only and foreign tags, alerts once', fixture(async f => {
+test('item 10 unreadable ledger preserves reason-only non-hotpatch ref and sibling store, alerts once', fixture(async f => {
   writeFileSync(hotPatchLedgerPath(f.env), '{bad');
-  const reasonOnly = { ...f.overlay };
+  const reasonOnly = { ...f.overlay, ref: 'lane/repair' };
   const sibling = join(f.root, '..', 'other-clone');
   mkdirSync(sibling);
-  const foreign = { ...f.overlay, hotPatch: { sha: f.sha,
-    loadedAt: f.record.loadedAt, ledgerKey: cloneKeyOf(hotPatchLedgerPath(f.env)) } };
+  const foreign = { ...f.overlay };
   mkdirSync(f.env.WE_DAEMON_OVERLAY_DIR, { recursive: true });
   writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify({ clone: f.root, overlays: [reasonOnly] }));
   writeFileSync(overlayFilePath(sibling, f.env), JSON.stringify({ clone: sibling, overlays: [foreign] }));
@@ -173,9 +178,9 @@ test('R3.10 unreadable ledger preserves reason-only and foreign tags, alerts onc
   assert.equal(f.events.filter(e => e.kind === 'hot-patch-needs-you').length, 1);
   assert.equal(readRebuildRequest(f.root, { env: f.env, lockRoot: f.env.WE_DAEMON_CLONE_LOCK_ROOT, nowMs: at + 1 }), null);
 }));
-test('R3.10 correctly tagged orphan is removed and requests rebuild', fixture(async f => {
-  f.replaceOverlay({ ...f.overlay, hotPatch: { sha: f.sha, loadedAt: f.record.loadedAt,
-    ledgerKey: cloneKeyOf(hotPatchLedgerPath(f.env)) } });
+test('item 10 unreadable ledger removes pinned hotpatch/40hex orphan in ticking clone and requests rebuild', fixture(async f => {
+  assert.equal(Object.hasOwn(f.overlay, 'hotPatch'), false);
+  assert.equal(Object.hasOwn(f.overlay, 'expectedSha'), false);
   writeFileSync(hotPatchLedgerPath(f.env), '{bad');
   await f.tick();
   assert.deepEqual(f.overlays(), []);
@@ -205,24 +210,31 @@ test('lost tick lock after overlay removal stops rollback and retirement', fixtu
   assert.equal(f.rollbacks.length, 0);
   assert(readHotPatch(f.env).rollbackPending);
 }));
-for (const source of ['overlay', 'applied']) test(`tick rolls back when ${source} SHA differs from ledger despite unchanged PR head`, fixture(async f => {
-  if (source === 'overlay') {
-    const original = { ...f.overlay, expectedSha: f.good };
-    f.save({ ...f.record, overlay: original });
-    f.replaceOverlay(original);
-  }
-  await f.tick(source === 'applied' ? { readRebuildState: () => ({ adopted: { applied: [{ ref: f.record.branch, sha: f.good }] } }) } : {});
-  assert.deepEqual(f.rollbacks, [f.preGood]);
-  assert.equal(readHotPatch(f.env), null);
-}));
+for (const source of ['remote', 'tracking', 'applied', 'missing tracking', 'missing applied']) {
+  test(`${source} SHA mismatch gives overlay-sha-moved and removes before rollback`, fixture(async f => {
+    if (source === 'remote') f.git(['update-ref', `refs/heads/${f.record.branch}`, f.good], f.remote);
+    if (source === 'tracking') f.git(['update-ref', `refs/remotes/origin/${f.record.branch}`, f.good]);
+    if (source === 'missing tracking') f.git(['update-ref', '-d', `refs/remotes/origin/${f.record.branch}`]);
+    const options = source === 'missing applied' ? { readRebuildState: () => ({ adopted: { applied: [] } }) } : source === 'applied'
+      ? { readRebuildState: () => ({ adopted: { applied: [{ ref: f.record.branch, sha: f.good }] } }) } : {};
+    let reason;
+    await f.tick({ ...options, removeOverlay: async () => {
+      reason = readHotPatch(f.env).rollbackPending;
+      f.order.push('remove'); f.clearOverlays();
+    } });
+    assert.equal(reason, 'overlay-sha-moved');
+    assert.deepEqual(f.rollbacks, [f.preGood]);
+    assert(f.order.indexOf('remove') < f.order.indexOf('rollback'));
+  }));
+}
 test('force-pushed replacement excluding original SHA rolls back on exact PR head mismatch', fixture(async f => {
-  f.git(['checkout', '-B', f.record.branch, f.good]);
+  f.git(['checkout', '-B', f.record.prBranch, f.good]);
   writeFileSync(join(f.root, 'replacement'), 'replacement');
   f.git(['add', '.']); f.git(['commit', '-qm', 'force replacement']);
   const replacement = f.git(['rev-parse', 'HEAD']);
   assert(!f.contains(f.sha));
-  // Keep the registered expected SHA pinned so the PR-head check independently triggers rollback.
-  const pinned = { ...f.overlay, expectedSha: f.sha };
+  // Immutable ref still points at A: PR-head movement independently triggers rollback.
+  const pinned = { ...f.overlay };
   f.save({ ...f.record, overlay: pinned }); f.replaceOverlay(pinned);
   let reason;
   await f.tick({ prState: async () => ({ state: 'OPEN', headRefOid: replacement }),
@@ -247,29 +259,36 @@ test('green MERGED ledger never retires while overlay removal fails to clear it'
   assert(readHotPatch(f.env)); assert.equal(f.overlays().length, 1);
 }));
 test('crash after registration before overlay persistence recovers matching overlayIntent', fixture(async f => {
-  f.save({ ...f.record, overlay: null, overlayIntent: { ...f.overlay, expectedSha: f.sha } });
+  f.save({ ...f.record, overlay: null, overlayIntent: { ...f.overlay } });
   await f.tick(red);
   assert.deepEqual(f.overlays(), []);
   assert.deepEqual(f.rollbacks, [f.preGood]);
   assert.equal(readHotPatch(f.env), null);
 }));
 test('crash recovery preserves overlay not matching intended PR', fixture(async f => {
-  f.save({ ...f.record, overlay: null, overlayIntent: { ...f.overlay, expectedSha: f.sha } });
+  f.save({ ...f.record, overlay: null, overlayIntent: { ...f.overlay } });
   f.replaceOverlay({ ...f.overlay, pr: 99 });
   await f.tick(red);
   assert.equal(f.overlays().length, 1);
   assert(readHotPatch(f.env).rollbackPending);
 }));
 
-test('pinned expected SHA ignores a moving remote tip while PR evidence still reports original SHA', fixture(async f => {
-  f.git(['update-ref', `refs/remotes/origin/${f.record.branch}`, f.good]);
-  await f.tick();
+test('tick compares remote ref, tracking ref and adopted applied SHA even without expectedSha', fixture(async f => {
+  const calls = [];
+  await f.tick({ run: (cmd, args, opts) => {
+    calls.push({ cmd, args });
+    return spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+  } });
+  assert(calls.some(c => c.cmd === 'git' && c.args.includes('ls-remote')
+    && c.args.includes('origin') && c.args.includes(`refs/heads/${f.record.branch}`)));
+  assert(calls.some(c => c.cmd === 'git' && c.args.includes('rev-parse')
+    && c.args.some(a => a.includes(`refs/remotes/origin/${f.record.branch}`))));
   assert.deepEqual(f.rollbacks, []);
   assert.deepEqual(readHotPatch(f.env), f.record);
 }));
 test('tick uses remote-tracking overlay identity when clone has no local overlay branch', fixture(async f => {
   f.git(['checkout', '--detach']);
-  f.git(['branch', '-D', f.record.branch]);
+  f.git(['branch', '-D', f.record.prBranch]);
   await f.tick();
   assert.deepEqual(readHotPatch(f.env), f.record);
   assert.deepEqual(f.rollbacks, []);
@@ -322,3 +341,55 @@ test('R3.6 red CI followed by unavailable workflow rolls back on the same tick',
     } }) });
   assert.deepEqual(f.rollbacks, [f.preGood]);
 }));
+
+for (const failure of ['unreadable', 'missing', 'malformed']) {
+  test(`ls-remote ${failure} throws and keeps ledger for wrapper alert and retry`, fixture(async f => {
+    const before = readFileSync(hotPatchLedgerPath(f.env), 'utf8');
+    await assert.rejects(() => f.tick({ run: (cmd, args, opts) => {
+      if (cmd === 'git' && args.includes('ls-remote')) return failure === 'unreadable'
+        ? { status: 128, stdout: '', stderr: 'offline' }
+        : { status: 0, stdout: failure === 'missing' ? '' : 'not-a-sha\trefs/heads/wrong\n', stderr: '' };
+      return spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+    } }), /ls-remote|remote.*(?:unreadable|unavailable)|evidence/i);
+    assert.equal(readFileSync(hotPatchLedgerPath(f.env), 'utf8'), before);
+    assert.deepEqual(f.rollbacks, []); assert(!f.order.includes('remove'));
+  }));
+}
+test('PR head B cannot enter immutable A decision inputs or the locally composed HEAD', fixture(async f => {
+  // Build B on the actual PR branch. Local clones/update-ref model publication without network IO.
+  writeFileSync(join(f.root, 'only-in-B'), 'B must never be loaded\n');
+  f.git(['add', '.']); f.git(['commit', '-qm', 'PR head B']);
+  const b = f.git(['rev-parse', 'HEAD']);
+  const published = join(f.home, 'published.git');
+  f.git(['clone', '--bare', '-q', f.root, published], f.home);
+  f.git(['update-ref', `refs/heads/${f.record.branch}`, f.sha], published);
+  f.git(['remote', 'set-url', 'origin', published]);
+  f.git(['update-ref', 'refs/remotes/origin/lane/repair', b]);
+  f.git(['checkout', '--detach', f.good]);
+  const applied = [{ ref: f.overlay.ref, sha: f.git(['rev-parse', `refs/remotes/origin/${f.overlay.ref}`]) }];
+  f.git(['merge', '--ff-only', applied[0].sha]);
+  assert.deepEqual(applied, [{ ref: `hotpatch/${f.sha}`, sha: f.sha }]);
+  assert.equal(f.git(['ls-remote', 'origin', `refs/heads/${f.record.prBranch}`]).split(/\s+/)[0], b);
+  assert.equal(f.git(['rev-parse', 'HEAD']), f.sha);
+  assert(!f.contains(b)); assert(!existsSync(join(f.root, 'only-in-B')));
+  let decision;
+  await f.tick({ readRebuildState: () => ({ adopted: { head: f.sha, applied } }),
+    prState: async () => ({ state: 'OPEN', headRefOid: b }),
+    removeOverlay: async () => { decision = readHotPatch(f.env).rollbackPending;
+      f.clearOverlays(); } });
+  assert.equal(decision, 'pr-head-moved');
+  assert.deepEqual(f.rollbacks, [f.preGood]);
+  assert(!f.contains(b));
+}));
+for (const retirement of ['rollback', 'merged']) {
+  test(`${retirement} retirement leaves immutable remote ref in place and logs its audit identity`, fixture(async f => {
+    const logs = [];
+    await f.tick({ ...(retirement === 'rollback' ? red : {
+      ciVerdict: async () => ({ state: 'green' }), prState: async () => ({ state: 'MERGED', headRefOid: f.sha }),
+    }), log: { log: (...args) => logs.push(args.join(' ')), error: (...args) => logs.push(args.join(' ')) } });
+    assert.equal(readHotPatch(f.env), null);
+    assert.equal(f.git(['ls-remote', 'origin', `refs/heads/${f.record.branch}`]).split(/\s+/)[0], f.sha);
+    assert.match([...logs, ...f.events.map(e => JSON.stringify(e))].join('\n'),
+      new RegExp(`${f.record.branch}.*(?:retain|left|audit)|(?:retain|left|audit).*${f.record.branch}`, 'i'));
+  }));
+}

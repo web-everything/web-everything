@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -38,7 +38,7 @@ test('CLI process exits 1 on refusal without a stack', () => {
 test.each(['verify-result', 'pr'])('removed command %s is refused', async command => {
   const f = fixture();
   expect(await main([command], f.io)).toBe(1);
-  expect(f.error()).toBe('expected request or status\n');
+  expect(f.error()).toBe('expected request, status or clear-rejection\n');
 });
 
 test('status without a global ledger prints no hot-patch open', async () => {
@@ -75,8 +75,8 @@ test('status refuses an unreadable global ledger', async () => {
 
 test('status prints ET ledger, overlay and watch, and refuses corrupt watch or overlay evidence', async () => {
   const f = fixture(), at = '2026-07-15T12:00:00.000Z';
-  const overlay = { ref: 'lane/patch', pr: 7, pinned: true, reason: 'R1100 hot-patch', addedAt: at, addedBy: null };
-  const ledger = { sha: 'a'.repeat(40), pr: 7, branch: overlay.ref, root: f.dir,
+  const overlay = { ref: `hotpatch/${'a'.repeat(40)}`, pr: 7, pinned: true, reason: 'R1100 hot-patch', addedAt: at, addedBy: null };
+  const ledger = { sha: 'a'.repeat(40), pr: 7, branch: overlay.ref, prBranch: 'lane/patch', root: f.dir,
     requestPid: 1, requestStart: Date.parse(at), loadedAt: at, wokeAt: at, overlay,
     preGood: { head: 'b'.repeat(40), inputsKey: 'c'.repeat(40), mainSha: 'd'.repeat(40), applied: [] } };
   writeFileSync(hotPatchLedgerPath(f.env), JSON.stringify(ledger));
@@ -84,6 +84,9 @@ test('status prints ET ledger, overlay and watch, and refuses corrupt watch or o
   writeFileSync(join(f.dir, `${cloneKeyOf(f.dir)}.force-watch.json`), JSON.stringify({ ticksLeft: 2, startedAt: at }));
   expect(await main(['status'], f.io)).toBe(0);
   const result = JSON.parse(f.output());
+  expect(result.ledger.branch).toBe(`hotpatch/${ledger.sha}`);
+  expect(result.ledger.prBranch).toBe('lane/patch');
+  expect(result.overlay.ref).toBe(`hotpatch/${ledger.sha}`);
   expect(result.ledger.loadedAt).toBe('2026-07-15T08:00:00-04:00');
   expect(result.ledger.requestStart).toBe(result.ledger.loadedAt);
   expect(result.ledger.wokeAt).toBe(result.ledger.loadedAt);
@@ -95,4 +98,23 @@ test('status prints ET ledger, overlay and watch, and refuses corrupt watch or o
   writeFileSync(overlayFilePath(f.dir, f.env), '{');
   expect(await main(['status'], f.io)).toBe(1);
   expect(f.error()).toMatch(/overlay state unreadable; repair evidence/);
+});
+
+
+test('clear-rejection removes only the selected SHA from durable rejection evidence', async () => {
+  const f = fixture(), sha = 'a'.repeat(40);
+  const entry = { sha, patchId: 'b'.repeat(40), pr: 7, reason: 'ci-red', at: '2026-07-15T12:00:00.000Z' };
+  const other = { ...entry, sha: 'c'.repeat(40), patchId: 'd'.repeat(40), pr: 8 };
+  const path = join(f.dir, 'hot-patch-rejected.json');
+  writeFileSync(path, JSON.stringify([entry, other]));
+  expect(await main(['clear-rejection', `--sha=${sha}`], f.io)).toBe(0);
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual([other]);
+  expect(f.error()).toBe('');
+});
+test('clear-rejection refuses unreadable evidence without overwriting it', async () => {
+  const f = fixture(), path = join(f.dir, 'hot-patch-rejected.json');
+  writeFileSync(path, '{bad');
+  expect(await main(['clear-rejection', `--sha=${'a'.repeat(40)}`], f.io)).toBe(1);
+  expect(f.error()).toMatch(/unreadable|repair/i);
+  expect(readFileSync(path, 'utf8')).toBe('{bad');
 });

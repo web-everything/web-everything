@@ -120,9 +120,9 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: finished - 1000 });
     store.update(old.id, r => markSucceeded(r, { at: new Date(finished).toISOString() }));
     const sha = 'b'.repeat(40);
-    ledger = { sha, pr: 42, branch: 'lane/repair', root, requestPid: process.pid, requestStart: 1,
+    ledger = { sha, pr: 42, branch: `hotpatch/${sha}`, prBranch: 'lane/repair', root, requestPid: process.pid, requestStart: 1,
       loadedAt: new Date(finished).toISOString(),
-      overlay: { ref: 'lane/repair', pr: 42, pinned: true, reason: 'R1100 hot-patch',
+      overlay: { ref: `hotpatch/${sha}`, pr: 42, pinned: true, reason: 'R1100 hot-patch',
         addedAt: new Date(finished).toISOString(), addedBy: null },
       preGood: { head: 'a'.repeat(40), inputsKey: 'c'.repeat(40), mainSha: 'a'.repeat(40), applied: [] } };
     plan = { finalSha: sha, applied: [{ ref: ledger.branch, sha }] };
@@ -154,6 +154,33 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     store.update(newJob.id, r => markSucceeded(r, { at: new Date(finished + 120000).toISOString() }));
     expect((await tick(240000)).reason).toBe('rebuild-job-spaced');
     expect(create).toHaveBeenCalledTimes(1);
+  });
+  it('queueing path persists the replacement claim before enqueue and cannot bypass cooldown twice', async () => {
+    const order = [];
+    const claimHotPatchWake = vi.fn(async (...args) => {
+      order.push('claim');
+      return hotPatch.claimHotPatchWake(...args);
+    });
+    const create = vi.spyOn(store, 'create');
+    create.mockImplementationOnce(record => {
+      order.push('enqueue');
+      expect(hotPatch.readHotPatch(env).wokeAt).toBe(new Date(finished + 120000).toISOString());
+      return createJobStore(store.dir).create(record);
+    });
+    const first = await tick(120000, { claimHotPatchWake });
+    expect(claimHotPatchWake).toHaveBeenCalledTimes(1);
+    expect(claimHotPatchWake).toHaveBeenCalledWith(env, root, plan, finished);
+    expect(first.reason).toBe('rebuild-job-started');
+    expect(order).toEqual(['claim', 'enqueue']);
+    expect(create).toHaveBeenCalledTimes(1);
+    const wokeAt = hotPatch.readHotPatch(env).wokeAt;
+    const queued = create.mock.results[0].value;
+    store.update(queued.id, r => markSucceeded(r, { at: new Date(finished + 120000).toISOString() }));
+    expect((await tick(240000, { claimHotPatchWake })).reason).toBe('rebuild-job-spaced');
+    expect(claimHotPatchWake).toHaveBeenCalledTimes(2);
+    await expect(claimHotPatchWake.mock.results[1].value).resolves.toBe(false);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(hotPatch.readHotPatch(env).wokeAt).toBe(wokeAt);
   });
   it('never wakes within WAKE_FLOOR_MS of last finish', async () => {
     expect((await tick(119999)).reason).toBe('rebuild-job-spaced');
