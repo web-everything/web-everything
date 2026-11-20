@@ -10,6 +10,7 @@ import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../dae
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
+import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
@@ -30,7 +31,7 @@ function evidence() {
   const platform = join(dir, 'platform.json');
   writeFileSync(platform, '{}');
   return { path, dir, env: {
-    WE_FIX_READY_PATH: path, WE_PLATFORM_PREFERENCES_FILE: platform,
+    HOME: dir, WE_FIX_READY_PATH: path, WE_PLATFORM_PREFERENCES_FILE: platform,
     WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only',
   }, save: (...rows) => writeFileSync(path, rows.map(r => JSON.stringify(r)).join('\n')) };
 }
@@ -704,7 +705,11 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'H' })).match).toBe('superseded');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'M2' })).match).toBe('superseded');
-    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]), plan: cleared, auditedTip: none })).match).toBe('superseded');
+    const auditedPin = 'b'.repeat(40);
+    // pinnedFrom never exempts, audited or not: the applied sha is judged on its own evidence
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: auditedPin }]), plan: cleared,
+      auditedTip: (_ref, sha) => sha === auditedPin })).reason).toBe('ready-audit-revoked');
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]), plan: cleared, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: null })).match).toBe('superseded'); // follow mode: no gate
   });
 
@@ -923,6 +928,31 @@ describe('unaudited-tip evidence and policy', () => {
       return { ...f.env, WE_PLATFORM_PREFERENCES_FILE: platform };
     };
     const entry = (extra = {}) => ({ ref, sha, ruling: 'R907', findings: ['finding'], ...extra });
+    it('authorizes exact ops-store evidence and refuses an unreadable store', () => {
+      const f = evidence();
+      f.save(weakened());
+      const path = storePath(f.env);
+      appendEntry({ ...entry(), actor: 'operator', quote: 'approved' }, { path });
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(true);
+      expect(makeAuditedTipGate(f.env)(ref, 'c'.repeat(40))).toBe(false);
+      rmSync(path);
+      mkdirSync(path);
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(false);
+      expect(makeAuditedTipGate(withAllowlist(f, [entry()]))(ref, sha)).toBe(true);
+    });
+    it('refuses an ops waiver revoked by a later WITHDRAWN request', () => {
+      const f = evidence();
+      f.save(weakened());
+      appendEntry({ ...entry(), actor: 'operator', quote: 'approved' }, {
+        path: storePath(f.env), now: () => '2026-11-17T12:00:00Z',
+      });
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(true);
+      write(f.dir, 'workspace/.operations/handoff/waiver-requests.jsonl', JSON.stringify({
+        ref: `${ref} (withdrawn)`, sha: sha.toUpperCase(), ruling: 'WITHDRAWN', at: '2026-11-18T12:00:00Z',
+      }) + '\n');
+      expect(makeAuditedTipGate(f.env)(ref, sha)).toBe(false);
+      expect(makeAuditedTipGate(withAllowlist(f, [entry()]))(ref, sha)).toBe(false);
+    });
     it('a self-declared ruling and disclosure with no operator allowlist entry stays held', () => {
       const f = evidence();
       f.save(weakened());

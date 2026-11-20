@@ -2,8 +2,8 @@
  * Card 84 — agy review seats: the settings, the shadow recording + agreement report, and void-on-escape.
  * Every test here is red on the code before card 84 (none of these modules existed).
  */
-import { describe, it, expect } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { describe, it, expect, vi } from 'vitest';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,7 @@ import {
 import { DEFAULT_ROUTING_POLICY, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
 import { runSeatWithProvider } from '../review-seat-runner.mjs';
 import {
-  compareShadowAnswers, summarizeShadowAgreement, renderShadowReport, appendShadowRow, readShadowRows,
+  compareShadowAnswers, summarizeShadowAgreement, summarizeCarbonPromotion, renderShadowReport, appendShadowRow, readShadowRows,
 } from '../../lib/review-shadow-agreement.mjs';
 import { runAgyReviewJuror, stateChangingToolCalls, changedCheckouts, escapingSymlinks } from '../../lib/agy-review-juror.mjs';
 import { judgeOutcome, unwrapJudgeOutcome, createDefaultJudge } from '../cli-adapter.mjs';
@@ -24,9 +24,9 @@ const FINDING = { summary: 'the guard is inverted so every caller passes', file:
 const OTHER = { summary: 'a log line leaks the token value', file: 'scripts/y.mjs', line: 3, disposition: 'blocker' };
 const REQUEST = { mandate: 'judge correctness', input: 'the diff', shape: { type: 'object' }, lens: 'correctness', runId: 'run-1', allowedTools: ['Read'] };
 const io = (extra) => ({ unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: '/lanes/review-lane', ...extra });
+const withEntries = (entries) => validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: { ...structuredClone(DEFAULT_ROUTING_POLICY.operations), ...entries } });
 
 describe('settings — review.seatProvider.<lens> comes from the routing policy (one source)', () => {
-  const withEntries = (entries) => validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: { ...structuredClone(DEFAULT_ROUTING_POLICY.operations), ...entries } });
   const strip = () => {
     const ops = structuredClone(DEFAULT_ROUTING_POLICY.operations);
     for (const k of Object.keys(ops)) if (k.startsWith('review-seat:mandatory:') || k.startsWith('review-seat:advisory:')) delete ops[k];
@@ -49,14 +49,30 @@ describe('settings — review.seatProvider.<lens> comes from the routing policy 
     expect(seatProviderDirective(s, 'security')).toEqual({ mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'claude' });
     const c = settingsFromRoutingPolicy(withEntries({ 'review-seat:mandatory:correctness': { provider: 'claude', model: 'sonnet', fallback: [] } }));
     expect(c.seatProvider.correctness).toBe('claude');
+    expect(c.claudeSeatModel.correctness).toBe('claude-sonnet-5-5');
   });
 
   it('the shipped routing policy: correctness and security in shadow on claude-opus-5-5-high, the advisory agy seat on', () => {
     const s = loadReviewSeatSettings({ policy: DEFAULT_ROUTING_POLICY });
     expect(s.seatProvider).toEqual({ correctness: 'shadow', security: 'shadow' });
     expect(s.seatModel).toEqual({ correctness: 'claude-opus-5-5-high', security: 'claude-opus-5-5-high' });
+    expect(s.claudeSeatModel).toEqual({ correctness: 'claude-sonnet-5-5', security: 'claude-sonnet-5-5' });
     expect(s.agyCorrectnessAdvisory).toBe(true);
     expect(s.agyModel).toBe('claude-opus-5-5-high');
+  });
+
+  it.each([
+    ['agy-claude', 'sonnet', 'claude-sonnet-5-5-high'],
+    ['agy-gemini', 'gemini-4-carbon-high', 'gemini-4-carbon-high'],
+  ])('preserves the actual advisory model for %s', (provider, model, actual) => {
+    const settings = settingsFromRoutingPolicy(withEntries({
+      'review-seat:advisory:agy-correctness': { provider, model, fallback: [] },
+    }), { aiRouting: {} });
+    expect(settings.agyModel).toBe(actual);
+    for (const builder of ['claude', 'codex']) {
+      expect(renderShadowReport([], undefined, 'claude', settings))
+        .toContain(`Post-promotion cross-vendor panel for ${builder} builder: pass`);
+    }
   });
 
   it('the policy refuses a shadow with no Claude route to count, and an unknown mode', () => {
@@ -152,7 +168,8 @@ function fixtureLane() {
   execFileSync('git', ['clone', '-q', lane, other]);
   return { root, lane, other, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
-const transcriptWith = (steps) => steps.map((s) => JSON.stringify({ event: 'step_update', step_update: s })).join('\n');
+const transcriptWith = (steps) => [...steps.map(step_update => ({ event: 'step_update', step_update })),
+  { event: 'result', result: { status: 'SUCCESS' } }].map(event => JSON.stringify(event)).join('\n');
 
 describe('void-on-escape — the agy juror\'s three escape checks (real git, fake agy)', () => {
   const run = (fx, behave) => runAgyReviewJuror({
@@ -226,6 +243,99 @@ describe('void-on-escape — the agy juror\'s three escape checks (real git, fak
 });
 
 describe('the agreement report (#76a identity, #76b sameAs through the PR table)', () => {
+  const carbonRow = (extra = {}) => ({ repo: 'o/r', pr: 1, head: 'head-a', model: 'gemini-4-carbon-high', servedModel: 'gemini-4-carbon-high',
+    claudeValid: true, agyValid: true, status: 'ok', overlap: { jaccard: 1, matched: 1, claudeCount: 1, agyCount: 1, claudeOnly: 0, agyOnly: 0 }, verdictAgree: true, lens: 'correctness', ...extra });
+  const carbonPr = (extra = {}) => [carbonRow(extra), carbonRow({ ...extra, lens: 'security' })];
+  it('counts ten single-lens PRs without making a promotion decision', () => {
+    const rows = Array.from({ length: 10 }, (_, i) => carbonRow({ pr: i + 1 }));
+    expect(summarizeCarbonPromotion(rows)).toEqual({ agree: 10, disagree: 0, invalid: 0, prs: 10, threshold: 10 });
+  });
+  it('a matching verdict with completely disjoint findings is disagreement, not agreement', () => {
+    const overlap = { jaccard: 0, matched: 0, claudeCount: 1, agyCount: 1, claudeOnly: 1, agyOnly: 1 };
+    expect(summarizeCarbonPromotion([carbonRow({ overlap })])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
+  });
+  it('Carbon missing one of Claude\'s findings is disagreement even with a match and the same verdict', () => {
+    const overlap = { jaccard: 0.5, matched: 1, claudeCount: 2, agyCount: 1, claudeOnly: 1, agyOnly: 0 };
+    expect(summarizeCarbonPromotion([carbonRow({ overlap })])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
+  });
+  it('an extra Carbon-only finding is disagreement even with a match and the same verdict', () => {
+    const overlap = { jaccard: 0.5, matched: 1, claudeCount: 1, agyCount: 2, claudeOnly: 0, agyOnly: 1 };
+    expect(summarizeCarbonPromotion([carbonRow({ overlap })])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
+  });
+  it('counts each PR once across repositories, heads, runs and lenses', () => {
+    const rows = [carbonRow({ head: null }), carbonRow({ head: 'next', lens: 'security' }),
+      carbonRow({ pr: 2 }), carbonRow({ pr: 2, verdictAgree: false }),
+      carbonRow({ repo: 'other/repo' }), carbonRow({ pr: 3, verdictAgree: 'true' })];
+    const before = structuredClone(rows);
+    expect(summarizeCarbonPromotion(rows, { threshold: 20 })).toEqual({ agree: 2, disagree: 2, invalid: 0, prs: 4, threshold: 20 });
+    expect(rows).toEqual(before);
+  });
+  it('ignores non-Carbon attempts and rows without a PR identity', () => {
+    const ignored = [null, carbonRow({ model: 'argon', servedModel: 'argon' }), carbonRow({ repo: null }), carbonRow({ pr: null })];
+    expect(summarizeCarbonPromotion(ignored)).toEqual({ agree: 0, disagree: 0, invalid: 0, prs: 0, threshold: 10 });
+    expect(summarizeCarbonPromotion([...carbonPr(), ...ignored])).toMatchObject({ agree: 1, prs: 1 });
+  });
+  it.each([
+    { claudeValid: undefined }, { agyValid: undefined }, { claudeValid: false }, { agyValid: false },
+    { claudeValid: 'true' }, { agyValid: 'true' }, { status: 'failed' }, { status: 'voided' }, { status: 'skipped' },
+    { overlap: null }, { servedModel: undefined }, { servedModel: '' }, { servedModel: 'unknown' },
+    { servedModel: 'gemini-4-argon-high' }, { fellBackTo: 'routing-model' }, { fallbackFrom: { model: 'other' } },
+    { model: 'argon', status: 'failed' },
+  ])('invalid Carbon evidence overrides agreement and disagreement in either order: %j', extra => {
+    const invalid = carbonRow(extra);
+    const valid = [...carbonPr(), carbonRow({ verdictAgree: false })];
+    const expected = { agree: 0, disagree: 0, invalid: 1, prs: 1, threshold: 10 };
+    expect(summarizeCarbonPromotion([invalid])).toEqual(expected);
+    expect(summarizeCarbonPromotion([...valid, invalid])).toEqual(expected);
+    expect(summarizeCarbonPromotion([invalid, ...valid])).toEqual(expected);
+    expect(summarizeCarbonPromotion([...valid, invalid, carbonRow({ pr: 2 })]))
+      .toEqual({ ...expected, agree: 1, prs: 2 });
+  });
+  it.each([false, null, undefined, 'true'])('a verdict other than literal true counts as disagree: %j', verdictAgree => {
+    expect(summarizeCarbonPromotion([...carbonPr(), carbonRow({ verdictAgree })]))
+      .toEqual({ agree: 0, disagree: 1, invalid: 0, prs: 1, threshold: 10 });
+  });
+  it('differing finding identities keep verdict agreement but count as disagreement for promotion', () => {
+    const comparison = compareShadowAnswers({
+      claude: { findings: [{ file: 'a.mjs', summary: 'first defect', disposition: 'blocker' }] },
+      agy: { findings: [{ file: 'b.mjs', summary: 'another defect', disposition: 'blocker' }] },
+    });
+    expect(comparison.verdictAgree).toBe(true);
+    expect(comparison.overlap.jaccard).toBe(0);
+    expect(summarizeCarbonPromotion([carbonRow(comparison)])).toMatchObject({ agree: 0, disagree: 1, invalid: 0 });
+  });
+  it.each([0, -1, 1, 9, 1.5, '10', NaN, Number.MAX_SAFE_INTEGER + 1])('rejects thresholds below ten or invalid/oversized thresholds: %j', threshold => {
+    expect(() => summarizeCarbonPromotion([], { threshold })).toThrow(RangeError);
+  });
+  it('renders counts and the manual promotion threshold, including an empty report', () => {
+    const rows = [carbonRow(), carbonRow({ pr: 2, verdictAgree: false }), carbonRow({ pr: 3, status: 'failed' })];
+    expect(renderShadowReport(summarizeShadowAgreement(rows), summarizeCarbonPromotion(rows))).toContain(
+      'Carbon vs Claude: 1 agree, 1 disagree, 1 invalid of 3 PRs; promotion threshold 10 agreeing PRs (promotion is manual; the orchestrator flips it)');
+    expect(renderShadowReport([], summarizeCarbonPromotion([]))).toContain(
+      'Carbon vs Claude: 0 agree, 0 disagree, 0 invalid of 0 PRs; promotion threshold 10 agreeing PRs (promotion is manual; the orchestrator flips it)');
+  });
+  it('CLI text and JSON report Carbon promotion using the resolved threshold and log its source', () => {
+    const root = mkdtempSync(join(tmpdir(), 'carbon-report-'));
+    try {
+      mkdirSync(join(root, '.conveyor'));
+      writeFileSync(join(root, '.conveyor', 'agy-shadow-agreement.jsonl'), carbonPr().map(row => JSON.stringify(row)).join('\n') + '\n');
+      const env = { ...process.env, CONVEYOR_STATE_ROOT: root, WE_REVIEW_SHADOW_AGY_PROMOTION_PRS: '10', WE_REVIEW_SHADOW_AGY_PROMOTION_REPLACES: 'codex' };
+      const script = 'scripts/lib/review-shadow-agreement.mjs';
+      const options = { env, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] };
+      const result = spawnSync(process.execPath, [script, '--report', '--json'], options);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('promotionAgreeingPrs=10 (env)');
+      expect(result.stderr).toContain('promotionReplaces=codex (env)');
+      const json = JSON.parse(result.stdout);
+      expect(json.carbonPromotion).toEqual({ agree: 1, disagree: 0, invalid: 0, prs: 1, threshold: 10, promotionReplaces: 'codex' });
+      expect(json.seats.map(seat => seat.compared)).toEqual([1, 1]);
+      const text = execFileSync(process.execPath, [script, '--report'], options);
+      expect(text).toContain('Carbon vs Claude: 1 agree, 0 disagree, 0 invalid of 1 PRs; promotion threshold 10 agreeing PRs');
+      for (const builder of ['claude', 'codex', 'agy']) expect(text).toContain(`Post-promotion cross-vendor panel for ${builder} builder:`);
+      expect(text).toContain('(promotion is manual; the orchestrator flips it)');
+      expect(text).toContain('replace one existing codex seat; panel size stays fixed');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('verdict + finding overlap: an exact match, a moved line with the same claim, and a disjoint finding', () => {
     expect(compareShadowAnswers({ claude: { findings: [] }, agy: { findings: [] } })).toMatchObject({ verdictAgree: true, overlap: { jaccard: 1 } });
     const c = compareShadowAnswers({ claude: { findings: [FINDING] }, agy: { findings: [{ ...FINDING, line: 40 }] } });
@@ -505,7 +615,7 @@ describe('PR #4131 review fixes', () => {
     expect(c.overlap).toMatchObject({ matched: 1, agyOnly: 1, claudeOnly: 0, jaccard: 0.5 });
   });
 
-  const runWith = (fx, act, transcript = '') => runAgyReviewJuror({
+  const runWith = (fx, act, transcript = transcriptWith([])) => runAgyReviewJuror({
     request: REQUEST, laneCwd: fx.lane, model: 'm',
     deps: { repoRoot: fx.other, spawnJudge: async ({ cwd }) => {
       const t = join(fx.root, 'transcript.jsonl'); writeFileSync(t, transcript); act?.(cwd);
@@ -565,7 +675,7 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
       const r = await runAgyReviewJuror({
         request: REQUEST, laneCwd: fx.lane, model: 'm',
         deps: { repoRoot: fx.other, spawnJudge: async () => {
-          const t = join(fx.root, 't.jsonl'); writeFileSync(t, '');
+          const t = join(fx.root, 't.jsonl'); writeFileSync(t, transcriptWith([]));
           execFileSync('mkdir', ['-p', join(fx.other, '.conveyor')]);
           writeFileSync(join(fx.other, '.conveyor', 'daemon.log'), 'a concurrent run logged');
           writeFileSync(join(fx.other, 'backlog-card.md'), 'a concurrent run filed a card');
@@ -599,4 +709,17 @@ describe('first live shadow run (PR #4133) — the shared checkout\'s own churn 
     expect(prompt.lastIndexOf('NEVER use run_command')).toBeGreaterThan(prompt.indexOf('PANEL MANDATE'));
     expect(prompt).toContain('list_dir, view_file, grep_search');
   });
+});
+
+it('an unpromoted Carbon advisory route retains no live non-shadow seat', () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+  try {
+    const settings = settingsFromRoutingPolicy(withEntries({
+      'review-seat:advisory:agy-correctness': { provider: 'agy-gemini', model: 'gemini-4-carbon-high', fallback: [] },
+    }), { aiRouting: {} });
+    expect(settings.agyModel).toBe('gemini-4-carbon-high');
+    expect(settings.agyCorrectnessAdvisory).toBe(false);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });

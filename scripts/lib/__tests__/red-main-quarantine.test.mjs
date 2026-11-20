@@ -34,6 +34,14 @@ describe('quarantine — who may write, and where', () => {
     expect(canWriteQuarantine('pr-4613')).toBe(false);
     expect(addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'x', reason: 'y', actor: 'some-pr', now: NOW }).ok).toBe(false);
   });
+
+  it('the cap of live files is global across jobs, for operator adds too', () => {
+    const add = (list, tests, job) => addEntries(list, { tests, brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, job });
+    let list = add(null, ['a.test.mjs', 'b.test.mjs', 'c.test.mjs'], 'soak-shard (1)').list;
+    list = add(list, ['d.test.mjs', 'e.test.mjs'], 'integration').list;
+    expect(add(list, ['f.test.mjs'], 'soak-shard (2)')).toMatchObject({ ok: false });
+    expect(add(list, ['a.test.mjs'], 'integration').ok).toBe(true);
+  });
   it('the push-ref guard allows exactly refs/heads/ops/quarantine', () => {
     expect(assertPushRef('ops/quarantine', QUARANTINE_REF)).toBe(QUARANTINE_REF);
     expect(() => assertPushRef('main', QUARANTINE_REF)).toThrow();

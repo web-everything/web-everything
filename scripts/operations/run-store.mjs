@@ -28,7 +28,9 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
+import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
+import { appendReviewRunIndex } from '../lib/review-run-index.mjs';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { assertRunRecord, isValidRunId, parseRunRecord, serializeRunRecord } from './run-record.mjs';
 
@@ -83,7 +85,7 @@ export function migrateLegacyRuns(legacyDir, sharedDir) {
   const skipped = [];
   if (!legacyDir || !existsSync(legacyDir) || resolve(legacyDir) === resolve(sharedDir)) return { moved, skipped };
   let names;
-  try { names = readdirSync(legacyDir).filter((f) => f.endsWith('.json') && isValidRunId(f.slice(0, -5))); } catch { return { moved, skipped }; }
+  try { names = runFileEntries(legacyDir); } catch { return { moved, skipped }; }
   if (!names.length) return { moved, skipped };
   try { mkdirSync(sharedDir, { recursive: true }); } catch { return { moved, skipped: names }; }
   for (const f of names) {
@@ -191,17 +193,48 @@ export function writeRun(record, dir = resolveRunsDir()) {
   const path = runPath(record.id, dir);
   mkdirSync(dir, { recursive: true });
   writeJsonAtomic(path, record); // temp file + validate + same-fs rename: safe across daemon processes
+  if (record.op === 'review-pr') {
+    try { appendReviewRunIndex(record, dir); } catch { /* discovery is best-effort; never fail a persisted run */ }
+  }
   return path;
 }
 
-/** Every run id currently on disk (sorted). Temp files and stray names are ignored. */
+const reportedInvalidEntries = new Set();
+const reportingInvalidEntries = new Set();
+
+/** Mark an invalid entry only after its durable event is delivered; failed writes retry on the next scan.
+ * Severity has its own delivery key so an earlier filename warning cannot hide lost PR evidence. */
+export function reportInvalidRunEntry(path, detail = {}) {
+  path = resolve(path);
+  const key = `${path}:${detail.severity ?? 'normal'}`;
+  if (reportedInvalidEntries.has(key) || reportingInvalidEntries.has(key)) return;
+  reportingInvalidEntries.add(key);
+  try {
+    void Promise.resolve(appendDaemonEvent({ kind: 'run-store-invalid-entry', detail: { path, ...detail } }))
+      .then(delivered => { if (delivered !== false) reportedInvalidEntries.add(key); })
+      .catch(() => {})
+      .finally(() => reportingInvalidEntries.delete(key));
+  } catch { reportingInvalidEntries.delete(key); /* retry on the next enumeration */ }
+}
+
+/** Run-record filenames; includeInvalid also exposes stray JSON for fail-safe evidence readers.
+ * Tombstones are silent; unexpected JSON names emit one successfully delivered event per path. */
+export function runFileEntries(dir = resolveRunsDir(), { includeInvalid = false, reportInvalid = reportInvalidRunEntry } = {}) {
+  let names;
+  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  return names.filter(name => {
+    if (!name.endsWith('.json')) return false;
+    const id = name.slice(0, -5);
+    if (isValidRunId(id)) return true;
+    if (id.endsWith('.abandoned') && isValidRunId(id.slice(0, -10))) return false;
+    reportInvalid(resolve(dir, name));
+    return includeInvalid;
+  });
+}
+
+/** Every run id currently on disk (sorted). */
 export function listRunIds(dir = resolveRunsDir()) {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.endsWith('.json'))
-    .map((f) => f.slice(0, -'.json'.length))
-    .filter(isValidRunId)
-    .sort();
+  return runFileEntries(dir).map(name => name.slice(0, -5)).sort();
 }
 
 /** Delete a run's record. A no-op when it is already gone. */

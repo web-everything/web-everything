@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
@@ -711,7 +712,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     for (const u of unavailable) io.log(`added seats: skipping ${u.provider} — ${u.reason}`);
     const remainingCalls = (list) => list.reduce((sum, p) => sum + Math.max(0, caps[p] - usedByProvider[p]), 0);
     const providerAvailable = (provider, seatKey) => usedByProvider[provider] < seatCaps[seatKey][provider];
-    let plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+    let plan = reviewSeatRoutes({ env, available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
 
     // RESERVE each distinct provider's ONE call under ITS OWN cap, before launching anything, so concurrent
     // reviews can never together overspend any one provider's budget. A provider that cannot be granted (another
@@ -739,7 +740,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         if (reservation.callIds.length === reservation.models.length) { callIdOf.set(p, new Map(reservation.models.map((model, index) => [model, reservation.callIds[index]]))); } else { anyDenied = true; available = available.filter((x) => x !== p); }
       }
       if (!anyDenied) break;
-      plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+      plan = reviewSeatRoutes({ env, available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
     }
     const providerUsage = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, { usedToday: usedByProvider[p] + (callIdOf.get(p)?.size ?? 0), cap: caps[p] }]));
     const totalUsedToday = Object.values(providerUsage).reduce((sum, u) => sum + u.usedToday, 0);
@@ -1133,6 +1134,10 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, schemaFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
+      if (!carbonNonShadowAllowed(model, { env })) {
+        resolvePromise({ report: null, error: 'Carbon not promoted — non-shadow seat refused', timedOut: false });
+        return;
+      }
       if (stoppingSeats || terminatingSeats) {
         resolvePromise({ report: null, error: 'review seats are stopping', timedOut: false });
         return;
@@ -1854,6 +1859,13 @@ export async function speculateRedTeam({
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
     const providers = rosterForKey('review-seat:red-team');
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    for (const p of providers) {
+      const source = routingEntry?.disabledProviders?.includes(p) ? 'routing disabledProviders'
+        : env?.[PROVIDER_CAP_ENV[p]] !== undefined ? PROVIDER_CAP_ENV[p]
+          : p === 'codex' && env?.WE_REVIEW_EXTRA_SEATS_DAILY_CAP !== undefined ? 'WE_REVIEW_EXTRA_SEATS_DAILY_CAP'
+            : routingEntry?.enabledProviders?.includes(p) ? 'routing/default' : 'default';
+      io.log(`red-team cap: ${p}=${caps[p]} (source: ${source})`);
+    }
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
@@ -1884,7 +1896,12 @@ export async function speculateRedTeam({
         // A valid overlay can supply a route even when the default chain is exhausted.
         // Without one, preserve the policy failure rather than selecting outside its chain.
         if (routeError && !configuredRoute) throw routeError;
-      } catch (error) { lastReason = error.message; break; }
+      } catch (error) {
+        // Exhausting the configured chain after a reservation denial is a budget
+        // deferral. Out-of-chain roster entries must neither launch nor mask it.
+        lastReason ??= error.message;
+        break;
+      }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
@@ -1898,6 +1915,7 @@ export async function speculateRedTeam({
       else {
         deferredByCap = true;
         lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        io.log(`red team deferred: ${lastReason} (scorecards + reservation ledger)`);
         available = available.filter((x) => x !== pick.provider);
       }
     }

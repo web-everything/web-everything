@@ -166,15 +166,15 @@ function versionStateTarget(root, link) {
  * REAL path (`checkBodyFileLocation`), and that guard is deliberately not widened. In a versioned daemon checkout the
  * staged write-up really lives in the sibling state dir (see versionStateTarget), so it would be refused on every
  * resume. Then the CLI gets a private copy: a fresh `mkdtemp` dir under `tmpDir`, the file mode 0600, removed by
- * `cleanup()` whatever the outcome. A staged file inside the checkout is passed unchanged. Any local failure is
+ * `cleanup()` whatever the outcome. A staged file inside the CHILD's cwd is passed unchanged. Any local failure is
  * notApplied (nothing has been published yet), and a half-made copy is removed.
  */
-function cliBodyFile({ root, staged, tmpDir }) {
+function cliBodyFile({ cwd, staged, tmpDir }) {
   const none = { path: staged, cleanup: () => {} };
   let dir = null;
   try {
     const real = realpathSync(staged);
-    const home = realpathSync(root);
+    const home = realpathSync(cwd);
     if (real === home || real.startsWith(home + sep)) return none;
     dir = mkdtempSync(join(tmpDir, 'review-body-'));
     const path = join(dir, basename(staged));
@@ -1059,14 +1059,23 @@ const STALE_CACHE_SUFFIX = / \(stale-cache cache-age-ms=[^()]*\)$/;
 function onlyVerdictDependentPending(ci, reviewedHead) {
   if (ci?.allowed !== false || ci.headSha !== reviewedHead || typeof ci.reason !== 'string') return false;
   if (!AFFECTED_ROW_REFUSALS.includes(ci.reason.replace(STALE_CACHE_SUFFIX, ''))) return false;
+  // A derived gate that already FAILED stays red until this very review lands, so it cannot hold the label either:
+  // review-gate always, merge-gate only when its failure carries the review-hold annotation (never a real hold).
+  const annotatedMergeGate = Array.isArray(ci.checks)
+    && ci.checks.some(row => row?.name === 'merge-gate' && row.mergeGateReviewHold);
+  // Only the plain `failure` conclusion qualifies: timed-out, cancelled and action-required runs are infra or setup
+  // faults, not the gate's by-design red.
+  const derivedRed = row => String(row?.reason).toLowerCase() === 'failure'
+    && (row.name === 'review-gate' || (row.name === 'merge-gate' && annotatedMergeGate));
   return Array.isArray(ci.affected) && ci.affected.length > 0
-    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name) && ['missing', 'pending'].includes(row?.reason));
+    && ci.affected.every(row => VERDICT_DEPENDENT_CHECKS.includes(row?.name)
+      && (['missing', 'pending'].includes(row?.reason) || derivedRed(row)));
 }
 
 /**
  * THE SINKS, bound to a repo root and an output channel.
  *
- * @param {{root?: string, out?: (line: string) => void, runNode?: Function, postComment?: Function, labelProvider?: object,
+ * @param {{root?: string, cwd?: string, out?: (line: string) => void, runNode?: Function, postComment?: Function, labelProvider?: object,
  *   json?: boolean, readLabels?: Function, setLabels?: Function}} [o] -
  *   `runNode` is the injectable subprocess runner (`(argv) => stdout`), so the label sink is testable without
  *   `gh`; `postComment` is the injectable `(repo, pr, body) => void` the `advise` sink posts through (#xlw02hw),
@@ -1082,6 +1091,8 @@ function onlyVerdictDependentPending(ci, reviewedHead) {
  */
 export function createReviewPrSinks({
   root = REPO_ROOT,
+  // Staging/code belongs to root; the label CLI runs in the reviewed checkout.
+  cwd = root,
   env = process.env,
   // The SAME store the executor and `run.mjs --resume` use (`resolveRunsDir()`, where `OPERATION_RUNS_DIR` wins);
   // reading `sharedRunsDir` here would miss every run a daemon job child or a test wrote under that override.
@@ -1776,7 +1787,7 @@ export function createReviewPrSinks({
       // Verify/recover the staged body BEFORE any external write: a refusal here must mean nothing landed.
       const staged = ensureStagedBody({ root, runId: ctx?.runId, bodyFile: payload.bodyFile, runStore, readRun: ctx?.readRun });
       // Before any external write too: a copy that cannot be made refuses as notApplied with nothing posted.
-      const { path: bodyPath, cleanup } = cliBodyFile({ root, staged, tmpDir });
+      const { path: bodyPath, cleanup } = cliBodyFile({ cwd, staged, tmpDir });
       if (payload.to === 'accepted' && payload.redTeamOwed) {
         try { await postPendingRedTeam(payload); } catch (e) { cleanup(); throw e; }
       }
@@ -1794,7 +1805,7 @@ export function createReviewPrSinks({
       ];
       let stdout = '';
       try {
-        stdout = String(runNode(argv, { cwd: root }));
+        stdout = String(runNode(argv, { cwd }));
       } catch (e) {
         stdout = String((e && e.stdout) || '');
         const text = parseCliError(stdout) || String((e && e.message) || e).split('\n').filter(Boolean).pop() || 'review-set-label.mjs failed';

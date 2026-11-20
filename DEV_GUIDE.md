@@ -22,6 +22,34 @@ Everything is served through port **3000** with automatic proxying:
 
 ## Scripts
 
+### Antigravity binary maintenance
+
+Schedule this single command hourly through the operator's existing daemon or cron,
+with the checkout as its working directory and `agy` / `brew` on its PATH:
+
+```sh
+node scripts/operations/agy-upgrade-check.mjs
+```
+
+No daemon is installed. The check smokes `agy --version` (20 seconds), checks
+`brew outdated --cask --json=v2` (60 seconds), upgrades only `antigravity-cli`
+(120 seconds), then smokes again. Timed-out children are killed by exact PID;
+combined child output is capped at 64 KiB. Unknown staleness skips the upgrade
+and logs an operator diagnostic. A failed smoke immediately holds the seat for
+24 hours and publishes a needs-you event; healthy smoke clears that hold.
+Repeated failures deduplicate by version and failure state.
+
+Settings resolve through the policy cascade with an empty platform layer and
+environment overrides only; effective values and sources are logged:
+`WE_AGY_UPGRADE_ENABLED` (default `true`),
+`WE_AGY_UPGRADE_MIN_INTERVAL_MINUTES` (default/minimum `60`, maximum `1440`),
+`WE_AGY_UPGRADE_SMOKE_TIMEOUT_MS` (default/maximum `20000`, minimum `1`).
+State is atomically written under `~/.antigravity-quota/` (or
+`ANTIGRAVITY_QUOTA_DIR`). Future, malformed, or oversized (8 KiB) run records
+cannot suppress a check. An exclusive `upgrade-check.lock` directory prevents
+overlapping runs. If the checker itself is killed, the operator must confirm
+it has stopped and remove that lock directory before the next scheduled run.
+
 | Command | Description |
 |---------|-------------|
 | `npm start` | Start unified dev environment (both servers) |

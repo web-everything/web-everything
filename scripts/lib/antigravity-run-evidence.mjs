@@ -26,6 +26,20 @@ export function agyRunEvidence({ stdout = '', stderr = '', requestedModel, now =
     fallbackDecision: exhausted ? 'skip-quota-exhausted' : mismatch ? 'skip-backend-mismatch' : modelMismatch ? 'skip-model-mismatch' : 'none' };
 }
 export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } = {}) {
+  try {
+    const health = JSON.parse(readFileSync(join(dir, 'binary', 'health.json'), 'utf8'));
+    const at = typeof health?.at === 'string' ? Date.parse(health.at) : NaN;
+    if (!['ok', 'dead'].includes(health?.state) || typeof health.version !== 'string'
+      || typeof health.reason !== 'string' || !Number.isFinite(at) || at > now) throw Error('invalid health');
+    // An interrupted upgrade or an unconfirmed kill never ages out: only a healthy smoke (or the operator) clears it.
+    const unresolved = health.reason === 'upgrading' || health.reason === 'cleanup incomplete';
+    if (health.state === 'dead' && (unresolved || now - at < 86400000))
+      return { ...health, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
+        modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead' };
+  } catch (error) {
+    if (error.code !== 'ENOENT') return { requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown',
+      modelEvidence: 'not-launched', fallbackDecision: 'skip-binary-dead', reason: 'binary health record is unreadable; inspect binary/health.json' };
+  }
   const readRows = (folder) => {
     try {
       return readdirSync(folder).filter((name) => name.endsWith('.json'))
@@ -38,22 +52,23 @@ export function readAgyHold(model, { dir = agyEvidenceDir(), now = Date.now() } 
   // Read the old global layout without rewriting it. Unattributed legacy holds remain global.
   const holds = readRows(dir).map((row) => ({ row,
     heldBackend: [row.servedModel, row.requestedModel].map(agyBackend).find((value) => value !== 'unknown') ?? 'unknown' }))
-    .filter(({ heldBackend }) => heldBackend === 'unknown' || backends.includes(heldBackend));
+    .filter(({ row, heldBackend }) => row.quotaState === 'provider-unresponsive' || heldBackend === 'unknown' || backends.includes(heldBackend));
   for (const heldBackend of backends) {
     holds.push(...readRows(join(dir, heldBackend)).map((row) => ({ row, heldBackend })));
   }
   const hold = holds.filter(({ row }) => Date.parse(row.quotaResetsAt) > now)
-    .sort((a, b) => Date.parse(b.row.quotaResetsAt) - Date.parse(a.row.quotaResetsAt))[0];
+    .sort((a, b) => Number(b.row.quotaState === 'provider-unresponsive') - Number(a.row.quotaState === 'provider-unresponsive')
+      || Date.parse(b.row.quotaResetsAt) - Date.parse(a.row.quotaResetsAt))[0];
   if (!hold) return null;
   const { row, heldBackend } = hold;
   const heldModel = row.servedModel && row.servedModel !== 'unknown' ? row.servedModel : row.requestedModel || 'unknown';
   return { ...row, requestedModel: model || 'default', servedModel: 'unknown', servedBackend: 'unknown', modelEvidence: 'not-launched',
-    fallbackDecision: 'skip-quota-hold', heldBackend, heldModel };
+    fallbackDecision: row.quotaState === 'provider-unresponsive' ? 'skip-provider-unresponsive' : 'skip-quota-hold', heldBackend, heldModel };
 }
 export function saveAgyHold(evidence, { dir = agyEvidenceDir() } = {}) {
-  if (evidence.quotaState !== 'exhausted') return;
+  if (!['exhausted', 'provider-unresponsive'].includes(evidence.quotaState)) return;
   const backend = evidence.servedBackend === 'unknown' ? agyBackend(evidence.requestedModel) : evidence.servedBackend;
-  const folder = join(dir, backend);
+  const folder = evidence.quotaState === 'provider-unresponsive' ? dir : join(dir, backend);
   mkdirSync(folder, { recursive: true });
   // Independent immutable observations: concurrent failures cannot shorten a previously observed hold.
   const file = join(folder, `${randomUUID()}.json`);
@@ -63,7 +78,8 @@ export function saveAgyHold(evidence, { dir = agyEvidenceDir() } = {}) {
 }
 export function agyEvidenceError(evidence) {
   const heldBy = evidence.heldBackend ? ` (held by ${evidence.heldBackend} model ${evidence.heldModel ?? 'unknown'})` : '';
-  const error = new Error(`antigravity: ${evidence.fallbackDecision}; requested ${evidence.requestedModel}; reported ${evidence.servedModel}; quota reset ${evidence.quotaResetsAt ?? 'unknown'}${heldBy}`);
+  const window = evidence.quotaState === 'provider-unresponsive' ? `; provider-unresponsive: first-output window ${evidence.firstOutputMs} ms; cooldown ${evidence.cooldownMs} ms` : '';
+  const error = new Error(`antigravity: ${evidence.fallbackDecision}; requested ${evidence.requestedModel}; reported ${evidence.servedModel}; quota reset ${evidence.quotaResetsAt ?? 'unknown'}${heldBy}${window}`);
   error.telemetry = evidence;
   return error;
 }
@@ -71,7 +87,9 @@ export function agyEvidenceError(evidence) {
 /** Whitelist provenance at each record boundary; never persist prompts or arbitrary report keys. */
 export function pickAgyEvidence(report = {}) {
   return Object.fromEntries(['requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision']
-    .filter((key) => typeof report?.[key] === 'string').map((key) => [key, report[key]]));
+    .concat(['firstOutputMs', 'cooldownMs'])
+    .filter((key) => ['firstOutputMs', 'cooldownMs'].includes(key) ? Number.isSafeInteger(report?.[key]) : typeof report?.[key] === 'string')
+    .map((key) => [key, report[key]]));
 }
 export function parseAgyReportEvidence(text) {
   try { return pickAgyEvidence(JSON.parse(text)); } catch { return {}; }

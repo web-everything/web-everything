@@ -40,6 +40,11 @@ import { EventEmitter } from 'node:events';
 const REPO = 'web-everything/web-everything';
 const NOW = Date.parse('2026-09-26T15:00:00Z');
 
+const CARBON_PROMOTION_CASES = [
+  { name: 'unpromoted (default)', env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: false, seatCount: 2 },
+  { name: 'manually promoted with a positive cap', env: { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', [PROVIDER_CAP_ENV['agy-gemini']]: '5' }, promoted: true, seatCount: 3 },
+];
+
 const CLAUDE_FINDING = { summary: 'isMechanicalMergeCommit trusts the message headline alone, so a forged merge headline bypasses the gate', file: 'scripts/lib/ai-pr-authorship.mjs', line: 41 };
 const LOOP_PAYLOAD = {
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict: 'changes' },
@@ -55,6 +60,90 @@ const LOOP_PAYLOAD = {
 
 const answer = (lenses) => `I reviewed it.\n\n\`\`\`json\n${JSON.stringify({ lenses })}\n\`\`\``;
 const VALID_SEAT_FINDING = { summary: 'Real finding', category: 'failing-input', impactIfUnfixed: 'broken', file: null, line: null, failure_scenario: 'A concrete failure.' };
+
+describe('red-team reservation routing under operator overrides', () => {
+  const run = (io, env) => speculateRedTeam({ pr: 5, repo: REPO, lanePath: 'lane',
+    read: LOOP_PAYLOAD.findings.read, env, post: false, record: false }, io);
+  const policyFor = (fallback = []) => {
+    const policy = structuredClone(readRoutingPolicy());
+    policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', fallback };
+    return policy;
+  };
+  const caps = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+  it('uses the codex-only override with both agy providers capped at zero', async () => {
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(),
+      readAiRouting: () => ({}), readHeadMessage: () => '',
+      runSeat: async o => { calls.push(['seat', o]); return { report: { lastMessage: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } }; } });
+    expect((await run(io, caps)).status).toBe('speculated');
+    expect(calls.filter(c => c[0] === 'reserve')).toEqual([['reserve', 'codex', 1, 1]]);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'codex', model: 'gpt-6.1-sol' });
+  });
+  it.each(['0', '300'])('retains codex daily-cap denial when out-of-chain agy capacity is %s', async agyCap => {
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(), readAiRouting: () => ({}),
+      reserveCalls: ({ provider, dailyCap }) => { calls.push(['denied', provider, dailyCap]); return { used: 5000, callIds: [] }; } });
+    const result = await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: agyCap });
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain('daily-cap: 5000/5000 non-Claude seat calls used today for codex');
+    expect(result.reason).not.toContain('no available route');
+    expect(calls.filter(c => c[0] === 'denied')).toEqual([['denied', 'codex', 5000]]);
+    expect(calls).toContainEqual(['log', 'red team deferred: daily-cap: 5000/5000 non-Claude seat calls used today for codex (scorecards + reservation ledger)']);
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+  });
+  it.each([
+    { name: 'explicit caps', env: caps, control: {}, expected: [
+      'codex=5000 (source: WE_REVIEW_SEAT_CAP_CODEX)', 'agy-claude=0 (source: WE_REVIEW_SEAT_CAP_AGY_CLAUDE)',
+      'agy-gemini=0 (source: WE_REVIEW_SEAT_CAP_AGY_GEMINI)'] },
+    { name: 'defaults', env: {}, control: {}, expected: [
+      'codex=80 (source: default)', 'agy-claude=300 (source: default)', 'agy-gemini=0 (source: default)'] },
+    { name: 'legacy cap', env: { [DAILY_CAP_ENV]: '17' }, control: {}, expected: [
+      'codex=17 (source: WE_REVIEW_EXTRA_SEATS_DAILY_CAP)', 'agy-claude=300 (source: default)', 'agy-gemini=0 (source: default)'] },
+    { name: 'routing controls', env: { WE_REVIEW_SEAT_CAP_CODEX: '5000' },
+      control: { disabledProviders: ['codex'], enabledProviders: ['agy-gemini'] }, expected: [
+        'codex=0 (source: routing disabledProviders)', 'agy-claude=300 (source: default)', 'agy-gemini=300 (source: routing/default)'] },
+  ])('logs each resolved provider cap and its source: $name', async ({ env, control, expected }) => {
+    const policy = policyFor();
+    Object.assign(policy.operations['review-seat:red-team'], control);
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policy, readAiRouting: () => ({}),
+      reserveCalls: () => ({ used: 5000, callIds: [] }) });
+    await run(io, env);
+    expect(calls.filter(c => c[0] === 'log' && c[1].startsWith('red-team cap: ')).map(c => c[1]))
+      .toEqual(expected.map(line => `red-team cap: ${line}`));
+  });
+
+  it('defers red team when the scorecard and outstanding ledger union exhausts codex capacity', async () => {
+    const at = new Date(NOW).toISOString();
+    const records = ['shared', 'done-only'].map(callId => ({ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+      provider: 'codex', callId, scoredAt: at }));
+    const ledger = { version: 1, reservations: ['shared', 'outstanding-only'].map(callId => ({ callId, at, provider: 'codex' })) };
+    const newId = vi.fn(() => 'must-not-allocate');
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policyFor(), readAiRouting: () => ({}),
+      readRecords: () => records, newId }, { codex: ledger });
+    const result = await run(io, { ...caps, WE_REVIEW_SEAT_CAP_CODEX: '3' });
+    expect(result).toMatchObject({ status: 'skipped', deferredByCap: true });
+    expect(result.reason).toContain('daily-cap: 3/3 non-Claude seat calls used today for codex');
+    expect(calls).toContainEqual(['reserve', 'codex', 1, 0]);
+    expect(newId).not.toHaveBeenCalled();
+    expect(calls.some(c => c[0] === 'seat')).toBe(false);
+    expect(calls).toContainEqual(['log', 'red team deferred: daily-cap: 3/3 non-Claude seat calls used today for codex (scorecards + reservation ledger)']);
+  });
+  it('tries a remaining in-chain fallback after codex reservation denial', async () => {
+    const { io, calls } = fakeSeatIo({
+      readRoutingPolicy: () => policyFor([{ provider: 'agy-claude', model: 'sonnet' }]), readAiRouting: () => ({}), readHeadMessage: () => '',
+      runSeat: async o => { calls.push(['seat', o]); return { report: { events: { finalResponse: answer({ 'red-team': { verdict: 'accept', findings: [] } }) } } }; },
+    });
+    const reserve = io.reserveCalls;
+    io.reserveCalls = o => o.provider === 'codex' ? { used: 5000, callIds: [] } : reserve(o);
+    expect((await run(io, { ...caps, WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '300' })).status).toBe('speculated');
+    expect(calls.find(c => c[0] === 'seat')[1].provider).toBe('agy-claude');
+  });
+  it('never reserves a routing-disabled provider even with a positive environment cap', async () => {
+    const policy = policyFor();
+    policy.operations['review-seat:red-team'].disabledProviders = ['codex'];
+    const { io, calls } = fakeSeatIo({ readRoutingPolicy: () => policy, readAiRouting: () => ({}) });
+    expect((await run(io, caps)).status).toBe('skipped');
+    expect(calls.some(c => c[0] === 'reserve' || c[0] === 'seat')).toBe(false);
+  });
+});
 
 /** A fake seat io recording every effect. Reservations are kept in ONE ledger PER PROVIDER inside `ledgerBox`
  *  (an object keyed by provider), matching the real io's per-provider ledger files — pass one `ledgerBox` to
@@ -111,7 +200,7 @@ describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
     expect(new Set(routes.map((r) => r.provider)).size).toBe(3);
     // The Gemini seat pins high effort in the model id; launchers omit the separate flag.
     expect(REVIEW_SEAT_MODELS['agy-gemini'].effort).toBe('high');
-    expect(REVIEW_SEAT_MODELS['agy-gemini'].model).toBe('gemini-4-argon-high');
+    expect(REVIEW_SEAT_MODELS['agy-gemini'].model).toBe('gemini-4-carbon-high');
   });
 
   it('routes every advisory lens review-pr does not already seat off-Claude, and leaves Claude\'s mandatory seats alone', () => {
@@ -128,7 +217,7 @@ describe('#4194 reviewSeatRoutes — which seats, on which provider', () => {
     expect(routes.length).toBeGreaterThan(0);
     for (const route of [pin, ...routes]) {
       const argv = buildAgyDirectTaskArgv({ ...route, review: true });
-      expect(argv).toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+      expect(argv).toEqual(expect.arrayContaining(['--model', 'gemini-4-carbon-high']));
       expect(argv).not.toContain('--effort');
     }
   });
@@ -386,7 +475,7 @@ describe('#4194 the direct-task scripts in --review mode', () => {
     expect(argvs).toHaveLength(2);
     for (const a of argvs) {
       expect(a).not.toContain('--dangerously-skip-permissions');
-      expect(a).toEqual(expect.arrayContaining(['--model', 'gemini-4-argon-high']));
+      expect(a).toEqual(expect.arrayContaining(['--model', 'gemini-4-carbon-high']));
       expect(a).not.toContain('--effort');
     }
   });
@@ -437,12 +526,17 @@ describe('#4194 prompt, answer parsing, confirmation, rows', () => {
     expect(big).toMatch(/truncated/);
   });
 
-  it('parses the last fenced JSON; a seat missing from it is not ok', () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: parses the last fenced JSON; only seated lenses require answers`, () => {
+    const seats = reviewSeatRoutes({ env }).routes;
+    expect(seats).toHaveLength(seatCount);
+    expect(seats.some(s => s.provider === 'agy-gemini')).toBe(promoted);
     const text = answer({ 'claim-accuracy': { verdict: 'changes', findings: [{ summary: 'wrong count', category: null, file: 'a.md', line: 3, impactIfUnfixed: 'broken', failure_scenario: null }] } });
     const parsed = parseSeatAnswer(text, seats);
     expect(parsed['claim-accuracy']).toMatchObject({ ok: true, verdict: 'changes' });
     expect(parsed['claim-accuracy'].findings[0]).toMatchObject({ summary: 'wrong count', file: 'a.md', line: 3 });
-    expect(parsed['standards-conformance'].ok).toBe(false);
+    expect(parsed['extra-juror:correctness'].ok).toBe(false);
+    if (promoted) expect(parsed['standards-conformance'].ok).toBe(false);
+    else expect(parsed).not.toHaveProperty('standards-conformance');
   });
 
   it('finds an unfenced answer however its JSON is spaced or indented', () => {
@@ -551,13 +645,15 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls).toContainEqual(['log', 'added seats: skipping agy-gemini — daily-cap: 0/0 non-Claude seat calls already used today for agy-gemini']);
   });
 
-  it('runs all three providers in parallel, writes one evidence row per seat, stamps Claude confirmation, cleans up', async () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: runs the admitted providers, writes one evidence row per seat, stamps Claude confirmation, cleans up`, async () => {
     const { io, calls, rows } = fakeSeatIo();
-    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' } }, io);
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
-    expect(r.rowsWritten).toBe(3);
+    expect(r.rowsWritten).toBe(seatCount);
     expect(rows.map((x) => `${x.seat}:${x.lens}@${x.provider}`).sort()).toEqual([
-      'advisory-lens:claim-accuracy@agy-claude', 'advisory-lens:standards-conformance@agy-gemini', 'extra-juror:correctness@codex',
+      'advisory-lens:claim-accuracy@agy-claude',
+      ...(promoted ? ['advisory-lens:standards-conformance@agy-gemini'] : []),
+      'extra-juror:correctness@codex',
     ]);
     const juror = rows.find((x) => x.seat === 'extra-juror');
     expect(juror.findings[0]).toMatchObject({ confirmedByClaude: true });
@@ -566,28 +662,34 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     for (const row of rows) expect(row.changedFiles).toEqual(LOOP_PAYLOAD.findings.read.netChangedFiles);
     const claim = rows.find((x) => x.lens === 'claim-accuracy');
     expect(claim.findings[0]).toMatchObject({ confirmedByClaude: false });
-    expect(calls.filter((c) => c[0] === 'seat')).toHaveLength(3);
+    expect(calls.filter((c) => c[0] === 'seat')).toHaveLength(seatCount);
     expect(calls.find((c) => c[0] === 'scratch')[1]).toMatchObject({ lanePath: '/lane', rev: 'a'.repeat(40) });
     expect(calls.at(-1)).toEqual(['rm', '/tmp/seat-scratch']);
     expect(renderSeatSummary(r).join('\n')).toMatch(/also raised by Claude/);
     // Card xn2wf9t — per-provider usage is reported, not just a shared total.
     expect(r.providerUsage.codex).toMatchObject({ usedToday: 1, cap: PROVIDER_CAP_DEFAULT.codex });
     expect(r.providerUsage['agy-claude']).toMatchObject({ usedToday: 1, cap: PROVIDER_CAP_DEFAULT['agy-claude'] });
-    expect(r.providerUsage['agy-gemini']).toMatchObject({ usedToday: 1, cap: 5 });
+    expect(r.providerUsage['agy-gemini']).toMatchObject({ usedToday: promoted ? 1 : 0, cap: 5 });
   });
 
-  it('each antigravity seat gets an inline brief; the codex seat (OS read-only sandbox) reads the checkout', async () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: each admitted antigravity seat gets an inline brief; the codex seat reads the checkout`, async () => {
     const written = new Map();
     const { io } = fakeSeatIo({ writeFile: (p, text) => written.set(p, text) });
-    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' } }, io);
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
+    expect(r.rowsWritten).toBe(seatCount);
     const claude = [...written].find(([p]) => p.endsWith('task-agy-claude.md'))[1];
-    const gemini = [...written].find(([p]) => p.endsWith('task-agy-gemini.md'))[1];
+    const gemini = [...written].find(([p]) => p.endsWith('task-agy-gemini.md'));
     const cod = [...written].find(([p]) => p.endsWith('task-codex.md'))[1];
     expect(claude).toContain(LOOP_PAYLOAD.findings.read.diffText.trim());
     expect(claude).not.toContain('/tmp/seat-scratch');
-    expect(gemini).toContain(LOOP_PAYLOAD.findings.read.diffText.trim());
-    expect(gemini).not.toContain('/tmp/seat-scratch');
+    if (promoted) {
+      expect(gemini[1]).toContain(LOOP_PAYLOAD.findings.read.diffText.trim());
+      expect(gemini[1]).not.toContain('/tmp/seat-scratch');
+    } else {
+      expect(gemini).toBeUndefined();
+      expect(r.seats.some(s => s.provider === 'agy-gemini')).toBe(false);
+    }
     expect(cod).toContain('/tmp/seat-scratch');
   });
 
@@ -600,18 +702,20 @@ describe('#4194 runExtraSeats — the arc, with fakes', () => {
     expect(calls.some((c) => ['reserve', 'scratch', 'seat'].includes(c[0]))).toBe(false);
   });
 
-  it('soak: a seat that fails, times out or throws never fails the run — it is only that seat\'s status', async () => {
+  for (const { name, env, promoted, seatCount } of CARBON_PROMOTION_CASES) it(`${name}: a seat that fails, times out or throws never fails the run — it is only that seat's status`, async () => {
     const { io, rows, calls } = fakeSeatIo({
       runSeat: async (o) => {
         if (o.provider === 'codex') throw new Error('spawn ENOENT');
         return { timedOut: true, report: null };
       },
     });
-    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env: { [PROVIDER_CAP_ENV['agy-gemini']]: '5' } }, io);
+    const r = await runExtraSeats({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: LOOP_PAYLOAD, env }, io);
     expect(r.status).toBe('ran');
+    expect(rows).toHaveLength(seatCount);
     expect(rows.find((x) => x.provider === 'codex').status).toBe('error');
     expect(rows.find((x) => x.provider === 'agy-claude').status).toBe('timeout');
-    expect(rows.find((x) => x.provider === 'agy-gemini').status).toBe('timeout');
+    if (promoted) expect(rows.find((x) => x.provider === 'agy-gemini').status).toBe('timeout');
+    else expect(rows.some((x) => x.provider === 'agy-gemini')).toBe(false);
     expect(rows.every((x) => x.findingsCount === 0)).toBe(true);
     expect(calls.at(-1)).toEqual(['rm', '/tmp/seat-scratch']);
   });
@@ -768,6 +872,25 @@ describe('#4194 review-job — the seats run AFTER the arc, and can never change
 describe('#4194 reserveSeatCalls — the daily budget is reserved BEFORE a call launches', () => {
   const at = (iso) => ({ callId: iso, at: iso });
   const ids = () => { let n = 0; return () => `r${++n}`; };
+
+  it.each(['codex', 'agy-claude', 'agy-gemini'])(
+    'counts the union of scorecards and outstanding reservation IDs for %s', provider => {
+      const timestamp = new Date(NOW).toISOString();
+      const records = ['shared', 'done-only'].map(callId => ({ dispatchKind: REVIEW_SEAT_DISPATCH_KIND,
+        provider, callId, scoredAt: timestamp }));
+      const ledger = { version: 1, reservations: [
+        ...['shared', 'outstanding-only'].map(callId => ({ provider, callId, at: timestamp })),
+        { provider, callId: 'yesterday', at: '2026-09-25T12:00:00Z' },
+        { provider: 'another-provider', callId: 'other-provider', at: timestamp },
+      ] };
+      const newId = vi.fn(() => 'new-call');
+      const input = { ledger, records, want: 1, now: NOW, newId, provider };
+      expect(reserveSeatCalls({ ...input, dailyCap: 3 })).toMatchObject({ used: 3, callIds: [] });
+      expect(newId).not.toHaveBeenCalled();
+      // One spare slot proves the overlap counts once and other days/providers do not consume it.
+      expect(reserveSeatCalls({ ...input, dailyCap: 4 })).toMatchObject({ used: 3, callIds: ['new-call'] });
+      expect(newId).toHaveBeenCalledOnce();
+    });
 
   it('grants up to what is left, counting both stored rows and outstanding reservations', () => {
     const records = [{ dispatchKind: REVIEW_SEAT_DISPATCH_KIND, callId: 'done-1', scoredAt: '2026-09-26T14:00:00Z' }];
@@ -1833,4 +1956,15 @@ else process.exitCode = 1;
     if (refuses) expect(call).toThrow(/outage/);
     else expect(call()).toEqual({ published: false, reason: 'outage' });
   });
+});
+
+// Historical multi-provider roster fixtures explicitly grant manual Carbon promotion.
+beforeEach(() => vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true'));
+afterEach(() => vi.unstubAllEnvs());
+it('refuses the Carbon-pinned advisory routes before manual promotion', () => {
+  vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
+  const plan = reviewSeatRoutes({ available: ['agy-gemini'] });
+  expect(plan.routes).toEqual([]);
+  expect(plan.skipped.length).toBeGreaterThan(0);
+  expect(plan.skipped.every(s => s.reason.includes('Carbon not promoted'))).toBe(true);
 });

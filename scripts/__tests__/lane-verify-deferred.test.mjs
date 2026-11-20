@@ -333,8 +333,10 @@ describe('wiring (source pins)', () => {
   const readFileSync = (p, e) => rf(p, e);
   it('only pr-land and verify-lane reference the deferred module; the open path refuses land mode', async () => {
     const { execFileSync } = await import('node:child_process');
-    const out = execFileSync('git', ['grep', '-l', 'lane-verify-deferred', '--', 'scripts', ':!scripts/__tests__'], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
-    expect(out).toEqual(['scripts/lib/lane-verify-deferred.mjs', 'scripts/pr-land.mjs', 'scripts/verify-lane.mjs'].sort());
+    // The timing inventory lists test paths as data, not deferred-module consumers.
+    const out = execFileSync('git', ['grep', '-l', 'lane-verify-deferred', '--', 'scripts', ':!scripts/__tests__', ':!scripts/ci/test-timings.json'], { encoding: 'utf8' }).split('\n').filter(Boolean).sort();
+    // R1086: the ci-only module reuses the deferred helpers (open modes only) and its own test names them.
+    expect(out).toEqual(['scripts/lib/__tests__/verify-ci-only.test.mjs', 'scripts/lib/lane-verify-deferred.mjs', 'scripts/lib/verify-ci-only.mjs', 'scripts/pr-land.mjs', 'scripts/verify-lane.mjs'].sort());
     expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/mode: PLAN\.mode/);
     // PR #6674 red team — pr-land reads the deferred record through the main-marker fallback, never the bare file.
     expect(readFileSync('scripts/pr-land.mjs', 'utf8')).toMatch(/deferred: readDeferredForSha\(gitDir, refSha\)/);
