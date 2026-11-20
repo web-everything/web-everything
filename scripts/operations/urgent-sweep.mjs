@@ -35,18 +35,18 @@ export function latestActionFailure(data, sha) {
   }
   return [...latest.values()].find(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha));
 }
-export function hotPatchCiEvidence(data, sha, required) {
+export function hotPatchCiEvidence(data, sha, required, now) {
   validateChecks(data, sha);
   if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
     throw Error('unreadable required CI jobs');
-  if (required.some(n => !data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && (c.name === n || c.name.startsWith(`${n} (`))))) throw Error('missing required Actions check; inspect CI or unload manually');
+  if (required.some(n => !data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && (c.name === n || c.name.startsWith(`${n} (`)) && Number.isSafeInteger(c.check_suite?.id) && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, sha, n === 'soak-replay-gate' ? '.github/workflows/soak-replay-gate.yml' : data.testWorkflowPath)))) throw Error('missing required Actions check; inspect CI or unload manually');
   const latest = new Map();
   for (const c of data.check_runs) {
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
     if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
   }
   if ([...latest.values()].some(c => c.app.id === TEST_CHECK_APP_ID
-    && c.status === 'completed' && c.conclusion !== 'success'))
+    && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && now - Date.parse(c.completed_at) >= 30 * 60_000))
     throw Error('unknown hot-patch CI conclusion; inspect checks or unload manually');
   if (!testWorkflowBound(testCheckEvidence(data, sha), data.workflows, sha, data.testWorkflowPath))
     throw Error('unreadable hot-patch CI binding');
@@ -306,7 +306,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             const required = await deps.required(r, data?.testWorkflowPath);
             if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
               throw new Error('unreadable required CI jobs');
-            if (hotPatch) hotPatchCiEvidence(data, r.sha, required);
+            if (hotPatch) hotPatchCiEvidence(data, r.sha, required, now);
             const checks = latestChecks.filter(c =>
               c?.app?.id === TEST_CHECK_APP_ID && c.head_sha === r.sha && typeof c.name === 'string'
               && Number.isSafeInteger(c.id) && Number.isSafeInteger(c.check_suite?.id)

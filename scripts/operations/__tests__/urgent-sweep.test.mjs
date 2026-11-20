@@ -1069,6 +1069,51 @@ describe('hot-patch sweep (R1100)', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
     expect(f.d.remove).not.toHaveBeenCalled();
   });
+  it.each(['smoke', 'daemon-soak', 'soak-replay-gate'])('a same-named %s from an unrelated workflow stays missing at 29 minutes and unloads as unknown at 31', async name => {
+    const rows = [check('test'), check(name, null, { status: 'queued', check_suite: { id: 8 } })];
+    const f = hotFixture(rows);
+    f.d.required.mockReturnValue(['test', name]);
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows,
+      workflows: { total_count: 2, workflow_runs: [...workflows.workflow_runs,
+        { check_suite_id: 8, head_sha: sha, path: '.github/workflows/unrelated.yml' }] } });
+    decisionBeforeRemoval(f, 'ci-unknown');
+    f.d.now = () => new Date(Date.parse(load.at) + 29 * 60_000).toISOString();
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each(['test', 'smoke', 'daemon-soak', 'soak-replay-gate'])('accepts required %s presence only from its expected workflow', async name => {
+    const rows = [check('test', null, { status: 'queued' }), check(`${name} (1)`, null, { status: 'queued', check_suite: { id: 8 } })];
+    const f = hotFixture(rows);
+    f.d.required.mockReturnValue([...new Set(['test', name])]);
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows,
+      workflows: { total_count: 2, workflow_runs: [...workflows.workflow_runs,
+        { check_suite_id: 8, head_sha: sha, path: name === 'soak-replay-gate' ? '.github/workflows/soak-replay-gate.yml' : '.github/workflows/ci.yml' }] } });
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  describe.each(['queued', 'in_progress'])('newer %s rerun over a completed failure', status => {
+    it.each([29, 30, 31])('uses the failure completed_at clock at %i minutes', async minutes => {
+      const completedAt = Date.parse(load.at) + 60 * 60_000;
+      const f = hotFixture([check('test', 'failure', { completed_at: new Date(completedAt).toISOString() }),
+        ...required.map(n => check(n, n === 'test' ? null : 'success', n === 'test' ? { status } : {}))]);
+      f.d.now = () => new Date(completedAt + minutes * 60_000).toISOString();
+      decisionBeforeRemoval(f, 'ci-unknown');
+      const result = await f.run();
+      expect(f.d.remove).toHaveBeenCalledTimes(minutes >= 30 ? 1 : 0);
+      if (minutes >= 30) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+      else expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+    });
+  });
+  it('a newer completed success supersedes a failure even 31 minutes after completed_at', async () => {
+    const f = hotFixture([check('test', 'failure', { completed_at: load.at }), ...required.map(n => check(n))]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
   it('keeps the six-hour escalation for a seven-hour pending hot patch', async () => {
     const f = hotFixture(required.map(n => check(n, null, { status: 'in_progress' })));
     f.d.now = () => new Date(Date.parse(load.at) + 7 * 3600_000).toISOString();
