@@ -115,7 +115,7 @@ describe('TT3 CI integration gate', () => {
   });
 
   it('runs exactly five independent groups with at least 1.6x timeout headroom', () => {
-    expect(parts.strategy['fail-fast']).toBe(false);
+    expect(parts.strategy['fail-fast']).toBe("${{ needs.changes.outputs.fail_fast == 'true' }}");
     expect(integrationGroups).toEqual(['scan-chain', 'sim-scenarios', 'lane-pool-a', 'lane-pool-b', 'parallel']);
     expect(parts.strategy.matrix.group).toEqual(integrationGroups);
     expect(parts.strategy.matrix.include.map((entry) => entry.group)).toEqual(integrationGroups);

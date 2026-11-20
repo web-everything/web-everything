@@ -53,6 +53,13 @@ on:
   # Called only by ci-self.yml (manual dry run of a branch's own ci.yml). github.event_name stays the
   # caller's `workflow_dispatch`, so the existing "manual dispatch runs the full suite" rules apply.
   workflow_call:
+    inputs:
+      dry_run_event:
+        type: string
+        default: ''
+      dry_run_red_shard:
+        type: string
+        default: ''
     secrets:
       WE_APP_PRIVATE_KEY:
         required: false
@@ -85,10 +92,17 @@ jobs:
     timeout-minutes: 5
     outputs:
       light: ${{ steps.detect.outputs.light }}
+      fail_fast: ${{ steps.failfast.outputs.fail_fast }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 50
+      - name: Resolve fail-fast for this event
+        id: failfast
+        # inputs.dry_run_event lets ci-self.yml simulate merge_group/pull_request; empty means the real event.
+        env:
+          EVENT_NAME: ${{ inputs.dry_run_event || github.event_name }}
+        run: node scripts/ci/fail-fast.mjs --event="$EVENT_NAME" >> "$GITHUB_OUTPUT"
       - name: Is this a card-only PR?
         timeout-minutes: 4
         id: detect
@@ -201,9 +215,9 @@ jobs:
     # 2026-11-18 RE-SIZED 25 -> 40: shard 3 now reaches 24 min (p90 ~24), leaving no headroom; 40 = ~1.6x p90.
     timeout-minutes: 40
     strategy:
-      # Don't cancel sibling shards when one fails — the `test` aggregator reports the combined red, and
-      # cancelling would hide which other shards also failed.
-      fail-fast: false
+      # Per-event (R1109, scripts/settings/ci-fail-fast.json): ON in the merge queue (the group is ejected anyway),
+      # OFF on PRs so a fixer sees every failing shard. The `test` aggregator still fails on a cancelled shard.
+      fail-fast: ${{ needs.changes.outputs.fail_fast == 'true' }}
       matrix:
         # Nine time-balanced coverage shards plus one no-coverage group.
         # Keep this SINGLE-DIMENSION matrix: strategy.job-total counts every combination.
@@ -211,6 +225,11 @@ jobs:
         # Keep --expect=9 in coverage-merge and the /9 unit-suite divisors in lockstep.
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     steps:
+      - name: Dry-run forced red shard
+        if: ${{ inputs.dry_run_red_shard != '' && inputs.dry_run_red_shard == format('{0}', matrix.shard) }}
+        run: |
+          echo "::error::Forced red shard (ci-self dry run)."
+          exit 1
       # Keep the fast-check name green for an intentionally empty unit-test scope.
       - name: Card-only unit scope receipt
         if: ${{ needs.changes.outputs.light == 'true' }}
@@ -423,7 +442,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: ${{ needs.changes.outputs.fail_fast == 'true' }}
       matrix:
         group: [scan-chain, sim-scenarios, lane-pool-a, lane-pool-b, parallel]
         include:

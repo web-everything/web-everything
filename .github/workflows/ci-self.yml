@@ -7,6 +7,15 @@ name: CI self-test
 # or `daemon-soak` checks. Manual dispatch only: no push, pull_request or merge_group trigger.
 on:
   workflow_dispatch:
+    inputs:
+      dry_run_event:
+        description: 'Simulate fail-fast for this event: merge_group or pull_request (empty = workflow_dispatch)'
+        required: false
+        default: ''
+      dry_run_red_shard:
+        description: 'Force this unit shard number to fail (empty = none)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -14,6 +23,9 @@ permissions:
 jobs:
   self:
     uses: ./.github/workflows/ci.yml
+    with:
+      dry_run_event: ${{ inputs.dry_run_event }}
+      dry_run_red_shard: ${{ inputs.dry_run_red_shard }}
     # Only the two secrets ci.yml reads for the private FUI checkout; never `inherit`.
     secrets:
       WE_APP_PRIVATE_KEY: ${{ secrets.WE_APP_PRIVATE_KEY }}

@@ -1,0 +1,4 @@
+{
+  "$comment": "R1109: fail-fast for the unit and integration shard matrices, one setting per event. In the merge queue the first red shard cancels its siblings (the group is ejected anyway). On pull requests every shard runs so a fixer sees the full failure list. Unreadable or unknown means no fail-fast. Read by scripts/ci/fail-fast.mjs from the ci.yml changes job. Required aggregates (test, coverage-merge, integration) still fail on a cancelled shard.",
+  "ci": { "failFast": { "mergeQueue": true, "pullRequest": false } }
+}
