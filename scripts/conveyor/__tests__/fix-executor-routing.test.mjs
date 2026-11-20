@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 // Legacy launch assertions use shipped policy with capacity scoring switched off.
 vi.mock('../../lib/settings-files.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -16,7 +18,8 @@ import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-
 const setting = { value: 'codex-first', source: 'default' };
 describe('CI-heal capacity eligibility reaches the launch boundary', () => {
   it('the daemon selects the independently resolved chain for the planned repair kind', () => {
-    const source = readFileSync(new URL('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', import.meta.url), 'utf8');
+    // Keep this a filesystem path: Vite rewrites literal new URL(..., import.meta.url) as an asset URL.
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'), 'utf8');
     expect(source).toContain('const chains = resolveRepairExecutorChains({ aiRouting: resolveFixChainInput() });');
     expect(source).toContain("chain: chains[planned.kind === 'ci-heal' ? 'ci-heal' : 'fix']");
   });
