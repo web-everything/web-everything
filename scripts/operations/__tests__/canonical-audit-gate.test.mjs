@@ -268,26 +268,31 @@ describe('R1053 additive audit records', () => {
       index: JSON.stringify({ key: finding.key, cardHash: finding.cardHash }) };
   };
   it('does not poison admission for a later clean audit, and skips an already poisoned unrelated head', async () => {
-    const records = [], output = [];
+    const records = [], output = [], errors = [], cards = [];
     const source = 'function X() {\n  return unsafeValue;\n}\nfunction Y() {\n  return changedValue;\n}';
     const deps = {
       resolveSha: ref => ref === 'origin/main' ? base : other,
       runCodex: () => 'WEAKENED\nx.mjs:2 unsafe return\u2028WEAKENED',
-      now: () => green.at, appendRecord: record => records.push(record), stdout: text => output.push(text), stderr: () => {},
+      now: () => green.at, appendRecord: record => records.push(record), stdout: text => output.push(text), stderr: text => errors.push(text),
       preExistingMode: () => 'prove', proveClearEnabled: () => true, preExistingExemptionEnabled: () => true,
       auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false }),
       reproOnBase: () => '#1 REPRODUCES SAME CLASS=E1 BASE=x.mjs:2\nQUOTE: return unsafeValue;',
       readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
       numstatText: () => '1\t1\tx.mjs\n', baseRecheckMax: () => 6, protectedPaths: () => [],
-      fileCard: () => ({ written: true, expedite: true, needsYou: true }),
+      // E1 needs a boolean receipt so proof reaches the post-proof contradiction check.
+      fileCard: card => { cards.push(card); return true; },
     };
     expect(await auditMain(['--base=origin/main', `--head=${other}`, '--json'], deps)).toBe(1);
     expect(JSON.parse(output.join('')).verdict).toBe('WEAKENED');
+    expect(cards).toHaveLength(1);
+    expect(cards[0].key).toBe('x.mjs|X|E1');
+    expect(errors.join('')).toContain('Audit exemption contains contradictory verdict text; no record written.');
     expect(records).toHaveLength(0);
     deps.resolveSha = ref => ref === 'origin/main' ? base : sha;
     deps.runCodex = () => 'NOT WEAKENED';
     expect(await auditMain(['--base=origin/main', `--head=${sha}`], deps)).toBe(0);
+    expect(records).toHaveLength(1);
     expect(fixture({ records }).result.ok).toBe(true);
     const poisoned = { ...scoped, head: other, base: 'e'.repeat(40), fingerprint: 'f'.repeat(64),
       preExisting: [{ ...entry, line: `${entry.line}\u2028WEAKENED` }] };

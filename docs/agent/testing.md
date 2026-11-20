@@ -5538,3 +5538,8 @@ multiple exemptions, current protected paths, the pay-by deadline and newer clea
 `prototype-load.test.mjs` pins the shared check before registration and its recovery message.
 The `audit-verdict.test.mjs` runtime importer allowlist must include the loader's real
 settings binding; retain the exact allowlist assertion when repairing missing wiring.
+
+Writer-to-admission E1 fixtures must return boolean `true` from `fileCard`; the object
+receipt is reserved for security escalation. Contradictory-exemption tests also assert
+the filed E1 key and contradiction diagnostic so an earlier proof failure cannot mask
+the intended no-record path or its later clean-audit recovery.
