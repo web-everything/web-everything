@@ -186,7 +186,7 @@ describe('validateVitestReport — fail closed on incomplete evidence', () => {
     ['name with surrounding whitespace', one({ name: ' a.test.mjs ' })],
     ['name with newline', one({ name: 'a.test.mjs\nb.test.mjs' })],
     ['name with carriage return', one({ name: 'a.test.mjs\r' })],
-    ['name with U+2028', one({ name: 'a.test.mjs ' })],
+    ['name with U+2028', one({ name: `a.test.mjs${String.fromCharCode(0x2028)}` })],
     ['name with NUL', one({ name: 'a\0.test.mjs' })],
     ['name that normalizes to empty', one({ name: './' })],
     ['name with a .. segment', one({ name: 'scripts/../../etc/a.test.mjs' })],
@@ -205,6 +205,27 @@ describe('validateVitestReport — fail closed on incomplete evidence', () => {
     ['non-array unhandledErrors', one({}, { unhandledErrors: { message: 'crash' } })],
     ['non-numeric runtime-error count', one({}, { numRuntimeErrorTestSuites: 'x' })],
     ['negative runtime-error count', one({}, { numRuntimeErrorTestSuites: -1 })],
+    // Self-review round: invisible characters, foreign checkouts, path-shape normalization, incomplete runs.
+    ['name with a zero-width space', one({ name: `a${String.fromCharCode(0x200b)}.test.mjs` })],
+    ['name with a BOM', one({ name: `${String.fromCharCode(0xfeff)}a.test.mjs` })],
+    ['name with a bidi override', one({ name: `a${String.fromCharCode(0x202e)}.test.mjs` })],
+    ['name that is not NFKC-normalized', one({ name: `${String.fromCharCode(0xff41)}.test.mjs` })],
+    ['absolute name from another checkout', one({ name: '/elsewhere/lane-9/a.test.mjs' })],
+    ['windows absolute name', one({ name: 'C:\\elsewhere\\a.test.mjs' })],
+    ['name with a doubled slash', one({ name: 'scripts//a.test.mjs' })],
+    ['name with a ./ segment', one({ name: 'scripts/./a.test.mjs' })],
+    ['name with a trailing slash', one({ name: 'scripts/a.test.mjs/' })],
+    ['duplicate suite names differing only in case', { testResults: [{ name: 'A.test.mjs', status: 'passed' }, { name: 'a.test.mjs', status: 'failed' }] }],
+    ['never-run (pending) assertion', one({ assertionResults: [{ status: 'passed' }, { status: 'pending' }] })],
+    ['non-string assertion status', one({ assertionResults: [{ status: 1 }] })],
+    ['pending tests counter', one({}, { numPendingTests: 2 })],
+    ['non-integer counter', one({}, { numTotalTests: 1.5 })],
+    ['string counter', one({}, { numFailedTests: '0' })],
+    ['non-boolean success', one({}, { success: 'true' })],
+    ['success with a failed suite', one({ status: 'failed' }, { success: true })],
+    ['failure with no failed suite', one({}, { success: false })],
+    ['numTotalTests disagreeing with assertions', one({ assertionResults: [{ status: 'passed' }] }, { numTotalTests: 3 })],
+    ['numFailedTests disagreeing with assertions', one({ status: 'failed', assertionResults: [{ status: 'failed' }] }, { numFailedTests: 0 })],
   ])('rejects %s with a reason', (_label, report) => {
     const result = validateVitestReport(report);
     expect(result.ok).toBe(false);
@@ -215,6 +236,20 @@ describe('validateVitestReport — fail closed on incomplete evidence', () => {
   it('accepts well-formed assertions on a failed suite', () => {
     expect(validateVitestReport(one({ status: 'failed', assertionResults: [{ status: 'passed' }, { status: 'failed' }, { status: 'skipped' }] })))
       .toEqual({ ok: true, reason: null });
+  });
+
+  it('accepts a report shaped like the vitest json reporter, with absolute names under this checkout', async () => {
+    const { resolve } = await import('node:path');
+    const root = resolve('.');
+    expect(validateVitestReport({
+      numTotalTestSuites: 4, numFailedTestSuites: 1, numPendingTestSuites: 0,
+      numTotalTests: 4, numPassedTests: 3, numFailedTests: 1, numPendingTests: 0, numTodoTests: 1,
+      success: false,
+      testResults: [
+        { name: `${root}/scripts/a.test.mjs`, status: 'failed', assertionResults: [{ status: 'passed' }, { status: 'failed' }] },
+        { name: `${root}/scripts/b.test.mjs`, status: 'passed', assertionResults: [{ status: 'skipped' }, { status: 'todo' }] },
+      ],
+    })).toEqual({ ok: true, reason: null });
   });
 
   it('rejects an empty selected report by default but accepts it when allowEmpty is set', () => {
