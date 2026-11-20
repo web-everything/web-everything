@@ -69,10 +69,10 @@ export default {
       if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true || removed.acceptedOmission !== true) {
         violations.push({ invariant: 'sanctioned-removal-missing-proof', detail: `reasoned removal did not record the exact live tip: ${JSON.stringify({ removal, event: removed })}` });
       }
-      const m = (history) => matchReadyCandidate({
+      const m = (history, live = { ref, sha }) => matchReadyCandidate({
         ready, plan: { finalSha: 'S2', inputsKey: 'K2', mainSha: 'M2', applied: [] }, prevHead: 'H',
         treeOf: () => 'T2', stillWanted: () => true, verifyBuilt: () => true,
-        liveApplied: [{ ref, sha }], carries: () => false,
+        liveApplied: [live], carries: () => false,
         retiredByOperator: (a) => overlayRetiredByOperator?.({ ...a, events: history,
           registered: (r) => readOverlays(scratch, { env }).some((o) => o.ref === r) }) ?? false,
         nowMs: t0 + 60_000, maxAgeMs: 3_600_000,
@@ -99,6 +99,29 @@ export default {
           violations.push({ invariant: 'unproven-retirement-adopted', detail: `${name} must keep the live-overlay omission refusal: ${JSON.stringify(result)}` });
         }
       }
+      // runAutoRebase registers the replacement under the original ref, with no `added` event.
+      const replacement = `${ref}-auto-1`;
+      git('checkout', '-qb', replacement);
+      git('commit', '--allow-empty', '-qm', 'auto-rebase replacement');
+      const replacementSha = git('rev-parse', 'HEAD');
+      git('checkout', '-q', 'main');
+      git('merge', '--no-ff', '-m', `daemon-rebuild: merge overlay ${replacement} onto main`, replacement);
+      addOverlay(scratch, { ref: replacement, stackBases: [ref] }, { env });
+      appendOverlayEvent(scratch, { kind: 'auto-rebase-registered', ref, new: replacement,
+        newSha: replacementSha, at: '2026-11-14T11:00:00Z' }, { env });
+      removeOverlay(scratch, replacement, { env });
+      appendOverlayEvent(scratch, { kind: 'removed', ref: replacement, tip: replacementSha }, { env });
+      const liveReplacement = { ref: replacement, sha: replacementSha };
+      if (m(readOverlayEventLog(scratch, env), liveReplacement).adopt !== null)
+        violations.push({ invariant: 'actorless-auto-rebase-removal-adopted', detail: 'replacement removal alone must refuse omission' });
+      await withdrawUnregisteredOverlay({ reason, acceptOmission: true, root: scratch, ref: replacement,
+        tip: replacementSha, actor, env, deps: { resolveOperatorIdentity: () => ({ login: actor, type: 'User' }) } });
+      const replacementEvents = readOverlayEventLog(scratch, env);
+      const replacementResult = m(replacementEvents, liveReplacement);
+      log?.(`auto-rebase replacement withdrawal -> adopt=${!!replacementResult.adopt} reason=${replacementResult.reason ?? ''}`);
+      if (replacementEvents.some(e => e.kind === 'added' && e.ref === replacement)
+        || replacementResult.adopt !== ready.adopt || replacementResult.retired?.[0] !== replacement)
+        violations.push({ invariant: 'auto-rebase-withdrawal-discarded', detail: JSON.stringify(replacementResult) });
       addOverlay(scratch, { ref }, { env });
       await retireRegistration({ root: scratch, ref, expectedTip: sha, actor, env,
         deps: { prove: () => ({ action: 'retire', tip: sha, reason: 'in-main' }), tip: () => sha } });

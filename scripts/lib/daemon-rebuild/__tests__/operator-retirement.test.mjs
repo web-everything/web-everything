@@ -145,6 +145,46 @@ describe('operator retirement of a live overlay', () => {
     refused(match([added, removed, { ...removed, kind: 'auto-retired', actor: undefined }]));
   });
 
+  it('accepts explicit live-tip withdrawal of an auto-rebased replacement without an added event', () => {
+    removeOverlay(root, ref, { env });
+    const events = [
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: added.at },
+      { ...removed, actor: undefined, operatorReason: undefined },
+      { ...removed, acceptedOmission: true, at: '2026-11-14T12:00:00Z' },
+    ];
+    expect(match(events)).toMatchObject({ adopt: { finalSha: 'candidate' }, retired: [ref] });
+  });
+
+  it.each([
+    ['missing registration time', { at: undefined }],
+    ['invalid registration time', { at: 'invalid' }],
+    ['retirement before registration', { at: '2026-11-14T12:00:00Z' }],
+    ['retirement at registration time', { at: removed.at }],
+    ['wrong replacement', { new: 'lane/other' }],
+    ['unknown registration kind', { kind: 'mystery' }],
+  ])('refuses auto-rebase withdrawal with %s', (_name, override) => {
+    removeOverlay(root, ref, { env });
+    refused(match([
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: added.at, ...override },
+      { ...removed, acceptedOmission: true },
+    ]));
+  });
+
+  it('a later auto-rebase registration vetoes retirement even after hand removal', () => {
+    removeOverlay(root, ref, { env });
+    refused(match([added, removed,
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: '2026-11-14T12:00:00Z' },
+    ]));
+  });
+
+  it('checks every mixed registration timestamp despite append order', () => {
+    removeOverlay(root, ref, { env });
+    refused(match([
+      { kind: 'auto-rebase-registered', ref: 'lane/original', new: ref, newSha: sha, at: '2026-11-14T12:00:00Z' },
+      added, removed,
+    ]));
+  });
+
   it('still discards a candidate after hand removal without a record', () => {
     removeOverlay(root, ref, { env });
     refused();

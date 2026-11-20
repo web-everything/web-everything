@@ -156,11 +156,14 @@ export function matchReadyCandidate({
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
-/** Only authenticated operator auto-retirement retires its exact tip, after every recorded add. Unknown evidence refuses. */
+/** Only authenticated operator auto-retirement retires its exact tip, after every recorded registration. Unknown evidence refuses. */
 export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) {
   try {
     if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
-    const history = events.filter((e) => e?.ref === ref);
+    // Auto-rebase records registration on the original ref with `new` naming the replacement.
+    // Normalize that registration so it supplies add chronology and also vetoes an older retirement.
+    const history = events.flatMap((e) => e?.kind === 'auto-rebase-registered' && e.new === ref
+      ? [{ ...e, kind: 'added', ref }] : e?.ref === ref ? [e] : []);
     const removed = history.at(-1)?.kind === 'auto-retired' ? history.at(-1) : null; // `removed` never carries authenticated operator evidence; any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
     if (!removed || removed.operatorReason !== true || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
