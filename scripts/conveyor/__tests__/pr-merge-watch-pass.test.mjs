@@ -19,7 +19,9 @@ vi.mock('node:fs', async importOriginal => {
   };
   return { ...actual, readFileSync, default: { ...actual.default, readFileSync } };
 });
-vi.mock('../../lib/daemon-events.mjs', () => ({ appendDaemonEvent: io.append }));
+vi.mock('../../lib/daemon-events.mjs', async importOriginal => ({
+  ...await importOriginal(), appendDaemonEvent: io.append,
+}));
 // An accidentally uninjected GitHub call must fail locally, never hit GitHub.
 vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(),
@@ -281,6 +283,53 @@ describe('runMergeWatch — acceptedRedTeamClearAndClean (humanReviewHold + fina
     expect(emitEvent).toHaveBeenCalledTimes(140);
     expect(new Set(emitEvent.mock.calls.map(([event]) => event.pr)).size).toBe(140);
     expect(emitEvent.mock.calls.every(([event]) => event.kind === 'pr-merged')).toBe(true);
+  });
+
+  it('only enqueues stuck heads and never spawns operations on any tick', async () => {
+    prs.set(REPO, Array.from({ length: 5 }, (_, i) => readyPr({ number: i + 1,
+      labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED' })));
+    const drain = vi.fn(() => { throw Error('watcher must never drain'); });
+    const options = { drain, readyStuck: { readLabelTime: () => at(0), readSkipReason: () => 'held' } };
+    await tick(181, options);
+    expect(emitEvent.mock.calls.filter(([e]) => e.kind === 'ready-stuck')).toHaveLength(5);
+    const queue = () => JSON.parse(fs.readFileSync(join(stateDir, 'stuck-trace-queue.json'), 'utf8'));
+    expect(Object.keys(queue())).toHaveLength(5);
+    await tick(182, options);
+    expect(Object.values(queue()).every(e => e.state === 'queued' && e.attempts === 0)).toBe(true);
+    expect(drain).not.toHaveBeenCalled();
+  });
+
+  it('delivers alerts and completes self-heal even when enqueue throws', async () => {
+    prs.set(REPO, [readyPr({ labels: labels('ready-to-merge'), mergeStateStatus: 'BLOCKED',
+      statusCheckRollup: [{ name: 'unit', conclusion: 'FAILURE', completedAt: at(-2000) }] })]);
+    const enqueue = vi.fn(() => { throw Error('queue write'); });
+    const drain = vi.fn(() => { throw Error('drain'); });
+    const refresh = vi.fn();
+    await tick(181, { enqueue, drain, readyStuck: {
+      readLabelTime: () => at(0), readSkipReason: () => 'held', refresh,
+      onlyChecksBlock: () => true, readRequiredChecks: () => ['unit'],
+      readMainChecks: () => ({ sha: HEAD, checks: [{ name: 'unit', conclusion: 'SUCCESS' }] }),
+    } });
+    expect(emitEvent.mock.calls.some(([e]) => e.kind === 'ready-stuck')).toBe(true);
+    expect(enqueue).toHaveBeenCalled(); expect(drain).not.toHaveBeenCalled();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    const state = JSON.parse(fs.readFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), 'utf8'));
+    expect(state.prs[17].heads[HEAD].readyStuckAlerted).toBe(true);
+  });
+
+  it.each([127, 128])('skips drain when 128 reads finish or defer the pass (%i PRs)', async count => {
+    prs.set(REPO, Array.from({ length: count }, (_, i) => readyPr({ number: i + 1, state: 'CLOSED' })));
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(join(stateDir, `${encodeURIComponent(REPO)}.json`), JSON.stringify({
+      prs: Object.fromEntries(prs.get(REPO).map(pr => [pr.number, { heads: {}, merged: false }])),
+    }));
+    const drain = vi.fn();
+    await tick(181, { drain });
+    expect(drain).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(128);
+    const cursorFile = join(stateDir, 'cursor.json');
+    if (count === 127) expect(fs.existsSync(cursorFile)).toBe(false);
+    else expect(JSON.parse(fs.readFileSync(cursorFile, 'utf8')).number).toBe(128);
   });
 
   it('closed without merged_at is not proof of a merge', async () => {

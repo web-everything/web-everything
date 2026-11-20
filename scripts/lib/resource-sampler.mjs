@@ -9,7 +9,7 @@ import { readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
-import { memoryFreePct, memoryAvailableMb } from './memory-available.mjs';
+import { memoryFreePctUnrounded, memoryAvailableMb } from './memory-available.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS } from './host-overload-settings.mjs';
 import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/heavy-admission.mjs';
 
@@ -66,7 +66,12 @@ export function countAgentSessions(procs) {
 }
 export function memoryPressureLevel(text) {
   const value = String(text).trim();
-  return /^(1|2|4)$/.test(value) ? Number(value) : null;
+  return /^(1|2|3|4)$/.test(value) ? Number(value) : null;
+}
+export function swapUsedMb(text) {
+  const match = /used\s*=\s*([\d.]+)M/.exec(String(text));
+  const used = match ? Number(match[1]) : NaN;
+  return Number.isFinite(used) && used >= 0 ? used : null;
 }
 /** Swap use in percent from `sysctl -n vm.swapusage` ("total = 27648.00M  used = 26500.00M  free = …"); null when
  *  unparseable, 0 with no swap configured. A fix-cap signal (operator 2026-10-10: swap, not CPU, hurt throughput). */
@@ -77,11 +82,11 @@ export function swapUsedPct(text) {
   if (!Number.isFinite(total) || !Number.isFinite(used)) return null;
   return total > 0 ? round(used / total * 100) : 0;
 }
-export function buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
+export function buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, swapUsedMb, swapGrowthMb, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
   return { schema: 'resource-snapshot/1', sampledAt: new Date(sampledAtMs).toISOString(),
     freshUntil: new Date(sampledAtMs + Math.min(3 * intervalMs, maxFreshMs)).toISOString(), intervalMs,
     cpu: { idlePct: finite(cpuIdlePct), cores: finite(cores), loadAvg: [0, 1, 2].map(i => finite(loadAvg?.[i])) },
-    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), metric: memMetric ?? null, availableMb: finite(memAvailableMb), floorMb: finite(memFloorMb), floorSource: memFloorSource ?? null, swapUsedPct: finite(swapPct) },
+    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), metric: memMetric ?? null, availableMb: finite(memAvailableMb), floorMb: finite(memFloorMb), floorSource: memFloorSource ?? null, swapUsedPct: finite(swapPct), swapUsedMb: finite(swapUsedMb), swapGrowthMb: finite(swapGrowthMb) },
     disk: { busyPct: finite(disk?.busyPct), ioDepth: finite(disk?.ioDepth), readMBps: finite(disk?.readMBps), writeMBps: finite(disk?.writeMBps) },
     // macOS exposes no public fsevents backlog counter.
     fsevents: { fseventsdCpuPct: finite(fseventsdCpuPct), backlog: null },
@@ -105,7 +110,7 @@ function defaultCountLanes(checkoutRoot = repoRoot()) {
 export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = os.loadavg, freemem = os.freemem,
   totalmem = os.totalmem, checkoutRoot = repoRoot(), readHeavySlots = () => defaultHeavySlots(checkoutRoot),
   countLanes = () => defaultCountLanes(checkoutRoot), now = Date.now } = {}) {
-  let previousCpus = null; let previousDisk = null; let previousTime = null;
+  let previousCpus = null; let previousDisk = null; let previousTime = null; let previousSwapMb = null;
   return { sample() {
     const errors = [];
     const probe = (name, fn) => {
@@ -136,20 +141,22 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
         floorSource: sources['host.capacity.memAvailableFloorMb'] ?? 'standard' };
     } catch { memPolicy = null; }
     const needPolicy = () => { if (!memPolicy) throw Error('memory policy unreadable'); return memPolicy; };
-    const memFreePct = probe('memFreePct', () => memoryFreePct({ metric: needPolicy().metric, exec: run, freemem, totalmem }));
+    const memFreePct = probe('memFreePct', () => memoryFreePctUnrounded({ metric: needPolicy().metric, exec: run, freemem, totalmem }));
     const memAvailableMb = probe('memAvailableMb', () => memoryAvailableMb({ metric: needPolicy().metric, exec: run, freemem }));
-    const swapPct = probe('swapUsedPct', () => {
-      const value = swapUsedPct(run('sysctl', ['-n', 'vm.swapusage']));
-      if (value === null) throw Error('unrecognized swap usage'); return value;
+    const swapText = probe('swapUsedPct', () => {
+      const text = run('sysctl', ['-n', 'vm.swapusage']);
+      if (swapUsedPct(text) === null || swapUsedMb(text) === null) throw Error('unrecognized swap usage'); return text;
     });
+    const nextSwapMb = swapUsedMb(swapText);
+    const swapGrowthMb = nextSwapMb !== null && previousSwapMb !== null ? nextSwapMb - previousSwapMb : null;
     const procs = probe('ps', () => parsePsCpu(run('ps', ['-A', '-o', 'pid=,pcpu=,comm='])));
     const snapshot = buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs, cpuIdlePct, cores: nextCpus?.length,
       loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, memAvailableMb, memFloorMb: memPolicy?.floorMb, memFloorSource: memPolicy?.floorSource, memMetric: memPolicy?.metric,
-      swapUsedPct: swapPct, disk,
+      swapUsedPct: swapUsedPct(swapText), swapUsedMb: nextSwapMb, swapGrowthMb, disk,
       fseventsdCpuPct: procs === null ? null : fseventsCpuPct(procs),
       agentSessions: procs === null ? null : countAgentSessions(procs),
       heavySlots: probe('heavySlots', readHeavySlots), laneCount: probe('laneCount', countLanes), errors });
-    previousCpus = nextCpus; previousDisk = nextDisk; previousTime = sampledAtMs;
+    previousCpus = nextCpus; previousDisk = nextDisk; previousTime = sampledAtMs; previousSwapMb = nextSwapMb;
     return snapshot;
   } };
 }

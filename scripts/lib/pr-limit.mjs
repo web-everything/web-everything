@@ -40,7 +40,7 @@ import { withFileLock } from './atomic-json-file.mjs';
 import { classifySession } from '../operations/session-role.mjs'; // THE worker/orchestrator marker — the same one pre-pr-review's bypass gate reads
 import { currentActorId } from './review-independence.mjs'; // the harness session id, recorded on every grant/refusal
 
-// ── LIMITS (defaults + per-repo env override) ───────────────────────────────────────────────────────────
+// ── LIMITS (standard → tool → platform → env) ───────────────────────────────────────────────────────────
 
 /** Today's per-repo caps (we:xniq7xs — the operator's own numbers). */
 export const PR_LIMIT_DEFAULTS = Object.freeze({ we: 15, frontierui: 5, 'plateau-app': 5 });
@@ -52,20 +52,38 @@ export const PR_LIMIT_ENV = Object.freeze({
   'plateau-app': 'WE_PR_LIMIT_PLATEAU_APP',
 });
 
-/**
- * The effective cap for a repo key. An env override wins when it parses to a finite number ≥ 0; otherwise
- * the default; an unknown repo key has no cap (`Infinity` — never refuses, since this module has nothing
- * principled to enforce for a repo it doesn't know). PURE.
- * @param {string} repoKey
- * @param {NodeJS.ProcessEnv} [env]
- * @returns {number}
- */
-export function resolvePrLimit(repoKey, env = process.env) {
-  const envName = PR_LIMIT_ENV[repoKey];
-  const raw = envName ? env?.[envName] : undefined;
-  const n = raw == null ? NaN : Number(raw);
-  if (Number.isFinite(n) && n >= 0) return Math.floor(n);
-  return Object.hasOwn(PR_LIMIT_DEFAULTS, repoKey) ? PR_LIMIT_DEFAULTS[repoKey] : Infinity;
+/** Pure cap cascade: standard → tool → platform → env. Only integers 1..100 count.
+ * `prLimit.limits.<repo>` is optional in scripts/settings/pr-limit.json; defaults stay in code.
+ * Unknown repos have no cap, even if another layer supplies one. */
+export function resolvePrLimitFrom(repoKey, { platform = {}, tool = {}, env = {} } = {}) {
+  if (!Object.hasOwn(PR_LIMIT_DEFAULTS, repoKey)) return { limit: Infinity, source: 'standard' };
+  let limit = PR_LIMIT_DEFAULTS[repoKey];
+  let source = 'standard';
+  const valid = (value) => Number.isInteger(value) && value >= 1 && value <= 100;
+  for (const [layer, value] of [['tool', tool?.limits?.[repoKey]], ['platform', platform?.limits?.[repoKey]]]) {
+    if (valid(value)) { limit = value; source = layer; }
+  }
+  const raw = env?.[PR_LIMIT_ENV[repoKey]];
+  const value = typeof raw === 'string' ? Number(raw) : raw;
+  if (valid(value)) { limit = value; source = 'env'; }
+  return { limit, source };
+}
+
+/** Read every call; unreadable tool settings keep the lower-layer default. Logs use the scope reader's
+ * deduplicated, opt-in policy logger. Injectable layers/read keep tests independent of settings files. */
+export function readPrLimit(repoKey, env = process.env, { platform = platformPreference('prLimit', { env }), tool, read = readSettings } = {}) {
+  if (tool === undefined) {
+    try { tool = read()?.prLimit ?? {}; } catch { tool = {}; }
+  }
+  const resolved = resolvePrLimitFrom(repoKey, { platform, tool, env });
+  logCascadeSources('prLimit', { value: { limits: { [repoKey]: resolved.limit } },
+    sources: { [`limits.${repoKey}`]: resolved.source } }, { env });
+  return resolved;
+}
+
+/** Compatible numeric reader; per-repo caps always resolve through the live settings cascade. */
+export function resolvePrLimit(repoKey, env = process.env, options) {
+  return readPrLimit(repoKey, env, options).limit;
 }
 
 // ── SCOPE — which open PRs the cap counts (operator ruling 2026-10-09 ~17:05 ET) ────────────────────────────
@@ -847,7 +865,7 @@ function parseFlags(argv) {
 /** The CLI body, exported so `scripts/operations/pr-limit.mjs` can be a thin re-export (mirrors
  *  `dispatch-pause.mjs`'s own inline CLI, kept here since this module already owns every piece of state
  *  the CLI touches). */
-export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), path = resolveLimitStatePath(env), ownBranch, stderr = process.stderr, stdout = null, lockOpts = {} } = {}) {
+export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), path = resolveLimitStatePath(env), ownBranch, stderr = process.stderr, stdout = null, lockOpts = {}, countRepos = countOpenPrsAllRepos } = {}) {
   const cmd = argv[0];
   const update = (fn) => updateLimitState(path, fn, lockOpts); // every write: locked read-modify-write
   const flags = parseFlags(argv.slice(1));
@@ -895,15 +913,18 @@ export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), pa
   if (cmd === 'status') {
     const state = readLimitState(path);
     const nowMs = Date.now();
-    const counts = countOpenPrsAllRepos();
-    const out = {
+    const counts = countRepos({ env }).map((row) => {
+      const { limit, source } = readPrLimit(row.repoKey, env);
+      return { ...row, limit, limitSource: source };
+    });
+    const status = {
       globalOff: isGlobalOffNow(state, nowMs),
       global: state.global,
       branches: state.branches,
       counts,
       historyTail: state.history.slice(-10),
     };
-    writeAllSync(1, JSON.stringify(out, null, 2) + '\n');
+    out(JSON.stringify(status, null, 2) + '\n');
     return 0;
   }
   stderr.write('usage: pr-limit.mjs <off|on|status|allow> [--reason=<text>] [--for=<duration>] [--branch=<b>] [--operator-quote=<verbatim>] [--by=<who>]\n');

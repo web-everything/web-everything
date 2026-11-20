@@ -1,4 +1,5 @@
 import * as reviewDispatch from '../review-dispatch.mjs';
+import * as ghShim from '../../lib/gh-app-shim.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
 import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
 /**
@@ -290,6 +291,112 @@ describe('runReviewJob — the arc, no Claude wrapper session', () => {
 
 describe('dispatchReviewJob — what the daemon calls', () => {
   const base = { ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root: '/daemon', checkStaleness: FRESH, readCompletion: () => null };
+
+  it.each(['WE_REVIEW_EXTRA_SEATS_DAILY_CAP', 'WE_REVIEW_SEAT_CAP_CODEX',
+    'WE_REVIEW_SEAT_CAP_AGY_CLAUDE', 'WE_REVIEW_SEAT_CAP_AGY_GEMINI'])(
+    'launch cap precedence matrix for %s: valid overlay wins, invalid overlay preserves valid parent', async key => {
+      const { reviewSeatLaunchEnv } = await import('../../lib/review-seat-caps.mjs');
+      const cases = [
+        ['5000', '0', '0'], ['5000', '80', '80'], ['5000', 'garbage', '5000'], ['5000', undefined, '5000'],
+        ['garbage', '0', '0'], ['garbage', 'garbage', 'garbage'], ['garbage', undefined, 'garbage'],
+        [undefined, '0', '0'], [undefined, 'garbage', 'garbage'], [undefined, undefined, undefined],
+      ];
+      for (const [parent, overlay, expected] of cases) {
+        const env = parent === undefined ? {} : { [key]: parent };
+        const settings = overlay === undefined ? {} : { [key]: overlay };
+        const child = reviewSeatLaunchEnv(env, settings);
+        expect(child[key], `${parent} + ${overlay}`).toBe(expected);
+        if (expected === undefined) expect(child).not.toHaveProperty(key);
+        expect(env).toEqual(parent === undefined ? {} : { [key]: parent });
+        expect(settings).toEqual(overlay === undefined ? {} : { [key]: overlay });
+      }
+    });
+
+  it('launch caps retain the legacy fallback unless an own provider cap is supplied', async () => {
+    const { reviewSeatLaunchEnv, resolveProviderCap } = await import('../../lib/review-seat-caps.mjs');
+    const env = { WE_REVIEW_EXTRA_SEATS_DAILY_CAP: '5000' };
+    expect(resolveProviderCap('codex', reviewSeatLaunchEnv(env, {}))).toBe(5000);
+    expect(resolveProviderCap('codex', reviewSeatLaunchEnv(env, { WE_REVIEW_SEAT_CAP_CODEX: '80' }))).toBe(80);
+  });
+
+  it.each(['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME'])(
+    'default settings resolver forwards the passed %s environment through the real resolver', marker => {
+      const env = { [marker]: marker === 'XPC_SERVICE_NAME' ? 'com.we.review' : 'review-daemon',
+        WE_REVIEW_SEAT_CAP_CODEX: '5000' };
+      const build = vi.spyOn(ghShim, 'buildGhShimSettingsEnv').mockReturnValue({ PATH: '/shim', WE_REVIEW_SEAT_CAP_CODEX: '0' });
+      let childEnv;
+      try {
+        dispatchReviewJob({ ...base, dir, env, spawnJob: input => { childEnv = input.env; return 4242; } });
+        expect(build).toHaveBeenCalledOnce();
+        expect(build).toHaveBeenCalledWith({ cwd: undefined, env });
+        expect(childEnv).toMatchObject({ ...env, PATH: '/shim', WE_REVIEW_SEAT_CAP_CODEX: '0' });
+      } finally { build.mockRestore(); }
+    });
+
+  it.each(['WE_GH_DAEMON_CALLER', 'XPC_SERVICE_NAME'])(
+    'default settings resolver refuses failed shim setup for passed %s even without an ambient daemon', marker => {
+      vi.stubEnv('WE_GH_DAEMON_CALLER', '');
+      vi.stubEnv('XPC_SERVICE_NAME', '');
+      const env = { [marker]: marker === 'XPC_SERVICE_NAME' ? 'com.we.review' : 'review-daemon' };
+      const build = vi.spyOn(ghShim, 'buildGhShimSettingsEnv').mockImplementation(() => { throw new Error('fixture shim unavailable'); });
+      const spawnJob = vi.fn();
+      try {
+        expect(() => dispatchReviewJob({ ...base, dir, env, spawnJob })).toThrow(/dispatch refused: fixture shim unavailable/);
+        expect(build).toHaveBeenCalledOnce();
+        expect(build).toHaveBeenCalledWith({ cwd: undefined, env });
+        expect(spawnJob).not.toHaveBeenCalled();
+        expect(readJobRecord('review-10', dir)).toBeNull();
+      } finally { build.mockRestore(); vi.unstubAllEnvs(); }
+    });
+
+  it('default settings resolver retains interactive fail-soft behavior', () => {
+    vi.stubEnv('WE_GH_DAEMON_CALLER', '');
+    vi.stubEnv('XPC_SERVICE_NAME', '');
+    const build = vi.spyOn(ghShim, 'buildGhShimSettingsEnv').mockImplementation(() => { throw new Error('fixture shim unavailable'); });
+    const spawnJob = vi.fn(() => 4242);
+    try {
+      expect(dispatchReviewJob({ ...base, dir, env: {}, spawnJob }).jobPid).toBe(4242);
+      expect(build).toHaveBeenCalledOnce();
+      expect(build).toHaveBeenCalledWith({ cwd: undefined, env: {} });
+      expect(spawnJob).toHaveBeenCalledOnce();
+    } finally { build.mockRestore(); vi.unstubAllEnvs(); }
+  });
+
+  it('resolves the same operator caps in the daemon, job and speculative runner despite settings overlays', async () => {
+    const { resolveProviderCap, reviewSeatLaunchEnv } = await import('../../lib/review-seat-caps.mjs');
+    const env = { WE_REVIEW_SEAT_CAP_CODEX: '5000', WE_REVIEW_EXTRA_SEATS_DAILY_CAP: '5000',
+      WE_REVIEW_SEAT_CAP_AGY_CLAUDE: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' };
+    let jobEnv, speculativeEnv;
+    dispatchReviewJob({ ...base, dir, env,
+      resolveSettingsEnv: () => ({ PATH: 'shim' }),
+      spawnJob: input => { jobEnv = input.env; return 4242; } });
+    const io = createReviewJobIo({ dir, env: jobEnv,
+      spawnSpeculative: (_bin, argv, options) => {
+        expect(argv).toContain('red-team-speculate');
+        speculativeEnv = options.env;
+        return { pid: 4243, unref() {} };
+      } });
+    io.startSpeculativeRedTeam({ pr: 10, repo: REPO, lanePath: dir, slug: 'caps', waitMs: 1 });
+    for (const provider of ['codex', 'agy-claude', 'agy-gemini']) {
+      expect(resolveProviderCap(provider, speculativeEnv)).toBe(resolveProviderCap(provider, env));
+    }
+    expect(speculativeEnv).toMatchObject({ ...env, PATH: 'shim' });
+    expect(reviewSeatLaunchEnv({})).not.toHaveProperty('WE_REVIEW_SEAT_CAP_AGY_GEMINI');
+    // A garbage inherited cap never displaces a valid overlay cap.
+    expect(reviewSeatLaunchEnv({ WE_REVIEW_SEAT_CAP_CODEX: 'garbage' }, { WE_REVIEW_SEAT_CAP_CODEX: '0' }).WE_REVIEW_SEAT_CAP_CODEX).toBe('0');
+  });
+
+  it('settings overlay can lower a cap to zero through both the job and speculative launch', () => {
+    let jobEnv, speculativeEnv;
+    dispatchReviewJob({ ...base, dir, env: { WE_REVIEW_SEAT_CAP_CODEX: '5000' },
+      resolveSettingsEnv: () => ({ WE_REVIEW_SEAT_CAP_CODEX: '0' }),
+      spawnJob: input => { jobEnv = input.env; return 4242; } });
+    const io = createReviewJobIo({ dir, env: jobEnv,
+      spawnSpeculative: (_bin, _argv, options) => { speculativeEnv = options.env; return { pid: 4243, unref() {} }; } });
+    io.startSpeculativeRedTeam({ pr: 10, repo: REPO, lanePath: dir, slug: 'lowered-cap', waitMs: 1 });
+    expect(jobEnv.WE_REVIEW_SEAT_CAP_CODEX).toBe('0');
+    expect(speculativeEnv.WE_REVIEW_SEAT_CAP_CODEX).toBe('0');
+  });
 
   it.each(['matching', 'mismatched', 'missing', 'unreadable', 'head-changed'])('advisory CI waiver: %s', state => {
     let spawns = 0;

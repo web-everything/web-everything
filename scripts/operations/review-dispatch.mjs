@@ -123,7 +123,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { repoProfile } from '../lib/repo-profile.mjs';
+import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -547,7 +547,7 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
   const repoStr = String(repo ?? '').trim();
   const repoKey = repoKeyForSlug(repoStr);
   const profile = repoKey === null ? null : repoProfile(repoKey, { home });
-  if (!profile?.capabilities?.review) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
+  if (assertCapability(repoKey, 'review', { resolveProfile: () => profile })) throw new Error(`review-dispatch: --repo ${repoStr} is not a constellation repo`);
   const laneRepo = profile.lanePoolRepo;
   if (repoKey !== 'we' && !checkoutExists(laneRepo)) {
     throw new Error(`unsupported-repo: ${repoKey} checkout does not exist at ${laneRepo}`);

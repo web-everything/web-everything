@@ -15,7 +15,7 @@ describe('fix executor chain', () => {
     const repo = JSON.parse(readFileSync('scripts/settings/fix-executor.json', 'utf8'));
     expect(FIX_EXECUTOR_CHAIN_DEFAULT).toEqual(['codex', 'codex-alt', 'claude']);
     expect(repo.fixExecutor.fallbackChain).toEqual(['codex', 'codex-alt', 'claude']);
-    expect(repo.fixExecutor.criticalClaudeFromRung).toBe(2);
+    expect(repo.fixExecutor.criticalClaudeFromRung).toBe(3);
   });
   it.each([[0,'codex'],[1,'codex'],[2,'codex-alt'],[3,'argon'],[4,'claude'],[9,'claude']])('ordinary u=%s chooses %s', (codexUnproductive, rung) => expect(pick({codexUnproductive}).rung).toBe(rung));
   it.each(['stronger-model','takeover','ruling-not-addressed'])('%s starts on the next rung', trigger => {

@@ -6,7 +6,7 @@ import {spawn} from 'node:child_process';
 import {pathToFileURL} from 'node:url';
 
 export const DEFAULT_BUDGET = {
-  slots: {leakAgeHours: 3},
+  slots: {leakAgeHours: 3, scanEntryBound: 200000, maxRunDirsPerTick: 200},
   presync: {maxAgeHours: 72, minAgeHours: 24, capBytes: null},
 };
 const HOUR = 3_600_000;
@@ -90,17 +90,17 @@ def child_directory(fd, name, expected=None):
         raise RuntimeError('directory replaced; preserve and inspect before retrying')
     return child
 removed = 0
-def empty(fd, depth=0):
+def empty(fd, depth=0, entry_bound=20000):
     global removed
     with os.scandir(fd) as children:
         for entry in children:
             removed += 1
-            if removed > 20000 or depth > 64:
+            if removed > entry_bound or depth > 64:
                 raise RuntimeError('removal bound exceeded; stop worker UID and inspect manually')
             st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
             if stat.S_ISDIR(st.st_mode):
                 child = child_directory(fd, entry.name, st)
-                try: empty(child, depth + 1)
+                try: empty(child, depth + 1, entry_bound)
                 finally: os.close(child)
                 if not same(st, os.stat(entry.name, dir_fd=fd, follow_symlinks=False)):
                     raise RuntimeError('directory replaced during removal')
@@ -130,18 +130,20 @@ async function pythonJSON(code, args) {
   });
 }
 
-async function inspectTree(path, root) {
+async function inspectTree(path, root, scanEntryBound) {
   return pythonJSON(PINNED_DIRECTORY + `
 result = dict(newest=0, bytes=0, complete=True)
 entries = 0
+entry_bound = int(sys.argv[3])
 def walk(fd, depth):
     global entries
     result['newest'] = max(result['newest'], os.fstat(fd).st_mtime * 1000)
     with os.scandir(fd) as children:
         for entry in children:
             entries += 1
-            if entries > 20000:
+            if entries > entry_bound:
                 result['complete'] = False
+                result['reason'] = 'tree scan bound exceeded'
                 return
             st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
             result['newest'] = max(result['newest'], st.st_mtime * 1000)
@@ -149,6 +151,7 @@ def walk(fd, depth):
             if stat.S_ISDIR(st.st_mode):
                 if depth >= 64:
                     result['complete'] = False
+                    result['reason'] = 'tree depth bound exceeded'
                     return
                 child = child_directory(fd, entry.name, st)
                 try:
@@ -170,12 +173,12 @@ try:
     walk(fd, 0)
 finally: os.close(fd)
 print(json.dumps(result))
-`, [resolve(root), relative(root, path)]);
+`, [resolve(root), relative(root, path), String(scanEntryBound)]);
 }
 
 // Both the rename and every recursive operation are relative to pinned parent
 // descriptors. An untrusted descendant can never redirect root into its target.
-async function removeTree(path, root, identity) {
+async function removeTree(path, root, identity, scanEntryBound) {
   return pythonJSON(PINNED_DIRECTORY + `
 import secrets
 fd = pinned(sys.argv[1])
@@ -196,14 +199,14 @@ try:
         if tomb != name: os.rename(name, tomb, src_dir_fd=fd, dst_dir_fd=fd)
         if not same(st, os.stat(tomb, dir_fd=fd, follow_symlinks=False)):
             raise RuntimeError('tree replaced during rename')
-        empty(tree)
+        empty(tree, entry_bound=int(sys.argv[5]))
         if not same(st, os.stat(tomb, dir_fd=fd, follow_symlinks=False)):
             raise RuntimeError('tree replaced during removal')
         os.rmdir(tomb, dir_fd=fd)
     finally: os.close(tree)
 finally: os.close(fd)
 print('{}')
-`, [resolve(root), relative(root, path), JSON.stringify(identity), String(TOMBSTONE.test(path.split('/').pop()))]);
+`, [resolve(root), relative(root, path), JSON.stringify(identity), String(TOMBSTONE.test(path.split('/').pop())), String(scanEntryBound)]);
 }
 
 // Called only under the matching exclusive writer lease. Historical writers
@@ -276,7 +279,8 @@ function settings(budget, budgetSource) {
       const supplied = budget?.[section]?.[key];
       const valid = (key === 'capBytes' && supplied === null)
         || (typeof supplied === 'number' && Number.isFinite(supplied) && supplied >= 0
-          && (key !== 'maxFiles' || Number.isSafeInteger(supplied)));
+          && (key !== 'scanEntryBound' || (Number.isSafeInteger(supplied) && supplied >= 1000 && supplied <= 1000000))
+          && (key !== 'maxRunDirsPerTick' || (Number.isSafeInteger(supplied) && supplied >= 1 && supplied <= 10000)));
       result[section][key] = valid ? supplied : fallback;
       budgetSource[`${section}.${key}`] = valid ? 'budget' : supplied === undefined
         ? 'default' : 'default (invalid budget value)';
@@ -295,19 +299,20 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
   apply = false, now = Date.now(), budget = {}, lock} = {}) {
   const summary = {apply, budgetSource: {}, counts: {runDirs: 0, presyncKeys: 0, receiptFiles: 0},
     bytes: {runDirs: 0, presync: 0, receipts: 0},
-    candidates: {runDirs: [], presyncKeys: [], receiptFiles: []}, skips: [], refusals: []};
+    candidates: {runDirs: [], presyncKeys: [], receiptFiles: []}, skips: [], partial: [], refusals: []};
   const effective = settings(budget, summary.budgetSource);
   const acquire = lock ?? makeLock(receipts);
   const recoveredWorkers = new Set();
   const skip = (consumer, reason, slot) => summary.skips.push({consumer, ...(slot ? {slot} : {}), reason});
   const refuse = (consumer, error) => summary.refusals.push({consumer, error: String(error.message ?? error)});
   async function remove(path, category, byteCategory, size, base, tree = null) {
-    if (apply) await removeTree(path, root, tree);
+    if (apply) await removeTree(path, root, tree, effective.slots.scanEntryBound);
     summary.counts[category]++;
     summary.bytes[byteCategory] += size;
     summary.candidates[category].push(relative(base, path));
   }
   async function slots() {
+    let reclaimed = 0, remaining = 0;
     const names = await directory(root);
     const workers = (await directory(receipts)).filter(name => WORKER.test(name));
     async function clean(parent, worker, slot) {
@@ -339,16 +344,21 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
         for (const name of parent ? await directory(parent) : []) {
           const run = originalName(name);
           if (!RUN_DIR.test(run) || run === reserved) continue;
+          if (reclaimed >= effective.slots.maxRunDirsPerTick) { remaining++; continue; }
           const path = join(parent, name);
           const st = await fs.lstat(path);
           if (!st.isDirectory() || await hasLiveRecord(receipts, run)) continue;
-          const tree = await inspectTree(path, root);
+          const tree = await inspectTree(path, root, effective.slots.scanEntryBound);
           if (!tree.complete) {
-            refuse('slots', new Error(`scan bound exceeded; preserving ${name}; stop worker UID and inspect manually`));
+            if (tree.reason === 'tree scan bound exceeded') {
+              summary.partial.push({consumer: 'slots', reason: tree.reason, path: relative(root, path),
+                fallback: 'preserved; raise slots.scanEntryBound or stop worker UID and inspect manually'});
+            } else refuse('slots', new Error(`tree depth bound exceeded; preserving ${name}; stop worker UID and inspect manually`));
             continue;
           }
           if (now - tree.newest > effective.slots.leakAgeHours * HOUR) {
             await remove(path, 'runDirs', 'runDirs', tree.bytes, root, tree);
+            reclaimed++;
           }
         }
       } finally { await held.release(); }
@@ -363,7 +373,12 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
       try { await clean(null, worker, `slot-${worker.slice(14)}`); }
       catch (error) { refuse('slots', error); }
     }
-    if (names.some(name => RUN_DIR.test(originalName(name))) || workers.includes('worker-active')) await clean(root, 'worker-active');
+    if (names.some(name => RUN_DIR.test(originalName(name))) || workers.includes('worker-active')) {
+      try { await clean(root, 'worker-active'); } catch (error) { refuse('slots', error); }
+    }
+    if (reclaimed >= effective.slots.maxRunDirsPerTick) {
+      summary.partial.push({consumer: 'slots', reason: 'run-dir bound', reclaimed, remaining});
+    }
   }
   async function presync() {
     const parent = join(root, 'presync');
@@ -371,9 +386,12 @@ export async function sweep({root = '/srv/forge-exec', receipts = '/srv/forge-re
     for (const name of await directory(parent)) {
       const path = join(parent, name);
       if (!KEY.test(originalName(name)) || !(await fs.lstat(path)).isDirectory()) continue;
-      const tree = await inspectTree(path, root);
+      const tree = await inspectTree(path, root, effective.slots.scanEntryBound);
       if (!tree.complete) {
-        refuse('presync', new Error(`scan bound exceeded; preserving ${name}; stop writers and inspect manually`));
+        if (tree.reason === 'tree scan bound exceeded') {
+          summary.partial.push({consumer: 'presync', reason: tree.reason, path: relative(root, path),
+            fallback: 'preserved; raise slots.scanEntryBound or stop writers and inspect manually'});
+        } else refuse('presync', new Error(`tree depth bound exceeded; preserving ${name}; stop writers and inspect manually`));
         continue;
       }
       keys.push({path, ...tree});
@@ -419,6 +437,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   if (!process.exitCode) {
     const result = await sweep(options);
     process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (result.partial.length) process.stderr.write(`forge-exec-sweep: partial (${result.partial.map(note => `${note.consumer}: ${note.reason}`).join('; ')})\n`);
     if (result.refusals.length) process.exitCode = 1; // systemd must see a refused consumer
   }
 }

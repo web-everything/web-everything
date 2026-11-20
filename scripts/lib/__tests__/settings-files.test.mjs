@@ -444,6 +444,13 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(real.duplicates).toEqual([]);
   });
 
+  it('declares catch-up ordering and first-listing defaults in merge-queue settings', () => {
+    for (const leaf of ['cleanFirst', 'snapshotFirst']) {
+      expect(real.settings.mergeQueue.enqueueOnEvent.catchUp[leaf]).toBe(true);
+      expect(real.owners[`mergeQueue.enqueueOnEvent.catchUp.${leaf}`]).toBe('settings/merge-queue.json');
+    }
+  });
+
   it('feature files are kebab-case <feature>.json objects', () => {
     for (const f of readdirSync(SETTINGS_DIR)) expect(f).toMatch(FEATURE_FILE_RE);
   });

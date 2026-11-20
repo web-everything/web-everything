@@ -81,7 +81,7 @@ export function explainWhy(facts) {
   const screen = [`why ${subject.kind} ${subject.id}`, ...sections.flatMap(s => [s.name, ...s.lines.slice(0, s.name === 'daemons' ? 7 : 3).map(l => `  ${l}`), ...(s.lines.length > (s.name === 'daemons' ? 7 : 3) ? [`  … ${s.lines.length - (s.name === 'daemons' ? 7 : 3)} more (see --json)`] : [])]),
     ...(result.suggestedOp ? [`suggested: ${result.suggestedOp}`] : []),
     ...((f.gaps ?? []).length ? ['gaps', ...f.gaps.slice(0, 5).map(g => `  ${compact(g.source)}: ${compact(g.error)}`), ...(f.gaps.length > 5 ? [`  … ${f.gaps.length - 5} more gaps (see --json)`] : [])] : [])].join('\n');
-  return { subject, ...result, sections, screen };
+  return { subject, ...result, head: f.pr?.headRefOid ?? null, sections, screen };
 }
 
 export function whyOperation({ readWhy } = {}) {

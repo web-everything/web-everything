@@ -9,12 +9,48 @@ import { classifySubmit } from '../open-pr.mjs';
 import { admitCanonicalAudit } from '../../pr-land.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
+import { blocker } from '../../lib/open-pr-preflight.mjs';
 
 const sha = 'a'.repeat(40);
 const base = 'b'.repeat(40);
 const message = `no canonical codex-audit record for ${sha}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${sha}`;
+
+describe('combined open-pr preflight', () => {
+  it('merges an audit refusal with all child blockers through exactly one --check spawn', () => {
+    const blockers = [blocker('verify', 'verify-red', 'red'), blocker('soak-declaration', 'soak-declaration', 'missing')];
+    const spawn = vi.fn(() => ({ status: 3, stdout: JSON.stringify({ reason: 'verify-red', blockers }) }));
+    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+      prePrReview: () => ({ action: 'pass' }), canonicalAudit: () => ({ ok: false, reason: 'canonical-audit-weakened', sha, message }) });
+    const result = run({ argv: ['--ref=lane/audit'] });
+    expect(result.blockers.map(b => b.reason)).toEqual(['canonical-audit-weakened', 'verify-red', 'soak-declaration']);
+    expect(result.detail).toContain('run verify-lane'); expect(result.detail).toContain(`waiver request for sha ${sha}`);
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check');
+  });
+  it('check success requests a main refresh without publishing or writing a bypass body', () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
+    const review = vi.fn(() => ({ action: 'pass', bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } }));
+    const audit = vi.fn(() => ({ ok: true, sha }));
+    const run = createPrLandRunner({ env: {}, spawn, canonicalAudit: audit, prePrReview: review,
+      prepGate: () => ({ ok: true }) });
+    expect(run({ argv: ['--ref=lane/audit', '--check'] }).outcome).toBe('checked');
+    expect(review.mock.calls[0][0].readOnly).toBe(true);
+    expect(audit.mock.calls[0][0].refreshMain).toBe(true);
+    expect(audit.mock.calls[0][0]).not.toHaveProperty('fetchMain');
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(spawn.mock.calls[0][1]).toContain('--check');
+    expect(spawn.mock.calls[0][1].some(a => a.startsWith('--body-file='))).toBe(false);
+  });
+  it('fails closed if the check child dies or returns an opened payload', () => {
+    for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
+      { status: 0, stdout: '{"reason":"opened","pr":7,"blockers":[]}' }]) {
+      const run = createPrLandRunner({ env: {}, spawn: () => child, canonicalAudit: () => ({ ok: true }),
+        prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }) });
+      expect(run({ argv: ['--ref=lane/audit', '--check'] })).toMatchObject({ outcome: 'refused', reason: 'preflight-unconfirmed' });
+    }
+  });
+});
 function runner(canonicalAudit) {
-  const spawn = vi.fn(() => ({ status: 0, stdout: '{"pr":7}' }));
+  const spawn = vi.fn((_cmd, args) => ({ status: 0, stdout: args.includes('--check') ? '{"reason":"check-ok"}' : '{"pr":7}' }));
   const review = vi.fn(() => ({ action: 'pass' }));
   const run = createPrLandRunner({ canonicalAudit, prePrReview: review, spawn, env: {}, prepGate: () => ({ ok: true }), readPrepBody: () => '' });
   return { run, spawn, review };
@@ -22,7 +58,7 @@ function runner(canonicalAudit) {
 
 // Keep both producers' default checker. Replace only filesystem/process effects in a child,
 // never the checker or evaluator; no real Git, credentials, network, or .git writes.
-function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
+function defaultProducer({ direct = false, dry = false, check = false, failMain = false, records = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
   const trace = join(dir, 'effects.jsonl');
   const preload = join(dir, 'effects.mjs');
@@ -45,7 +81,10 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
       if (cmd !== 'git') throw new Error('unexpected process: ' + cmd);
       const a = args[0] === '-C' ? args.slice(2) : args;
       if (a[0] === 'rev-parse') return ${JSON.stringify(sha)};
-      if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') return '';
+      if (a[0] === 'fetch' && a.join(' ') === 'fetch origin main') {
+        if (${failMain}) throw new Error('fixture main remote unavailable');
+        return '';
+      }
       if (a[0] === 'fetch') throw new Error("couldn't find remote ref");
       if (a[0] === 'merge-base') return a.includes('--is-ancestor') ? '' : ${JSON.stringify(base)};
       if (a[0] === 'diff') return a.includes('--name-only') ? 'docs/guide.md\\n'
@@ -53,9 +92,14 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
         : 'diff --git a/docs/guide.md b/docs/guide.md\\n+documentation only\\n';
       throw new Error('unexpected git: ' + a.join(' '));
     };
+    cp.spawnSync = (cmd, args) => {
+      fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify(['forge-read', args]) + '\\n');
+      if (!String(cmd).endsWith('gh')) throw new Error('unexpected spawn: ' + cmd);
+      return { status: 0, stdout: '[]', stderr: '' };
+    };
     syncBuiltinESMExports();
   `);
-  const argv = [`--repo=${dir}`, '--ref=lane/audit', `--sha=${sha}`, '--title=docs: update guide', '--body=Documentation update', '--json', ...(dry ? ['--dry-run'] : [])];
+  const argv = [`--repo=${dir}`, '--ref=lane/audit', `--sha=${sha}`, '--title=docs: update guide', '--body=Documentation update', '--json', ...(dry ? ['--dry-run'] : []), ...(check ? ['--check'] : [])];
   let entry = join(root, 'scripts/pr-land.mjs');
   if (!direct) {
     entry = join(dir, 'open.mjs');
@@ -65,8 +109,8 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
       const run = createPrLandRunner({ cwd: ${JSON.stringify(dir)}, env: process.env,
         prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
         spawn: (_cmd, args) => {
-          appendFileSync(${JSON.stringify(trace)}, JSON.stringify(['publication', args]) + '\\n');
-          return { status: 0, stdout: '{"pr":7}' };
+          appendFileSync(${JSON.stringify(trace)}, JSON.stringify([args.includes('--check') ? 'preflight' : 'publication', args]) + '\\n');
+          return { status: 0, stdout: args.includes('--check') ? '{"reason":"check-ok"}' : '{"pr":7}' };
         } });
       console.log(JSON.stringify(run({ argv: ${JSON.stringify(argv)} })));
     `);
@@ -87,6 +131,30 @@ function defaultProducer({ direct = false, dry = false, records = [] } = {}) {
 }
 
 describe('default canonical checker integration', () => {
+  it.each([false, true])('check calls the default Git fetch port before accepting audit evidence, direct=%s', direct => {
+    const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { result, effects } = defaultProducer({ direct, check: true, records: [record] });
+    const fetches = effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'));
+    expect(fetches).toHaveLength(1);
+    expect(fetches[0][1].slice(-3)).toEqual(['fetch', 'origin', 'main']);
+    const fetchIndex = effects.indexOf(fetches[0]);
+    expect(effects.findIndex(([cmd, args]) => cmd === 'git' && args.includes('--is-ancestor'))).toBeGreaterThan(fetchIndex);
+    expect(result.reason).not.toBe('canonical-audit-missing');
+    expect(result.blockers?.some(b => b.gate === 'canonical-audit')).not.toBe(true);
+    if (!direct) expect(result.outcome).toBe('checked');
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push') || args.includes('create'))).toBe(false);
+  });
+  it.each([false, true])('check refuses passing stale audit evidence and reports a failed main refresh, direct=%s', direct => {
+    const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
+    const { status, result, effects } = defaultProducer({ direct, check: true, failMain: true, records: [record] });
+    expect(result.reason).toBe('canonical-audit-missing');
+    expect(result.detail).toContain('main not refreshed: fixture main remote unavailable');
+    if (direct) expect(status).toBe(3);
+    else expect(result.outcome).toBe('refused');
+    expect(effects.filter(([cmd, args]) => cmd === 'git' && args.includes('fetch'))).toHaveLength(1);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args.includes('--is-ancestor'))).toBe(false);
+    expect(effects.some(([cmd, args]) => cmd === 'publication' || args.includes('push') || args.includes('create'))).toBe(false);
+  });
   it.each([false, true])('default open-pr checker refuses missing evidence for docs-only changes, dry=%s', dry => {
     const { result, effects } = defaultProducer({ dry });
     expect(result).toMatchObject({ outcome: 'refused', reason: 'canonical-audit-missing' });
@@ -98,7 +166,7 @@ describe('default canonical checker integration', () => {
     expect(status).toBe(3);
     expect(result).toMatchObject({ merged: false, reason: 'canonical-audit-missing' });
     expect(result.detail).toContain(`codex-audit --base=origin/main --head=${sha}`);
-    expect(effects.some(([cmd, args]) => cmd !== 'git' || args.includes('push'))).toBe(false);
+    expect(effects.some(([cmd, args]) => args.includes('push') || args.includes('create'))).toBe(false);
   });
   it('default open-pr admits an audited unpublished local head and delegates publication', () => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
@@ -119,17 +187,17 @@ describe('default canonical checker integration', () => {
   });
 });
 describe('open-pr canonical gate', () => {
-  it.each([false, true])('refuses without spawning including dry run=%s', dry => {
+  it.each([false, true])('refuses after collecting child preflight including dry run=%s', dry => {
     const check = vi.fn(() => ({ ok: false, reason: 'canonical-audit-missing', message }));
     const { run, spawn, review } = runner(check);
-    expect(run({ argv: ['--ref=lane/audit', ...(dry ? ['--dry-run'] : [])] })).toEqual({ outcome: 'refused', reason: 'canonical-audit-missing', detail: message });
-    expect(spawn).not.toHaveBeenCalled(); expect(check).toHaveBeenCalledOnce();
+    expect(run({ argv: ['--ref=lane/audit', ...(dry ? ['--dry-run'] : [])] })).toMatchObject({ outcome: 'refused', reason: 'canonical-audit-missing', detail: expect.stringContaining(message) });
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check'); expect(check).toHaveBeenCalledOnce();
     if (!dry) expect(review.mock.invocationCallOrder[0]).toBeLessThan(check.mock.invocationCallOrder[0]);
   });
-  it('reports WEAKENED without spawning', () => {
+  it('reports WEAKENED after child preflight', () => {
     const { run, spawn } = runner(() => ({ ok: false, reason: 'canonical-audit-weakened', message }));
     expect(run({ argv: ['--ref=lane/audit', '--dry-run'] }).reason).toBe('canonical-audit-weakened');
-    expect(spawn).not.toHaveBeenCalled();
+    expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check');
   });
   it.each([false, true])('allows a real green record and pins the published sha, dry run=%s', dry => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
@@ -140,11 +208,11 @@ describe('open-pr canonical gate', () => {
     expect(run({ argv: ['--ref=lane/audit', ...(dry ? ['--dry-run'] : [])] }).outcome).toBe('opened');
     expect(spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
   });
-  it('check failures and incomplete decisions refuse without spawning', () => {
+  it('check failures and incomplete decisions still collect child gates', () => {
     for (const check of [() => { throw new Error('unreadable'); }, () => undefined]) {
       const { run, spawn } = runner(check);
       expect(run({ argv: ['--ref=lane/audit'] }).reason).toBe('canonical-audit-missing');
-      expect(spawn).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledOnce(); expect(spawn.mock.calls[0][1]).toContain('--check');
     }
   });
   it.each(['canonical-audit-missing', 'canonical-audit-weakened'])('classifies direct pr-land %s refusals', reason => {

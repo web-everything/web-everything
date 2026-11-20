@@ -33,7 +33,10 @@ const probe = async () => { probeCalls++; return typeof probeResult === 'functio
 const makeRunner = () => createRunner({testRoot: root, testPath: bin + ':/usr/bin:/bin', testEgressProbe: probe});
 async function requestFor(runner) {
   const prepared = await runner.prepare({nonce, label: 'abcdef-1'});
-  const work = join(root, 'runs', prepared.run, 'work');
+  const runRoot = prepared.slot
+    ? join(root, 'runs', 'slot-' + prepared.slot.slice('forge-exec-'.length))
+    : join(root, 'runs');
+  const work = join(runRoot, prepared.run, 'work');
   await writeFile(join(work, 'package-lock.json'), 'lock');
   const entries = [{path: Buffer.from('package-lock.json'), sha256: hash('lock'), executable: false}];
   const manifest = manifestAPI.manifestWire({entries, excluded: []});
@@ -47,7 +50,7 @@ beforeEach(async () => {
   await symlink(process.execPath, join(bin, 'node'));
   await writeFile(join(bin, 'npm'), `#!/bin/bash\necho ran >> '${root}/npm.log'\nmkdir -p node_modules\nexit 0\n`, {mode: 0o755});
   probeCalls = 0;
-  probeResult = {code: 0};
+  probeResult = {code: 0, stdout: ruleset(process.getuid())};
   nftStub.code = undefined;
 });
 afterEach(async () => {
@@ -58,6 +61,27 @@ afterEach(async () => {
   await rm(root, {recursive: true, force: true});
 });
 const ran = () => readFile(join(root, 'npm.log'), 'utf8').then(() => true, () => false);
+// Numeric `nft list table` form of the complete forge-egress.sh ruleset.
+const ruleset = uid => `table inet forge_exec_egress {
+  set registry4 {
+    type ipv4_addr
+    elements = { 104.16.24.34, 104.16.25.34 }
+  }
+  set registry6 {
+    type ipv6_addr
+    elements = { 2606:4700::6810:1822 }
+  }
+  chain slot_egress {
+    oifname "lo" accept
+    ip daddr @registry4 tcp dport 443 accept
+    ip6 daddr @registry6 tcp dport 443 accept
+    reject with icmpx type admin-prohibited
+  }
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid { ${uid} } jump slot_egress
+  }
+}`;
 
 describe('egress table readiness', () => {
   it.each([
@@ -70,8 +94,54 @@ describe('egress table readiness', () => {
     await expect(runner.prepare({nonce, label: 'abcdef-1'})).rejects.toMatchObject({code: 'egress-table-absent'});
     expect(testExecute).toHaveBeenCalledTimes(1);
     expect(testExecute).toHaveBeenCalledWith('/usr/sbin/nft',
-      ['list', 'table', 'inet', 'forge_exec_egress'],
+      ['-n', 'list', 'table', 'inet', 'forge_exec_egress'],
       {env: {PATH: '/usr/sbin:/usr/bin:/bin', LANG: 'C'}, timeoutMs: 5000});
+  });
+  it.each([false, true])('checks this run UID against installed coverage (covered=%s)', async covered => {
+    const uid = process.getuid();
+    await mkdir(join(root, 'runs'), {recursive: true});
+    await mkdir(join(root, 'runs', 'slot-14'), {mode: 0o710});
+    const table = value => ({code: 0, stdout: ruleset(value)});
+    probeResult = table(uid);
+    const runner = makeRunner(), request = await requestFor(runner);
+    probeResult = table(covered ? uid : uid + 1);
+    if (covered) {
+      expect((await runner.run(request)).code).toBe(0);
+      expect(await ran()).toBe(true);
+    } else {
+      await expect(runner.run(request)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+      expect(await ran()).toBe(false);
+    }
+  });
+  it.each(['', 'garbage', 'meta skuid { 2014 } jump slot_egress'])('refuses incomplete UID evidence %j', async stdout => {
+    probeResult = {code: 0, stdout};
+    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+  });
+  it.each([
+    ['preceding unconditional accept', text => text.replace('meta skuid', 'accept\n    meta skuid')],
+    ['preceding broader accept', text => text.replace('meta skuid', 'meta skuid { 2014, 2015 } accept\n    meta skuid')],
+    ['preceding return', text => text.replace('meta skuid', 'return\n    meta skuid')],
+    ['preceding jump-away', text => text.replace('meta skuid', 'jump other_chain\n    meta skuid')],
+    ['preceding unparseable rule', text => text.replace('meta skuid', 'unknown rule\n    meta skuid')],
+    ['empty slot_egress chain', text => text.replace(/chain slot_egress \{[^}]*\}/, 'chain slot_egress { }')],
+    ['missing slot_egress chain', text => text.replace(/chain slot_egress \{[^}]*\}/, '')],
+    ['missing terminal restriction', text => text.replace('reject with icmpx type admin-prohibited', '')],
+    ['permissive terminal verdict', text => text.replace('reject with icmpx type admin-prohibited', 'accept')],
+    ['wrong hook', text => text.replace('hook output', 'hook input')],
+    ['unrestricted destination accept', text => text.replace('ip daddr @registry4 tcp dport 443 accept', 'accept')],
+    ['malformed UID set', text => text.replace('{ 2014 } jump', '{ 2014, } jump')],
+    ['trailing unknown evidence', text => text + '\nunknown'],
+  ])('refuses UID coverage with %s', async (_name, change) => {
+    probeResult = {code: 0, stdout: change(ruleset(2014))};
+    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+  });
+  it.each([
+    ['numeric priority and singleton UID', text => text.replace('priority filter', 'priority 0').replace('{ 2014 } jump', '2014 jump')],
+    ['terminal drop', text => text.replace('reject with icmpx type admin-prohibited', 'drop')],
+    ['empty registry sets', text => text.replace(/\s*elements = \{[^}]*\}/g, '')],
+  ])('accepts complete restrictions with %s', async (_name, change) => {
+    probeResult = {code: 0, stdout: change(ruleset(2014))};
+    await expect(makeRunner().egressReady(2014)).resolves.toBeUndefined();
   });
   it('execute timeout resolves timedOut and kills a real sleeping child with SIGKILL', async () => {
     const pending = execute(process.execPath, ['-e', keepAliveScript()], {timeoutMs: 100});
@@ -112,7 +182,7 @@ describe('egress table readiness', () => {
     for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
     const nft = children.slice(before).filter(c => c.file === '/usr/sbin/nft');
     expect(nft).toHaveLength(1);
-    expect(nft[0].argv).toEqual(['list', 'table', 'inet', 'forge_exec_egress']);
+    expect(nft[0].argv).toEqual(['-n', 'list', 'table', 'inet', 'forge_exec_egress']);
     // A zero exit from the production probe is the only thing that lets it pass.
     nftStub.code = 0;
     await expect(createRunner(injected).egressReady()).resolves.toBeUndefined();
@@ -174,7 +244,7 @@ describe('egress table readiness', () => {
     for (const callback of Object.values(injected)) expect(callback).not.toHaveBeenCalled();
     expect(children.slice(before).filter(c => c.file === '/usr/sbin/nft')).toHaveLength(1);
   });
-  it('egress readiness: a zero exit lets the run proceed', async () => {
+  it('egress readiness: complete rules covering the run UID let the run proceed', async () => {
     const runner = makeRunner(), request = await requestFor(runner);
     expect((await runner.run(request)).code).toBe(0);
     expect(await ran()).toBe(true);

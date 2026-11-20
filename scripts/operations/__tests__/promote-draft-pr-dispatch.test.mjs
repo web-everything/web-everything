@@ -581,3 +581,18 @@ it('promote-draft: a reconcile that always overruns the budget still handles one
   }
   expect(promoted).toEqual([5, 6]);
 });
+
+it('capability-off refuses promotion while a withdrawn draft remains held', () => {
+  const ready = vi.fn();
+  const options = {
+    root: '/repo', resolveProfile: () => ({ capabilities: { review: false } }),
+    reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: 'a'.repeat(40) }], refusals: [] }),
+    provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [],
+    readHeadCheckState: ALWAYS_GREEN, clearAwaitingCi: NOOP_STATUS,
+  };
+  expect(runReconcilePromoteDraftDispatch(options).refusals).toEqual([expect.objectContaining({ kind: 'unsupported-repo' })]);
+  expect(ready).not.toHaveBeenCalled();
+  expect(runReconcilePromoteDraftDispatch({ ...options, readPrLabels: () => ['review-status:draft-withdrawn'] }).refusals)
+    .toEqual([expect.objectContaining({ kind: 'draft-withdrawn' })]);
+  expect(ready).not.toHaveBeenCalled();
+});

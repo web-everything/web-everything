@@ -29,17 +29,26 @@ export function parsePrep(text) {
   const lines = (typeof text === 'string' ? text : '').split(/\r?\n/);
   const waiver = lines.map((line) => line.match(/^\s*prep:\s*waived\s*[—–-]\s*(\S.{3,})/i))
     .find((match) => match && nonTrivial(match[1]));
-  const start = lines.findIndex((line) => /^PREP:/i.test(stripMarkdown(line)));
+  const start = lines.findIndex((line) => /^PREP(?::|$)/i.test(stripMarkdown(line).trim()));
   const sections = new Map();
   let current;
   for (const line of start < 0 ? [] : lines.slice(start + 1)) {
-    const clean = stripMarkdown(line);
-    const heading = clean.match(/^(Acceptance|Pre-mortem|Files|Tests):\s*(.*)$/i);
+    const clean = stripMarkdown(line).trim();
+    const heading = clean.match(/^(Acceptance|Pre-mortem|Files|Tests|Touch-set|Touch set|Test plan|Threat model)(?::\s*(.*)|$)/i);
     if (heading) {
-      current = HEADINGS.find((name) => name.toLowerCase() === heading[1].toLowerCase());
+      const name = heading[1].toLowerCase();
+      current = /^touch[- ]set$/.test(name) ? 'Files'
+        : name === 'test plan' ? 'Tests'
+          : HEADINGS.find((heading) => heading.toLowerCase() === name) || 'Threat model';
       if (!sections.has(current)) sections.set(current, []);
-      sections.get(current).push(heading[2]);
-    } else if (/^PREP:/i.test(clean) || /^Slot:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
+      sections.get(current).push(heading[2] || '');
+    } else if (/^PREP(?::|$)/i.test(clean)) {
+      sections.clear();
+      current = undefined;
+    } else if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(line.trim())
+      || /^(?:🤖|Generated with|Co-Authored-By:|Claude-Session:)/i.test(clean)
+      || /^https?:\/\/\S+$/i.test(clean)
+      || /^Slot:/i.test(clean) || /^\s*#{1,6}\s/.test(line)) {
       current = undefined;
     } else if (current) sections.get(current).push(line);
   }

@@ -1,5 +1,13 @@
 [
   {
+    "file": "scripts/operations/urgent-verify-marker.mjs",
+    "reason": "The urgent receipt verifier mirrors WE CI's pinned Frontier UI checkout repository and rejects workflow drift; these exact repository literals authenticate the required sibling source, rather than select an implicit gh target."
+  },
+  {
+    "file": "scripts/operations/urgent-verify.mjs",
+    "reason": "The WE urgent runner validates the Frontier UI sibling origin against urgentFuiRepo before verifying it; the repository literal is the diagnostic for that deliberately pinned CI prerequisite, not an implicit gh target."
+  },
+  {
     "file": "scripts/conveyor/status-artifact.mjs",
     "reason": "The status board joins local WE backlog numbers and WE commit subjects to the WE lane plan; its PR links belong to that backlog."
   },
@@ -26,5 +34,13 @@
   {
     "file": "scripts/lib/lane-alternates.mjs",
     "reason": "Names the one GitHub redirect pair (chalbert/web-everything to web-everything/web-everything) so a lane remote and the org URL read as the same repository; deliberately WE-specific and never widened to other repos."
+  },
+  {
+    "file": "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.mjs",
+    "reason": "This soak scenario must use the real registered repository slug so the review-capability admission check passes and the stale-accept recovery path is actually reached."
+  },
+  {
+    "file": "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.mjs",
+    "reason": "This soak scenario must use real registered repository slugs so review-capability admission reaches the injected declining and healthy round-cap outcomes."
   }
 ]

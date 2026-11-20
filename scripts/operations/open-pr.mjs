@@ -75,8 +75,8 @@ export const SUBMIT_PR_EFFECT = 'open-pr.submit';
  */
 export const OPEN_MODES = Object.freeze(['park', 'label-on-green', 'no-wait', 'land']);
 
-/** The submission outcomes a caller acts on. THREE, for the reason `verify` has three. */
-export const SUBMIT_OUTCOMES = Object.freeze(['opened', 'refused', 'unrun']);
+/** Submission outcomes distinguish an open, refusal, environment failure and preflight. */
+export const SUBMIT_OUTCOMES = Object.freeze(['opened', 'refused', 'unrun', 'checked']);
 
 /**
  * Plan the invocation. PURE.
@@ -93,7 +93,7 @@ export function resolveRef({ ref, branch, derive = () => '' } = {}) {
   return derive();
 }
 
-export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', requireVerified = false, dryRun = false, skipPrePrReview = '', actor = '', operatorInstruction = '' } = {}) {
+export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', verify = '', requireVerified = false, dryRun = false, check = false, skipPrePrReview = '', actor = '', operatorInstruction = '' } = {}) {
   const prepareItem = prepareItemFromRef(ref);
   if (prepareItem && !prepareBatchIds(title).length) title = preparePrTitle(prepareItem);
   const problems = [];
@@ -124,11 +124,12 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
   // dry-run plan render, never by a real `gh pr create`". Requiring a body here for a rehearsal made the
   // operation stricter than the home for the one call that touches nothing — which is why `pr/SKILL.md`'s
   // rehearsal step could not name it.
-  if (!dryRun && (typeof bodyFile !== 'string' || !bodyFile.trim())) {
+  if (!dryRun && !check && (typeof bodyFile !== 'string' || !bodyFile.trim())) {
     problems.push('`bodyFile` must name a file holding a non-empty body — the drain gate rejects a bodyless PR at land, which stalls the queue (not required with `dryRun`, which opens nothing). ' + SUPERSEDES_LINE_GUIDANCE);
   }
   if (!OPEN_MODES.includes(mode)) problems.push(`\`mode\` must be one of ${OPEN_MODES.join('|')}`);
   if (mode === 'park' && !parkLabel) problems.push('`parkLabel` is required in `park` mode — that is what parking means');
+  if (verify !== '' && verify !== undefined && verify !== 'ci-only') problems.push('`verify` accepts only ci-only when given');
   if (problems.length) throw new Error(`open-pr: cannot plan this PR — ${problems.join('; ')}`);
 
   const argv = ['--ref=' + ref, '--base=' + base];
@@ -167,8 +168,10 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
   //     and got a rehearsal instead of a landed PR would have no way to see why. Omission is the only
   //     encoding of "off" the home understands.
   if (typeof sha === 'string' && sha.trim()) argv.push('--sha=' + sha.trim());
+  if (verify === 'ci-only') argv.push('--verify=ci-only');
   if (requireVerified === true) argv.push('--require-verified');
   if (dryRun === true) argv.push('--dry-run');
+  if (check === true) argv.push('--check');
 
   return {
     ref,
@@ -180,6 +183,7 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
     // Reported so a caller reading the verdict sees WHICH commit and WHICH guards this plan carries, rather
     // than having to re-parse `argv`. `sha` is empty exactly when the home's own default applies.
     sha: typeof sha === 'string' ? sha.trim() : '',
+    verify: verify === 'ci-only' ? verify : '',
     requireVerified: requireVerified === true,
     dryRun: dryRun === true,
     // Consumed by the IO shell's pre-PR review check; never forwarded to pr-land.
@@ -251,9 +255,11 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       sha: { type: 'string', required: false, default: '' },
       // The #2833 finish-guard: refuse to land a HEAD with no green verification marker. Defaulting it to
       // `true` would be a policy change smuggled in as a schema edit — the home's callers decide.
+      verify: { type: 'string', required: false, default: '', enum: ['', 'ci-only'] },
       requireVerified: { type: 'boolean', required: false, default: false },
       // Rehearsal: the home prints the exact gh sequence and executes nothing.
       dryRun: { type: 'boolean', required: false, default: false },
+      check: { type: 'boolean', required: false, default: false },
       skipPrePrReview: { type: 'string', required: false, default: '' },
       // The bypass is operator-authority only: it needs both of these (see `authoriseBypass`).
       actor: { type: 'string', required: false, default: '' },
@@ -267,7 +273,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       // PR #1516's round-1 juror found in `verify`, where the io layer was tested and this layer was not.
       reads: [
         'input.ref', 'input.branch', 'input.base', 'input.title', 'input.bodyFile', 'input.mode', 'input.parkLabel',
-        'input.sha', 'input.requireVerified', 'input.dryRun', 'input.skipPrePrReview', 'input.actor', 'input.operatorInstruction',
+        'input.sha', 'input.verify', 'input.requireVerified', 'input.dryRun', 'input.check', 'input.skipPrePrReview', 'input.actor', 'input.operatorInstruction',
       ],
       fn: (view) => planOpen({
         ref: resolveRef({ ref: view.input.ref, branch: view.input.branch, derive: deriveRef }),
@@ -277,8 +283,10 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
         mode: view.input.mode,
         parkLabel: view.input.parkLabel,
         sha: view.input.sha,
+        verify: view.input.verify,
         requireVerified: view.input.requireVerified,
         dryRun: view.input.dryRun,
+        check: view.input.check,
         skipPrePrReview: view.input.skipPrePrReview,
         actor: view.input.actor,
         operatorInstruction: view.input.operatorInstruction,
@@ -362,6 +370,8 @@ export function classifySubmit({ status, signal, stdout = '', stderr = '', error
     return {
       outcome,
       reason: parsed.reason,
+      ...(parsed.blockers ? { blockers: parsed.blockers } : {}),
+      ...(parsed.info ? { info: parsed.info } : {}),
       detail: parsed.detail ?? tail,
       // Carried even on a refusal: a post-open refusal names a PR that EXISTS, and the caller needs its
       // number to go look at what was opened-then-refused.
@@ -411,6 +421,7 @@ export function extractSubmitResult(payload) {
 
 /** Human submit summary; the effect completing does not mean the home opened a PR. */
 export function describeSubmit(result) {
+  if (result.outcome === 'checked') return { line: `submit: check ok${result.detail ? ' — ' + result.detail : ''}`, failed: false };
   if (result.outcome === 'opened' && result.labelStep === 'deferred') {
     return { line: `submit: opened #${result.pr}${result.url ? ` ${result.url}` : ''} — ${result.detail}`, failed: false };
   }

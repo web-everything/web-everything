@@ -25,7 +25,7 @@ function wellFormedAudit(record) {
 }
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
-  readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
+  readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
@@ -37,6 +37,20 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     message: 'cannot resolve the PR source to a full 40-hex sha; resolve it with git rev-parse, then run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' };
   const refuse = (reason, detail) => ({ ok: false, reason, record: null, sha: fullSha,
     message: `${detail}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${fullSha}, then retry opening the PR.` });
+  let fetchAttempted = false, fetched = false, fetchError;
+  const fetchMain = () => {
+    if (!fetchAttempted) {
+      fetchAttempted = true;
+      try { (fetchMainOpt || (() => git('fetch', 'origin', 'main')))(); fetched = true; }
+      catch (error) { fetchError = String(error?.stderr || error?.message || error).trim(); }
+    }
+    if (!fetched) throw new Error(`main not refreshed: ${fetchError || 'origin/main fetch unavailable; retry when main can be read'}`);
+  };
+  // A preflight may read refs but must never admit evidence against an unrefreshed main.
+  if (refreshMain) {
+    try { fetchMain(); }
+    catch (error) { return refuse('canonical-audit-missing', error.message); }
+  }
   let records, config;
   try {
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
@@ -63,14 +77,6 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
-  let fetchAttempted = false, fetched = false;
-  const fetchMain = () => {
-    if (!fetchAttempted) {
-      fetchAttempted = true;
-      try { (fetchMainOpt || (() => git('fetch', 'origin', 'main')))(); fetched = true; } catch { /* no coverage */ }
-    }
-    if (!fetched) throw new Error('origin/main fetch unavailable; retry when main can be read');
-  };
   const ancestor = ancestorOpt || ((base, head) => { git('merge-base', '--is-ancestor', base, head); return true; });
   const covers = base => { try { fetchMain(); return ancestor(base, 'origin/main'); } catch { return false; } };
   const liveFingerprint = liveFingerprintOpt || (evidence => {

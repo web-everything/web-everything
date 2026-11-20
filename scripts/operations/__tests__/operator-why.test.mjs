@@ -92,6 +92,7 @@ it('injects all external reads and preserves failed-source gaps', () => {
   });
   const facts = read({ pr: 5017, item: '', repo: base.repo });
   expect(facts.pr.number).toBe(5017); expect(facts.checks[0].conclusion).toBe('SUCCESS');
+  expect(explainWhy(facts).head).toBe('sha'); expect(explainWhy({ ...base, pr: null }).head).toBeNull();
   expect(facts.gaps).toContainEqual({ source: 'build holds', error: 'offline' });
   expect(facts.logs.find(l => l.name === 'fix').line).toContain('#5017');
   expect(read({ pr: 0, item: '5754', repo: base.repo }).card.queued).toBe(true);

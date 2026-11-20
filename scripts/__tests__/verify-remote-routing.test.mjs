@@ -719,7 +719,7 @@ process.exit(again?0:1);`);
           ROUTING_REMOTE_EXIT: String(remoteExit), ROUTING_LOCAL_EXIT: String(localExit),
           ROUTING_REMOTE_FAILURE: remoteFailure ? '1' : '0',
           ROUTING_LOCAL_DELAY: confirmed && !laterPhases ? '1' : '0',
-          ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched',
+          ROUTING_RETRY_EXIT: retryExit === undefined ? '' : String(retryExit), WE_VERIFY_ISOLATED_RETRY: 'untouched', WE_VERIFY_RETRY_FAILED: '0',
           ROUTING_STANDARDS_EXIT: baseCompared || (mode === 'local-fallback' && retryExit !== undefined) ? '0' : '',
           WE_VERIFY_RUN_ALL_PHASES: '1', WE_FORGE_GATE_DISPATCH: '1',
           ...(watchdogKill ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}), ROUTING_LOCAL_BEHAVIOR: localBehavior,

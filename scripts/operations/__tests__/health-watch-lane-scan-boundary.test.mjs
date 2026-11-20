@@ -442,6 +442,8 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./tmp-sweep.mjs#formatTmpSweepLine:formatTmpSweepLine",
       "helper:./tmp-sweep.mjs#readBusyTopLevel:readBusyTopLevel",
       "helper:./tmp-sweep.mjs#sweepOurTmp:sweepOurTmp",
+      // The tick owns urgent sweep IO; health-watch invokes this one reviewed entry point.
+      "helper:./urgent-sweep-tick.mjs#runUrgentSweepTick:runUrgentSweepTick",
       "helper:node:fs#closeSync:closeSync",
       "helper:node:fs#existsSync:existsSync",
       "helper:node:fs#mkdirSync:mkdirSync",
@@ -558,6 +560,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "helper:./session-watchdog.mjs#resolveSessionWatchdogConfig:resolveSessionWatchdogConfig": 1,
       "helper:./tmp-sweep.mjs#readBusyTopLevel:readBusyTopLevel": 1,
       "helper:./tmp-sweep.mjs#sweepOurTmp:sweepOurTmp": 2,
+      "helper:./urgent-sweep-tick.mjs#runUrgentSweepTick:runUrgentSweepTick": 1,
       "helper:node:fs#openSync:openSync": 3,
       "helper:node:fs#mkdirSync:mkdirSync": 2,
       "helper:node:fs#renameSync:renameSync": 1,

@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { decideAdmission } from '../resource-policy.mjs';
+import { decideMemoryFloor } from '../memory-warn-corroboration.mjs';
 import { cpuIdlePctFromTimes, parseIoregDiskStats, diskFromDeltas, parsePsCpu, fseventsCpuPct, countAgentSessions, memoryPressureLevel, swapUsedPct, buildSnapshot, createSampler, resourcePaths, writeSnapshot, readSnapshot, appendResourceLog } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'resource-')); roots.push(root); return root; };
@@ -41,7 +43,7 @@ describe('resource sampler', () => {
     expect(memoryPressureLevel(' 4\n')).toBe(4);
     expect(memoryPressureLevel('2')).toBe(2);
     expect(memoryPressureLevel('1')).toBe(1);
-    expect(memoryPressureLevel('3')).toBeNull();
+    expect(memoryPressureLevel('3')).toBe(3);
     expect(memoryPressureLevel('1junk')).toBeNull();
   });
   it('fix-cap signals: parses swap use from `sysctl vm.swapusage` (live 2026-10-10: 26.5 of 27.6 GB)', () => {
@@ -57,6 +59,43 @@ describe('resource sampler', () => {
     expect(snapshot.schema).toBe('resource-snapshot/1');
     expect(snapshot.fsevents.backlog).toBeNull();
     expect(snapshot.errors).toEqual([]);
+  });
+  it('records swap MB and growth against the previous sample; missing reads break the delta', () => {
+    let used = 100; let tick = 0;
+    const sampler = createSampler({ exec: (cmd, args) => {
+      if (cmd === 'sysctl' && args[1] === 'vm.swapusage') return used === null ? 'unreadable' : `total = 4096M used = ${used}M free = 0M`;
+      if (cmd === 'sysctl') return '2';
+      return cmd === 'ioreg' ? ioreg : '';
+    }, now: () => tick++ * 10000, cpus: () => [], freemem: () => 45, totalmem: () => 100,
+    readHeavySlots: () => ({}), countLanes: () => 0 });
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 100, swapGrowthMb: null });
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 100, swapGrowthMb: 0 });
+    used = 612;
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 612, swapGrowthMb: 512 });
+    used = null;
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: null, swapGrowthMb: null });
+    used = 100;
+    expect(sampler.sample().memory.swapGrowthMb).toBeNull();
+    used = 0;
+    expect(sampler.sample().memory).toMatchObject({ swapUsedMb: 0, swapGrowthMb: -100 });
+  });
+  it('publishes the unrounded bytes ratio so both admission gates hold at 19.96% free', () => {
+    const policy = vi.spyOn(hostSettings, 'loadHostOverloadSettings').mockReturnValue({
+      settings: { host: { capacity: { snapshotMaxFreshMs: 20000, memoryMetric: 'free', memAvailableFloorMb: 1024 } } }, sources: {} });
+    try {
+      let freeMb = 1996;
+      const sampler = createSampler({ exec: cmd => cmd === 'sysctl' ? '2' : '', now: () => 0, cpus: () => [],
+        freemem: () => freeMb * 1024 * 1024, totalmem: () => 10000 * 1024 * 1024,
+        readHeavySlots: () => ({}), countLanes: () => 0 });
+      const s = sampler.sample();
+      expect(s.memory.freePct).toBe(19.96);
+      expect(decideAdmission({ kind: 'build', snapshot: s, nowMs: 0 }).verdict).toBe('hold');
+      expect(decideMemoryFloor({ ...s.memory, floorMb: 1024 }).admit).toBe(false);
+      freeMb = 2000;
+      const clean = sampler.sample();
+      expect(decideAdmission({ kind: 'build', snapshot: clean, nowMs: 0 }).verdict).toBe('admit');
+      expect(decideMemoryFloor({ ...clean.memory, floorMb: 1024 }).admit).toBe(true);
+    } finally { policy.mockRestore(); }
   });
   it('isolates probe failures and uses elapsed deltas with bounded subprocesses', () => {
     let tick = 0;

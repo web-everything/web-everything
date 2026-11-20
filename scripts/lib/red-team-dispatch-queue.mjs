@@ -9,20 +9,62 @@ import { isRealHead } from './red-team-skip-outcome.mjs';
 import { readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { isUnderTest } from './under-test.mjs';
-import { readRedTeamProbes } from './red-team-gate.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { readRedTeamProbes, redTeamForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
+import { redTeamSkipNeedsSettlement } from './review-red-team-on-skip.mjs';
+import { readRedTeamStatus, readCarriedCheckUnpublished } from './drain-red-team-evidence.mjs';
+import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+
+// Match recovery's result-on-head obligations. A failed check is published evidence for a blocked
+// result, but missing/incomplete checks and policy-clear holds must still reach recovery.
+function settledResult({ repo, pr, head, comments, labels, env = process.env,
+  readStatus = key => readRedTeamStatus({ ...key, env }),
+  readCarry = key => readRedTeamCarry({ ...key, env }),
+  readCarriedCheck = key => readCarriedCheckUnpublished({ ...key, env }),
+  readCheckFact = isUnderTest() ? null : key => {
+    const app = resolveWeAppId({ env });
+    return app.ok ? readRedTeamRecoveryFact({ ...key, appId: app.appId,
+      gh: (args, options) => runGhSync(args, { ...options, env }) }) : app;
+  } }) {
+  if (!isPublishableRedTeamResult(redTeamForHead(comments, pr, head))) return false;
+  try {
+    const key = { repo, pr, head };
+    if (!Array.isArray(labels) || labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:pending')) return false;
+    const carry = readCarry(key);
+    if ((carry && carry.step !== 'done') || redTeamSkipNeedsSettlement(readStatus(key))
+      || readCarriedCheck(key) !== false || !readCheckFact) return false;
+    const fact = readCheckFact({ repo, pr, headSha: head });
+    return fact?.ok === true || (fact?.ok === false && fact.reason === 'red-team check run failed (failure)');
+  } catch { return false; } // Unreadable evidence keeps the recovery opportunity.
+}
 
 export function readLiveRedTeamPr({ repo, pr }) {
   if (isUnderTest()) return null; // Hermetic callers inject evidence; never spawn gh under tests.
-  return JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'state,headRefOid'],
-    { encoding: 'utf8', timeout: 15000, maxBuffer: 65536, throttle: { maxAttempts: 1 } }));
+  const live = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json',
+    'number,state,isDraft,headRefOid,headRefName,baseRefName,mergeStateStatus,mergeable,reviewDecision,labels,statusCheckRollup,body,title,url,author,createdAt,updatedAt,files'],
+    { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, throttle: { maxAttempts: 1 } }));
+  if (live.state === 'OPEN') {
+    try { live.comments = readCompletePrComments(pr, { repo,
+      exec: (_file, args, options) => runGhSync(args, { ...options, throttle: { maxAttempts: 1 } }),
+    }); } catch { live.comments = null; } // Keep live state/head even when verdict evidence cannot be read.
+  }
+  return live;
 }
 
 const transactions = new WeakMap();
 const operatorFloors = new WeakSet();
 const cardOnlyHeads = new Map();
 const MAX_CARD_ONLY_HEADS = 256;
-const MAX_PROBES = 2;
+const DEFAULT_MAX_PROBES = 6;
+const MAX_PROBES_CEILING = 50;
+const probeCap = (value, log, source = 'direct argument') => {
+  if (value === undefined) return DEFAULT_MAX_PROBES;
+  if (Number.isInteger(value) && value >= 0 && value <= MAX_PROBES_CEILING) return value;
+  note(log, `maxProbesPerTick=6 (source: ${source}; invalid maxProbes; using default)`);
+  return DEFAULT_MAX_PROBES;
+};
 // Holds where the runner cannot start a review for this head at all (no job, no capacity spent). Such an entry is
 // probed in fair, bounded turns, without occupying a capacity-bound admission.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
@@ -52,8 +94,9 @@ export function loadRedTeamQueueFloor({ env = process.env,
   file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-team-queue.json'), readFile = readFileSync,
   log = () => {} } = {}) {
   let settings;
+  let settingsUnreadable = false;
   try { settings = JSON.parse(readFile(file, 'utf8'))?.redTeam?.queue; }
-  catch { /* Unavailable settings never create extra capacity. */ }
+  catch { settingsUnreadable = true; }
   const minimumEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT;
   const idleEnv = env.WE_RED_TEAM_QUEUE_MIN_CONCURRENT_IDLE_PCT;
   const reviewStartsEnv = env.WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE;
@@ -61,12 +104,39 @@ export function loadRedTeamQueueFloor({ env = process.env,
   const reviewStarts = reviewStartsEnv === undefined ? settings?.reviewStartsPerTickWhileIdle : parseEnv(reviewStartsEnv);
   const operator = readOperatorPolicy('redTeamQueue', { env, log });
   const operatorMinimum = operator?.minConcurrent;
-  if (operator === null) return { minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  if (operator === null) {
+    // Preserve bounded recovery without raising the configured cap or enabling capacity raises.
+    const maxProbesPerTick = settingsUnreadable ? 0 : failClosedCapacity('redTeamQueue.maxProbesPerTick',
+      probeCap(settings?.maxProbesPerTick, log, 'scripts/settings/red-team-queue.json'), { codeDefault: DEFAULT_MAX_PROBES, log });
+    note(log, `maxProbesPerTick=${maxProbesPerTick} (source: operator-db-unreadable; stricter of settings and default${settingsUnreadable ? '; settings unreadable, probes OFF' : ''})`);
+    return { maxProbesPerTick, minConcurrent: failClosedCapacity('redTeamQueue.minConcurrent', 0, { log }), idlePct: 10, reviewStartsPerTick: 0 };
+  }
   const minimum = operatorMinimum ?? (minimumEnv === undefined ? settings?.minConcurrent : parseEnv(minimumEnv));
   const validIdle = value => Number.isInteger(value) && value >= 0 && value <= 100;
   // An invalid override never replaces a valid file threshold with a looser one: it is ignored.
   const idle = idleEnv !== undefined && validIdle(parseEnv(idleEnv)) ? parseEnv(idleEnv) : settings?.minConcurrentIdlePct;
+  let maxProbesPerTick;
+  let probeSource;
+  if (settingsUnreadable) {
+    maxProbesPerTick = 0;
+    probeSource = 'scripts/settings/red-team-queue.json; settings unreadable; fail closed, probes OFF';
+  } else if (operator?.maxProbesPerTick !== undefined) {
+    maxProbesPerTick = operator.maxProbesPerTick;
+    probeSource = 'operator-db';
+  } else if (!Object.hasOwn(settings ?? {}, 'maxProbesPerTick')) {
+    maxProbesPerTick = DEFAULT_MAX_PROBES;
+    probeSource = 'default; settings key absent';
+  } else if (!Number.isInteger(settings.maxProbesPerTick)
+    || settings.maxProbesPerTick < 0 || settings.maxProbesPerTick > MAX_PROBES_CEILING) {
+    maxProbesPerTick = DEFAULT_MAX_PROBES;
+    probeSource = 'scripts/settings/red-team-queue.json; invalid maxProbesPerTick; using default';
+  } else {
+    maxProbesPerTick = settings.maxProbesPerTick;
+    probeSource = 'scripts/settings/red-team-queue.json';
+  }
+  note(log, `maxProbesPerTick=${maxProbesPerTick} (source: ${probeSource}; hard ceiling 50)`);
   const floor = {
+    maxProbesPerTick,
     // A missing threshold means the default 10; a present but invalid one disables the floor (never a looser guess).
     minConcurrent: (idle === undefined || validIdle(idle)) && Number.isInteger(minimum) && minimum >= 0
       ? Math.min(minimum, operatorMinimum === undefined ? RED_TEAM_QUEUE_MIN_CONCURRENT_CAP : RED_TEAM_QUEUE_MIN_CONCURRENT_MAX) : 0,
@@ -108,9 +178,10 @@ export function defaultQueueFile(env = process.env, home = homedir()) {
 
 /** Synchronous IO matches the daemon's tick; admission never dequeues a PR. */
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
-  writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr } = {}) {
+  writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr,
+  ...recoveryReaders } = {}) {
   let entries = [];
-  let live = new Map(), waiting = new Set();
+  let live = new Map(), waiting = new Set(), decided = new Set();
   let pending = null;
   let stale = false; // true after a failed persist, until a later write succeeds
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : 3;
@@ -161,10 +232,21 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   };
   const queue = {
     entries: () => copy(entries),
+    // Incomplete discovery authorizes only a live, same-head probe of an existing blocked entry.
+    // This read never evicts, re-keys, syncs or admits a new PR.
+    confirmedBlocked({ repo, readLivePr: read = readLivePr } = {}) {
+      return entries.filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)).flatMap(entry => {
+        try {
+          const pr = read({ repo, pr: entry.pr });
+          return pr?.state === 'OPEN' && pr.headRefOid === entry.head && pr.isDraft === false
+            && Array.isArray(pr.comments) ? [{ ...pr, number: entry.pr }] : [];
+        } catch { return []; }
+      });
+    },
     // Validate incoming PRs too: maintenance may have removed a terminal PR still present in a stale plan.
     // Each PR is read once per reconciliation; the daemon reader shares evidence across the tick.
-    reconcile({ readLivePr: read = readLivePr, candidates = [] } = {}) {
-      live = new Map(); waiting = new Set();
+    reconcile({ readLivePr: read = readLivePr, candidates = [], ...recovery } = {}) {
+      live = new Map(); waiting = new Set(); decided = new Set();
       const persisted = new Set(entries);
       const subjects = new Map(entries.map(entry => [entry.key, entry]));
       for (const { repo, pr } of candidates) {
@@ -180,13 +262,25 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           continue;
         }
         live.set(entry.key, pr);
-        if (!persisted.has(entry)) continue;
-        if (pr.state !== 'OPEN') { remove(entry, `live PR ${pr.state.toLowerCase()}`); continue; }
-        if (pr.headRefOid !== entry.head) {
+        if (pr.state !== 'OPEN') {
+          if (persisted.has(entry)) remove(entry, `live PR ${pr.state.toLowerCase()}`);
+          continue;
+        }
+        if (persisted.has(entry) && pr.headRefOid !== entry.head) {
           // Re-key in place, preserving FIFO position; stale planner rows are deferred until they match.
           entry.head = pr.headRefOid; entry.attempts = 0;
           delete entry.blocked; delete entry.lastProbeTurn;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
+        }
+        if (!Array.isArray(pr.comments)) {
+          waiting.add(entry.key);
+          note(log, `keep ${entry.key}: red-team verdict evidence unreadable; admission deferred`);
+          continue;
+        }
+        if (settledResult({ ...recoveryReaders, ...recovery, repo: entry.repo, pr: entry.pr,
+          head: pr.headRefOid, comments: pr.comments, labels: pr.labels })) {
+          decided.add(entry.key);
+          if (persisted.has(entry)) remove(entry, `red-team result already on head ${pr.headRefOid}`);
         }
       }
       return live;
@@ -194,7 +288,8 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
     sync(repo, candidates) {
       candidates = candidates.filter(candidate => {
         const key = `${repo}#${Number(candidate.pr)}`, pr = live.get(key);
-        if (pr && pr.state !== 'OPEN') return false;
+        if (decided.has(key) || (pr && pr.state !== 'OPEN')) return false;
+        if (waiting.has(key)) return false;
         if (live.has(key) && (!pr || pr.headRefOid !== candidate.head)) { waiting.add(key); return false; }
         return true;
       });
@@ -212,18 +307,20 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         changed(`enqueue ${key}`);
       }
     },
-    admit(repo, count, { allowProbes = true } = {}) {
+    admit(repo, count, { allowProbes = true, maxProbes, probeKeys } = {}) {
+      const maxProbeCount = probeCap(maxProbes, log);
       const validCount = typeof count === 'number' && !Number.isNaN(count); // invalid count fails closed: no probes either
       const bound = typeof count === 'number' && !Number.isNaN(count) ? Math.max(0, Math.floor(count)) : 0;
       // Least-recently-probed heads get the next bounded turn without using a runnable slot.
       // Missing turns get one-time legacy catch-up; newly blocked entries always carry a turn.
-      const mine = entries.filter(entry => entry.repo === repo && !waiting.has(entry.key));
+      const mine = entries.filter(entry => entry.repo === repo
+        && (probeKeys ? probeKeys.has(entry.key) : !waiting.has(entry.key)));
       // Disabled probes or an invalid count fail closed; a valid zero count still allows worker-free probes.
       const selected = mine.filter(entry => NON_RUNNABLE_REASONS.has(entry.blocked) && allowProbes && validCount)
-        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, MAX_PROBES);
+        .sort((a, b) => (a.lastProbeTurn ?? 0) - (b.lastProbeTurn ?? 0)).slice(0, maxProbeCount);
       const probes = new Set(selected.map(entry => entry.key));
       if (selected.length) {
-        advanceProbeTurns(mine, selected);
+        advanceProbeTurns(entries.filter(entry => entry.repo === repo), selected);
         changed(`advance probe turns for ${repo}`);
       }
       const runnable = mine.filter(entry => !NON_RUNNABLE_REASONS.has(entry.blocked)).slice(0, bound);
@@ -234,7 +331,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           note(log, `hold ${entry.key}: ${allowProbes && validCount ? 'waiting for a probe turn' : 'probes disabled'}`);
           continue;
         }
-        note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}`);
+        note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}; head=${entry.head}`);
       }
       return copy(admitted);
     },
@@ -282,7 +379,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   // Stage all queue mutations, including reconciliation, until the runner succeeds.
   transactions.set(queue, () => {
     const before = copy(entries), previousAdmissions = new Map(admissions);
-    const previousLive = live, previousWaiting = new Set(waiting);
+    const previousLive = live, previousWaiting = new Set(waiting), previousDecided = new Set(decided);
     pending = [];
     return {
       commit() {
@@ -301,7 +398,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       },
       abort() {
         entries = before;
-        live = previousLive; waiting = previousWaiting;
+        live = previousLive; waiting = previousWaiting; decided = previousDecided;
         admissions.clear();
         for (const [repo, admitted] of previousAdmissions) admissions.set(repo, admitted);
         pending = null;
@@ -345,14 +442,29 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  floor, readCpuIdlePct, readLivePr, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
+  floor, readCpuIdlePct, readLivePr, inventoryComplete = true, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const transaction = transactions.get(queue)?.();
   try {
+    if (!inventoryComplete) {
+      const confirmed = queue.confirmedBlocked({ repo, readLivePr });
+      const refusals = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
+        && confirmed.some(pr => pr.number === Number(row.prNumber) && pr.headRefOid === row.headSha));
+      const probeKeys = new Set(refusals.map(row => `${repo}#${Number(row.prNumber)}`));
+      const capacity = normalizeCapacity(rawCapacity);
+      const admitted = queue.admit(repo, 0, { probeKeys, allowProbes: readableCapacity(capacity), maxProbes: floor?.maxProbesPerTick });
+      const allowed = new Set(admitted.map(entry => entry.pr));
+      const result = run({ ...rest, repo, plan: { ...plan, dispatch: [],
+        refusals: refusals.filter(row => allowed.has(Number(row.prNumber))) },
+      rawPrs: confirmed.filter(pr => allowed.has(pr.number)), capacity, log });
+      // Keep membership and retry state until complete discovery returns, even after a dispatch.
+      const finish = result => { transaction?.commit(); return result; };
+      return result?.then ? result.then(finish).catch(error => { transaction?.abort(); throw error; }) : finish(result);
+    }
     const managed = new Set(queue.entries().filter(entry => entry.repo === repo).map(entry => entry.pr));
     const incoming = (plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       .map(row => ({ repo, pr: Number(row.prNumber) }));
-    const liveEvidence = queue.reconcile({ readLivePr, candidates: incoming });
+    const liveEvidence = queue.reconcile({ ...rest, readLivePr, candidates: incoming });
     const candidates = [], cardOnlyCandidates = [];
     for (const row of plan?.refusals ?? []) {
       if (row.kind !== 'already-reviewed-head') continue;
@@ -383,7 +495,8 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const bypassed = new Set();
     for (const entry of cardOnlyCandidates) {
       const key = `${repo}#${entry.pr}`, livePr = liveEvidence.get(key);
-      const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head);
+      const current = !liveEvidence.has(key) || (livePr?.state === 'OPEN' && livePr.headRefOid === entry.head
+        && Array.isArray(livePr.comments) && !redTeamForHead(livePr.comments, entry.pr, entry.head));
       if (current && skipCardOnly && readableCapacity(capacity)) { bypassed.add(entry.pr); note(log, `card-only ${repo}#${entry.pr} bypasses red-team queue`); }
       else candidates.push(entry);
     }
@@ -401,7 +514,7 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const exhausted = bound === 0 && capacity && finite(capacity.lanes)
       && (capacity.remainingStarts == null || finite(capacity.remainingStarts))
       && (capacity.budget == null || finite(capacity.budget.left));
-    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity) });
+    const admitted = queue.admit(repo, exhausted ? Infinity : bound, { allowProbes: readableCapacity(capacity), maxProbes: floor?.maxProbesPerTick });
     const allowed = new Set(admitted.map(entry => entry.pr));
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))

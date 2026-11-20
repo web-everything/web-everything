@@ -13,6 +13,8 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { isValidPolicyLayer, resolveResourcePolicy, decideAdmission } from './resource-policy.mjs';
 import { readDeclaredSettings, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
+// Like resource-gate, this cycle is lazy: settings are read only when admitting, never at module load.
+import { loadMemoryPressureSettings } from '../readiness/heavy-admission.mjs';
 // The pure policy + decision live in we:scripts/lib/resource-policy.mjs so a read-only declaring module (the
 // resource-status operation) can import them without reaching fs.
 export { RESOURCE_POLICY_STANDARD, RESOURCE_POLICY_KINDS, resolveResourcePolicy, decideAdmission } from './resource-policy.mjs';
@@ -98,7 +100,8 @@ export function admit({ kind, env = process.env, nowMs = Date.now(), root, polic
   let decision;
   try {
     root ??= resolveCoordinationRoot({ env });
-    decision = decideAdmission({ kind, snapshot: readSnapshot({ root }), policy: policy ?? loadResourcePolicy({ env }).policy, nowMs });
+    decision = decideAdmission({ kind, snapshot: readSnapshot({ root }), policy: policy ?? loadResourcePolicy({ env }).policy, nowMs,
+      ...loadMemoryPressureSettings({ env }) });
   } catch {
     decision = decideAdmission({ kind, snapshot: null, nowMs });
   }

@@ -54,7 +54,7 @@ describe('launchd templates', () => {
     const keys = { relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
       standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
       matchRequestVariants: 'WE_VERIFY_MATCH_REQUEST_VARIANTS', supersede: 'WE_VERIFY_SUPERSEDE', restartInFlight: 'WE_VERIFY_RESTART_IN_FLIGHT',
-      runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY',
+      runAllPhases: 'WE_VERIFY_RUN_ALL_PHASES', isolatedRetry: 'WE_VERIFY_ISOLATED_RETRY', retryFailed: 'WE_VERIFY_RETRY_FAILED',
       relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH', alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS',
       skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY', revertRed: 'WE_VERIFY_REVERT_RED',
       revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',

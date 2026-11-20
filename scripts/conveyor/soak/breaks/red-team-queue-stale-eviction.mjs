@@ -26,7 +26,7 @@ export default {
         writeFile: (path, data) => files.set(path, data),
         rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
         unlink: path => files.delete(path),
-        readLivePr: ({ pr }) => ({ state: pr === 7 ? 'MERGED' : pr === 8 ? 'CLOSED' : 'OPEN', headRefOid: head }),
+        readLivePr: ({ pr }) => ({ state: pr === 7 ? 'MERGED' : pr === 8 ? 'CLOSED' : 'OPEN', comments: [], headRefOid: head }),
       });
       const queue = open();
       queue.sync(repo, candidates);
@@ -38,7 +38,7 @@ export default {
       check(open().entries().length === 6 && open().entries().every(entry => entry.pr < 7),
         'terminal PR survived maintenance or was re-enqueued from stale candidates');
       const changed = open();
-      changed.reconcile({ readLivePr: ({ pr }) => ({ state: 'OPEN', headRefOid: pr === 2 ? 'c'.repeat(40) : head }) });
+      changed.reconcile({ readLivePr: ({ pr }) => ({ state: 'OPEN', comments: [], headRefOid: pr === 2 ? 'c'.repeat(40) : head }) });
       const rekeyed = open().entries();
       check(rekeyed[1]?.pr === 2 && rekeyed[1].head === 'c'.repeat(40)
         && rekeyed[1].attempts === 0 && rekeyed[1].blocked === undefined,
@@ -50,7 +50,7 @@ export default {
         await runWithRedTeamQueue({ queue: remaining, repo,
           plan: { refusals: candidates.map(({ pr }) => ({ prNumber: pr, kind: 'already-reviewed-head', headSha: head })) },
           capacity: { lanes: 1 }, readNetFiles: () => ({ ok: false }),
-          readLivePr: ({ pr }) => ({ state: pr === 1 ? 'MERGED' : 'OPEN', headRefOid: 'b'.repeat(40) }),
+          readLivePr: ({ pr }) => ({ state: pr === 1 ? 'MERGED' : 'OPEN', comments: [], headRefOid: 'b'.repeat(40) }),
           run: async () => { throw error; },
         });
       } catch (failure) { caught = failure; }

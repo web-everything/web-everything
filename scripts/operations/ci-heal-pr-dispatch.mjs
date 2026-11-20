@@ -64,7 +64,7 @@ import { aiRoutingInputs, resolveAiRouting } from '../lib/ai-routing.mjs';
 import { assertMainNotStale } from './review-dispatch.mjs';
 import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
-import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
+import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
 import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
@@ -487,6 +487,17 @@ export async function runReconcileCiHealDispatch({
     console.error(`ci-heal-pr-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
     return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, timeoutFollowups, reconcileRefusals: 0, reconcileRefusalDetails: [], owedFlush };
   }
+  let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
+  if (cursor != null) {
+    const start = ciHealEntries.findIndex(entry => entry.prNumber === cursor);
+    if (start > 0) ciHealEntries = [...ciHealEntries.slice(start), ...ciHealEntries.slice(0, start)];
+  }
+  const profile = resolveProfile(repoKey);
+
+  // Preserve any already-recorded `fix`/`review` unsupported rows for this repo — a DIFFERENT stage this file
+  // knows nothing about — and replace only its own `ci-heal` rows with what THIS pass just computed.
+  const otherRows = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action !== 'ci-heal');
+
   const timeoutResults = [];
   for (const entry of (reconciled.dispatch ?? []).filter((row) => row.kind === 'ci-timeout-rerun')) {
     try {
@@ -502,29 +513,18 @@ export async function runReconcileCiHealDispatch({
       timeoutResults.push({ kind: 'ci-timeout-rerun', pr: entry.prNumber, status: 'refused', reason: error.message, why: error.message });
     }
   }
-  let ciHealEntries = orderCiHealEntriesOldestFirst((reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal'));
-  if (cursor != null) {
-    const start = ciHealEntries.findIndex(entry => entry.prNumber === cursor);
-    if (start > 0) ciHealEntries = [...ciHealEntries.slice(start), ...ciHealEntries.slice(0, start)];
-  }
   if (!ciHealEntries.length && timeoutResults.length) return {
     handled: 0, deferred: [], nextCursor: null, dispatched: timeoutResults.filter((r) => r.status === 'requested'),
     refusals: timeoutResults.filter((r) => r.status !== 'requested'), timeoutFollowups,
     reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush,
   };
-  const profile = resolveProfile(repoKey);
-
-  // Preserve any already-recorded `fix`/`review` unsupported rows for this repo — a DIFFERENT stage this file
-  // knows nothing about — and replace only its own `ci-heal` rows with what THIS pass just computed.
-  const otherRows = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action !== 'ci-heal');
-
-  if (!profile?.capabilities?.ciHeal) {
-    const refusals = ciHealEntries.map((entry) => ({
+  if (assertCapability(repoKey, 'ciHeal', { resolveProfile: () => profile })) {
+    const refusals = (reconciled.dispatch ?? []).filter((entry) => entry.kind === 'ci-heal').map((entry) => ({
       kind: 'unsupported-repo', repo: repoKey, prNumber: entry.prNumber, action: 'ci-heal',
       why: 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
     }));
     recordUnsupported({ repo: repoKey, rows: [...otherRows, ...refusals], path: unsupportedPath });
-    return { handled: ciHealEntries.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
+    return { handled: refusals.length, deferred: [], nextCursor: null, dispatched: timeoutResults.filter(r => r.status === 'requested'), refusals: [...refusals, ...timeoutResults.filter(r => r.status !== 'requested')], timeoutFollowups, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals, owedFlush };
   }
   // `ci-heal` IS supported here — clear any stale `ci-heal` unsupported rows, preserving `fix`/`review` rows.
   recordUnsupported({ repo: repoKey, rows: otherRows, path: unsupportedPath });
@@ -549,6 +549,7 @@ export async function runReconcileCiHealDispatch({
   console.error(`ci-heal-pr-dispatch: timing pre-loop ms=${clock() - startedAt}`);
   // Phase A: finish admission and assign lanes before any expensive launch.
   // Polling and flushes may have spent the phase budget already; admission gets its own bounded slice.
+  const logRefusal = (pr, r) => console.error(`ci-heal-pr-dispatch: refused ${r.kind ?? 'unknown'} PR #${pr}: ${r.why ?? r.reason ?? 'no reason recorded'}`);
   const effectiveGateSliceMs = gateSliceMs ?? 120_000;
   const gateDeadlineAt = clock() + effectiveGateSliceMs;
   console.error(`ci-heal-pr-dispatch: gate slice ms=${effectiveGateSliceMs} source=${gateSliceMs == null ? 'default' : 'option'}`);
@@ -696,7 +697,13 @@ export async function runReconcileCiHealDispatch({
     } finally {
       const gateMs = clock() - entryNow;
       if (launch) launch.gateMs = gateMs;
-      else console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+      else {
+        // Every gate refusal is logged with its kind and reason; no launch without a recorded reason is logged as unknown.
+        // A salvage that pushed recorded a dispatch, not a refusal.
+        const rows = refusals.length ? refusals : dispatched.length ? [] : [{ kind: 'unknown', why: 'no launch and no refusal recorded' }];
+        for (const r of rows) logRefusal(entry.prNumber, r);
+        console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+      }
     }
   }
 
@@ -709,12 +716,14 @@ export async function runReconcileCiHealDispatch({
       // Admission ran up front, so a stop requested meanwhile (kill file, adoption yield) is honoured before each launch.
       if (fixLoop.killed()) {
         outcome.refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
+        logRefusal(entry.prNumber, outcome.refusals.at(-1));
         return;
       }
       // The first launch is exempt from adoption yield; host capacity guards still apply.
       if (launchStarted && (yieldedForAdoption ||= safeAdoptYield(shouldYield))) {
         deferred.push(entry.prNumber);
         outcome.refusals.push({ pr: entry.prNumber, kind: 'adoption-yield', why: 'daemon adoption requested a yield before this launch' });
+        logRefusal(entry.prNumber, outcome.refusals.at(-1));
         return;
       }
       launchStarted = true;
@@ -743,6 +752,7 @@ export async function runReconcileCiHealDispatch({
       } finally { dispatchMs = clock() - dispatchStartedAt; }
       if (result?.held) {
         outcome.refusals.push({ pr: entry.prNumber, kind: 'held', why: result.reason ?? `a CI-heal for PR #${entry.prNumber} is already in flight` });
+        logRefusal(entry.prNumber, outcome.refusals.at(-1));
         const next = waitingForLane.shift();
         if (next) {
           next.planned.lane = planned.lane;
@@ -757,6 +767,7 @@ export async function runReconcileCiHealDispatch({
       } catch { /* Dispatch succeeded; ledger writes are best effort. */ }
     } catch (e) {
       outcome.refusals.push({ pr: entry.prNumber, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
+      logRefusal(entry.prNumber, outcome.refusals.at(-1));
     } finally {
       console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=${dispatchMs}`);
     }
@@ -765,6 +776,7 @@ export async function runReconcileCiHealDispatch({
   for (let i = 0; i < launches.length; i += LAUNCH_WAVE) await Promise.all(launches.slice(i, i + LAUNCH_WAVE).map(runLaunch));
   for (const { entry, outcome, gateMs } of waitingForLane) {
     outcome.refusals.push({ pr: entry.prNumber, kind: 'no-lane', why: `no free lane to dispatch a CI-heal agent for PR #${entry.prNumber}` });
+    logRefusal(entry.prNumber, outcome.refusals.at(-1));
     console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
   }
   const dispatched = outcomes.flatMap(row => row.dispatched);
