@@ -171,9 +171,13 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     else if (!still) return { add: null, remove: [], skipped: 'check-changed' };
     else plan = next;
     // Last head guard, after every read and right before the write.
-    let last = null;
-    try { last = recheck.readPrState(repo, pr)?.headRefOid; } catch { last = null; }
+    let last = null, lastLabels = null;
+    try { const fresh = recheck.readPrState(repo, pr); last = fresh?.headRefOid; lastLabels = fresh?.labels; } catch { last = null; }
     if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };
+    // A blocked label on the fresh state vetoes any settle to clear (a block always wins); unreadable labels refuse too.
+    if (!Array.isArray(lastLabels)) return { add: null, remove: [], skipped: 'labels-unreadable' };
+    if (plan.add !== 'red-team:blocked' && lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked'))
+      return { add: null, remove: [], skipped: 'blocked-label' };
   }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);

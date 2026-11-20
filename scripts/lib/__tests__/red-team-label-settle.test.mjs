@@ -180,6 +180,12 @@ describe('red-team label settles from the head\'s check', () => {
     it('a partial env still sees a carried-check marker under the process env', () => {
       expect(readCheckClearFact({ ...input, env: { WE_APP_ID: '123' }, gh: ghFor([run()]) })).toBe(true);
     });
+    it('a blocked label on the fresh state vetoes the settle to clear', () => {
+      const { provider, run: go } = make(() => true);
+      provider.readPrState.mockReturnValue({ headRefOid: head, labels: ['red-team:pending', 'red-team:blocked'] });
+      expect(go().skipped).toBe('blocked-label');
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
     it('an unreadable thread at swap time refuses the settle', () => {
       const { provider, run: go } = make(() => true);
       provider.readComments.mockImplementation(() => { throw new Error('x'); });
