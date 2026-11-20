@@ -14,7 +14,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, exist
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { withAddGuardLock, stackAwareOverlayCheck, findStackBases } from '../daemon-overlay.mjs';
 import { overlayFilePath } from '../lib/daemon-overlays.mjs';
 
@@ -99,6 +99,21 @@ function overlayStateFile(overlayDir, cloneDir) {
 }
 
 describe('daemon-overlay.mjs add — expected SHA admission', () => {
+  it.each(['cli', 'cli-spoof', 'in-process', 'trusted'])('hot-patch add requires in-process provenance: %s', mode => {
+    const f = makeFixture();
+    const sha = gitOk(f.cloneDir, ['rev-parse', 'HEAD']).trim(), ref = `hotpatch/${sha}`;
+    gitOk(f.cloneDir, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+    const args = ['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, `--expected-sha=${sha}`, '--pr=42', '--json'];
+    const env = { ...f.env, WE_HOT_PATCH_PROVENANCE: 'true' };
+    const r = mode.startsWith('cli') ? runCli([...args, ...(mode === 'cli-spoof' ? ['--hotPatchProvenance=true', '--hot-patch-provenance=true'] : [])], env)
+      : spawnSync(process.execPath, ['--input-type=module', '--eval',
+        `const { main } = await import(${JSON.stringify(pathToFileURL(CLI).href)}); await main(process.argv.slice(1), {}, { hotPatchProvenance: ${mode === 'trusted'} });`,
+        ...args], { env, encoding: 'utf8', timeout: 30_000 });
+    expect(r.status, r.stderr).toBe(mode === 'trusted' ? 0 : 3);
+    if (mode !== 'trusted') expect(r.stderr).toContain('hot-patch-provenance-required');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays.map(row => row.ref) ?? []).toEqual(mode === 'trusted' ? [ref] : []);
+  });
+
   it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {
     const f = makeFixture();
     const ref = 'lane/sha-bound';
@@ -638,6 +653,47 @@ describe('stackAwareOverlayCheck', () => {
   const full = { ok: true, clean: false, files: ['shared.txt'], conflicting: [existingOverlays[0]] };
   const via = { chain: ['lane/b'], ancestry: [] };
   const options = { root: '/unused', ref: 'lane/c', pr: 4915, existingOverlays, env: {}, originUrl: '/origin' };
+
+  it('refuses stacking on a hotpatch even when the preview would be clean', async () => {
+    const ref = `hotpatch/${'a'.repeat(40)}`;
+    const preview = vi.fn().mockResolvedValue({ ok: true, clean: true });
+    expect(await stackAwareOverlayCheck({ ...options, preview,
+      stackBases: () => ({ bases: [ref], via: { chain: [ref], ancestry: [] } }),
+    })).toMatchObject({ ok: false, reason: 'hot-patch-stack-refused' });
+  });
+  it.each(['reader-failure', 'missing-object', 'unknown-result'])('refuses unknown hot-patch independence: %s', async kind => {
+    const hot = `hotpatch/${'a'.repeat(40)}`, candidate = 'b'.repeat(40);
+    const preview = vi.fn().mockResolvedValue({ ok: true, clean: true });
+    const stackBases = opts => findStackBases({ ...opts, run: (cmd, args) => {
+      if (kind === 'reader-failure') throw Error('offline');
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${candidate}\trefs/heads/lane/c\n${'a'.repeat(40)}\trefs/heads/${hot}\n` };
+      return { status: kind === 'missing-object' ? 128 : null };
+    } });
+    expect(await stackAwareOverlayCheck({ ...options, env: { WE_DAEMON_OVERLAY_STACK_BASES: '{}' },
+      existingOverlays: [{ ref: hot }], preview, stackBases,
+    })).toMatchObject({ ok: false, reason: 'hot-patch-stack-refused' });
+    expect(preview).not.toHaveBeenCalled();
+  });
+
+  it.each(['independent', 'descendant', 'missing-tip', 'chain-reader', 'chain-bound', 'malformed-map'])('checks hot-patch independence with %s evidence', async kind => {
+    const hot = `hotpatch/${'a'.repeat(40)}`, candidate = 'b'.repeat(40);
+    const preview = vi.fn().mockResolvedValue({ ok: true, clean: true });
+    const chain = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [i ? `base-${i}` : 'lane/c', `base-${i + 1}`]));
+    const env = kind === 'chain-reader' ? {} : { WE_DAEMON_OVERLAY_STACK_BASES:
+      kind === 'chain-bound' ? JSON.stringify(chain) : kind === 'malformed-map' ? '{' : '{}' };
+    const stackBases = opts => findStackBases({ ...opts, run: (cmd, args) => {
+      if (cmd === 'gh') return { status: 1 };
+      if (args[0] === 'ls-remote') return { status: 0, stdout:
+        `${candidate}\trefs/heads/lane/c\n${kind === 'missing-tip' ? '' : `${'a'.repeat(40)}\trefs/heads/${hot}\n`}` };
+      return { status: kind === 'descendant' ? 0 : 1 };
+    } });
+    const result = await stackAwareOverlayCheck({ ...options, env,
+      existingOverlays: [{ ref: hot }], preview, stackBases });
+    expect(result).toMatchObject(kind === 'independent' ? { ok: true, clean: true }
+      : { ok: false, reason: 'hot-patch-stack-refused' });
+    expect(preview).toHaveBeenCalledTimes(kind === 'independent' ? 1 : 0);
+    if (kind === 'chain-bound') expect(result.fallback).toContain('NEEDS-YOU');
+  });
 
   it('runs only one preview with no bases', async () => {
     const preview = vi.fn().mockResolvedValue(full);

@@ -12,12 +12,13 @@ const TOP = 'lane/top';
 const BASE_SHA = 'a'.repeat(40);
 const TOP_SHA = 'b'.repeat(40);
 
-async function removalFixture({ concurrent = false, descendant = true }, check) {
+async function removalFixture({ concurrent = false, descendant = true, hot = false, cached = false }, check) {
+  const BASE = hot ? `hotpatch/${BASE_SHA}` : 'lane/base';
   const root = fs.mkdtempSync(join(tmpdir(), 'prototype-load-remove-'));
   const env = { HOME: root, TMPDIR: root, USER: 'test', WE_DAEMON_OVERLAY_DIR: join(root, 'overlays') };
   const recordPath = join(root, 'prototype-loads.jsonl');
   const state = () => readOverlayState(root, { env });
-  const registerTop = () => addOverlay(root, { ref: TOP, reason: 'uncached registration', now: '2026-11-09T12:00:00Z' }, { env });
+  const registerTop = () => addOverlay(root, { ref: TOP, ...(cached ? { stackBases: [BASE] } : {}), reason: 'uncached registration', now: '2026-11-09T12:00:00Z' }, { env });
   try {
     addOverlay(root, { ref: BASE, reason: 'base registration', now: '2026-11-09T11:00:00Z' }, { env });
     if (!concurrent) registerTop();
@@ -61,6 +62,18 @@ async function removalFixture({ concurrent = false, descendant = true }, check) 
 }
 
 describe('prototype-load default guarded removal ancestry protection', () => {
+  it('explicit hot-patch removal refuses cached dependents and emits NEEDS-YOU without touching them', async () => {
+    await removalFixture({ hot: true, cached: true }, ({ result, state }) => {
+      const ref = `hotpatch/${BASE_SHA}`;
+      expect(result).toMatchObject({ ok: false, stopReason: 'remove-refused', detail: 'stacked-dependents', removed: [] });
+      expect(state.overlays.map(r => r.ref)).toEqual([ref, TOP]);
+      const root = result.clone;
+      const events = fs.readdirSync(join(root, 'overlays')).filter(n => n.endsWith('.events.jsonl'))
+        .flatMap(n => fs.readFileSync(join(root, 'overlays', n), 'utf8').trim().split('\n').map(JSON.parse));
+      expect(events).toContainEqual(expect.objectContaining({ alert: true, ref, dependents: [TOP], reason: expect.stringContaining('NEEDS-YOU') }));
+    });
+  });
+
   const retained = ({ result, state, initialBase, ancestry, exec, records }) => {
     expect(result).toMatchObject({ ok: false, stopReason: 'remove-refused', detail: 'not-proved', removed: [] });
     expect(state.corrupt).toBe(false);

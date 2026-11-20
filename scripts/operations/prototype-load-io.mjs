@@ -6,7 +6,23 @@
  * `--replace=<old>` swaps an old top for a new one that contains all its commits, in one loader command, and
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
+ *
+ * R1100 acceptance: only exact-SHA, protected canonical hot-patch PRs with bound
+ * pending/successful Actions CI may bypass the urgent receipt; health-watch cannot.
+ * Regression plan (already committed in operations/__tests__/prototype-load.test.mjs):
+ * - `hot-patch urgent admission (R1100)`: `refuses zero PRs`, `refuses two PRs`,
+ *   `refuses PR head differs`, `refuses base differs`, `refuses foreign repo`;
+ * - the same block: `refuses missing rule`, `refuses inactive ruleset`,
+ *   `refuses bypassable ruleset`, `refuses ruleset id mismatch`,
+ *   `refuses any failed check`, and `refuses health-watch target`;
+ * - shared CI guards: `refuses completed CI %s even with a signed green marker`
+ *   and `urgent refuses unknown check status before reading a signed receipt`;
+ * - positive control: `accepts bound Actions test %s without a receipt and records
+ *   hotPatch.pr` covers queued, in_progress and completed-success evidence.
+ * Risk: admission is provisional; urgent-sweep withdrawal still requires the target
+ * daemon to rebuild. These hermetic tests do not establish live rollback behavior.
  */
+import { verifyRuleset, reserveHotPatch, assertHotPatchSingleton, readLedger } from '../hot-patch.mjs';
 import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
@@ -14,7 +30,7 @@ import { randomUUID } from 'node:crypto';
 import nodeFs from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, resolve, relative, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
@@ -287,7 +303,16 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         return difference.code === 0 && difference.stdout === '';
       });
     };
-    const loader = (action, clone, ref, extra = []) => execute('node', [resolve(repo, config.loaderCli), action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])], repo);
+    const loader = (action, clone, ref, extra = []) => {
+      const args = [action, `--clone=${clone}`, ...(ref ? [`--ref=${ref}`] : []), ...extra, ...(action === 'remove' ? [] : ['--json'])];
+      if (input.urgent === true && validSha(input.sha) && input.branch === `hotpatch/${input.sha}`
+        && ref === input.branch && ['add', 'replace'].includes(action)) {
+        // Provenance exists only in the imported function's options. No CLI flag or environment bypass.
+        const source = `import { main } from ${JSON.stringify(pathToFileURL(resolve(repo, config.loaderCli)).href)}; await main(process.argv.slice(1), {}, { hotPatchProvenance: true });`;
+        return execute('node', ['--input-type=module', '--eval', source, ...args], repo);
+      }
+      return execute('node', [resolve(repo, config.loaderCli), ...args], repo);
+    };
     const lastJson = (r) => { try { return JSON.parse(r.stdout.trim().split(/\r?\n/).at(-1)); } catch { return null; } };
     // A replace check proves containment and checks the new ref against the list without the replaced one.
     const replaceCheck = (clone, ref, expectedSha, old) => {
@@ -351,6 +376,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
+    let hotPatchReservation;
     let readinessStep = 'readiness-unreadable';
     let pendingAdoption = null;
     const stop = (reason, details = {}) => {
@@ -458,7 +484,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (targets.length !== 1) return stop('remove-refused', { detail: 'expected-one-registration' });
         const dependents = listed.rows.filter((r) => r.ref !== input.remove &&
           (r.stackBases?.includes(input.remove) || Object.values(r.stackVia || {}).flat().includes(input.remove)));
-        if (dependents.length) return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
+        if (dependents.length) {
+          // Share the withdrawal refusal event; this cached path must also alert for hot patches.
+          if (/^hotpatch\/[a-f0-9]{40}$/.test(input.remove))
+            proveOverlayWithdrawal({ root: out.clone, ref: input.remove, env: childEnv, git });
+          return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
+        }
         requireGit('fetch', 'origin', `+refs/heads/${input.remove}:refs/remotes/origin/${input.remove}`);
         const tip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${input.remove}^{commit}`);
         if (!validSha(tip)) return stop('remove-refused', { detail: 'invalid-tip' });
@@ -489,7 +520,19 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.ok = true; return out;
       }
       if (input.replace !== undefined && input.replace !== '' && (!safeRegistrationRef(input.replace) || input.replace === input.branch)) return stop('bad-input', { detail: 'invalid --replace ref' });
-      if (!safeRef(input.branch)) return stop('bad-input', { detail: 'bad-branch', fallback: 'Pass --branch=lane/<name>: a branch under lane/ with only letters, digits, dot, dash, underscore and slash.' });
+      const hotPatchMode = input.urgent === true && validSha(input.sha) && input.branch === `hotpatch/${input.sha}`;
+      if (hotPatchMode && input.replace) return stop('bad-input', { detail: 'hot-patch-replace-refused' });
+      let hotPatch;
+      if (hotPatchMode) {
+        try {
+          hotPatchReservation = reserveHotPatch({ env, fs, inherited: true });
+          assertHotPatchSingleton(readLedger(env, 'urgent-loads', fs), readLedger(env, 'urgent-sweep-state', fs));
+        } catch (e) { return stop('no-ready', { detail: 'hot-patch-singleton', error: String(e.message),
+          fallback: 'Inspect hot-patch status and the reservation owner; settle existing loads before retrying. Remove a stale lock only after confirming its owner has stopped.' }); }
+      }
+      if (hotPatchMode && (basename(out.clone) === 'wev-health-watch' || input.daemon === 'health-watch'))
+        return stop('bad-input', { detail: 'health-watch-target', fallback: 'Target a different daemon; health-watch must remain outside the patch.' });
+      if (!safeRef(input.branch) && !hotPatchMode) return stop('bad-input', { detail: 'bad-branch', fallback: 'Pass --branch=lane/<name>: a branch under lane/ with only letters, digits, dot, dash, underscore and slash.' });
       if (!validSha(input.sha)) return stop('bad-input', { detail: 'bad-sha', fallback: 'Use the full 40-character sha (git rev-parse origin/<branch>), not a short sha.' });
       if (!Number.isFinite(config.adoption?.timeoutMs) || config.adoption.timeoutMs < 0
         || !Number.isFinite(config.adoption.pollMs) || config.adoption.pollMs <= 0) return stop('bad-input', { detail: 'bad-adoption-settings', fallback: 'Fix adoption.timeoutMs and adoption.pollMs in scripts/settings/prototype-load.json.' });
@@ -526,6 +569,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
+      let hotGh;
       let urgentCiFailed = false;
       let prConflict, conflict, noTestCheckAtAll = false;
       let ciRefusal = null;
@@ -540,6 +584,12 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             apiUnavailable = true;
             return { code: 1, stdout: '' };
           }
+        };
+        if (hotPatchMode) hotGh = async args => {
+          const actual = args[0] === 'api' ? args.slice(0, -2) : args;
+          const result = gh(actual);
+          if (result.code !== 0) throw Error('hot-patch PR/rules protection unreadable; repair evidence and retry');
+          return JSON.parse(result.stdout);
         };
         const origin = resolveOriginRepository({ git: (args) => git(...args), gh });
         if (!origin.repo) {
@@ -565,7 +615,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           } catch { /* Unknown mergeability retains the existing urgent rules. */ }
         }
         noCi('ci-checks-unreadable', 'Repair the check-runs reader and retry with complete evidence (at most 100 checks).');
-        const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
+        const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100${hotPatchMode ? '&filter=all' : ''}`]);
         if (result.code !== 0) return null;
         const data = JSON.parse(result.stdout);
         // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
@@ -581,6 +631,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             || !['queued', 'in_progress', 'completed'].includes(r.status)
             || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
           throw new Error('malformed, incomplete or oversized CI checks');
+        if (hotPatchMode && data.check_runs.some(r => r.name === 'test' && r.head_sha === sha && r.app.id === TEST_CHECK_APP_ID
+          && !(r.status === 'queued' || r.status === 'in_progress' || r.status === 'completed' && r.conclusion === 'success')))
+          throw Error('hot-patch test check is neither pending nor successful; repair CI and retry');
         const evidence = testCheckEvidence(data, sha);
         // Only "no check named test at all" can be the no-CI-run signature of a conflicting head; a test check
         // from another app, or on another sha, is mis-bound evidence and must keep refusing.
@@ -615,7 +668,28 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         && (['queued', 'in_progress'].includes(checkRun.status)
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
-      if (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success') {
+      const readHotPatchPr = async () => {
+        if (normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')) !== 'https://github.com/web-everything/web-everything') throw Error('canonical PR repository required');
+        const prs = await hotGh(['api', `repos/web-everything/web-everything/commits/${input.sha}/pulls`, '--repo', 'web-everything/web-everything']);
+        if (!Array.isArray(prs) || prs.length !== 1) throw Error('exactly one open PR required');
+        const pr = prs[0];
+        if (!Number.isSafeInteger(pr?.number) || pr.number <= 0 || pr.state !== 'open' || pr.head?.sha !== input.sha
+          || pr.base?.ref !== 'main' || pr.head?.repo?.full_name !== 'web-everything/web-everything'
+          || pr.base?.repo?.full_name !== 'web-everything/web-everything') throw Error('open canonical PR at exact head and base main required');
+        return pr;
+      };
+      if (hotPatchMode) {
+        if (ciRefusal || !checkRun || checkRun.sha !== input.sha || checkRun.name !== 'test'
+          || checkRun.appId !== TEST_CHECK_APP_ID || !(['queued', 'in_progress'].includes(checkRun.status)
+            || checkRun.status === 'completed' && checkRun.conclusion === 'success'))
+          return stop('no-ready', { detail: 'hot-patch-ci-unbound', fallback: 'Require a bound Actions test check pending or successful at this SHA; repair evidence and retry.' });
+        try {
+          const pr = await readHotPatchPr();
+          await verifyRuleset({ sha: input.sha, ghJson: hotGh });
+          hotPatch = { pr: pr.number };
+        } catch (e) { return stop('no-ready', { detail: 'hot-patch-pr-protection', error: String(e.message), fallback: 'Repair PR/ruleset evidence or use ordinary delivery.' }); }
+      }
+      if (!hotPatchMode && (checkRun?.sha !== input.sha || checkRun.name !== 'test' || checkRun.appId !== TEST_CHECK_APP_ID || checkRun.status !== 'completed' || checkRun.conclusion !== 'success')) {
         if (!input.urgent) return stop('no-ready', { detail: 'no-passing-test-check', fallback: 'Complete the test check-run on this SHA and retry; repair the reader if evidence is unavailable, incomplete or exceeds 100 checks. --tests-run/--audit are labels only.', ...ciRefusal });
         // A confirmed merge conflict never gets a CI run, so a missing test check is expected there; every other
         // CI refusal (unreadable, unbound, failed) still blocks the urgent path.
@@ -646,7 +720,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const storedFor = (r, key) => (typeof r?.[key] === 'string' && r[key].toLowerCase() === lowerLive && carriesAcross(r.fingerprint, r.fingerprint) ? [r.fingerprint] : []);
       const stored = [...new Set([...storedFor(canonical, 'head'), ...storedFor(out.gate?.record, 'sha')])];
       const producedFp = liveFp || (stored.length === 1 ? stored[0] : null);
-      const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
+      // Disclosed provisional readiness: hotPatch.pr on the urgent-load record marks pending-CI loads.
+      const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: hotPatch && checkRun.status !== 'completed' ? 'pending' : 'green',
         audit: canonical.verdict, testCheck: checkRun, ...(producedFp ? { fingerprint: producedFp } : {}),
         ...(auditGate?.ruledWeakened ? { auditRuling: auditGate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
       out.gate ||= { source: 'canonical-check-run', record: producedReady };
@@ -689,6 +764,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'check-unverifiable';
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
+      if (hotPatchMode && !contains) return stop('no-ready', { detail: 'hot-patch-behind-main',
+        fallback: 'Rebase the PR onto main, retest and audit its new SHA, then request a new immutable hot patch.' });
       let comparison = input.sha;
       // `conflict` is set only after exact-head GitHub evidence and a signed full-suite receipt.
       // Keep that tested head intact: merging main would either refuse its known conflict or
@@ -735,6 +812,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.check = replaceCheck(out.clone, out.effectiveRef, out.effectiveSha, input.replace);
         if (out.check.ok === false && out.check.reason === 'not-contained') return stop('replace-not-contained');
       }
+      if (out.check.stackBases?.some(ref => /^hotpatch\/[a-f0-9]{40}$/.test(ref)))
+        return stop('check-unverifiable', { detail: 'hot-patch-stack-refused',
+          fallback: 'Unload the hot patch and rebase onto main before registering another overlay.' });
       const established = [...new Set(rows.map((r) => r.ref))].filter((ref) => ref !== input.replace);
       const contained = [], blocking = [];
       const overlapping = [], combinedChanged = new Set(effectivePaths);
@@ -853,8 +933,17 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         fs.mkdirSync(dirname(file), { recursive: true });
         fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
       };
+      if (hotPatch) {
+        try {
+          const current = await readTestCheck({ sha: input.sha, branch: input.branch });
+          if (urgentCiFailed || ciRefusal || current?.sha !== input.sha || current.name !== 'test' || current.appId !== TEST_CHECK_APP_ID
+            || !(['queued', 'in_progress'].includes(current.status) || current.status === 'completed' && current.conclusion === 'success')) throw Error('hot-patch CI no longer pending or successful');
+          if ((await readHotPatchPr()).number !== hotPatch.pr) throw Error('hot-patch PR identity changed');
+        } catch (e) { return stop('no-ready', { detail: 'hot-patch-admission-changed', error: String(e.message), fallback: 'Repair PR/CI evidence at this SHA and retry.' }); }
+      }
       if (input.urgent) {
         urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
+        if (hotPatch) urgentIntent.hotPatch = hotPatch;
         if (conflict) urgentIntent.conflict = conflict;
         // Persist intent before any registration mutation; failure refuses admission.
         appendUrgent(urgentIntent);
@@ -992,6 +1081,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out;
     } catch (e) { return stop(stage, { ...(stage === 'no-ready' ? { detail: readinessStep } : {}), error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
+      hotPatchReservation?.release();
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }
       catch (e) { out.ok = false; out.stopReason ||= 'check-unverifiable'; out.recordError = String(e.message || e); }

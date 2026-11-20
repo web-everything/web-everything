@@ -1010,3 +1010,225 @@ describe('production sweep storage and removal guards', () => {
     expect(result.refused).toBe('tip-moved-restored'); expect(restore).toHaveBeenCalledWith('/clone', entry, process.env);
   });
 });
+
+
+// MVP dependency contract: deps.pr(load) reads pulls/<load.hotPatch.pr> and returns REST PR evidence.
+describe('hot-patch sweep (R1100)', () => {
+  const openPr = () => ({ number: 42, state: 'open', merged: false, head: { sha } });
+  function hotFixture(rows) {
+    const f = fixture(rows);
+    const ref = `hotpatch/${sha}`;
+    f.loads[0] = { ...load, ref, repo: 'https://github.com/web-everything/web-everything', hotPatch: { pr: 42 },
+      registration: { clone: load.clone, ref, sha } };
+    f.d.pr = vi.fn(() => openPr());
+    return f;
+  }
+  it.each(['foreign-app', 'malformed'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
+    const failed = check(kind === 'unrelated' ? 'daemon-soak' : 'test', 'failure',
+      kind === 'foreign-app' ? { app: { id: 99 } } : kind === 'unbound' ? { check_suite: { id: 8 } } : {});
+    const f = hotFixture([failed]);
+    if (kind === 'malformed') f.d.checks.mockReturnValue({ total_count: 2, check_runs: [failed], workflows });
+    if (kind === 'required-unreadable') f.d.required.mockImplementation(() => { throw Error('missing workflow'); });
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
+  it.each(['neutral', 'skipped', 'stale'])('unloads completed %s as unknown after 30 minutes', async conclusion => {
+    const f = hotFixture([check('test', conclusion)]);
+    f.d.now = () => new Date(Date.parse(load.at) + 30 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each([29, 30, 31])('missing required smoke is unknown at %i minutes despite a successful bound test', async minutes => {
+    const f = hotFixture([check('test')]);
+    f.d.required.mockReturnValue(['test', 'smoke']);
+    f.d.now = () => new Date(Date.parse(load.at) + minutes * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    const result = await f.run();
+    expect(f.d.remove).toHaveBeenCalledTimes(minutes >= 30 ? 1 : 0);
+    if (minutes >= 30) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    else expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+  });
+  it('unloads pending CI after 31 minutes when PR evidence is unreadable', async () => {
+    const f = hotFixture([check('test', null, { status: 'in_progress' })]);
+    f.d.pr.mockImplementation(() => { throw Error('PR unavailable'); });
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('unloads an Actions failure even when required-job reading fails', async () => {
+    const f = hotFixture([check('daemon-soak', 'failure', { check_suite: { id: 8 } })]);
+    f.d.required.mockImplementation(() => { throw Error('required jobs unavailable'); });
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+  });
+  it('ignores superseded hot-patch failure with a newer successful rerun', async () => {
+    const f = hotFixture([check('test', 'failure'), ...required.map(n => check(n))]);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each(['smoke', 'daemon-soak', 'soak-replay-gate'])('a same-named %s from an unrelated workflow stays missing at 29 minutes and unloads as unknown at 31', async name => {
+    const rows = [check('test'), check(name, null, { status: 'queued', check_suite: { id: 8 } })];
+    const f = hotFixture(rows);
+    f.d.required.mockReturnValue(['test', name]);
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows,
+      workflows: { total_count: 2, workflow_runs: [...workflows.workflow_runs,
+        { check_suite_id: 8, head_sha: sha, path: '.github/workflows/unrelated.yml' }] } });
+    decisionBeforeRemoval(f, 'ci-unknown');
+    f.d.now = () => new Date(Date.parse(load.at) + 29 * 60_000).toISOString();
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each(['test', 'smoke', 'daemon-soak', 'soak-replay-gate'])('accepts required %s presence only from its expected workflow', async name => {
+    const rows = [check('test', null, { status: 'queued' }), check(`${name} (1)`, null, { status: 'queued', check_suite: { id: 8 } })];
+    const f = hotFixture(rows);
+    f.d.required.mockReturnValue([...new Set(['test', name])]);
+    f.d.checks.mockReturnValue({ total_count: rows.length, check_runs: rows,
+      workflows: { total_count: 2, workflow_runs: [...workflows.workflow_runs,
+        { check_suite_id: 8, head_sha: sha, path: name === 'soak-replay-gate' ? '.github/workflows/soak-replay-gate.yml' : '.github/workflows/ci.yml' }] } });
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  describe.each(['queued', 'in_progress'])('newer %s rerun over a completed failure', status => {
+    it.each([29, 30, 31])('uses the failure completed_at clock at %i minutes', async minutes => {
+      const completedAt = Date.parse(load.at) + 60 * 60_000;
+      const f = hotFixture([check('test', 'failure', { completed_at: new Date(completedAt).toISOString() }),
+        ...required.map(n => check(n, n === 'test' ? null : 'success', n === 'test' ? { status } : {}))]);
+      f.d.now = () => new Date(completedAt + minutes * 60_000).toISOString();
+      decisionBeforeRemoval(f, 'ci-unknown');
+      const result = await f.run();
+      expect(f.d.remove).toHaveBeenCalledTimes(minutes >= 30 ? 1 : 0);
+      if (minutes >= 30) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+      else expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+    });
+  });
+  it('a newer completed success supersedes a failure even 31 minutes after completed_at', async () => {
+    const f = hotFixture([check('test', 'failure', { completed_at: load.at }), ...required.map(n => check(n))]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it.each([undefined, 'garbage'])('unloads a superseded failure with missing or invalid completed_at (%s) and a queued rerun', async completedAt => {
+    const f = hotFixture([check('test', 'failure', completedAt === undefined ? {} : { completed_at: completedAt }),
+      ...required.map(n => check(n, n === 'test' ? null : 'success', n === 'test' ? { status: 'queued' } : {}))]);
+    f.d.now = () => new Date(Date.parse(load.at) + 30 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it('keeps the six-hour escalation for a seven-hour pending hot patch', async () => {
+    const f = hotFixture(required.map(n => check(n, null, { status: 'in_progress' })));
+    f.d.now = () => new Date(Date.parse(load.at) + 7 * 3600_000).toISOString();
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+  });
+  it.each([false, 'unreadable'])('expires a 48h merged-but-unproven hot patch: %s', async containment => {
+    const f = hotFixture([check('test', null, { status: 'queued' })]);
+    f.d.pr.mockReturnValue({ ...openPr(), merged: true, state: 'closed' });
+    f.d.mergedOverlay.mockImplementation(() => { if (containment === 'unreadable') throw Error('ancestry unavailable'); return containment; });
+    f.d.now = () => new Date(Date.parse(load.at) + 48 * 3600_000).toISOString();
+    await f.run();
+    expect(f.d.mergedOverlay).toHaveBeenCalled();
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
+  it.each([`hotpatch/${sha}-m1`, `hotpatch/${'b'.repeat(40)}`])('does not grant hot-patch rules to %s', async ref => {
+    const f = hotFixture();
+    f.loads[0] = { ...f.loads[0], ref, registration: { ...f.loads[0].registration, ref } };
+    f.d.pr.mockReturnValue({ ...openPr(), state: 'closed' });
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.pr).not.toHaveBeenCalled();
+  });
+  function decisionBeforeRemoval(f, reason) {
+    f.d.remove.mockImplementation(() => {
+      expect(f.state.at(-1)).toMatchObject({ status: 'unload-decision', reason,
+        trackingId: load.trackingId, ref: f.loads[0].ref, sha, registration: f.loads[0].registration });
+      return { retired: true };
+    });
+  }
+  it.each(['bound test', 'unbound daemon-soak'])('validates %s failure before removal', async kind => {
+    const greenRows = required.map(n => check(n));
+    const failed = kind === 'bound test' ? check('test', 'failure')
+      : check('daemon-soak', 'failure', { check_suite: { id: 8 } });
+    const f = hotFixture([...greenRows, failed]);
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.state.find(r => r.status === 'unload-decision').check).toMatchObject({ head_sha: sha, conclusion: 'failure' });
+  });
+  it('a lane unbound daemon-soak failure only escalates', async () => {
+    const f = fixture([...required.map(n => check(n)), check('daemon-soak', 'failure', { check_suite: { id: 8 } })]);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
+  describe.each(['CI unreadable', 'PR unreadable'])('%s is independently classified', kind => {
+    it.each([29, 31])('at %i minutes', async minutes => {
+      const f = hotFixture();
+      const reader = kind === 'CI unreadable' ? f.d.checks : f.d.pr;
+      reader.mockImplementation(() => { throw new Error('API unavailable'); });
+      f.d.now = () => new Date(Date.parse(load.at) + minutes * 60_000).toISOString();
+      decisionBeforeRemoval(f, 'ci-unknown');
+      const result = await f.run();
+      const shouldUnload = minutes >= 30;
+      expect(f.d.remove).toHaveBeenCalledTimes(shouldUnload ? 1 : 0);
+      if (shouldUnload) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+      else {
+        expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+        if (kind === 'PR unreadable') expect(f.d.pr).toHaveBeenCalledWith(f.loads[0]);
+      }
+    });
+  });
+  it.each([
+    ['head moved after green', { ...openPr(), head: { sha: 'b'.repeat(40) } }, 'pr-head-moved'],
+    ['closed unmerged', { ...openPr(), state: 'closed' }, 'pr-closed'],
+    ['merged at another head', { ...openPr(), state: 'closed', merged: true, head: { sha: 'b'.repeat(40) } }, 'pr-head-moved'],
+  ])('unloads when %s', async (_, pr, reason) => {
+    const f = hotFixture();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    f.d.pr.mockReturnValue(pr);
+    decisionBeforeRemoval(f, reason);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.pr).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.state.find(r => r.status === 'unload-decision')).toMatchObject({ pr });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each([24 * 60 - 1, 24 * 60])('expires an open PR after green at %i minutes', async minutes => {
+    const f = hotFixture();
+    await f.run();
+    f.d.now = () => new Date(Date.parse(load.at) + minutes * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'expired');
+    const result = await f.run();
+    expect(f.d.pr).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.d.remove).toHaveBeenCalledTimes(minutes === 24 * 60 ? 1 : 0);
+    if (minutes === 24 * 60) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+  });
+  it('merged at the loaded sha stays for existing in-main retirement, even after 24h', async () => {
+    const f = hotFixture();
+    f.d.pr.mockReturnValue({ ...openPr(), state: 'closed', merged: true });
+    f.d.mergedOverlay.mockReturnValue(true);
+    f.d.now = () => '2026-11-19T12:00:00Z';
+    await f.run();
+    expect(f.d.pr).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.d.mergedOverlay).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('raises NEEDS-YOU when HEAD still contains the sha 15 minutes after hot-patch unload', async () => {
+    const f = hotFixture([check('test', 'failure')]);
+    await f.run();
+    f.d.escalate.mockClear();
+    f.d.overlayState.mockReturnValue({ corrupt: false, overlays: [] });
+    f.d.now = () => '2026-11-18T12:15:00Z';
+    expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ kind: 'needs-you' }));
+  });
+});

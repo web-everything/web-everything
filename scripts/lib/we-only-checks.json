@@ -1,5 +1,13 @@
 [
   {
+    "file": "scripts/operations/prototype-load-io.mjs",
+    "reason": "R1100 hot-patch is canonical-repo-only (web-everything/web-everything)."
+  },
+  {
+    "file": "scripts/operations/urgent-sweep.mjs",
+    "reason": "R1100 hot-patch is canonical-repo-only (web-everything/web-everything)."
+  },
+  {
     "file": "scripts/operations/urgent-verify-marker.mjs",
     "reason": "The urgent receipt verifier mirrors WE CI's pinned Frontier UI checkout repository and rejects workflow drift; these exact repository literals authenticate the required sibling source, rather than select an implicit gh target."
   },

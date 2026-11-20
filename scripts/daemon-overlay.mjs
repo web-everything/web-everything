@@ -123,7 +123,7 @@ import {
 } from './lib/daemon-overlays.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
-import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
+import { safeRegistrationRef, validSha, testCheckEvidence, testWorkflowBound } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
@@ -179,21 +179,27 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
 }
 
 /**
- * Best-effort, read-only stack evidence. Remote tips are checked only against objects already in root;
- * absent objects contribute no ancestry evidence. The explicit chain map suppresses all gh calls.
+ * Read-only stack evidence. With a registered hot patch, missing objects or failed readers
+ * make independence unknown and registration refuses. Other overlays keep best-effort discovery.
+ * The explicit chain map suppresses all gh calls.
  */
 export function findStackBases({
   root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = spawnSync,
 }) {
   const refs = [...new Set(existingOverlays.map(o => o.ref).filter(r => r !== ref))];
   const via = { chain: [], ancestry: [] };
+  const strict = refs.some(r => /^hotpatch\/[a-f0-9]{40}$/.test(r));
+  let unknown = false;
   const invoke = (cmd, args) => {
     try {
-      return run(cmd, args, {
+      const result = run(cmd, args, {
         cwd: root, encoding: 'utf8', timeout: 15_000,
         env: { ...env, GIT_OPTIONAL_LOCKS: '0' },
       }) ?? { status: null };
+      if (result.error || result.status === null || result.status === undefined) unknown = true;
+      return result;
     } catch {
+      unknown = true;
       return { status: null };
     }
   };
@@ -203,7 +209,8 @@ export function findStackBases({
     try {
       const parsed = JSON.parse(env.WE_DAEMON_OVERLAY_STACK_BASES);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) chainMap = parsed;
-    } catch { /* An invalid test map is empty, never a reason to call gh. */ }
+      else unknown = true;
+    } catch { unknown = true; /* Never fall back to gh for an explicit map. */ }
   }
   let head = ref;
   const seen = new Set([ref]);
@@ -216,21 +223,26 @@ export function findStackBases({
         ? ['pr', 'view', String(pr), '--json', 'baseRefName', '--jq', '.baseRefName']
         : ['pr', 'list', '--head', head, '--state', 'open', '--json', 'baseRefName', '--jq', '.[0].baseRefName'];
       const result = invoke('gh', args);
+      if (result.status !== 0 || result.error || typeof result.stdout !== 'string') unknown = true;
       base = result.status === 0 ? result.stdout : null;
     }
+    if (base != null && typeof base !== 'string') unknown = true;
     base = typeof base === 'string' ? base.trim() : '';
-    if (!base || base === 'null' || seen.has(base)) break;
+    if (base && base !== 'null' && !safeRegistrationRef(base)) unknown = true;
+    if (seen.has(base)) { unknown = true; break; }
+    if (!base || base === 'null') break;
     via.chain.push(base);
     if (base === 'main' || base === 'master') break;
     seen.add(base);
     head = base;
+    if (hop === 11) unknown = true;
   }
 
   if (refs.length) {
     let url = originUrl;
     if (!url) {
       const result = invoke('git', ['-C', root, 'remote', 'get-url', 'origin']);
-      url = result.status === 0 ? String(result.stdout ?? '').trim() : null;
+      url = result.status === 0 && !result.error ? String(result.stdout ?? '').trim() : null;
     }
     if (url) {
       const result = invoke('git', ['ls-remote', url, ...[ref, ...refs].map(r => `refs/heads/${r}`)]);
@@ -244,16 +256,23 @@ export function findStackBases({
         if (candidate) {
           for (const base of refs) {
             const tip = tips.get(base);
-            if (tip && invoke('git', ['merge-base', '--is-ancestor', tip, candidate]).status === 0) {
-              via.ancestry.push(base);
+            if (!tip) { unknown = true; continue; }
+            const ancestry = invoke('git', ['merge-base', '--is-ancestor', tip, candidate]);
+            if (ancestry.error || ![0, 1].includes(ancestry.status)) unknown = true;
+            if (ancestry.status === 0) via.ancestry.push(base);
+            if (/^hotpatch\/[a-f0-9]{40}$/.test(base) && tip !== base.slice(9)) {
+              // A moved remote ref cannot hide ancestry of the immutable patch SHA.
+              const pinned = invoke('git', ['merge-base', '--is-ancestor', base.slice(9), candidate]);
+              if (pinned.error || ![0, 1].includes(pinned.status)) unknown = true;
+              if (pinned.status === 0) via.ancestry.push(base);
             }
           }
-        }
-      }
-    }
+        } else unknown = true;
+      } else unknown = true;
+    } else unknown = true;
   }
   const found = new Set([...via.chain, ...via.ancestry]);
-  return { bases: refs.filter(r => found.has(r)), via };
+  return { bases: refs.filter(r => found.has(r)), via, ...(strict ? { unknown } : {}) };
 }
 
 /** Retry a conflicting preview with the candidate's registered bases set aside, like stack-tops rebuild. */
@@ -262,9 +281,21 @@ export async function stackAwareOverlayCheck({
   preview = previewOverlayConflict, stackBases = findStackBases,
 }) {
   const options = { root, ref, pr, existingOverlays, env, originUrl };
-  const { bases, via } = await stackBases(options);
-  const full = await preview(options);
+  const strict = existingOverlays.some(o => /^hotpatch\/[a-f0-9]{40}$/.test(o.ref));
+  let result;
+  try { result = await stackBases(options); } catch (error) {
+    if (!strict) throw error;
+    return { ok: false, reason: 'hot-patch-stack-refused' };
+  }
+  const { bases, via } = result ?? {};
+  if (strict && (result?.unknown !== false || !Array.isArray(bases)
+    || !via || !Array.isArray(via.chain) || !Array.isArray(via.ancestry)))
+    return { ok: false, reason: 'hot-patch-stack-refused',
+      fallback: 'NEEDS-YOU: prove hot-patch independence with readable ancestry or unload it before registering.' };
   const evidence = { stackBases: bases, stackVia: via };
+  if ([...bases, ...(via?.chain ?? []), ...(via?.ancestry ?? [])].some(base => /^hotpatch\/[a-f0-9]{40}$/.test(base)))
+    return { ok: false, reason: 'hot-patch-stack-refused', ...evidence };
+  const full = await preview(options);
   if (!full.ok || full.clean || bases.length === 0) return { ...full, ...evidence };
   const sa = await preview({ ...options, existingOverlays: existingOverlays.filter(o => !bases.includes(o.ref)) });
   if (!sa.ok) return { ...full, ...evidence };
@@ -506,14 +537,21 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     return result.stdout.trim();
   };
   const state = readOverlayState(root, { env });
+  const refuseDependents = (reason, dependents) => {
+    if (/^hotpatch\/[a-f0-9]{40}$/.test(ref)) appendOverlayEvent(root, {
+      kind: 'needs-you', ref, alert: true, dependents,
+      reason: `NEEDS-YOU: hot-patch withdrawal refused; inspect dependents: ${dependents.join(', ')}. Retain registrations and resolve dependencies manually.`,
+    }, { env });
+    return { action: 'keep', reason };
+  };
   if (state.corrupt) return { action: 'keep', reason: 'stacked-or-unreadable' };
   if (state.overlays.some((r) => r.stackVia !== undefined && (!r.stackVia
     || typeof r.stackVia !== 'object' || Array.isArray(r.stackVia)
     || !Object.values(r.stackVia).every((bases) => Array.isArray(bases) && bases.every(safeRegistrationRef)))))
     return { action: 'keep', reason: 'unreadable-stack-evidence' };
-  const stacked = state.overlays.some((r) => r.ref !== ref && (r.stackBases?.includes(ref)
+  const stacked = state.overlays.filter((r) => r.ref !== ref && (r.stackBases?.includes(ref)
     || Object.values(r.stackVia || {}).flat().includes(ref)));
-  if (stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  if (stacked.length) return refuseDependents('stacked-or-unreadable', stacked.map(r => r.ref));
   const current = requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0];
   // stackBases is only a cache. Re-prove ancestry under the add guard so
   // an uncached or newly registered stack top cannot lose its base.
@@ -527,7 +565,7 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     if (!validSha(otherTip)) return { action: 'keep', reason: 'stacked-dependents' };
     const ancestry = git('merge-base', '--is-ancestor', tip, otherTip);
     if (![0, 1].includes(ancestry.code)) throw new Error('ancestry unverifiable; inspect stacked dependents before unloading manually');
-    if (ancestry.code === 0) return { action: 'keep', reason: 'stacked-dependents' };
+    if (ancestry.code === 0) return refuseDependents('stacked-dependents', [other.ref]);
   }
   return { action: 'retire', tip: current, reason };
 }
@@ -578,10 +616,44 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       const at = Date.parse(decision?.at), loadedAt = Date.parse(load.at);
       const matches = decision?.clone === root && decision.ref === load.ref && decision.sha === load.sha
         && isDeepStrictEqual(decision.registration, load.registration);
-      const negative = decision?.reason === 'ci-failed'
+      // Only immutable hot-patch loads may use the shorter unknown clock or PR lifecycle evidence.
+      const hotPatch = validSha(load.sha) && load.ref === `hotpatch/${load.sha}`
+        && load.registration.ref === load.ref && load.registration.sha === load.sha;
+      if (typeof load.ref === 'string' && load.ref.startsWith('hotpatch/') && !hotPatch)
+        return refuse('urgent-decision-required');
+      let hotNegative = false;
+      let currentFailure = false;
+      if (hotPatch && ['ci-unknown', 'ci-failed', 'expired', 'pr-head-moved', 'pr-closed'].includes(decision?.reason)) {
+        // The add guard covers all readers and mutation: persisted evidence alone is never current authority.
+        const { createSweepDeps, hotPatchCiEvidence, validateChecks, latestActionFailure } = await import('./operations/urgent-sweep.mjs');
+        const readers = () => createSweepDeps({ env, home: env.HOME });
+        let unknown = false, pr;
+        try {
+          const checks = await (deps.readUrgentChecks ?? (r => readers().checks(r)))(load);
+          validateChecks(checks, load.sha);
+          currentFailure = Boolean(latestActionFailure(checks, load.sha));
+          const required = await (deps.readUrgentRequired ?? ((r, path) => readers().required(r, path)))(load, checks.testWorkflowPath);
+          hotPatchCiEvidence(checks, load.sha, required, Date.now());
+        } catch { unknown = true; }
+        try {
+          pr = await (deps.readUrgentPr ?? (r => readers().pr(r)))(load);
+          if (!Number.isSafeInteger(load.hotPatch?.pr) || load.hotPatch.pr <= 0
+            || pr?.number !== load.hotPatch.pr || !['open', 'closed'].includes(pr.state)
+            || typeof pr.merged !== 'boolean' || !validSha(pr.head?.sha)) throw Error('unreadable PR');
+        } catch { unknown = true; pr = null; }
+        const unknownEligible = at - loadedAt >= 30 * 60 * 1000;
+        if (decision.reason === 'ci-unknown') hotNegative = unknown && unknownEligible;
+        else if (decision.reason === 'ci-failed') hotNegative = currentFailure || (unknown && unknownEligible);
+        else if (pr) hotNegative = (
+          decision.reason === 'expired' && at - loadedAt >= 24 * 60 * 60 * 1000
+            && !(pr.merged && pr.head.sha === load.sha)
+          || decision.reason === 'pr-head-moved' && pr.head.sha !== load.sha
+          || decision.reason === 'pr-closed' && pr.state === 'closed' && pr.merged === false);
+      }
+      const negative = hotNegative || (!hotPatch && decision?.reason === 'ci-failed'
         ? decision.check?.head_sha === load.sha && decision.check.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(decision.check.conclusion)
-        : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000;
+        : decision?.reason === 'ci-expired' && Number.isFinite(loadedAt) && at - loadedAt >= 24 * 60 * 60 * 1000);
       if (!matches || !/^[a-f0-9]{40}$/.test(load.sha ?? '') || typeof load.ref !== 'string'
         || !Number.isFinite(loadedAt) || !Number.isFinite(at) || at < loadedAt || at > Date.now() || !negative) return refuse('urgent-decision-required');
       let withdrawal;
@@ -634,7 +706,9 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
  * otherwise `old` is restored (`replace-raced-restored`). Same lock and drop intent as retire.
  * `deps` ({contain, check, tip, afterDrop}) is a test seam.
  */
-export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, deps = {} }) {
+export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, hotPatchProvenance = false, deps = {} }) {
+  if (typeof ref === 'string' && ref.startsWith('hotpatch/') && hotPatchProvenance !== true)
+    return { ok: false, refused: 'hot-patch-provenance-required', code: 3 };
   const contain = deps.contain ?? (() => proveReplaceContainment({ root, oldRef: old, newRef: ref, expectedSha, env }));
   const conflictCheck = deps.check ?? ((existingOverlays) => stackAwareOverlayCheck({ root, ref, pr, existingOverlays, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
@@ -647,6 +721,7 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (oldEntry.edgeResolution) return { ok: false, refused: 'replaced-has-edge-resolution', code: 3 };
     const containment = contain();
     if (!containment.ok) return { ok: false, refused: containment.reason, containment, code: containment.reason === 'sha-moved' ? 3 : 1 };
+    if (/^hotpatch\/[a-f0-9]{40}$/.test(old)) return { ok: false, refused: 'hot-patch-stack-refused', containment, code: 1 };
     if (!containment.contained) return { ok: false, refused: 'not-contained', containment, code: 3 };
     const check = await conflictCheck(state.overlays.filter((o) => o?.ref !== old));
     warnSetAside(check);
@@ -853,7 +928,7 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
   }
 }
 
-export async function main(argv = process.argv.slice(2), deps = {}) {
+export async function main(argv = process.argv.slice(2), deps = {}, { hotPatchProvenance = false } = {}) {
   const [cmd, ...rest] = argv;
   if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops', 'stale'].includes(cmd)) {
     fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops|stale, got ${JSON.stringify(cmd ?? null)}`);
@@ -870,6 +945,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 
   if (cmd !== 'list' && cmd !== 'stale' && cmd !== 'recover-drops' && typeof flags.ref !== 'string') {
     return fail(`--ref=<branch> is required for ${cmd}`);
+  }
+  // Only prototype-load's validated hot-patch path supplies this in-process option.
+  // Never derive it from parsed flags or the environment, including for --check.
+  if (['add', 'replace'].includes(cmd) && flags.ref.startsWith('hotpatch/') && hotPatchProvenance !== true) {
+    const refused = 'hot-patch-provenance-required';
+    process.stderr.write(`daemon-overlay: REFUSED ${refused}; use prototype-load's hot-patch path.\n`);
+    if (flags.json) process.stdout.write(`${JSON.stringify({ registered: false, replaced: false, refused,
+      check: { ok: false, reason: refused }, wouldRegister: false, wouldReplace: false })}\n`);
+    process.exitCode = 3;
+    return;
   }
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
     return fail('--sha=<full 40-hex tip of origin/edge/<ref>> is required for approve-edge');
@@ -1073,6 +1158,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     }
     const r = await replaceRegistration({
       root, ref: flags.ref, old, expectedSha: flags['expected-sha'], pr, by, reason, pinned, env, checkOnly: !!flags.check,
+      hotPatchProvenance,
     });
     if (r.code) process.exitCode = r.code;
     if (!asJson && !r.ok) {
