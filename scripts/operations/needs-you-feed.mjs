@@ -9,6 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { liveResultGateState, breakClass, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
@@ -99,8 +100,12 @@ export function itemsFromReport(report) {
 // Strict fallback: every confirmed break is owed a send-back and no finding class defers to a card.
 const ALERT_BREAK_POLICY = Object.freeze({ broken: 'send-back', degraded: 'send-back', unconfirmed: 'advisory', findingClasses: Object.freeze({}) });
 /** The shared reader; a missing file or an unset/invalid broken/degraded value is unreadable (strict), never a default. */
-export function readBreakPolicy() {
-  const read = readConfirmedBreaks({ strict: true });
+export function readBreakPolicy({ env = process.env } = {}) {
+  // Unreadable or absent finding-class preferences are unreadable policy: the class reader would silently default to deferrals.
+  const prefs = readPlatformPreferences({ env, warn: () => {} });
+  const classes = prefs.prefs.findingClasses;
+  if (prefs.errors.length || !classes || typeof classes !== 'object' || Array.isArray(classes)) throw new Error('findingClasses preferences are unreadable');
+  const read = readConfirmedBreaks({ env, strict: true });
   if (read.source?.broken === 'default' || read.source?.degraded === 'default') throw new Error('confirmedBreaks is not set');
   return read.value;
 }
@@ -278,6 +283,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
       const cardByPolicy = new Set(planRedTeamActions(state.result, policy).card.map(f => f.index));
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.kind !== 'block'
+        && (r.keys ?? []).includes(f.index) // the shared reader lists every finding's rulings: settle per break key only
         && (r.source === 'operator' || (!strict && r.kind === 'card' && breakClass(f) !== 'broken' && cardByPolicy.has(f.index))));
       // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
       // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.

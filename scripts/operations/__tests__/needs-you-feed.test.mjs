@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
-import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
+import { feedPath, diffFeed, itemsFromReport, parseFeedLine, appendLines, replay, unacknowledged, acknowledge, resolveSettings, runOnce, gateReadyItems, readBreakPolicy, REPORT_KINDS, GATE_KINDS, assertProducerCheckout, monitorCommand, main, sidecarsOf } from '../needs-you-feed.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { GATE_OUTCOMES, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
@@ -483,6 +483,16 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
           body: `${redTeamGateMarker(5768, head, GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` }];
       expect(await kind(comments, () => { throw new Error('unreadable'); })).toBe('confirmed-break-owed-send-back');
       expect(await kind(comments, () => cardPolicy)).toBe('needs-you');
+    });
+    it('a card record covering only #1 does not settle uncarded #2', async () => {
+      const [res, rec] = gateComments({ outcome: GATE_OUTCOMES.CARD_QUEUED, broken: true, impact: 'degraded', count: 2 });
+      const one = { ...rec, body: `${rec.body}\n- 1 finding(s) filed as a follow-up card (#1).` };
+      expect(await kind([res, one], () => cardPolicy)).toBe('confirmed-break-owed-send-back');
+    });
+    it.each([['missing', null], ['malformed', '{not json'], ['without findingClasses', '{}']])('readBreakPolicy refuses (strict) when the class preferences are %s', (_n, content) => {
+      const dir = temp(), file = join(dir, 'prefs.json');
+      if (content !== null) writeFileSync(file, content);
+      expect(() => readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: file } })).toThrow(/unreadable/);
     });
     it('an unreadable setting falls back to the strict policy (alarm)', async () => {
       const comments = queued('degraded', 2);
