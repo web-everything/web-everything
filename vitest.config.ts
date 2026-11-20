@@ -125,6 +125,7 @@ export default defineConfig({
       // #1047: WE's plug tests relocated to FUI (the canonical impl home) when `we:plugs/` was deleted.
       'blocks/**/__tests__/**/*.test.{ts,tsx}',
       'src/**/__tests__/**/*.test.{ts,tsx}', // build-time data files (e.g. burndown accounting)
+      'scripts/lib/resource-pool*.test.mjs',
       'scripts/**/__tests__/**/*.test.mjs', // build/CI tooling (e.g. conformance auto-fix engine, #095)
       'scripts/lib/red-team-gate-catchup.test.mjs', // Co-located Gap 1 regression suite.
       'skills-src/**/__tests__/**/*.test.mjs', // skill-local mechanism modules (e.g. the conveyor headless runner, #2702)

@@ -241,7 +241,8 @@ describe('health-investigate on the declared dispatch-lane operation', () => {
     expect(argv.slice(0, 3)).toEqual(['--bg', '-n', r.session]);
     const deny = argv.find((a) => a.startsWith('--disallowedTools='));
     const rules = deny.slice('--disallowedTools='.length).split(',');
-    for (const must of ['Edit', 'Write', 'Bash(gh pr comment:*)', 'Bash(gh:*)', 'Bash(git:*)', `Bash(node ${root}/scripts/operations/run.mjs dispatch-lane:*)`, `Bash(node ${root}/scripts/operations/run.mjs urgent-verify:*)`, `Bash(node ${root}/scripts/operations/run.mjs urgent-sweep:*)`]) {
+    for (const must of ['Edit', 'Write', 'Bash(gh pr comment:*)', 'Bash(gh:*)', 'Bash(git:*)', `Bash(node ${root}/scripts/operations/run.mjs dispatch-lane:*)`, `Bash(node ${root}/scripts/operations/run.mjs urgent-verify:*)`, `Bash(node ${root}/scripts/operations/run.mjs urgent-sweep:*)`,
+      `Bash(node ${root}/scripts/operations/run.mjs resource-pool:*)`, 'Bash(node scripts/operations/run.mjs resource-pool:*)']) {
       expect(rules, must).toContain(must);
     }
     const allow = argv.find((a) => a.startsWith('--allowedTools='));

@@ -55,6 +55,15 @@ const ranges = [
   ['redTeamQueue.minConcurrent', 0, 24],
   ['redTeamQueue.maxProbesPerTick', 0, 50],
   ['deliveryCapacity.pinUnits', 1, 200],
+  ['resourcePool.builderFloor', 0, 64],
+  ['resourcePool.class.1.reserve', 0, 64],
+  ['resourcePool.class.1.max', 0, 64],
+  ['resourcePool.class.2.reserve', 0, 64],
+  ['resourcePool.class.2.max', 0, 64],
+  ['resourcePool.class.3.reserve', 0, 64],
+  ['resourcePool.class.3.max', 0, 64],
+  ['resourcePool.class.4.reserve', 0, 64],
+  ['resourcePool.class.4.max', 0, 64],
 ];
 const EXPIRY_LEAVES = ['deliveryCapacity.pinUntil', 'deliveryCapacity.holdUntil']; // epoch-ms expiries, covered by delivery-capacity-override tests
 
@@ -105,7 +114,7 @@ describe('capacity-only operator store', () => {
   });
   it.each(ranges)('%s declares a safe direction and finite fail-closed fallback', key => {
     const leaf = store.CAPACITY_LEAVES[key];
-    expect(leaf.direction).toBe(key.endsWith('raiseMinMemFreePct') ? 'threshold' : 'cap');
+    expect(leaf.direction).toBe(key.endsWith('raiseMinMemFreePct') || key.endsWith('builderFloor') || key.endsWith('.reserve') ? 'threshold' : 'cap');
     expect(Number.isFinite(leaf.failClosedFallback)).toBe(true);
     expect(leaf.validate(leaf.failClosedFallback)).toBe(true);
     if (key === 'reviewConcurrency.maxLiveReviewRounds') expect(leaf.failClosedFallback).toBe(3);
