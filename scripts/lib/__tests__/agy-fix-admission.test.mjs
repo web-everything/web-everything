@@ -151,8 +151,10 @@ it('keeps tests directory scopes admissible while refusing them as applied files
   expect(admit({ size: 1, scope: ['tests'] })).toEqual({ kind: 'test-fix', size: 1, scope: ['tests'] });
 });
 
-it('documents kindMaxSize as direct-build-only while repair dispatch stays size 1', () => {
+it('marks every agy-build settings key direct-only while repair dispatch stays size 1', () => {
   const text = readFileSync(new URL('../../../docs/agent/testing.md', import.meta.url), 'utf8');
+  const settings = JSON.parse(readFileSync(new URL('../../settings/agy-build.json', import.meta.url), 'utf8'));
+  for (const key of Object.keys(settings)) expect(text).toContain(`| \`${key}\` | Direct build only |`);
   expect(text).toContain('For direct `runConfinedAgyBuild` calls only');
   expect(text).toContain('Repair dispatch always requires `size === 1`');
   expect(admit({ taskKind: 'doc-fix', size: 3, scope: ['docs'] })).toBeNull();

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runConfinedAgyBuild } from '../agy-confined-build.mjs';
@@ -133,6 +133,15 @@ describe('agy build fail-closed admission', () => {
     expect((await f.run(undefined, { input: { kind: 'feature', size: 2 },
       env: { WE_AGY_BUILD_KINDS: 'feature', WE_AGY_BUILD_MAX_SIZE: '2' } })).status).toBe('ok');
   });
+  it.each([
+    { settings: { maxSize: 2 } },
+    { settings: { maxSize: 0 }, env: { WE_AGY_BUILD_MAX_SIZE: '2' } },
+  ])('maxSize widening admits a kind outside allowedKinds: %j', async options => {
+    const f = fixture();
+    expect(await f.run(undefined, { ...options, input: { kind: 'feature', size: 2 } }))
+      .toMatchObject({ status: 'ok', applied: [] });
+    expect(f.spawnAgy).toHaveBeenCalledOnce();
+  });
   it('env narrowing wins over widened settings', async () => {
     const f = fixture();
     expect((await f.run(undefined, { input: { kind: 'feature', size: 2 },
@@ -159,6 +168,101 @@ describe('agy build fail-closed admission', () => {
 });
 
 describe('launcher-owned atomic application', () => {
+  it('voids an oversized worker snapshot before diffing with a provider fallback', async () => {
+    const f = fixture();
+    let post;
+    const result = await f.run(dir => {
+      writeFileSync(join(dir, 'docs/huge.md'), '');
+      truncateSync(join(dir, 'docs/huge.md'), 64 * 1024 * 1024 + 1);
+      post = f.commands.length;
+    });
+    expect(result).toMatchObject({ status: 'voided', applied: [] });
+    expect(result.reasons.join(' ')).toContain('next fix provider');
+    expect(f.commands.slice(post).some(args => args.includes('--raw'))).toBe(false);
+  });
+  it('preserves unchanged internal baseline symlinks without following worker links', async () => {
+    const f = fixture();
+    symlinkSync('a.md', join(f.lane, 'docs/reference'));
+    commit(f.lane);
+    expect(await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n')))
+      .toMatchObject({ status: 'ok', applied: ['docs/a.md'] });
+    expect(lstatSync(join(f.lane, 'docs/reference')).isSymbolicLink()).toBe(true);
+  });
+  it.each([false, true])('refuses JavaScript files under __fixtures__ at admission and application (tracked=%s)', async tracked => {
+    const path = 'src/__tests__/__fixtures__/payload.js';
+    const f = fixture();
+    if (tracked) {
+      mkdirSync(dirname(join(f.lane, path)), { recursive: true });
+      writeFileSync(join(f.lane, path), 'before\n');
+      commit(f.lane);
+    }
+    expect(deriveAgyFixAdmission({ size: 1, scope: [path] }, { scope: [path] })).toBeNull();
+    expect(await f.run(dir => {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), 'after\n');
+    }, { input: { scope: ['src/__tests__'] } })).toMatchObject({ status: 'voided', applied: [] });
+    expect(git(f.lane, 'status', '--porcelain')).toBe('');
+  });
+  it('never executes a clean filter planted after the control hash', async () => {
+    const f = fixture();
+    const marker = join(f.root, 'filter-executed');
+    let post = false;
+    let planted = false;
+    const result = await f.run(dir => {
+      writeFileSync(join(dir, 'docs/a.md'), 'after\n');
+      post = true;
+    }, { beforeExec: (args, dir) => {
+      // The real-lane snapshot happens after the post-worker control check.
+      if (post && !planted && args.includes(f.lane)) {
+        planted = true;
+        writeFileSync(join(dir, '.git/config'), `[filter "attack"]\n clean = touch '${marker}'\n`);
+        writeFileSync(join(dir, '.gitattributes'), '* filter=attack\n');
+      }
+    } });
+    expect(planted).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    expect(result).toMatchObject({ status: 'voided', applied: [] });
+  });
+  it('never executes a delayed surviving writer clean filter after the control hash', async () => {
+    const f = fixture();
+    const go = join(f.root, 'go'), done = join(f.root, 'done'), marker = join(f.root, 'executed');
+    let writer, exited, post = false, triggered = false;
+    try {
+      const result = await f.run(async dir => {
+        writeFileSync(join(dir, 'docs/a.md'), 'after\n');
+        writer = spawn(process.execPath, ['--input-type=module', '-e', `
+          import { existsSync, writeFileSync } from 'node:fs';
+          const [dir, go, done, marker] = process.argv.slice(1);
+          const timer = setInterval(() => {
+            if (!existsSync(go)) return;
+            writeFileSync(dir + '/.git/config', '[filter "attack"]\\n clean = touch "' + marker + '"\\n');
+            writeFileSync(dir + '/.gitattributes', '* filter=attack\\n');
+            writeFileSync(done, 'ready');
+            clearInterval(timer);
+          }, 5);
+          setTimeout(() => process.exit(2), 10000).unref();
+          process.stdout.write('ready');
+        `, dir, go, done, marker], { stdio: ['ignore', 'pipe', 'pipe'] });
+        exited = new Promise(resolve => writer.on('close', resolve));
+        await new Promise((resolve, reject) => { writer.stdout.once('data', resolve); writer.once('error', reject); });
+        post = true;
+      }, { beforeExec: args => {
+        if (!post || triggered || !args.includes(f.lane)) return;
+        triggered = true;
+        writeFileSync(go, 'go');
+        // Allow the separate process to mutate controls while the launcher is in its post-hash window.
+        execFileSync(process.execPath, ['-e', `
+          const fs = require('node:fs');
+          const timer = setInterval(() => { if (fs.existsSync(process.argv[1])) { clearInterval(timer); } }, 5);
+        `, done], { timeout: 5000 });
+      } });
+      expect(triggered).toBe(true);
+      expect(await exited).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      expect(result).toMatchObject({ status: 'voided', applied: [] });
+      expect(git(f.lane, 'status', '--porcelain')).toBe('');
+    } finally { writer?.kill(); if (exited) await exited; }
+  });
   it.each(admissibleTargets)('admits and applies allowlisted path %s inside scope', async path => {
     const f = fixture();
     expect(deriveAgyFixAdmission({ taskKind: 'feature', size: 1, scope: [path] }, { scope: [path] })).not.toBeNull();
@@ -226,7 +330,7 @@ describe('launcher-owned atomic application', () => {
       .toMatchObject({ status: 'ok', applied: ['docs/guide.md'] });
     expect(readFileSync(join(f.lane, 'docs/guide.md'), 'utf8')).toBe('after\n');
   });
-  it('pins every post-run clone git call, including untracked diff generation', async () => {
+  it('uses only a launcher-owned repository for post-run diff generation', async () => {
     const f = fixture();
     let post;
     expect((await f.run(dir => {
@@ -234,11 +338,17 @@ describe('launcher-owned atomic application', () => {
       writeFileSync(join(dir, 'docs/guide.md'), 'new\n');
       post = f.execCalls.length;
     })).status).toBe('ok');
-    const calls = f.execCalls.slice(post).filter(c => c.opts.env.GIT_WORK_TREE === f.clone());
-    expect(calls).toHaveLength(5);
+    const after = f.execCalls.slice(post);
+    expect(after.some(c => c.args.includes(f.clone()) || c.opts.cwd === f.clone()
+      || c.opts.env.GIT_WORK_TREE === f.clone())).toBe(false);
+    const calls = after.filter(c => c.opts.env.GIT_WORK_TREE);
+    expect(calls).toHaveLength(4);
     for (const { args, opts } of calls) {
-      expect(opts.env).toMatchObject({ GIT_DIR: join(f.clone(), '.git'), GIT_COMMON_DIR: join(f.clone(), '.git'),
-        GIT_WORK_TREE: f.clone(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+      const trusted = opts.env.GIT_WORK_TREE;
+      expect(trusted).not.toBe(f.clone());
+      expect(existsSync(trusted)).toBe(false); // launcher cleans its diff repository too
+      expect(opts.env).toMatchObject({ GIT_DIR: join(trusted, '.git'), GIT_COMMON_DIR: join(trusted, '.git'),
+        GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
         GIT_NO_REPLACE_OBJECTS: '1', GIT_ALTERNATE_OBJECT_DIRECTORIES: '' });
       expect(args).toEqual(expect.arrayContaining(['core.attributesFile=/dev/null', 'core.fsmonitor=false',
         'core.hooksPath=/dev/null', 'core.pager=cat', 'diff.external=']));
@@ -570,8 +680,10 @@ describe('final patch enforcement', () => {
     }
     let mutated = false;
     expect(await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), {
-      beforeExec: (args, dir) => {
+      beforeExec: (args) => {
         if (!mutated && args.includes('diff') && args.includes('--binary') && !args.includes('--no-index')) {
+          // Synthetic corruption of the launcher-owned final artifact must still be rejected.
+          const dir = args[args.indexOf('-C') + 1];
           mutated = true;
           writeFileSync(join(dir, path), 'changed\n');
           if (path.endsWith('.json')) git(dir, 'add', path);
@@ -587,8 +699,9 @@ describe('final patch enforcement', () => {
     const f = fixture();
     let mutated = false;
     expect(await f.run(dir => writeFileSync(join(dir, 'docs/a.md'), 'after\n'), {
-      beforeExec: (args, dir) => {
+      beforeExec: (args) => {
         if (!mutated && args.includes('diff') && args.includes('--binary') && !args.includes('--no-index')) {
+          const dir = args[args.indexOf('-C') + 1];
           mutated = true;
           if (mode.startsWith('new file')) {
             writeFileSync(join(dir, 'docs/new.md'), 'new\n');

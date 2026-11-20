@@ -203,11 +203,13 @@ it.skipIf(process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec'))
   },
 );
 
-it('documents that direct write and home-read confinement excludes service-mediated writes', () => {
+it('documents that direct write and home-read confinement excludes service-mediated writes and secret reads', () => {
   for (const path of ['../agy-sandbox.mjs', '../../../docs/agent/testing.md']) {
     const text = readFileSync(new URL(path, import.meta.url), 'utf8');
     expect(text).toContain("process's own file writes and home reads");
     expect(text).toContain('Mach/XPC/LaunchServices-mediated writes');
+    expect(text).toContain('Service-mediated secret reads');
+    for (const channel of ['securityd', 'gh auth token', 'ssh-agent']) expect(text).toContain(channel);
     for (const command of ['defaults', 'open', 'osascript', 'launchctl']) expect(text).toContain(command);
     expect(text).toContain('out of scope');
   }

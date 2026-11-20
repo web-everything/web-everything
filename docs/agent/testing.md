@@ -4871,6 +4871,14 @@ file/directory scope prefixes (at most 20 entries). For direct `runConfinedAgyBu
 any kind with size at/below `maxSize` remains admitted (R1062). Missing/nonfinite sizes refuse;
 settings must remain readable, with environment overrides above settings above defaults.
 Repair dispatch always requires `size === 1`, independently of these direct-build settings.
+The settings surface is explicitly direct-only; raising these values does not widen production repair dispatch.
+
+| Setting | Reachability |
+| --- | --- |
+| `allowedKinds` | Direct build only |
+| `kindMaxSize` | Direct build only |
+| `maxSize` | Direct build only |
+
 Keep whole-run rejection cases for mixed scope, Git controls, escaping/new symlinks, modes,
 binary/submodule changes, traversal, Git calls, moved HEAD, changed real lane and incomplete
 or rewritten transcripts. The launcher applies the admitted patch without staging or committing.
@@ -4891,12 +4899,16 @@ No token or settings are copied and no private HOME is created or deleted.
 The profile confines the process's own file writes and home reads. Mach/XPC/LaunchServices-mediated writes
 (`defaults`, `open`, `osascript`, `launchctl`) are out of scope. No service-mediated write protection
 is claimed; the REAL probes below exercise direct file IO only (doc-presence regression).
+Service-mediated secret reads (`securityd`, `gh auth token`, `ssh-agent`) are also out of scope.
+The direct file denies do not prevent Keychain services or agent sockets from serving credentials.
 Direct file writes are default-denied, with exactly the disposable clone, per-run private temp directory,
 `~/.gemini/antigravity-cli/log` (subpath), and `/dev/null`, `/dev/tty`, `/dev/dtracehelper` granted.
 `AGY_STATE_WRITE_DIRS` names exactly the measured log requirement; extend it only with measured evidence.
 The private temp is made outside the clone, lane and home workspace. The transcript directory is
 outside every write grant; the launcher removes only its own temporary directories after the run.
 Redirected log directories refuse with a provider/operator fallback rather than widening write access.
+The shared log directory is still writable: planted entries could affect a later unsandboxed logger.
+Per-run log isolation is tracked in #x9ffusk; service-mediated credential isolation is tracked in #x6wh6fe.
 
 Home reads are denied by default, then reopened only for the disposable clone, private temp,
 real-HOME `.gemini` state and the resolved agy binary directory/Homebrew prefix. Keep this
@@ -4959,10 +4971,18 @@ narrow it, with criticality re-checked), before the normal review and audit path
 for agy's API. Mach/XPC/LaunchServices-mediated access remains out of scope; direct-file probes do not establish service isolation.
 Size-1 jobs of any kind are also admitted by R1062; neither is a confinement claim.
 
-The launcher hashes clone Git redirect/configuration controls with filesystem reads before any
-post-run Git invocation; unreadable or changed controls and a missing Git directory void the run. Clone Git reads
-pin both Git directories and the work tree, disable external diff/textconv and external configuration,
-and never accept clone controls as routing authority. Recheck every tracked and untracked diff path
+The launcher hashes clone Git redirect/configuration controls with filesystem reads; unreadable or
+changed controls and a missing Git directory void the run. The detached exclusive-transcript worker
+group is stopped on exit, before pipe close returns evidence. Post-run host Git never runs against
+the worker clone: a second repository created before launch owns its Git metadata, index and copied
+work tree, outside all worker write grants. Regular-file bytes are copied; unchanged baseline symlinks
+are recreated from trusted Git objects without dereferencing them. New/changed links and special files
+refuse. Worker Git metadata is never copied, so a post-hash clean-filter configuration cannot execute
+on the host. Ignored additions are enumerated too. Git reads in the launcher-owned repository pin
+both Git directories and the work tree and disable external diff/textconv and external configuration.
+Snapshot capture is bounded to 100,000 entries, depth 128, 64 MiB per file and 1 GiB total;
+exceeding a bound voids the run with a next-provider fallback before patch generation.
+Recheck every tracked and untracked diff path
 against the shared critical-work verdict as well as the allowlist predicate before applying anything.
 Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal
 of critical descendants within an otherwise permitted directory scope.

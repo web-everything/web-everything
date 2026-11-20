@@ -2,7 +2,7 @@
  * The launcher alone applies admitted hunks; agy's git operations remain forbidden. */
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { escapingSymlinks, gitControlFiles, snapshotCheckout, changedControl, changedCheckouts,
@@ -45,11 +45,56 @@ function cloneGitControls(clone) {
   record('.git', 'dir');
   if (out['.git'] === null) throw new Error('missing clone git directory');
   for (const p of ['info', 'objects', 'objects/info', 'refs']) record(`.git/${p}`, 'dir');
-  for (const p of ['commondir', 'HEAD', 'config', 'info/attributes', 'info/exclude', 'objects/info/alternates', 'shallow'])
+  for (const p of ['commondir', 'HEAD', 'packed-refs', 'config', 'info/attributes', 'info/exclude', 'objects/info/alternates', 'shallow'])
     record(`.git/${p}`, 'file');
-  for (const p of ['worktrees', 'modules', 'refs/replace', 'hooks']) record(`.git/${p}`, 'dir', true);
+  for (const p of ['worktrees', 'modules', 'refs', 'hooks']) record(`.git/${p}`, 'dir', true);
   record('.gitattributes', 'file');
   return out;
+}
+
+// Materialize bytes, never worker Git metadata, in a launcher-owned work tree. Git must
+// never consult the live worker checkout after launch, even when its control hashes match.
+function copyWorkerTree(source, target, baselineLinks, root = source, budget = { entries: 0, bytes: 0 }, depth = 0) {
+  if (depth > 128) throw new Error('worker snapshot depth limit');
+  if (realpathSync(source) !== source) throw new Error('redirected worker directory');
+  for (const name of readdirSync(source)) {
+    if (source === root && name === '.git') continue;
+    if (name.toLowerCase() === '.git') throw new Error('nested worker git directory');
+    const from = join(source, name), to = join(target, name);
+    const st = lstatSync(from);
+    budget.bytes += st.size;
+    if (++budget.entries > 100_000 || st.size > 64 * 1024 * 1024 || budget.bytes > 1024 * 1024 * 1024)
+      throw new Error('worker snapshot size limit');
+    if (st.isSymbolicLink()) {
+      const expected = baselineLinks.get(from.slice(root.length + 1));
+      if (expected === undefined || readlinkSync(from) !== expected) throw new Error('new or changed worker symlink');
+      // Reproduce only a trusted pre-launch link, never dereference it during capture.
+      symlinkSync(expected, to);
+    } else if (st.isDirectory()) {
+      mkdirSync(to);
+      copyWorkerTree(from, to, baselineLinks, root, budget, depth + 1);
+    } else {
+      if (!st.isFile() || st.isSymbolicLink()) throw new Error('worker symlink or special file');
+      const fd = openSync(from, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino || opened.size !== st.size
+          || realpathSync(source) !== source) throw new Error('worker path changed during capture');
+        const bytes = Buffer.alloc(opened.size);
+        let offset = 0;
+        while (offset < bytes.length) {
+          const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+          if (!count) throw new Error('worker file truncated during capture');
+          offset += count;
+        }
+        const after = fstatSync(fd);
+        if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs)
+          throw new Error('worker file changed during capture');
+        writeFileSync(to, bytes, { flag: 'wx', mode: st.mode & 0o777 });
+        chmodSync(to, st.mode & 0o777); // preserve executable evidence even under a restrictive umask
+      } finally { closeSync(fd); }
+    }
+  }
 }
 const defaultExec = (bin, args, opts) => {
   try { return execFileSync(bin, args, opts); }
@@ -159,7 +204,7 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     spawnAgy = defaultSpawnAgy, mkTempDir = mkdtempSync,
     platform = process.platform, sandboxExists = existsSync,
     removeDir = p => rmSync(p, { recursive: true, force: true }), log = console.error } = deps;
-  let clone, transcriptDir;
+  let clone, transcriptDir, diffDir;
   const result = (status, reasons = [], extra = {}) => ({ status, applied: [],
     reasons: reasons.map(r => scrubPaths(r, [clone, laneDir, MODULE_REPO_ROOT, tmpdir()])
       .replace(/[\x00-\x1f\x7f]/g, ' ')), ...extra });
@@ -212,10 +257,19 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     if (startHead !== before[laneDir].head) return result('refused', ['lane HEAD changed during clone']);
     if (escapingSymlinks(clone).length) return result('refused', ['clone contains escaping symlinks']);
     const control = cloneGitControls(clone);
-    const cloneGit = (args, opts = {}) => git(args, { ...opts, env: { ...gitEnv,
-      GIT_DIR: join(clone, '.git'), GIT_COMMON_DIR: join(clone, '.git'), GIT_WORK_TREE: clone,
+    // Created before the worker starts; this sibling is absent from every worker write grant.
+    diffDir = realpathSync(mkdtempSync(join(tmpdir(), 'we-agy-diff-')));
+    git(['clone', '--quiet', '--no-checkout', '--no-hardlinks', '--template=', laneDir, diffDir]);
+    git(['-C', diffDir, 'read-tree', startHead]);
+    const diffGit = (args, opts = {}) => git(args, { ...opts, env: { ...gitEnv,
+      GIT_DIR: join(diffDir, '.git'), GIT_COMMON_DIR: join(diffDir, '.git'), GIT_WORK_TREE: diffDir,
       GIT_ALTERNATE_OBJECT_DIRECTORIES: '',
     } });
+    const baselineLinks = new Map();
+    for (const entry of diffGit(['-C', diffDir, 'ls-files', '--stage', '-z']).split('\0')) {
+      const match = /^120000 ([a-f0-9]+) 0\t(.+)$/.exec(entry);
+      if (match) baselineLinks.set(match[2], diffGit(['-C', diffDir, 'cat-file', 'blob', match[1]]));
+    }
     // Launcher-owned sibling of the clone and sandbox temp; never grant worker writes here.
     transcriptDir = realpathSync(mkdtempSync(join(tmpdir(), 'we-agy-transcript-')));
     chmodSync(transcriptDir, 0o700);
@@ -243,10 +297,10 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     if (escapingSymlinks(clone).length) reasons.push('clone contains escaping symlinks after run');
     // Do not invoke git after detecting changed controls or incomplete escape evidence.
     if (reasons.length) return result('voided', reasons);
-    if (cloneGit(['-C', clone, 'rev-parse', 'HEAD']).trim() !== startHead) return result('voided', ['clone HEAD moved']);
     if (spawnError || outcome?.code !== 0 || outcome?.timedOut) return result('failed', ['agy build failed; use the next fix provider']);
+    copyWorkerTree(realpathSync(clone), diffDir, baselineLinks);
     const diffFlags = ['--no-ext-diff', '--no-textconv', '--no-renames'];
-    const raw = cloneGit(['-C', clone, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
+    const raw = diffGit(['-C', diffDir, 'diff', '--raw', '-z', ...diffFlags, startHead]).split('\0');
     const rejectPath = p => !isAdmissibleTargetPath(p) || !inScope(p, scope);
     for (let i = 0; i < raw.length && raw[i]; i += 2) {
       const match = /^:(\d{6}) (\d{6}) [a-f0-9]+ [a-f0-9]+ ([AMD])$/.exec(raw[i]);
@@ -258,13 +312,14 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
         || oldMode !== '000000' && newMode !== '000000' && oldMode !== newMode)
         return result('voided', ['symlink, submodule or mode change rejected']);
     }
-    let patch = cloneGit(['-C', clone, 'diff', '--binary', ...diffFlags, startHead]);
-    const untracked = cloneGit(['-C', clone, 'ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean);
+    let patch = diffGit(['-C', diffDir, 'diff', '--binary', ...diffFlags, startHead]);
+    // Include ignored files too: worker-provided ignore rules cannot hide additions.
+    const untracked = diffGit(['-C', diffDir, 'ls-files', '--others', '-z']).split('\0').filter(Boolean);
     for (const p of untracked) {
       if (rejectPath(p)) return result('voided', ['unsafe or out-of-scope untracked path']);
-      const st = lstatSync(join(clone, p));
+      const st = lstatSync(join(diffDir, p));
       if (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o111)) return result('voided', ['untracked symlink or special file rejected']);
-      patch += cloneGit(['diff', '--no-index', '--binary', ...diffFlags, '--', '/dev/null', p], { cwd: clone, diffExit: true });
+      patch += diffGit(['diff', '--no-index', '--binary', ...diffFlags, '--', '/dev/null', p], { cwd: diffDir, diffExit: true });
     }
     if (/^(GIT binary patch|Binary files )/m.test(patch)) return result('voided', ['binary diff rejected']);
     if (/^(old mode|new mode) /m.test(patch)
@@ -289,6 +344,9 @@ export async function runConfinedAgyBuild({ task, laneDir, scope, kind, size, mo
     return result('voided', ['confinement or atomic apply evidence failed; use another fix provider or request human review']);
   } finally {
     try { if (clone) removeDir(clone); }
-    finally { if (transcriptDir) rmSync(transcriptDir, { recursive: true, force: true }); }
+    finally {
+      try { if (transcriptDir) rmSync(transcriptDir, { recursive: true, force: true }); }
+      finally { if (diffDir) rmSync(diffDir, { recursive: true, force: true }); }
+    }
   }
 }

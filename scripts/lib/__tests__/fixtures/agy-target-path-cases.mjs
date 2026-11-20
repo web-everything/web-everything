@@ -5,6 +5,8 @@ export const admissibleTargets = [
   'scripts/lib/__tests__/foo.test.mjs', 'src/__tests__/a.test.ts', 'src/a.spec.ts',
 ];
 export const refusedTargets = [
+  'src/__tests__/__fixtures__/payload.js', 'tests/__fixtures__/payload.cjs',
+  'src/__tests__/__fixture__/payload.ts', 'src/__tests__/fixtures/payload.js',
   'docs/a.test.mjs', 'docs/__tests__/a.test.ts',
   'tests/a11y/rendered-site-a11y.spec.ts', 'tests/e2e/flow.spec.ts',
   'docs/Makefile', 'docs/Dockerfile', 'docs/install', 'docs/CODEOWNERS',

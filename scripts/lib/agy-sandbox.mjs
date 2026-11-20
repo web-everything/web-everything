@@ -13,6 +13,8 @@ const inside = (p, root) => p === root || p.startsWith(`${root}/`);
 
 /** Confines the process's own file writes and home reads. Mach/XPC/LaunchServices-mediated writes
  * (defaults, open, osascript, launchctl) are out of scope; this is not a service sandbox.
+ * Service-mediated secret reads (securityd, gh auth token, ssh-agent) are also out of scope;
+ * direct file denies do not isolate Mach/XPC services or agent sockets.
  * Pure SBPL builder. Inputs are canonical absolute paths resolved by the launcher.
  * deniedPaths lets the launcher resolve secret symlinks; extraDeniedPaths supports isolated probes. */
 export function buildSandboxProfile({ transcriptDir, cloneDir, privateTempDir, laneDir, homeDir, workspaceOps,

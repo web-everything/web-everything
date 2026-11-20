@@ -33,7 +33,7 @@ function admissible(p, scope) {
     || p.startsWith('docs/') && !isDoc(p) && !(scope && isDirectory(p))
     || !((scope ? isDocScope(p) : isDoc(p)) || (scope ? isTestScope(p) : isTest(p)))) return false;
   // Fixtures and tests of critical modules protect enforcement: a test is admissible only when its SUBJECT is not critical.
-  if (/(^|\/)fixtures?(\/|$)/.test(p)) return false;
+  if (/(^|\/)(?:fixtures?|__fixtures?__)(\/|$)/i.test(p)) return false;
   const subject = p.replace(/(^|\/)(?:__tests__|tests)\//, '$1')
     .replace(/\.(test|spec)(\.[^/.]+)$/, '$2').replace(/(?:-integration|-e2e|-unit)+(\.[^/.]+)$/, '$1');
   // Top-level script tests also exercise modules housed in scripts/lib.

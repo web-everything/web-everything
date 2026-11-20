@@ -455,6 +455,14 @@ export async function runAgyDirectExec({
     let settled = false;
     let timer;
     let child;
+    let groupStopError;
+    let groupStopped = false;
+    const stopExclusiveGroup = () => {
+      if (groupStopped || !exclusiveLog || !Number.isInteger(child?.pid) || child.pid <= 0) return;
+      groupStopped = true;
+      try { process.kill(-child.pid, 'SIGKILL'); }
+      catch (e) { if (e.code !== 'ESRCH') groupStopError = e; }
+    };
     const removeSignalListeners = () => {
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
@@ -474,6 +482,8 @@ export async function runAgyDirectExec({
       settled = true;
       clearTimeout(timer);
       removeSignalListeners();
+      stopExclusiveGroup();
+      if (groupStopError) { err += `worker group cleanup failed: ${groupStopError.message}\n`; code = null; }
       const evidence = agyRunEvidence({ stdout: out, stderr: err, requestedModel: model });
       try { saveHold(evidence); } catch (e) { err += `quota hold persistence failed: ${e.message}`; code = 1; }
       if (evidence.fallbackDecision !== 'none') {
@@ -515,6 +525,9 @@ export async function runAgyDirectExec({
     child.stdout?.on('data', (d) => recordStdout(stdoutDecoder.decode(d, { stream: true })));
     child.stderr?.on('data', (d) => { err += d.toString(); });
     child.on('error', (e) => { recordError(e); settle(null); });
+    // exit precedes close: descendants may still hold the pipes open. Stop the detached
+    // group now, then await close before returning any transcript to the confined builder.
+    child.on('exit', stopExclusiveGroup);
     child.on('close', (code) => {
       recordStdout(stdoutDecoder.decode());
       settle(code);
