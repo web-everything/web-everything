@@ -16,10 +16,10 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 156 (158 declaration rows).
-- Declared leaves: 573 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 156.
-- Instant capacity leaves: 11.
+- Top-level keys: 157 (159 declaration rows).
+- Declared leaves: 584 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 157.
+- Instant capacity leaves: 14.
 - Constants to settle: 312.
 - Instant gaps: 28.
 
@@ -31,12 +31,15 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 
 | Capacity leaf | Range | Unit | Instant | Description |
 | --- | --- | --- | --- | --- |
+| ciHeal.reserve | integer 0–12 | slots | yes | Delivery slots held back for CI-heal work. |
 | deliveryCapacity.holdUntil | positive safe integer ≤ now + 72 hours | epoch milliseconds | yes | End of a delivery capacity hold. |
 | deliveryCapacity.pinUnits | integer 1–200 | units | yes | Pinned delivery capacity. |
 | deliveryCapacity.pinUntil | positive safe integer ≤ now + 72 hours | epoch milliseconds | yes | Expiry of a delivery capacity pin. |
 | fix.conflictFixExemptPerPass | integer 0–10 | fixes/pass | yes | Mechanical conflict-fix exemptions per pass. |
 | fix.conflictFixesPerPass | integer 0–24 | fixes/pass | yes | Conflict-fix dispatch allowance per pass. |
 | host.maxReviewDispatchPerTick | integer 1–16 | dispatches/tick | yes | Maximum host review dispatches per tick. |
+| lanes.maxConcurrent | integer 1–24 | lanes | yes | Maximum concurrently leased lanes. |
+| redTeamQueue.maxProbesPerTick | integer 0–50 | probes/tick | yes | Maximum red-team probes started per tick. |
 | redTeamQueue.minConcurrent | integer 0–24 | jobs | yes | Minimum concurrent red-team jobs. |
 | resourceGate.fixCap.ceiling | integer 1–24 | workers | yes | Maximum adaptive fix capacity. |
 | resourceGate.fixCap.floor | integer 1–24 | workers | yes | Minimum adaptive fix capacity. |
@@ -109,7 +112,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | fixDispatchMaxConcurrent | scripts/dispatch-settings.json | 1 | 2 | pr | no | Maximum concurrent fix dispatches. |
 | fixExecutor | scripts/settings/fix-executor.json | 2 | {"fallbackChain":["codex","codex-alt","claude"],"criticalCl… | pr | no | Fix executor fallback chain and critical Claude routing rung. |
 | fixLoop | scripts/settings/exhausted-retry.json | 5 | {"exhaustedRetry":{"enabled":true,"onMainMove":true,"maxRet… | pr | no | Retry policy for exhausted fixes after main advances. |
-| fixPassBudget | scripts/settings/fix-pass-budget.json | 3 | {"stuckFixersMs":120000,"ciHealMs":180000,"promoteDraftMs":… | pr | no | Per-pass time budgets for fixer recovery and draft promotion. |
+| fixPassBudget | scripts/settings/fix-pass-budget.json | 7 | {"fixMs":120000,"notesMs":90000,"orphanGuardMs":60000,"stuc… | pr | no | Per-pass time budgets for fixer recovery and draft promotion. |
 | fixScope | scripts/settings/fix-scope.json | 1 | {"regionMarginLines":3} | pr | no | Line margin around a finding region in fix scope. |
 | floorMb | scripts/settings/node-heap-cap.json | 1 | 1024 | pr | no | Minimum child-process V8 old-space cap in megabytes. |
 | forgeSlots | scripts/settings/forge-slots.json | 3 | {"default":8,"hosts":{"forge":14,"forge-b":8}} | pr | no | Forge execution pool size by host, with a default for unlisted hosts. |
@@ -168,7 +171,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | redMainHold | scripts/settings/red-main-hold.json | 1 | "on" | pr | no | Contain merge drain work while main CI is red. |
 | redMainMode | scripts/settings/red-main-hold.json | 1 | "quarantine" | pr | no | Stop or quarantine behavior while main CI is red. |
 | redMainQuarantine | scripts/settings/red-main-hold.json | 1 | {"ttlMin":1440} | pr | no | Quarantine duration and test population bounds for red main. |
-| redTeam | scripts/settings/red-team-queue.json, scripts/settings/red-team.json | 7 | {"queue":{"minConcurrent":6,"minConcurrentIdlePct":10,"revi… | pr | no | Red-team queue floor, idle starts and status publication policy. |
+| redTeam | scripts/settings/red-team-queue.json, scripts/settings/red-team.json | 8 | {"queue":{"maxProbesPerTick":6,"minConcurrent":6,"minConcur… | pr | no | Red-team queue floor, idle starts and status publication policy. |
 | redTeamGate | scripts/settings/red-team.json | 1 | {"$comment":"source: both (standard default), check-run (cu… | pr | no | Red-team gate source and publication recovery policy. |
 | referralHoldAutoResolve | scripts/settings/referral-hold-auto-resolve.json | 3 | {"enabled":true,"onBlock":"send-back","onClean":"resume"} | pr | no | Resolve ruled referral holds by resuming or sending back work. |
 | referralWindowMinutes | scripts/settings/referral-judge-window.json | 1 | 60 | pr | no | Time window in minutes for referral judgment. |
@@ -197,6 +200,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | tasks | scripts/settings/daemon-tasks.json | 1 | [{"label":"com.plateau.drain-daemon","program":["{node}","{… | pr | no | Daemon task definitions used to render launchd plists. |
 | timing | scripts/settings/review.json | 3 | {"startAfter":"push","cancelOnCiRed":true,"startEarly":"sha… | pr | no | Review start timing, early-start mode and cancellation on CI failure. |
 | transcriptCheck | scripts/settings/codex-transcript-check.json | 2 | {"mode":"warn","tokenCap":3000000} | pr | no | Post-run Codex transcript diagnostics mode and token cap. |
+| uiFastLane | scripts/settings/review.json | 6 | {"enabled":false,"seats":1,"redTeam":false,"nitpicksBlock":… | pr | no | UI-only fast review lane: enablement, seats, size bound and eligible paths. |
 | urgentSweep | scripts/settings/urgent-sweep.json | 1 | {"intervalMinutes":5} | pr | no | Urgent work sweep interval in minutes. |
 | vendorRouting | scripts/settings/vendor-routing.json | 0 | {"byTaskType":{}} | pr | no | Preferred vendors by task type. |
 | verify | scripts/settings/verify-recovery.json | 4 | {"loadRetry":{"maxAttempts":3},"infraRetry":{"maxAttempts":… | pr | no | Verification load and infrastructure retries and gate ceiling policy. |

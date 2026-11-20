@@ -812,6 +812,12 @@
       "changeVia": "pr",
       "instant": false
     },
+    "uiFastLane": {
+      "description": "UI-only fast review lane: enablement, seats, size bound and eligible paths.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
     "seatsByTouchSet": {
       "description": "Select review seats using the touched paths.",
       "owner": "scripts/settings/review.json",
@@ -970,6 +976,21 @@
     }
   },
   "capacityLeaves": {
+    "ciHeal.reserve": {
+      "description": "Delivery slots held back for CI-heal work.",
+      "range": "integer 0–12",
+      "unit": "slots"
+    },
+    "lanes.maxConcurrent": {
+      "description": "Maximum concurrently leased lanes.",
+      "range": "integer 1–24",
+      "unit": "lanes"
+    },
+    "redTeamQueue.maxProbesPerTick": {
+      "description": "Maximum red-team probes started per tick.",
+      "range": "integer 0–50",
+      "unit": "probes/tick"
+    },
     "fix.conflictFixesPerPass": {
       "description": "Conflict-fix dispatch allowance per pass.",
       "range": "integer 0–24",
