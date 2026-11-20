@@ -47,7 +47,7 @@ export function ciUnitPlan(workflow) {
 const runText = run => run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#')).join('\n');
 const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci\nnpm run build:tools'];
 const jobSetupRuns = {
-  standards: setupRuns, 'test-shard': setupRuns, integration: setupRuns,
+  standards: setupRuns, 'test-shard': setupRuns, 'integration-part': setupRuns,
   'coverage-merge': ['npm ci'],
 };
 const mirroredRuns = {
@@ -83,7 +83,7 @@ fi
   'host-paths': [
     "node scripts/lint-host-paths.mjs",
   ],
-  'integration': [
+  'integration-part': [
     `
 if [ "\${{ needs.changes.result }}" != "success" ]; then
 echo "changes (card-only detection) did not succeed (result: \${{ needs.changes.result }}) - failing closed."
@@ -97,6 +97,18 @@ echo "run=true" >> "$GITHUB_OUTPUT"
 fi
 `,
     "npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job=\"integration\")",
+  ],
+  integration: [
+    `
+if [ "\${{ needs.changes.result }}" != "success" ]; then
+echo "changes did not succeed - failing closed."
+exit 1
+fi
+if [ "\${{ needs.integration-part.result }}" != "success" ]; then
+echo "integration-part did not succeed - failing closed."
+exit 1
+fi
+`,
   ],
   'test': [
     `
@@ -153,7 +165,8 @@ const siblingActions = [
 const mirroredActions = {
   changes: [{ name: undefined, uses: 'actions/checkout@v4', with: { 'fetch-depth': 50 } }],
   standards: siblingActions,
-  integration: siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
+  'integration-part': siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
+  integration: [],
   'test-shard': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)'
     ? "${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}" : "${{ needs.changes.outputs.light != 'true' }}" })),
     { name: 'Upload shard coverage', if: "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}", uses: 'actions/upload-artifact@v4', with: {
@@ -187,18 +200,18 @@ function mirroredRunContext(job, text) {
   const setup = setupRuns.includes(text);
   const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
     : setup || job === 'standards' || (job === 'coverage-merge' && index === 1)
-      || (job === 'test-shard' && index > 0) || (job === 'integration' && index === 1) ? 'web-everything' : undefined;
+      || (job === 'test-shard' && index > 0) || (job === 'integration-part' && index === 1) ? 'web-everything' : undefined;
   const condition = job === 'test-shard' ? (setup ? fullUnit : [
     "${{ needs.changes.outputs.light == 'true' }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
-  ][index]) : job === 'integration' && (setup || index === 1) ? fullIntegration : undefined;
+  ][index]) : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
     'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': undefined,
     env: job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
-    } : undefined,
+    } : job === 'integration-part' && index === 1 ? { WE_INTEGRATION_GROUP: '${{ matrix.group }}' } : undefined,
   };
 }
 
@@ -226,6 +239,15 @@ export function ciGatePlan(workflow) {
   const requiredJobs = ciRequiredJobs(workflow);
   if (document.env !== undefined || document.defaults?.run !== undefined)
     throw new Error('unreadable-ci-gates: workflow execution context; update the urgent verification mirror');
+  // Local verification runs the full, ungrouped integration inventory once. Only this
+  // reviewed matrix and aggregator layout are equivalent to that local execution.
+  const integrationGroups = ['scan-chain', 'sim-scenarios', 'lane-pool-a', 'lane-pool-b', 'parallel'];
+  if (!isDeepStrictEqual(jobs.integration?.needs, ['changes', 'integration-part'])
+    || jobs.integration?.if !== '${{ always() }}' || jobs.integration?.strategy !== undefined
+    || jobs['integration-part']?.needs !== 'changes' || jobs['integration-part']?.if !== '${{ !cancelled() }}'
+    || !isDeepStrictEqual(jobs['integration-part']?.strategy, {
+      'fail-fast': false, matrix: { group: integrationGroups, include: integrationGroups.map(group => ({ group, timeout: 20 })) },
+    })) throw new Error('unreadable-ci-gates: integration layout; update the urgent verification mirror');
   for (const job of requiredJobs) {
     const mirrored = mirroredRuns[job];
     const steps = jobs?.[job]?.steps;
@@ -241,9 +263,9 @@ export function ciGatePlan(workflow) {
     const actualRuns = steps.filter(s => 'run' in s).map(s => runText(s.run));
     if (actualRuns.length !== expectedRuns.length || expectedRuns.some(text => actualRuns.filter(run => run === text).length !== 1))
       throw new Error(`unreadable-ci-gates: ${job} command layout; update the urgent verification mirror`);
-    const sibling = ['standards', 'test-shard', 'integration'].includes(job);
+    const sibling = ['standards', 'test-shard', 'integration-part'].includes(job);
     const checkouts = steps.filter(s => s.uses === 'actions/checkout@v4');
-    const expectedCheckouts = sibling ? 2 : job === 'test' ? 0 : 1;
+    const expectedCheckouts = sibling ? 2 : ['test', 'integration'].includes(job) ? 0 : 1;
     if (checkouts.length !== expectedCheckouts || checkouts.some((checkout, index) => {
       const options = checkout.with ?? {};
       const fui = sibling && index === 1;
@@ -269,7 +291,7 @@ export function ciGatePlan(workflow) {
   };
   const merge = step('coverage-merge', 'Merge coverage + enforce 80% bar (#2082)').run;
   const host = step('host-paths', 'Host-local path ratchet').run;
-  const integration = step('integration', 'Real-git integration suite (lane-pool, operations transport)').run;
+  const integration = step('integration-part', 'Real-git integration suite (lane-pool, operations transport)').run;
   const upload = step('test-shard', 'Upload shard coverage');
   const download = step('coverage-merge', 'Download shard coverage');
   if (!covered || merge !== `npm run coverage:merge -- coverage-shards --threshold=80 --expect=${covered}`
@@ -280,7 +302,7 @@ export function ciGatePlan(workflow) {
     || !upload.if?.includes(`matrix.shard != ${plan.length}`)
     || download.uses !== 'actions/download-artifact@v4' || download.with?.path !== 'web-everything/coverage-shards'
     || download.with?.pattern !== 'coverage-shard-*' || download.with?.['merge-multiple'] === true) throw new Error('unreadable-ci-gates');
-  for (const job of ['standards', 'test-shard', 'integration']) {
+  for (const job of ['standards', 'test-shard', 'integration-part']) {
     const fui = step(job, 'Install + build FUI tools'), install = step(job, 'Install');
     if (runText(fui.run ?? '') !== 'npm ci\nnpm run build:tools' || fui['working-directory'] !== 'frontierui'
       || runText(install.run ?? '') !== 'npm ci' || install['working-directory'] !== 'web-everything'

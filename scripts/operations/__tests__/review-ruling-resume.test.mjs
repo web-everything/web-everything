@@ -18,7 +18,7 @@ import { createRegistry } from '../registry.mjs';
 import { createFileRunStore, createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome } from '../cli-adapter.mjs';
 import { rewindRunToStep } from '../engine.mjs';
-import { REVIEW_EFFECTS, reviewPrOperation, reviewSeatOptionsForRun } from '../review-pr.mjs';
+import { REVIEW_EFFECTS, REVIEW_SEAT_POLICY_PERSISTED_AT, reviewPrOperation, reviewSeatOptionsForRun } from '../review-pr.mjs';
 import { runReviewLoopOnce, defaultFindResumableRun, RESUME_MAX_ATTEMPTS } from '../review-loop-cli.mjs';
 import { isBodyFileRefusal } from '../review-pr-io.mjs';
 import {
@@ -280,6 +280,50 @@ describe('stale stageVerdict referral refusal', () => {
 });
 
 describe('ordinary review-pr CLI resume preserves the saved roster', () => {
+  it('restores a proven historical minimum only when both persisted policy fields are absent', () => {
+    const settings = { minNonClaudeSeats: 2 };
+    const historical = { findings: { read: {}, judge: {}, judgeSecurity: {} }, pending: { step: 'reduce' },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-16T00:00:00Z' }] };
+    expect(reviewSeatOptionsForRun(historical, settings)).toMatchObject({ minNonClaudeSeats: 0 });
+    for (const policy of [{ minNonClaudeSeats: 1 }, { minNonClaudeSeats: 2 }, { minNonClaudeSeats: 0 }]) {
+      expect(reviewSeatOptionsForRun({ ...historical, findings: { ...historical.findings, read: policy } }, settings))
+        .toMatchObject(policy);
+    }
+    for (const policy of [{ seatSteps: ['judge', 'judgeSecurity'] }, { minNonClaudeSeats: null }]) {
+      const options = reviewSeatOptionsForRun({ ...historical, findings: { ...historical.findings, read: policy } }, settings);
+      expect(options).not.toHaveProperty('minNonClaudeSeats');
+      expect(options.seatSettings.minNonClaudeSeats).toBe(2);
+    }
+    expect(reviewSeatOptionsForRun({ findings: {} }, settings).seatSettings.minNonClaudeSeats).toBe(2);
+  });
+
+  it.each([
+    ['pre-cutoff gets zero', '2026-10-17T01:48:09.999Z', true],
+    ['post-cutoff missing policy reports a live minimum shortfall', '2026-10-17T01:48:10.001Z', false],
+    ['at-cutoff missing policy reports a live minimum shortfall', REVIEW_SEAT_POLICY_PERSISTED_AT, false],
+    ['no timestamp reports a live minimum shortfall', undefined, false],
+    ['malformed timestamp reports a live minimum shortfall', 'not-a-date', false],
+  ])('%s', (_name, startedAt, historical) => {
+    const registry = createRegistry();
+    const original = reviewPrOperation({ readPr: stubReader(), minNonClaudeSeats: 0 });
+    registry.register(original);
+    const run = advanceWhileRunning(startRun({ op: original.name, id: 'policy-cutoff',
+      input: { pr: 4361, repo: 'o/n' }, registry }), { registry });
+    const { seatSteps, minNonClaudeSeats, ...read } = run.findings.read;
+    const clean = { summary: 'looked', findings: [] };
+    const saved = { ...run, findings: { read, judge: clean, judgeSecurity: clean }, pending: { step: 'reduce' },
+      stepTimings: startedAt === undefined ? [] : [{ step: 'read', stepIndex: 0, startedAt }] };
+    const options = reviewSeatOptionsForRun(saved, { minNonClaudeSeats: 2 });
+    if (historical) expect(options.minNonClaudeSeats).toBe(0);
+    else expect(options).not.toHaveProperty('minNonClaudeSeats');
+    const resumed = reviewPrOperation({ readPr: stubReader(), ...options });
+    const reduce = () => resumed.steps.find(s => s.name === 'reduce').step.fn({
+      input: run.input, findings: saved.findings,
+    });
+    if (historical) expect(reduce().nonClaudeSeatShortfall).toBeNull();
+    else expect(reduce).toThrow(/blocked-on-infra:.*NON-CLAUDE SEAT SHORTFALL: 0\/2/);
+  });
+
   it.each([
     {},
     { codexAdvisory: true },
@@ -388,7 +432,8 @@ describe('ordinary review-pr CLI resume preserves the saved roster', () => {
     if (strip) {
       // A run saved before the roster was persisted: its `read` finding names only the security seat.
       const { seatSteps, minNonClaudeSeats, ...read } = run.findings.read;
-      run = { ...run, findings: { ...run.findings, read } };
+      run = { ...run, findings: { ...run.findings, read },
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: '2026-10-16T00:00:00Z' }] };
     }
     while (run.pending?.kind === 'judge') {
       store.write(run);

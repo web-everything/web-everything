@@ -1,3 +1,4 @@
+import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 /**
  * @file scripts/conveyor/orphan-fix-round.mjs
  * @description The orphaned-fix-round guard: a `review:changes` PR whose last fix round ENDED with nobody owning it.
@@ -274,6 +275,7 @@ export async function runOrphanFixRoundPass({
   escalate = defaultEscalate,
   postComment = defaultPostComment,
   graceMs = DEFAULT_ORPHAN_GRACE_MS,
+  resolveProfile = repoProfile,
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
 } = {}) {
   const enabled = orphanGuardEnabled(env);
@@ -291,6 +293,10 @@ export async function runOrphanFixRoundPass({
         Object.assign(row, { decision: plan.decision, reason: plan.reason });
         rows.push(row);
         if (!enabled) { row.result = 'report-only (WE_ORPHAN_FIX_GUARD=0)'; continue; }
+        if (plan.decision === 'redispatch') {
+          const refusal = assertCapability(slug, 'fix', { resolveProfile });
+          if (refusal) { row.result = `not-done: ${refusal.why}`; continue; }
+        }
         const labels = labelNames(p.labels);
         const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
           : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number })

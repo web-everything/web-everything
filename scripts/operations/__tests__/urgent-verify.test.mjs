@@ -166,7 +166,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     const fs = { readFileSync: vi.fn(p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow), mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn(), copyFileSync: vi.fn() };
     const spawnSync = vi.fn((cmd, args, opts) => ({ status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? `${opts.cwd === '/frontierui' ? urgentFuiRepo : marker.repo}.git/\n` : args[0]?.includes('shard-assign') ? 'scripts/example.test.mjs\n' : '' }));
     const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync,
-      env: { PATH: '/bin', HOME: '/home/test', URGENT_KEY: urgentKeyPath('/home/test'), NODE_OPTIONS: urgentKeyPath('/home/test') } });
+      env: { PATH: '/bin', HOME: '/home/test', URGENT_KEY: urgentKeyPath('/home/test'), NODE_OPTIONS: urgentKeyPath('/home/test'), WE_INTEGRATION_GROUP: 'scan-chain' } });
     expect((await urgentVerify({ sha }, d)).ok).toBe(true);
     expect(spawnSync).toHaveBeenCalledWith('sh', ['scripts/ci/fetch-main-history.sh'], expect.objectContaining({ cwd: '/repo' }));
     const heavy = spawnSync.mock.calls.filter(([, args]) => args[0].endsWith('scripts/readiness/heavy-admission.mjs'));
@@ -174,6 +174,8 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(4), o.cwd])).toEqual([
       [['npm', 'ci'], '/frontierui'], [['npm', 'run', 'build:tools'], '/frontierui'], [['npm', 'ci'], '/repo']]);
     expect(spawnSync.mock.calls.every(([, , o]) => !JSON.stringify(o.env).includes(urgentKeyPath('/home/test')) && !Object.keys(o.env).some(k => k.startsWith('URGENT_')))).toBe(true);
+    // The local mirror must cover the union of every matrix part, even from a grouped parent.
+    expect(spawnSync.mock.calls.every(([, , o]) => !Object.hasOwn(o.env, 'WE_INTEGRATION_GROUP'))).toBe(true);
     const keyReadOrder = fs.readFileSync.mock.invocationCallOrder[fs.readFileSync.mock.calls.findIndex(([p]) => p.endsWith('.key'))];
     expect(keyReadOrder).toBeGreaterThan(spawnSync.mock.invocationCallOrder.at(-1));
     expect(heavy.every(([, args, opts]) => args.includes('--wait-ms=60000') && opts.maxBuffer > 0 && opts.timeout > 0)).toBe(true);
@@ -228,9 +230,32 @@ describe('CI gate mirroring fails closed', () => {
       hostPaths: ['node', 'scripts/lint-host-paths.mjs'],
       integration: ['npm', 'run', 'test:integration:vitest'],
     });
+    expect(ciGatePlan(workflow).requiredJobs).toEqual([
+      'changes', 'test-shard', 'integration-part', 'integration', 'standards', 'coverage-merge', 'host-paths', 'test',
+    ]);
   });
   const real = yaml.safeLoad(workflow);
-  const mirroredJobs = ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'];
+  const mirroredJobs = ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'test', 'standards'];
+  it.each([
+    ['missing group', doc => { doc.jobs['integration-part'].strategy.matrix.group.pop(); }],
+    ['duplicate group', doc => { doc.jobs['integration-part'].strategy.matrix.group[0] = 'parallel'; }],
+    ['unknown group', doc => { doc.jobs['integration-part'].strategy.matrix.group.push('unknown'); }],
+    ['missing matrix', doc => { delete doc.jobs['integration-part'].strategy; }],
+    ['excluded group', doc => { doc.jobs['integration-part'].strategy.matrix.exclude = [{ group: 'parallel' }]; }],
+    ['extra matrix axis', doc => { doc.jobs['integration-part'].strategy.matrix.other = ['extra']; }],
+    ['include overrides selector', doc => { doc.jobs['integration-part'].strategy.matrix.include[0].group = 'parallel'; }],
+    ['include injects context', doc => { doc.jobs['integration-part'].strategy.matrix.include[0].env = { NODE_OPTIONS: '--require=unexpected' }; }],
+    ['fail fast', doc => { doc.jobs['integration-part'].strategy['fail-fast'] = true; }],
+    ['missing part dependency', doc => { doc.jobs.integration.needs = ['changes']; }],
+    ['missing changes dependency', doc => { delete doc.jobs['integration-part'].needs; }],
+    ['aggregator condition', doc => { doc.jobs.integration.if = '${{ success() }}'; }],
+    ['part condition', doc => { doc.jobs['integration-part'].if = '${{ false }}'; }],
+    ['aggregator matrix', doc => { doc.jobs.integration.strategy = { matrix: { group: ['parallel'] } }; }],
+  ])('refuses unmirrored integration layout: %s with an operator fallback', (_, mutate) => {
+    const doc = yaml.safeLoad(workflow);
+    mutate(doc);
+    expect(() => ciGatePlan(yaml.safeDump(doc))).toThrow('unreadable-ci-gates: integration layout; update the urgent verification mirror');
+  });
   it.each(mirroredJobs)('refuses an added download-artifact step in %s', job => {
     const changed = yaml.safeLoad(workflow);
     changed.jobs[job].steps.push({ name: 'Additional required artifact', uses: 'actions/download-artifact@v4', with: { name: 'required' } });
@@ -273,7 +298,7 @@ describe('CI gate mirroring fails closed', () => {
       [steps[first], steps[second]] = [steps[second], steps[first]];
       expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates');
     });
-  it.each(['test-shard', 'standards', 'coverage-merge', 'host-paths', 'integration'])(
+  it.each(['test-shard', 'standards', 'coverage-merge', 'host-paths', 'integration-part', 'integration'])(
     'refuses extra previously allowlisted commands in %s even with matching context', job => {
       for (const run of ['npm run build:tools', 'npm ci --ignore-scripts', 'npm ci',
         'sh scripts/ci/fetch-main-history.sh', 'npm ci\nnpm run build:tools']) {
@@ -281,13 +306,13 @@ describe('CI gate mirroring fails closed', () => {
         changed.jobs[job].steps.push({ run,
           'working-directory': run.includes('\n') ? 'frontierui' : 'web-everything',
           ...(job === 'test-shard' ? { if: "${{ needs.changes.outputs.light != 'true' }}" }
-            : job === 'integration' ? { if: "${{ steps.gate.outputs.run == 'true' }}" } : {}),
+            : job === 'integration-part' ? { if: "${{ steps.gate.outputs.run == 'true' }}" } : {}),
         });
         expect(() => ciGatePlan(yaml.safeDump(changed)), run).toThrow('unreadable-ci-gates');
       }
     });
   const checkoutSteps = Object.entries(real.jobs)
-    .filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'standards'].includes(job))
+    .filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'standards'].includes(job))
     .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => step.uses === 'actions/checkout@v4' ? [[job, index, step.with?.path === 'frontierui']] : []));
   it.each(checkoutSteps)('pins checkout source and directory for %s step %i (FUI=%s)', (job, index, fui) => {
     for (const [key, value] of [['ref', 'other-branch'], ['ref', null], ['path', 'unexpected'],
@@ -300,7 +325,7 @@ describe('CI gate mirroring fails closed', () => {
     }
   });
 
-  const runSteps = Object.entries(real.jobs).filter(([job]) => ['changes', 'test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'].includes(job))
+  const runSteps = Object.entries(real.jobs).filter(([job]) => mirroredJobs.includes(job))
     .flatMap(([job, spec]) => spec.steps.flatMap((step, index) => typeof step.run === 'string' ? [[job, index, step.name]] : []));
   it.each(runSteps)('refuses changed execution context for %s step %i (%s)', (job, index) => {
     for (const [key, value] of Object.entries({ 'working-directory': 'unexpected', env: { NODE_OPTIONS: '--require=unexpected' }, shell: 'bash', if: '${{ false }}', 'continue-on-error': true })) {
@@ -316,13 +341,13 @@ describe('CI gate mirroring fails closed', () => {
         expect(() => ciGatePlan(yaml.safeDump(changed)), key).toThrow('unreadable-ci-gates');
       }
     });
-  it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'])(
+  it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'test', 'standards'])(
     'refuses an extra unknown run step in %s and tells the operator to update the mirror', job => {
       const changed = yaml.safeLoad(workflow);
       changed.jobs[job].steps.push({ name: 'Additional validation', run: 'npm run new-validation' });
       expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('unreadable-ci-gates: update the urgent verification mirror');
     });
-  it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration', 'test', 'standards'])(
+  it.each(['test-shard', 'coverage-merge', 'host-paths', 'integration-part', 'integration', 'test', 'standards'])(
     'refuses an unknown uses action in %s and tells the operator to update the mirror', job => {
       const changed = yaml.safeLoad(workflow);
       changed.jobs[job].steps.push({ uses: 'unknown/validation@v1' });
