@@ -1924,6 +1924,16 @@ export async function speculateRedTeam({
       } catch (error) { lastReason = error.message; break; }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
+      // Check the resolved model, including builder/AI overrides, before spending its budget.
+      // Keep runSeat's guard too: promotion can be withdrawn between admission and execution.
+      const candidateModel = configuredRoute?.model ?? RED_TEAM_MODELS[pick.provider].model;
+      if (!carbonNonShadowAllowed(candidateModel, { env, log: io.log })) {
+        lastReason = 'Carbon not promoted — non-shadow seat refused';
+        unavailable.push(`${pick.provider}: ${lastReason}`);
+        io.log(`red team: ${pick.provider}: ${lastReason}; retrying fallback provider`);
+        available = available.filter(p => p !== pick.provider);
+        continue;
+      }
       if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
       if (pick.provider === 'agy-claude') io.log('red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
       if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');

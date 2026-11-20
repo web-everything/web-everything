@@ -294,9 +294,9 @@ for (const reason of ['held', 'capped', 'CLI unavailable', 'reservation denied']
     const resolved = setting('red-team', { provider: 'agy-gemini', model: RED_TEAM_MODELS['agy-gemini'].model, effort: 'high' });
     assert.deepEqual(resolved.invalid, []);
     const { calls: baselineCalls } = await seat(empty, overrides,
-      { WE_REVIEW_SEAT_CAP_AGY_GEMINI: reason === 'capped' ? '0' : '20' });
+      { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: reason === 'capped' ? '0' : '20' });
     const { calls, logs } = await seat(() => resolved, overrides,
-      { WE_REVIEW_SEAT_CAP_AGY_GEMINI: reason === 'capped' ? '0' : '20' });
+      { WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: reason === 'capped' ? '0' : '20' });
     assert.deepEqual(calls, baselineCalls);
     assert.equal(calls[0].provider, 'codex');
     assert.ok(logs.some(line => line.includes('agy-gemini unavailable')));
@@ -440,6 +440,36 @@ const builderSeat = (builder, overrides = {}, env = {}) => seat(empty, overrides
   (args, io) => speculateRedTeam({ ...args, read: { ...args.read,
     body: buildDelegationMarker({ provider: builder, model: 'gpt-6-astra', taskType: 'bugfix' }) } }, io));
 
+test.each(['policy', 'overlay'])('unpromoted Carbon from %s falls back before reservation', async source => {
+  const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+  policy.aliases['agy-gemini']['probation-model'] = RED_TEAM_MODELS['agy-gemini'].model;
+  if (source === 'policy') policy.operations['review-seat:red-team'] = {
+    provider: 'agy-gemini', model: 'probation-model', effort: 'high',
+    fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }],
+  };
+  const actual = await seat(source === 'overlay' ? providerOnly('red-team', 'agy-gemini') : empty,
+    { readRoutingPolicy: () => policy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' });
+  assert.equal(actual.result.status, 'speculated', actual.result.reason);
+  assert.deepEqual(actual.reservations, ['codex']);
+  assert.equal(actual.calls[0].provider, 'codex');
+  assert.ok(actual.logs.some(line => /Carbon not promoted.*fallback/.test(line)));
+});
+
+test('unpromoted Carbon cannot escape an operator route with no allowed fallback', async () => {
+  const readRoutingPolicy = createRoutingPolicyReader({ env: {}, read: () => JSON.stringify(DEFAULT_ROUTING_POLICY),
+    preferences: () => ({ errors: [], prefs: { routingOverrides: {
+      'review-seat:red-team': { provider: 'agy-gemini', model: RED_TEAM_MODELS['agy-gemini'].model, effort: 'high', fallback: [] },
+    } } }), emit: () => {},
+  });
+  const actual = await builderSeat('codex', { readRoutingPolicy }, {
+    WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false',
+  });
+  assert.equal(actual.result.status, 'skipped');
+  assert.match(actual.result.reason, /Carbon not promoted/);
+  assert.deepEqual(actual.reservations, []);
+  assert.deepEqual(actual.calls, []);
+});
+
 test('builder preference preserves policy model and effort in both directions', async () => {
   const policy = structuredClone(DEFAULT_ROUTING_POLICY);
   policy.operations['review-seat:red-team'] = { provider: 'codex', model: 'sol', effort: 'xhigh',
@@ -448,7 +478,9 @@ test('builder preference preserves policy model and effort in both directions', 
     ['codex', 'agy-gemini', policy.aliases['agy-gemini'].flash, 'medium'],
     ['claude', 'codex', policy.aliases.codex.sol, 'xhigh'],
   ]) {
-    const actual = await builderSeat(builder, { readRoutingPolicy: () => policy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20' });
+    const actual = await builderSeat(builder, { readRoutingPolicy: () => policy }, {
+      WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false',
+    });
     assert.equal(actual.result.status, 'speculated', actual.result.reason);
     assert.deepEqual([actual.calls[0].provider, actual.calls[0].model, actual.calls[0].effort], [provider, model, effort]);
   }

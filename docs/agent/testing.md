@@ -4915,6 +4915,13 @@ route. `ai-routing-red-team-sites.test.mjs` retains the cap/quota refusal cases 
 covers builder policy models, efforts, operator precedence and disabled fallbacks.
 Explicit settings zero defeats `enabledProviders`; unreadable or malformed seat
 settings warn and use repo defaults, including Gemini's disabled default.
+
+Red-team admission checks the resolved model against the same Carbon promotion guard
+as execution before reserving budget. A positive Gemini cap alone does not promote
+Carbon: builder, policy and AI-overlay routes retry the remaining allowed providers.
+Keep fixtures for unpromoted fallback, promoted Carbon, non-Carbon Gemini aliases and
+an operator chain with no permitted fallback. Historical budget-race fixtures must
+explicitly promote Carbon so they continue exercising reservation denial.
 ## Overlay main-sync interrupted test evidence
 
 A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
