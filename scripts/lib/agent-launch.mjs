@@ -123,36 +123,48 @@ function classOf(rule, value, ceiling) {
 // (core.sshCommand, core.pager, url.*.insteadOf, even a harmless user.name) is dropped on its own, and the
 // kept pins are re-indexed in their original order, so one extra entry can never discard the protections.
 const GIT_PINS = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
-// Tightening-only beyond the pin inventory: a protocol allow rule set to "never" or "user" can only narrow
-// which transports run (git's default for unknown protocols is already "user").
+const GIT_TRANSPORT_POLICY = /^protocol\.(?:[a-z0-9+.-]+\.)?allow$/i;
+// Transport candidates are also checked against the parent's policy in childGitConfig:
+// a protocol-specific exception takes precedence over Git's global protocol.allow setting.
 const tighteningGitPair = (key, value) => GIT_PINS.some(([k, v]) => key === k && value === v)
-  || ((value === 'never' || value === 'user') && /^protocol\.(?:[a-z0-9+.-]+\.)?allow$/i.test(key));
+  || ((value === 'never' || value === 'user') && GIT_TRANSPORT_POLICY.test(key));
 function gitConfigPairs(env) {
   const raw = env.GIT_CONFIG_COUNT;
-  if (typeof raw !== 'string' || !/^\d+$/.test(raw)) return null;
+  if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
   const count = Number(raw);
   // Reject impossible counts before iterating (each entry needs a key and a value var).
   if (!Number.isSafeInteger(count) || count * 2 + 1 > Object.keys(env).length) return null;
-  const kept = [], all = [];
+  const kept = [];
   for (let i = 0; i < count; i++) {
     const key = env[`GIT_CONFIG_KEY_${i}`], value = env[`GIT_CONFIG_VALUE_${i}`];
-    if (typeof key === 'string') all.push(key);
+    // Validate the entire declared set before filtering: dropping a broken entry would turn
+    // Git's parse failure into a successful child operation. Empty values (helper resets) are valid.
+    if (typeof key !== 'string' || typeof value !== 'string'
+      || key.match(/^[a-z0-9-]+\.(?:[^\n]*\.)?[a-z][a-z0-9-]*$/i)?.[0] !== key) return null;
     if (tighteningGitPair(key, value)) kept.push([key, value]);
   }
-  return { count, kept, all };
+  return { count, kept };
 }
 // The sole indexed-config exception to GIT_*: from the parent AND the caller bag, only tightening pairs
 // pass (exact hardening pins, protocol.*.allow=never). Every other entry drops on its own; kept pairs are
 // re-indexed, parent pairs first, so no extra entry can discard a protection and no caller pair can add one
 // that loosens.
 function childGitConfig(ambient, inherit) {
-  const parent = gitConfigPairs(ambient), bag = gitConfigPairs(inherit);
+  const parent = gitConfigPairs(ambient);
+  if (Object.hasOwn(ambient, 'GIT_CONFIG_COUNT') && !parent) {
+    fail('ambient GIT_CONFIG_COUNT and indexed keys/values must form a complete valid configuration; repair the parent environment and retry');
+  }
+  const bag = gitConfigPairs(inherit);
   // Git applies later entries over earlier ones, so a caller pair is added only for a key the parent's KEPT
   // pairs do not set (git keys compare case-insensitively): the caller can add hardening, never override the
   // parent's. A parent pair that was dropped as non-tightening is absent from the child, so it does not block one.
   const parentKeys = new Set((parent?.kept ?? []).map(([k]) => String(k).toLowerCase()));
   const kept = [...(parent?.kept ?? [])];
+  const parentTransportPolicy = kept.some(([key]) => GIT_TRANSPORT_POLICY.test(key));
   for (const pair of bag?.kept ?? []) {
+    // Only a prohibition is always safe under an inherited transport policy. This also blocks
+    // exported remote-probe "always" pins from reopening a transport the parent prohibited.
+    if (parentTransportPolicy && GIT_TRANSPORT_POLICY.test(pair[0]) && pair[1] !== 'never') continue;
     if (!parentKeys.has(pair[0].toLowerCase()) && !kept.some(([k, v]) => k === pair[0] && v === pair[1])) kept.push(pair);
   }
   if (!kept.length) return parent?.count === 0 ? { GIT_CONFIG_COUNT: '0' } : {};

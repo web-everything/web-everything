@@ -5451,9 +5451,13 @@ A restrictive exact rule overrides a dangerous family (notably GIT_ALLOW_PROTOCO
 Git hardening predicates). Unknown ambient names inherit verbatim, preserving computed
 settings such as `WE_PR_LIMIT_WE=0`; unknown caller-bag names remain excluded. The drift
 inventory documents literal repository env reads, not completeness of computed reads.
-Ambient indexed Git config is all-or-nothing: every pair must exactly match an exported
-lane, remote-probe or history-proof hardening pin. Caller-bag config and other Git config
-sources stay excluded. Audit affirmative dangerous `why` reasons and exact
+Ambient indexed Git config must have a valid decimal count and a complete set of valid
+keys and string values; malformed sets refuse launch before binary resolution or spawn.
+Absent counts and zero counts ignore orphan indexed entries, as Git does. Valid sets are
+filtered per pair to exported hardening pins and supported transport policies. Caller pairs
+cannot replace a retained parent key. When the parent has a transport policy, caller transport
+pairs pass only as `never`, including when a remote-probe pin would otherwise allow `always`.
+Other Git config sources stay excluded. Audit affirmative dangerous `why` reasons and exact
 members of never families too: exact precedence must not accidentally reopen a family.
 Never rules cover runtime/shell injection, launcher-owned paths, exec redirects,
 credentials and guard bypasses. Do not classify a restrictive refusal or a reason

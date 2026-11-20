@@ -516,6 +516,8 @@ describe('#7022 audit escapes are closed by construction', () => {
       'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'];
     const bag = Object.fromEntries(redirects.map(name => [name, '/tmp/evil']));
     for (const name of redirects) vi.stubEnv(name, '/tmp/evil');
+    refused({ ...base(), inheritEnv: bag }, /ambient GIT_CONFIG/);
+    clearEnv('GIT_CONFIG_COUNT'); // Orphan entries cannot form a config set; the remaining redirects must still drop.
     const { env } = buildAgentInvocation({ ...base(), inheritEnv: bag }, seam()).options;
     for (const name of redirects) expect(env, name).not.toHaveProperty(name);
     for (const name of redirects) expect(registry[name]?.class ?? registry['GIT_*'].class, name).toBe('drop');
@@ -595,17 +597,44 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     expect(envOf({ GIT_GRAFT_FILE: '/dev/null' }).GIT_GRAFT_FILE).toBe('/dev/null');
     expect(envOf({ GIT_GRAFT_FILE: '/tmp/forged' })).not.toHaveProperty('GIT_GRAFT_FILE');
   });
-  it.each(['', '-1', '1.5', '1x', ' 1', '1e0', 'Infinity', '9007199254740992', '999999999'])
-    ('drops malformed or impossible ambient count %j without forwarding a partial set', count => {
+  it.each(['', '-1', '1.5', '1x', ' 1', '1\n', '1e0', 'Infinity', '9007199254740992', '999999999'])
+    ('refuses malformed or impossible ambient count %j before spawn', count => {
       setParent({ GIT_CONFIG_COUNT: count, GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
-      expect(configOf(envOf({}))).toEqual({});
+      refused({ ...base(), inheritEnv: laneGitHardeningEnv({}) }, /ambient GIT_CONFIG/);
+      refused(claude(), /ambient GIT_CONFIG/);
     });
-  it.each(['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])
-    ('drops the entire set when %s is missing', missing => {
+  it.each(['GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])
+    ('refuses incomplete ambient config when %s is missing before spawn', missing => {
       setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
       clearEnv(missing);
-      expect(configOf(envOf({}))).toEqual({});
+      refused({ ...base(), inheritEnv: laneGitHardeningEnv({}) }, /ambient GIT_CONFIG/);
+      refused(claude(), /ambient GIT_CONFIG/);
     });
+  it('ignores orphan indexed entries when the ambient count is absent', () => {
+    setParent({ GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null' });
+    expect(configOf(envOf({}))).toEqual({});
+  });
+  it.each(['', 'core', '.name', 'core.', 'core.1x', 'co_re.name', 'core.a_b',
+    'core.hooksPath\n', 'core.hooksPath\r', 'core.hooksPath\u2028', 'core.hooksPath\u2029'])
+    ('refuses malformed ambient key %j instead of discarding a Git parse failure', key => {
+      setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+        GIT_CONFIG_KEY_1: key, GIT_CONFIG_VALUE_1: 'x' });
+      refused(base(), /ambient GIT_CONFIG/);
+    });
+  it.each(['GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1'])
+    ('refuses a missing later %s even when valid hardening precedes it', missing => {
+      setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+        GIT_CONFIG_KEY_1: 'credential.helper', GIT_CONFIG_VALUE_1: '' });
+      clearEnv(missing);
+      refused(base(), /ambient GIT_CONFIG/);
+    });
+  it('malformed caller config cannot erase valid parent pins or forward a partial caller set', () => {
+    const parent = laneGitHardeningEnv({});
+    setParent(parent);
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1x' }))).toEqual(configOf(parent));
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never',
+      GIT_CONFIG_KEY_1: 'credential.helper' }))).toEqual(configOf(parent));
+  });
   it('preserves a zero count verbatim and drops orphan indexed entries', () => {
     setParent({ GIT_CONFIG_COUNT: '0', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '.githooks' });
     expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '0' });
@@ -645,6 +674,45 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     expect(configOf(envOf(bag))).toEqual({ GIT_CONFIG_COUNT: '2',
       GIT_CONFIG_KEY_0: 'protocol.https.allow', GIT_CONFIG_VALUE_0: 'never',
       GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+  });
+  it.each([
+    ['protocol.allow', 'never', 'protocol.file.allow', 'user'],
+    ['PrOtOcOl.AlLoW', 'never', 'PrOtOcOl.file.AlLoW', 'user'],
+    ['protocol.allow', 'never', 'protocol.ext.allow', 'user'],
+    ['protocol.allow', 'user', 'protocol.ext.allow', 'user'],
+    ['protocol.https.allow', 'never', 'protocol.allow', 'user'],
+    ['protocol.https.allow', 'never', 'protocol.file.allow', 'user'],
+    ...['https', 'http', 'git', 'ssh'].map(protocol => ['protocol.allow', 'never', `protocol.${protocol}.allow`, 'always']),
+  ])('caller transport exceptions cannot weaken parent %s=%s via %s=%s', (parentKey, parentValue, callerKey, callerValue) => {
+    const parent = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: parentKey, GIT_CONFIG_VALUE_0: parentValue };
+    setParent(parent);
+    const io = seam();
+    launchAgent({ ...base(), inheritEnv: {
+      GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: callerKey, GIT_CONFIG_VALUE_0: callerValue,
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null',
+      GIT_CONFIG_KEY_2: callerKey, GIT_CONFIG_VALUE_2: callerValue,
+    } }, io);
+    expect(configOf(io.spawn.mock.calls[0][2].env)).toEqual({ ...parent, GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_1: 'core.hooksPath', GIT_CONFIG_VALUE_1: '/dev/null' });
+  });
+  it('caller transport prohibitions can still tighten an inherited global transport policy', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'user' });
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'never' })))
+      .toMatchObject({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_1: 'protocol.file.allow', GIT_CONFIG_VALUE_1: 'never' });
+  });
+  it('caller remote-probe exceptions pass when the parent has no transport policy', () => {
+    const caller = laneHistoryProofEnv({}, { remoteProbe: true });
+    expect(configOf(envOf(caller))).toEqual(configOf(caller));
+  });
+  it('real Git still refuses local transport after a caller requests a file exception', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.allow', GIT_CONFIG_VALUE_0: 'never' });
+    clearEnv('GIT_ALLOW_PROTOCOL');
+    const child = envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'user' });
+    for (const env of [process.env, child]) {
+      const result = spawnSync('git', ['ls-remote', cwd], { env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
+      expect(result.status, result.stderr).toBe(128);
+      expect(result.stderr).toContain("transport 'file' not allowed");
+    }
   });
   it('forwards unregistered ambient WE_PR_LIMIT_WE=0 and arbitrary values but drops unknown bag names', () => {
     for (const name of ['WE_PR_LIMIT_WE', 'SEC1_ARBITRARY_UNKNOWN', 'SEC1_BAG_UNKNOWN']) clearEnv(name);

@@ -532,6 +532,9 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
     for (const name of names) expect(ruleFor(name), name).toMatchObject({ class: 'drop', never: true });
     const bag = Object.fromEntries(names.map(name => [name, 'hostile']));
     for (const [name, value] of Object.entries(bag)) vi.stubEnv(name, value);
+    expect(() => childEnv()).toThrow(/ambient GIT_CONFIG/);
+    expect(() => childEnv(bag)).toThrow(/ambient GIT_CONFIG/);
+    clearEnv('GIT_CONFIG_COUNT'); // No count means orphan indexed entries; all remaining never rules still drop.
     for (const env of [childEnv(), childEnv(bag)]) {
       for (const name of names.filter(n => !['PATH', 'HOME'].includes(n))) expect(env, name).not.toHaveProperty(name);
     }
