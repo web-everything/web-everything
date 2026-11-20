@@ -21,7 +21,7 @@ import { appendFileSync, existsSync, mkdirSync, realpathSync, writeSync } from '
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { daemonEventsPath } from './daemon-events.mjs';
-import { lastGoodForClone, rebuildGraceForClone } from './daemon-last-good.mjs';
+import { lastGoodForClone, lastGoodMaxAgeMs, readRebuildStateFile, rebuildGraceForClone } from './daemon-last-good.mjs';
 import { readSettings as readOperatorSettings } from './settings-files.mjs';
 // Sparse copied-CLI fixtures may omit the launcher; only lane fallback needs it, and must refuse without it.
 const freshLauncher = await import('../run-fresh.mjs').catch(() => null);
@@ -381,6 +381,7 @@ export const OPERATOR_CLI_STALE_MARKER = 'run from an up-to-date lane';
 export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'main', run = gitRun,
   listBehindFiles = (r) => behindFiles(r, base, run), env = process.env,
   cwd = process.cwd(), argv = process.argv, execArgv = process.execArgv,
+  adoptedState = (r) => readRebuildStateFile(r, env), now = () => Date.now(),
   exists = existsSync, readSettings = readOperatorSettings, spawn = spawnSync, laneSpawn = spawnSync, emitEvent = emitLaneReleaseFailedSync, exit = (code) => process.exit(code),
   write = (s) => { try { writeSync(2, s); } catch { /* stderr closed */ } },
   skipUnderVitest = !!process.env.VITEST } = {}) {
@@ -407,6 +408,21 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
   } catch (e) {
     if (!isStaleMainRefusalMessage(e?.message)) throw e;
     const behind = last?.behind ?? 'several';
+    // R1099 — a daemon's own smoke-gated ADOPTED build is current by construction. Honour the same off knob.
+    try {
+      let knob = env?.WE_OPERATOR_CLI_FRESH_FALLBACK;
+      if (knob === undefined) { try { knob = readSettings()?.operatorCli?.freshFallback; } catch { /* absent */ } }
+      if (knob !== 'off') {
+        const head = readHeadSha(root, run);
+        const verdict = decideAdoptedBuild({ headSha: head, state: adoptedState(root), dirty: codeDirty(root, run),
+          nowMs: now(), maxAgeMs: lastGoodMaxAgeMs(env) });
+        if (verdict.ok) {
+          write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs, but is its daemon's `
+            + `ADOPTED smoke-passed build ${head.slice(0, 12)} (adopted ${verdict.at}) — running it, not refusing.\n`);
+          return { adoptedBuild: true, behind, head };
+        }
+      }
+    } catch { /* unreadable evidence refuses below */ }
     const refusal = new Error(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it `
       + `runs (${STALE_MAIN_REFUSAL_MARKER}) — its verdict could be wrong on a bug main already fixed, so it refuses: `
       + `${OPERATOR_CLI_STALE_MARKER} (a fresh lane on origin/${base}: \`node scripts/lane-pool.mjs acquire\`). `
@@ -551,6 +567,21 @@ export function isSameCheckout(a, b) {
 export function selfFastForwardAction({ sameCheckout, codeChanged, armed, reexeced }) {
   if (!sameCheckout || codeChanged === false) return 'proceed';
   return armed && !reexeced ? 'reexec' : 'refuse';
+}
+
+/**
+ * PURE (R1099): is this checkout exactly its daemon's ADOPTED smoke-passed build? Accepts only a full 40-hex
+ * `headSha` equal to `state.adopted.head`, a clean code tree, and an adoption no older than `maxAgeMs`.
+ * Anything missing, unreadable or mismatched refuses (fail closed).
+ */
+export function decideAdoptedBuild({ headSha, state, dirty, nowMs, maxAgeMs } = {}) {
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { ok: false, reason: 'head-unreadable' };
+  if (state?.adopted?.head !== headSha) return { ok: false, reason: 'head-not-adopted' };
+  if (dirty !== false) return { ok: false, reason: 'tree-dirty' };
+  const at = Date.parse(state.adopted.at || '');
+  if (!Number.isFinite(at) || !Number.isFinite(nowMs) || !(maxAgeMs > 0)) return { ok: false, reason: 'adoption-time-unreadable' };
+  if (nowMs - at > maxAgeMs) return { ok: false, reason: 'adoption-too-old' };
+  return { ok: true, head: headSha, at: state.adopted.at };
 }
 
 /** `git rev-parse HEAD` in `root`, or `null` (never throws). */
