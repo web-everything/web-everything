@@ -4,10 +4,10 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/ci-heal-mark.mjs", "we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs"]
+scope: ["we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs"]
 dateOpened: "2026-10-02"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "e2ca80ac2a75e42cb204b6d736bdf55bf87f5e38"
+preparedDate: "2026-11-20"
+preparedAgainstSha: "98e57b4c75e6202498fc613e547a5582240a5bae"
 tags: []
 ---
 
@@ -15,118 +15,157 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/ci-heal-mark.mjs:250` — A deterministic test scenario that injects a concurrent label addition exactly during the `gh pr edit` execution window to assert how the script recovers or reports the breach.
+1. `we:scripts/conveyor/ci-heal-mark.mjs:461` — A deterministic test scenario that injects a concurrent label addition exactly during the `gh pr edit` execution window to assert how the script recovers or reports the breach.
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3475@442a00342e7fa9abb130bc1e62ff88283453c0a0
 
 ## Progress
 
-Preparation research: the original premise cited the edit window at
-`we:scripts/conveyor/ci-heal-mark.mjs:186` and scoped both the production script and
-`we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs`. The goal remains an executable
-concurrent-label regression scenario. The corrected location is
-`we:scripts/conveyor/ci-heal-mark.mjs:250`: the mutation is followed by verification
-at lines 251–256 in that same source. The source/test scope remains paired, but the
-expected implementation diff is test-only; production behavior already reports the
-breach and does not recover by removing either label.
+Re-preparation found factual drift. The old scope paired
+`we:scripts/conveyor/ci-heal-mark.mjs` with
+`we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs`, despite expecting a test-only
+change. The old premise placed both modes at the same direct write and promised
+one heal comment and the same verification error for both modes. Corrected scope
+is the existing test file alone; production files below are evidence, not planned
+edits. Size remains 3: one subprocess harness, approximately 90–140 changed lines
+for a twelve-case matrix, edit-time trace, mode-specific assertions and coverage
+inventory. No runtime default, caller, persisted state or label policy changes.
 
-Evidence: `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:328` defines concurrent
-review-label cases, but the fake CLI injects them on the second **view** at line 361,
-before the edit. Its post-write case at line 337 changes the head on a later view;
-the edit handler does not inject a concurrent label. Thus existing coverage does
-not deliver this item's exact timing. The reporting paths are
-`we:scripts/conveyor/ci-heal-mark.mjs:287` (best-effort normal hand-back) and
-`we:scripts/conveyor/ci-heal-mark.mjs:323` (restore-only failure). These findings are
-from source inspection, not a claim that the proposed cases have run.
+Source evidence:
+
+- `we:scripts/conveyor/ci-heal-mark.mjs:461` is now the direct restore-only edit;
+  its verification is at `we:scripts/conveyor/ci-heal-mark.mjs:463` and its CLI
+  reporting at `we:scripts/conveyor/ci-heal-mark.mjs:533`.
+- Normal completion delegates at `we:scripts/conveyor/ci-heal-mark.mjs:503` through
+  `we:scripts/conveyor/ci-heal-mark.mjs:400` to
+  `we:scripts/conveyor/rearm-review.mjs:362`. The shared writer verifies at
+  `we:scripts/review-set-label.mjs:2402`, including forbidden remaining labels
+  from `we:scripts/review-set-label.mjs:571`. Its error differs from restore-only.
+- The normal path posts a request comment before the swap
+  (`we:scripts/review-set-label.mjs:2282`);
+  `we:scripts/conveyor/rearm-review.mjs:294` explicitly describes this as a request,
+  not verified success. Thus two comments survive a normal verification refusal.
+- Existing races at `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:410`
+  and `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:411` inject on reads,
+  including the stale landing-signal scenario at
+  `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:373`. The edit handler at
+  `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:415` has no concurrent-label
+  injection. This exact timing goal is still outstanding.
+
+These are source observations; no runtime pass is claimed during preparation.
+The existing preparation stamps are left for the runner to replace.
 
 ## Design
 
-Extend the existing stateful fake-`gh` incident replay in
-`we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs`. Add an explicit scenario field
-for a label injected inside the `pr edit` handler, after its requested additions
-have been applied and before the state is persisted and the command returns.
-Keep the pre-edit reads unlabelled, the head unchanged, and the PR open and non-draft.
-This deterministically places the competing write between the final guard read and
-the verification read, without sleeps, network access, or production injection hooks.
+Extend the stateful fake CLI in
+`we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs` with an explicit edit-window
+scenario field. Apply the requested label additions, inject the competing label,
+record a snapshot, then persist state and return from that same fake edit call.
+Record view snapshots too: the last pre-edit view must lack both routing labels;
+the next view must contain pending plus the injected label. Keep the head stable,
+the PR open and non-draft, and initial labels empty. No sleeps or production hooks.
 
-Exercise `review:human`, `review:changes`, `review:accepted`, `review:unknown`, and
-`ready-to-merge` separately in both normal completion and `--restore-routing-only`.
-Persist the competing label alongside `review:pending`; assert raw final state
-before the existing simulated lifecycle cleanup. A benign unrelated label is a
-positive control: it must survive and must not trigger a verification error.
+Run each of `review:human`, `review:changes`, `review:accepted`, `review:unknown`,
+`ready-to-merge`, and benign `area:docs` through normal completion and
+`--restore-routing-only` (twelve cases). Assert raw persisted labels before the
+existing lifecycle simulation. All cases issue exactly one additive pending edit,
+without removals, retries, rollback or acceptance restamping.
 
-The established behavior in `we:scripts/conveyor/ci-heal-mark.mjs` is reporting,
-not rollback. Normal completion preserves its durable heal comment and exits zero,
-with no `restored` field and `carryReason` equal to
-`CI-heal routing restoration could not be verified`. Restore-only exits one,
-reports that error on stderr, and posts no restoration-success comment. Neither
-path removes the competing label, retries the edit, or restamps acceptance.
-No interface, label policy, or persistent-data migration is needed.
+Conflicting normal cases exit zero with `restamped: false`, `rearmed: false`, no
+`restored`, and a `carryReason` containing
+`missing review handoff could not be verified: label transition was not observed`.
+They retain one heal comment and one re-arm request comment; the latter explicitly
+says completion reports verification. Conflicting restore-only cases exit one,
+stderr contains `CI-heal routing restoration could not be verified`, stdout has no
+success JSON, and no comments are posted. Both modes preserve the conflicting label
+and pending hold. The benign control succeeds with `restored: review:pending`, no
+failure diagnostic, and preserves `area:docs`: two comments in normal mode, one
+routing-restoration comment in restore-only mode.
 
 ## MVP
 
-1. **Must 1 — Deterministic injection:** add edit-window fixtures to
-   `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs`, covering the five conflicting
-   labels and one benign label in both CLI modes. Record enough call/state evidence
-   to show the final pre-edit read was clean and injection happened in the edit handler.
-2. **Must 2 — Exact observations:** assert exit status, JSON or stderr diagnostics,
-   raw final labels, comment contents/counts, and exactly one additive edit with no
-   removals for each edit-window case. Conflicting cases retain both labels and
-   never claim restoration success; the benign case reports successful restoration.
-3. **Must 3 — Preserve existing coverage:** retain pre-edit refusal, write failure,
-   ignored-write, and post-write head-change cases. Adjust scenario expectation
-   branching explicitly so new edit-window cases are not mistaken for skipped writes.
+1. Add the twelve fixtures and edit/view trace snapshots to the existing incident
+   replay. Give each new test a searchable `4742 edit-window` prefix and include
+   its mode and label in its name.
+2. Branch new-case expectations explicitly before the existing `scenario.pr` and
+   failure shortcuts at
+   `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:440` and
+   `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:501`. Assert timing, labels,
+   calls, diagnostics and comment bodies/counts; do not weaken old assertions.
+3. Add a named `4742 edit-window matrix completeness` test over the fixture list:
+   require exactly the six labels in each mode. Retain all existing pre-read,
+   pre-write, unreadable-evidence, ignored-write and post-write failure cases.
 
-Implement fixtures first, then assertions and expectation branching, and land them
-as one test-only change. Size 3 remains appropriate for the existing subprocess
-harness, two output contracts, and mutation-sensitive assertions. The production
-source remains in scope as the behavior under test, paired with its existing test.
+## Acceptance
 
-## Done when
+The executable probe for every criterion is the queued test-file run below,
+preceded by a presence check for the named new test. Presence fails on the current
+checkout; after implementation the presence check and assertions must both pass.
+This is coverage debt: current production behavior is expected to pass new tests,
+so do not represent it as a runtime bug with a naturally red baseline.
 
-1. Musts 1–2: the focused incident replay runs all edit-window cases in both modes,
-   proves their injection ordering, and asserts the existing reporting contract and
-   preserved concurrent labels.
-2. Must 3: the complete matching test file passes with existing scenarios intact.
-3. Must 2: disabling the conflicting-label post-write check makes the new conflicting
-   cases fail; restoring that check returns them to green. This is a coverage addition:
-   the current production code is expected to pass the new tests, so no unmodified
-   baseline failure is claimed.
+- [A1] Executable: `4742 edit-window matrix completeness` in
+  `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs` asserts the twelve-case
+  inventory; each `4742 edit-window` case asserts clean final pre-read → injection
+  inside edit → verification read, exactly one additive edit, and preserved raw
+  labels. The presence-and-test command below fails before these tests exist.
+- [A2] Executable: the eight review-label conflicts and two ready-to-merge conflicts
+  named `4742 edit-window <mode> <label>` in
+  `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs` assert the mode-specific
+  fail-closed output and comment contracts from Design. Run the same
+  presence-and-test command; removal of either verifier's conflict predicate must
+  also make its corresponding cases fail.
+- [A3] Executable: the two `4742 edit-window <mode> area:docs` tests in
+  `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs` assert successful restoration,
+  preserved benign labels, exact comments, and no failure diagnostic. The same
+  presence-and-test command fails before the matrix exists and passes afterward;
+  rejecting all additions must fail these controls. The full file retains existing
+  caller and fail-closed regression assertions. No defaults or callers change.
 
 ## Test plan
 
-Run the incident replay in `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs`
-with Vitest's test-name filter `CI-heal missing routing label incident replay`, then
-run that full test file. Invoke Vitest from the WE checkout using the filesystem
-path corresponding to the prefixed reference. Include the benign-label control
-so a verifier that rejects every concurrent addition cannot satisfy the suite.
-Keep all PR state and fake executables in each test's existing temporary directory.
+Run from the WE checkout. Prefixes below identify repository paths; the shell
+removes the locus before passing a path to a tool. Use the host heavy queue only:
 
-For normal conflicting cases assert exactly one heal marker comment, no restoration
-success, `restamped: false`, `rearmed: false`, and the exact `carryReason`. For
-restore-only conflicting cases assert status one, the verification error in stderr,
-no success JSON and no comments. For benign cases assert `restored: review:pending`
-and the mode-appropriate heal or restoration comment. Check every fake command
-still addresses the fixture repository and that no real GitHub call escapes the fake.
+```sh
+test_ref=we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs
+queue_ref=we:scripts/readiness/heavy-admission.mjs
+rg -q '4742 edit-window matrix completeness' "${test_ref#we:}" &&
+node "${queue_ref#we:}" run -- npx vitest run "${test_ref#we:}"
+```
+
+For focused debugging, add `-t '4742 edit-window'` to the queued Vitest invocation.
+A missing-test-name check alone is not sufficient proof; require the matrix count
+and behavioral assertions too. Keep fixtures under the task's temporary directory,
+with the fake executable first on PATH. Preserve the existing repository-target
+assertion at `we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs:450` and rejection
+of unexpected fake commands. Never contact GitHub for this test.
 
 ## Proof plan
 
-Save the focused and full-file test results plus representative command traces and
-final fixture state for both modes. Temporarily disable only the conflicting-label
-predicate at `we:scripts/conveyor/ci-heal-mark.mjs:255` in an isolated validation copy;
-the new conflicting cases must fail on their reporting assertions while the benign
-control remains green. Restore the predicate and rerun the focused cases. Record
-this as mutation evidence, not as proof of an atomic GitHub write or automatic recovery.
+Capture the pre-build presence failure, then the post-build full-file result and
+representative traces/raw state from both modes. The trace must demonstrate that
+injection ran inside edit, not merely on a later view. Capture normal request
+comments separately from the completion result so a request cannot masquerade as
+verified restoration.
 
-The runner owns preparation checks and stamping. During implementation, run the
-repository standards gate and verify the final diff contains only the intended test
-change and no retained mutation. Independent review of this preparation belongs to
-the runner's parked review flow.
+In an isolated validation copy under the task temporary directory, remove the
+review-family conflict predicate and forbidden-removal-label predicate from
+`we:scripts/review-set-label.mjs:2408`; normal conflict tests must fail. Separately
+remove the conflicting-label predicate in
+`we:scripts/conveyor/ci-heal-mark.mjs:466`; restore-only conflict tests must fail.
+Benign controls must remain green in both experiments. Restore the production
+sources and rerun the focused matrix through the queue. No mutation belongs in the
+submitted diff. This proves sensitivity to breach reporting, not atomic remote
+writes or automatic recovery.
+
+The runner owns preparation checks, stamping and parked review. Implementation
+validation includes the queued standards gate and the full matching test file.
+If admission is busy, use the queue's bounded wait once, then stop and report.
 
 ## Follow-ups
 
-No prerequisite or unresolved policy fork remains for this coverage-only goal.
-Automatic reconciliation of the resulting mixed labels would require a separate
-policy decision about competing writers; this item only locks down the existing
-breach reporting. A real remote race experiment is unnecessary for deterministic
-coverage and is not part of this item.
+No prerequisite or unresolved policy fork remains for this test-only goal.
+Automatic reconciliation of mixed labels is a separate policy question; this card
+records the current reporting behavior. A remote race experiment is outside scope.
+No blockedBy change is proposed.
