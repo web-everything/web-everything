@@ -12,12 +12,12 @@ it('BEFORE: skipping BLOCKED heads strands cleared stale-failed gates', async ()
     .toContain('stale-failed gate was not repaired with two pinned branch updates');
 });
 
-it('fix presence stays true when planner behavior regresses', () => {
+it.each(['return { head };', 'humanSurfaceGuardAllows', 'expected_head_sha=', 'fixClaimHeld'])('fix presence stays true when %s regresses', token => {
   const root = mkdtempSync(join(tmpdir(), 'stale-static-'));
   try {
     mkdirSync(join(root, 'scripts/lib'), { recursive: true });
     const source = readFileSync(new URL('../../../lib/stale-gate-update-branch.mjs', import.meta.url), 'utf8');
-    writeFileSync(join(root, 'scripts/lib/stale-gate-update-branch.mjs'), source.replace('return { head };', 'return null;'));
+    writeFileSync(join(root, 'scripts/lib/stale-gate-update-branch.mjs'), source.replaceAll(token, token === 'return { head };' ? 'return null;' : 'removedGuard'));
     expect(b.fixPresent(root)).toBe(true);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

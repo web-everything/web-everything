@@ -253,7 +253,7 @@ import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIO
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
-import { readStaleGateUpdateBranchMax, readStaleGateRequiredChecks, updateStaleGateBranches } from './lib/stale-gate-update-branch.mjs';
+import { readStaleGateUpdateBranchMax, readStaleGateRequiredAppId, updateStaleGateBranches } from './lib/stale-gate-update-branch.mjs';
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
@@ -7346,20 +7346,19 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const staleGateSetting = readStaleGateUpdateBranchMax({ env });
   process.stderr.write(`drain.staleGateUpdateBranchMax=${staleGateSetting.value} (${staleGateSetting.source})\n`);
   if (!DRY_RUN) {
-    const staleGateRosters = new Map();
+    const staleGateAppIds = new Map();
     const staleGateRepoKey = repo => REPOS.find(r => (r || localSlug) === repo);
     refreshStaleBlockedGates(verdicts, {
       localSlug, max: staleGateSetting.value,
       defaultBranchOf: repo => defaultBranchOf(staleGateRepoKey(repo)),
-      requiredChecksOf: repo => {
-        if (!staleGateRosters.has(repo)) {
+      requiredAppIdOf: repo => {
+        if (!staleGateAppIds.has(repo)) {
           const repoKey = staleGateRepoKey(repo);
-          const roster = readStaleGateRequiredChecks({ repo, branch: defaultBranchOf(repoKey) });
-          staleGateRosters.set(repo, roster);
+          const appId = readStaleGateRequiredAppId({ repo, branch: defaultBranchOf(repoKey) });
+          staleGateAppIds.set(repo, appId);
         }
-        return staleGateRosters.get(repo);
+        return staleGateAppIds.get(repo);
       },
-      isRequiredCheckGreen,
       fixClaimHeld: (repo, num) => !repoKeyForSlug(repo) || prestageFixClaimHeld(num, { claimKey: repoKeyForSlug(repo) }),
       humanSurfaceGuardAllows: (repo, num, head) => !approvedHeadHold({ repo: staleGateRepoKey(repo), num }, head, { strict: true }),
     });

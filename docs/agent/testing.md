@@ -6,7 +6,12 @@ The drain's stale-gate repair is advisory: a BLOCKED skip remains a skip for the
 Exercise the real `refreshStaleBlockedGates` hook with injected GitHub IO, including the exact
 `expected_head_sha` PUT, a repeated pass on the same head, and a 422. Reserve the head before
 the write; an uncertain response must not permit another attempt. The soak break
-`stale-failed-merge-gate-blocks-drain` detects fix presence statically so behavioral regressions remain required failures. Its 422
+`stale-failed-merge-gate-blocks-drain` uses only the exported planner name as its fix-presence marker,
+so deleting a guard cannot turn a regression into an expected failure. Eligibility uses the newest
+check-run id on the pinned head from the required merge-gate app id (live branch protection/rulesets).
+Other apps are ignored; missing/unreadable app identity, non-failed or unfinished newest runs,
+and unreadable or blocking fresh review decisions skip repair. Other required checks do not enter
+this advisory repair decision. Cover these paths in `stale-gate-update-branch.test.mjs`. Its 422
 assertion scopes logs to the conflict action; the log-suppression regression must fail the scenario.
 
 ## Review PR fetch isolation (R37)

@@ -17,24 +17,22 @@ export default {
   fixPresent(root) {
     try {
       const source = readFileSync(join(root, HELPER), 'utf8');
-      return ['export function planStaleGateUpdateBranch', 'export function updateStaleGateBranches',
-        'expected_head_sha=', 'fixClaimHeld', 'humanSurfaceGuardAllows', 'requiredChecks', 'attempted(path, c.head)']
-        .every(guard => source.includes(guard));
+      return source.includes('export function planStaleGateUpdateBranch');
     } catch { return false; }
   },
   async run({ sourceRoot = ROOT, updateBranches } = {}) {
     const violations = [];
     const stateRoot = mkdtempSync(join(tmpdir(), 'soak-stale-gate-'));
     try {
-      const { isRequiredCheckGreen, refreshStaleBlockedGates, unlandableStateReason } = await import(pathToFileURL(join(sourceRoot, 'scripts/merge-ai-prs.mjs')).href);
+      const { refreshStaleBlockedGates, unlandableStateReason } = await import(pathToFileURL(join(sourceRoot, 'scripts/merge-ai-prs.mjs')).href);
       const update = updateBranches ?? (args => refreshStaleBlockedGates(args.candidates.map(c => ({
         repo: c.repo, num: c.num, headSha: c.head, decision: 'skip', reason: unlandableStateReason('BLOCKED'),
       })), args));
       const writes = [], logs = [];
       let conflict = false;
       const args = { candidates: [7106, 7117, 7118].map(num => ({ repo: 'example/widgets', num, head })),
-        max: 2, stateRoot, defaultBranchOf: () => 'main', requiredChecksOf: () => [{ context: 'test', appId: CHECK_APP }, { context: 'merge-gate', appId: CHECK_APP }],
-        isRequiredCheckGreen, fixClaimHeld: () => false, humanSurfaceGuardAllows: () => true, log: line => logs.push(line),
+        max: 2, stateRoot, defaultBranchOf: () => 'main', requiredAppIdOf: () => CHECK_APP,
+        fixClaimHeld: () => false, humanSurfaceGuardAllows: () => true, log: line => logs.push(line),
         gh: (_bin, argv) => {
           if (argv[0] === 'pr') return JSON.stringify({ number: Number(argv[2]), headRefOid: head,
             baseRefName: 'main', isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', reviewDecision: 'APPROVED',
@@ -46,9 +44,35 @@ export default {
             return '{}';
           }
           return JSON.stringify({ total_count: 2, check_runs: [{ id: 2, name: 'test', head_sha: head, app: { id: 1 },
-            status: 'completed', conclusion: 'success' }, { id: 1, name: 'merge-gate', head_sha: head,
+            status: 'completed', conclusion: 'success' }, { id: 1, name: 'merge-gate', head_sha: head, app: { id: CHECK_APP },
             status: 'completed', conclusion: 'failure' }] });
         } };
+      const read = args.gh;
+      const rejected = [
+        ['other app newer failure', { gate: { conclusion: 'success' }, otherApp: true }],
+        ['no required-app run', { gate: { app: { id: 2 } } }],
+        ['unknown required app', { requiredAppId: null }],
+        ['newest required gate succeeded', { gate: { conclusion: 'success' } }],
+        ['newest required gate pending', { gate: { status: 'in_progress', conclusion: null } }],
+        ...['CHANGES_REQUESTED', 'REVIEW_REQUIRED', undefined].map(reviewDecision => ['blocked or unreadable review', { reviewDecision }]),
+      ];
+      for (const [name, evidence] of rejected) {
+        update({ ...args, requiredAppIdOf: () => 'requiredAppId' in evidence ? evidence.requiredAppId : CHECK_APP,
+          gh: (bin, argv) => {
+            if (argv[1] === '-X') return read(bin, argv);
+            const result = JSON.parse(read(bin, argv));
+            if (argv[0] === 'pr') {
+              if ('reviewDecision' in evidence) result.reviewDecision = evidence.reviewDecision;
+            } else {
+              const gate = result.check_runs.find(c => c.name === 'merge-gate');
+              Object.assign(gate, evidence.gate);
+              if (evidence.otherApp) result.check_runs.push({ ...gate, id: 99, app: { id: 2 }, conclusion: 'failure' });
+              result.total_count = result.check_runs.length;
+            }
+            return JSON.stringify(result);
+          } });
+        if (writes.length) violations.push(`${name} authorized a branch update`);
+      }
       for (const humanSurfaceGuardAllows of [() => false, () => undefined,
         () => { throw new Error('approval proof unreadable'); }]) {
         const logStart = logs.length;

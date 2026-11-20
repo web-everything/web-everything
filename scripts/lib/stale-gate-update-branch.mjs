@@ -41,34 +41,21 @@ export function readStaleGateUpdateBranchMax({ env = process.env, readTool = rea
 }
 
 /** Pure. Evidence must describe the judged head, including a complete gate history. */
-export function planStaleGateUpdateBranch({ pr, head, defaultBranch, checkRuns, requiredChecks,
-  isRequiredCheckGreen, fixClaimHeld, attempted = false } = {}) {
+export function planStaleGateUpdateBranch({ pr, head, defaultBranch, checkRuns, requiredAppId,
+  fixClaimHeld, attempted = false } = {}) {
   if (!pr || !sha(head) || pr.headRefOid !== head || attempted !== false || fixClaimHeld !== false
-    || pr.requiredCheckReadError || pr.isCrossRepository !== false || pr.mergeable !== 'MERGEABLE'
+    || pr.isCrossRepository !== false || pr.mergeable !== 'MERGEABLE'
     || ![null, '', 'APPROVED'].includes(pr.reviewDecision)
     || pr.mergeStateStatus !== 'BLOCKED' || typeof defaultBranch !== 'string' || !defaultBranch.trim() || pr.baseRefName !== defaultBranch
     || !Array.isArray(pr.labels) || pr.labels.some(l => typeof l?.name !== 'string')
-    || !Array.isArray(pr.statusCheckRollup) || pr.statusCheckRollup.length >= 100
-    || !Array.isArray(requiredChecks) || !requiredChecks.length
-    || requiredChecks.some(c => typeof c?.context !== 'string' || !c.context.trim())
-    || typeof isRequiredCheckGreen !== 'function' || !Array.isArray(checkRuns)) return null;
+    || !Number.isSafeInteger(requiredAppId) || requiredAppId <= 0 || !Array.isArray(checkRuns)) return null;
   const labels = new Set(pr.labels.map(l => l.name));
   if (!['ready-to-merge', 'review:accepted', 'red-team:clear'].every(l => labels.has(l))
     || holds.some(l => labels.has(l))) return null;
-  const gates = checkRuns.filter(c => c?.name === 'merge-gate');
+  const gates = checkRuns.filter(c => c?.name === 'merge-gate' && c?.app?.id === requiredAppId);
   if (!gates.length || gates.some(c => !Number.isSafeInteger(c.id) || c.id <= 0 || c.head_sha !== head)) return null;
   const latest = [...gates].sort((a, b) => b.id - a.id)[0];
   if (latest.status !== 'completed' || latest.conclusion !== 'failure') return null;
-  try {
-    if (!requiredChecks.filter(c => c.context !== 'merge-gate').every(({ context, appId }) => {
-      if (!Number.isSafeInteger(appId) || appId <= 0) return false;
-      const rows = checkRuns.filter(c => c?.name === context && c?.app?.id === appId);
-      if (!rows.length || rows.some(c => c.head_sha !== head || !Number.isSafeInteger(c.id) || c.id <= 0)) return false;
-      const statusCheckRollup = rows.map(c => ({ __typename: 'CheckRun', name: c.name, databaseId: c.id,
-        status: c.status?.toUpperCase(), conclusion: c.conclusion?.toUpperCase() }));
-      return isRequiredCheckGreen({ ...pr, statusCheckRollup }, context) === true;
-    })) return null;
-  } catch { return null; }
   return { head };
 }
 
@@ -82,15 +69,15 @@ function attempted(path, head) {
 }
 
 /** Best effort only; reserve before PUT so errors/crashes never retry the same head. No merge decisions change.
- * The caller supplies only BLOCKED skip verdicts and memoizes the live required-check roster per repo.
+ * The caller supplies only BLOCKED skip verdicts and memoizes the live required merge-gate app id per repo.
  */
-export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranchOf, requiredChecksOf,
-  isRequiredCheckGreen, fixClaimHeld, humanSurfaceGuardAllows, gh = execFileSyncThrottled, log = message => process.stderr.write(`${message}\n`),
+export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranchOf, requiredAppIdOf,
+  fixClaimHeld, humanSurfaceGuardAllows, gh = execFileSyncThrottled, log = message => process.stderr.write(`${message}\n`),
   stateRoot = join(resolveCoordinationRoot(), 'stale-gate-update-branch') } = {}) {
   const results = [];
   if (!Number.isSafeInteger(max) || max < 1 || max > 100 || !Array.isArray(candidates)) return results;
   let attempts = 0;
-  // At most 100 fresh PR reads + 100 gate reads per pass, apart from the memoized roster read.
+  // At most 100 fresh PR reads + 100 gate reads per pass, apart from the memoized required-app read.
   if (candidates.length > 100) log('stale-gate-update-branch: candidate scan capped at 100; inspect remaining PRs and update branches manually');
   const options = { encoding: 'utf8', stdio: 'pipe', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 };
   for (const c of candidates.slice(0, 100)) {
@@ -101,21 +88,18 @@ export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranc
       const path = join(stateRoot, key(c));
       if (attempted(path, c.head)) continue;
       const defaultBranch = defaultBranchOf(c.repo);
-      const requiredChecks = requiredChecksOf(c.repo);
-      if (!defaultBranch || !Array.isArray(requiredChecks) || !requiredChecks.length) continue;
+      const requiredAppId = requiredAppIdOf(c.repo);
+      if (!defaultBranch || !Number.isSafeInteger(requiredAppId) || requiredAppId <= 0) continue;
       const pr = JSON.parse(gh('gh', ['pr', 'view', String(c.num), '--repo', c.repo, '--json',
-        'number,headRefOid,baseRefName,isCrossRepository,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup'], options));
+        'number,headRefOid,baseRefName,isCrossRepository,mergeable,mergeStateStatus,reviewDecision,labels'], options));
       if (pr?.number !== c.num || pr.headRefOid !== c.head) continue;
-      if (!Array.isArray(pr.statusCheckRollup) || pr.statusCheckRollup.length >= 100) {
-        throw new Error('unreadable or capped check rollup');
-      }
       const checks = JSON.parse(gh('gh', ['api', `repos/${c.repo}/commits/${c.head}/check-runs?per_page=100&filter=all`], options));
       if (!Array.isArray(checks?.check_runs) || !Number.isSafeInteger(checks.total_count)
         || checks.total_count !== checks.check_runs.length || checks.total_count > 100) {
         throw new Error('incomplete or oversized check evidence; inspect and update branch manually');
       }
       const plan = planStaleGateUpdateBranch({ pr, head: c.head, defaultBranch, checkRuns: checks.check_runs,
-        requiredChecks, isRequiredCheckGreen, fixClaimHeld: fixClaimHeld(c.repo, c.num) });
+        requiredAppId, fixClaimHeld: fixClaimHeld(c.repo, c.num) });
       if (!plan) continue;
       mkdirSync(stateRoot, { recursive: true });
       withFileLock(`${path}.lock`, () => {
@@ -139,13 +123,15 @@ export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranc
   return results;
 }
 
-/** Live union only: older names-only caches cannot prove a required app's identity. */
-export function readStaleGateRequiredChecks({ repo, branch, readRequired = readRequiredStatusChecksDetailed } = {}) {
+/** Live policy only: no cached names-only roster can prove the required gate app identity. */
+export function readStaleGateRequiredAppId({ repo, branch, readRequired = readRequiredStatusChecksDetailed } = {}) {
   if (typeof repo !== 'string' || !repo.trim() || typeof branch !== 'string' || !branch.trim()) return null;
   try {
-    const { checks, requiredCheckApps } = readRequired({ repo, branch, includeAppIds: true });
-    if (!Array.isArray(checks) || !checks.length || !Array.isArray(requiredCheckApps)
-      || checks.some(context => !requiredCheckApps.some(c => c.context === context))) return null;
-    return requiredCheckApps;
+    const { requiredCheckApps } = readRequired({ repo, branch, includeAppIds: true });
+    if (!Array.isArray(requiredCheckApps)) return null;
+    const gates = requiredCheckApps.filter(c => c?.context === 'merge-gate');
+    if (!gates.length || gates.some(c => !Number.isSafeInteger(c.appId) || c.appId <= 0)) return null;
+    const ids = new Set(gates.map(c => c.appId));
+    return ids.size === 1 ? gates[0].appId : null;
   } catch { return null; }
 }
