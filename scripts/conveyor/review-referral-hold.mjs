@@ -4,14 +4,15 @@
  * (no new panel), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
-import { resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
+import { isValidRunId, resolveRunsDir, reportInvalidRunEntry, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
+import { validateRunRecord } from '../operations/run-record.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
-  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable } from '../lib/jury-core.mjs';
+  referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable, VERDICTS } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -52,8 +53,9 @@ const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
- * A run suspended at human confirmation has completed its panel, although the operation is pending. */
-export function reviewRunEvidence(run) {
+ * A run suspended at human confirmation has completed its panel, although the operation is pending.
+ * Misnamed-record recovery requires a recognized review verdict as well as completion timing. */
+export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
@@ -120,10 +122,11 @@ export function reviewRunEvidence(run) {
       });
   } catch { /* unreadable step or seat evidence cannot establish a quota-only attempt */ }
   if (!sha(head) || !Number.isFinite(startedAt)) return null;
-  if (!Number.isFinite(completedAt)) {
+  if (!Number.isFinite(completedAt) || (requireVerdict && !Object.values(VERDICTS).includes(verdict?.verdict))) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
       ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
@@ -186,9 +189,59 @@ function writeEvidenceDiskCache(file, entries) {
     renameSync(tmp, file);
   } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
 }
+// Stray records are untrusted. Oversized/unreadable files retain the invalid-entry alert for operator repair.
+export const INVALID_RUN_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
-  let names;
-  try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  const entries = runFileEntries(dir, { includeInvalid: true, reportInvalid: path => {
+    if (!basename(path).startsWith('review-pr-')) reportInvalidRunEntry(path);
+  } });
+  const invalidEvidence = entries.flatMap(name => {
+    if (!name.startsWith('review-pr-') || isValidRunId(name.slice(0, -5))) return [];
+    let fd;
+    const path = join(dir, name);
+    try {
+      // Nonblocking open avoids hanging on a FIFO before we can reject its descriptor's type.
+      fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) throw new Error('not a regular file');
+      if (stat.size > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
+      const buffer = Buffer.alloc(INVALID_RUN_EVIDENCE_MAX_BYTES + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const bytes = readSync(fd, buffer, length, buffer.length - length, null);
+        if (bytes === 0) break;
+        length += bytes;
+      }
+      if (length > INVALID_RUN_EVIDENCE_MAX_BYTES) throw new Error('oversized record');
+      const run = JSON.parse(buffer.toString('utf8', 0, length));
+      // Recovery tolerates the bad id only; malformed run state must never clear a hold.
+      const errors = validateRunRecord(run).errors.filter(error => !error.startsWith('invalid run id '));
+      if (errors.length) throw new Error(errors.join('; '));
+      if (!Number.isSafeInteger(Number(run?.input?.pr)) || Number(run.input.pr) <= 0) throw new Error('no PR number');
+      // The verdict payload must be well formed: the pipeline always writes pendingReferrals (an array) on a
+      // needs-human verdict, so a missing or non-array list means the record is unreadable, never evidence.
+      // Every payload the projection may read is validated, so a valid one can never mask a malformed one.
+      for (const payload of [run.verdict, run.findings?.referralVerdict, run.resumeOf?.verdict, run.findings?.record?.verdict]) {
+        if (!payload || typeof payload !== 'object') continue;
+        for (const key of ['pendingReferrals', 'blockedReferrals']) {
+          if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new Error(`verdict ${key} is not a list`);
+        }
+        // Element shapes the pipeline writes: pendingReferrals are non-empty reason strings, blockedReferrals are objects.
+        if (payload.pendingReferrals?.some(item => typeof item !== 'string' || !item.trim())) throw new Error('verdict pendingReferrals holds a malformed element');
+        if (payload.blockedReferrals?.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error('verdict blockedReferrals holds a malformed element');
+        if (payload.verdict === VERDICTS.NEEDS_HUMAN && !Array.isArray(payload.pendingReferrals)) throw new Error('needs-human verdict without pendingReferrals');
+      }
+      // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
+      const evidence = reviewRunEvidence(run, { requireVerdict: true });
+      reportInvalidRunEntry(path);
+      return evidence ? [evidence] : [];
+    } catch (error) {
+      reportInvalidRunEntry(path, { severity: 'high', reason: error.message });
+      return [];
+    }
+    finally { if (fd !== undefined) closeSync(fd); }
+  });
+  const names = entries.filter(name => isValidRunId(name.slice(0, -5)));
   const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
   let disk = null;
   let dirty = false;
@@ -198,7 +251,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   // daemon had written even one new record) — ~140 MB of transient heap per pass, several passes per tick. A warm
   // process now parses its few missed records directly and leaves the file alone; the file is read (and rewritten)
   // only when this call misses every record or more than EVIDENCE_DISK_MIN_MISSES of them. Same evidence either way.
-  const rows = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).map(name => {
+  const rows = names.filter(n => n.startsWith('review-pr-')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
@@ -228,7 +281,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     disk ??= readEvidenceDiskCache(file);
     if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
   }
-  return out;
+  return [...out, ...invalidEvidence];
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
@@ -321,7 +374,7 @@ function latestReviewAttempt(history) {
  * @returns {{id: string, head: string}|null}
  */
 export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
-  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
@@ -355,7 +408,8 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 function evaluateReferralHold(pr, runs, { repo, now = Date.now(), env = process.env,
   // The SAME reader the review gate uses, so a `card` ruling naming a card that does not exist yet keeps the hold.
   cardReadable = ref => referralCardReadable(ref, REPO_ROOT) } = {}) {
-  const attempts = runs.filter(r => r.repo === repo && r.pr === Number(pr.number));
+  // Misnamed incomplete evidence spends no-verdict retries, but cannot supersede a referral hold.
+  const attempts = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(attempts);
   const history = attempts.filter(r => Number.isFinite(r.completedAt))
     .sort((a, b) => b.completedAt - a.completedAt);
