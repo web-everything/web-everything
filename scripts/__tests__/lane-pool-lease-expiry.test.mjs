@@ -3,6 +3,7 @@ import { execFileSync, spawnSync, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { join, resolve } from 'node:path';
+import { spawnKeepAlive } from '../lib/test-keepalive.mjs';
 
 const cli = resolve('scripts/lane-pool.mjs');
 let root, lane, pool, reference, env;
@@ -135,7 +136,7 @@ it('a fresh live lease produces no stale refusal during an acquirable reap pass'
 });
 
 it('an exiting acquire wrapper can name its surviving sibling as the lease holder', async () => {
-  const sibling = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const sibling = spawnKeepAlive();
   try {
     seed();
     const wrapper = `require('node:child_process').execFileSync(process.execPath, ${JSON.stringify([
