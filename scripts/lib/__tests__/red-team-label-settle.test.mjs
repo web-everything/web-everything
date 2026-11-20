@@ -163,6 +163,23 @@ describe('red-team label settles from the head\'s check', () => {
       go();
       expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, expect.objectContaining({ add: 'red-team:blocked' }));
     });
+    it('a head moving during the swap-time comment read refuses the write', () => {
+      const { provider, run: go } = make(() => true);
+      provider.readComments.mockImplementation(() => { provider.readPrState.mockReturnValue({ headRefOid: old, labels: ['red-team:pending'] }); return []; });
+      go();
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
+    it('the rechecks read through the fresh recheck provider, not a memoizing injected one', () => {
+      const stale = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
+      const fresh = { readPrState: vi.fn(() => ({ headRefOid: old, labels: ['red-team:pending'] })), readComments: vi.fn(() => []) };
+      stale.readPrState.mockReturnValueOnce(live).mockReturnValueOnce(live);
+      syncRedTeamStatusLabels({ ...input, live, provider: stale, recheckProvider: fresh, readCheckClear: () => true, standingRuling: null });
+      expect(fresh.readPrState).toHaveBeenCalled();
+      expect(stale.setLabels).not.toHaveBeenCalled();
+    });
+    it('a partial env still sees a carried-check marker under the process env', () => {
+      expect(readCheckClearFact({ ...input, env: { WE_APP_ID: '123' }, gh: ghFor([run()]) })).toBe(true);
+    });
     it('an unreadable thread at swap time refuses the settle', () => {
       const { provider, run: go } = make(() => true);
       provider.readComments.mockImplementation(() => { throw new Error('x'); });

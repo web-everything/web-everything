@@ -107,19 +107,23 @@ export function readCheckClearFact({ repo, pr, head, env = process.env, gh = cre
     if (app.ok !== true) return false;
     const options = { repo, pr, headSha: head, appId: app.appId, gh };
     // An unconfirmed carried-check publish (its outbox marker, which may own a live hold) is no proof either.
-    if (carriedCheckMarkerPresent({ repo, pr, head, env })) return false;
+    // A partial env inherits the process env, so the marker directory is never a different one (a missed hold).
+    if (carriedCheckMarkerPresent({ repo, pr, head, env: { ...process.env, ...env } })) return false;
     return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact({ ...options, strictSummary: true }).ok === true;
   } catch { return false; }
 }
 
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
-  provider: injectedProvider, log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
+  provider: injectedProvider, recheckProvider, log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
   gh, readCheckClear = args => (!gh && (isUnderTest() || isUnderTest(env)) ? false : readCheckClearFact({ ...args, env, gh })) } = {}) {
   const provider = injectedProvider ?? createGhProvider();
   // Head rechecks decide a label swap, so they read fresh (no gh read memo), like the check reads.
   const freshGh = createFreshGh(runGhSync, env);
-  const recheck = injectedProvider ?? createGhProvider({ exec: (args, options) => freshGh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, ...options }) });
+  // Production callers inject their own provider, so the rechecks never trust it: they always read fresh. Only a test run
+  // (no live gh) reuses the injected fake.
+  const recheck = recheckProvider ?? (injectedProvider && (isUnderTest() || isUnderTest(env)) ? injectedProvider
+    : createGhProvider({ exec: (args, options) => freshGh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, ...options }) }));
   if (!readRedTeamProbes({ env, log }).value.statusLabels) return { add: null, remove: [] };
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
@@ -166,6 +170,10 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     if (next.add === 'red-team:blocked') plan = next;
     else if (!still) return { add: null, remove: [], skipped: 'check-changed' };
     else plan = next;
+    // Last head guard, after every read and right before the write.
+    let last = null;
+    try { last = recheck.readPrState(repo, pr)?.headRefOid; } catch { last = null; }
+    if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };
   }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
