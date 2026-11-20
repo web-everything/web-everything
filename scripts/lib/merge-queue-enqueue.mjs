@@ -19,6 +19,7 @@ import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
+import { acceptanceCoversHead } from './review-escalation.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
@@ -721,6 +722,10 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
     try {
       if (newestRequiredFailedGate(await readFailedGate({ repo: c.repo, headSha,
         branch: classifyOptions.defaultBranch || 'main' }), headSha)) {
+        // Fail closed: the rebuild restamps the acceptance, so it must already cover THIS head (unknown = held).
+        const evidence = acceptance ?? (readAcceptance ? await readAcceptance({ pr: c.num, repo: c.repo, cwd: refreshOptions.cwd }) : null);
+        const coverage = acceptanceCoversHead(evidence ?? {});
+        if (!coverage.covers) return { ...unchanged, reason: `failed merge-gate refresh held: acceptance does not cover head (${coverage.reason || 'unknown'})` };
         return refreshStartupFailure({ c, headSha, classification: { runId: null, runConclusion: 'failure' },
           setting, statePath, writeClaim, warn, refreshOptions, failedGateBudget });
       }

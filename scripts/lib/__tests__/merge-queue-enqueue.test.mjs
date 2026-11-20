@@ -920,6 +920,7 @@ describe('required-app failed gate uses the existing guarded refresh', () => {
         { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }] },
       requiredChecks: ['test', 'merge-gate'], classifyPr: () => ({ decision: 'merge' }), setting: 'on',
       failedGateBudget: { remaining: 2 },
+      readAcceptance: vi.fn(async () => ({ acceptedSha: HEAD, headSha: HEAD })),
       readFailedGate: vi.fn(async () => ({ requiredAppId: 1, checkRuns: [failed()] })),
       readVerdict: vi.fn(() => { throw Error('no historical verdict needed'); }),
       cloneDir: '/clone', statePath: join(mkdtempSync(join(tmpdir(), 'failed-gate-')), 'ledger.json'),

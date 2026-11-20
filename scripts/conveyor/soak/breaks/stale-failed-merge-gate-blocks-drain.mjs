@@ -68,6 +68,19 @@ export default {
         pr.comments[0].body = `<!-- reviewed-sha: ${head} -->`;
         report.laterHeads.push((await run(false, { env })).calls);
       }
+      // Review-coverage bypass: a fresh PR whose acceptance names an OTHER commit must be held, never rebuilt and restamped.
+      const fresh = (number, reviewed) => {
+        const head = 'c'.repeat(40);
+        const copy = structuredClone(pr);
+        Object.assign(copy, { number, id: `PR_${number}`, headRefName: `lane/readme-${number}`, headRefOid: head });
+        copy.commits[0].oid = head;
+        copy.statusCheckRollup = copy.statusCheckRollup.map(row => ({ ...row, head_sha: head }));
+        copy.comments[0].body = `<!-- reviewed-sha: ${reviewed ?? head} -->`;
+        return copy;
+      };
+      writeFileSync(state, JSON.stringify({ groups: [], failed: {}, lastReconcileAt: Date.now() }));
+      report.uncovered = (await run(false, { prs: [fresh(47, 'a'.repeat(40))], only: null, env })).calls;
+      report.covered = (await run(false, { prs: [fresh(48)], only: null, env })).calls;
     }, { slug: CONSTELLATION_REPOS.we.slug });
     return report;
   },
@@ -88,6 +101,8 @@ export default {
       || !report.multi.report.revalidationAborted.some(row => row.reason.includes('budget exhausted')))
       violations.push('held PRs consumed the shared budget or the per-pass cap was lost');
     if (report.laterHeads.some(calls => pushes(calls).length)) violations.push('later head reset the PR refresh bound');
+    if (pushes(report.uncovered).length) violations.push('failed gate rebuilt a head the acceptance does not cover');
+    if (pushes(report.covered).length !== 1) violations.push('covered failed-gate head was not rebuilt (control)');
     if (report.merged.length) violations.push('repair changed the original skip into a merge');
     if ([...report.first, ...report.second].some(a => a.includes('PUT') || (a[0] === 'api' && a[1] === 'graphql' && a.some(x => x.startsWith('query=mutation')))))
       violations.push('repair bypassed the refresh path');
