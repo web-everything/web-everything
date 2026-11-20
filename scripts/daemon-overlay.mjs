@@ -54,6 +54,7 @@
  *   node scripts/daemon-overlay.mjs approve-edge --clone=<path> --ref=<branch> --sha=<40-hex> [--by=..] [--reason=..] [--json]
  *   node scripts/daemon-overlay.mjs replace --clone=<path> --ref=<new> --replaces=<old> --expected-sha=<40-hex> [--pr=N] [--check] [--reason=..] [--by=..] [--json]
  *   node scripts/daemon-overlay.mjs retire  --clone=<path> --ref=<branch> --expected-tip=<40-hex> [--expected-entry=<json>] [--reason=..] [--by=..] [--json]
+ *   node scripts/daemon-overlay.mjs retire --clone=<path> --ref=<branch> --tip=<40-hex> --actor=<login> --reason="..." --accept-omission [--json]
  *   node scripts/daemon-overlay.mjs recover-drops --clone=<path> [--json]   (settle drop intents an interrupted retire/replace left)
  *
  * `replace` (R310, incident 2026-11-01) registers `--ref` and drops `--replaces` in one command, only when every
@@ -63,6 +64,8 @@
  * `retire` re-proves retirement itself (`operations/prototype-retire.mjs`), drops the entry only while it equals
  * `--expected-entry` and its tip is `--expected-tip`, re-checks the tip after the drop (restoring on a move), and
  * appends an `auto-retired` event.
+ * `retire --tip` instead acknowledges omission of an unregistered live applied overlay. It requires
+ * an authenticated human --actor, a non-automatic --reason and --accept-omission (alias --accept-uncontained).
  *
  * `approve-edge` records, on an already-registered overlay, the exact tip of its `origin/edge/<ref>` branch as
  * the approved conflict resolution. A rebuild resolves an overlay conflict through an edge branch ONLY when its
@@ -127,6 +130,53 @@ import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { readOverlayStale } from './lib/daemon-rebuild/overlay-prune.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
+import { assertHumanOperator, resolveOperatorIdentity } from './lib/operator-identity.mjs';
+import { REBUILD_IDENTITY_ENV } from './lib/daemon-rebuild/shared.mjs';
+
+const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
+  'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
+]);
+
+/** Every explicit withdrawal requires acknowledgement, including tips already contained in main. */
+function requireOmissionAcceptance({ acceptOmission, acceptUncontained }) {
+  if (acceptOmission !== true && acceptUncontained !== true)
+    throw new Error('--accept-omission (alias --accept-uncontained) is required to acknowledge content omission');
+}
+
+/** Explicit operator withdrawal of an exact live tip; the rebuild merge and smoke gate adoption. */
+export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reason, acceptOmission = false, acceptUncontained = false, env = process.env, deps = {} }) {
+  if (!safeRegistrationRef(ref)) throw new Error('a valid --ref is required');
+  if (typeof tip !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(tip)) throw new Error('--tip must be a full lowercase 40-hex live tip');
+  if (typeof reason !== 'string' || !reason.trim()) throw new Error('--reason is required for operator withdrawal');
+  if (AUTOMATIC_RETIREMENT_REASONS.includes(reason.trim().toLowerCase())) throw new Error('--reason must explicitly describe operator withdrawal, not automatic retirement');
+  if (typeof actor !== 'string' || !actor.trim()) throw new Error('--actor is required for operator withdrawal');
+  const login = assertHumanOperator(await (deps.resolveOperatorIdentity ?? resolveOperatorIdentity)({ env }), actor);
+  requireOmissionAcceptance({ acceptOmission, acceptUncontained });
+  return withAddGuardLock(root, env, async () => {
+    const state = readOverlayState(root, { env });
+    if (state.corrupt) throw new Error('overlay store is corrupt; repair it before retrying withdrawal');
+    if (state.overlays.some(o => o.ref === ref)) throw new Error('ref is still registered; use guarded --expected-tip retirement');
+    const git = (args) => (deps.run ?? spawnSync)('git', args, { cwd: root, env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
+      encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024 });
+    const base = git(['merge-base', 'HEAD', 'refs/remotes/origin/main']);
+    if (base.status !== 0 || base.error || !/^[a-f0-9]{40}$/.test(String(base.stdout ?? '').trim()))
+      throw new Error('live rebuild base unreadable; restore local origin/main evidence and retry');
+    // Same first-parent merge evidence and committer identity as prepare.mjs liveOverlaysOf.
+    const log = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', 'HEAD', '--not', base.stdout.trim()]);
+    if (log.status !== 0 || log.error || typeof log.stdout !== 'string') throw new Error('live rebuild history unreadable or oversized; inspect the clone history before retrying');
+    const applied = String(log.stdout).split('\n').some(line => {
+      const [parents, committer, subject] = line.split('\t');
+      const ps = parents.split(' ');
+      const hit = subject?.match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #\d+\) )?onto /);
+      return hit?.[1] === ref && committer === REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL
+        && [2, 3].includes(ps.length) && ps[1] === tip;
+    });
+    if (!applied) throw new Error('--tip is not a live applied tip for this ref; inspect the clone rebuild merge parents and retry');
+    appendOverlayEvent(root, { kind: 'auto-retired', ref, tip, reason: reason.trim(), actor: login,
+      operatorReason: true, acceptedOmission: true, liveApplied: true }, { env });
+    return { retired: true, list: state.overlays };
+  });
+}
 
 /**
  * Best-effort, read-only stack evidence. Remote tips are checked only against objects already in root;
@@ -456,8 +506,14 @@ export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.e
     return result.stdout.trim();
   };
   const state = readOverlayState(root, { env });
-  const stacked = state.overlays.some((r) => r.ref !== ref && r.stackBases?.includes(ref));
-  if (state.corrupt || stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  if (state.corrupt) return { action: 'keep', reason: 'stacked-or-unreadable' };
+  if (state.overlays.some((r) => r.stackVia !== undefined && (!r.stackVia
+    || typeof r.stackVia !== 'object' || Array.isArray(r.stackVia)
+    || !Object.values(r.stackVia).every((bases) => Array.isArray(bases) && bases.every(safeRegistrationRef)))))
+    return { action: 'keep', reason: 'unreadable-stack-evidence' };
+  const stacked = state.overlays.some((r) => r.ref !== ref && (r.stackBases?.includes(ref)
+    || Object.values(r.stackVia || {}).flat().includes(ref)));
+  if (stacked) return { action: 'keep', reason: 'stacked-or-unreadable' };
   const current = requireGit('ls-remote', 'origin', `refs/heads/${ref}`).split(/\s+/)[0];
   // stackBases is only a cache. Re-prove ancestry under the add guard so
   // an uncached or newly registered stack top cannot lose its base.
@@ -797,15 +853,15 @@ export async function withAddGuardLock(root, env, fn, hooks = {}) {
   }
 }
 
-async function main() {
-  const [cmd, ...rest] = process.argv.slice(2);
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const [cmd, ...rest] = argv;
   if (!['add', 'remove', 'list', 'approve-edge', 'replace', 'retire', 'recover-drops', 'stale'].includes(cmd)) {
     fail(`expected add|remove|list|approve-edge|replace|retire|recover-drops|stale, got ${JSON.stringify(cmd ?? null)}`);
     return;
   }
 
   try {
-    if (cmd !== 'stale') pruneStaleOverlayRecords(workspaceFor(dirname(fileURLToPath(import.meta.url))));
+    if (cmd !== 'stale') (deps.pruneStaleOverlayRecords ?? pruneStaleOverlayRecords)(workspaceFor(dirname(fileURLToPath(import.meta.url))));
   } catch { /* self-heal is best-effort */ }
   const flags = parseFlags(rest);
   const clone = typeof flags.clone === 'string' ? flags.clone : null;
@@ -1034,14 +1090,19 @@ async function main() {
     };
   } else if (cmd === 'retire') {
     // R310: see retireRegistration. The CLI re-proves retirement itself; --reason is bookkeeping only.
-    const expectedTip = flags['expected-tip'];
-    if (!/^[a-f0-9]{40}$/.test(expectedTip || '')) return fail('--expected-tip=<full 40-hex tip that was proved retired> is required for retire');
-    let expectedEntry;
-    if (typeof flags['expected-entry'] === 'string') {
-      try { expectedEntry = JSON.parse(flags['expected-entry']); } catch { return fail('--expected-entry must be the JSON registration that was proved'); }
+    if (flags['expected-tip'] === undefined && flags.tip !== undefined) {
+      output = await withdrawUnregisteredOverlay({ root, ref: flags.ref, tip: flags.tip, actor: flags.actor, reason,
+        acceptOmission: flags['accept-omission'] === true, acceptUncontained: flags['accept-uncontained'] === true, env, deps });
+    } else {
+      const expectedTip = flags['expected-tip'];
+      if (!/^[a-f0-9]{40}$/.test(expectedTip || '')) return fail('--expected-tip=<full 40-hex tip that was proved retired> is required for retire');
+      let expectedEntry;
+      if (typeof flags['expected-entry'] === 'string') {
+        try { expectedEntry = JSON.parse(flags['expected-entry']); } catch { return fail('--expected-entry must be the JSON registration that was proved'); }
+      }
+      output = await retireRegistration({ root, ref: flags.ref, expectedTip, expectedEntry, by, env });
+      if (output.refused) process.exitCode = 3;
     }
-    output = await retireRegistration({ root, ref: flags.ref, expectedTip, expectedEntry, by, env });
-    if (output.refused) process.exitCode = 3;
   } else if (cmd === 'recover-drops') {
     // R310: settle drop intents an interrupted retire/replace left behind (see settlePendingDrops).
     output = await recoverDrops({ root, env, by });
