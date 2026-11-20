@@ -5,6 +5,18 @@ const now = Date.parse('2026-11-18T12:00:00Z');
 const event = (kind, age, daemon = 'wev-control') => ({ kind, at: new Date(now - age * 60000).toISOString(), daemon });
 const assess = events => assessDegraded({ events, daemon: 'control', clone: '/workspace/wev-control', now, afterMinutes: 60 });
 describe('R1075 daemon log assessor', () => {
+  it.each(['expired', 'other-base', 'already-head'])('benign discard reason %s never degrades a healthy daemon', reason => {
+    const events = ['ready-candidate-discarded', 'ready-candidate-discarded-needs-you']
+      .map(kind => ({ ...event(kind, 120), detail: { reason } }));
+    expect(assess(events)).toMatchObject({ degraded: false, evidence: { signals: [] } });
+  });
+  it.each(['rejected-since', 'forced-sha-pinned', 'forced-watch-unreadable', 'forced-watch-owed',
+    'forced-watch-missing', 'fallback-not-allowed', 'overlay-no-longer-wanted', 'unverified-build',
+    'ready-audit-revoked', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
+    'pinned-overlay-hold-marker-failed', undefined, 'unknown-reason'])(
+    'actionable or unknown discard reason %s remains degradation evidence', reason => {
+      expect(assess([{ ...event('ready-candidate-discarded', 120), detail: { reason } }]).degraded).toBe(true);
+    });
   it('degraded: oldest unresolved signal exceeds threshold', () => {
     expect(assess([event('overlay-adoption-overdue', 90)])).toMatchObject({ degraded: true, evidence: { ageMinutes: 90, lastAdoptionAt: null, afterMinutes: 60 } });
   });

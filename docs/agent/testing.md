@@ -5136,6 +5136,20 @@ Other admission gates remain in force; merging still requires real CI. Urgent ad
 `urgent-verify.test.mjs` and `prototype-load.test.mjs` cover runner authorship, closed paths,
 later-red supersession, event logging and the unchanged non-urgent CI gate. Run via heavy admission.
 
+Reader mutation probes must run a test that exercises the edited reader itself; an injected
+reader result cannot defend the reader's parsing or veto logic. Each documented veto needs
+that coverage for every new entry mode. The degraded cases in `prototype-load.test.mjs` leave
+`testCheck` unset and exercise failed non-test check-runs with the test absent or in progress.
+Policy wiring also needs an explicit non-default value: the 180-minute threshold case must
+refuse a 120-minute signal. `degraded-daemon.test.mjs` classifies benign and actionable discard
+reasons, sharing the benign classifier with rollback.
+
+Deferred rollback tests must change the next rebuild result after withdrawal, because the
+withdrawn registration no longer appears in refusal evidence. The degraded fast-path soak
+retries false and throwing event appends on a benign adopted rebuild, preserving the original
+failure reason and withdrawal result. Pending failure work must neither emit adoption/overdue
+notices nor overwrite a refreshed registration's nonce.
+
 The first local step runs the workflow-pinned `sh scripts/ci/fetch-main-history.sh` in the checkout; a failure signs a red receipt before any suites. Historical green never disables verdict timeouts: after green, persist `nonGreenSince` on the first current non-green read and apply the 6h escalation / 24h unload deadlines from that observation. Loads that never passed retain their load-time deadline. A recovered green clears that episode clock and its six-hour escalation deduplication; a later non-green episode can escalate again.
 
 ## Urgent local verification receipts

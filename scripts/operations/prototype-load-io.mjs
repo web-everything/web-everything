@@ -500,7 +500,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Assess eligibility here; select the fallback only after ordinary CI admission is known.
       // Only this log read can enable R1075; extra caller fields have no authority.
       let degradedEvidence;
-      if (!input.urgent && config.degradedFastPath.enabled && !settingErrors.length && !platform.errors.length) {
+      if (!input.urgent && config.degradedFastPath.enabled && !settingErrors.length && !platform.errors.length
+        && !env.WE_DAEMON_EVENTS?.trim()) {
         let events;
         try { events = fs.readFileSync(daemonEventsPath({ env, home: env.HOME }), 'utf8'); } catch { /* no evidence */ }
         const assessment = assessDegraded({ events, daemon: input.daemon, clone: out.clone,
@@ -974,6 +975,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (alerts) {
           if (out.degradedFastPath) {
             out.rollback = await rollbackDegradedLoad({ root: out.clone, ref: out.effectiveRef, sha: out.effectiveSha,
+              pendingRecord: pendingAdoption,
               fastPath: out.degradedFastPath, reason: 'adoption-refused', env: { ...childEnv, WE_DAEMON_STATE_DIR: env.WE_DAEMON_STATE_DIR, WE_DAEMON_EVENTS: env.WE_DAEMON_EVENTS },
               readState, retire: removeRegistration || undefined, needsYou, io: fs, emit: emitDaemonEvent, now,
               planner: retirePlanner, gitArgs: (args) => git(...args), ghArgs: (args) => execute('gh', args),

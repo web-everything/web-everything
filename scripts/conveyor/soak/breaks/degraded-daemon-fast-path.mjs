@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { assessDegraded } from '../../../operations/degraded-daemon.mjs';
 import { checkDegradedFailures } from '../../../operations/degraded-load-rollback.mjs';
-import { recordPendingAdoption, readPendingAdoptions } from '../../../lib/overlay-adoption.mjs';
+import { recordPendingAdoption, readPendingAdoptions, checkPendingAdoptions } from '../../../lib/overlay-adoption.mjs';
 import { appendDaemonEvent } from '../../../lib/daemon-events.mjs';
 import { overlayFilePath, readOverlayState } from '../../../lib/daemon-overlays.mjs';
 import { alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
@@ -52,11 +52,15 @@ export default {
       if (protection === 'moved-tip') repo.seedOriginBranch(ref, { 'later.mjs': 'export const later = true;\n' }, ref);
       const result = { adopted, moved: adopted, reason: failure, plan: { applied: [{ ref, sha }] }, alerts: failure === 'ready-candidate-discarded'
         ? [{ kind: failure, detail: refusalDetail ? refusalDetail({ ref, sha }) : { refs: [ref], reason: 'superseded-omits-live-overlay' } }] : [] };
-      let eventAttempts = 0, pendingAfterFailedEvent;
-      const check = () => checkDegradedFailures({ root, result, env, now: () => now + 1000,
+      let eventAttempts = 0, pendingAfterFailedEvent, failureAfterFailedEvent;
+      const check = (nextResult = result) => checkDegradedFailures({ root, result: nextResult, env, now: () => now + 1000,
         emit: async (event, opts) => {
           eventAttempts++;
-          return failEventOnce && eventAttempts === 1 ? false : appendDaemonEvent(event, opts);
+          if (failEventOnce && eventAttempts === 1) {
+            if (failEventOnce === 'throw') throw new Error('event store unavailable');
+            return false;
+          }
+          return appendDaemonEvent(event, opts);
         },
         // Real retirement planner and guarded registry transaction; only GitHub is hermetic.
         ghArgs: args => args[0] === 'repo'
@@ -67,7 +71,12 @@ export default {
       await check();
       if (failEventOnce) {
         pendingAfterFailedEvent = readPendingAdoptions(root, { env }).length;
-        await check();
+        failureAfterFailedEvent = readPendingAdoptions(root, { env })[0]?.degradedFailure;
+        const notices = await checkPendingAdoptions({ root, env, now: () => now + 20 * 60000,
+          isAncestor: () => false, emit: event => appendDaemonEvent(event, { env }) });
+        if (notices.length) violations.push('withdrawn candidate emitted adoption notices');
+        await check({ adopted: true, moved: true, reason: 'up-to-date', alerts: [] });
+        await check({ reason: 'up-to-date', alerts: [] });
       }
       const remains = readOverlayState(root, { env }).overlays.some(r => r.ref === ref);
       const protectedRegistration = protection && protection !== 'open-pr';
@@ -83,7 +92,7 @@ export default {
       const alertsPath = alertsFilePath(root, env);
       const alerts = fs.existsSync(alertsPath) ? fs.readFileSync(alertsPath, 'utf8') : '';
       if (expectRefusal && !adopted && !alerts.includes('NEEDS-YOU')) violations.push('failure did not escalate NEEDS-YOU');
-      return { violations, remains, events, alerts, pendingAfterFailedEvent, eventAttempts };
+      return { violations, remains, events, alerts, pendingAfterFailedEvent, failureAfterFailedEvent, eventAttempts };
     });
   },
   judge: report => report.violations,

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkPendingAdoptions, clearPendingAdoption, pendingAdoptionPath, readPendingAdoptions, recordPendingAdoption } from '../overlay-adoption.mjs';
+import { checkPendingAdoptions, clearPendingAdoption, pendingAdoptionPath, readPendingAdoptions, recordPendingAdoption, recordDegradedFailure } from '../overlay-adoption.mjs';
 
 const SHA = 'a'.repeat(40);
 const setup = () => {
@@ -12,6 +12,41 @@ const setup = () => {
 const t0 = Date.parse('2026-11-01T10:00:00.000Z');
 
 describe('overlay adoption events', () => {
+  it('persists degraded failure work only for the original nonce and preserves other registrations', () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA }, { env });
+    const original = readPendingAdoptions(root, { env })[0];
+    recordPendingAdoption(root, { ref: 'lane/y', sha: SHA }, { env });
+    const failure = { reason: 'smoke-rejected', rollback: { retired: true } };
+    expect(recordDegradedFailure(root, original, failure, { env })).toBe(true);
+    expect(readPendingAdoptions(root, { env })).toEqual([
+      { ...original, degradedFailure: failure }, expect.objectContaining({ ref: 'lane/y' }),
+    ]);
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA }, { env });
+    expect(recordDegradedFailure(root, original, failure, { env })).toBe(false);
+    expect(readPendingAdoptions(root, { env }).every(r => !r.degradedFailure)).toBe(true);
+  });
+  it('failure tracking refuses unreadable pending state without overwriting it', () => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA }, { env });
+    const original = readPendingAdoptions(root, { env })[0];
+    const fs = { ...nodeFs, readFileSync: () => { throw new Error('unreadable'); } };
+    expect(recordDegradedFailure(root, original, { reason: 'smoke-rejected' }, { env, fs })).toBe(false);
+    expect(readPendingAdoptions(root, { env })).toEqual([original]);
+  });
+  it.each([false, true])('keeps an owed degraded failure out of adoption notices (ancestor=%s)', async ancestor => {
+    const { root, env } = setup();
+    recordPendingAdoption(root, { ref: 'lane/x', sha: SHA, at: new Date(t0).toISOString() }, { env });
+    const pending = readPendingAdoptions(root, { env })[0];
+    nodeFs.writeFileSync(pendingAdoptionPath(root, env), JSON.stringify([
+      { ...pending, degradedFailure: { reason: 'smoke-rejected', rollback: { retired: true } } },
+    ]));
+    const emit = vi.fn(() => true), isAncestor = vi.fn(() => ancestor);
+    expect(await checkPendingAdoptions({ root, env, emit, isAncestor, now: () => t0 + 20 * 60000 })).toEqual([]);
+    expect(emit).not.toHaveBeenCalled();
+    expect(isAncestor).not.toHaveBeenCalled();
+    expect(readPendingAdoptions(root, { env })).toHaveLength(1);
+  });
   it('preserves degraded evidence across an overdue notice until adoption', async () => {
     const { root, env } = setup();
     const degradedFastPath = { sha: SHA, branch: 'lane/x', marker: { sig: 'receipt' } };

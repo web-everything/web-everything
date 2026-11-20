@@ -120,7 +120,7 @@ esac
     expect(readFileSync(alertsFilePath(options.root, options.env), 'utf8')).toContain('NEEDS-YOU');
   });
 
-  it('still checks pending adoption when degraded rollback emission throws', async () => {
+  it('still checks unrelated pending adoption when degraded rollback emission throws', async () => {
     const ref = 'lane/refused';
     recordPendingAdoption(options.root, { ref, sha, degradedFastPath: { sha, branch: ref, daemon: 'review' } }, { env: options.env });
     terminal({ moved: false, reason: 'smoke-rejected', plan: { applied: [{ ref, sha }] } });
@@ -128,12 +128,35 @@ esac
       if (event.kind === 'prototype-load.degraded-fast-path-failed') throw new Error('rollback event unavailable');
       return true;
     });
-    // An old pending entry must still get its overdue notice after the rollback hook throws.
+    // Other loads still get notices; the withdrawn load owes only its failure event.
     const { pendingAdoptionPath } = await import('../overlay-adoption.mjs');
     const [pending] = readPendingAdoptions(options.root, { env: options.env });
     writeFileSync(pendingAdoptionPath(options.root, options.env), JSON.stringify([{ ...pending, at: new Date(Date.now() - 3600000).toISOString() }]));
+    recordPendingAdoption(options.root, { ref: 'lane/unrelated', sha: 'c'.repeat(40),
+      at: new Date(Date.now() - 3600000).toISOString() }, { env: options.env });
     await rebuildClone(options);
-    expect(options.emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'overlay-adoption-overdue' }), expect.anything());
+    const overdue = options.emitEvent.mock.calls.filter(([event]) => event.kind === 'overlay-adoption-overdue');
+    expect(overdue.map(([event]) => event.detail.ref)).toEqual(['lane/unrelated']);
+    expect(readPendingAdoptions(options.root, { env: options.env }).find(r => r.ref === ref)).toMatchObject({
+      degradedFailure: { reason: 'smoke-rejected', rollback: { retired: true } },
+    });
+  });
+  it('rebuildClone retries a withdrawn load failure event on a later benign pass', async () => {
+    const ref = 'lane/refused';
+    recordPendingAdoption(options.root, { ref, sha, degradedFastPath: { sha, branch: ref, daemon: 'review' } }, { env: options.env });
+    terminal({ moved: false, reason: 'smoke-rejected', plan: { applied: [{ ref, sha }] } });
+    let failedEvents = 0;
+    options.emitEvent.mockImplementation(event => event.kind !== 'prototype-load.degraded-fast-path-failed' || ++failedEvents > 1);
+    await rebuildClone(options);
+    expect(readPendingAdoptions(options.root, { env: options.env })[0]).toMatchObject({
+      degradedFailure: { reason: 'smoke-rejected', rollback: { retired: true, absent: true } },
+    });
+    terminal({ moved: false, reason: 'up-to-date' });
+    await rebuildClone(options);
+    const events = options.emitEvent.mock.calls.filter(([event]) => event.kind === 'prototype-load.degraded-fast-path-failed');
+    expect(events).toHaveLength(2);
+    expect(events[1][0]).toEqual(events[0][0]);
+    expect(readPendingAdoptions(options.root, { env: options.env })).toEqual([]);
   });
   it('emits rebuild-adopted once with the adopted SHA after a new-head swap', async () => {
     const result = { moved: true, adopted: true, head: sha, prevHead, plan: { finalSha: sha }, alerts: [] };

@@ -81,6 +81,20 @@ export function recordPendingAdoption(root, { ref, sha, at = new Date().toISOStr
 
 const sameRecord = (a, b) => a.ref === b.ref && a.sha === b.sha && a.nonce === b.nonce;
 
+/** Persist rollback work under the pending-record mutex without replacing a newer load. */
+export function recordDegradedFailure(root, record, failure, { env = process.env, fs = nodeFs } = {}) {
+  if (!record || typeof record.nonce !== 'string' || !record.nonce) return false;
+  let found = false;
+  try {
+    updatePending(root, env, fs, list => list.map(r => {
+      if (!sameRecord(r, record)) return r;
+      found = true;
+      return { ...r, degradedFailure: failure };
+    }));
+    return found;
+  } catch { return false; }
+}
+
 /** Clear this load's record under the same mutex, preserving any concurrently refreshed registration. */
 export function clearPendingAdoption(root, record, { env = process.env, fs = nodeFs } = {}) {
   if (!record || typeof record.nonce !== 'string' || !record.nonce) return false;
@@ -117,6 +131,9 @@ export async function checkPendingAdoptions({ root, env = process.env, fs = node
       return true;
     });
     for (const rec of active) {
+      // A refused load owes rollback/failure reporting, never an adoption notice.
+      // checkDegradedFailures owns retries; retain the existing TTL/cap bounds.
+      if (rec.degradedFailure) continue;
       const ageMs = checkedAt - Date.parse(rec.at);
       let adopted = false;
       try { adopted = isAncestor(root, rec.sha); } catch { adopted = false; }

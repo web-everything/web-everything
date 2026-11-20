@@ -277,7 +277,14 @@ function fixture(options = {}) {
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner, readUrgentKey: () => { if (options.missingUrgentKey) throw new Error('missing'); return urgentKey; },
-    emitDaemonEvent: async event => { records.push(event); return !options.eventWriteFails; }, needsYou: options.needsYou ?? (() => {}),
+    emitDaemonEvent: async event => {
+      records.push(event);
+      if (options.failedEventWrite && event.kind === 'prototype-load.degraded-fast-path-failed') {
+        if (options.failedEventWrite === 'throw') throw new Error('failure event unwritable');
+        return false;
+      }
+      return !options.eventWriteFails;
+    }, needsYou: options.needsYou ?? (() => {}),
     readState: options.readState ?? (() => ({ corrupt: false, overlays: [...registrations.values(), ...admitted] })),
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
@@ -3357,6 +3364,32 @@ describe('default test check-run reader (production wiring)', () => {
     const marker = { sha: SHA, fuiSha: SHA, fuiRepo: 'https://github.com/frontier-ui/frontierui', suite: 'full', shards: 1, result: 'green', startedAt: new Date(-2000).toISOString(), finishedAt: new Date(-1000).toISOString(), host: 'test-host', repo: `https://github.com/${REPO_SLUG}`, steps: ['fetch-main-history', 'install-fui', 'install', 'unit:unit:1/1', 'coverage', 'hostPaths', 'integration', 'standards'] };
     return JSON.stringify({ ...marker, sig: urgentSignature(marker, urgentKey) });
   };
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].flatMap(conclusion =>
+    ['absent', 'in_progress'].map(test => ({ conclusion, test }))))(
+    'degraded entry vetoes a non-test $conclusion with test $test through the production reader', async ({ conclusion, test }) => {
+      const checks = [run({ id: 2, name: 'standards', check_suite: { id: 8 }, conclusion }),
+        ...(test === 'absent' ? [] : [run({ status: test, conclusion: null })])];
+      const f = ghFixture({ ready: undefined, urgentLedger: urgentReceipt(),
+        daemonEvents: JSON.stringify({ daemon: 'wev-control', kind: 'overlay-adoption-overdue', at: new Date(-7200000).toISOString() }),
+        checks: { total_count: checks.length, check_runs: checks } });
+      expect(await f.run()).toMatchObject({ ok: false, detail: 'ci-failed-urgent' });
+      expect(f.gh.some(c => c.includes(`/commits/${SHA}/check-runs`))).toBe(true);
+      expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+      expect(f.readyWrites).toEqual([]);
+      expect(mutations(f, 'add')).toHaveLength(0);
+    });
+  it('degraded entry refuses an unbound workflow through the production reader', async () => {
+    const f = ghFixture({ ready: undefined, urgentLedger: urgentReceipt(),
+      daemonEvents: JSON.stringify({ daemon: 'wev-control', kind: 'overlay-adoption-overdue', at: new Date(-7200000).toISOString() }),
+      checks: { total_count: 1, check_runs: [run({ status: 'in_progress', conclusion: null })] },
+      runs: { total_count: 0, workflow_runs: [] },
+    });
+    expect(await f.run()).toMatchObject({ ok: false, detail: 'ci-workflow-unbound' });
+    expect(f.gh.some(c => c.includes('/actions/runs'))).toBe(true);
+    expect(f.reads.some(p => p.includes('urgent-full-green'))).toBe(false);
+    expect(f.readyWrites).toEqual([]);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
     'urgent refuses a pending suite plus another suite completed with %s', async conclusion => {
       const f = ghFixture({ urgentLedger: urgentReceipt(), checks: { total_count: 2, check_runs: [
@@ -3579,6 +3612,17 @@ describe('R1075 degraded daemon admission', () => {
     const f = degraded({ daemonEvents: 'truncated jsonl' });
     expect(await f.run({ evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
   });
+  it('caller WE_DAEMON_EVENTS override cannot enable degraded admission', async () => {
+    const f = degraded({ env: { WE_DAEMON_EVENTS: '/caller/daemon-events.jsonl' } });
+    expect(await f.run({ evidence: { signals: [signal], ageMinutes: 120 } })).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+    expect(f.reads).not.toContain('/caller/daemon-events.jsonl');
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('passes a configured 180-minute threshold to the assessor for a 120-minute signal', async () => {
+    const f = degraded({ settings: { degradedFastPath: { enabled: true, degradedAfterMinutes: 180 } } });
+    expect(await f.run()).toMatchObject({ ok: false, detail: 'no-passing-test-check' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
   it.each(['security', 'B-class', 'B class', 'R37', '[B]', 'insecure temp file', 'arbitrary code execution', 'unclassified relaxation'])('findings cannot be waived on this path: %s', async text => {
     const findings = [`scripts/tool.mjs:1 ${text}`];
     const f = degraded({ ready: JSON.stringify({ ref: BASE.branch, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R1075', auditDisclosed: findings }),
@@ -3627,6 +3671,18 @@ describe('R1075 degraded daemon admission', () => {
     const f = degraded({ alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }), removeRegistration: async () => ({ retired: false, refused: 'registration-changed' }), needsYou });
     expect(await f.run()).toMatchObject({ registered: true, rollback: { retired: false }, needsYou: true });
     expect(needsYou.mock.calls[0][0].error).toContain('unload manually');
+  });
+  it.each(['false', 'throw'])('immediate rollback persists an owed failure event when append returns %s', async failedEventWrite => {
+    const f = degraded({ failedEventWrite,
+      alerts: JSON.stringify({ at: new Date(0).toISOString(), kind: 'smoke-rejected', detail: { ref: BASE.branch } }),
+      removeRegistration: async () => ({ retired: true }),
+      retirePlan: ({ rows }) => rows.map(r => ({ ref: r.ref, action: 'retire', reason: 'pr-merged', tip: SHA })),
+    });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, rollback: { retired: true, eventRecorded: false } });
+    const pending = [...f.pendingFiles.values()].flatMap(text => JSON.parse(text));
+    expect(pending).toEqual([expect.objectContaining({ ref: BASE.branch, sha: SHA,
+      degradedFailure: { reason: 'adoption-refused', rollback: { retired: true } },
+    })]);
   });
   it('never carries an older head audit across a matching fingerprint on degraded admission', async () => {
     const fingerprint = 'a'.repeat(64);

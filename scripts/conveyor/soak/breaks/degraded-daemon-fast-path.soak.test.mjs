@@ -54,12 +54,16 @@ it('R1075 unreadable registry retains the registration and escalates manual reco
   expect(report.alerts).toContain('unload manually');
 });
 
-it('R1075 retains tracking until the failure event is durably appended', async () => {
-  const report = await scenario.run({ failEventOnce: true });
+it.each([true, 'throw'])('R1075 retries the owed failure event on a benign rebuild after withdrawal (first append=%s)', async failEventOnce => {
+  const report = await scenario.run({ failEventOnce });
   expect(report.violations).toEqual([]);
   expect(report.pendingAfterFailedEvent).toBe(1);
+  expect(report.failureAfterFailedEvent).toMatchObject({ reason: 'smoke-rejected', rollback: { retired: true } });
   expect(report.eventAttempts).toBe(2);
   expect(report.events.filter(e => e.kind === 'prototype-load.degraded-fast-path-failed')).toHaveLength(1);
+  expect(report.events.find(e => e.kind === 'prototype-load.degraded-fast-path-failed').detail).toMatchObject({
+    reason: 'smoke-rejected', rollback: { retired: true }, marker: { sig: 'receipt-marker' },
+  });
 });
 
 it('R1075 ignores a discarded older candidate when this rebuild successfully adopted the new build', async () => {

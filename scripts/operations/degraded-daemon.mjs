@@ -4,6 +4,10 @@ import { basename } from 'node:path';
 const SIGNALS = new Set(['overlay-adoption-overdue', 'ready-candidate-discarded',
   'ready-candidate-discarded-needs-you', 'REBUILD-DISCARD-LOOP', 'rebuild-discard-loop']);
 const ADOPTIONS = new Set(['overlay-adopted', 'rebuild-adopted']);
+export const isBenignDiscardReason = reason => ['expired', 'other-base', 'already-head'].includes(reason);
+const isSignal = e => SIGNALS.has(e.kind)
+  && (!['ready-candidate-discarded', 'ready-candidate-discarded-needs-you'].includes(e.kind)
+    || !isBenignDiscardReason(e.detail?.reason));
 export function assessDegraded({ events, daemon, clone, now, afterMinutes }) {
   const evidence = { signals: [], lastAdoptionAt: null, ageMinutes: null, afterMinutes };
   const no = () => ({ degraded: false, evidence });
@@ -19,7 +23,7 @@ export function assessDegraded({ events, daemon, clone, now, afterMinutes }) {
       && (typeof e.at !== 'string' || !Number.isFinite(Date.parse(e.at)) || Date.parse(e.at) > now))) return no();
     const adopted = own.filter(e => ADOPTIONS.has(e.kind)).sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
     evidence.lastAdoptionAt = adopted?.at ?? null;
-    evidence.signals = own.filter(e => SIGNALS.has(e.kind) && (!adopted || Date.parse(e.at) > Date.parse(adopted.at)))
+    evidence.signals = own.filter(e => isSignal(e) && (!adopted || Date.parse(e.at) > Date.parse(adopted.at)))
       .map(({ kind, at }) => ({ kind, at })).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
     if (!evidence.signals.length) return no();
     evidence.ageMinutes = (now - Date.parse(evidence.signals[0].at)) / 60000;

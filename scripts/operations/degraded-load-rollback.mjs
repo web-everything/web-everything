@@ -11,14 +11,21 @@ const run = (cmd, args, cwd, env) => {
 import { readOverlayState } from '../lib/daemon-overlays.mjs';
 import { reportNeedsYou } from '../lib/daemon-rebuild/auto-rebase.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
-import { readPendingAdoptions, clearPendingAdoption } from '../lib/overlay-adoption.mjs';
+import { readPendingAdoptions, clearPendingAdoption, recordDegradedFailure } from '../lib/overlay-adoption.mjs';
+import { isBenignDiscardReason } from './degraded-daemon.mjs';
 
 export async function rollbackDegradedLoad({ root, ref, sha, fastPath, reason, env,
+  pendingRecord,
   readState = readOverlayState, retire = retireRegistration, needsYou = reportNeedsYou,
   emit = appendDaemonEvent, io = fs, now = () => Date.now(), tip, prove, planner = defaultRetirePlanner,
   gitArgs = (args) => run('git', args, root, env), ghArgs = (args) => run('gh', args, root, env) }) {
-  let rollback;
-  try {
+  reason = pendingRecord?.degradedFailure?.reason ?? reason;
+  let rollback = pendingRecord?.degradedFailure?.rollback;
+  // Record the refusal before withdrawing: later rebuilds no longer name this ref.
+  const remember = failure => !pendingRecord || recordDegradedFailure(root, pendingRecord, failure, { env, fs: io });
+  if (!remember({ reason, ...(rollback ? { rollback } : {}) }))
+    return { retired: false, refused: 'failure-tracking-unwritable', eventRecorded: false };
+  if (!rollback?.retired) try {
     const state = await readState(root, { env });
     if (state?.corrupt !== false || !Array.isArray(state.overlays)) throw new Error('unreadable registry');
     const entry = state.overlays.find(r => r.ref === ref);
@@ -57,11 +64,17 @@ export async function rollbackDegradedLoad({ root, ref, sha, fastPath, reason, e
     }
   } catch (e) { rollback = { retired: false, refused: String(e.message || e) }; }
   const detail = { ...fastPath, ref, reason, rollback };
+  // Preserve the withdrawal result before reporting, which can itself fail.
+  const remembered = remember({ reason, rollback });
   needsYou({ root, env, ref, stage: 'prototype-load.degraded-fast-path-failed',
     error: `NEEDS-YOU: ${reason}; registration ${rollback?.retired ? 'withdrawn' : 'withdrawal refused; inspect registry and unload manually'}`, io,
     now: () => new Date(now()).toISOString() });
-  const eventRecorded = await emit({ kind: 'prototype-load.degraded-fast-path-failed', daemon: fastPath.daemon, detail },
-    { env, now: () => new Date(now()) });
+  if (!remembered) return { ...rollback, eventRecorded: false };
+  let eventRecorded = false;
+  try {
+    eventRecorded = await emit({ kind: 'prototype-load.degraded-fast-path-failed', daemon: fastPath.daemon, detail },
+      { env, now: () => new Date(now()) });
+  } catch { /* Persisted failure work is retried on the next rebuild. */ }
   return { ...rollback, eventRecorded: eventRecorded === true };
 }
 
@@ -76,16 +89,18 @@ export async function checkDegradedFailures({ root, result, env, now = () => Dat
   for (const pending of readPendingAdoptions(root, { env })) {
     if (!pending.degradedFastPath) continue;
     const refused = (result.alerts ?? []).find(a => /discard|reject|drop|refus|conflict/.test(a.kind)
-      && !['expired', 'other-base', 'already-head'].includes(a.detail?.reason)
+      && !isBenignDiscardReason(a.detail?.reason)
       && matchesDegradedRegistration(a.detail, pending));
     const smoked = /^(?:smoke-|dispatch-smoke-failed|still-rejected)/.test(result.reason ?? '')
       && result.plan?.applied?.some(a => a.ref === pending.ref && a.sha === pending.sha);
     const dropped = [...(result.fallback?.dropped ?? []), ...(result.setAside?.dropped ?? [])]
       .some(a => a.ref === pending.ref && (!a.sha || a.sha === pending.sha));
-    if ((result.adopted || result.moved) && !dropped) continue;
-    if (!refused && !smoked && !dropped) continue;
+    if (!pending.degradedFailure) {
+      if ((result.adopted || result.moved) && !dropped) continue;
+      if (!refused && !smoked && !dropped) continue;
+    }
     const rollback = await rollbackDegradedLoad({ root, ref: pending.ref, sha: pending.sha,
-      fastPath: pending.degradedFastPath, reason: refused?.kind ?? result.reason, env, now, ...deps });
+      fastPath: pending.degradedFastPath, pendingRecord: pending, reason: refused?.kind ?? result.reason ?? 'candidate-dropped', env, now, ...deps });
     if (rollback?.retired && rollback.eventRecorded) clearPendingAdoption(root, pending, { env });
   }
 }
