@@ -16,6 +16,8 @@ import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, resolve, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readPlatformPreferences, resolveCascade, formatCascadeSourcesLine } from '../lib/policy-cascade.mjs';
+import { resolveAuditSettings } from '../lib/audit-settings.mjs';
+import { revalidateExemptions } from './canonical-audit-gate.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { retireRegistration, proveOverlayWithdrawal } from '../daemon-overlay.mjs';
 import { assertHumanOperator, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
@@ -518,10 +520,18 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const liveFp = liveFingerprint([...auditRecords, ...config.ruledWeakened]);
       const waiver = !out.gate?.ruledWeakened ? waiverForHead(config.ruledWeakened, input, liveFp) : null;
       const auditGate = out.gate;
+      const auditRead = (path, encoding) => fs.readFileSync(path, encoding);
+      const auditPolicy = auditRecords.some(record => record?.preExisting?.length)
+        ? resolveAuditSettings({ fileRead: auditRead, platformRead: auditRead, env }).value : undefined;
       out.canonicalAudit = { mode: 'refuse', ...canonicalAuditEvidence(auditRecords, input.sha, covers, liveFp,
-        { ruledWeakened: auditGate }) };
+        { ruledWeakened: auditGate, auditPolicy }) };
       if (!out.canonicalAudit.ok) return stop('no-canonical-audit', {
         fallback: waiver ? `waiver exists but no fix-ready record. Run scripts/operations/fix-ready-record.mjs with auditRuling and auditDisclosed matching the waiver, then retry prototype-load.` : `Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${input.sha}, then retry prototype-load. WEAKENED requires a matching ruledWeakened entry and fix-ready disclosure.` });
+      if (out.canonicalAudit.record?.preExisting?.length && !revalidateExemptions(out.canonicalAudit.record,
+        { readFile: auditRead, env, now })) {
+        out.canonicalAudit = { mode: 'refuse', ok: false, reason: 'exemption-stale' };
+        return stop('no-canonical-audit', { fallback: 'Pre-existing exemption authority is stale or unreadable; restore current policy/card evidence or request human review.' });
+      }
       if (auditGate?.ruledWeakened) console.warn(`WARNING: RULED-WEAKENED EXCEPTION ${auditGate.ruledWeakened.ruling}: loading ${input.branch}@${input.sha} despite audit WEAKENED (source layer: ${auditGate.ruledWeakened.layer || 'tool'}). Disclosed findings: ${auditGate.ruledWeakened.findings.join(' | ')}`);
       stage = 'no-ready';
       // Only an exact-sha successful `test` check-run can produce fresh readiness.

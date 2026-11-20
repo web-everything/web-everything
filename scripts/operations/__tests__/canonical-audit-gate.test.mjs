@@ -3,7 +3,7 @@ import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
 import { AUDIT_SETTINGS_PATH, resolveAuditSettings } from '../../lib/audit-settings.mjs';
 import { canonicalAuditEvidence } from '../prototype-load.mjs';
-import { cardHash } from '../audit-base-repro.mjs';
+import { cardHash, cardLine } from '../audit-base-repro.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +17,7 @@ const ref = 'lane/audit-gate';
 const green = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
 const weak = { ...green, verdict: 'WEAKENED', findings: ['missing guard'] };
 const waiver = { ref, sha, ruling: 'R123', findings: weak.findings };
-function fixture({ records = [green], auditText, audit = {}, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore } = {}) {
+function fixture({ records = [green], auditText, audit = {}, tool = {}, writerSettings, targetSettings, platform = {}, resolved = sha, fetchMain = () => {}, ancestor = () => true, readOverride, liveFingerprint = () => null, execOverride, auditAt = '/fixture-home/audit.jsonl', opsStore, readCards, readCard, now } = {}) {
   const reads = [], calls = [];
   const env = { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: fileURLToPath(import.meta.url) };
   const enoent = () => { const error = new Error('missing'); error.code = 'ENOENT'; throw error; };
@@ -32,7 +32,7 @@ function fixture({ records = [green], auditText, audit = {}, tool = {}, writerSe
     if (path === auditAt) return auditText ?? records.map(r => JSON.stringify(r)).join('\n');
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
-  const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
+  const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint, readCards, readCard, now,
     exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved)
       : args.includes('origin/main^{commit}') ? base : resolved; } });
   return { result, reads, calls };
@@ -257,9 +257,16 @@ describe('canonical audit before opening a PR', () => {
 
 
 describe('R1053 additive audit records', () => {
-  const entry = { line: 'x.mjs:2 unsafe return', key: 'x.mjs|X|B2',
-    base: { sha: base, path: 'x.mjs', line: 2, quote: 'return unsafe();' }, relation: 'SAME', cardHash: cardHash('x.mjs|X|B2') };
+  const entry = { line: 'x.mjs:2 unsafe return', key: 'x.mjs|X|E1',
+    base: { sha: base, path: 'x.mjs', line: 2, quote: 'return unsafe();' }, relation: 'SAME', cardHash: cardHash('x.mjs|X|E1') };
   const scoped = { ...green, modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [entry] };
+  const enabled = { preExistingExemption: { enabled: true }, preExisting: { mode: 'prove' },
+    proveMode: { clearEnabled: true }, releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: false } };
+  const held = (finding = entry) => {
+    const [path, symbol, cls] = finding.key.split('|');
+    return { cards: cardLine({ date: '2026-11-17 12:00', cls, path, symbol, sha10: base.slice(0, 10), text: finding.line }),
+      index: JSON.stringify({ key: finding.key, cardHash: finding.cardHash }) };
+  };
   it('does not poison admission for a later clean audit, and skips an already poisoned unrelated head', async () => {
     const records = [], output = [];
     const source = 'function X() {\n  return unsafeValue;\n}\nfunction Y() {\n  return changedValue;\n}';
@@ -267,9 +274,9 @@ describe('R1053 additive audit records', () => {
       resolveSha: ref => ref === 'origin/main' ? base : other,
       runCodex: () => 'WEAKENED\nx.mjs:2 unsafe return\u2028WEAKENED',
       now: () => green.at, appendRecord: record => records.push(record), stdout: text => output.push(text), stderr: () => {},
-      preExistingMode: () => 'prove', preExistingExemptionEnabled: () => true,
+      preExistingMode: () => 'prove', proveClearEnabled: () => true, preExistingExemptionEnabled: () => true,
       auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false }),
-      reproOnBase: () => '#1 REPRODUCES SAME CLASS=B2 BASE=x.mjs:2\nQUOTE: return unsafeValue;',
+      reproOnBase: () => '#1 REPRODUCES SAME CLASS=E1 BASE=x.mjs:2\nQUOTE: return unsafeValue;',
       readBaseFile: () => source, readHeadFile: () => source,
       diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
       numstatText: () => '1\t1\tx.mjs\n', baseRecheckMax: () => 6, protectedPaths: () => [],
@@ -287,16 +294,15 @@ describe('R1053 additive audit records', () => {
     expect(fixture({ records: [poisoned, ...records], liveFingerprint: () => 'd'.repeat(64) }).result.ok).toBe(true);
     expect(fixture({ records: [...records, { ...poisoned, head: sha }] }).result.ok).toBe(false);
   });
-  it.each(['exact', 'carried'])('both consumers apply tightened policy to a valid saved B2 exemption (%s)', kind => {
+  it.each(['exact', 'carried'])('both consumers apply tightened policy to a valid saved E1 exemption (%s)', kind => {
     const fp = 'd'.repeat(64);
     const record = { ...scoped, fingerprint: fp, ...(kind === 'carried' ? { head: other } : {}) };
-    const enabled = { preExistingExemption: { enabled: true }, preExisting: { mode: 'prove' }, releaseStage: 'prerelease' };
     const shared = audit => canonicalAuditEvidence([record], sha, () => true, fp, {
       auditPolicy: resolveAuditSettings({ env: {}, platform: null, fileRead: () => JSON.stringify({ audit }) }).value,
     });
     expect(shared(enabled)).toMatchObject({ ok: true, record });
     // PR opening always requires its own head; the shared prototype reader may also carry evidence.
-    if (kind === 'exact') expect(fixture({ records: [record], audit: enabled }).result.ok).toBe(true);
+    if (kind === 'exact') expect(fixture({ records: [record], audit: enabled, readCards: () => held() }).result.ok).toBe(true);
     for (const tightened of [{ preExisting: { mode: 'block' } }, { releaseStage: 'prod' }]) {
       const audit = { ...enabled, ...tightened };
       expect(shared(audit)).toMatchObject({ ok: false, reason: 'pre-existing-exemption-forbidden' });
@@ -341,7 +347,54 @@ describe('R1053 additive audit records', () => {
     }
   });
   it('a7 admits mixed old and new records', () => {
-    expect(fixture({ records: [green, scoped], audit: { preExistingExemption: { enabled: true }, preExisting: { mode: 'prove' } } }).result).toMatchObject({ ok: true, record: scoped });
+    expect(fixture({ records: [green, scoped], audit: enabled, readCards: () => held() }).result).toMatchObject({ ok: true, record: scoped });
+  });
+  it.each(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'])('R1085 refuses a saved %s exemption even with both security receipts', cls => {
+    const key = `x.mjs|X|${cls}`, finding = { ...entry, key, cardHash: cardHash(key) };
+    const persisted = held(finding);
+    persisted.cards += `\n- [R1053][needs-you] 2026-11-17 12:00 ET: security pre-existing (${cls}) ${key}`;
+    expect(fixture({ records: [green, { ...scoped, preExisting: [finding] }], audit: enabled,
+      readCards: () => persisted }).result).toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+  });
+  it.each(['missing', false])('refuses a saved exemption when prove clearing is %s', clearEnabled => {
+    const audit = { ...enabled, proveMode: clearEnabled === 'missing' ? {} : { clearEnabled } };
+    expect(fixture({ records: [green, scoped], audit, readCards: () => held() }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+  });
+  it.each(['card removed', 'index unreadable', 'index malformed', 'cards unreadable', 'second card removed'])('revalidates every exemption and refuses %s', kind => {
+    const second = { ...entry, key: 'y.mjs|Y|E2', cardHash: cardHash('y.mjs|Y|E2'),
+      line: 'y.mjs:2 unsafe return', base: { ...entry.base, path: 'y.mjs' } };
+    const readCards = () => {
+      if (kind === 'cards unreadable') throw new Error('unreadable');
+      return { cards: kind === 'card removed' ? '' : held().cards,
+        index: kind === 'index unreadable' ? undefined : kind === 'index malformed' ? '{bad' : held().index };
+    };
+    expect(fixture({ records: [green, { ...scoped, preExisting: kind === 'second card removed' ? [entry, second] : [entry] }],
+      audit: enabled, readCards }).result).toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+    const cleanRecord = { ...green, at: '2026-11-18T00:00:00Z' };
+    expect(fixture({ records: [scoped, cleanRecord], audit: enabled, readCards }).result)
+      .toMatchObject({ ok: true, record: cleanRecord });
+  });
+  it.each(['builtin', 'raceBlockPaths', 'guardFloorPaths'])('revokes exemptions on current protected paths: %s', kind => {
+    const path = kind === 'builtin' ? 'scripts/guard-bash.mjs' : 'x.mjs';
+    const key = `${path}|X|E1`, finding = { ...entry, key, cardHash: cardHash(key), line: `${path}:2 unsafe return`,
+      base: { ...entry.base, path } };
+    const audit = { ...enabled, ...(kind === 'builtin' ? {} : { [kind]: [path] }) };
+    expect(fixture({ records: [{ ...scoped, preExisting: [finding] }], audit, readCards: () => held(finding) }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+  });
+  it.each(['E1', 'E2', 'D2'])('%s shares persisted pay-by requirements and revokes at the deadline', cls => {
+    const key = `x.mjs|X|${cls}`, finding = { ...entry, key, cardHash: cardHash(key), line: `${entry.line}; backlog/debt.md` };
+    const options = { records: [{ ...scoped, preExisting: [finding] }],
+      audit: { ...enabled, cards: { requirePayBy: true, requireOnMain: true } }, readCards: () => held(finding),
+      now: () => Date.parse('2026-11-20T00:00:00Z') };
+    expect(fixture({ ...options, readCard: () => 'mustPayBefore: 2026-11-21\n' }).result.ok).toBe(true);
+    expect(fixture({ ...options, now: () => Date.parse('2026-11-21T00:00:00Z'),
+      readCard: () => 'mustPayBefore: 2026-11-21\n' }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+    for (const readCard of [() => null, () => 'No pay-by', () => 'mustPayBefore: invalid\n', () => { throw new Error('unreadable'); }]) {
+      expect(fixture({ ...options, readCard }).result).toMatchObject({ ok: false, reason: 'canonical-audit-exemption-stale' });
+    }
   });
   it.each([
     { releaseStage: 'prod', preExisting: { mode: 'prove' } },

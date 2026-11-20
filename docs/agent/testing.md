@@ -5522,3 +5522,19 @@ Observed before the source repair and after it, respectively:
 The pre-fix regression run reported 19 failed and 108 passed tests. Per proof-only dispatch
 policy, the test file is not rerun locally after repair; the launcher's verify verdict supplies
 the after-test evidence. The direct admission probe above was repeated after repair.
+
+## Persisted exemption admission fixtures
+
+Both PR opening and prototype loading must call `revalidateExemptions` before admitting
+saved exemptions. Prototype loading supplies its injected filesystem and environment to
+both policy selection and revalidation; a hermetic fixture must never consult host policy.
+Valid exemption controls use E1, E2 or D2, explicitly enable prove clearing, and supply
+the exact persisted held card and a readable index. Pay-by tests supply persisted backlog
+card text and an injected clock. R1085 keeps every B-class exemption blocked even when
+both security receipts exist; do not use B-class as a generic passing fixture.
+
+`canonical-audit-gate.test.mjs` covers card removal, malformed or unreadable receipts,
+multiple exemptions, current protected paths, the pay-by deadline and newer clean audits.
+`prototype-load.test.mjs` pins the shared check before registration and its recovery message.
+The `audit-verdict.test.mjs` runtime importer allowlist must include the loader's real
+settings binding; retain the exact allowlist assertion when repairing missing wiring.

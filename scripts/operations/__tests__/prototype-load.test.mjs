@@ -656,7 +656,9 @@ describe('prototype-load canonical audit admission', () => {
     ['current', null, null],
     ['exemption disabled', 'pre-existing-exemption-disabled', /codex-audit/],
     ['mode revoked', 'pre-existing-exemption-forbidden', /codex-audit/],
+    ['prove clearing disabled', 'exemption-stale', /human review|restore/i],
     ['card removed', 'exemption-stale', /human review|restore/i],
+    ['index malformed', 'exemption-stale', /human review|restore/i],
     ['B-class security exemption', 'exemption-stale', /human review|restore/i],
     ['new protected path', 'exemption-stale', /human review|restore/i],
     ['unreadable settings', 'pre-existing-exemption-disabled', /codex-audit/],
@@ -669,11 +671,11 @@ describe('prototype-load canonical audit admission', () => {
     const exemptionFiles = {
       [resolve(dirname(fileURLToPath(import.meta.url)), '../../settings/codex-audit.json')]: kind === 'unreadable settings' ? '{bad' : JSON.stringify({ audit: {
         preExistingExemption: { enabled: kind !== 'exemption disabled' },
-        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, proveMode: { clearEnabled: true }, releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: false },
+        preExisting: { mode: kind === 'mode revoked' ? 'block' : 'prove' }, proveMode: { clearEnabled: kind !== 'prove clearing disabled' }, releaseStage: 'prerelease', cards: { requirePayBy: false, requireOnMain: false },
         ...(kind === 'new protected path' ? { raceBlockPaths: ['x.mjs'] } : {}),
       } }),
       '/home/test/workspace/.operations/handoff/cards-to-file.md': [kind === 'card removed' ? '' : card, escalation].join('\n'),
-      '/home/test/workspace/.operations/coordination/pre-existing-findings.jsonl': JSON.stringify({ key, cardHash: exemption.cardHash }),
+      '/home/test/workspace/.operations/coordination/pre-existing-findings.jsonl': kind === 'index malformed' ? '{bad' : JSON.stringify({ key, cardHash: exemption.cardHash }),
     };
     const f = auditedFixture('refuse', { exemptionFiles, auditBaseInMain: TREE,
       audits: auditLines([auditRecord({ modelVerdict: 'WEAKENED', findingKeys: [], preExisting: [exemption] })]) });
