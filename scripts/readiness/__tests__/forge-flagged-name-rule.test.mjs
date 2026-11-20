@@ -52,7 +52,45 @@ const shipped=['design-systems/acme.tokens.json','src/_data/protocols/credential
   'src/_data/semantics/token.json','src/_data/anything/deep/oauth-token.json','src/_includes/research-descriptions/design-token-theming.njk',
   'docs/password-policy.md'];
 const content=p=>p.endsWith('.njk')||p.endsWith('.md')?njk:tokens;
+// Copy the tracked corpus into `cwd`. The Git index, not the working tree, says
+// which paths are links: a Forge worktree keeps the index link but holds a real
+// projected directory there, so lstat/readlink would misread it as a file.
+const copyCorpus=async(repo,paths)=>{
+  const stage=await exec({file:'git',args:['ls-files','-s','-z','--',...paths],cwd:repo});
+  expect(stage.code).toBe(0);
+  const links=new Map();
+  for(const record of stage.stdout.toString().split('\0').filter(Boolean)){
+    const [meta,path]=record.split('\t');
+    if(meta.startsWith('120000 '))links.set(path,meta.split(' ')[1]);
+  }
+  for(const path of paths){
+    if(links.has(path)){
+      const target=await exec({file:'git',args:['cat-file','blob',links.get(path)],cwd:repo});
+      expect(target.code).toBe(0);
+      await fs.mkdir(join(cwd,path,'..'),{recursive:true});
+      await fs.symlink(target.stdout.toString(),join(cwd,path));
+    }else await write(path,await fs.readFile(join(repo,path)));
+  }
+};
 describe('credential-name rule (R321)',()=>{
+  it('copies a bridge corpus whose index link is a real projected directory (Forge worktree shape)',async()=>{
+    // Same shape materializeWorktree leaves: index mode 120000, real directory on disk.
+    const repo=await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR,'forge-bridge-corpus-')));
+    try {
+      const run=(...args)=>{const r=spawnSync('git',args,{cwd:repo});if(r.status!==0)throw new Error('Fixture git failed');return r.stdout;};
+      run('init','-q');
+      await fs.mkdir(join(repo,'agent-memory-src'));await fs.writeFile(join(repo,'agent-memory-src/note.md'),'note');
+      await fs.mkdir(join(repo,'.claude'));await fs.symlink('../agent-memory-src',join(repo,'.claude/agent-memory'));
+      run('add','.');
+      await fs.rm(join(repo,'.claude/agent-memory'));
+      await fs.mkdir(join(repo,'.claude/agent-memory'));await fs.writeFile(join(repo,'.claude/agent-memory/note.md'),'note');
+      const paths=run('ls-files','-z','--','.claude/agent-memory','agent-memory-src/').toString().split('\0').filter(Boolean);
+      expect(paths).toContain('.claude/agent-memory');
+      await copyCorpus(repo,paths);
+      expect(await fs.readlink(join(cwd,'.claude/agent-memory'))).toBe('../agent-memory-src');
+      expect(await fs.readFile(join(cwd,'agent-memory-src/note.md'),'utf8')).toBe('note');
+    } finally {await fs.rm(repo,{recursive:true,force:true});}
+  });
   it('buildManifest projects the actual tracked repo memory bridge with public evidence pinned to HEAD',async()=>{
     const repo=fileURLToPath(new URL('../../../',import.meta.url));
     // Exercise the real bridge corpus, rather than a hand-picked flat inventory.
@@ -64,13 +102,7 @@ describe('credential-name rule (R321)',()=>{
     expect(paths).toContain('.claude/agent-memory');
     expect(paths).toContain('agent-memory-src/8-project_theme_tokens_js_first.md');
     expect(paths).toContain('agent-memory-src/never-touch-secrets-even-filenames.md');
-    for(const path of paths){
-      const source=join(repo,path);
-      if((await fs.lstat(source)).isSymbolicLink()){
-        await fs.mkdir(join(cwd,path,'..'),{recursive:true});
-        await fs.symlink(await fs.readlink(source),join(cwd,path));
-      }else await write(path,await fs.readFile(source));
-    }
+    await copyCorpus(repo,paths);
     await git(['add','.']);await commit();
     const manifest=await buildManifest({cwd,exec});
     for(const path of paths.filter(p=>p.startsWith('agent-memory-src/'))){

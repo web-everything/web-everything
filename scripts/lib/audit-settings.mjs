@@ -163,6 +163,10 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
   'scripts/readiness/prepare-hold-state.mjs',
+  // Binary maintenance serializes scheduled ticks with an exclusive lock directory.
+  'scripts/operations/agy-upgrade-check.mjs',
+  // The urgent-load verifier takes an exclusive lock directory and `wx` receipt files (found by the hold scan).
+  'scripts/operations/urgent-verify.mjs',
   // Receipt archiving reserves its temp with `wx` and publishes with a no-clobber hard link.
   'scripts/readiness/forge-receipts-archive.mjs',
   // Forge deploy reserves record temps with `wx` and serializes writers on a flock deploy lock.
@@ -187,6 +191,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/conveyor/health-responder-state.mjs',
   // Landed on main since: the lane dependency installer (a no-clobber link create).
   'scripts/lib/lane-deps-installer.mjs',
+  // The ruled-weakened waiver store: a locked append/prune/rewrite (an exclusive create).
+  'scripts/operations/ruled-weakened-store.mjs',
   // Landed on main since: the fetch-only mirror sync (an exclusive create, a lock directory and a lock file name).
   'scripts/lib/mirror-sync.mjs',
   // Landed on main since: the red-main quarantine rerun marker (an exclusive `wx` create).
@@ -226,7 +232,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
-  'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs',
+  'scripts/operations/ruled-weakened-prune.mjs',
+  'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
   'scripts/conveyor/health-watch.mjs', 'scripts/conveyor/liveness-sweep.mjs', 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs',
@@ -251,7 +258,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/conveyor/soak/breaks/standdown-pr-holds-scope-slot.mjs', 'scripts/conveyor/stand-down-auto-proceed-io.mjs',
   'scripts/held-cards-io.mjs', 'scripts/lane-drain.mjs', 'scripts/lib/card-group.mjs', 'scripts/lib/card-number-ledger.mjs',
   'scripts/lib/daemon-clone-lock.mjs', 'scripts/lib/daemon-item-tasks.mjs', 'scripts/lib/daemon-jobs-runtime.mjs',
-  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
+  'scripts/lib/daemon-load-overlay.mjs', 'scripts/lib/daemon-rebuild/adopt.mjs', 'scripts/lib/daemon-rebuild/auto-rebase.mjs',
   'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
@@ -295,7 +302,9 @@ export const LOCK_USERS = Object.freeze([
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
   'scripts/conveyor/pr-live-owner-watch-io.mjs',
   // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
-  'scripts/conveyor/timeout-evidence-pool.mjs']);
+  'scripts/conveyor/timeout-evidence-pool.mjs',
+  // The shared stuck-trace queue serializes enqueue, claims and completion through withFileLock.
+  'scripts/conveyor/stuck-trace.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
@@ -315,6 +324,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs',
   // The missing-run push reservation is an exclusive-create (`wx`) hold: a race in it double-pushes a recovery.
   'scripts/conveyor/missing-run-push.mjs',
+  // The AGY usage reader writes its record through an exclusive-create (`wx`) temp file before the rename.
+  'scripts/operations/agy-usage-reader.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',
   'scripts/guard-*', 'scripts/**/guard-*', 'scripts/*-guard*', 'scripts/**/*-guard*', 'scripts/guarded-*', 'scripts/**/guarded-*',
   '.claude/settings.json', '.githooks/', 'scripts/lib/git-hook-surface.mjs', 'scripts/lib/permission-change.mjs',

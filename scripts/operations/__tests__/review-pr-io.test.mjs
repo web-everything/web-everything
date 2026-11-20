@@ -40,7 +40,7 @@ const fixtureRunStore = (root) => ({ read: (id) => {
   return { id, effects: ['o-n-7-verdict.md', 'v.md'].map((bodyFile, i) => ({ key: `${id}#0#${i}`, type: 'review.write-up', status: 'applied', payload: { bodyFile, body: body || 'Accept' } })) };
 } });
 const createReviewPrSinks = (o = {}) => createSinks({ runStore: fixtureRunStore(o.root), readPublishHead: ({ expectedHead }) => expectedHead, publishGate: ({ expectedHead }) => ({ headSha: expectedHead, checks: [] }), ...o });
-import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation } from '../review-pr.mjs';
+import { REVIEW_EFFECTS, REVIEW_PR_CHANNEL, REVIEW_PR_OP, reviewPrOperation, antigravityReviewFromEnv } from '../review-pr.mjs';
 import { createRegistry } from '../registry.mjs';
 import { RED_TEAM_SETTINGS_FILE, redTeamMarker } from '../../lib/red-team-gate.mjs';
 import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH } from '../../lib/policy-cascade.mjs';
@@ -759,6 +759,32 @@ describe('the label sink', () => {
     expect(argv).toContain(`--body-file=${join(reviewSidecarDir(root), 'run-1', 'o-n-7-verdict.md')}`);
     // It never builds a `gh` call of its own — the single home owns the write arc, the markers and the ordering.
     expect(argv.join(' ')).not.toContain('gh ');
+  });
+
+  it('staged in checkout A, child cwd B: passes a private copy accepted by the child allowlist', async () => {
+    const cwd = join(root, 'checkout-b'), scratch = join(root, 'temp');
+    mkdirSync(cwd); mkdirSync(scratch);
+    const staged = reviewBodyPath({ root, runId: CTX.runId, bodyFile: payload.bodyFile });
+    // Model distinct checkout/temp roots even though the fixture itself lives in the host temp dir.
+    // The CLI also lists a hard-coded /tmp root, which on Linux CI contains this fixture, so name only the two roots.
+    expect(checkBodyFileLocation(staged, [cwd, scratch]).ok).toBe(false);
+    let copy;
+    const { sinks } = resolveOperation(REVIEW_PR_OP, { cwd,
+      sinkFactory: controls => createReviewPrSinks({ root, ...controls, tmpDir: scratch,
+      publishGate: () => ({ allowed: true, headSha: payload.reviewedHead }),
+      runNode: (argv, opts) => {
+        expect(opts.cwd).toBe(cwd);
+        copy = argv.find(a => a.startsWith('--body-file=')).slice(12);
+        expect(copy).not.toBe(staged);
+        expect(checkBodyFileLocation(copy, bodyFileRoots(opts.cwd))).toEqual({ ok: true });
+        expect(checkBodyFileLocation(copy, bodyFileRoots(opts.cwd, scratch))).toEqual({ ok: true });
+        expect(readFileSync(copy, 'utf8')).toBe('# verdict');
+        expect(statSync(copy).mode & 0o777).toBe(0o600);
+        return '{"ok":true,"pr":7,"to":"accepted"}';
+      } }) });
+    await expect(sinks[REVIEW_EFFECTS.LABEL](payload, CTX)).resolves.toMatchObject({ ok: true });
+    expect(existsSync(copy)).toBe(false);
+    expect(readFileSync(staged, 'utf8')).toBe('# verdict');
   });
 
   // Resume from a DIFFERENT checkout: the staged file lives under the first lane's root, so this root has none.
@@ -2921,8 +2947,35 @@ describe('#4315 durable referral effects', () => {
     expect(mandatoryReferralState(h.state.comments, { head: 'b'.repeat(40) }).blocked).toEqual(result === 'block' ? [old.referrals[0].key] : []);
   });
 
+  it.each([
+    {},
+    { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' },
+    { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' },
+  ])('unpromoted Carbon keeps prior referrals pending through the sink and acceptance gate (%j)', async env => {
+    const h = harness({ env });
+    const old = seedReferrals(h, ['judgeAntigravityReview'], h.state.headRefOid);
+    expect(antigravityReviewFromEnv(env)).toBe(false);
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(result.pending).toEqual([old.referrals[0].key]);
+    expect(result.records.every(r => !r.dropped && !r.rulings.length)).toBe(true);
+    expect(mandatoryReferralState(h.state.comments, { head: h.state.headRefOid }).pending).toEqual(result.pending);
+    expect(() => assertMandatoryReferralsCleared(h.state, { repo: 'o/r', pr: 7, env, readRuns: () => [] }))
+      .toThrow(/mandatory referral hold/);
+    expect(h.judge).not.toHaveBeenCalled();
+    expect(h.ledger).toEqual([]);
+  });
+
   it('flag on with the Gemini cap left unset keeps the seat\'s referrals pending', async () => {
     const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1' } });
+    seedReferrals(h, Array(2).fill('judgeAntigravityReview'));
+    const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
+    expect(result.pending).toHaveLength(2);
+    expect(result.records.every(r => !r.dropped)).toBe(true);
+  });
+
+  it('a promoted seat with the Gemini cap left unset keeps its persisted referrals pending', async () => {
+    // R1062: pin promotion to isolate the unset-cap policy from the new unpromoted default.
+    const h = harness({ failure: 'judge', env: { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true' } });
     seedReferrals(h, Array(2).fill('judgeAntigravityReview'));
     const result = await h.make()[REVIEW_EFFECTS.MANDATORY_REFERRALS](h.payload, CTX);
     expect(result.pending).toHaveLength(2);
@@ -2944,8 +2997,10 @@ describe('#4315 durable referral effects', () => {
   it.each([
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 1],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
-    [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
     [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 5],
+    [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
+    [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '0', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '0' }, 1],
+    [{ REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' }, 5],
   ])('replays #3481: config %j leaves %i pending', async (env, count) => {
     const h = harness({ failure: 'judge', env });
     const old = seedReferrals(h, ['judge', ...Array(4).fill('judgeAntigravityReview')]);
@@ -3152,7 +3207,9 @@ describe('#4315 durable referral effects', () => {
     expect(h.judge).toHaveBeenCalledTimes(current.length);
   });
   it.each(['1', '0'])('replays the 14:08Z run shape with optional seat=%s: all 55 keys read back', async enabled => {
-    const h = harness({ env: { REVIEW_PR_ANTIGRAVITY_REVIEW: enabled } });
+    // R1062: replay the historically promoted seat with an explicitly positive Gemini cap.
+    const h = harness({ env: { REVIEW_PR_ANTIGRAVITY_REVIEW: enabled,
+      WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' } });
     const fixture = JSON.parse(readFileSync('scripts/operations/__tests__/fixtures/referral-3481-shape.json', 'utf8'));
     h.payload = { read: fixture.read, referrals: fixture.referrals };
     h.state.headRefOid = fixture.read.netBasis.rev;
@@ -3996,6 +4053,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
   const REPRODUCED = { summary: 'ran it', results: [{ index: 0, reproduced: true, evidence: 'ran the cited path; it fails' }] };
 
   function world() {
+    // R1062: the operation, referral sink and landing guard replay the same promoted, enabled seat.
+    const env = { REVIEW_PR_ANTIGRAVITY_REVIEW: '1', WE_REVIEW_SHADOW_AGY_PROMOTED: 'true', WE_REVIEW_SEAT_CAP_AGY_GEMINI: '40' };
     const state = { headRefOid: H1, body: '<!-- authored-by-actor: author -->', labels: ['review:pending'], comments: [], createdAt: '' };
     const trace = [];
     const provider = { readPrState: () => structuredClone(state), ensureLabel: () => {},
@@ -4004,7 +4063,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter((l) => !plan.remove.includes(l)), plan.add]; } };
     const referralJudge = vi.fn(async (request) => ({ sessionId: request.sessionId, value: { rulings: [] } }));
     const lines = [];
-    const sinks = createReviewPrSinks({ root, labelProvider: provider, readChangedLines: () => new Set([12]), postComment: provider.postComment, referralJudge, mirrorReferral: () => {}, cardReadable: () => true, out: (l) => lines.push(l) });
+    const sinks = createReviewPrSinks({ root, env, labelProvider: provider, readChangedLines: () => new Set([12]), postComment: provider.postComment, referralJudge, mirrorReferral: () => {}, cardReadable: () => true, out: (l) => lines.push(l) });
     const spawns = [];
     async function runOnce(id, verifierAnswer, seatFinding = original) {
       const declaration = reviewPrOperation({ codexAdvisory: false, correctnessAdvisory: false, antigravityReview: true,
@@ -4031,7 +4090,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       return run;
     }
     const records = () => readReferralRecords(state.comments, { head: state.headRefOid }).records;
-    return { state, trace, lines, referralJudge, spawns, runOnce, records, sinks };
+    return { state, trace, lines, referralJudge, spawns, runOnce, records, sinks, env };
   }
 
   it('NOT REPRODUCED: one verifier turn, one live referral and an independent ruling attempt; a same-head run posts no new record and repeats no attempt', async () => {
@@ -4045,7 +4104,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(record.verified).toEqual([{ key: referralFindingKey('judgeAntigravityReview', original), outcome: 'not-reproduced', reason: 'x.mjs:1 the guard holds on the head' }]);
     expect(activeReferrals(record)).toHaveLength(1);
     expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toHaveLength(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
     expect(w.state.labels).toContain('review:human');
     // A negative is evidence only: the empty independent ruling leaves the mandatory hold pending.
     expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
@@ -4091,7 +4150,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(record.verified).toEqual([{ key: referralFindingKey('judgeAntigravityReview', original), outcome: 'reproduced' }]);
     expect(activeReferrals(record)).toHaveLength(1);
     expect(first.verdict.pendingReferrals).toHaveLength(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
     expect(w.state.labels).toEqual(['review:human']);
 
     const recordPosts = w.trace.filter((t) => t === 'referral').length;
@@ -4099,7 +4158,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.spawns).toHaveLength(1);
     expect(w.referralJudge).toHaveBeenCalledTimes(1);
     expect(w.trace.filter((t) => t === 'referral').length).toBe(recordPosts);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
   });
 
   // A verification that did not finish FAILS CLOSED: the claim stays a CONFIRMED referral with no `verified` entry, so the head's record
@@ -4120,7 +4179,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.records()).toHaveLength(1);
     expect(again.findings.reduce.uncorroboratedRetirements).toBeUndefined();
     expect(reviewLoopAutoConfirm(again.pending, again)).toBeNull();
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
   });
 
   // PR #5025 review: the hold must outlive the run. A claim whose verification did not finish is kept as a live referral, so the head's
@@ -4137,13 +4196,13 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
     expect(first.findings.reduce.referrals).toHaveLength(1);
     expect(w.records()).toHaveLength(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
     // The same head, the seat omits the claim, and the verifier now has nothing to say: the durable record still holds it.
     const quiet = await w.runOnce('run-2', REPRODUCED, null);
     expect(quiet.verdict.verdict).not.toBe('accept');
     expect(reviewLoopAutoConfirm(quiet.pending, quiet)).toBeNull();
     expect(mandatoryReferralState(w.state.comments, { head: H1 }).pending).toHaveLength(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
     expect(w.spawns).toHaveLength(1);
   });
 
@@ -4157,7 +4216,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.records()[0].verified[0].outcome).toBe('not-reproduced');
     expect(activeReferrals(w.records()[0])).toHaveLength(1);
     expect(w.referralJudge).toHaveBeenCalledTimes(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
     expect(first.verdict.verdict).toBe('needs-human');
     expect(first.pending).toMatchObject({ kind: 'confirm', of: 'human' });
     expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
@@ -4182,14 +4241,14 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     await w.runOnce('run-1', NOT_REPRODUCED);
     expect(w.records()[0].verified[0].outcome).toBe('not-reproduced');
     expect(mandatoryReferralState(w.state.comments, { head: H1 }).blocked).toHaveLength(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
 
     await w.runOnce('run-2', REPRODUCED, { ...original, verdict: 'PLAUSIBLE' });
     expect(w.spawns).toHaveLength(1);
     expect(w.referralJudge).toHaveBeenCalledTimes(1);
     expect(activeReferrals(w.records()[0])).toHaveLength(1);
     expect(mandatoryReferralState(w.state.comments, { head: H1 }).blocked).toHaveLength(1);
-    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
+    expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7, env: w.env })).toThrow(/mandatory referral hold/);
   });
 
   // PR #5025 review: a steered verifier's lone "does not reproduce" (free-form evidence, no line in the claim's own file) must not
@@ -4380,11 +4439,33 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     expect(f.runNode).not.toHaveBeenCalled();
   });
   it.each([
-    ['failed', { name: 'review-gate', status: 'completed', conclusion: 'failure', head_sha: head }],
     ['on another head', { name: 'review-gate', status: 'completed', conclusion: 'success', head_sha: 'e'.repeat(40) }],
     ['malformed', { name: 'review-gate', head_sha: head }],
-  ])('still holds when review-gate is %s (only missing/pending are exempt)', async (_label, row) => {
+  ])('still holds when review-gate is %s', async (_label, row) => {
     const f = await run([ok('test'), row], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  // Derived gates stay red until this very review lands, so a FAILED derived gate cannot hold the label.
+  const failed = name => ({ name, status: 'completed', conclusion: 'failure', head_sha: head });
+  it('publishes when review-gate and an annotated merge-gate are red and all real checks are green', async () => {
+    const checks = [ok('test'), failed('review-gate'), { ...failed('merge-gate'), mergeGateReviewHold: { holds: ['review-hold-labels'] } }];
+    const f = await run(checks, { requiredChecks: ['test', 'review-gate', 'merge-gate'] });
+    await expect(f.publish()).resolves.toEqual({ ok: true });
+    expect(f.runNode).toHaveBeenCalledTimes(1);
+  });
+  it.each(['cancelled', 'timed_out', 'action_required'])('still holds when review-gate ended %s', async conclusion => {
+    const f = await run([ok('test'), { ...failed('review-gate'), conclusion }], { requiredChecks: withReviewGate });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds when merge-gate is red without the review-hold annotation', async () => {
+    const f = await run([ok('test'), failed('review-gate'), failed('merge-gate')], { requiredChecks: ['test', 'review-gate', 'merge-gate'] });
+    await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
+    expect(f.runNode).not.toHaveBeenCalled();
+  });
+  it('still holds when a real check is red beside a red review-gate', async () => {
+    const f = await run([failed('test'), failed('review-gate')], { requiredChecks: withReviewGate });
     await expect(f.publish()).rejects.toMatchObject({ notApplied: true, message: 'review held: CI still pending on reviewed head' });
     expect(f.runNode).not.toHaveBeenCalled();
   });

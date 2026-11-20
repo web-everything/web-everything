@@ -22,8 +22,10 @@ import {
   rebuildClone, readRebuildState, rebuildStatePath, readReadyCandidate, readyCandidatePath, matchReadyCandidate,
 } from '../daemon-rebuild.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
-import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
-import { readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
+import { addOverlay, appendOverlayEvent, readOverlays, removeOverlay, overlayFilePath } from '../daemon-overlays.mjs';
+import { overlayRetiredByOperator, readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
+import * as adoption from '../daemon-rebuild/adopt.mjs';
+import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as preparation from '../daemon-rebuild/prepare.mjs';
 process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'follow'; // legacy tip-following; the audited-tip gate has its own test
 
@@ -399,6 +401,206 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(noSmoke).not.toHaveBeenCalled();
   });
 
+  it.each(['new overlay', 'descendant tip'])('adopts a partial candidate after %s churn and rebuilds the pending overlay next tick', async (churn) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    pushBranch(originDir, 'lane/first', (dir) => writeFile(dir, 'first.txt', 'first\n'));
+    addOverlay(cloneDir, { ref: 'lane/first' }, { env });
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    await rebuildClone({ root: cloneDir, env, runSmoke, lockOpts: LOCK_OPTS });
+    const target = readReadyCandidate(cloneDir, env)?.adopt.finalSha;
+    expect(target).toBeTruthy();
+    endTick();
+    const pendingRef = churn === 'new overlay' ? 'lane/second' : 'lane/first';
+    const tip = pushBranch(originDir, pendingRef, (dir) => writeFile(dir, 'pending.txt', 'pending\n'),
+      { base: churn === 'new overlay' ? 'origin/main' : 'origin/lane/first' });
+    if (churn === 'new overlay') addOverlay(cloneDir, { ref: pendingRef }, { env });
+    const smoke = vi.fn(async () => PASS);
+    const adopted = await rebuildClone({ root: cloneDir, env, runSmoke: smoke, lockOpts: LOCK_OPTS });
+    expect(adopted).toMatchObject({ adopted: true, reason: 'ready-adopted', head: target });
+    expect(adopted.alerts).toContainEqual({ kind: 'ready-candidate-adopted-partial', detail: { target, pending: [pendingRef] } });
+    expect(smoke).not.toHaveBeenCalled();
+    expect(existsSync(join(cloneDir, 'pending.txt'))).toBe(false);
+    const next = await rebuildClone({ root: cloneDir, env, adoptOnly: true, runSmoke: smoke, lockOpts: LOCK_OPTS });
+    expect(next.reason).toBe('needs-build');
+    expect(next.plan.finalSha).not.toBe(target);
+    expect(next.plan.applied).toContainEqual(expect.objectContaining({ ref: pendingRef, sha: tip }));
+    const rebuilt = await rebuildClone({ root: cloneDir, env, runSmoke: smoke, lockOpts: LOCK_OPTS });
+    expect(rebuilt.adopted).toBe(true);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(readFileSync(join(cloneDir, 'pending.txt'), 'utf8')).toBe('pending\n');
+    expect(rebuilt.alerts.some((a) => a.kind === 'ready-candidate-adopted-partial')).toBe(false);
+  });
+
+  it('discards a candidate when the wanted tip was replaced by a non-descendant', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    pushBranch(originDir, 'lane/replaced', (dir) => writeFile(dir, 'old.txt', 'old\n'));
+    addOverlay(cloneDir, { ref: 'lane/replaced' }, { env });
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    await rebuildClone({ root: cloneDir, env, runSmoke, lockOpts: LOCK_OPTS });
+    endTick();
+    pushBranch(originDir, 'lane/replaced', (dir) => writeFile(dir, 'new.txt', 'new\n'), { force: true });
+    const smoke = vi.fn(async () => PASS);
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke: smoke, lockOpts: LOCK_OPTS });
+    expect(result.reason).not.toBe('ready-adopted');
+    expect(result.alerts).toContainEqual(expect.objectContaining({
+      kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'unverified-build' }),
+    }));
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(cloneDir, 'old.txt'))).toBe(false);
+  });
+
+  it('discards a candidate containing a removed ref even when its successor contains that tip', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    env.WE_DAEMON_OVERLAY_STACK_MODE = 'independent';
+    const original = pushBranch(originDir, 'lane/m1', (dir) => writeFile(dir, 'first.txt', 'first\n'));
+    addOverlay(cloneDir, { ref: 'lane/m1' }, { env });
+    await rebuildClone({ root: cloneDir, env, runSmoke: async () => PASS, lockOpts: LOCK_OPTS });
+    pushBranch(originDir, 'lane/m3', (dir) => writeFile(dir, 'successor.txt', 'successor\n'), { base: 'origin/lane/m1' });
+    addOverlay(cloneDir, { ref: 'lane/m3' }, { env });
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    await rebuildClone({ root: cloneDir, env, runSmoke, lockOpts: LOCK_OPTS });
+    const ready = readReadyCandidate(cloneDir, env);
+    expect(ready.adopt.applied.map((a) => a.ref)).toEqual(['lane/m1', 'lane/m3']);
+    endTick();
+    removeOverlay(cloneDir, 'lane/m1', { env });
+    pushBranch(originDir, 'lane/m3', (dir) => rmSync(join(dir, 'first.txt')), { base: 'origin/lane/m3' });
+    advanceMain(originDir, (dir) => writeFile(dir, 'main.txt', 'main\n'));
+    const smoke = vi.fn(async () => PASS);
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke: smoke, lockOpts: LOCK_OPTS });
+    expect(result.adopted).toBe(true);
+    expect(result.reason).not.toBe('ready-adopted');
+    expect(result.alerts).toContainEqual(expect.objectContaining({
+      kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'overlay-no-longer-wanted', target: ready.adopt.finalSha }),
+    }));
+    expect(git(cloneDir, ['merge-base', '--is-ancestor', original, 'HEAD']).status).toBe(0);
+    expect(smoke).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(cloneDir, 'first.txt'))).toBe(false);
+    expect(result.alerts.some((a) => a.kind === 'ready-candidate-adopted-partial')).toBe(false);
+  });
+
+  it('does not omit a live overlay retired during planning while it remains in overlaysBefore', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    const ref = 'lane/retired-during-plan';
+    const sha = pushBranch(originDir, ref, (dir) => writeFile(dir, 'live.txt', 'live\n'));
+    addOverlay(cloneDir, { ref, pr: 99 }, { env });
+    const added = { kind: 'added', ref, at: '2026-11-14T10:00:00Z' };
+    appendOverlayEvent(cloneDir, added, { env });
+    expect(await rebuildClone({ root: cloneDir, env, runSmoke: async () => PASS, prState: async () => 'OPEN', lockOpts: LOCK_OPTS }))
+      .toMatchObject({ adopted: true });
+    const liveHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const candidate = advanceMain(originDir, (dir) => writeFile(dir, 'candidate.txt', 'candidate\n'));
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    try {
+      expect(await rebuildClone({ root: cloneDir, env, runSmoke, mainOnly: true, lockOpts: LOCK_OPTS }))
+        .toMatchObject({ reason: 'tick-in-progress' });
+      expect(readReadyCandidate(cloneDir, env)?.adopt).toMatchObject({ finalSha: candidate, applied: [] });
+    } finally { endTick(); }
+    const retired = { kind: 'auto-retired', ref, tip: sha, actor: OPERATOR_LOGINS[0], operatorReason: true, reason: 'withdraw fix', at: new Date().toISOString() };
+    expect(overlayRetiredByOperator({ ref, sha, events: [added, retired], registered: () => false })).toBe(true);
+    const noSmoke = vi.fn(async () => PASS);
+    const result = await rebuildClone({
+      root: cloneDir, env, adoptOnly: true, runSmoke: noSmoke, lockOpts: LOCK_OPTS,
+      prState: async () => {
+        removeOverlay(cloneDir, ref, { env });
+        appendOverlayEvent(cloneDir, retired, { env });
+        return 'OPEN';
+      },
+    });
+    expect(readOverlays(cloneDir, { env })).toEqual([]);
+    expect(result.alerts).toContainEqual(expect.objectContaining({
+      kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: expect.stringContaining(`superseded-omits-live-overlay: ${ref}`) }),
+    }));
+    expect(result.reason).not.toBe('ready-adopted');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(liveHead);
+    expect(noSmoke).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['retired-merged content present', {}, true],
+    ['auto-dropped content present', { kind: 'auto-dropped', reason: 'pr-merged' }, true],
+    ['in main content present', { reason: 'PR content is IN MAIN' }, true],
+    ['in-main content present', { reason: 'in-main' }, true],
+    ['retired-merged content absent', { content: false }, false],
+    ['retirement tip mismatch', { tip: 'b'.repeat(40) }, false],
+    ['retirement tip missing', { tip: undefined }, false],
+    ['later re-add despite empty registry', { later: 'added' }, false],
+    ['overlay still registered', { registered: true }, false],
+    ['retirement unrelated to merge', { reason: 'withdraw fix' }, false],
+    ['negated merge statement', { reason: 'PR 7055 is not merged yet' }, false],
+    ['negated in-main statement', { reason: 'PR content is not in main' }, false],
+    ['has not yet merged', { reason: 'PR 7055 has not yet merged' }, false],
+    ['explicit false content evidence', { evidence: { contentInMain: false, cleanMerges: true } }, false],
+    ['later unknown lifecycle event', { later: 'unknown' }, false],
+    ['unreadable event log', { log: 'unreadable' }, false],
+    ['missing event log', { log: 'missing' }, false],
+  ])('historical merge retirement: %s', async (_name, options, accepted) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    const ref = 'lane/review-seat-fairness-m1';
+    const sha = pushBranch(originDir, ref, (dir) => writeFile(dir, 'live.txt', 'live\n'));
+    addOverlay(cloneDir, { ref }, { env });
+    expect(await rebuildClone({ root: cloneDir, env, runSmoke: async () => PASS, lockOpts: LOCK_OPTS }))
+      .toMatchObject({ adopted: true });
+    const liveHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    removeOverlay(cloneDir, ref, { env });
+    const retirement = {
+      kind: 'auto-retired', ref, tip: sha, by: OPERATOR_LOGINS[0],
+      reason: 'PR 7055 merged; registration is stale',
+      ...Object.fromEntries(Object.entries(options).filter(([key]) => ['kind', 'tip', 'reason', 'evidence'].includes(key))),
+    };
+    expect(retirement).not.toHaveProperty('actor');
+    if (!options.evidence) expect(retirement).not.toHaveProperty('evidence');
+    appendOverlayEvent(cloneDir, retirement, { env });
+    if (options.later) appendOverlayEvent(cloneDir, { kind: options.later, ref }, { env });
+    if (options.registered) addOverlay(cloneDir, { ref }, { env });
+    // Squash-equivalent content: the candidate does not carry the overlay by ancestry.
+    const candidate = advanceMain(originDir, (dir) => {
+      writeFile(dir, 'candidate.txt', 'candidate\n');
+      if (options.content !== false) writeFile(dir, 'live.txt', 'live\n');
+    });
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    try {
+      expect(await rebuildClone({ root: cloneDir, env, runSmoke, mainOnly: true, lockOpts: LOCK_OPTS }))
+        .toMatchObject({ reason: 'tick-in-progress' });
+      expect(readReadyCandidate(cloneDir, env)?.adopt).toMatchObject({ finalSha: candidate, applied: [] });
+    } finally { endTick(); }
+    expect(git(cloneDir, ['merge-base', '--is-ancestor', sha, candidate]).status).toBe(1);
+    if (options.log) {
+      const file = overlayFilePath(cloneDir, env).replace(/\.json$/, '.events.jsonl');
+      if (options.log === 'missing') rmSync(file);
+      else writeFileSync(file, `${readFileSync(file, 'utf8')}unreadable\n`);
+    }
+    // Move the plan beyond the already-smoked candidate so the retention guard must run.
+    advanceMain(originDir, (dir) => {
+      writeFile(dir, 'later.txt', 'later\n');
+      // Keep this re-registration live: content on current main would otherwise cause a valid same-tick drop.
+      if (options.registered) rmSync(join(dir, 'live.txt'));
+    });
+    const matching = vi.spyOn(adoption, 'matchReadyCandidate');
+    const noSmoke = vi.fn(async () => PASS);
+    try {
+      const result = await rebuildClone({ root: cloneDir, env, adoptOnly: true, runSmoke: noSmoke, lockOpts: LOCK_OPTS });
+      expect(matching).toHaveBeenCalledOnce();
+      if (options.registered) {
+        expect(readOverlays(cloneDir, { env }).map((overlay) => overlay.ref)).toContain(ref);
+        expect(matching.mock.calls[0][0].plan.decisions).not.toContainEqual(expect.objectContaining({ ref, action: 'remove' }));
+      }
+      const match = matching.mock.results[0].value;
+      if (accepted) {
+        expect(match).toMatchObject({ match: 'superseded', retired: [ref], adopt: { finalSha: candidate } });
+        expect(result).toMatchObject({ reason: 'ready-adopted', readyMatch: 'superseded' });
+      } else {
+        expect(match).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${ref}`, omitted: [ref] });
+        expect(result.reason).not.toBe('ready-adopted');
+      }
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(accepted ? candidate : liveHead);
+      expect(noSmoke).not.toHaveBeenCalled();
+    } finally { matching.mockRestore(); }
+  });
+
   it('never brings back an overlay whose PR closed in the SAME tick that finds the ready candidate', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/bad-pr', (dir) => writeFile(dir, 'bad.txt', 'x\n'));
@@ -667,6 +869,20 @@ describe('matchReadyCandidate — pure', () => {
     expect(matchReadyCandidate(args()).match).toBe('superseded');
     expect(matchReadyCandidate(args({ stillWanted: () => false })).reason).toBe('overlay-no-longer-wanted');
   });
+  it.each(['wanted successor containing the removed tip', 'unwanted successor', 'registered retraction', 'unknown ancestry'])(
+    'refuses a replacement with %s even if the candidate contains the old tip', (evidence) => {
+      const ready = { ...base, adopt: { ...base.adopt, applied: [
+        { ref: 'lane/a', sha: 'a1' }, { ref: 'lane/successor', sha: 's1' },
+      ] } };
+      const m = matchReadyCandidate(args({
+        ready,
+        stillWanted: (ref, sha) => ref === 'lane/successor' && sha === 's1' && evidence !== 'unwanted successor',
+        registered: (ref) => ref === 'lane/successor' || evidence === 'registered retraction',
+        carries: (sha, build) => build === 'S1' || (sha === 'a1' && build === 's1' && evidence !== 'unknown ancestry'),
+      }));
+      expect(m).toMatchObject({ adopt: null, reason: 'overlay-no-longer-wanted' });
+    },
+  );
   describe('omitted live overlays', () => {
     const live = (...refs) => refs.map((r) => ({ ref: r, sha: `${r}-sha` }));
     const o = (extra) => args({ liveApplied: live('lane/m'), carries: () => false, ...extra });
@@ -688,6 +904,24 @@ describe('matchReadyCandidate — pure', () => {
       }));
       expect(m.adopt).toBeNull();
       expect(m.omitted).toEqual(['lane/u']);
+    });
+    it('lists duplicate live ref/sha entries once when discarding', () => {
+      const m = matchReadyCandidate(o({ liveApplied: live('lane/m', 'lane/m') }));
+      expect(m).toMatchObject({ adopt: null, reason: 'superseded-omits-live-overlay: lane/m', omitted: ['lane/m'] });
+    });
+    it('passes the exact live sha and retires duplicate live entries once', () => {
+      const removedForMain = vi.fn(() => true);
+      const m = matchReadyCandidate(o({ liveApplied: live('lane/m', 'lane/m'), removedForMain, contentInBuild: () => true }));
+      expect(m).toMatchObject({ match: 'superseded', retired: ['lane/m'] });
+      expect(removedForMain).toHaveBeenCalledOnce();
+      expect(removedForMain).toHaveBeenCalledWith('lane/m', 'lane/m-sha');
+    });
+    it('keeps distinct live shas of the same ref subject to independent proof', () => {
+      const m = matchReadyCandidate(o({
+        liveApplied: [...live('lane/m'), { ref: 'lane/m', sha: 'other-sha' }],
+        removedForMain: (_ref, sha) => sha === 'other-sha', contentInBuild: () => true,
+      }));
+      expect(m).toMatchObject({ adopt: null, omitted: ['lane/m'] });
     });
   });
   it('a rejection of the same inputs recorded after the pass wins', () => {

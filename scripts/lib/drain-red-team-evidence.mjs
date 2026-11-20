@@ -5,13 +5,14 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
 import { foreignStaleOwnerDead } from './red-team-foreign-host-stale.mjs';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
-import { isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
-import { createNewestRunFinder, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
+import { NAME_RE, isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, sharedRunsDir } from '../operations/run-store.mjs';
+import { createNewestRunFinder, resolveRunScanSettings, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
+import { assertReviewRunEvidence, readNamedCandidates, readReviewRunIndex } from './review-run-index.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { pidNamespace, pidStartTime } from './pid-alive.mjs';
 
@@ -421,16 +422,78 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     if (!completeReads.has(settleAt)) completeReads.set(settleAt, completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, settleAt }));
     return completeReads.get(settleAt);
   };
-  const runScan = () => {
+  const indexReadErrors = new Map();
+  const indexReads = new Map(); // bounded by the shared payload budget
+  const indexIdentities = new Map();
+  const currentIdentity = (id, metadataReader = stat) => {
+    const metadata = metadataReader(join(runsDir, `${id}.json`));
+    return JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
+  };
+  const discardChangedRead = (id, identity) => {
+    if (indexIdentities.get(id) !== identity) {
+      indexReads.delete(id);
+      indexReadErrors.delete(id);
+      indexIdentities.delete(id);
+    }
+  };
+  const setting = resolveRunScanSettings(scanSettings);
+  const maxParses = setting.value.scan.maxParses;
+  let parsed = 0;
+  const budgetExhausted = Symbol('shared review parse budget exhausted');
+  let hardHold = false;
+  const runScan = (indexedIds, allCandidates = false) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
+    const mtimes = new Map();
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
     // different records in the drain's and recovery's windows, and the two could disagree.
-    const find = createNewestRunFinder({ ids: list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
-      stat: id => stat(join(runsDir, `${id}.json`)), read: id => read(id, runsDir), scanSettings, warn });
-    const end = find((run, id, at, nextAt) => {
+    const find = createNewestRunFinder({ ids: indexedIds ?? list(runsDir).filter(id => id.startsWith('review-pr-')), tieBreak: 'id-asc',
+      stat: id => {
+        // Metadata orders the same liveness bounds as the ordinary scan.
+        const metadata = stat(join(runsDir, `${id}.json`));
+        mtimes.set(id, metadata.mtimeMs);
+        return metadata;
+      }, read: id => {
+        const identity = indexedIds || indexReads.has(id) ? currentIdentity(id) : undefined;
+        discardChangedRead(id, identity);
+        if (!indexReads.has(id) && parsed >= maxParses) {
+          // This record remains unread: preserve its boundary for the existing capped-scan rules.
+          boundary = mtimes.get(id);
+          (warn ?? console.warn)(`runs.scan.maxParses=${maxParses} (source: ${setting.sources['scan.maxParses']}) reached: scan-capped; HOLD and inspect omitted runs before increasing the setting`);
+          throw budgetExhausted;
+        }
+        let run;
+        if (indexReadErrors.has(id)) throw indexReadErrors.get(id);
+        if (indexReads.has(id)) run = indexReads.get(id);
+        else {
+          parsed++; // Failed reads also consume the shared budget.
+          run = read(id, runsDir);
+        }
+        if (indexedIds) {
+          indexReads.set(id, run);
+          indexIdentities.set(id, identity);
+        }
+        if (allCandidates || NAME_RE.test(id)) {
+          const match = NAME_RE.exec(id);
+          try {
+            assertReviewRunEvidence(run);
+            if (run?.id !== id || (match && (run.op !== 'review-pr' || Number(run.input?.pr) !== Number(match[1])))) throw Error('review run filename and payload disagree');
+          } catch (error) { hardHold = true; throw error; }
+        }
+        if (!allCandidates && indexedIds && (run?.id !== id
+          || run.op !== 'review-pr' || run.input?.repo !== repo || Number(run.input?.pr) !== Number(pr))) {
+          // A payload with a different identity must never reappear as a verdict
+          // when the fallback reuses this verified file's cached read.
+          const error = Error('unverified review index entry');
+          if (run?.id !== id) indexReadErrors.set(id, error);
+          throw error;
+        }
+        return run;
+      }, scanSettings, warn });
+    let end;
+    try { end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
         if (!abandonedReview(hit, now)) {
@@ -457,8 +520,11 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       const { exact, newest } = slots[tieBreak];
       boundary = nextAt;
       if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
-      return exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
-    });
+      return (!indexedIds || allCandidates) && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
+    }); } catch (error) {
+      if (error !== budgetExhausted) throw error;
+      end = RUN_SCAN_CAPPED;
+    }
     scan = { slots, startless, count, end, newestSettled, boundary };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
@@ -489,7 +555,75 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
-    if (!scan) runScan();
+    if (!scan) {
+      // Injected listing fixtures retain the index/fallback seam; production uses names.
+      if (list === listRunIds) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const before = readNamedCandidates(runsDir, repo, pr, { list });
+          if (before === null) {
+            // A store not created yet has no records; other discovery failures hold.
+            try { readdirSync(runsDir); hardHold = true; }
+            catch (error) { hardHold = error.code !== 'ENOENT'; }
+            break;
+          }
+          try { runScan(before.ids, true); }
+          catch { hardHold = true; scan = null; break; }
+          const after = readNamedCandidates(runsDir, repo, pr, { list });
+          let unchanged = true;
+          try {
+            for (const [id, identity] of indexIdentities) {
+              if (currentIdentity(id) !== identity) { unchanged = false; break; }
+            }
+          } catch { unchanged = false; }
+          if (after !== null && before.snapshot === after.snapshot && unchanged) break;
+          scan = null;
+          if (attempt === 1) hardHold = true;
+        }
+      }
+      if (!scan) {
+        try {
+          const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),
+            read: id => {
+              const identity = currentIdentity(id);
+              discardChangedRead(id, identity);
+              if (!indexReads.has(id)) {
+                if (parsed >= maxParses) throw budgetExhausted;
+                parsed++;
+                indexIdentities.set(id, identity);
+                // Failed reads consume budget and retain the scan's unreadable-record refusal.
+                try {
+                  const run = read(id, runsDir);
+                  if (run != null && run.id !== id) throw Error('unverified review index entry');
+                  indexReads.set(id, run);
+                }
+                catch (error) { indexReads.set(id, null); indexReadErrors.set(id, error); throw error; }
+              }
+              return indexReads.get(id);
+            },
+          });
+          if (ids.length) {
+            try {
+              runScan(ids);
+              // A locator alone cannot prove a head has no review. Wrong-head/stale hints
+              // and capped index reads must take the original bounded fallback.
+              if (!scan.slots[order].exact || scan.end?.ok === false) scan = null;
+            } catch { scan = null; }
+          }
+          if (!scan) {
+            // Reuse verification reads only while their file identity still matches.
+            // Replacements require fresh IO charged to the same budget (including failures).
+            runScan();
+          }
+        } catch (error) {
+          if (!hardHold) throw error;
+          return { ok: false, reason: 'scan-capped' };
+        }
+      }
+      indexReads.clear();
+      indexReadErrors.clear();
+      indexIdentities.clear();
+    }
+    if (hardHold) return { ok: false, reason: 'scan-capped' };
     const key = `${order}|${exactHead}|${writtenAfter}|${newestHead}`;
     if (!failures.has(key)) failures.set(key, failureFor(order, exactHead, writtenAfter, newestHead));
     const slot = scan.slots[order];

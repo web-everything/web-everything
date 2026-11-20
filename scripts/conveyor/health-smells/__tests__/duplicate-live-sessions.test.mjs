@@ -10,6 +10,10 @@
 import { describe, it, expect } from 'vitest';
 import duplicateLiveSessions, { findDuplicateLiveSessions, isNonTerminal } from '../duplicate-live-sessions.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
+// Static import: health-watch.mjs has a heavy module graph (multi-second transform under load). Loading it at
+// collect time keeps that cost out of the per-test 5000 ms budget; probeAgents below runs on an injected exec
+// (no real `claude agents` call) so the test itself is hermetic.
+import { probeAgents } from '../../health-watch.mjs';
 
 const agent = (over = {}) => ({
   name: 'ci-heal-2784', state: 'working', sessionId: 'sid-a', cwd: '/lanes/lane-1', ...over,
@@ -87,7 +91,6 @@ describe('duplicate-live-sessions.evaluate', () => {
   // PR #2789 review (correctness) — asserts the smell against the REAL production probe's output shape, not a
   // hand-built fixture, so a probe/smell field mismatch (sessionId/cwd dropped by the probe) is caught here.
   it('carries sessionIds/cwds through from the real health-watch probeAgents() output shape', async () => {
-    const { probeAgents } = await import('../../health-watch.mjs');
     const raw = [
       { name: 'ci-heal-2784', state: 'working', kind: 'background', startedAt: 't1', cwd: '/lanes/lane-1', sessionId: 'sid-a' },
       { name: 'ci-heal-2784', state: 'working', kind: 'background', startedAt: 't2', cwd: '/lanes/lane-2', sessionId: 'sid-b' },

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 let directory;
@@ -161,4 +161,50 @@ it('R907 a throwing floor diagnostic logger still passes refreshed policy to rec
   expect(passedMinimums()).toEqual([12, 3]);
   expect(floorLines()).toHaveLength(2);
   expect(storeRead).toHaveBeenCalledTimes(2);
+});
+
+
+it.each([false, true])('queue maintenance runs before a failed reconcile, including paused=%s ticks', async paused => {
+  const { runReviewTick } = await import('../review-daemon.mjs');
+  const maintenance = vi.fn();
+  const recovery = vi.fn();
+  runReviewTick({ repo: 'example/project', paused, reconcileRedTeamQueue: maintenance,
+    redTeamOnSkip: recovery, holdReconcile: () => [],
+    reconcile: () => { expect(maintenance).toHaveBeenCalledWith({ repo: 'example/project' }); throw new Error('deferred'); } });
+  expect(maintenance).toHaveBeenCalledTimes(1);
+  expect(recovery).not.toHaveBeenCalled();
+});
+
+it('production maintenance evicts a merged persisted entry without invoking redTeamOnSkip', async () => {
+  const file = join(directory, 'queue.json');
+  writeFileSync(file, JSON.stringify([{ key: 'example/project#7012', repo: 'example/project', pr: 7012,
+    head: 'a'.repeat(40), blocked: 'planner-skip', attempts: 1, enqueuedAt: 1 }]));
+  const readLivePr = vi.fn(() => ({ state: 'MERGED', headRefOid: 'a'.repeat(40) }));
+  const { cliReviewTickOpts } = await import('../review-daemon.mjs');
+  const opts = cliReviewTickOpts({ log, readLivePr });
+  opts.reconcileRedTeamQueue({ repo: 'example/project' });
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([]);
+  expect(readLivePr).toHaveBeenCalledWith({ repo: 'example/project', pr: 7012 });
+  expect(queueRun).not.toHaveBeenCalled();
+});
+
+it('production maintenance retains planner skips while re-keying heads and deferring unreadable PRs', async () => {
+  const file = join(directory, 'queue.json');
+  const entries = [1, 2, 3, 4, 5, 6].map(pr => ({ key: `example/project#${pr}`, repo: 'example/project', pr,
+    head: 'a'.repeat(40), blocked: 'planner-skip', attempts: 1, enqueuedAt: 1 }));
+  writeFileSync(file, JSON.stringify(entries));
+  const { cliReviewTickOpts } = await import('../review-daemon.mjs');
+  const opts = cliReviewTickOpts({ log, readLivePr: ({ pr }) => {
+    if (pr === 5) return { state: 'OPEN', comments: [], headRefOid: 'b'.repeat(40) };
+    if (pr === 6) return null;
+    return { state: 'OPEN', comments: [], headRefOid: 'a'.repeat(40) };
+  } });
+  opts.reconcileRedTeamQueue({ repo: 'example/project' });
+  const persisted = JSON.parse(readFileSync(file, 'utf8'));
+  expect(persisted.slice(0, 4)).toEqual(entries.slice(0, 4));
+  expect(persisted[4]).toEqual({ key: 'example/project#5', repo: 'example/project', pr: 5,
+    head: 'b'.repeat(40), attempts: 0, enqueuedAt: 1 });
+  expect(persisted[5]).toEqual(entries[5]);
+  expect(log.error.mock.calls.flat().join(' ')).toContain('live PR unreadable; admission deferred');
+  expect(queueRun).not.toHaveBeenCalled();
 });

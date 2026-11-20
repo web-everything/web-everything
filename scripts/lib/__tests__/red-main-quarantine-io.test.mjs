@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs, runAddCommand } from '../red-main-quarantine-io.mjs';
+import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs, runAddCommand, runRemovalCommand } from '../red-main-quarantine-io.mjs';
 import { addEntries, pruneOnGreen, testsToSkip } from '../red-main-quarantine.mjs';
 
 const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -70,7 +70,11 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
 });
 
 describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
-  const flags = { tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'a' };
+  it('operator --job reaches the published entry', () => {
+    runAddCommand({ tests: 'a.test.mjs', 'broken-sha': SHA, actor: 'operator', owner: 'o', reason: 'r', job: 'soak-shard (1)' },
+      { rerun: () => null, write: ({ change }) => { expect(change(null).list.entries[0].job).toBe('soak-shard (1)'); return { ok: true }; } });
+  });
+  const flags = { tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'operator' };
   it('a successful add calls the rerun with the broken sha and --dir, and attaches `rerun` to the output', () => {
     const rerun = vi.fn(() => ({ rerun: true, runId: 42 }));
     const write = vi.fn(() => ({ ok: true, events: [] }));
@@ -222,5 +226,37 @@ describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of
     expect(first.rerun).toBe(true);
     expect(inner).toMatchObject({ rerun: false, reason: 'already-rerun' });
     expect(reruns(calls)).toHaveLength(1);
+  });
+});
+
+
+describe('orchestrator CLI authority and transport', () => {
+  const flags = { actor: 'orchestrator', tests: TEST, 'broken-sha': SHA, owner: 'owner', reason: 'red' };
+  it.each([undefined, false, 'true'])('denies CLI add/remove/prune and direct writes with absent, false or invalid authority (%s)', value => {
+    const options = { env: {}, platform: { authority: { redMainQuarantine: value } }, tool: {}, write: vi.fn(), rerun: vi.fn() };
+    expect(() => runAddCommand(flags, options)).toThrow(/redMainQuarantine/);
+    expect(() => runRemovalCommand(flags, options)).toThrow(/redMainQuarantine/);
+    expect(() => runRemovalCommand(flags, { ...options, prune: true })).toThrow(/redMainQuarantine/);
+    expect(() => writeQuarantineChange({ ...options, actor: 'orchestrator', change: vi.fn() })).toThrow(/redMainQuarantine/);
+    expect(options.write).not.toHaveBeenCalled();
+    expect(options.rerun).not.toHaveBeenCalled();
+  });
+  it('persists authorized CLI add/remove/prune events and commit messages as orchestrator', () => {
+    const { board, origin } = repo();
+    const settings = { env: {}, platform: { authority: { redMainQuarantine: true } }, tool: { authority: { redMainQuarantine: false } } };
+    const options = { ...settings, write: o => writeQuarantineChange({ board, ...o }), rerun: () => null };
+    runAddCommand(flags, options);
+    expect(readQuarantine({ board }).list.entries).toHaveLength(1);
+    expect(g(['log', '-1', '--format=%s', 'refs/heads/ops/quarantine'], origin)).toContain('by orchestrator');
+    runRemovalCommand(flags, options);
+    expect(readQuarantine({ board }).list.entries).toEqual([]);
+    expect(g(['log', '-1', '--format=%s', 'refs/heads/ops/quarantine'], origin)).toContain('by orchestrator');
+    runAddCommand(flags, options);
+    runRemovalCommand({ ...flags, 'main-green': 'true' }, { ...options, prune: true });
+    expect(readQuarantine({ board }).list.entries).toEqual([]);
+    const events = g(['show', 'refs/heads/ops/quarantine:events.jsonl'], origin).trim().split('\n').map(JSON.parse);
+    expect(events).toHaveLength(4);
+    expect(events.every(e => e.actor === 'orchestrator')).toBe(true);
+    expect(events.map(e => e.type)).toEqual(['quarantine-added', 'quarantine-removed', 'quarantine-added', 'quarantine-removed']);
   });
 });

@@ -88,7 +88,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv, scrubGitRepoEnv, scrubRiskyLaneConfig } from '../lib/lane-git-hardening.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
@@ -102,8 +102,8 @@ import { RED_TEAM_STATUS_LABEL_META } from '../lib/red-team-status-label-meta.mj
 import { publishAttention } from './needs-you-feed.mjs';
 
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, hostname } from 'node:os';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -114,6 +114,7 @@ import {
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
+import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -127,10 +128,10 @@ import { resolveProviderCap } from './review-seat-policy.mjs';
 import { INFRA_RETRY_COOLOFF_MS, markSelfReportedDone } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
+  createRedTeamIo, extraSeatsEnabled, recordDiscardedSeats, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs, quotaHoldOrProbe, callsUsedTodayForProvider,
 } from './review-extra-seats.mjs';
 import {
-  decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
+  decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, loadConcurrentSeats, READ_SINK_ENV,
 } from '../lib/review-speculative-red-team.mjs';
 import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
@@ -309,16 +310,116 @@ export function execReadRaw(file, args, options = {}) {
   return execFileSyncThrottled(file, args, { ...options, maxBuffer: options.maxBuffer ?? READ_MAX_BUFFER });
 }
 
+/** An `owner/name` GitHub slug. A `.` or `..` segment is no GitHub name and would walk a `gh api repos/<slug>` path. */
+const isGithubSlug = slug => /^[\w.-]+\/[\w.-]+$/.test(slug ?? '') && !slug.split('/').some(part => /^\.+$/.test(part));
+
+/** Fetch outside the lane's config boundary, then hand only verified objects to the lane. */
+function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, exec, readConfig, spawnPack, log, repoIds }) {
+  if (!isGithubSlug(repo)) throw Error('invalid review repository; inspect repo argument before retrying');
+  const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
+  const configDir = mkdtempSync(join(tmpdir(), 'review-git-config-'));
+  try {
+    const emptyConfig = join(configDir, 'empty');
+    writeFileSync(emptyConfig, '', { mode: 0o600 });
+    // One environment for every lane Git call: no inherited config sources or indexed overrides.
+    const gitOptions = { ...options, env: laneGitHardeningEnv({ ...scrubGitRepoEnv(env),
+      GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_SYSTEM: emptyConfig, GIT_CONFIG_NOSYSTEM: '1' }) };
+    // Object checking pins do not override per-message severities or skip lists.
+    // Check before scrubbing can remove include directives and hide prohibited settings.
+    const fsckConfig = readConfig('git', ['config', '--includes', '--name-only', '--get-regexp',
+      '^(fetch|transfer|receive)\\.fsck\\.|^fsck\\.'], {
+      cwd: lanePath, env: gitOptions.env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    if (fsckConfig.error || fsckConfig.signal || fsckConfig.status !== 1
+      || fsckConfig.stdout !== '' || fsckConfig.stderr !== '') {
+      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+    }
+    const { kept } = scrubRiskyLaneConfig(lanePath, { log, run: (args, opts) => exec('git', args,
+      { ...gitOptions, ...opts }) });
+    // Only these exact origin keys are intentionally retained by the scrubber. Everything else
+    // reports a failed read/removal, including failures that leave transport URL rewrites active.
+    if (kept.some(key => !/^remote\.origin\.(?:url|pushurl|proxy|receivepack|uploadpack|vcs)$/i.test(key))) {
+      throw Error('review lane config scrub failed; inspect and repair lane configuration before retrying');
+    }
+    const origin = exec('git', ['remote', 'get-url', 'origin'], gitOptions).trim();
+    // Only GitHub's own ports name github.com: 22 for ssh, 443 for https, 22 or 443 for ssh.github.com (as
+    // drain-api-reads' origin parser does). The origin is identity evidence only: the fetch below uses a fixed URL.
+    // An https login part is RFC 3986 userinfo characters only: `#`, `?`, `\` or whitespace would end the real host
+    // before `@github.com` (`https://evil.example#@github.com/o/r` is evil.example).
+    const originRepo = /^(?:git@github\.com:|ssh:\/\/git@github\.com(?::22)?\/|ssh:\/\/git@ssh\.github\.com(?::22|:443)?\/|https:\/\/(?:[\w.~%!$&'()*+,;=:-]+@)?github\.com(?::443)?\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(origin)?.[1];
+    const identityError = 'review lane origin repository mismatch or unreadable; inspect lane before retrying';
+    if (!isGithubSlug(originRepo)) throw Error(identityError);
+    if (originRepo.toLowerCase() !== repo.toLowerCase()) {
+      const resolveId = slug => {
+        const key = slug.toLowerCase();
+        if (repoIds.has(key)) return repoIds.get(key);
+        const output = exec('gh', ['api', `repos/${slug}`, '--jq', '.id'], gitOptions).trim();
+        const id = Number(output);
+        if (!/^\d+$/.test(output) || !Number.isSafeInteger(id) || id <= 0) throw Error(identityError);
+        repoIds.set(key, id);
+        return id;
+      };
+      try {
+        const originId = resolveId(originRepo), expectedId = resolveId(repo);
+        if (originId !== expectedId) throw Error(identityError);
+      } catch { throw Error(identityError); }
+    }
+    const iso = join(configDir, 'iso.git');
+    // An empty template and no inherited template dir: a hostile template must never seed iso.git/config.
+    const { GIT_TEMPLATE_DIR: _template, ...isolatedEnv } = gitOptions.env;
+    exec('git', ['init', '--bare', '--quiet', '--template=', iso], { ...gitOptions, env: isolatedEnv, cwd: configDir });
+    const isoOptions = { ...gitOptions, env: isolatedEnv, cwd: iso };
+    const pins = ['-c', 'protocol.allow=never', '-c', 'protocol.ssh.allow=always', '-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'gc.auto=0',
+      '-c', 'maintenance.auto=false', '-c', 'fetch.fsckObjects=true', '-c', 'transfer.fsckObjects=true',
+      '-c', 'core.sshCommand=ssh', '-c', 'ssh.variant=ssh'];
+    // No network command sees the lane as cwd or git-dir. Its config cannot redirect this URL.
+    exec('git', [...pins, 'fetch', '--no-recurse-submodules', '--no-auto-gc', '--no-auto-maintenance', '--upload-pack=git-upload-pack',
+      '--no-tags', `git@github.com:${repo}.git`, `refs/pull/${pr}/head`], isoOptions);
+    const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], isoOptions).trim();
+    if (!/^[a-f0-9]{40}$/i.test(fetched)) throw Error('pinned review commit unavailable');
+    if (fetched !== head) throw Error(headChangedError);
+    const packOptions = { ...isoOptions, encoding: null, maxBuffer: 1024 ** 3 };
+    const checkedSpawn = (args, options) => {
+      const result = spawnPack('git', args, options);
+      if (result.error || result.signal || result.status !== 0 || !Buffer.isBuffer(result.stdout)) {
+        throw Error('pinned review commit unavailable; object handoff failed; inspect lane and retry shared setup', { cause: result.error });
+      }
+      return result.stdout;
+    };
+    const pack = checkedSpawn([...pins, 'pack-objects', '--revs', '--stdout'], {
+      ...packOptions, input: `${fetched}\n`,
+    });
+    checkedSpawn([...pins, 'index-pack', '--stdin', '--strict'], {
+      ...packOptions, cwd: lanePath, input: pack,
+    });
+    // A lane loose object can shadow the genuine object just imported in the pack.
+    // Compare against the independently fetched commit, including its exact bytes.
+    try {
+      const tree = exec('git', ['rev-parse', `${fetched}^{tree}`], isoOptions).trim();
+      const laneTree = exec('git', ['rev-parse', `${fetched}^{tree}`], gitOptions).trim();
+      const commit = checkedSpawn([...pins, 'cat-file', 'commit', fetched], packOptions);
+      const laneCommit = checkedSpawn([...pins, 'cat-file', 'commit', fetched], { ...packOptions, cwd: lanePath });
+      if (!/^[a-f0-9]{40}$/i.test(tree) || tree !== laneTree || !commit.equals(laneCommit)) {
+        throw Error('commit content mismatch');
+      }
+    } catch (cause) {
+      throw Error('pinned review commit unavailable; inspect lane and retry shared setup', { cause });
+    }
+    return fetched;
+  } finally { rmSync(configDir, { recursive: true, force: true }); }
+}
+
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
-  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider),
+  seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
   const recoveryAdmissions = new Map();
+  const repoIds = new Map();
   const restoreAdmission = ({ repo, pr, head }) => {
     const path = join(redTeamStatusDir(env), `${encodeURIComponent(repo)}-${Number(pr)}-${head}.json`);
     const admission = recoveryAdmissions.get(path);
@@ -352,7 +453,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         lanePath: input.carry.lanePath,
         skipPolicy: () => readRedTeamProbes({ env, log: line => process.stderr.write(`${line}\n`) }).value.skipCardOnly,
         proveMove: move => proveCardOnlyHeadMove({ ...move,
-          exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) }),
+          exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv(env) }) }),
         applyLabel: ({ repo, pr }) => {
           provider.ensureLabel(repo, 'red-team:clear', RED_TEAM_STATUS_LABEL_META['red-team:clear']);
           provider.setLabels(repo, pr, { add: 'red-team:clear', remove: ['red-team:pending'] });
@@ -361,6 +462,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       publishNeedsYou: isUnderTest(env) || isUnderTest(process.env) ? () => {} : item => publishAttention(item),
     } }),
     clearRedTeamQueued: restoreAdmission,
+    planRedTeamMode: ({ pr, repo, head }) => planRedTeamRecovery(readWitness({ pr, repo, head, env }),
+      { now: Date.now(), probe: recoveryProbe, deadlineMs: staleRunDeadlineMs(env), env }).mode,
     redTeamStatus: input => {
       const head = input.loopPayload?.findings?.read?.netBasis?.rev;
       const key = { repo: input.repo, pr: input.pr, head, env };
@@ -439,24 +542,18 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
           ...(admissionPrior.retryCount !== undefined ? { retryCount: admissionPrior.retryCount } : {}) } } } : {}) };
     },
     root,
-    fetchRedTeamHead: ({ lanePath, pr, head }) => {
+    fetchRedTeamHead: ({ lanePath, repo, pr, head }) => {
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('missing pinned red-team head');
-      const options = { cwd: lanePath, env: laneGitHardeningEnv(env), timeout: 180_000, maxBuffer: 1024 * 1024 };
-      exec('git', ['-C', lanePath, 'fetch', '--quiet', '--no-tags', 'origin', `pull/${pr}/head`], options);
-      const fetched = exec('git', ['-C', lanePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'], options).trim();
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError: 'red-team head changed during fetch', env, exec, readConfig, spawnPack, log, repoIds });
       if (fetched !== head) throw Error('red-team head changed during fetch');
-      const resolved = exec('git', ['-C', lanePath, 'rev-parse', '--verify', `${head}^{commit}`], options).trim();
-      if (resolved !== head) throw Error('pinned red-team commit unavailable');
-      return { head: resolved };
+      return { head };
     },
     prepareLane: ({ pr, repo, lanePath }) => {
+      if (!isGithubSlug(repo)) throw Error('invalid review repository; inspect repo argument before retrying');
       const options = { cwd: lanePath, env, timeout: 180_000, maxBuffer: 1024 * 1024 };
       const { headRefOid: head } = JSON.parse(exec('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], options));
       if (!/^[a-f0-9]{40}$/i.test(head ?? '')) throw Error('review head missing; inspect PR evidence before retrying');
-      // Acquisition scrubs unsafe config, but command-valued pins must also apply to every lane Git call.
-      const gitOptions = { ...options, env: laneGitHardeningEnv(env) };
-      exec('git', ['fetch', '--no-tags', `https://github.com/${repo}.git`, `refs/pull/${pr}/head`], gitOptions);
-      const fetched = exec('git', ['rev-parse', 'FETCH_HEAD^{commit}'], gitOptions).trim();
+      const fetched = fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError: 'review head changed during fetch; retry shared setup on the live head', env, exec, readConfig, spawnPack, log, repoIds });
       if (fetched !== head) throw Error('review head changed during fetch; retry shared setup on the live head');
       return { head };
     },
@@ -472,7 +569,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     // Prove in the review lane: prepareLane fetched and pinned the PR head there; the daemon's own clone may lack it.
     proveCardOnlyHeadMove: ({ lanePath, ...move } = {}) => (typeof lanePath === 'string' && lanePath
       ? proveCardOnlyHeadMove({ ...move, cwd: lanePath,
-        exec: (file, args, options) => exec(file, args, { ...options, env: laneGitHardeningEnv(env) }) })
+        exec: (file, args, options) => exec(file, args, { ...options, env: laneHistoryProofEnv(env) }) })
       : { ok: false }),
     // The carry's own resolver is its only source (logged with that source); no timing setting governs it.
     carryAcrossRebaseSetting: () => resolveCarryAcrossRebase({ env, readFile }),
@@ -543,7 +640,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       };
     },
     releaseLane: (slug) => node(['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${slug}`], { timeoutMs: 5 * 60 * 1000 }),
-    // #4194 — the ADDED non-Claude seats, run in their own process AFTER the verdict is decided, under a hard wall.
+    // Added non-Claude seats: single-shot compatibility path under a hard wall.
     // Whatever happens in there comes back as a status; nothing here can throw into the arc.
     runExtraSeats: ({ pr, repo, lanePath, loopPayload, slug }) => {
       if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
@@ -605,6 +702,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     },
     // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    concurrentSeatsSetting: () => loadConcurrentSeats({ env }),
     // R365 fix 5 — `review.finalHeadSeats` (see `../lib/review-final-head-seats.mjs`) and the PR's live head.
     finalHeadSeatsSetting: () => resolveFinalHeadSeats({ env }),
     liveHead: ({ pr, repo }) => {
@@ -638,11 +736,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
       const fd = openSync(handle.logFile, 'w');
       try {
-        const child = spawn(process.execPath, [
+        const child = spawnSpeculative(process.execPath, [
           ...heapCapArgs('review-extra-seats'),
           'scripts/operations/review-extra-seats.mjs', 'red-team-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
           `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
-        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        ], { cwd: root, env: reviewSeatLaunchEnv(env), stdio: ['ignore', fd, fd], detached: true });
         child.unref();
         if (!child.pid) return null;
         return { ...handle, pid: child.pid, startedAt: Date.now() };
@@ -702,6 +800,72 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     recordDiscardedRedTeam: (o) => recordDiscardedRedTeam(o, createRedTeamIo({ env })),
     cleanupSpeculativeRedTeam: (handle) => {
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
+    },
+    startSpeculativeSeats: ({ pr, repo, lanePath, slug, waitMs, readSink }) => {
+      if (!extraSeatsEnabled(env)) return null;
+      mkdirSync(dir, { recursive: true });
+      const base = join(dir, `${slug}.spec-seats`);
+      const handle = { ownsReadSink: !readSink, readSink: readSink ?? `${base}.read.json`, passFile: `${base}.pass.json`, reservedFile: `${base}.pass.json.reserved`, logFile: `${base}.log` };
+      for (const f of [...(handle.ownsReadSink ? [handle.readSink] : []), handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
+      const fd = openSync(handle.logFile, 'w');
+      try {
+        const child = spawn(process.execPath, [
+          ...heapCapArgs('review-extra-seats'),
+          'scripts/operations/review-extra-seats.mjs', 'seats-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
+          `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
+        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        child.unref();
+        if (!child.pid) return null;
+        return { ...handle, pid: child.pid, startedAt: Date.now(), wallMs: resolveSeatTimeoutMs(env) + 5 * 60_000 };
+      } finally { closeSync(fd); }
+    },
+    awaitSpeculativeSeats: (handle, { timeoutMs }) => {
+      const t0 = Date.now();
+      const readPass = () => { try { return existsSync(handle.passFile) ? JSON.parse(readFileSync(handle.passFile, 'utf8')) : null; } catch { return null; } };
+      for (;;) {
+        const pass = readPass();
+        if (pass) return { spec: pass, waitedMs: Date.now() - t0 };
+        if (!specAlive(handle.pid)) return { spec: readPass(), waitedMs: Date.now() - t0 };
+        if (Date.now() - t0 >= timeoutMs) {
+          try { process.kill(-handle.pid, 'SIGTERM'); } catch { /* gone */ }
+          return { spec: null, waitedMs: Date.now() - t0, timedOut: true };
+        }
+        sleepSync(1000);
+      }
+    },
+    cancelSpeculativeSeats: (handle) => {
+      if (specAlive(handle.pid)) {
+        try { process.kill(-handle.pid, 'SIGTERM'); } catch { /* gone */ }
+        const t0 = Date.now();
+        while (specAlive(handle.pid) && Date.now() - t0 < 30_000) sleepSync(250);
+        if (specAlive(handle.pid)) { try { process.kill(-handle.pid, 'SIGKILL'); } catch { /* gone */ } }
+      }
+      const readJson = (f) => { try { return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null; } catch { return null; } };
+      return { spec: readJson(handle.passFile), reserved: readJson(handle.reservedFile) };
+    },
+    finishSpeculativeSeats: ({ pr, repo, loopPayload, slug, handle }) => {
+      const loopFile = join(dir, `${slug}.seats.loop.json`);
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(loopFile, JSON.stringify(loopPayload));
+        const r = node([
+          'scripts/operations/review-extra-seats.mjs', 'seats-finish', `--pr=${pr}`, `--repo=${repo}`, `--pass=${handle.passFile}`, `--loop-json=${loopFile}`,
+        ], { timeoutMs: 10 * 60 * 1000 });
+        for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
+          writeLineSync(2, `  ${line}`);
+        }
+        const last = String(r.stdout ?? '').trim().split('\n').pop() ?? '';
+        try { return JSON.parse(last); } catch { return { status: 'error', reason: `added-seats finish exit ${r.status}${r.signal ? ` (${r.signal})` : ''}, no result` }; }
+      } catch (e) {
+        return { status: 'error', reason: String(e?.message ?? e).slice(0, 300) };
+      } finally {
+        try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
+      }
+    },
+    speculativeSeatsReadSunk: (handle) => existsSync(handle.readSink),
+    recordDiscardedSeats: (o) => recordDiscardedSeats(o, createRedTeamIo({ env })),
+    cleanupSpeculativeSeats: (handle) => {
+      for (const f of [...(handle.ownsReadSink ? [handle.readSink] : []), handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
     },
     recordSeatTimings: (runId, rows) => {
       if (!runId || !rows.length) return;
@@ -789,6 +953,52 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
   }
 }
 
+/** Added seats are evidence only; unstarted calls may fall back to the sequential policy. */
+export function settleSpeculativeSeats({ spec, out, input }, io) {
+  const discard = reason => {
+    let spend;
+    try {
+      const { spec: pass, reserved } = io.cancelSpeculativeSeats(spec);
+      if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
+      spend = io.recordDiscardedSeats?.({ pr: out.pr, repo: out.repo, pass, reserved, reason });
+    } catch (e) { spend = { status: 'error', reason: tail(e?.message ?? e, 200) }; }
+    io.log?.(`review-job ${out.sessionSlug}: added seats discarded — ${reason}`);
+    return { status: 'discarded', reason, spend };
+  };
+  try {
+    if (['bounced', 'parked'].includes(out.outcome)) return discard(`review ${out.outcome}`);
+    if (out.outcome === BLOCKED_ON_INFRA) return discard(`review ${out.outcome}`);
+    if (!input) return discard('no final loop input');
+    const sequential = reason => {
+      const rev = input.loopPayload?.findings?.read?.netBasis?.rev;
+      const liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo });
+      if (!isRealHead(rev) || !isRealHead(liveHead) || liveHead.toLowerCase() !== rev.toLowerCase()) {
+        return discard('added seats live head differs or is unreadable');
+      }
+      return { ...discard(reason), sequential: true };
+    };
+    if (io.speculativeSeatsReadSunk?.(spec) === false) return sequential('the review loop wrote no read sink');
+    const waited = io.awaitSpeculativeSeats(spec, { timeoutMs: Math.max(0, (spec.wallMs ?? resolveSeatTimeoutMs() + 5 * 60_000) - (Date.now() - spec.startedAt)) });
+    const pass = waited?.spec;
+    if (Number.isFinite(pass?.durationMs)) spec.seatsMs = pass.durationMs;
+    if (!waited?.timedOut && pass?.status === 'no-read') return sequential(pass.reason ?? 'no added seats read');
+    if (waited?.timedOut || pass?.status !== 'speculated') return discard(pass?.reason ?? 'added seats pass failed or incomplete');
+    const rev = input.loopPayload?.findings?.read?.netBasis?.rev;
+    if (!isRealHead(rev) || pass.rev !== rev) return discard('added seats head differs from final loop head');
+    const gate = finalHeadSeatsGate(input, io);
+    if (gate.skip) return discard(`final-head seats: ${gate.reason}`);
+    const liveHead = io.liveHead?.({ pr: input.pr, repo: input.repo });
+    if (!isRealHead(liveHead) || liveHead.toLowerCase() !== pass.rev.toLowerCase()) return discard('added seats live head differs or is unreadable');
+    const result = io.finishSpeculativeSeats({ ...input, handle: spec });
+    if (result?.status !== 'ran') return discard(result?.reason ?? 'added seats finish failed');
+    return result;
+  } catch (e) {
+    return discard(`added seats settlement failed: ${tail(e?.message ?? e, 200)}`);
+  } finally {
+    try { io.cleanupSpeculativeSeats?.(spec); } catch { /* best effort */ }
+  }
+}
+
 /** x00g3tt — the compact form of the red team's result the job prints (the full rows live in the store). */
 export function summarizeRedTeam(r) {
   if (!r || typeof r !== 'object') return null;
@@ -858,7 +1068,15 @@ export function commentReasonSuffix(value, text = (v, fb) => { try { return Stri
 }
 
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
+  const jobStartedAt = io.now();
   const seatsBox = {};
+  if (!opts.redTeamOnly && typeof io.concurrentSeatsSetting === 'function') {
+    try {
+      const setting = io.concurrentSeatsSetting();
+      seatsBox.concurrentEnabled = setting?.enabled === true;
+      io.log(`review-job: review.extraSeats.concurrent=${setting?.value ?? '?'} (${setting?.source ?? '?'})${setting?.invalid?.length ? ` · ignored invalid: ${setting.invalid.join('; ')}` : ''}`);
+    } catch { seatsBox.concurrentEnabled = false; }
+  }
   // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
   // without the hook, is the sequential order: the red team starts only after the review accepts.
   if (!opts.redTeamOnly && typeof io.speculativeRedTeamSetting === 'function') {
@@ -877,16 +1095,21 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
   // per head is the pass's own `(pr, rev)` row + comment marker.
   const accepted = Boolean(seatsBox.input) && !seatsBox.admissionFailed && redTeamOwedFor(seatsBox.input.loopPayload);
-  // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
-  // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
-  // released and the job slot dropped — so the seats never delay the pipeline and nothing they do can touch the
-  // outcome above. A missing hook, a crash, a timeout, a thrown kill switch: each is only a status in `extraSeats`.
-  if (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function') {
+  // Settle added evidence after the arc. Discarded calls never alter the verdict;
+  // only unstarted calls may use the old sequential policy when input and live head are valid.
+  const concurrentSeats = seatsBox.concurrent ?? null;
+  const seatsStartedAt = io.now();
+  if (concurrentSeats || (!opts.redTeamOnly && seatsBox.input && typeof io.runExtraSeats === 'function')) {
     let extraSeats;
     try {
-      let gate;
-      try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
-      extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
+      if (concurrentSeats) {
+        extraSeats = settleSpeculativeSeats({ spec: concurrentSeats, out, input: seatsBox.input }, io);
+      }
+      if (!concurrentSeats || extraSeats?.sequential) {
+        let gate;
+        try { gate = finalHeadSeatsGate(seatsBox.input, io); } catch (e) { gate = { skip: false, reason: `gate error (fail-open): ${tail(e?.message ?? e, 200)}` }; }
+        extraSeats = gate.skip ? { status: 'skipped', reason: `final-head seats: ${gate.reason}` } : io.runExtraSeats(seatsBox.input);
+      }
     } catch (e) {
       extraSeats = { status: 'error', reason: tail(e?.message ?? e, 300) };
     }
@@ -894,7 +1117,11 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       + `${Array.isArray(extraSeats?.seats) ? `: ${extraSeats.seats.map((x) => `${x.lens}@${x.provider}=${x.status}/${x.findingsCount ?? 0}f/${x.confirmedCount ?? 0}c`).join(', ')}` : ''}`);
     recordSeats(extraSeats?.seats ?? []);
     out.extraSeats = summarizeExtraSeats(extraSeats);
+    if (extraSeats?.spend) out.extraSeats.spend = extraSeats.spend;
   }
+  out.timings.seatsMs = concurrentSeats ? concurrentSeats.seatsMs ?? Math.max(0, Date.now() - concurrentSeats.startedAt) : io.now() - seatsStartedAt;
+  out.timings.seatsConcurrent = Boolean(concurrentSeats);
+  if (!opts.redTeamOnly) io.log(`review-job ${out.sessionSlug}: seatsConcurrent counters: started=${Number(Boolean(concurrentSeats))} used=${Number(Boolean(concurrentSeats) && out.extraSeats?.status === 'ran')} discarded=${Number(Boolean(concurrentSeats) && out.extraSeats?.status === 'discarded')}`);
   // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when the review ACCEPTED (`redTeamOwedFor`), and only after
   // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
   // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
@@ -1034,6 +1261,7 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     const discarded = decision === 'discard';
     io.log(`review-job ${out.sessionSlug}: speculative-red-team counters: started=${Number(Boolean(spec))} used=${Number(decision === 'finish')} discarded-infra=${Number(discarded && out.outcome === BLOCKED_ON_INFRA)} discarded-parked=${Number(discarded && out.outcome === 'parked')} discarded-bounced=${Number(discarded && out.outcome === 'bounced')} stale=${Number(decision === 'stale')} skipped-infra=${Number(Boolean(seatsBox.skippedInfra))}`);
   }
+  out.timings.totalMs = io.now() - jobStartedAt;
   return out;
 }
 
@@ -1230,6 +1458,10 @@ function runReviewArc({
       return result({ ...classified, lanePath });
     };
     if (redTeamOnly) {
+      if (redTeamMode === 'auto') {
+        const mode = io.planRedTeamMode({ pr: planned.pr, repo: planned.repo, head });
+        redTeamMode = ['fresh', 'resume'].includes(mode) ? mode : 'fresh';
+      }
       if (!['fresh', 'resume'].includes(redTeamMode)) throw Error('unknown red-team mode; inspect recovery settings before retrying');
       const stored = io.readRedTeamOnlyPayload({ pr: planned.pr, repo: planned.repo, head });
       let loopPayload = stored?.loopPayload;
@@ -1322,10 +1554,19 @@ function runReviewArc({
         seatsBox.speculative = null;
       }
     }
+    if (seatsBox.concurrentEnabled && typeof io.startSpeculativeSeats === 'function') {
+      try {
+        const [prior] = markSelfReportedDone([{ name: slug, state: 'working', startedAt: 0, sessionId: seatsBox.prevCompletion?.sessionId }],
+          () => seatsBox.prevCompletion, io.now());
+        const blocked = prior.awaitingInfraCooloff || io.reviewInfraBlock?.({ pr: planned.pr, repo: planned.repo, slug });
+        if (!blocked) seatsBox.concurrent = io.startSpeculativeSeats({ pr: planned.pr, repo: planned.repo, lanePath, slug,
+          waitMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink });
+      } catch (e) { io.log(`review-job ${slug}: concurrent added seats did not start (${tail(e?.message ?? e, 200)}) — sequential order`); }
+    }
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? null });
+    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
@@ -1390,7 +1631,7 @@ export function dispatchReviewJob({
   dir = reviewJobsDir(env, root),
   spawnJob = defaultSpawnJob,
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
-  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined),
+  resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
 } = {}) {
@@ -1423,7 +1664,7 @@ export function dispatchReviewJob({
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
   const settingsEnv = resolveSettingsEnv() || {};
-  const childEnv = { ...env, ...settingsEnv };
+  const childEnv = reviewSeatLaunchEnv(env, settingsEnv);
   // The dispatcher's own actor id (if it happens to run inside a session) must never leak into the job — the
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
@@ -1594,8 +1835,8 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
-      // Bare legacy flag is fresh-guarded; explicit modes survive detached dispatch.
-      const redTeamMode = flag('red-team-only') ?? 'fresh';
+      // Bare legacy flag selects recovery automatically; explicit modes stay strict.
+      const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),

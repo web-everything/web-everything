@@ -6,6 +6,8 @@ import {spawn, spawnSync} from 'node:child_process';
 import {join} from 'node:path';
 import {resolveSettings, planPrune, scanCache, executePrune, readLiveEvidence} from '../forge-cache-prune.mjs';
 
+vi.mock('node:fs/promises', async importOriginal => ({...await importOriginal()}));
+
 const HOUR = 3_600_000, GiB = 1024 ** 3, now = Date.UTC(2026, 10, 9);
 const hex = c => c.repeat(64), lock = hex('a');
 let tmp, root, receipts;
@@ -670,6 +672,254 @@ describe('live reservation compatibility', () => {
 });
 
 describe('readLiveEvidence', () => {
+  const selectorCases = [
+    {scenario: 'string siblings', evidence: {siblings: 'true'}},
+    {scenario: 'numeric siblings', evidence: {siblings: 1}},
+    {scenario: 'null siblings', evidence: {siblings: null}},
+    {scenario: 'object siblings', evidence: {siblings: {frontierui: {sha: 'd'.repeat(40)}}}},
+    {scenario: 'string manifest', evidence: {manifest: 'invalid'}},
+    {scenario: 'array manifest', evidence: {manifest: []}},
+    {scenario: 'string manifest.siblings', evidence: {manifest: {siblings: 'yes'}}},
+    {scenario: 'numeric manifest.siblings', evidence: {manifest: {siblings: 1}}},
+    {scenario: 'null manifest.siblings', evidence: {manifest: {siblings: null}}},
+    {scenario: 'runner object manifest.siblings', evidence: {manifest: {siblings: {frontierui: {sha: 'd'.repeat(40)}}}}, resolved: true},
+    {scenario: 'empty object manifest.siblings', evidence: {manifest: {siblings: {}}}, resolved: true},
+    {scenario: 'array manifest.siblings', evidence: {manifest: {siblings: []}}},
+    {scenario: 'invalid siblingShas despite valid siblings', evidence: {siblings: true, siblingShas: {}}},
+    {scenario: 'invalid siblings despite valid manifest', evidence: {siblings: 'true', manifest: {siblings: true}}},
+    {scenario: 'valid false selectors', evidence: {siblings: false, manifest: {siblings: false}}, resolved: true},
+    {scenario: 'valid true selectors', evidence: {siblings: true, manifest: {siblings: true}}, resolved: true},
+    {scenario: 'absent selectors', evidence: {}, resolved: true, receiptFallback: true},
+    {scenario: 'null manifest is invalid', evidence: {manifest: null}},
+  ];
+  it.each(selectorCases.flatMap(testCase => ['prepared', 'running', 'receipt'].flatMap(suffix =>
+    (testCase.resolved || suffix === 'receipt' ? [true] : [false, true])
+      .map(withDigests => ({...testCase, suffix, withDigests})))))
+  ('leaked reservation with $scenario in $suffix (digests=$withDigests) protects the whole lock unless resolved', async ({evidence, suffix, withDigests, resolved: selectorsResolved = false, receiptFallback = false}) => {
+    const resolved = selectorsResolved && (!receiptFallback || suffix === 'receipt');
+    const run = await reserve();
+    const receiptPath = join(receipts, `${run}.receipt`);
+    const evidencePath = join(receipts, `${run}.${suffix}`);
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), ...(suffix === 'receipt' ? evidence : {})});
+    if (suffix !== 'receipt') {
+      await json(evidencePath, {lock, ...(withDigests ? {inputDigest: hex('b'), manifestDigest: hex('c')} : {}), ...evidence});
+      await fs.utimes(evidencePath, (now - 3000) / 1000, (now - 3000) / 1000);
+    }
+    await fs.utimes(join(receipts, 'worker-active', 'reservation.json'),
+      (now - 3 * HOUR) / 1000, (now - 3 * HOUR) / 1000);
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(resolved ? [] : [lock]));
+    expect(live.profiles).toEqual(new Set());
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
+  });
+
+  const siblingSelectionCases = [
+    {scenario: 'runner object manifest.siblings selects precise manifestDigest profile',
+      evidence: record(true), digest: 'c'},
+    {scenario: 'empty object manifest.siblings selects precise manifestDigest profile',
+      evidence: {manifest: {siblings: {}}}, digest: 'c'},
+    ...[null, 'yes', 1, []].map(siblings => ({
+      scenario: `invalid manifest.siblings=${JSON.stringify(siblings)} protects whole lock`,
+      evidence: {manifest: {siblings}}, conflict: true,
+    })),
+    {scenario: 'object manifest.siblings conflicts with record.siblings:false',
+      evidence: {...record(true), siblings: false}, conflict: true},
+    {scenario: 'object manifest.siblings agrees with record.siblings:true',
+      evidence: {...record(true), siblings: true}, digest: 'c'},
+    {scenario: 'receipt siblings:false conflicts with valid siblingShas',
+      evidence: {siblings: false, siblingShas: {frontierui: 'd'.repeat(40)}}, conflict: true},
+    {scenario: 'manifest.siblings:true conflicts with record.siblings:false',
+      evidence: {manifest: {siblings: true}, siblings: false}, conflict: true},
+    {scenario: 'manifest without siblings conflicts with record.siblings:true',
+      evidence: {manifest: {}, siblings: true}, conflict: true},
+    {scenario: 'manifest without siblings conflicts with valid siblingShas',
+      evidence: {manifest: {}, siblingShas: {frontierui: 'd'.repeat(40)}}, conflict: true},
+    {scenario: 'agreeing false manifest and record signals select inputDigest',
+      evidence: {manifest: {}, siblings: false}, digest: 'b'},
+    {scenario: 'agreeing true manifest and record signals select manifestDigest',
+      evidence: {manifest: {siblings: true}, siblings: true}, digest: 'c'},
+    {scenario: 'agreeing true record and siblingShas signals select manifestDigest',
+      evidence: {siblings: true, siblingShas: {frontierui: 'd'.repeat(40)}}, digest: 'c'},
+    {scenario: 'all three agreeing true signals select manifestDigest',
+      evidence: {manifest: {siblings: true}, siblings: true, siblingShas: {frontierui: 'd'.repeat(40)}}, digest: 'c'},
+  ];
+  it.each(siblingSelectionCases.flatMap(testCase => [false, true].map(leaked => ({...testCase, leaked}))))
+  ('$scenario (leaked=$leaked)', async ({evidence, conflict = false, digest, leaked}) => {
+    const run = await reserve();
+    const receiptPath = join(receipts, `${run}.receipt`);
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), ...evidence});
+    await fs.utimes(join(receipts, 'worker-active', 'reservation.json'),
+      (now - (leaked ? 3 * HOUR : 1000)) / 1000, (now - (leaked ? 3 * HOUR : 1000)) / 1000);
+    await fs.utimes(receiptPath, (now - 500) / 1000, (now - 500) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(conflict ? [lock] : []));
+    expect(live.profiles).toEqual(new Set(conflict || leaked ? [] : [`${lock}/dev-v5-${hex(digest)}`]));
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    const keep = conflict ? profiles : leaked ? [] : profiles.filter(e => e.name === `dev-v5-${hex(digest)}`);
+    expectDecision(plan(profiles, {live}), profiles.filter(e => !keep.includes(e)), keep);
+  });
+
+  it.each([
+    {scenario: 'null siblingShas', siblingShas: null},
+    {scenario: 'string siblingShas', siblingShas: 'd'.repeat(40)},
+    {scenario: 'array siblingShas', siblingShas: ['d'.repeat(40)]},
+    {scenario: 'empty siblingShas map', siblingShas: {}},
+    {scenario: 'non-hex sibling SHA', siblingShas: {frontierui: 'g'.repeat(40)}},
+    {scenario: 'short sibling SHA', siblingShas: {frontierui: 'd'.repeat(39)}},
+    {scenario: 'non-string sibling SHA', siblingShas: {frontierui: null}},
+    {scenario: 'mixed valid and invalid sibling SHAs', siblingShas: {frontierui: 'd'.repeat(40), other: 'bad'}},
+    {scenario: 'valid siblingShas', siblingShas: {frontierui: 'd'.repeat(40)}, resolved: true},
+    {scenario: 'valid uppercase sibling SHA', siblingShas: {frontierui: 'D'.repeat(40)}, resolved: true},
+  ])('leaked reservation with $scenario protects the whole lock unless valid', async ({siblingShas, resolved = false}) => {
+    const run = await reserve();
+    const preparedPath = join(receipts, `${run}.prepared`);
+    const receiptPath = join(receipts, `${run}.receipt`);
+    await json(preparedPath, record(true));
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), siblingShas});
+    await fs.utimes(join(receipts, 'worker-active', 'reservation.json'), (now - 3 * HOUR) / 1000, (now - 3 * HOUR) / 1000);
+    await fs.utimes(preparedPath, (now - 3000) / 1000, (now - 3000) / 1000);
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(resolved ? [] : [lock]));
+    expect(live.profiles).toEqual(new Set());
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
+  });
+
+  it.each([
+    {scenario: 'protects the whole lock for an expired reservation with unresolved siblings evidence', resolved: false},
+    {scenario: 'reclaims an expired reservation with fully resolved siblings evidence', resolved: true},
+  ])('$scenario', async ({resolved}) => {
+    const run = await reserve();
+    const reservationPath = join(receipts, 'worker-active', 'reservation.json');
+    const runningPath = join(receipts, `${run}.running`);
+    const receiptPath = join(receipts, `${run}.receipt`);
+    await json(runningPath, {lock, siblings: true, ...(resolved ? {manifestDigest: hex('c')} : {})});
+    await json(receiptPath, {v: 1, run, phase: 'test', code: 0,
+      lock, inputDigest: hex('b'), manifestDigest: hex('c'), siblingShas: {frontierui: 'd'.repeat(40)}});
+    await fs.utimes(reservationPath, (now - 3 * HOUR) / 1000, (now - 3 * HOUR) / 1000);
+    await fs.utimes(runningPath, (now - 3000) / 1000, (now - 3000) / 1000);
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.locks).toEqual(new Set(resolved ? [] : [lock]));
+    expect(live.profiles).toEqual(new Set());
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), resolved ? profiles : [], resolved ? [] : profiles);
+  });
+
+  it.each([
+    {scenario: 'digest-free siblings', evidence: {siblings: true}},
+    {scenario: 'digest-free siblingShas', evidence: {siblingShas: {frontierui: 'd'.repeat(40)}}},
+    ...['manifest', 'siblings', 'siblingShas', 'manifest.siblings', 'manifestDigest', 'inputDigest', 'lock']
+      .flatMap(field => [null, false, 0, '', [], {}].map(value => ({
+        scenario: `${field}=${JSON.stringify(value)}`,
+        evidence: field === 'manifest.siblings' ? {manifest: {siblings: value}} : {[field]: value},
+        refused: ['manifestDigest', 'inputDigest', 'lock'].includes(field),
+      }))),
+    {scenario: 'fieldless running', evidence: {}, fieldless: true},
+  ])('older $scenario running fails closed unless fieldless despite a newer known prepared profile', async ({evidence, refused = false, fieldless = false}) => {
+    const run = await reserve();
+    const runningPath = join(receipts, `${run}.running`);
+    const preparedPath = join(receipts, `${run}.prepared`);
+    await json(runningPath, evidence);
+    await json(preparedPath, record(false));
+    await fs.utimes(runningPath, (now - 2000) / 1000, (now - 2000) / 1000);
+    await fs.utimes(preparedPath, (now - 1000) / 1000, (now - 1000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(!refused);
+    if (refused) {
+      expect(live.refused).toMatch(/Invalid reserved (profile|lock) evidence/);
+    } else {
+      expect(live.profiles).toEqual(new Set([`${lock}/dev-v5-${hex('b')}`]));
+      expect(live.locks).toEqual(new Set(fieldless ? [] : [lock]));
+    }
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), fieldless ? profiles.slice(1) : [], fieldless ? profiles.slice(0, 1) : profiles);
+  });
+
+  it('protects the whole lock for an older manifest-only receipt despite a newer known running profile', async () => {
+    const run = await reserve();
+    const receiptPath = join(receipts, `${run}.receipt`);
+    const runningPath = join(receipts, `${run}.running`);
+    await json(receiptPath, {lock, manifestDigest: hex('c')});
+    await json(runningPath, record(false));
+    await fs.utimes(receiptPath, (now - 2000) / 1000, (now - 2000) / 1000);
+    await fs.utimes(runningPath, (now - 1000) / 1000, (now - 1000) / 1000);
+
+    const live = await readLiveEvidence({receipts, now});
+    expect(live.complete).toBe(true);
+    expect(live.profiles).toEqual(new Set([`${lock}/dev-v5-${hex('b')}`]));
+    expect(live.locks).toEqual(new Set([lock]));
+    const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+    expectDecision(plan(profiles, {live}), [], profiles);
+  });
+
+  it.each([
+    // PR #7079 historical probe: phase order pruned two unrelated profiles;
+    // file-time ordering protects all three when the fieldless running is newest.
+    {scenario: 'newer fieldless running protects the whole lock', runningAge: 1000, protectedLock: true},
+    {scenario: 'no running record allows reclamation', runningAge: null, protectedLock: false},
+    {scenario: 'running older than receipt allows reclamation', runningAge: 2500, protectedLock: false},
+    {scenario: 'receipt wins a timestamp tie with running', runningAge: 2000, protectedLock: false},
+  ])('$scenario', async ({runningAge, protectedLock}) => {
+    const run = `r-${'1'.repeat(32)}`;
+    const files = new Map([
+      [join(receipts, 'worker-active', 'reservation.json'),
+        {value: {run, writerGuard: 1}, mtimeMs: now - 3 * HOUR}],
+      [join(receipts, `${run}.prepared`), {value: record(false), mtimeMs: now - 3000}],
+      [join(receipts, `${run}.receipt`), {value: {v: 1, run, phase: 'test', code: 0,
+        lock, inputDigest: hex('b'), manifestDigest: hex('c')}, mtimeMs: now - 2000}],
+    ]);
+    if (runningAge !== null) files.set(join(receipts, `${run}.running`),
+      {value: {run, owner: 'writer'}, mtimeMs: now - runningAge});
+    const directories = new Set([receipts, join(receipts, 'worker-active')]);
+    const fileAt = path => {
+      const file = files.get(path);
+      if (!file) throw Object.assign(new Error('Missing evidence'), {code: 'ENOENT'});
+      return file;
+    };
+    try {
+      vi.spyOn(fs, 'readdir').mockResolvedValue(['worker-active']);
+      vi.spyOn(fs, 'lstat').mockImplementation(async path => directories.has(path)
+        ? {isDirectory: () => true} : {mtimeMs: fileAt(path).mtimeMs});
+      vi.spyOn(fs, 'open').mockImplementation(async path => {
+        const contents = Buffer.from(JSON.stringify(fileAt(path).value));
+        let position = 0;
+        return {
+          stat: async () => ({isFile: () => true, size: contents.length}),
+          read: async (buffer, offset, length) => {
+            const bytesRead = contents.copy(buffer, offset, position, position + length);
+            position += bytesRead;
+            return {bytesRead};
+          },
+          close: async () => {},
+        };
+      });
+      const live = await readLiveEvidence({receipts, now});
+      expect(live.complete).toBe(true);
+      expect(live.locks).toEqual(new Set(protectedLock ? [lock] : []));
+      // A fieldless running record contributes no profile; earlier known evidence
+      // remains precise, while locks protects every profile under the same lock.
+      expect(live.profiles).toEqual(new Set(protectedLock ? [`${lock}/dev-v5-${hex('b')}`] : []));
+      const profiles = [entry('b', 30), entry('c', 30), entry('f', 30)];
+      expectDecision(plan(profiles, {live}), protectedLock ? [] : profiles, protectedLock ? profiles : []);
+    } finally { vi.restoreAllMocks(); }
+  });
+
   it('an empty readable receipts directory is complete with no protected profiles', async () => {
     expect(await readLiveEvidence({receipts})).toMatchObject({complete: true, profiles: new Set()});
   });
@@ -679,6 +929,7 @@ describe('readLiveEvidence', () => {
     const result = await readLiveEvidence({receipts});
     expect(result.complete).toBe(true);
     expect(result.profiles).toEqual(new Set([`${lock}/dev-v5-${hex(siblings ? 'c' : 'b')}`]));
+    expect(result.locks).toEqual(new Set());
   });
   it('unions numbered and legacy reservations including warm runs, ignoring inactive records', async () => {
     const a = await reserve(), b = await reserve(`warm-${'2'.repeat(32)}`, 'worker-active-2');

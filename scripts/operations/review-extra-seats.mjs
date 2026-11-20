@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
 import { FINDING_CLASSES, classAction, stricterClass, readFindingClassPolicy, validAlsoClasses } from '../lib/finding-class-policy.mjs';
 import { decodeRecoveryAdmission } from '../lib/drain-red-team-evidence.mjs';
@@ -661,10 +662,16 @@ export function renderSeatSummary(result) {
  * @param {ReturnType<typeof createExtraSeatsIo>} io
  * @returns {Promise<object>}
  */
-export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = process.env, routingPolicy = readRoutingPolicy() } = {}, io = createExtraSeatsIo({ env })) {
+export async function runExtraSeats(o = {}, io = createExtraSeatsIo({ env: o.env ?? process.env })) {
+  const pass = await speculateExtraSeats({ ...o, read: o.loopPayload?.findings?.read }, io);
+  return finishExtraSeats({ ...o, pass }, io);
+}
+
+/** Calls, reservations and live quota observations only: no scored comparisons before the final loop read is known. */
+export async function speculateExtraSeats({ pr, repo, lanePath, read, env = process.env, routingPolicy = readRoutingPolicy(), onReserved = () => {}, onProgress = () => {} } = {}, io = createExtraSeatsIo({ env })) {
+  const startedAt = io.now();
   try {
     if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: `${EXTRA_SEATS_ENV}=${env[EXTRA_SEATS_ENV]}` };
-    const read = loopPayload?.findings?.read;
     if (!read || typeof read.diffText !== 'string' || !read.diffText.trim()) {
       return { status: 'skipped', reason: 'the review loop printed no diff (it did not reach its read step)' };
     }
@@ -711,13 +718,14 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
     for (const u of unavailable) io.log(`added seats: skipping ${u.provider} — ${u.reason}`);
     const remainingCalls = (list) => list.reduce((sum, p) => sum + Math.max(0, caps[p] - usedByProvider[p]), 0);
     const providerAvailable = (provider, seatKey) => usedByProvider[provider] < seatCaps[seatKey][provider];
-    let plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+    let plan = reviewSeatRoutes({ env, available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
 
     // RESERVE each distinct provider's ONE call under ITS OWN cap, before launching anything, so concurrent
     // reviews can never together overspend any one provider's budget. A provider that cannot be granted (another
     // review just took its last slot) is dropped from `available` and the plan is rebuilt on whoever is left —
     // bounded to the provider count, so this can never loop forever.
     const callIdOf = new Map();
+    const reservations = [];
     for (let attempt = 0; attempt <= REVIEW_SEAT_PROVIDERS.length && plan.routes.length; attempt += 1) {
       const wantedProviders = [...new Set(plan.routes.map((r) => r.provider))].filter((p) => !callIdOf.has(p));
       if (!wantedProviders.length) break;
@@ -728,6 +736,8 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
           const models = [...new Set(plan.routes.filter(r => r.provider === p).map(r => `${r.model}/${r.effort}`))];
           reservation = io.reserveCalls({ provider: p, want: models.length, dailyCap: caps[p], now });
           reservation.models = models;
+          reservations.push(...reservation.callIds.map((callId, i) => ({ callId, provider: p, model: models[i]?.split('/')[0], rev })));
+          onReserved({ reservations });
         } catch (e) {
           return {
             status: 'skipped',
@@ -739,7 +749,7 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         if (reservation.callIds.length === reservation.models.length) { callIdOf.set(p, new Map(reservation.models.map((model, index) => [model, reservation.callIds[index]]))); } else { anyDenied = true; available = available.filter((x) => x !== p); }
       }
       if (!anyDenied) break;
-      plan = reviewSeatRoutes({ available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
+      plan = reviewSeatRoutes({ env, available, providerAvailable, scorecards: records, callsRemaining: remainingCalls(available), routingPolicy });
     }
     const providerUsage = Object.fromEntries(REVIEW_SEAT_PROVIDERS.map((p) => [p, { usedToday: usedByProvider[p] + (callIdOf.get(p)?.size ?? 0), cap: caps[p] }]));
     const totalUsedToday = Object.values(providerUsage).reduce((sum, u) => sum + u.usedToday, 0);
@@ -755,12 +765,9 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
       };
     }
 
-    const claudeFindings = claudeFindingsFromLoop(loopPayload);
-    const claudeVerdict = loopPayload?.verdict?.verdict ?? null;
     const timeoutMs = resolveSeatTimeoutMs(env);
     let scratch = null;
-    const seats = [];
-    let rowsWritten = 0;
+    const callsMade = [];
     try {
       scratch = io.makeScratch({ lanePath, rev, pr });
       const inputDir = seatInputDir(scratch);
@@ -797,25 +804,78 @@ export async function runExtraSeats({ pr, repo, lanePath, loopPayload, env = pro
         const parsed = call.status === 'ok' ? repoRelativeFindings(parseSeatAnswer(call.text, group), scratch) : {};
         preserveSeatRawAnswer({ callId, call, parsed, seats: group }, io);
         const quota = { usedPercent: run?.report?.quotaUsedPercent ?? null, resetsAt: toIsoInstant(run?.report?.quotaResetsAt) };
-        const rows = buildSeatRows({
+        const completed = {
           evidence: run?.report ?? {},
-          callId, pr, repo, provider, model, effort, seats: group, call, parsed, claudeFindings, claudeVerdict, quota, durationMs: Date.parse(finishedAt) - t0,
+          callId, pr, repo, provider, model, effort, seats: group, call, parsed, quota, durationMs: Date.parse(finishedAt) - t0,
           startedAt: new Date(t0).toISOString(), finishedAt,
           changedFiles: read.netChangedFiles ?? null,
-        });
-        for (const row of rows) {
-          try { io.append(row); rowsWritten += 1; } catch (e) { io.log(`added seats: evidence row for ${row.lens}/${provider} NOT written — ${e.message}`); }
-          seats.push(row);
+        };
+        // Admission reads the live store, not worker progress. Publish quota evidence as soon
+        // as this call completes, before another call or settlement can delay it or be cancelled.
+        for (const row of buildSeatRows({ ...completed, claudeFindings: null })) {
+          try { io.append({ ...row, quotaObservation: true, discarded: true, seatVerdict: null, findings: [], findingsCount: 0, confirmedCount: 0, scoredAt: finishedAt }); }
+          catch (e) { io.log(`added seats: live quota evidence NOT written — ${e.message}`); }
         }
+        callsMade.push(completed);
+        // Progress retains completed spend details for cancellation accounting.
+        onProgress({ rev, reservations, calls: callsMade });
       });
       await Promise.all(calls);
     } finally {
       if (scratch) { try { io.removeScratch(scratch); } catch { io.log(`review scratch cleanup failed; TTL sweep will retry`); } }
     }
-    return { status: 'ran', seats, skipped, callsUsedToday: totalUsedToday, dailyCap: totalDailyCap, providerUsage, rowsWritten };
+    return { status: 'speculated', rev, readFingerprint: redTeamReadFingerprint(read), durationMs: io.now() - startedAt, calls: callsMade, reservations, skipped, callsUsedToday: totalUsedToday, dailyCap: totalDailyCap, providerUsage };
   } catch (e) {
     return { status: 'error', reason: String(e?.message ?? e).slice(0, MAX_TEXT) };
   }
+}
+
+/** Finish only evidence from this exact pinned head, comparing it with the real jurors. */
+export async function finishExtraSeats({ loopPayload, pass, env = process.env } = {}, io = createExtraSeatsIo({ env })) {
+  if (pass?.status !== 'speculated') return pass ?? { status: 'error', reason: 'no added seats pass' };
+  if (!extraSeatsEnabled(env)) return { status: 'disabled', reason: 'kill switch thrown' };
+  const rev = loopPayload?.findings?.read?.netBasis?.rev;
+  if (!isPinnedRev(rev) || pass.rev !== rev) return { status: 'discarded', reason: 'added seats head differs from final loop head' };
+  if (!pass.readFingerprint || pass.readFingerprint !== redTeamReadFingerprint(loopPayload?.findings?.read)) {
+    return { status: 'discarded', reason: 'added seats read differs from final loop read' };
+  }
+  if (!Array.isArray(pass.calls) || !pass.calls.length || !pass.calls.every(c => c?.callId && Array.isArray(c.seats) && c.seats.length && c.call?.status && c.parsed && typeof c.parsed === 'object')) {
+    return { status: 'discarded', reason: 'incomplete added seats pass' };
+  }
+  let seats;
+  try {
+    seats = pass.calls.flatMap(call => buildSeatRows({ ...call, claudeFindings: claudeFindingsFromLoop(loopPayload), claudeVerdict: loopPayload?.verdict?.verdict ?? null })
+      .map(row => ({ ...row, scoredAt: call.finishedAt ?? call.startedAt ?? new Date(io.now()).toISOString() })));
+  } catch { return { status: 'discarded', reason: 'incomplete added seats pass; comparison rows could not be built' }; }
+  let rowsWritten = 0;
+  for (const row of seats) {
+    try { io.append(row); rowsWritten += 1; } catch (e) { io.log(`added seats: evidence row for ${row.lens}/${row.provider} NOT written — ${e.message}`); }
+  }
+  return { status: 'ran', seats, skipped: pass.skipped, callsUsedToday: pass.callsUsedToday, dailyCap: pass.dailyCap, providerUsage: pass.providerUsage, rowsWritten };
+}
+
+/** One unscored spend row per reserved call, including workers cancelled mid-call. */
+export function recordDiscardedSeats({ pr, repo, pass, reserved, reason }, io = createExtraSeatsIo()) {
+  const reservations = new Map([...(reserved?.reservations ?? []), ...(pass?.reservations ?? [])].map(r => [r.callId, r]));
+  let rowsWritten = 0;
+  for (const r of reservations.values()) {
+    const call = (pass?.status === 'speculated' ? pass.calls?.find(c => c.callId === r.callId) : null)
+      ?? reserved?.calls?.find(c => c.callId === r.callId);
+    const completed = call ? { ...call, status: 'speculated', rev: pass?.rev ?? reserved?.rev, findings: Object.values(call.parsed ?? {}).flatMap(s => s.findings ?? []) } : null;
+    const row = buildRedTeamDiscardRow({ pr, repo, pass: completed, reserved: r, reason, now: io.now() });
+    try { io.append({ ...row, seat: 'added-seats', lens: null }); rowsWritten += 1; }
+    catch (e) { io.log(`added seats: discard spend NOT written — ${e.message}`); }
+    // Quota observations survive discard: a failed probe must re-arm the provider hold,
+    // and a clean probe must be able to clear it, without publishing a seat verdict.
+    // Keep the call observation time: settlement must not let old clean evidence clear a newer hold.
+    if (call) {
+      for (const quotaRow of buildSeatRows({ ...call, claudeFindings: null })) {
+        try { io.append({ ...quotaRow, discarded: true, seatVerdict: null, findings: [], findingsCount: 0, confirmedCount: 0, scoredAt: call.finishedAt ?? call.startedAt ?? row.scoredAt }); }
+        catch (e) { io.log(`added seats: discarded quota evidence NOT written — ${e.message}`); }
+      }
+    }
+  }
+  return { status: reservations.size === rowsWritten ? 'recorded' : 'error', rowsWritten };
 }
 
 // ── THE REAL EFFECTS ────────────────────────────────────────────────────────────────────────────────────────────
@@ -1133,6 +1193,10 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
     removeScratch: removeReviewScratch,
     writeFile: (path, text) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, text); },
     runSeat: ({ provider, taskFile, schemaFile, dir, model, effort, timeoutMs }) => new Promise((resolvePromise) => {
+      if (!carbonNonShadowAllowed(model, { env })) {
+        resolvePromise({ report: null, error: 'Carbon not promoted — non-shadow seat refused', timedOut: false });
+        return;
+      }
       if (stoppingSeats || terminatingSeats) {
         resolvePromise({ report: null, error: 'review seats are stopping', timedOut: false });
         return;
@@ -1854,6 +1918,13 @@ export async function speculateRedTeam({
     const routingEntry = routingPolicy.operations['review-seat:red-team'];
     const providers = rosterForKey('review-seat:red-team');
     const caps = Object.fromEntries(providers.map((p) => [p, resolveRoutingProviderCap(p, env, routingEntry)]));
+    for (const p of providers) {
+      const source = routingEntry?.disabledProviders?.includes(p) ? 'routing disabledProviders'
+        : env?.[PROVIDER_CAP_ENV[p]] !== undefined ? PROVIDER_CAP_ENV[p]
+          : p === 'codex' && env?.WE_REVIEW_EXTRA_SEATS_DAILY_CAP !== undefined ? 'WE_REVIEW_EXTRA_SEATS_DAILY_CAP'
+            : routingEntry?.enabledProviders?.includes(p) ? 'routing/default' : 'default';
+      io.log(`red-team cap: ${p}=${caps[p]} (source: ${source})`);
+    }
     const usedByProvider = Object.fromEntries(providers.map((p) => [p, callsUsedTodayForProvider(records, now, p)]));
     for (const p of providers) {
       if (!io.cliAvailable(p)) { unavailable.push(`${p}: CLI not found on PATH`); continue; }
@@ -1884,7 +1955,12 @@ export async function speculateRedTeam({
         // A valid overlay can supply a route even when the default chain is exhausted.
         // Without one, preserve the policy failure rather than selecting outside its chain.
         if (routeError && !configuredRoute) throw routeError;
-      } catch (error) { lastReason = error.message; break; }
+      } catch (error) {
+        // Exhausting the configured chain after a reservation denial is a budget
+        // deferral. Out-of-chain roster entries must neither launch nor mask it.
+        lastReason ??= error.message;
+        break;
+      }
       const pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
       let reservation;
@@ -1898,6 +1974,7 @@ export async function speculateRedTeam({
       else {
         deferredByCap = true;
         lastReason = `daily-cap: ${reservation.used}/${caps[pick.provider]} non-Claude seat calls used today for ${pick.provider}`;
+        io.log(`red team deferred: ${lastReason} (scorecards + reservation ledger)`);
         available = available.filter((x) => x !== pick.provider);
       }
     }
@@ -2265,7 +2342,7 @@ export function replayPayload({ view, diffText }) {
 // ── CLI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** CLI boundary; injected red-team effects keep recovery tests free of paid calls. */
-export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {}) {
+export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo, seatsIo } = {}) {
   const [sub, ...rest] = argv;
   const flag = (name) => {
     const hit = rest.find((a) => a.startsWith(`--${name}=`));
@@ -2283,19 +2360,21 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   };
   if (sub === 'run' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
-    runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() })
+    return runExtraSeats({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload() }, seatsIo)
       .then((result) => emit(result, renderSeatSummary));
   } else if (sub === 'red-team' && flag('pr') && flag('repo') && flag('lane') && flag('loop-json')) {
     return runRedTeam({ pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), loopPayload: readPayload(), post: !rest.includes('--no-post'), resumeOnly: rest.includes('--resume-only'),
       redTeamMode: flag('red-team-mode'), redTeamAdmission: flag('red-team-admission') === undefined ? undefined : readAdmission() }, redTeamIo)
       .then((result) => emit(result, renderRedTeamSummary));
-  } else if (sub === 'red-team-speculate' && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
-    // Card xbizuci — THE SPECULATIVE RED TEAM, started by the review job beside the review loop. It waits for the
+  } else if ((sub === 'red-team-speculate' || sub === 'seats-speculate') && flag('pr') && flag('repo') && flag('lane') && flag('read-sink') && flag('out')) {
+    // Speculative evidence workers, started by the review job beside the review loop. Each waits for the
     // loop's `read` (written to --read-sink the moment the read step finishes), runs the first half of the pass on
-    // exactly that read, and writes the pass to --out. It never writes a seat row, a comment or a trial: the job
+    // exactly that read, and writes the pass to --out. Added seats write live unscored quota observations;
+    // neither worker writes scored comparisons, a comment or a trial: the job
     // finishes the pass only if the review accepts (`red-team-finish`), and otherwise records the spend as discarded.
     // The reservation is written to `<out>.reserved` as soon as it is taken, so a pass killed mid-call is still
-    // accounted for. SIGTERM (the job calling it off) kills the running seat CLI's own process group first.
+    // accounted for. Added-seat completions also update that progress file for spend details; quota
+    // observations go straight to the live store. SIGTERM kills the running seat CLI's own process group first.
     const outPath = flag('out');
     const writeJson = (path, value) => { const tmp = `${path}.${process.pid}.tmp`; writeFileSync(tmp, `${JSON.stringify(value)}\n`); renameSync(tmp, path); };
     const waitMs = Number(flag('wait-ms')) > 0 ? Number(flag('wait-ms')) : 45 * 60 * 1000;
@@ -2307,22 +2386,27 @@ export function runExtraSeatsCli(argv = process.argv.slice(2), { redTeamIo } = {
       if (got || Date.now() - startedAt >= waitMs) { resolveRead(got); return; }
       setTimeout(() => nextRead(resolveRead), 1000);
     };
-    new Promise(nextRead).then(async (sunk) => {
+    return new Promise(nextRead).then(async (sunk) => {
       const readAt = Date.now();
       let result;
       if (!sunk?.read) result = { status: 'no-read', reason: `the review loop wrote no read within ${Math.round(waitMs / 1000)}s` };
       else {
-        result = await speculateRedTeam({
+        result = await (sub === 'seats-speculate' ? speculateExtraSeats : speculateRedTeam)({
           pr: Number(flag('pr')), repo: flag('repo'), lanePath: flag('lane'), read: sunk.read, resume: false,
           onReserved: (r) => writeJson(`${outPath}.reserved`, r),
+          onProgress: (r) => writeJson(`${outPath}.reserved`, r),
           onTiming: (r) => writeJson(`${outPath}.reserved`, r),
-        });
+        }, sub === 'seats-speculate' ? seatsIo : undefined);
       }
       writeJson(outPath, { ...result, timings: { startedAt, readAt, finishedAt: Date.now() } });
-      process.stderr.write(`red team (speculative): ${result.status}${result.reason ? ` — ${result.reason}` : ''}\n`);
+      process.stderr.write(`${sub === 'seats-speculate' ? 'added seats' : 'red team'} (speculative): ${result.status}${result.reason ? ` — ${result.reason}` : ''}\n`);
     }).catch((e) => {
       try { writeJson(outPath, { status: 'error', reason: String(e?.message ?? e).slice(0, MAX_TEXT) }); } catch { /* nothing more to do */ }
     });
+  } else if (sub === 'seats-finish' && flag('pr') && flag('repo') && flag('pass') && flag('loop-json')) {
+    let pass = null;
+    try { pass = JSON.parse(readFileSync(flag('pass'), 'utf8')); } catch { /* incomplete evidence */ }
+    return finishExtraSeats({ loopPayload: readPayload(), pass }, seatsIo).then(result => emit(result, renderSeatSummary));
   } else if (sub === 'red-team-finish' && flag('pr') && flag('repo') && flag('pass') && flag('loop-json')) {
     // Card xbizuci — the second half of an ACCEPTED review's speculative pass: seat row, folded verdict, effects.
     let pass = null;
