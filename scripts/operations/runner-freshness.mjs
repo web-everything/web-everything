@@ -18,9 +18,9 @@ export const requiresFreshRunner = (declaration) => declaration.name === 'verify
 export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = false }, {
   env = process.env, now = Date.now, filesystem = fs,
   // Waiting for Git alone does not wait for maintenance it detaches after a fetch.
-  git = (args, cwd) => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], {
+  git = (args, cwd, { credentialPins = true } = {}) => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], {
     cwd, encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...laneGitHardeningEnv(scrubInheritedGitEnv(env)), GIT_OPTIONAL_LOCKS: '0' },
+    env: { ...laneGitHardeningEnv(scrubInheritedGitEnv(env), { credentialPins }), GIT_OPTIONAL_LOCKS: '0' },
   }),
   diagnostic = (line) => process.stderr.write(`${line}\n`),
 } = {}) {
@@ -29,8 +29,11 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
   let behind = null;
   let uncertainty = '';
   let pinnedRunner = false;
+  // Keep credentials disabled during discovery. Only a resolved non-lane checkout
+  // may use the operator's credential helper for its freshness fetch.
+  let credentialPins = true;
   const readGit = (args) => {
-    const result = String(git(args, root)).trim();
+    const result = String(git(args, root, { credentialPins })).trim();
     if (!result && args[0] !== 'fetch') throw new Error(`empty Git response: ${args.join(' ')}`);
     return result;
   };
@@ -42,6 +45,7 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
       const parts = relative(pool, root).split(sep);
       lane = parts.length === 2 && parts[0] !== '..' && parts[0] !== '' && /^lane-\d+$/.test(parts[1]);
     } catch { /* A missing pool grants no exemption. */ }
+    credentialPins = lane;
     if (lane && declaration.name === 'open-pr') {
       // Unreadable detached evidence must fail closed, but ordinary attached lanes
       // retain their exemption without requiring a lease.

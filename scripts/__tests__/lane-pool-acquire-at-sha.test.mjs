@@ -9,7 +9,7 @@ let root, origin, reference, pool, lane, initial, tip;
 const git = (args, cwd = reference) => execFileSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.name=Test', '-c', 'user.email=t@example.invalid', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const lease = () => join(lane, '.git', '.lane-lease');
 function run(command, args = [], extraEnv = {}) {
-  return spawnSync(process.execPath, [script, command, `--origin=${origin}`, `--reference=${reference}`, '--name=at-sha', ...(extraEnv.TEST_INSTALL ? [] : ['--no-install']), '--no-reap', '--session=at-test', ...args], {
+  return spawnSync(process.execPath, [script, command, `--origin=${origin}`, `--reference=${reference}`, '--name=at-sha', ...(extraEnv.TEST_INSTALL ? [] : ['--no-install']), ...(extraEnv.TEST_REAP ? [] : ['--no-reap']), '--session=at-test', ...args], {
     encoding: 'utf8', env: { ...process.env, LANE_POOL_ROOT: pool, LANE_POOL_AUTO_RECOVER: '0', ...extraEnv },
   });
 }
@@ -43,6 +43,23 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 describe('acquire at an exact pushed branch tip', () => {
+  it.each([false, true])('restores main after a partially failed pinned checkout (prior lease=%s)', prior => {
+    if (prior) expect(run('acquire', ['--lane=1']).status).toBe(0);
+    const originalLease = prior ? readFileSync(lease(), 'utf8') : null;
+    const marker = join(root, 'checkout-failed');
+    const env = gitShim(`if (args.includes('checkout') && args.includes('--detach') && !fs.existsSync(${JSON.stringify(marker)})) {
+      fs.writeFileSync(${JSON.stringify(marker)}, 'failed');
+      const result = cp.spawnSync(realGit, args, { stdio: 'inherit' });
+      process.exit(result.status === 0 ? 1 : result.status);
+    }`);
+    const r = acquire(tip, [], env);
+    expect(r.status).not.toBe(0);
+    if (prior) expect(readFileSync(lease(), 'utf8')).toBe(originalLease);
+    else expect(existsSync(lease())).toBe(false);
+    expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
+    expect(existsSync(marker)).toBe(true);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
+  });
   it.each(['1', 'auto'])('detaches at the tip and records lease and JSON fields (--lane=%s)', selection => {
     const r = acquire(tip, [`--lane=${selection}`, '--json', '--wait-ms=0']);
     expect(r.status, r.stderr).toBe(0);
@@ -166,7 +183,7 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(r.status).not.toBe(0);
     expect(JSON.parse(readFileSync(lease(), 'utf8'))).toEqual(replacement);
   });
-  it.each(['head', 'commit', 'tracked', 'untracked', 'holder'])('refuses late %s changes during pinned release', change => {
+  it.each([false, true].flatMap(allPools => ['head', 'commit', 'tracked', 'untracked', 'holder'].map(change => [change, allPools])))('refuses late %s changes during pinned release (all-pools=%s)', (change, allPools) => {
     expect(acquire().status).toBe(0);
     const replacement = { session: 'replacement', holder: 'replacement', acquiredAt: new Date().toISOString() };
     const mutation = change === 'head' ? `cp.execFileSync(realGit, ['checkout', '--detach', ${JSON.stringify(initial)}]);`
@@ -175,7 +192,7 @@ describe('acquire at an exact pushed branch tip', () => {
       : change === 'untracked' ? "fs.writeFileSync('late.txt', 'late work');"
       : `fs.writeFileSync('.git/.lane-lease', ${JSON.stringify(JSON.stringify(replacement))});`;
     const env = gitShim(`if (args.slice(-3).join(' ') === 'rev-parse --verify HEAD') { ${mutation} }`);
-    const r = run('release', ['--lane=1'], env);
+    const r = run('release', allPools ? ['--all-pools'] : ['--lane=1'], env);
     expect(r.status, r.stderr).not.toBe(0);
     expect(existsSync(lease())).toBe(true);
     expect(spawnSync('git', ['symbolic-ref', '-q', 'HEAD'], { cwd: lane }).status).not.toBe(0);
@@ -183,7 +200,7 @@ describe('acquire at an exact pushed branch tip', () => {
     if (change === 'untracked') expect(readFileSync(join(lane, 'late.txt'), 'utf8')).toBe('late work');
     if (change === 'holder') expect(JSON.parse(readFileSync(lease(), 'utf8'))).toEqual(replacement);
   });
-  it.each([[false, false], [false, true], [true, false], [true, true]])('release never overwrites a collision (ignored=%s discard=%s)', (ignored, discard) => {
+  it.each([false, true].flatMap(allPools => [[false, false], [false, true], [true, false], [true, true]].map(pair => [...pair, allPools])))('release never overwrites a collision (ignored=%s discard=%s all-pools=%s)', (ignored, discard, allPools) => {
     // Main tracks a path which the pinned target deliberately deletes and ignores.
     writeFileSync(join(reference, 'collision.txt'), 'main version'); git(['add', '.']); git(['commit', '-m', 'main collision', '--quiet']);
     git(['push', '--quiet', 'origin', 'HEAD:main']);
@@ -191,7 +208,7 @@ describe('acquire at an exact pushed branch tip', () => {
     tip = git(['rev-parse', 'HEAD']); git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
     expect(acquire().status).toBe(0);
     writeFileSync(join(lane, 'collision.txt'), 'precious');
-    const r = run('release', ['--lane=1', ...(discard ? ['--discard'] : [])]);
+    const r = run('release', [...(allPools ? ['--all-pools'] : ['--lane=1']), ...(discard ? ['--discard'] : [])]);
     expect(r.status, r.stderr).not.toBe(0);
     expect(readFileSync(join(lane, 'collision.txt'), 'utf8')).toBe('precious');
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
@@ -203,5 +220,61 @@ describe('acquire at an exact pushed branch tip', () => {
     expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
     expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
     expect(existsSync(lease())).toBe(false);
+  });
+  it.each(['commit', 'checkout', 'stranded claim'])('release --discard recovers a pinned lane after %s', change => {
+    expect(acquire().status).toBe(0);
+    if (change === 'commit') git(['commit', '--allow-empty', '-m', 'worker commit'], lane);
+    else git(['checkout', ...(change === 'checkout' ? ['--detach', initial] : ['main'])], lane);
+    const r = run('release', ['--lane=1', '--discard']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
+    expect(existsSync(lease())).toBe(false);
+  });
+  it.each(['commit', 'checkout', 'stranded claim'])('release --force preserves a moved pinned HEAD after %s', change => {
+    expect(acquire().status).toBe(0);
+    if (change === 'commit') git(['commit', '--allow-empty', '-m', 'worker commit'], lane);
+    else git(['checkout', ...(change === 'checkout' ? ['--detach', initial] : ['main'])], lane);
+    const before = git(['rev-parse', 'HEAD'], lane);
+    const r = run('release', ['--lane=1', '--force']);
+    expect(r.status).not.toBe(0);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(before);
+    expect(existsSync(lease())).toBe(true);
+  });
+  it('release --force --discard recovers a moved pinned HEAD for a foreign holder', () => {
+    expect(acquire(tip, [], { CLAUDE_CODE_SESSION_ID: 'other-holder' }).status).toBe(0);
+    git(['commit', '--allow-empty', '-m', 'worker commit'], lane);
+    const r = run('release', ['--lane=1', '--session=foreign', '--force', '--discard']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
+    expect(existsSync(lease())).toBe(false);
+  });
+  it.each([false, true])('cross-pool release returns a pinned lane to main (discard=%s)', discard => {
+    expect(acquire().status).toBe(0);
+    if (discard) git(['commit', '--allow-empty', '-m', 'worker commit'], lane);
+    const r = run('release', ['--all-pools', ...(discard ? ['--discard'] : [])]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
+    expect(existsSync(lease())).toBe(false);
+  });
+  it.each([false, true])('terminal pinned lease reaping resets only a lane without new work (moved=%s)', moved => {
+    mkdirSync(join(reference, 'backlog'));
+    writeFileSync(join(reference, 'backlog', '123-item.md'), '---\nstatus: resolved\n---\n');
+    git(['add', 'backlog']); git(['commit', '-m', 'resolved item']);
+    git(['push', '--quiet', 'origin', 'HEAD:main']);
+    const main = git(['rev-parse', 'HEAD']);
+    expect(acquire(tip, ['--session=conveyor-123']).status).toBe(0);
+    const expired = { ...JSON.parse(readFileSync(lease(), 'utf8')), acquiredAt: '2000-01-01T00:00:00Z', ttlMinutes: 1 };
+    writeFileSync(lease(), JSON.stringify(expired));
+    if (moved) git(['commit', '--allow-empty', '-m', 'new work'], lane);
+    const before = git(['rev-parse', 'HEAD'], lane);
+    const env = gitShim('');
+    writeFileSync(join(root, 'shim-bin', 'gh'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const r = run('list', ['--acquirable', '--json'], { ...env, TEST_REAP: '1' });
+    expect(r.status, r.stderr).toBe(0);
+    expect(existsSync(lease())).toBe(moved);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(moved ? before : main);
+    if (!moved) expect(git(['symbolic-ref', '--short', 'HEAD'], lane)).toBe('main');
   });
 });

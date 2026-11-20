@@ -2256,6 +2256,15 @@ function reapDeadLeasesInPool(repo, nowMs, ttlMs) {
       // lease `deadLeasePlan` judged — anything else (including "already gone") is left untouched.
       if (laneHoldRefuses(c.dir, 'release')) continue; // xbdixjc
       reapTestBarrier();
+      if (c.lease.at !== undefined) {
+        if (releaseRedirectRefuses(c.dir, `lane-${c.lane}`)) continue;
+        const io = realSalvageIo({ repo, preflightLaneDir: c.dir });
+        scrubClaimedLaneConfig(c.dir, 'before pinned reap');
+        if (releaseWorkRefuses(c.dir, `lane-${c.lane}`, undefined, {
+          io, key: repo.originUrl ? `${repo.name}\0${repo.originUrl}` : null, url: repo.originUrl || null,
+        }, { discard: false, setExitCode: false })) continue;
+        if (resetPinnedLaneForRelease(repo, c.dir, c.lease, { discard: false })) continue;
+      }
       if (!takeMarkerIf(c.dir, (moved) => sameLease(moved, c.lease), c.lane)) continue;
       // #3383 — record the reap in the lane-history ledger (best-effort, after the marker is confirmed ours to drop).
       appendLaneHistory(c.dir, laneHistoryEntry({
@@ -3611,10 +3620,10 @@ function releaseRedirectRefuses(dir, label) {
 
 // Every refusal string (the stderr log, the journal line and `--json` details) passes `safe`, which strips URL
 // credentials: a failed listing or fetch message carries the origin URL (scripts/lib/lane-pool-salvage-push.mjs).
-function releaseWorkRefuses(dir, label, salvage, proof) {
+function releaseWorkRefuses(dir, label, salvage, proof, { discard = !!flags.discard, setExitCode = true } = {}) {
   const safe = value => redactUrlCredentials(String(value)).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ');
   const quote = value => /^[a-zA-Z0-9_./:-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-  const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof, { preservedStash: flags.discard ? [] : releaseSalvageStash(dir) });
+  const { commits, why, hint, note } = releaseUnprovenCommits(dir, salvage, proof, { preservedStash: discard ? [] : releaseSalvageStash(dir) });
   const tracked = releaseTrackedChanges(dir);
   if (commits === '' && tracked === '') return false;
   const details = [
@@ -3626,7 +3635,7 @@ function releaseWorkRefuses(dir, label, salvage, proof) {
     tracked === null ? 'tracked status unreadable or exceeds the Git output limit; inspect the index and worktree manually'
       : tracked ? `tracked changes: ${safe(tracked)}` : '',
   ].filter(Boolean).join('; ');
-  if (flags.discard) {
+  if (discard) {
     log(`  WARNING ${safe(label)}: --discard accepts loss on reuse of ${details}; releasing`);
     return false;
   }
@@ -3643,8 +3652,28 @@ function releaseWorkRefuses(dir, label, salvage, proof) {
   journalLaneEvent(dir, {
     action: 'release-refused', reason: `UNPUSHED_WORK — ${bounded}`, loud: true, unpushed: true,
   }, { unlessRepeat: true });
-  process.exitCode = 1;
+  if (setExitCode) process.exitCode = 1;
   return { reason: 'unpushed-work', details: bounded };
+}
+
+// Every path that frees a pinned lease must first return its clone to the integration
+// branch. Only --discard permits a HEAD that moved before release; --force still
+// changes ownership alone. Recheck work and holder after the caller's origin proof.
+function resetPinnedLaneForRelease(repo, dir, lease, { discard = !!flags.discard } = {}) {
+  if (lease.at === undefined) return false;
+  try {
+    if (!sameLease(readLease(dir), lease)) throw new Error('lease changed before pinned release reset; inspect the current holder');
+    if (git(['rev-parse', '--verify', 'HEAD'], dir).trim() !== lease.at && !discard) throw new Error('pinned HEAD moved; inspect the lane or release with --discard');
+    const dirty = git(['status', '--porcelain', '--untracked-files=all'], dir).trim();
+    if (dirty && !discard) throw new Error('pinned lane has new work; inspect it or release with --discard');
+    if (!repo?.branch) throw new Error('integration branch unresolved; inspect the pool before release');
+    if (!sameLease(readLease(dir), lease)) throw new Error('lease changed before pinned checkout; inspect the current holder');
+    git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
+    journalLaneEvent(dir, { action: 'release-reset', headAfter: laneHead(dir), reason: 'return pinned lease to integration branch' });
+    return false;
+  } catch (e) {
+    return { reason: 'reset-failed', details: msgOf(e) };
+  }
 }
 
 // Bound a refusal's details for the journal and `--json`; a cut is marked so the text never reads as complete.
@@ -3758,6 +3787,9 @@ async function cmdReleaseAllPools(repo) {
       }
       const refusedWork = releaseWorkRefuses(dir, `${name}/lane-${n}`, salvage, proof);
       if (refusedWork) { kept.push({ pool: name, lane: n, ...refusedWork }); continue; }
+      releaseTestBarrier();
+      const refusedReset = resetPinnedLaneForRelease(salvageRepo, dir, lease);
+      if (refusedReset) { kept.push({ pool: name, lane: n, ...refusedReset }); process.exitCode = 1; continue; }
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
         continue;
@@ -3962,26 +3994,8 @@ async function cmdRelease(repo) {
       url: repo.originUrl || null });
     if (refusedWork) { kept.push({ lane: n, ...refusedWork }); continue; }
     releaseTestBarrier();
-    if (lease.at !== undefined) {
-      if (!sameLease(readLease(dir), lease)) {
-        log(`  lane-${n}: lease changed before pinned release reset — refusing; inspect the current holder`);
-        kept.push({ lane: n, reason: 'lease-changed' });
-        process.exitCode = 1;
-        continue;
-      }
-      try {
-        if (git(['rev-parse', '--verify', 'HEAD'], dir).trim() !== lease.at) throw new Error('pinned HEAD moved; inspect the lane before release');
-        const dirty = git(['status', '--porcelain', '--untracked-files=all'], dir).trim();
-        if (dirty && !flags.discard) throw new Error('pinned lane has new work; inspect it or release with --discard');
-        if (!sameLease(readLease(dir), lease)) throw new Error('lease changed before pinned checkout; inspect the current holder');
-        git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
-        journalLaneEvent(dir, { action: 'release-reset', headAfter: laneHead(dir), reason: 'return pinned lease to integration branch' });
-      } catch (e) {
-        kept.push({ lane: n, reason: 'reset-failed', details: msgOf(e) });
-        process.exitCode = 1;
-        continue;
-      }
-    }
+    const refusedReset = resetPinnedLaneForRelease(repo, dir, lease);
+    if (refusedReset) { kept.push({ lane: n, ...refusedReset }); process.exitCode = 1; continue; }
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
