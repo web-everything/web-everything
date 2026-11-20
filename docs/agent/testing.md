@@ -5487,6 +5487,8 @@ Red-team pool completeness compares only status files within the canonical
 `MAX_AGE_MS` mtime window. Apply that exclusion before JSON/size validation so
 aged-out attempt metadata cannot poison the live inventory; corrupt or oversized
 recent evidence remains unknown. Pin the inclusive age boundary in fixtures.
+Derive the fixture clock from the stored `statSync(...).mtimeMs` after `utimesSync`,
+since filesystem timestamp rounding can move a requested boundary just outside the window.
 
 
 ## Resource pool shadow read boundary

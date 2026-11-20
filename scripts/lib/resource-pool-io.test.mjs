@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, statSync } from 'node:fs';
 import fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,7 @@ import { reviewJobsDir } from '../operations/review-job-store.mjs';
 import { resourcePoolOperation, renderResourcePool } from '../operations/resource-pool.mjs';
 import { assessResourceStatus } from '../operations/resource-status.mjs';
 import { lockIdFor } from '../readiness/file-locks.mjs';
+import { MAX_AGE_MS } from '../operations/red-team-slots.mjs';
 let root, paths;
 const nowMs = Date.now();
 const snapshot = { sampledAt: new Date(nowMs - 1000).toISOString(), freshUntil: new Date(nowMs + 10000).toISOString(),
@@ -270,10 +271,17 @@ it('fails closed on oversized recent red-team evidence with an inspect-source di
   put(join(paths.redTeam, 'oversized.json'), ' '.repeat(16 * 1024 * 1024 + 1));
   expect(read('redTeam')).toMatchObject({ unknown: true, error: expect.stringContaining('inspect source') });
 });
-it('keeps red-team records exactly at the canonical age boundary eligible and fails closed on corrupt JSON', () => {
+it.each([
+  { offsetMs: -1, unknown: true },
+  { offsetMs: 0, unknown: true },
+  { offsetMs: 1, unknown: false },
+])('checks corrupt red-team JSON at canonical age boundary offset $offsetMs ms', ({ offsetMs, unknown }) => {
   const file = join(paths.redTeam, 'boundary.json'); put(file, '{broken');
-  const boundary = new Date(nowMs - 48 * 60 * 60 * 1000); utimesSync(file, boundary, boundary);
-  expect(read('redTeam').unknown).toBe(true);
+  const boundary = new Date(nowMs - MAX_AGE_MS); utimesSync(file, boundary, boundary);
+  // Filesystems can round utimes below the requested millisecond. Anchor the
+  // observation clock to the stored timestamp so the inclusive cutoff is exact.
+  const observedNow = statSync(file).mtimeMs + MAX_AGE_MS + offsetMs;
+  expect(read('redTeam', { nowMs: observedNow })).toMatchObject({ ok: !unknown, unknown });
 });
 
 it.each([{}, { status: null }, { status: 42 }, { status: 'running', repo: 'we', pr: 'bad', head: 'abc' },
