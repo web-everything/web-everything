@@ -88,7 +88,11 @@ export function recordLocalSlotFallback({ lockRoot, reason, detail, repo, kind: 
     const row = { ts: new Date(now()).toISOString(), reason: bounded(reason ?? 'unknown'), detail: detail == null ? null : bounded(detail), lane: basename(String(repo)), kind: kind == null ? null : bounded(kind) };
     mkdirSync(lockRoot, { recursive: true });
     // Append (atomic for one small write); trim only when oversized, so concurrent writers never rewrite each other.
-    if (existsSync(file) && statSync(file).size > MAX_BYTES) writeFileSync(file, readFileSync(file, 'utf8').slice(-MAX_BYTES / 2), 'utf8');
+    if (existsSync(file) && statSync(file).size > MAX_BYTES) {
+      // Keep whole rows only: drop the partial line the slice may start in.
+      const tail = readFileSync(file, 'utf8').slice(-MAX_BYTES / 2);
+      writeFileSync(file, tail.includes('\n') ? tail.slice(tail.indexOf('\n') + 1) : '', 'utf8');
+    }
     appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');
     return row;
   } catch { return null; }

@@ -145,10 +145,12 @@ export async function acquireLocalDefault({ cwd, env, remainingMs }, {
   const acquired = await acquire({ ...options, env, kind: 'vitest', ceilingMs: remainingMs,
     canDefer: true, waitMs: remainingMs, log: m => process.stderr.write(m) });
   if (acquired.ok) {
+    let row = null;
     try {
-      recordFallback({ lockRoot: options.lockRoot, reason: unloggedPathReason('verify-shard-run'),
+      row = recordFallback({ lockRoot: options.lockRoot, reason: unloggedPathReason('verify-shard-run'),
         detail: 'shard vitest takes a local slot', repo: cwd, kind: 'vitest' });
     } catch { /* Logging must never change slot acquisition or routing. */ }
+    if (!row) { try { process.stderr.write('verify-shard-run: local-slot fallback row could not be recorded\n'); } catch { /* best effort */ } }
   }
   return { ...acquired, options };
 }
