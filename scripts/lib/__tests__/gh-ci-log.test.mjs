@@ -106,7 +106,6 @@ const deferredFindingReaders = new Map([
   ['scripts/lib/drain-mq-failure-recovery-io.mjs', 1],
   ['scripts/lib/drain-queue-safety.mjs', 2],
   ['scripts/lib/finished-ci-cache.mjs', 0],
-  ['scripts/lib/merge-gate-hold-class.mjs', 1],
   ['scripts/lib/red-main-quarantine-io.mjs', 2], // Existing API array and its documented shell command.
   ['scripts/lib/renamed-pr-refresh.mjs', 1],
   ['scripts/operations/operator-queue.mjs', 1],
