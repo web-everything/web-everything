@@ -803,6 +803,155 @@ describe('runReviewTick — the per-tick sequence', () => {
   });
 });
 
+describe('CLI red-team reserve wiring', () => {
+  const repo = 'web-everything/web-everything';
+  const head = 'a'.repeat(40);
+  const entries = (count, blocked) => Array.from({ length: count }, (_, i) => ({
+    key: `${repo}#${i + 1}`, repo, pr: i + 1, head, enqueuedAt: 1, attempts: 0,
+    ...(blocked ? { blocked } : {}),
+  }));
+  const live = ({ pr }) => ({ number: pr, state: 'OPEN', isDraft: false,
+    headRefOid: head, labels: ['red-team:pending'], comments: [], reviews: [] });
+  async function fixture(seed, check) {
+    vi.resetModules(); // A fresh daemon must restore its production queue on its first tick.
+    const directory = mkdtempSync(join(tmpdir(), 'review-reserve-'));
+    const file = join(directory, 'queue.json');
+    writeFileSync(file, JSON.stringify(seed));
+    vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', file);
+    vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');
+    vi.stubEnv('WE_REVIEW_MAX_LIVE_ROUNDS', '8');
+    vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+    vi.stubEnv('WE_RED_TEAM_QUEUE_MIN_CONCURRENT', '0');
+    try {
+      const daemon = await import('../review-daemon.mjs');
+      const log = { error: vi.fn() };
+      const opts = extra => daemon.cliReviewTickOpts({ log, readLivePr: live, listCommands: () => '', ...extra });
+      await check({ daemon, opts, log });
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
+  it('restores the production queue before computing the first CLI tick reserve', async () => {
+    await fixture(entries(3), ({ opts }) => {
+      const readLivePr = vi.fn(live);
+      const production = opts({ readLivePr });
+      expect(production.liveReviewBudget).toMatchObject({ reserve: 3, left: 8 });
+      production.reconcileRedTeamQueue();
+      expect(readLivePr).toHaveBeenCalledTimes(3);
+      expect(production.liveReviewBudget.reserve).toBe(3);
+    });
+  });
+
+  it.each([undefined, 'planner-skip', 'review-unfinished'])('lends back the reserve for an empty or blocked-only queue (%s)', async blocked => {
+    await fixture(blocked ? entries(6, blocked) : [], ({ opts }) => {
+      const production = opts();
+      production.reconcileRedTeamQueue();
+      expect(production.liveReviewBudget).toMatchObject({ reserve: 0, left: 8 });
+      expect(production.liveReviewBudget.reason).not.toContain('red-team reserve');
+    });
+  });
+
+  it('uses reconciled runnable heads, excluding terminal and unreadable entries on the same tick', async () => {
+    await fixture([...entries(5), entries(6, 'planner-skip')[5], entries(7)[6]], ({ opts }) => {
+      const production = opts({ readLivePr: ({ pr }) => pr === 1 ? { state: 'MERGED' }
+        : pr === 2 ? { state: 'CLOSED' } : pr === 3 ? null
+          : pr === 4 ? { ...live({ pr }), comments: null } : pr === 7 ? { ...live({ pr }), isDraft: true }
+            : { ...live({ pr }), ...(pr === 6 ? { headRefOid: 'b'.repeat(40) } : {}) } });
+      const budget = production.liveReviewBudget;
+      expect(budget.reserve).toBe(4);
+      budget.left = 5; // Reconciliation must not replenish the shared balance.
+      production.reconcileRedTeamQueue();
+      expect(budget).toMatchObject({ reserve: 2, left: 5 });
+      expect(budget.reason).toContain('red-team reserve 2');
+    });
+  });
+
+  it('lends back the reserve when inventory is incomplete or the queue is disabled', async () => {
+    await fixture(entries(6), ({ opts }) => {
+      const production = opts();
+      production.reconcileRedTeamQueue({ inventoryComplete: false });
+      expect(production.liveReviewBudget.reserve).toBe(0);
+      production.reconcileRedTeamQueue();
+      expect(production.liveReviewBudget.reserve).toBe(4);
+      vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'off');
+      expect(opts().liveReviewBudget.reserve).toBe(0);
+    });
+  });
+
+  it('logs an unreadable queue once while lending the reserve back', async () => {
+    await fixture(entries(6), async ({ opts, log }) => {
+      const queueModule = await import('../../../scripts/lib/red-team-dispatch-queue.mjs');
+      const create = queueModule.createRedTeamDispatchQueue;
+      vi.spyOn(queueModule, 'createRedTeamDispatchQueue').mockImplementation(options => {
+        const queue = create(options);
+        queue.entries = () => { throw Error('queue entries unavailable'); };
+        return queue;
+      });
+      const production = opts();
+      expect(production.liveReviewBudget.reserve).toBe(0);
+      expect(production.liveReviewBudget.reason).not.toContain('red-team reserve');
+      expect(log.error.mock.calls.flat().filter(line => line.includes('reserve queue unreadable'))).toHaveLength(1);
+    });
+  });
+
+  it('dispatches five of fifteen pending red-team PRs within two hours under sustained review load', async () => {
+    await fixture(entries(15), async ({ daemon, opts }) => {
+      const labels = await import('../../../scripts/lib/red-team-result-label-sync.mjs');
+      vi.spyOn(labels, 'syncResultOnHeadLabels').mockImplementation(({ rawPrs }) => ({ rawPrs }));
+      const catchUp = await import('../../../scripts/lib/red-team-gate-catchup.mjs');
+      vi.spyOn(catchUp, 'runGateCatchUp').mockReturnValue({});
+      const evidence = await import('../../../scripts/lib/drain-red-team-evidence.mjs');
+      vi.spyOn(evidence, 'readDrainRedTeamEvidence').mockReturnValue({ recorded: false,
+        loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } } });
+      vi.spyOn(evidence, 'readRedTeamStatus').mockReturnValue(null);
+      vi.spyOn(evidence, 'readRecoveryWitness').mockReturnValue({ rawWriter: { parsed: null } });
+      const start = Date.parse('2026-11-20T12:00:00Z');
+      let clock = start;
+      let pid = 100;
+      const jobs = [];
+      const dispatched = new Map();
+      const lastDispatch = new Map();
+      const job = await import('../../../scripts/operations/review-job.mjs');
+      vi.spyOn(job, 'dispatchReviewJob').mockImplementation(({ pr, redTeamOnly }) => {
+        expect(redTeamOnly).toBe(true);
+        dispatched.set(pr, clock);
+        jobs.push({ pid: ++pid, until: clock + 30 * 60_000 });
+        return { jobPid: pid };
+      });
+      const ordinary = Array.from({ length: 20 }, (_, i) => ({ number: 1000 + i, labels: ['review:pending'] }));
+      for (let minute = 0; minute <= 120; minute += 10) {
+        clock = start + minute * 60_000;
+        const pending = entries(15).filter(entry => !dispatched.has(entry.pr));
+        const production = opts({ listCommands: () => jobs.filter(job => job.until > clock)
+          .map(job => `${job.pid} 1 node scripts/operations/review-job.mjs run`).join('\n') });
+        const out = daemon.runReviewTickAllRepos({
+          repos: ['frontier-ui/frontierui', repo], startIndex: 0,
+          authGateOverride: () => ({ paused: false }),
+          liveReviewBudget: production.liveReviewBudget, reconcileRedTeamQueue: production.reconcileRedTeamQueue,
+          redTeamOnSkip: options => production.redTeamOnSkip({ ...options, now: () => clock, lastDispatch }),
+          reconcile: ({ repo: current }) => current === repo
+            ? { dispatch: [], refusals: pending.map(entry => ({ kind: 'already-reviewed-head', prNumber: entry.pr, headSha: head })) }
+            : { dispatch: ordinary.map(pr => ({ kind: 'review', prNumber: pr.number })), refusals: [] },
+          readPrs: ({ repo: current }) => current === repo ? pending.map(entry => live({ pr: entry.pr })) : ordinary,
+          readAgents: () => [], hostAdmission: () => ({ admitted: true, maxPerTick: 40 }),
+          acquirableLanes: () => 40, recoveryAcquirableLanes: () => 40,
+          dispatch: () => { jobs.push({ pid: ++pid, until: start + 3 * 60 * 60_000 }); return { agentId: `ordinary-${pid}` }; },
+          holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], now: () => clock,
+        });
+        expect(out.repos.every(row => !row.error)).toBe(true);
+        expect(jobs.filter(job => job.until > clock).length).toBeLessThanOrEqual(8);
+        expect(production.liveReviewBudget.left).toBeGreaterThanOrEqual(0);
+      }
+      expect(dispatched.size).toBeGreaterThanOrEqual(5);
+      expect([...dispatched.values()].sort((a, b) => a - b)[4] - start).toBeLessThanOrEqual(2 * 60 * 60_000);
+      expect(jobs.some(job => job.until === start + 3 * 60 * 60_000)).toBe(true);
+    });
+  });
+});
+
 describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, never by reviews owed alone', () => {
   const owedPlan = (entries, refusals = []) => ({ dispatch: entries, refusals });
   const reviewsPlan = (n) => owedPlan(Array.from({ length: n }, (_, i) => ({ kind: 'review', prNumber: 100 + i, attempts: 0 })));

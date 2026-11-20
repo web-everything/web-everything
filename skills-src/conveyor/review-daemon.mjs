@@ -1501,8 +1501,34 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     }
     return livePrs.get(key);
   };
-  let queueSize;
-  try { queueSize = redTeamDispatchQueue?.entries?.().length; } catch { /* unknown queue lends the reserve back */ }
+  const queueOff = () => ['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase());
+  // Restore persisted work before the first budget read after a daemon restart.
+  if (!queueOff() && !redTeamDispatchQueue) {
+    try { log.error(`review-daemon: red-team queue on (source: ${process.env.WE_RED_TEAM_DISPATCH_QUEUE === undefined ? 'default' : 'env WE_RED_TEAM_DISPATCH_QUEUE'})`); }
+    catch { /* Diagnostics must not interrupt admission. */ }
+    redTeamDispatchQueue = createRedTeamDispatchQueue({ log: line => log.error(line) });
+  }
+  let inventoryComplete = true;
+  let queueReadFailed = false;
+  const queueSize = () => {
+    if (queueOff() || !inventoryComplete) return 0;
+    try {
+      return redTeamDispatchQueue.entries().filter(entry => {
+        // Persisted blocks are validated by the queue reader and consume probe turns, not worker slots.
+        if (entry.blocked !== undefined) return false;
+        if (!livePrs.has(entry.key)) return true; // Restored work, before this tick's reconciliation.
+        const pr = livePrs.get(entry.key);
+        return pr?.state === 'OPEN' && pr.isDraft !== true && pr.headRefOid === entry.head && Array.isArray(pr.comments);
+      }).length;
+    } catch (error) {
+      if (!queueReadFailed) {
+        queueReadFailed = true;
+        try { log.error(`review-daemon: red-team reserve queue unreadable; lending reserve back: ${String(error?.message ?? error).split('\n')[0]}`); }
+        catch { /* Diagnostics must not interrupt admission. */ }
+      }
+      return undefined;
+    }
+  };
   const options = {
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
@@ -1510,11 +1536,12 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
-    reconcileRedTeamQueue: ({ inventoryComplete = true } = {}) => {
+    reconcileRedTeamQueue: ({ inventoryComplete: complete = true } = {}) => {
       livePrs.clear();
-      if (['off', '0', 'false', 'no'].includes(String(process.env.WE_RED_TEAM_DISPATCH_QUEUE ?? '').trim().toLowerCase())) return;
+      inventoryComplete = complete;
+      if (queueOff()) return;
       redTeamDispatchQueue ??= createRedTeamDispatchQueue({ log: line => log.error(line) });
-      if (!inventoryComplete) return;
+      if (!complete) return;
       // Maintenance evicts terminal PRs and re-keys changed live heads.
       redTeamDispatchQueue.reconcile({ readLivePr: readQueuePr });
     },
@@ -1981,9 +2008,18 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
     const value = overrides?.values?.['redTeam.queue.reservedSlots'];
     if (overrides?.readable !== false && Number.isInteger(value) && value >= 0 && value <= 8) reservedSlots = value;
   } catch { /* unreadable override uses the default reserve */ }
-  const reserve = Number.isInteger(queueSize) && queueSize > 0 ? Math.min(reservedSlots, queueSize, max) : 0;
-  return { left: Math.max(0, max - live), live, max, countedJobPids, reserve,
-    reason: `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})${reserve > 0 ? `; red-team reserve ${reserve}` : ''}` };
+  // CLI supplies a reader so maintenance/dispatch can change runnable membership within this tick.
+  // Keep the process snapshot and shared `left` balance intact across those queue changes.
+  const reserve = () => {
+    const size = typeof queueSize === 'function' ? queueSize() : queueSize;
+    return Number.isInteger(size) && size > 0 ? Math.min(reservedSlots, size, max) : 0;
+  };
+  return { left: Math.max(0, max - live), live, max, countedJobPids,
+    get reserve() { return reserve(); },
+    get reason() {
+      const slots = reserve();
+      return `live review rounds ${live} of maxLiveReviewRounds=${max} (${src})${slots > 0 ? `; red-team reserve ${slots}` : ''}`;
+    } };
 }
 
 export function buildCliDaemonEffects({
