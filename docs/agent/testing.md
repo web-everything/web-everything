@@ -5198,3 +5198,13 @@ Captured `gh pr view` file lists may omit additions/deletions. Positive overlap-
 controls must supply a larger target diff explicitly, otherwise both sizes are zero
 and no yield is exercised. Targets in dependency controls must also be enqueue-eligible
 (e.g. `review:accepted` rather than `review:pending`) so the test reaches dependency logic.
+
+
+## Urgent drain soak registration and isolation queue evidence
+
+`drain-urgent-behind-parked` registers expected failure from static source patterns only;
+keep its behavioural probe in `run()`, so a regression cannot select `it.fails`.
+Unreadable source must throw. During isolation release, unreadable queue facts retain
+the hold and defer until the next pass; the ordinary best-effort admission catch stays unchanged.
+Run its soak test with `vitest.soak.config.ts`, and the isolation-hold, batching and
+enqueue-on-event unit tests with the default config, all through heavy-admission.

@@ -80,6 +80,33 @@ describe('isolation hold', () => {
 
 // Exercise the production reader, rather than only injecting core eligibility.
 describe('isolation hold live suspect reader', () => {
+  it.each(['throw', 'invalid JSON', 'missing queue', 'partial queue'])('defers release and keeps isolation when queue evidence is %s', failure => {
+    const state = isolation();
+    const before = structuredClone(state);
+    const logs = [];
+    const shell = createAdaptiveBatching({ repo: 'owner/repo', settings, dryRun: true,
+      nowMs: () => nowMs, readFile: () => JSON.stringify(state), log: line => logs.push(line),
+      exec: (_cmd, args) => {
+        expect(args).toContain('graphql');
+        if (failure === 'throw') throw new Error('queue read failed');
+        if (failure === 'invalid JSON') return '{';
+        return JSON.stringify({ data: { repository: { mergeQueue: { entries: failure === 'missing queue'
+          ? {} : { nodes: [], pageInfo: { hasNextPage: true } } } } } });
+      } });
+    expect(shell.gate(7183)).toMatchObject({ admit: false,
+      reason: expect.stringContaining('isolation hold retained'), error: expect.any(String) });
+    expect(state).toEqual(before);
+    expect(logs).toContainEqual(expect.stringContaining('isolation hold retained'));
+    expect(shell.gate(7193).admit).toBe(false);
+  });
+
+  it('preserves fail-open queue reads without an isolation hold', () => {
+    const shell = createAdaptiveBatching({ repo: 'owner/repo', settings, dryRun: true,
+      readFile: () => JSON.stringify(initialBatchingState()), log: () => {},
+      exec: () => { throw new Error('queue read failed'); } });
+    expect(shell.gate(7183)).toMatchObject({ admit: true, error: 'queue read failed' });
+  });
+
   it.each(['red-team:pending', 'review:pending', 'parked', 'hold'])('releases other work on live %s and holds again when it clears', label => {
     const suspect = readSuspect();
     const shell = createAdaptiveBatching({ repo: 'owner/repo', settings, dryRun: true,

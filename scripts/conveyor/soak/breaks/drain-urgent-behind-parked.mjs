@@ -1,5 +1,6 @@
 /** Regression: catch-up must prioritise urgent work and never park it behind an ineligible overlap target. */
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -54,9 +55,24 @@ export default {
   card: 'drain-priority-label-prep acceptances 1, 2 and 3',
   fixedBy: { sha: 'pending', where: 'drain priority and pass-local eligibility', paths: [
     'scripts/lib/enqueue-on-event.mjs', 'scripts/conveyor/overlap-yield-enqueueable.mjs', 'scripts/merge-ai-prs.mjs',
+    'scripts/lib/merge-queue-adaptive-batching.mjs',
   ] },
-  // Behaviour decides expected failure; a broken probe must fail before registration.
-  fixPresent(root) { return probe(root).violations.length === 0; },
+  // Registration checks source only: a behavioural regression must fail run(),
+  // never select it.fails. Read every source eagerly so unreadable files throw.
+  fixPresent(root) {
+    const [enqueue, overlap, batching] = [
+      'scripts/lib/enqueue-on-event.mjs',
+      'scripts/conveyor/overlap-yield-enqueueable.mjs',
+      'scripts/lib/merge-queue-adaptive-batching.mjs',
+    ].map(path => readFileSync(join(root, path), 'utf8'));
+    return /^\s*override: priority\?\.mode === 'enforce' && pr\.urgentLabelVerified === true && pr\.labels\?\.some\(label => label\.name === 'priority:urgent'\) \? \{ value: 'urgent', byOperator: true \} : undefined,/m.test(enqueue)
+      && /^\s*if \(\['BEHIND', 'BLOCKED', 'DIRTY', 'DRAFT', 'HAS_HOOKS', 'UNSTABLE'\]\.includes\(row\.mergeStateStatus\)\) return false;/m.test(overlap)
+      && /^\s*if \(!row\.requiredCheckGreen \|\| !labels\.has\('ready-to-merge'\)/m.test(overlap)
+      && /'parked', 'hold'\]\.some\(\(label\) => labels\.has\(label\)\)/.test(overlap)
+      && /^\s*const enqueueEligibility = new Map\(\);/m.test(batching)
+      && /enqueueEligibility\.set\(suspect, false\)/.test(batching)
+      && /admitEnqueue\(\{ state, num, nowMs: nowMs\(\), settings, inQueue: facts\.inQueue, priorityClass, enqueueEligibility \}\)/.test(batching);
+  },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     return probe(root);

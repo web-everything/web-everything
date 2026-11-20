@@ -475,8 +475,15 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
       try {
         const facts = readQueueFacts({ repo, exec });
         if (facts.error) {
-          // Fail open, except for a PR seen in the queue: it may have been ejected.
-          if (load().groups.some(g => active(g) && g.seen?.includes(num))) {
+          const state = load();
+          // Releasing isolation requires readable queue evidence. Retry next pass.
+          if (state.isolate.length > 0) {
+            const reason = 'queue unreadable; isolation hold retained — retry next drain pass';
+            say(`merge-queue batching: defer #${num} (${reason})`);
+            return { admit: false, reason, error: facts.error };
+          }
+          // Otherwise fail open, except for a PR seen in the queue: it may have been ejected.
+          if (state.groups.some(g => active(g) && g.seen?.includes(num))) {
             warn(facts.error);
             return { admit: false, reason: `#${num} was seen in the queue; queue unreadable`, error: facts.error };
           }
