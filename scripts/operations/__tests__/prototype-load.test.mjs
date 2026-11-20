@@ -3363,6 +3363,17 @@ describe('default test check-run reader (production wiring)', () => {
     expect(await failed.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail: 'ci-failed-urgent' });
     expect(mutations(failed, 'add')).toHaveLength(0);
   });
+  // The conflict exemption covers only "no check named test at all"; every other CI refusal still stops a conflicting head.
+  it.each([
+    ['a foreign-app test check', { checks: { total_count: 1, check_runs: [run({ app: { id: 999 } })] } }, 'ci-test-check-missing'],
+    ['an unbound workflow', { runs: { total_count: 1, workflow_runs: [wf({ path: '.github/workflows/other.yml' })] } }, 'ci-workflow-unbound'],
+    ['incomplete checks', { checks: { total_count: 2, check_runs: [run()] } }, 'ci-checks-unreadable'],
+    ['an unreadable checks API', { fail: 'checks' }, 'ci-checks-unreadable'],
+  ])('still refuses a conflicting head with a valid receipt on %s', async (_, options, detail) => {
+    const f = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), ...options });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, detail });
+    expect(f.readyWrites).toEqual([]); expect(mutations(f, 'add')).toHaveLength(0);
+  });
   it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])(
     'urgent refuses a pending suite plus another suite completed with %s', async conclusion => {
       const f = ghFixture({ urgentLedger: urgentReceipt(), checks: { total_count: 2, check_runs: [

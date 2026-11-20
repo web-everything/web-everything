@@ -523,7 +523,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       // Only an exact-sha successful `test` check-run can produce fresh readiness.
       // Injected runners must return {sha, name, status, conclusion}; missing integration fails closed.
       let urgentCiFailed = false;
-      let prConflict, conflict;
+      let prConflict, conflict, noTestCheckAtAll = false;
       let ciRefusal = null;
       const noCi = (detail, fallback) => { ciRefusal = { detail, fallback }; return null; };
       const readTestCheck = testCheck || (({ sha }) => {
@@ -578,7 +578,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
           throw new Error('malformed, incomplete or oversized CI checks');
         const evidence = testCheckEvidence(data, sha);
-        if (!evidence) return noCi('ci-test-check-missing', 'Complete the GitHub Actions test check on this SHA and retry.');
+        // Only "no check named test at all" can be the no-CI-run signature of a conflicting head; a test check
+        // from another app, or on another sha, is mis-bound evidence and must keep refusing.
+        if (!evidence) { noTestCheckAtAll = !data.check_runs.some(r => r.name === 'test');
+          return noCi('ci-test-check-missing', 'Complete the GitHub Actions test check on this SHA and retry.'); }
         // Bind the check to the expected workflow file via its suite -> workflow run; any failed read refuses.
         noCi('ci-workflows-unreadable', 'Repair the workflow-runs reader and retry with complete evidence (at most 100 runs).');
         const runs = origin.gh(['api', `repos/${origin.repo}/actions/runs?head_sha=${sha}&per_page=100`]);
@@ -613,7 +616,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         // A confirmed merge conflict never gets a CI run, so a missing test check is expected there; every other
         // CI refusal (unreadable, unbound, failed) still blocks the urgent path.
         if (ciRefusal && ciRefusal.detail !== 'ci-api-unavailable'
-          && !(prConflict && ciRefusal.detail === 'ci-test-check-missing')) return stop('no-ready', ciRefusal);
+          && !(prConflict && noTestCheckAtAll && ciRefusal.detail === 'ci-test-check-missing')) return stop('no-ready', ciRefusal);
         let ledger, shards, expectedSteps, origin;
         try {
           origin = normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin'));
