@@ -6176,6 +6176,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     if (options.forceRefresh || options.runConclusion === 'startup_failure') {
       try {
         if (cardGrouping.inGroup(v)) throw Error('open card group owns this head');
+        // Membership needs readable evidence; the shared hold also refuses unknown group state.
+        const groupHold = cardGrouping.holdFor(v);
+        if (groupHold) throw Error(`card group holds this head (${groupHold.reason}); retry after group state clears`);
         const live = await fetchFreshPrForRevalidation(v.repo, v.num);
         if (!live || live.headRefOid !== options.expectedHead
           || classifyPr({ ...live, mergeStateStatus: 'CLEAN' }, { requiredCheck: REQUIRED,

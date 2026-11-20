@@ -489,14 +489,22 @@ describe('failed-gate trigger through the real drain', () => {
 });
 
 
-it('failed-gate trigger keeps card-group membership stable', () => world(async ({pr,run,dir,slug}) => {
+it.each(['source', 'combined', 'unreadable'])('failed-gate trigger holds %s card-group state without consuming the retry', role => world(async ({pr,run,dir,slug}) => {
   failedGatePr(pr);
   const state = join(dir,'groups.json');
-  writeFileSync(state, JSON.stringify({groups:[{id:'fixture',repo:slug,pr:77,branch:'lane/card-group-fixture',createdAt:Date.now(),
-    sources:[{num:42,headSha:sha}],files:['backlog/xfixture.md']}],failed:{},lastReconcileAt:Date.now()}));
-  const out = await run(false, {env:{...repairEnv,WE_DRAIN_CARD_GROUP_STATE:state}});
+  writeFileSync(state, role === 'unreadable' ? '{broken' : JSON.stringify({groups:[{id:'fixture',repo:slug,
+    pr:role === 'combined' ? 42 : 77,branch:role === 'combined' ? pr.headRefName : 'lane/card-group-fixture',createdAt:Date.now(),
+    sources:[{num:role === 'source' ? 42 : 99,headSha:sha}],files:['backlog/xfixture.md']}],failed:{},lastReconcileAt:Date.now()}));
+  const env = {...repairEnv,WE_DRAIN_CARD_GROUP_STATE:state};
+  const out = await run(false, {env});
   expect(refreshPushes(out.calls)).toEqual([]);
-  expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree')).toBe(false);
+  expect(out.calls.some(a => a[0] === 'git' && a[1] === 'commit-tree' || a[0] === 'node'), JSON.stringify(out.calls)).toBe(false);
+  expect(out.report.revalidationAborted).toEqual([expect.objectContaining({reason:expect.stringContaining('card group')})]);
+  // A hold must leave the once-per-head repair available when ownership is released or state repaired.
+  writeFileSync(state, JSON.stringify({groups:[],failed:{},lastReconcileAt:Date.now()}));
+  const released = await run(false, {env});
+  expect(refreshPushes(released.calls)).toHaveLength(1);
+  expect(released.report.merged).toEqual([]);
 }));
 
 it('failed-gate trigger retains an approved human-surface head through refreshApprovedHeadChecked', () => world(async ({pr,run}) => {
