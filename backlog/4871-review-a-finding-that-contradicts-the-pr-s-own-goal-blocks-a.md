@@ -3,10 +3,8 @@ bornAs: xobzl5d
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/lib/jury-core.mjs", "we:skills-src/jury/panel-fanout.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs", "we:skills-src/jury/__tests__/panel-fanout.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs"]
+
 dateOpened: "2026-10-01"
-preparedDate: "2026-10-03"
-preparedAgainstSha: "a4687bea96bcde71038823a9ffeee3ff774c04f2"
 tags: []
 ---
 
@@ -77,3 +75,12 @@ Replay the #3215 finding (reconstructed from the card text, since the original J
 1. **Executable** — vitest on every test file in this card's scope: we:scripts/lib/__tests__/jury-core.test.mjs, we:scripts/lib/__tests__/review-loop-policy.test.mjs, we:scripts/operations/__tests__/review-loop-cli.test.mjs, we:skills-src/jury/__tests__/panel-fanout.test.mjs and we:scripts/operations/__tests__/review-pr.test.mjs passes with the #3215 replay, the schema-parity, filing, intersection, no-file and injection cases, and fails before this item lands.
 2. **Must (error path)** — a filing call that errors never undoes a recorded accept (the only new obligation here; fail-closed normalization already holds), pinned by the CLI filing-failure case in Done-when #1's executable.
 3. **Must (non-code inputs)** — `contradictsGoal` is keyed on the finding, not the file type, so a finding on a docs/config/data file blocks the same way; one test uses a `.md` file.
+
+## Findings (standalone worker, 2026-11-19)
+
+The build-dispatch daemon held #4871 with:
+
+> worker-declined: Not prepared: #4871 — could-not-prepare. The card requires filing failures to preserve acceptance, but 'we:docs/agent/platform-decisions.md:6650' ('#post-accept-advisory-cards') requires failed filing to keep the PR parked, one card per PR, and staged activation. The unresolved choice is whether #4871 follows that ratified policy or explicitly requests an exception. I cannot choose that policy change during preparation. No files changed or stamps added. No tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
