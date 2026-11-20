@@ -611,6 +611,14 @@ describe('R1053 prove mode', () => {
       numstatText: () => '1\t1\tx.mjs\n', fileCard: vi.fn(({ expedite }) => expedite ? { written: true, expedite: true, needsYou: true } : true) });
     return f;
   }
+  it.each(['\u2028', '\u2029', '\r', '\r\n', '\n'])('refuses to append an exemption with a contradictory verdict after separator %j', async separator => {
+    const f = proof();
+    f.deps.runCodex = () => `WEAKENED\n${finding}${separator}\u200bＷＥＡＫＥＮＥＤ`;
+    expect(await main([...ARGS, '--json'], f.deps)).toBe(1);
+    expect(JSON.parse(f.output.join(''))).toMatchObject({ verdict: 'WEAKENED', preExisting: [] });
+    expect(f.deps.appendRecord).not.toHaveBeenCalled();
+    expect(f.errors.join('')).toContain('contradictory');
+  });
   it.each([undefined, false, 'true'])('disabled or missing exemption %j retains all findings and records shadow evidence', async enabled => {
     const f = proof();
     if (enabled === undefined) delete f.deps.preExistingExemptionEnabled;

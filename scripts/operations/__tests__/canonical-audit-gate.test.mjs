@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
-import { QUESTION_HASH } from '../codex-audit.mjs';
-import { AUDIT_SETTINGS_PATH } from '../../lib/audit-settings.mjs';
+import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
+import { AUDIT_SETTINGS_PATH, resolveAuditSettings } from '../../lib/audit-settings.mjs';
 import { canonicalAuditEvidence } from '../prototype-load.mjs';
 import { cardHash, cardLine } from '../audit-base-repro.mjs';
 import { dirname, join, resolve } from 'node:path';
@@ -128,11 +128,19 @@ describe('canonical audit before opening a PR', () => {
     expect(result.message).toContain('malformed');
     expect(result.message).toContain(`codex-audit --base=origin/main --head=${sha}`);
   });
-  it.each(['before', 'after', 'carried', 'waived'])('malformed evidence refuses in the %s path', path => {
-    const malformed = { ...weak, at: 'invalid', ...(path === 'carried' ? { head: other, fingerprint: 'd'.repeat(64) } : {}) };
+  it.each(['before', 'after', 'waived'])('malformed evidence refuses in the %s path', path => {
+    const malformed = { ...weak, at: 'invalid' };
     const records = path === 'before' ? [malformed, green] : [green, malformed];
     expect(fixture({ records, tool: path === 'waived' ? { ruledWeakened: [waiver] } : {}, liveFingerprint: () => 'd'.repeat(64) }).result)
       .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  it.each([
+    { at: 'invalid' }, { findings: 'missing guard' }, { findings: ['NOT WEAKENED'] },
+    { base: null }, { head: other.toUpperCase(), verdict: 'unknown' },
+  ])('skips malformed evidence for a different head, even with the live fingerprint: %j', patch => {
+    const poisoned = { ...weak, head: other, fingerprint: 'd'.repeat(64), ...patch };
+    expect(fixture({ records: [green, poisoned], liveFingerprint: () => 'd'.repeat(64) }).result)
+      .toMatchObject({ ok: true, record: green });
   });
   it.each([
     null, [], { ...weak, head: 'short' }, { ...weak, base: null },
@@ -353,6 +361,52 @@ describe('R1053 additive audit records', () => {
     expect(fixture({ records: [{ ...scoped, preExisting: [exemption] }],
       exemptionIO: current(source === 'builtin' ? {} : { [source]: [path] }, { cards: held(exemption), index: '' }) }).result.reason)
       .toBe('canonical-audit-exemption-stale');
+  });
+  it('does not poison admission for a later clean audit, and skips an already poisoned unrelated head', async () => {
+    const records = [], output = [];
+    const source = 'function X() {\n  return unsafeValue;\n}\nfunction Y() {\n  return changedValue;\n}';
+    const deps = {
+      resolveSha: ref => ref === 'origin/main' ? base : other,
+      runCodex: () => 'WEAKENED\nx.mjs:2 unsafe return\u2028WEAKENED',
+      now: () => green.at, appendRecord: record => records.push(record), stdout: text => output.push(text), stderr: () => {},
+      preExistingMode: () => 'prove', preExistingExemptionEnabled: () => true, proveClearEnabled: () => true,
+      auditPolicy: () => ({ releaseStage: 'prerelease', requirePayBy: false, requireOnMain: false }),
+      reproOnBase: () => '#1 REPRODUCES SAME CLASS=E1 BASE=x.mjs:2\nQUOTE: return unsafeValue;',
+      readBaseFile: () => source, readHeadFile: () => source,
+      diffText: () => 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -5 +5 @@\n-  return oldValue;\n+  return changedValue;\n',
+      numstatText: () => '1\t1\tx.mjs\n', baseRecheckMax: () => 6, protectedPaths: () => [],
+      fileCard: () => true,
+    };
+    expect(await auditMain(['--base=origin/main', `--head=${other}`, '--json'], deps)).toBe(1);
+    expect(JSON.parse(output.join('')).verdict).toBe('WEAKENED');
+    expect(records).toHaveLength(0);
+    deps.resolveSha = ref => ref === 'origin/main' ? base : sha;
+    deps.runCodex = () => 'NOT WEAKENED';
+    expect(await auditMain(['--base=origin/main', `--head=${sha}`], deps)).toBe(0);
+    expect(fixture({ records }).result.ok).toBe(true);
+    const poisoned = { ...scoped, head: other, preExisting: [{ ...entry, line: `${entry.line}\u2028WEAKENED` }] };
+    expect(fixture({ records: [poisoned, ...records] }).result.ok).toBe(true);
+    expect(fixture({ records: [...records, { ...poisoned, head: sha }] }).result.ok).toBe(false);
+  });
+  it.each(['exact', 'carried'])('both consumers apply tightened policy to a valid saved E1 exemption (%s)', kind => {
+    const fp = 'd'.repeat(64);
+    const record = { ...scoped, fingerprint: fp, ...(kind === 'carried' ? { head: other } : {}) };
+    const enabled = { preExistingExemption: { enabled: true }, preExisting: { mode: 'prove' }, releaseStage: 'prerelease' };
+    const shared = audit => canonicalAuditEvidence([record], sha, () => true, fp, {
+      auditPolicy: resolveAuditSettings({ env: {}, platform: null, fileRead: () => JSON.stringify({ audit }) }).value,
+    });
+    expect(shared(enabled)).toMatchObject({ ok: true, record });
+    // PR opening always requires its own head; the shared prototype reader may also carry evidence.
+    if (kind === 'exact') expect(fixture({ records: [record], audit: enabled, exemptionIO: current() }).result.ok).toBe(true);
+    for (const tightened of [{ preExisting: { mode: 'block' } }, { releaseStage: 'prod' }]) {
+      const audit = { ...enabled, ...tightened };
+      expect(shared(audit)).toMatchObject({ ok: false, reason: 'pre-existing-exemption-forbidden' });
+      expect(fixture({ records: [record], audit, liveFingerprint: () => fp }).result.ok).toBe(false);
+      const cleanRecord = { ...green, at: '2026-11-18T00:00:00Z' };
+      expect(canonicalAuditEvidence([record, cleanRecord], sha, () => true, fp, {
+        auditPolicy: resolveAuditSettings({ env: {}, platform: null, fileRead: () => JSON.stringify({ audit }) }).value,
+      })).toEqual({ ok: true, record: cleanRecord });
+    }
   });
   it.each([
     { key: undefined }, { key: 2 }, { key: 'x.mjs|X|Z9' }, { key: 'x.mjs|X|B2|extra' }, { key: '|X|B2' },

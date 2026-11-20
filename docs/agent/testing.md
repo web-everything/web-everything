@@ -4599,6 +4599,14 @@ still list them. Changed live heads are re-keyed in place with attempts and bloc
 unreadable evidence keeps entries, logs the failure, and defers admission. Reconciliation
 runs inside the dispatch transaction so a thrown runner rolls back eviction and re-keying.
 Planner skips retain the existing bounded, fair probe rotation.
+The `red-team-queue-verdict-evict` break also replays decided-head eviction: use
+`isPublishableRedTeamResult(redTeamForHead(...))` over complete trusted comments,
+then require readable carry/status/outbox evidence with no settlement owed and a
+confirmed completed check (success or failure). Missing checks, unfinished carries,
+unpublished carried checks, pending labels and unreadable evidence keep recovery queued.
+Readable live fixtures must supply `comments: []` when no result exists; missing
+comment evidence retains the entry and defers admission. Decided heads must stay
+evicted when stale planner candidates return, including the card-only bypass.
 Run the soak `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
 
 ## Timeout evidence synchronous worker pool
@@ -4798,6 +4806,43 @@ model finding text. A confirmed held card satisfies existence (D5). Security fix
 for every B class must supply separate `written`, `expedite`, and `needsYou` confirmations,
 and exercise a persisted-card write that drops the needs-you line. Keep the block-mode
 stdout/record golden unchanged when changing proof-mode policy.
+
+Saved exemptions must pass the current enabled, `prove`, and `prerelease` checks in
+`canonicalAuditEvidence`, so prototype loading and PR opening enforce the same policy.
+Apply the policy to the selected record: a fresh clean audit can replace old exemption
+evidence. Before appending, the audit writer checks the computed verdict against both
+remaining findings and `preExisting.line`, using the same contradiction detector as
+`findAudit`. Preserve CR boundaries before stripping controls; check LF, CRLF, U+2028,
+U+2029, fullwidth verdicts and invisible characters. Contradictory exemptions return
+`WEAKENED` without writing a ledger record and name retry or human review as recovery.
+PR opening skips malformed records with a full, known different head, including records
+with a matching fingerprint. Malformed records for the current head, ambiguous identities,
+and unreadable JSON lines still refuse admission. Valid carried WEAKENED evidence still vetoes.
+
+Live fixture replay, 2026-11-19 (PR #7089 operator send-back): the actual audit `main`
+wrote a temporary JSONL ledger, and the actual `checkCanonicalAuditForOpen` read it.
+Commit resolution, main coverage, Codex output and trusted settings were injected;
+no network or production ledger was used. The source fixture keeps `X` unchanged and
+changes only `Y`, with a confirmed B2 SAME proof and security-card receipt. The model
+answer was `WEAKENED\nx.mjs:2 unsafe return\u2028WEAKENED`.
+
+```text
+Before:
+item1 {"exitCode":0,"verdict":"NOT WEAKENED","recordsWritten":1,"laterCleanOpens":false,"prePoisonedCleanOpens":false}
+item2 {"prove":{"prototype":true,"open":true},"block":{"prototype":true,"open":false},"prod":{"prototype":true,"open":false}}
+After:
+item1 {"exitCode":1,"verdict":"WEAKENED","recordsWritten":0,"laterCleanOpens":true,"prePoisonedCleanOpens":true}
+item2 {"prove":{"prototype":true,"open":true},"block":{"prototype":false,"open":false},"prod":{"prototype":false,"open":false}}
+```
+
+For item 2 the fixture first saved a valid B2 exemption under enabled/prove/prerelease,
+then tightened only the mode or only the stage. `prototype` is the shared evidence
+reader used by prototype-load; `open` is the PR-opening gate. The regression cases
+live in `codex-audit.test.mjs` (separator variants) and `canonical-audit-gate.test.mjs`
+(writer-to-admission, existing poison, current policy for exact and carried evidence,
+and clean re-audit recovery). A before-only local run reported 13 failures and 296
+passes. Under the fix launcher's proof-only protocol, the launcher owns the unit
+after-run; direct fixture replay above supplies the observed behavior after repair.
 ## Stuck trace isolation
 
 The stuck-trace node:test fixtures inject both operations and the event sink. Keep
@@ -4852,6 +4897,21 @@ directory resolution, must return the drain context unchanged on exceptions.
 For every bounded-read risk, the test plan must name a regression counting actual read attempts
 or asserting the read range, including the default shared budget across repositories. Inject a
 failure after a successful staged read to prove no partial completeness can be published.
+Index verification payloads may serve the bounded fallback only after rechecking the file
+identity captured before the read (mtime, device, inode, size, ctime and birthtime). Changed
+identities discard cached payloads and read errors; fresh attempts still consume the shared
+parse budget. The unchanged one-read fallback and unchanged-mtime atomic-replacement cases
+in `review-run-index.test.mjs` pin both reuse and stale-cache refusal for drain and recovery.
+Both backfills must count payload attempts before calling the reader and retain that count
+outside staging, so aborts, listing churn and failed persistence cannot refund the shared
+50-read drain budget. The `%s backfill preserves payload spend after %s` cases and the
+`an aborted open-PR backfill leaves only the actual remainder after %s` drain cases pin this
+accounting. The open pass receives at most 25 of the shared 50 reads; unused reads go
+to the full pass, which always has at least 25 reads when the open pass obeys its cap.
+Unknown spend exhausts the open allocation, preserving the full pass's reservation.
+The repeated saturated-tick regression in `merge-ai-prs-review-backfill.test.mjs`
+pins full-pass completion without exceeding the shared budget. The bounded evidence scan and scan-capped HOLD
+remain the fallback until a later tick can complete discovery.
 Keep the lost-append, poison, complete-hit, churn, cooldown, budget and wiring regressions in `review-run-index.test.mjs`, run alongside `drain-red-team-evidence.test.mjs`
 through heavy admission.
 ## Fast-drain round listing and live target refresh
@@ -5192,6 +5252,27 @@ repaired bare-paths: blocking=false, publishable=true
 repaired card finding: we:blocks/widget.ts:2 unsafe return; we:backlog/debt.md
 ```
 
+
+## Negative review-run proofs
+
+`headNeverReviewedFromRuns` may bypass its 400-run scan only through
+`readCompleteReviewRunsForPr`: an all-PR backfill watermark, acknowledged poison
+markers, stat-only listing verification, and no overflow or eviction for that PR.
+The full-backfill verified staging state lives in the index and uses the same identity
+reconciliation and bad-record cooldown as the open-PR backfill, parsing at most 50
+records per call by default. Concurrent writes requeue only changed identities; a bad
+or unreadable record blocks the global watermark while other candidates advance.
+Open-PR hint refreshes must preserve that staging state and proof.
+Full completeness includes a SHA-256 digest of the rebuilt entries and eviction
+markers. Readers and the backfill reuse path reject a missing or mismatched digest:
+deleting a PR key, dropping one row, or losing an eviction marker cannot preserve
+the proof. Old snapshots without the digest require a new bounded full pass.
+Appends never reseal a proof; only a completed rebuild writes the digest. This
+checks persisted consistency, not authenticity against a writer forging the whole index.
+Unverifiable indexed identities return to the original capped scan; they never
+establish absence. Keep bounded resumption, a 3,012-file snapshot, eviction, poison
+races, and capped negative fallbacks in `review-run-index.test.mjs`, alongside the
+existing `redteam-pending-settle` and `review-red-team-on-skip` suites.
 ## Forge sweep partial work
 
 `forge-exec-sweep.mjs` shares `slots.scanEntryBound` (integer 1000–1000000, default 200000) between
@@ -5206,3 +5287,14 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## Open-pr preflight
+
+`open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
+or writing bypass receipts. `pr-land-preflight.test.mjs` runs the actual CLI with gate/forge ports replaced and
+records push/create/card effects. A real refusal uses the same checkpoint. PR-limit refusal is a check-only
+blocker hint: a real open evaluates capacity after pushing and leaves the ref pushed when refusing.
+Park opens ready for review; draft-promotion still handles older drafts.
+
+Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
+`main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
+`open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.

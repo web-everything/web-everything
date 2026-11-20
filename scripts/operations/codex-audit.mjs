@@ -206,18 +206,32 @@ export async function main(argv, deps) {
     let verdict = lines.shift();
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
-    let findings = lines.filter(line => line.trim()).map(clean);
+    const prove = deps.preExistingMode?.() === 'prove' && verdict === 'WEAKENED';
+    // Preserve CR boundaries in proof mode before stripping controls; keep default block formatting unchanged.
+    const modelFindings = lines.filter(line => line.trim()).map(line => clean(prove ? line.replace(/\r/g, '\n') : line));
+    let findings = modelFindings;
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
-    if (deps.preExistingMode?.() === 'prove' && deps.proveClearEnabled?.() === true && verdict === 'WEAKENED') {
+    if (prove && deps.proveClearEnabled?.() === true) {
       Object.assign(result, await proveFindings(findings, base, head, deps));
       ({ verdict, findings } = result);
     }
     // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
     let fingerprint = null;
     try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
+    const record = { at: deps.now(), base, head, baseRef: flags.base,
+      questionHash: QUESTION_HASH, verdict, findings, ...(result.modelVerdict ? { modelVerdict: result.modelVerdict, findingKeys: result.findingKeys, preExisting: result.preExisting, ...(result.shadowPreExisting ? { shadowPreExisting: result.shadowPreExisting } : {}) } : {}), ...(fingerprint ? { fingerprint } : {}) };
+    const retainedLines = [...record.findings, ...(record.preExisting ?? []).map(f => f.line)];
+    // Use the reader's contradiction check after proof changes the verdict. A repeated model verdict also
+    // makes a partial exemption ambiguous when CR/LF split it into a separate, still-blocking finding.
+    if (hasConflictingVerdict(record.verdict, retainedLines)
+      || (record.preExisting?.length && hasConflictingVerdict('NOT WEAKENED', modelFindings))) {
+      deps.stderr('Audit exemption contains contradictory verdict text; no record written. Retry or request human review of the full diff.\n');
+      Object.assign(result, { verdict: 'WEAKENED', findings: modelFindings, preExisting: [], findingKeys: [] });
+      deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${['WEAKENED', ...modelFindings].join('\n')}\n`);
+      return 1;
+    }
     try {
-      await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings, ...(result.modelVerdict ? { modelVerdict: result.modelVerdict, findingKeys: result.findingKeys, preExisting: result.preExisting, ...(result.shadowPreExisting ? { shadowPreExisting: result.shadowPreExisting } : {}) } : {}), ...(fingerprint ? { fingerprint } : {}) });
+      await deps.appendRecord(record);
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;

@@ -36,7 +36,7 @@ export default {
           { name: 'test', status: 'COMPLETED', conclusion: scenario === 'real CI failure' ? 'FAILURE' : 'SUCCESS' }] };
       const prs = excusePrMergeGateHolds([pr], { repo: 'owner/repo', mergeGateSetting: 'on',
         readMergeGateVerdict: args => readMergeGateVerdict({ ...args, cache: new Map(),
-          runGh: argv => argv[1].endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }) });
+          runGh: argv => argv.at(-1).endsWith('/logs') ? evidence.log : JSON.stringify(evidence.job) }) });
       for (const elapsed of [0, 60000, 120000]) {
         const plan = planReconcile({ prs, requiredChecks, agents: [], advisoryReviewOnHumanHandoff: 'on',
           now: Date.parse('2026-11-18T12:00:00Z') + elapsed, reviewTiming: { startAfter: 'ci-green' } });

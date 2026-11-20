@@ -26,8 +26,8 @@ function validPreExisting(f) {
   try { return findingKey({ file: parts[0], symbol: parts[1], class: parts[2] }) === f.key; } catch { return false; }
 }
 
-// The shared evaluator skips unusable records. At admission, corrupt evidence must
-// refuse before that skip can expose an older pass (including a carried pass).
+// The shared evaluator skips unusable records. Corrupt evidence for the opening head
+// must refuse before that skip can expose an older pass (including a carried pass).
 function wellFormedAudit(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)
     || !validSha(record.head) || !validSha(record.base)
@@ -86,7 +86,7 @@ export function revalidateExemptions(record, { settingsOptions = {}, readFile = 
 }
 
 export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env = process.env,
-  readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, ancestor: ancestorOpt,
+  readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   settingsOptions = {}, readCards, readCard = readCardFromMain, now = Date.now,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
@@ -99,6 +99,20 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     message: 'cannot resolve the PR source to a full 40-hex sha; resolve it with git rev-parse, then run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' };
   const refuse = (reason, detail) => ({ ok: false, reason, record: null, sha: fullSha,
     message: `${detail}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${fullSha}, then retry opening the PR.` });
+  let fetchAttempted = false, fetched = false, fetchError;
+  const fetchMain = () => {
+    if (!fetchAttempted) {
+      fetchAttempted = true;
+      try { (fetchMainOpt || (() => git('fetch', 'origin', 'main')))(); fetched = true; }
+      catch (error) { fetchError = String(error?.stderr || error?.message || error).trim(); }
+    }
+    if (!fetched) throw new Error(`main not refreshed: ${fetchError || 'origin/main fetch unavailable; retry when main can be read'}`);
+  };
+  // A preflight may read refs but must never admit evidence against an unrefreshed main.
+  if (refreshMain) {
+    try { fetchMain(); }
+    catch (error) { return refuse('canonical-audit-missing', error.message); }
+  }
   let records, config, policy;
   try {
     // Same settings source and path resolution as the audit writer (codex-audit-io.mjs): the file beside
@@ -119,7 +133,19 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     } catch {
       return refuse('canonical-audit-missing', 'the audit record file has an unreadable/truncated line');
     }
-    if (!records.every(wellFormedAudit)) {
+    let malformedHead = false;
+    records = records.filter(record => {
+      if (wellFormedAudit(record)) return true;
+      // Only a full, unambiguous foreign head can be isolated. Unknown identities still fail closed.
+      if (typeof record?.head === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(record.head)
+        && record.head.toLowerCase() !== fullSha) {
+        warn(`ignoring malformed canonical audit record for another head ${record.head.toLowerCase()}`);
+        return false;
+      }
+      malformedHead = true;
+      return false;
+    });
+    if (malformedHead) {
       return refuse('canonical-audit-missing', 'the audit record file has a malformed record; inspect and repair the audit record file');
     }
     policy = resolveAuditSettings({ fileRead: readFile, platformRead: readFile, env, log: warn });
@@ -127,14 +153,6 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   } catch {
     return refuse('canonical-audit-missing', `no canonical codex-audit record for ${fullSha} (audit evidence or settings unreadable)`);
   }
-  let fetchAttempted = false, fetched = false;
-  const fetchMain = () => {
-    if (!fetchAttempted) {
-      fetchAttempted = true;
-      try { (fetchMainOpt || (() => git('fetch', 'origin', 'main')))(); fetched = true; } catch { /* no coverage */ }
-    }
-    if (!fetched) throw new Error('origin/main fetch unavailable; retry when main can be read');
-  };
   const ancestor = ancestorOpt || ((base, head) => { git('merge-base', '--is-ancestor', base, head); return true; });
   const covers = base => { try { fetchMain(); return ancestor(base, 'origin/main'); } catch { return false; } };
   const liveFingerprint = liveFingerprintOpt || (evidence => {
@@ -172,9 +190,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   if (evidence.reason === 'pre-existing-exemption-disabled') {
     return refuse('canonical-audit-missing', 'saved pre-existing exemption is disabled by audit settings');
   }
-  // Apply current policy to the selected evidence, so a fresh clean audit can supersede an exemption.
-  if (evidence.ok && evidence.record?.preExisting?.length
-    && (policy.value.releaseStage === 'prod' || policy.value.preExistingMode === 'block')) {
+  if (evidence.reason === 'pre-existing-exemption-forbidden') {
     return refuse('canonical-audit-missing', 'saved pre-existing exemption is forbidden by current audit policy');
   }
   // Evaluate every head's veto first, then require this head's own passing evidence to open.
