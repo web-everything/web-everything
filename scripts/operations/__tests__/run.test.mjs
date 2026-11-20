@@ -253,7 +253,7 @@ describe('runner freshness real repository witnesses', () => {
 });
 
 
-it('real lane slot passes while override cannot suppress the dispatch guard', async () => {
+it('real attached lane slot passes while override cannot suppress the dispatch guard', async () => {
   await withBareOrigin(async ctx => {
     seedCheckout(ctx);
     ctx.seedOriginBranch('main', { 'scripts/drift.mjs': 'export const drift = 1;' });
@@ -264,13 +264,18 @@ it('real lane slot passes while override cannot suppress the dispatch guard', as
     expect(dispatch.status).toBe(1);
     expect(dispatch.stderr).toMatch(/refusing to dispatch|stale/i);
     expect(dispatch.records).toEqual([]);
+    // An ordinary lane is attached; detached open-pr runners need readable lease evidence.
+    // Restore that geometry after the detached dispatch-refusal probe above.
+    ctx.git(['checkout', '--quiet', 'main']);
     const lane = join(ctx.tmp, 'pool', 'web-everything', 'lane-1');
     mkdirSync(dirname(lane), { recursive: true });
     renameSync(ctx.clone, lane);
     const r = runCli({ ...ctx, clone: lane }, ['open-pr', '--json']);
     expect(r.status).toBe(1);
-    expect(r.stdout).toMatch(/cannot plan this PR/);
+    expect(r.stdout, r.stderr).toMatch(/cannot plan this PR/);
     expect(r.stderr).not.toMatch(/Refusing|override/);
+    expect(r.records).toEqual([]);
+    expect(r.calls).toEqual([]);
   });
 }, 120_000);
 
