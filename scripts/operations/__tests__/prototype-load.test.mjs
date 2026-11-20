@@ -634,7 +634,15 @@ describe('prototype-load ruled-WEAKENED admission', () => {
 });
 
 describe('prototype-load canonical audit admission', () => {
-  it.each(['current', 'exemption disabled', 'mode revoked', 'card removed', 'B-class security exemption', 'new protected path', 'unreadable settings'])('revalidates persisted exemptions before loading: %s', kind => {
+  it.each([
+    ['current', null, null],
+    ['exemption disabled', 'pre-existing-exemption-disabled', /codex-audit/],
+    ['mode revoked', 'pre-existing-exemption-forbidden', /codex-audit/],
+    ['card removed', 'exemption-stale', /human review|restore/i],
+    ['B-class security exemption', 'exemption-stale', /human review|restore/i],
+    ['new protected path', 'exemption-stale', /human review|restore/i],
+    ['unreadable settings', 'pre-existing-exemption-disabled', /codex-audit/],
+  ])('revalidates persisted exemptions before loading: %s', (kind, reason, fallback) => {
     const cls = kind === 'B-class security exemption' ? 'B2' : 'E1';
     const key = `x.mjs|X|${cls}`, line = 'x.mjs:2 unsafe return';
     const exemption = { key, line, relation: 'SAME', cardHash: cardHash(key), base: { sha: TREE, path: 'x.mjs', line: 2, quote: 'return unsafe();' } };
@@ -655,10 +663,9 @@ describe('prototype-load canonical audit admission', () => {
       if (kind === 'current') {
         expect(out).toMatchObject({ ok: true, registered: true, canonicalAudit: { ok: true } });
       } else {
-        const disabled = kind === 'exemption disabled' || kind === 'unreadable settings';
         expect(out).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
-          canonicalAudit: { ok: false, reason: disabled ? 'pre-existing-exemption-disabled' : 'exemption-stale' } });
-        expect(out.fallback).toMatch(disabled ? /codex-audit/ : /human review|restore/i);
+          canonicalAudit: { ok: false, reason } });
+        expect(out.fallback).toMatch(fallback);
         expect(mutations(f, 'add')).toHaveLength(0);
       }
     });
