@@ -101,7 +101,7 @@ describe('red-team label settles from the head\'s check', () => {
   describe('sync', () => {
     it('re-reads the check at swap time and refuses a changed fact', () => {
       const live3 = { headRefOid: head, labels: ['red-team:pending'] };
-      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live3), readPrFiles: vi.fn(() => null) };
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live3), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
       const reader = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
       syncRedTeamStatusLabels({ ...input, live: live3, provider, readCheckClear: reader, standingRuling: null });
       expect(reader).toHaveBeenCalledTimes(2);
@@ -110,7 +110,7 @@ describe('red-team label settles from the head\'s check', () => {
     it('production wiring: the default reader runs the real fact over the injected gh', () => {
       const live2 = { headRefOid: head, labels: ['red-team:pending'] };
       const mk = gh => {
-        const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live2), readPrFiles: vi.fn(() => null) };
+        const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live2), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
         syncRedTeamStatusLabels({ ...input, live: live2, provider, gh, standingRuling: null });
         return provider;
       };
@@ -119,21 +119,21 @@ describe('red-team label settles from the head\'s check', () => {
     });
     it('the drain-scan rollback disables the check as evidence', () => {
       const reader = vi.fn(() => true);
-      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live0), readPrFiles: vi.fn(() => null) };
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live0), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
       const live0 = { headRefOid: head, labels: ['red-team:pending'] };
       syncRedTeamStatusLabels({ ...input, env: { ...input.env, WE_RED_TEAM_GATE_SOURCE: 'drain-scan' }, live: live0, provider, readCheckClear: reader, standingRuling: null });
       expect(reader).not.toHaveBeenCalled();
     });
     it('re-verifies the head before removing pending when clear already coexists', () => {
       const both = { headRefOid: head, labels: ['red-team:pending', 'red-team:clear'] };
-      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => both), readPrFiles: vi.fn(() => null) };
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => both), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
       syncRedTeamStatusLabels({ ...input, labels: both.labels, live: both, provider, standingRuling: null,
         readCheckClear: () => { provider.readPrState.mockReturnValue({ headRefOid: old, labels: both.labels }); return true; } });
       expect(provider.setLabels).not.toHaveBeenCalled();
     });
     const live = { headRefOid: head, labels: ['red-team:pending'] };
     const make = readCheckClear => {
-      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live), readPrFiles: vi.fn(() => null) };
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
       return { provider, run: () => syncRedTeamStatusLabels({ ...input, live, provider, readCheckClear, standingRuling: null }) };
     };
     it('writes clear when the check fact is clear', () => {
@@ -147,6 +147,33 @@ describe('red-team label settles from the head\'s check', () => {
         go();
         expect(provider.setLabels).not.toHaveBeenCalledWith('o/n', 42, expect.objectContaining({ add: 'red-team:clear' }));
       }
+    });
+    const brk = [{ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — break` },
+      { author: { login: 'web-everything' }, body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=sent-back -->` }];
+    it('a block arriving during a settle ends up red-team:blocked (a block always wins)', () => {
+      const { provider, run: go } = make(() => true);
+      provider.readComments.mockReturnValue(brk);
+      expect(go().add).toBe('red-team:blocked');
+      expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, expect.objectContaining({ add: 'red-team:blocked' }));
+    });
+    it('a block still wins when the check fact goes false at the re-read', () => {
+      let calls = 0;
+      const { provider, run: go } = make(() => ++calls === 1);
+      provider.readComments.mockReturnValue(brk);
+      go();
+      expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, expect.objectContaining({ add: 'red-team:blocked' }));
+    });
+    it('an unreadable thread at swap time refuses the settle', () => {
+      const { provider, run: go } = make(() => true);
+      provider.readComments.mockImplementation(() => { throw new Error('x'); });
+      go();
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
+    it('a restrictive plan is never delayed by the settle re-read', () => {
+      const reader = vi.fn(() => false);
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => brk) };
+      syncRedTeamStatusLabels({ ...input, live, provider, comments: brk, readCheckClear: reader, standingRuling: null });
+      expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, expect.objectContaining({ add: 'red-team:blocked' }));
     });
     it('refuses when the head moved after the check was read', () => {
       const { provider, run: go } = make(() => { provider.readPrState.mockReturnValue({ headRefOid: old, labels: ['red-team:pending'] }); return true; });

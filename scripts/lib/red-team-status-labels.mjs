@@ -114,8 +114,12 @@ export function readCheckClearFact({ repo, pr, head, env = process.env, gh = cre
 
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
-  provider = createGhProvider(), log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
+  provider: injectedProvider, log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
   gh, readCheckClear = args => (!gh && (isUnderTest() || isUnderTest(env)) ? false : readCheckClearFact({ ...args, env, gh })) } = {}) {
+  const provider = injectedProvider ?? createGhProvider();
+  // Head rechecks decide a label swap, so they read fresh (no gh read memo), like the check reads.
+  const freshGh = createFreshGh(runGhSync, env);
+  const recheck = injectedProvider ?? createGhProvider({ exec: (args, options) => freshGh(args, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, ...options }) });
   if (!readRedTeamProbes({ env, log }).value.statusLabels) return { add: null, remove: [] };
   const state = live ?? provider.readPrState(repo, pr);
   if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
@@ -135,7 +139,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
       // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
       // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
       if (!Array.isArray(headFiles) || headFiles.length >= 3000) { headFiles = null; headVerified = false; }
-      if (provider.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
+      if (recheck.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
     } catch { headFiles = null; headVerified = false; }
   }
   // The head's check run settles a held pending label. Read only when pending is live; a throw or non-true is no proof.
@@ -145,16 +149,23 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   if (liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked') && redTeamCheckRunIsEvidence({ env })) {
     try { checkClear = readCheckClear({ repo, pr, head }) === true; } catch { checkClear = false; }
   }
-  const plan = planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: thread, standingRuling: scope, headFiles, headVerified, checkClear });
-  // Re-verify the head right before writing a check-derived clear: a moved head refuses.
-  if (checkClear && (plan.add || plan.remove.length) && !dryRun) {
+  const planWith = (threadNow, clear) => planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: threadNow, standingRuling: scope, headFiles, headVerified, checkClear: clear });
+  let plan = planWith(thread, checkClear);
+  // A check-derived settle only ever moves pending to clear. It re-verifies the head and re-reads the check and the thread
+  // right before writing; a block always wins: a recorded break found on that re-read is written as blocked, never skipped.
+  if (checkClear && plan.add !== 'red-team:blocked' && plan.add !== 'red-team:pending' && (plan.add || plan.remove.length) && !dryRun) {
     let again = null;
-    try { again = provider.readPrState(repo, pr)?.headRefOid; } catch { again = null; }
+    try { again = recheck.readPrState(repo, pr)?.headRefOid; } catch { again = null; }
     if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };
-    // Re-read the check and hold at swap time: evidence that changed or became unreadable since the plan refuses.
     let still = false;
     try { still = readCheckClear({ repo, pr, head }) === true; } catch { still = false; }
-    if (!still) return { add: null, remove: [], skipped: 'check-changed' };
+    let threadNow = null;
+    try { threadNow = recheck.readComments(repo, pr); } catch { threadNow = null; }
+    if (!Array.isArray(threadNow)) return { add: null, remove: [], skipped: 'thread-unreadable' };
+    const next = planWith(threadNow, still);
+    if (next.add === 'red-team:blocked') plan = next;
+    else if (!still) return { add: null, remove: [], skipped: 'check-changed' };
+    else plan = next;
   }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
