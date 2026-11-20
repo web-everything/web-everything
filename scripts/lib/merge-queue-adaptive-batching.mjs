@@ -220,6 +220,11 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, prio
   if (existing) return result(true, existing.id);
   // A PR already in the native queue needs no new admission/group record.
   if (inQueue.has(num)) return result(true);
+  if (mode === 'isolate') {
+    // Resumed isolation shares the same cap: a released PR's group may still be in flight.
+    const inFlight = state.groups.filter(active).length;
+    if (inFlight >= settings.maxGroupsInFlight) return result(false, null, `queue holds ${inFlight} group(s) (max ${settings.maxGroupsInFlight})`);
+  }
   if (mode === 'isolate') return result(true, openGroup(state, num, nowMs, mode, 1, priorityClass).id);
 
   for (const g of state.groups.filter(g => g.status === 'forming')) {

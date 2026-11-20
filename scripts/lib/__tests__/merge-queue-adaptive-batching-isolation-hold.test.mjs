@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
-  STANDARD_BATCHING_SETTINGS, initialBatchingState, admitEnqueue, createAdaptiveBatching,
+  STANDARD_BATCHING_SETTINGS, initialBatchingState, admitEnqueue, observeQueue, createAdaptiveBatching,
 } from '../merge-queue-adaptive-batching.mjs';
 import { redTeamLabelHoldReason, sendBackReason } from '../drain-queue-safety.mjs';
 
@@ -180,6 +180,31 @@ it('released solo admission respects the shared group cap', () => {
   const first = decide(isolation(), 7183, eligibility);
   expect(decide(first.state, 7193, eligibility)).toMatchObject({ admit: false, mode: 'strict',
     reason: 'queue holds 1 group(s) (max 1)' });
+});
+
+it('resumed isolation defers #7155 while released #7183 occupies the only group, then admits after it merges', () => {
+  const cappedSettings = { ...settings, maxGroupsInFlight: 1 };
+  const released = decide(isolation(), 7183, new Map([[7155, false]]), cappedSettings);
+  expect(released).toMatchObject({ admit: true, mode: 'strict' });
+  const queued = observeQueue({ state: released.state, inQueue: new Set([7183]),
+    merged: new Set(), nowMs, settings: cappedSettings }).state;
+  const eligible = eligibilityFor(readSuspect());
+
+  const deferred = admitEnqueue({ state: queued, num: 7155, nowMs,
+    settings: cappedSettings, inQueue: new Set([7183]), enqueueEligibility: eligible });
+
+  expect(deferred).toMatchObject({ admit: false, mode: 'isolate', groupId: null,
+    reason: 'queue holds 1 group(s) (max 1)' });
+  expect(deferred.state.groups).toEqual(queued.groups);
+  expect(deferred.state.isolate).toEqual([7155]);
+
+  const drained = observeQueue({ state: deferred.state, inQueue: new Set(),
+    merged: new Set([7183]), nowMs: nowMs + 1, settings: cappedSettings }).state;
+  const resumed = admitEnqueue({ state: drained, num: 7155, nowMs: nowMs + 1,
+    settings: cappedSettings, inQueue: new Set(), enqueueEligibility: eligible });
+  expect(resumed).toMatchObject({ admit: true, mode: 'isolate', reason: null });
+  expect(resumed.state.groups.filter(g => g.status === 'forming' || g.status === 'queued'))
+    .toEqual([expect.objectContaining({ prs: [7155], mode: 'isolate', status: 'queued' })]);
 });
 
 it('released retry cannot reuse a persisted multi-PR reservation', () => {
