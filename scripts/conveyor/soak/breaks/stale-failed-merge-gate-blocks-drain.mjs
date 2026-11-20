@@ -16,6 +16,7 @@ export default {
   },
   async run({ sourceRoot = ROOT } = {}) {
     const { createPrestageWorld } = await import(pathToFileURL(join(sourceRoot, 'scripts/__tests__/fixtures/merge-ai-prs-prestage-world.mjs')).href);
+    const { CONSTELLATION_REPOS } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/constellation-repos.mjs')).href);
     const world = createPrestageWorld((argv, options) => spawnSync(process.execPath,
       [join(sourceRoot, 'scripts/merge-ai-prs.mjs'), ...argv], options));
     const report = {};
@@ -67,7 +68,7 @@ export default {
         pr.comments[0].body = `<!-- reviewed-sha: ${head} -->`;
         report.laterHeads.push((await run(false, { env })).calls);
       }
-    }, { slug: 'web-everything/web-everything' });
+    }, { slug: CONSTELLATION_REPOS.we.slug });
     return report;
   },
   judge(report) {

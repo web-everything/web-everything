@@ -5710,3 +5710,10 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+## Drain recovery fixture maintenance
+
+Recovery settings tests inject settings or their reader for isolation; process test flags must
+still honor declared kill switches. When a source-extracted CLI fixture calls a shared helper,
+include that helper in the extracted source and keep assertions for every authorization stage.
+Soak breaks needing a supported repository resolve its slug from `CONSTELLATION_REPOS`.
