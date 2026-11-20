@@ -1,6 +1,7 @@
 // @vitest-environment node
-import {createPrivateKey,generateKeyPairSync} from 'node:crypto';
+import {createPrivateKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {inspect} from 'node:util';
+import {runInNewContext} from 'node:vm';
 import {describe,expect,it} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
@@ -37,6 +38,28 @@ const blocked=content=>{
 };
 
 describe('Forge key structure slice 1',()=>{
+  it.each(['\n','\r','\r\n','\u2028','\u2029'])('ends JavaScript line comments at %j before scanning private JWK members',lineEnd=>{
+    const {privateKey,publicKey}=generateKeyPairSync('ed25519');
+    const json=JSON.stringify(privateKey.export({format:'jwk'}));
+    const comment='// note'+lineEnd;
+    const message=Buffer.from('line terminator regression');
+    for(const object of [json.replace(',',','+comment),json.replace('{','{'+comment),json.replace(':',comment+':')]) {
+      const reconstructed=createPrivateKey({key:runInNewContext('('+object+')'),format:'jwk'});
+      expect(verify(null,message,publicKey,sign(null,message,reconstructed))).toBe(true);
+      const source=Buffer.from('export default '+object+';');
+      blocked(source);
+      // Odd prose quotes force the independent object-candidate path.
+      blocked(Buffer.from('say " '+object));
+      for(const tracked of [false,true])expect(()=>manifestEntry(Buffer.from('docs/token.mjs'),source,false,tracked))
+        .toThrow(expect.objectContaining({code:'excluded-source-file'}));
+    }
+    // A comment ending before an empty private-primes array must not turn a public JWK into a finding.
+    const publicJson=JSON.stringify(publicKey.export({format:'jwk'}));
+    const publicObject=publicJson.slice(0,-1)+',"oth":['+comment+']}';
+    expect(keyStructureFinding(Buffer.from('export default '+publicObject+';'))).toBeNull();
+    const bytes=privateKey.export({format:'der',type:'pkcs8'});
+    blocked(Buffer.from('['+[...bytes].join(','+comment)+']'));
+  });
   it('acceptance break: blocks a 14-char oct k',()=>{
     blocked(Buffer.from(JSON.stringify({[keyType]:'oct',k:'abcdefghijklm'+'n'})));
   });

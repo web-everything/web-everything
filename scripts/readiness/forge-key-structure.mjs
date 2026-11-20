@@ -76,10 +76,11 @@ function afterTrivia(text,index) {
     const code=text.charCodeAt(i);
     if(code===32||(code>=9&&code<=13)||code===160||code===0xfeff||code===0x2028||code===0x2029||(code>=0x2000&&code<=0x200a)||code===0x1680||code===0x202f||code===0x205f||code===0x3000) {i++;continue;}
     if(code===47&&text[i+1]==='/') {
-      const lf=text.indexOf('\n',i+2),cr=text.indexOf('\r',i+2);
-      const end=lf===-1?cr:cr===-1?lf:Math.min(lf,cr);
-      if(end===-1)return -1;
-      i=end+1;continue;
+      // ECMAScript line comments end at LF, CR, line separator or paragraph separator.
+      const lineEnd=/[\r\n\u2028\u2029]/g;
+      lineEnd.lastIndex=i+2;
+      if(!lineEnd.exec(text))return -1;
+      i=lineEnd.lastIndex;continue;
     }
     if(code===47&&text[i+1]==='*') {
       // Reuse the last close search: no `*/` lies between its start and its result (or after its start when -1),
@@ -118,7 +119,7 @@ function jwkFinding(bytes) {
   const text=bytes.toString('utf8');
   if(!text.trimStart().startsWith('{'))return false;
   let depth=0,key=null,pending=null,anyKty=false,octKty=false,oct=false,priv=false;
-  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|(?:[A-Za-z_$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))(?:[\w$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))*|[{}\[\]:,]/gi)) {
+  for(const match of text.matchAll(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|(?:[A-Za-z_$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))(?:[\w$]|\\u(?:[\da-f]{4}|\{[\da-f]+\}))*|[{}\[\]:,]/gi)) {
     const token=match[0];
     if(token[0]==='/')continue;
     if(token==='{'||token==='[') {
@@ -172,7 +173,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
   const stack=[],visited=new Set();
-  const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|[{}\[\]\ufffd]/g
+  const tokens=comments?/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}\[\]\ufffd]/g
     :/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|[{}\[\]\ufffd]/g;
   for(const match of text.matchAll(tokens)) {
     tick();
@@ -209,7 +210,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // The gate admits any JSON \u escape too, since a key name can be spelled `kty` and decodes to `kty`.
   if(/kty|\\u/i.test(text)) {
-    const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+    const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
@@ -232,7 +233,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
   for(const match of text.matchAll(/\[([^\[\]]*)\]/g)) {
     tick();
-    const body=match[1].replace(/\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\r\n]*/g,' ').trim();
+    const body=match[1].replace(/\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\r\n\u2028\u2029]*/g,' ').trim();
     if(!/^(?:-?\d+|0x[\da-f]+)(?:\s*,\s*(?:-?\d+|0x[\da-f]+))*\s*,?$/i.test(body))continue;
     const numbers=body.replace(/,\s*$/,'').split(',').map(Number);
     if(numbers.every(number=>Number.isInteger(number)&&number>=-128&&number<=255))emit(Buffer.from(numbers));
