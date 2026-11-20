@@ -75,6 +75,7 @@ describe('assertOperatorCliFresh (item 113)', () => {
 describe('re-stamp runs from fresh code: accepts the daemon-ADOPTED smoke-passed build (R1099)', () => {
   const now = Date.parse('2026-11-20T16:00:00Z');
   const hoursAgo = (h) => new Date(now - h * 3_600_000).toISOString();
+  const good = (head, h) => ({ adopted: { head, at: hoursAgo(h) }, smokePassed: [{ tree: 't', key: 'k' }] });
   // Behind in a code file, with fallbacks that must never run: a spawn/lane acquire would mean the old path.
   const boom = () => { throw new Error('fallback must not run'); };
   const setup = () => {
@@ -92,36 +93,67 @@ describe('re-stamp runs from fresh code: accepts the daemon-ADOPTED smoke-passed
 
   it('re-stamp runs from fresh code: HEAD == adopted head, clean, adopted 2h ago -> accepted, no spawn/lane', () => {
     const { clone, head } = setup();
-    const { out, lines } = call(clone, () => ({ adopted: { head, at: hoursAgo(2) } }));
+    const { out, lines } = call(clone, () => good(head, 2));
     expect(out).toMatchObject({ adoptedBuild: true, head });
     expect(lines.join('')).toMatch(/ADOPTED smoke-passed build/);
   });
 
   it('refuses when HEAD differs from the adopted head', () => {
     const { clone } = setup();
-    expect(() => call(clone, () => ({ adopted: { head: 'a'.repeat(40), at: hoursAgo(1) } }), { env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
+    expect(() => call(clone, () => good('a'.repeat(40), 1))).toThrow(OPERATOR_CLI_STALE_MARKER);
   });
 
   it('refuses when the code tree is dirty', () => {
     const { clone, head } = setup();
     writeFileSync(join(clone, 'a.mjs'), 'export const a = 7; // local edit\n');
-    expect(() => call(clone, () => ({ adopted: { head, at: hoursAgo(1) } }), { env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
+    expect(() => call(clone, () => good(head, 1))).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
+
+  it('refuses a future adoption timestamp', () => {
+    const { clone, head } = setup();
+    expect(() => call(clone, () => good(head, -48))).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
+
+  it.each(['rejected', 'inProgress', 'quarantine', 'unverified', 'building', 'held', 'busySkippedTrees', 'forceUnverifiedTrees'])(
+    'refuses when the rebuild record carries an unsafe marker: %s', (key) => {
+      const { clone, head } = setup();
+      expect(() => call(clone, () => ({ ...good(head, 1), [key]: key.endsWith('Trees') ? ['t'] : { x: 1 } }))).toThrow(OPERATOR_CLI_STALE_MARKER);
+    });
+
+  it('refuses when no smoke pass is recorded', () => {
+    const { clone, head } = setup();
+    expect(() => call(clone, () => ({ ...good(head, 1), smokePassed: [] }))).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
+
+  it('refuses when the behind-file list is unknown (fail closed)', () => {
+    const { clone, head } = setup();
+    expect(() => call(clone, () => good(head, 1), { listBehindFiles: () => null })).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
+
+  it('an already re-executed CLI never takes the adopted-build exit', () => {
+    const { clone, head } = setup();
+    expect(() => call(clone, () => good(head, 1), { env: { WE_OPERATOR_CLI_FRESH_REEXEC: '1' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
   });
 
   it('refuses when the adoption is older than the max age', () => {
     const { clone, head } = setup();
-    expect(() => call(clone, () => ({ adopted: { head, at: hoursAgo(25) } }), { env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
+    expect(() => call(clone, () => good(head, 25))).toThrow(OPERATOR_CLI_STALE_MARKER);
+  });
+
+  it('caps the max age at 24h even if the alert knob is raised', () => {
+    const { clone, head } = setup();
+    expect(() => call(clone, () => good(head, 48), { env: { WE_DAEMON_LAST_GOOD_MAX_AGE_MS: String(10 * 24 * 3_600_000) } })).toThrow(OPERATOR_CLI_STALE_MARKER);
   });
 
   it.each([['no rebuild record', () => null], ['unreadable adopted.at', (h) => ({ adopted: { head: h, at: 'garbage' } })], ['no adopted block', () => ({})]])(
     'refuses on %s', (_name, state) => {
       const { clone, head } = setup();
-      expect(() => call(clone, () => state(head), { env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
+      expect(() => call(clone, () => state(head))).toThrow(OPERATOR_CLI_STALE_MARKER);
     });
 
   it('WE_OPERATOR_CLI_FRESH_FALLBACK=off skips the adopted-build acceptance and refuses', () => {
     const { clone, head } = setup();
-    expect(() => call(clone, () => ({ adopted: { head, at: hoursAgo(1) } }), { env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
+    expect(() => call(clone, () => good(head, 1), { env: { WE_OPERATOR_CLI_FRESH_FALLBACK: 'off' } })).toThrow(OPERATOR_CLI_STALE_MARKER);
   });
 });
 

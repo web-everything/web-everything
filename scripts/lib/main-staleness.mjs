@@ -401,7 +401,7 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
     const files = listBehindFiles(r);
     // Unknown diff fails closed; a diff with no code file is not stale for this CLI.
     if (Array.isArray(files) && !files.some(isCodePath)) return (last = { fresh: true, behind, behindNonCodeOnly: true });
-    return (last = { action: 'warn', reason: 'not-auto-syncing', behind, ahead: 0, dirty: false });
+    return (last = { action: 'warn', reason: 'not-auto-syncing', behind, ahead: 0, dirty: false, filesKnown: Array.isArray(files) });
   };
   try {
     return assertMainNotStale(root, check, { base, label });
@@ -412,7 +412,7 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
     try {
       let knob = env?.WE_OPERATOR_CLI_FRESH_FALLBACK;
       if (knob === undefined) { try { knob = readSettings()?.operatorCli?.freshFallback; } catch { /* absent */ } }
-      if (knob !== 'off') {
+      if (knob !== 'off' && env?.WE_OPERATOR_CLI_FRESH_REEXEC !== '1' && last?.filesKnown === true) {
         const head = readHeadSha(root, run);
         const verdict = decideAdoptedBuild({ headSha: head, state: adoptedState(root), dirty: codeDirty(root, run),
           nowMs: now(), maxAgeMs: lastGoodMaxAgeMs(env) });
@@ -574,13 +574,23 @@ export function selfFastForwardAction({ sameCheckout, codeChanged, armed, reexec
  * `headSha` equal to `state.adopted.head`, a clean code tree, and an adoption no older than `maxAgeMs`.
  * Anything missing, unreadable or mismatched refuses (fail closed).
  */
+const ADOPTED_BUILD_MAX_AGE_MS = 24 * 3_600_000; // hard ceiling, whatever the alert knob says
 export function decideAdoptedBuild({ headSha, state, dirty, nowMs, maxAgeMs } = {}) {
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/.test(headSha)) return { ok: false, reason: 'head-unreadable' };
   if (state?.adopted?.head !== headSha) return { ok: false, reason: 'head-not-adopted' };
   if (dirty !== false) return { ok: false, reason: 'tree-dirty' };
   const at = Date.parse(state.adopted.at || '');
   if (!Number.isFinite(at) || !Number.isFinite(nowMs) || !(maxAgeMs > 0)) return { ok: false, reason: 'adoption-time-unreadable' };
-  if (nowMs - at > maxAgeMs) return { ok: false, reason: 'adoption-too-old' };
+  const age = nowMs - at;
+  if (age < -60_000) return { ok: false, reason: 'adoption-in-future' };
+  if (age > Math.min(maxAgeMs, ADOPTED_BUILD_MAX_AGE_MS)) return { ok: false, reason: 'adoption-too-old' };
+  // Any recorded unsafe or unverified state means the adoption is not a clean smoke-passed build.
+  const s = state;
+  const present = (v) => (Array.isArray(v) ? v.length > 0 : !!v && (typeof v !== 'object' || Object.keys(v).length > 0));
+  if (['rejected', 'inProgress', 'quarantine', 'unverified', 'building', 'held', 'busySkippedTrees', 'forceUnverifiedTrees'].some((k) => present(s[k]))) {
+    return { ok: false, reason: 'unsafe-rebuild-state' };
+  }
+  if (!Array.isArray(s.smokePassed) || !s.smokePassed.length) return { ok: false, reason: 'no-smoke-pass-recorded' };
   return { ok: true, head: headSha, at: state.adopted.at };
 }
 
