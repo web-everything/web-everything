@@ -92,8 +92,9 @@ const backoff = { retryAt: nullable(date), attempts: positive };
 // flags; validate those fields when present, and require deadlines for scheduled retries.
 // Other incomplete files require operator repair; only ENOENT creates EMPTY_STATE.
 export const rebuildStateSchema = {
-  held: v => fields(v, { reason: string, since: date, updatedAt: date }, backoff)
-    && (v.reason !== 'smoke-env-timeout' || date(v.retryAt)),
+  // A legacy env-timeout hold has no retryAt (the live incident that this recovery exists for): it is valid evidence
+  // and is treated as due by recovery. A present retryAt must still be a date or null.
+  held: v => fields(v, { reason: string, since: date, updatedAt: date }, backoff),
   rejected: v => fields(v, { inputsKey: string, reason: string, at: date }, { ...backoff,
     harnessBroken: boolean, externalOnly: boolean, envLoad: boolean, dispatchSmoke: boolean })
     && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
@@ -102,8 +103,9 @@ export const rebuildStateSchema = {
     inputsKey: string, mainSha: string, applied, verified: boolean }),
   quarantine: v => fields(v, { prevHead: string, reason: string }),
   unverified: v => fields(v, { head: string, prevHead: string }),
+  // `adoptOnly` is written only for adopt-only leases (legacy shape); absent means a real-job lease.
   building: v => fields(v, { token: string, pid: positive, host: string, startedAt: date,
-    target: string, inputsKey: string, path: string, adoptOnly: boolean }),
+    target: string, inputsKey: string, path: string }, { adoptOnly: boolean }),
   busySkippedTrees: strings,
   forceUnverifiedTrees: strings,
   smokePassed: v => Array.isArray(v) && v.every(r => fields(r, { key: string, tree: string, passedAt: date })),

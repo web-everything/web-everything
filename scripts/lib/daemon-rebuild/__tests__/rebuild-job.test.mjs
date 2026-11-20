@@ -283,7 +283,7 @@ it.each([
   const original = readFileSync(file, 'utf8');
   const adopt = vi.fn(); const reattach = vi.fn(); const error = vi.fn();
   const store = createJobStore(join(root, 'jobs'));
-  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, log: { error } });
+  const result = await rebuildCloneAsJob({ root, env, store, adopt, reattach, launchOnly: true, log: { error } });
   expect(result.reason).toBe('state-unreadable');
   expect(adopt).not.toHaveBeenCalled(); expect(reattach).not.toHaveBeenCalled();
   expect(readFileSync(file, 'utf8')).toBe(original);
@@ -494,7 +494,8 @@ const requiredCases = [
   const optional = kind === 'state' && (
     (path[0] === 'pinnedNotified' && path.length > 1)
     || (path[0] === 'rejected' && ['retryAt', 'attempts', 'harnessBroken', 'externalOnly', 'envLoad', 'dispatchSmoke'].includes(path[1]))
-    || (path[0] === 'held' && path[1] === 'attempts'));
+    || (path[0] === 'held' && ['retryAt', 'attempts'].includes(path[1])) // legacy env-timeout holds have no retryAt
+    || (path[0] === 'building' && path[1] === 'adoptOnly')); // legacy lease shape: written only for adopt-only leases
   return (optional ? ['wrong-type'] : ['missing', 'wrong-type']).map(mode => [kind, path.join('.'), mode]);
 });
 
