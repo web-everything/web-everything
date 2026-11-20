@@ -146,6 +146,32 @@ describe('oldest owed CI-heal first', () => {
       expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[5082, 'fix-cap'], [5087, 'fix-cap']]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('ci-heal refusal is always logged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusal-log-'));
+    const plan = planReconcile({ requiredChecks: ['test'], prs: [5087, 5082].map(number => ({
+      number, state: 'OPEN', headRefName: `lane/${number}`, headRefOid: 'a'.repeat(40),
+      labels: [{ name: 'ci:failed' }], comments: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    })) });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
+        checkStaleness: FRESH, dispatch: vi.fn(), dispatchThrottle: {
+          tryAdmit: () => ({ admit: false, kind: 'fix-cap', why: 'reserve slots full' }), recheckHost: () => ({ admit: true }),
+        },
+        ciHealReserve: createCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '0' }, gate: () => ({ admit: true }) }),
+        pickFreeLanes: () => [1, 2], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+        resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+        flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+        salvage: async () => null, currentBuild: () => null,
+        fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
+      });
+      const lines = err.mock.calls.map(c => String(c[0]));
+      expect(lines.some(l => /refused fix-cap PR #5082: .*fixer cap full/.test(l))).toBe(true);
+      expect(lines.some(l => /refused fix-cap PR #5087: /.test(l))).toBe(true);
+    } finally { err.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 const TEMPLATE = 'heal #{{ITEM_NUM}} pr={{PR_NUM}} ref={{LANE_REF}} lane={{LANE}} slug={{SESSION_SLUG}} scope={{SCOPE}} why={{REASON}}';

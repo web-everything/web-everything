@@ -696,7 +696,13 @@ export async function runReconcileCiHealDispatch({
     } finally {
       const gateMs = clock() - entryNow;
       if (launch) launch.gateMs = gateMs;
-      else console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+      else {
+        // Every gate refusal is logged with its kind and reason; no launch without a recorded reason is logged as unknown.
+        for (const r of (refusals.length ? refusals : [{ kind: 'unknown', why: 'no launch and no refusal recorded' }])) {
+          console.error(`ci-heal-pr-dispatch: refused ${r.kind ?? 'unknown'} PR #${entry.prNumber}: ${r.why ?? r.reason ?? 'no reason recorded'}`);
+        }
+        console.error(`ci-heal-pr-dispatch: timing PR #${entry.prNumber} gate-ms=${gateMs} dispatch-ms=0`);
+      }
     }
   }
 
