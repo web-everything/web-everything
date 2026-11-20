@@ -184,6 +184,11 @@ export function forceBlockedReason(root, env = process.env) {
   if (readForceWatch(root, env)) return 'watch-already-open';
   if (watchUnreadable(root, env)) return 'watch-unreadable'; // fail closed: an unreadable watch may be an open one
   if (pendingRollbacks.has(watchPath(root, env))) return 'rollback-owed'; // never adopt over an unpaid rollback
+  // The global ledger is intentionally checked without importing hot-patch (which imports this module).
+  try {
+    readFileSync(join(stateDir(env), 'hot-patch.json'));
+    return 'hot-patch-open';
+  } catch (error) { if (error?.code !== 'ENOENT') return 'hot-patch-open'; }
   return null;
 }
 

@@ -174,12 +174,12 @@ function clockFor(dir) {
  * A matching hot-patch wake skips spacing once; enqueue failure never consumes it.
  * @param {{root: string, env?: object, log?: object, mainOnly?: boolean, entries?: string[],
  *   adopt: (o?: object) => Promise<object>, store?: object, reattach?: Function, clock?: object, now?: () => number,
- *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function, rng?: () => number}} o
+ *   codeSha?: string, snapshot?: object, settings?: object, evict?: Function, rng?: () => number, markWoke?: Function}} o
  */
 export async function rebuildCloneAsJob({
   root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
-  codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
+  codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng, markWoke = markHotPatchWoke,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);
   mkdirSync(store.dir, { recursive: true });
@@ -268,7 +268,7 @@ export async function rebuildCloneAsJob({
   // Capture the ledger SHA before checking/enqueueing so a replacement cannot consume another patch's wake.
   let sha;
   try { sha = readHotPatch(env)?.sha; } catch { /* Unreadable wake evidence retains ordinary spacing. */ }
-  const wake = hotPatchWakeDue({ env, plan: r.plan,
+  const wake = hotPatchWakeDue({ root, env, plan: r.plan,
     lastFinishedMs: last ? Date.parse(last.job.finishedAt || 0) : 0, now: now() });
   if (!(wake && sha) && last && !lastRes?.readyRecorded && sinceMs < intervalMs) {
     housekeeping();
@@ -288,8 +288,12 @@ export async function rebuildCloneAsJob({
     return { moved: false, reason: 'rebuild-job-queue-failed', finishedJobs, alerts: r.alerts ?? [] };
   }
   if (wake && sha) {
-    try { markHotPatchWoke(env, sha); }
-    catch { /* The job is already queued; a wake-marker failure must not undo enqueue. */ }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try { await markWoke(env, sha); break; }
+      catch (error) {
+        if (attempt === 3) say(`ALERT hot-patch wake marker failed after 3 attempts for queued job ${queued.id}: ${String(error?.message || error).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')}; repair the ledger before another wake`);
+      }
+    }
   }
   say(`queued rebuild job ${queued.id} for ${String(r.plan?.finalSha ?? '?').slice(0, 9)} — build + live smoke run detached; this daemon keeps ticking on its current tree and adopts only a smoke-passed build`);
   await pass();

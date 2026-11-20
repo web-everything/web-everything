@@ -1,7 +1,8 @@
 /** Checklist 1, 3, 6, 7: workflow/run identity and fail-closed CI evidence. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { hotPatchCiVerdict } from '../hot-patch-ci.mjs';
+import { hotPatchCiVerdict, requiredChecksForMain } from '../hot-patch-ci.mjs';
+import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
 const sha = 'a'.repeat(40), repo = 'web-everything/web-everything';
 // Fixtures ported from hot-patch-verify-source.test.mjs on origin/lane/hot-patch-s2.
 const run = (id, conclusion = 'success', extra = {}) => ({ id, name: 'test', head_sha: sha,
@@ -33,10 +34,10 @@ async function verdict({ runs = [run(1)], jobs = { 1: [job('test')] }, required 
   const result = await hotPatchCiVerdict({ repo: repository, sha, required,
     fetchJson: fetchJson ?? (async path => {
       paths.push(path);
-      if (path === `/repos/${repo}/actions/workflows/${workflow}/runs?head_sha=${sha}`) return { workflow_runs: runs };
+      if (path === `/repos/${repo}/actions/workflows/${workflow}/runs?head_sha=${sha}&per_page=100&page=1`) return { workflow_runs: runs };
       const suiteMatch = path.match(/\/check-suites\/(\d+)$/);
       if (suiteMatch) return Object.hasOwn(suites, suiteMatch[1]) ? suites[suiteMatch[1]] : suite(suiteMatch[1]);
-      const match = path.match(/^\/repos\/web-everything\/web-everything\/actions\/runs\/(\d+)\/jobs$/);
+      const match = path.match(/^\/repos\/web-everything\/web-everything\/actions\/runs\/(\d+)\/jobs\?per_page=100&page=1$/);
       assert(match, `unexpected API path: ${path}`);
       assert(Object.hasOwn(jobs, match[1]), `jobs requested for ignored run ${match[1]}`);
       return { jobs: jobs[match[1]] };
@@ -46,8 +47,8 @@ async function verdict({ runs = [run(1)], jobs = { 1: [job('test')] }, required 
 }
 test('endpoint construction uses the workflow filename as the REST identifier', async () => {
   const result = await verdict(); assert.equal(result.state, 'green');
-  assert.deepEqual(result.paths, [`/repos/${repo}/actions/workflows/${workflow}/runs?head_sha=${sha}`,
-    `/repos/${repo}/check-suites/1`, `/repos/${repo}/actions/runs/1/jobs`]);
+  assert.deepEqual(result.paths, [`/repos/${repo}/actions/workflows/${workflow}/runs?head_sha=${sha}&per_page=100&page=1`,
+    `/repos/${repo}/check-suites/1`, `/repos/${repo}/actions/runs/1/jobs?per_page=100&page=1`]);
 });
 for (const app of [{ id: 1, slug: 'github-actions' }, { id: 15368, slug: 'foreign' }, undefined]) {
   test(`another app newer success ignored: ${JSON.stringify(app)}`, async () => {
@@ -90,10 +91,10 @@ test('soak-replay-gate uses its own frozen workflow mapping', async () => {
   const paths = [];
   const result = await verdict({ required: ['soak-replay-gate'], fetchJson: async path => {
     paths.push(path);
-    if (path === `/repos/${repo}/actions/workflows/soak-replay-gate.yml/runs?head_sha=${sha}`)
+    if (path === `/repos/${repo}/actions/workflows/soak-replay-gate.yml/runs?head_sha=${sha}&per_page=100&page=1`)
       return { workflow_runs: [run(8)] };
     if (path === `/repos/${repo}/check-suites/8`) return suite(8);
-    assert.equal(path, `/repos/${repo}/actions/runs/8/jobs`);
+    assert.equal(path, `/repos/${repo}/actions/runs/8/jobs?per_page=100&page=1`);
     return { jobs: [job('soak-replay-gate')] };
   } });
   assert.equal(result.state, 'green'); assert.equal(paths.length, 3);
@@ -117,5 +118,49 @@ for (const phase of ['runs', 'jobs']) test(`fetch throws reading ${phase}: unkno
 for (const payload of [null, {}, { workflow_runs: [] }, { workflow_runs: [{}] }]) {
   test(`unreadable or absent run evidence is unknown: ${JSON.stringify(payload)}`, async () => {
     assert.equal((await verdict({ fetchJson: async () => payload })).state, 'unknown');
+  });
+}
+
+test('failed and partial protection reads preserve every observed name plus the fallback floor', () => {
+  const expected = [...new Set([...FALLBACK_REQUIRED_STATUS_CHECKS, 'unmapped-extra'])];
+  assert.deepEqual(requiredChecksForMain(() => { throw Object.assign(Error('offline'), { partialChecks: ['unmapped-extra'] }); }), expected);
+  assert.deepEqual(requiredChecksForMain(() => ({ partialChecks: ['unmapped-extra'], checks: [] })), expected);
+  assert.deepEqual(requiredChecksForMain(() => { throw Error('offline'); }), [...FALLBACK_REQUIRED_STATUS_CHECKS]);
+  assert.deepEqual(requiredChecksForMain(() => ({ checks: ['test'] })), ['test']);
+});
+for (const phase of ['runs', 'jobs']) {
+  test(`${phase} pagination discovers a later failure instead of accepting first-page success`, async () => {
+    const paths = [];
+    const result = await verdict({ fetchJson: async path => {
+      paths.push(path);
+      const page = Number(new URL(path, 'https://example.test').searchParams.get('page'));
+      if (path.includes('/workflows/')) return phase === 'runs'
+        ? { total_count: 101, workflow_runs: page === 1 ? Array.from({ length: 100 }, (_, i) => run(i + 1)) : [run(101)] }
+        : { total_count: 1, workflow_runs: [run(1)] };
+      if (path.includes('/check-suites/')) return suite(path.split('/').at(-1));
+      if (phase === 'runs') { assert(path.includes('/runs/101/jobs?')); return { jobs: [job('test', 'failure')] }; }
+      return { total_count: 101, jobs: page === 1 ? Array.from({ length: 100 }, () => job('test')) : [job('test', 'failure')] };
+    } });
+    assert.equal(result.state, 'red');
+    assert(paths.some(path => path.endsWith('per_page=100&page=2')));
+  });
+  for (const capped of [false, true]) test(`${phase} incomplete ${capped ? 'ten-page cap' : 'short page'} is unknown`, async () => {
+    let pages = 0;
+    const result = await verdict({ fetchJson: async path => {
+      if (path.includes('/check-suites/')) return suite(1);
+      if (phase === 'jobs' && path.includes('/workflows/')) return { workflow_runs: [run(1)] };
+      pages++;
+      return { total_count: 1001, [phase === 'runs' ? 'workflow_runs' : 'jobs']:
+        Array.from({ length: capped ? 100 : 1 }, () => phase === 'runs' ? run(1) : job('test')) };
+    } });
+    assert.equal(result.state, 'unknown');
+    assert.equal(pages, capped ? 10 : 1);
+    assert.match(result.reason, /inspect workflows manually/);
+  });
+}
+for (const [conclusion, status, expected] of [['success', 'completed', 'green'], ['failure', 'completed', 'red'],
+  ['success', 'in_progress', 'pending'], [null, 'completed', 'unknown']]) {
+  test(`duplicate required names require all successes: ${expected}`, async () => {
+    assert.equal((await verdict({ jobs: { 1: [job('test'), job('test', conclusion, { status })] } })).state, expected);
   });
 }

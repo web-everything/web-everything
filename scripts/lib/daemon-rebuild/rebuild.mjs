@@ -16,7 +16,7 @@ import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
-import { readHotPatch, runHotPatchTick } from '../hot-patch.mjs';
+import { runHotPatchTick } from '../hot-patch.mjs';
 import { hotPatchCiVerdict, requiredChecksForMain } from '../hot-patch-ci.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { readOverlays, readOverlayState, removeOverlay } from '../daemon-overlays.mjs';
@@ -191,8 +191,6 @@ async function hotPatchWatch(options, emitEvent) {
   if (!root || readyOnly) return;
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   try {
-    const ledger = readHotPatch(stEnv);
-    if (!ledger || cloneKeyOf(ledger.root) !== cloneKeyOf(root)) return;
     const git = makeGit({ run, cwd: root, env });
     const repo = 'web-everything/web-everything';
     const ghJson = args => JSON.parse(runGhSync(args, {
@@ -225,7 +223,7 @@ async function hotPatchWatch(options, emitEvent) {
         return result.status === 0;
       },
       lock: (target, fn, opts) => withWriteLock(target, stillHeld =>
-        hotPatchRollbackLock.run({ key: cloneKeyOf(target), stillHeld }, fn), opts),
+        hotPatchRollbackLock.run({ key: cloneKeyOf(target), stillHeld }, () => fn(stillHeld)), opts),
       emit: event => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
     });
   } catch { /* a watch failure never changes the rebuild outcome */ }

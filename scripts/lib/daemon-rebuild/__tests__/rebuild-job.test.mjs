@@ -178,14 +178,27 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     expect((await tick()).reason).toBe('rebuild-job-spaced');
     expect(store.list().records).toHaveLength(1);
   });
-  it('a wake-marker write failure does not fail the already successful enqueue', async () => {
+  it('a persistent wake-marker failure alerts with its reason after three attempts and preserves enqueue', async () => {
     vi.spyOn(store, 'create').mockImplementationOnce(record => {
       const queued = createJobStore(store.dir).create(record);
       writeFileSync(hotPatch.hotPatchLedgerPath(env), '{unreadable after enqueue');
       return queued;
     });
-    expect((await tick()).reason).toBe('rebuild-job-started');
+    const error = vi.fn();
+    const markWoke = vi.fn((...args) => hotPatch.markHotPatchWoke(...args));
+    expect((await tick(120000, { log: { error }, markWoke })).reason).toBe('rebuild-job-started');
     expect(store.list().records).toHaveLength(2);
+    expect(markWoke).toHaveBeenCalledTimes(3);
+    expect(error).toHaveBeenCalledWith(expect.stringMatching(/ALERT hot-patch wake marker failed after 3 attempts.*ledger/i));
+  });
+  it('transient wake-marker failure retries and stops on success', async () => {
+    const error = vi.fn();
+    const markWoke = vi.fn().mockImplementationOnce(() => { throw Error('disk busy'); })
+      .mockImplementation((...args) => hotPatch.markHotPatchWoke(...args));
+    expect((await tick(120000, { log: { error }, markWoke })).reason).toBe('rebuild-job-started');
+    expect(markWoke).toHaveBeenCalledTimes(2);
+    expect(hotPatch.readHotPatch(env).wokeAt).toBeTruthy();
+    expect(error.mock.calls.some(([message]) => message.includes('ALERT'))).toBe(false);
   });
   it('enqueue failure leaves wokeAt unset so a later tick can retry', async () => {
     vi.spyOn(store, 'create').mockImplementationOnce(() => {

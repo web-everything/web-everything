@@ -27,6 +27,7 @@ const fixture = fn => async () => {
   writeFileSync(join(origin, 'README.md'), 'base\n');
   git(['add', '.'], origin); git(['commit', '-qm', 'base'], origin);
   git(['clone', '-q', origin, root], home);
+  git(['remote', 'set-url', 'origin', 'https://github.com/web-everything/web-everything.git']);
   const good = git(['rev-parse', 'HEAD']);
   git(['checkout', '-qb', 'lane/repair']);
   writeFileSync(join(root, path), '// patch\n');
@@ -47,9 +48,9 @@ const fixture = fn => async () => {
     assert.equal(cmd, 'git', 'all non-Git effects must use injected seams');
     return spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
   };
-  const request = { root, pr: 42, sha, branch: 'lane/repair', env, run, now: () => at,
-    ghJson: async () => ({ state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }),
-    lock: async (...args) => { effects.push('lock'); return args.findLast(a => typeof a === 'function')(); },
+  const request = { root, pr: 42, sha, branch: 'lane/repair', env, run, now: () => at, startTimeOf: () => at,
+    ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }),
+    lock: async (...args) => { effects.push('lock'); return args.findLast(a => typeof a === 'function')(() => true); },
     readRebuildState: () => ({ adopted: preGood }),
     addOverlay: async (...args) => { calls.push({ cmd: 'addOverlay', args }); assert(existsSync(hotPatchLedgerPath(env)), 'ledger armed before overlay'); effects.push('overlay'); return overlay; },
     writeRebuildRequest: async () => { effects.push('rebuild'); } };
@@ -72,7 +73,7 @@ for (const path of ['README.md', 'scripts/lib/hot-patch.mjs']) {
     writeFileSync(join(f.root, path), '// forbidden\n');
     f.git(['add', '.']); f.git(['commit', '-qm', 'forbidden']);
     const sha = f.git(['rev-parse', 'HEAD']);
-    await refused({ ...f.request, sha, ghJson: async () => ({ state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
+    await refused({ ...f.request, sha, ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
     assert(!f.effects.includes('overlay'));
   }));
 }
@@ -81,11 +82,21 @@ test('rename from a non-listed path refuses; diff uses --no-renames', fixture(as
   f.git(['rm', f.path]); mkdirSync(join(f.root, dirname(f.path)), { recursive: true }); f.git(['mv', 'README.md', f.path]);
   f.git(['commit', '-qam', 'rename']);
   const sha = f.git(['rev-parse', 'HEAD']);
-  await refused({ ...f.request, sha, ghJson: async () => ({ state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
+  await refused({ ...f.request, sha, ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
   assert(f.calls.some(c => c.args.includes('diff') && c.args.includes('--no-renames')));
 }));
 test('one non-merge commit whose parent is reachable from target origin/main succeeds', fixture(async f => {
-  await requestHotPatch(f.request);
+  let rebuilds = 0;
+  const result = await requestHotPatch({ ...f.request, writeRebuildRequest: async (root, options) => {
+    rebuilds++;
+    assert.equal(root, f.root);
+    assert.equal(options.ref, f.request.branch);
+    assert.equal(readHotPatch(f.env).sha, f.sha);
+    assert.deepEqual(readHotPatch(f.env).overlay, f.overlay);
+    await f.request.writeRebuildRequest(root, options);
+  } });
+  assert.equal(result.ok, true);
+  assert.equal(rebuilds, 1, 'successful admission must issue exactly one rebuild request');
   assert.deepEqual(readHotPatch(f.env).preGood, f.preGood);
   assert.equal(readHotPatch(f.env).sha, f.sha);
   assert.deepEqual(f.effects, ['lock', 'overlay', 'rebuild']);
@@ -94,20 +105,20 @@ test('one non-merge commit whose parent is reachable from target origin/main suc
 test('two commits above origin/main refuse', fixture(async f => {
   writeFileSync(join(f.root, f.path), '// second\n'); f.git(['commit', '-qam', 'second']);
   const sha = f.git(['rev-parse', 'HEAD']);
-  await refused({ ...f.request, sha, ghJson: async () => ({ state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
+  await refused({ ...f.request, sha, ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
 }));
 test('merge commit refuses even with a parent reachable from origin/main', fixture(async f => {
   f.git(['checkout', '-qb', 'side', f.good]); writeFileSync(join(f.root, 'side'), 'side');
   f.git(['add', '.']); f.git(['commit', '-qm', 'side']);
   f.git(['checkout', 'lane/repair']); f.git(['merge', '--no-ff', 'side', '-m', 'merge']);
   const sha = f.git(['rev-parse', 'HEAD']);
-  await refused({ ...f.request, sha, ghJson: async () => ({ state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
+  await refused({ ...f.request, sha, ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
 }));
 for (const change of [{ pr: undefined }, { state: 'CLOSED' }, { state: 'MERGED' },
   { headRefOid: 'd'.repeat(40) }, { headRefName: 'lane/other' }]) {
   test(`PR evidence refuses ${JSON.stringify(change)}`, fixture(async f => {
     await refused({ ...f.request, ...(Object.hasOwn(change, 'pr') ? change : {}),
-      ghJson: async () => ({ state: 'OPEN', headRefOid: f.sha, headRefName: 'lane/repair', ...change }) });
+      ghJson: async () => ({ baseRefName: 'main', state: 'OPEN', headRefOid: f.sha, headRefName: 'lane/repair', ...change }) });
     assert(!f.effects.includes('overlay'));
   }));
 }
@@ -126,7 +137,7 @@ test('wx refuses a ledger appearing inside the write lock without overwriting or
   const original = '{"owner":"concurrent"}';
   await refused({ ...f.request, lock: async (...args) => {
     writeFileSync(hotPatchLedgerPath(f.env), original, { flag: 'wx' });
-    return args.findLast(a => typeof a === 'function')();
+    return args.findLast(a => typeof a === 'function')(() => true);
   } });
   assert.equal(readFileSync(hotPatchLedgerPath(f.env), 'utf8'), original);
   assert(!f.effects.includes('overlay'));
@@ -168,4 +179,75 @@ test('hostile Git environment is stripped and replacement objects disabled for a
 test('legacy grafts refuse rather than accepting rewritten ancestry', fixture(async f => {
   writeFileSync(join(f.root, '.git/info/grafts'), `${f.sha}\n`);
   await refused(f.request); assert(!f.effects.includes('overlay'));
+}));
+
+test('leading-whitespace path refuses exact NUL-delimited allowlist comparison', fixture(async f => {
+  f.git(['reset', '--hard', f.good]);
+  const path = ` ${f.path}`;
+  mkdirSync(dirname(join(f.root, path)), { recursive: true });
+  writeFileSync(join(f.root, path), '// forbidden whitespace path\n');
+  f.git(['add', '.']); f.git(['commit', '-qm', 'whitespace']);
+  const sha = f.git(['rev-parse', 'HEAD']);
+  await assert.rejects(() => requestHotPatch({ ...f.request, sha,
+    ghJson: async () => ({ state: 'OPEN', baseRefName: 'main', headRefOid: sha, headRefName: 'lane/repair' }) }), /exact allowlist/);
+  assert(!f.effects.includes('overlay'));
+}));
+for (const baseRefName of ['release', undefined]) test(`non-main or missing base refuses: ${baseRefName}`, fixture(async f => {
+  await refused({ ...f.request, ghJson: async args => {
+    assert(args.at(-1).includes('baseRefName'));
+    return { state: 'OPEN', baseRefName, headRefOid: f.sha, headRefName: 'lane/repair' };
+  } });
+  assert(!f.effects.includes('overlay'));
+}));
+for (const origin of ['https://github.com/other/web-everything.git', 'https://github.com.evil/web-everything/web-everything'])
+  test(`noncanonical origin refuses: ${origin}`, fixture(async f => {
+    f.git(['remote', 'set-url', 'origin', origin]);
+    await assert.rejects(() => requestHotPatch(f.request), /canonical.*origin/);
+    assert(!f.effects.includes('overlay'));
+  }));
+test('corrupt force-watch refuses admission with watch-unreadable', fixture(async f => {
+  writeFileSync(join(f.env.WE_DAEMON_STATE_DIR, `${cloneKey(f.root)}.force-watch.json`), '{bad');
+  await assert.rejects(() => requestHotPatch(f.request), /watch-unreadable/);
+  assert(!f.effects.includes('overlay'));
+}));
+test('force-watch becoming corrupt during registration refuses rebuild', fixture(async f => {
+  await assert.rejects(() => requestHotPatch({ ...f.request, addOverlay: async () => {
+    writeFileSync(join(f.env.WE_DAEMON_STATE_DIR, `${cloneKey(f.root)}.force-watch.json`), '{bad');
+    return f.overlay;
+  } }), /watch-unreadable/);
+  assert(!f.effects.includes('rebuild'));
+}));
+test('lost request write lock preserves armed intent and does not persist registration or rebuild', fixture(async f => {
+  let held = true;
+  await assert.rejects(() => requestHotPatch({ ...f.request,
+    lock: async (_root, fn) => fn(() => held),
+    addOverlay: async () => { held = false; return f.overlay; },
+  }), /write lock lost/);
+  const record = readHotPatch(f.env);
+  assert.equal(record.overlay, null);
+  assert.equal(record.overlayIntent.expectedSha, f.sha);
+  assert(!f.effects.includes('rebuild'));
+}));
+test('lock lost before reservation makes no ledger or overlay mutation', fixture(async f => {
+  await assert.rejects(() => requestHotPatch({ ...f.request, lock: async (_root, fn) => fn(() => false) }), /write lock lost/);
+  assert.equal(readHotPatch(f.env), null);
+  assert(!f.effects.includes('overlay'));
+}));
+test('intended overlay identity is durable before registration starts', fixture(async f => {
+  await requestHotPatch({ ...f.request, addOverlay: async () => {
+    const r = readHotPatch(f.env);
+    assert.equal(r.overlay, null);
+    assert.deepEqual(r.overlayIntent, { ...f.overlay, expectedSha: f.sha });
+    return f.overlay;
+  } });
+}));
+
+test('force-watch opening during registration still blocks our verified reservation from rebuilding', fixture(async f => {
+  await assert.rejects(() => requestHotPatch({ ...f.request, addOverlay: async () => {
+    writeFileSync(join(f.env.WE_DAEMON_STATE_DIR, `${cloneKey(f.root)}.force-watch.json`),
+      JSON.stringify({ sha: f.sha, ticksLeft: 5 }));
+    return f.overlay;
+  } }), /force-watch blocked during registration: watch-already-open/);
+  assert(!f.effects.includes('rebuild'));
+  assert.equal(readHotPatch(f.env), null);
 }));

@@ -194,9 +194,12 @@ describe('recordForcedAdoption sinks', () => {
     expect(events.map((ev) => ev.kind)).toContain('force-adopt-aborted');
   });
   it('refuses with watch-write-failed (and retracts the logged adoption) when the durable watch cannot be written', async () => {
-    writeFileSync(join(dir, 'blocker'), 'x');
     const e = { ...env, WE_DAEMON_STATE_DIR: join(dir, 'blocker', 'state') };
-    const r = await recordForcedAdoption({ ...args(), env: e, emit: async () => true });
+    // Admit with readable evidence, then lose state storage before the durable watch write.
+    const r = await recordForcedAdoption({ ...args(), env: e, emit: async event => {
+      if (event.kind === 'force-adopt') writeFileSync(join(dir, 'blocker'), 'x');
+      return true;
+    } });
     expect(r).toMatchObject({ ok: false, reason: 'watch-write-failed' });
     expect(readFileSync(env.WE_FORCE_ADOPT_HANDOFF, 'utf8')).toMatch(/adopting[\s\S]*NOT adopted[^\n]*watch-write-failed/);
     expect(readFileSync(env.WE_FORCE_ADOPT_CORONER, 'utf8')).toMatch(/force-adopt-aborted/);
@@ -909,5 +912,18 @@ describe('forcedWatchStatus: the one reader of "is this forced build still watch
     await setup();
     await runForceWatchTick({ root, env, currentHead: SHA, probe: async () => ({ healthy: false }), rollback: async () => ({ ok: false }), emit: async () => true });
     expect(forcedWatchStatus(root, env, SHA)).toBe('owed');
+  });
+});
+
+describe('global hot-patch admission exclusion', () => {
+  it.each(['{}', '{corrupt', 'directory'])('blocks force-adopt when the global ledger exists or is unreadable: %s', async content => {
+    mkdirSync(env.WE_DAEMON_STATE_DIR, { recursive: true });
+    const path = join(env.WE_DAEMON_STATE_DIR, 'hot-patch.json');
+    if (content === 'directory') mkdirSync(path); else writeFileSync(path, content);
+    expect(forceBlockedReason(root, env)).toBe('hot-patch-open');
+    expect(await recordForcedAdoption({ root, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE },
+      sha: SHA, lastGood: { head: 'a'.repeat(40) }, smoke: { verdict: 'code', failed: [] }, emit: async () => true,
+    })).toMatchObject({ ok: false, reason: 'hot-patch-open' });
+    expect(readForceWatch(root, env)).toBeNull();
   });
 });

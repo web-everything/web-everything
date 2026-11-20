@@ -21,7 +21,7 @@ import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, r
 import { readReadyCandidate, alertsFilePath, writeRebuildState, writeReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { withWriteLock, cloneLockDirs } from '../daemon-clone-lock.mjs';
 import { rollbackToGood } from '../daemon-rebuild/rebuild.mjs';
 import { hotPatchLedgerPath, readHotPatch, HOT_PATCH_MAX_OPEN_MS, HOT_PATCH_OVERLAY_REASON } from '../hot-patch.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
@@ -973,6 +973,18 @@ describe('shared hot-patch rollback wiring', () => {
     expect(readHotPatch(env)).toEqual(ledger);
     return { cloneDir, env, sha, overlay };
   };
+
+  it('corrupt ledger reaches orphan-overlay cleanup through the real rebuildClone wrapper', async () => {
+    const { cloneDir, env } = isolationFixture();
+    writeFileSync(hotPatchLedgerPath(env), '{corrupt');
+    const emitEvent = vi.fn(async () => true);
+    await tick(cloneDir, env, { versions: {}, adoptOnly: true, emitEvent });
+    expect(readOverlays(cloneDir, { env })).toEqual([]);
+    const requestPath = join(cloneLockDirs(cloneDir, env.WE_DAEMON_CLONE_LOCK_ROOT).base, 'rebuild-request.json');
+    expect(JSON.parse(readFileSync(requestPath, 'utf8'))).toMatchObject({ reason: HOT_PATCH_OVERLAY_REASON });
+    expect(emitEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'hot-patch-needs-you' }), expect.anything());
+    expect(readFileSync(hotPatchLedgerPath(env), 'utf8')).toBe('{corrupt');
+  });
 
   it('a foreign clone leaves both HEADs, overlays, and the global hot-patch ledger unchanged', async () => {
     const { cloneDir, env, sha, overlay } = isolationFixture();
