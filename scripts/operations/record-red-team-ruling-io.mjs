@@ -18,7 +18,8 @@ import { syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { resolveCardRef } from './record-referral-ruling-io.mjs';
 import { CARD_REF_RE, readCardAtPrHead, referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { trackingRefspec } from '../lib/git-transport-branch.mjs';
-import { redTeamWriterEnv } from '../lib/red-team-check-run.mjs';
+import { appWriterProbeFor, redTeamWriterEnv } from '../lib/red-team-check-run.mjs';
+import { LEGACY_BOT_LOGINS } from '../lib/github-app-identity.mjs';
 import { assertRulingIdentity, isRulingComment, judgePolicyOnce, assertHumanOperator, isHumanOperatorComment, operatorBoundComments, operatorGhEnv, resolveOperatorIdentity } from '../lib/operator-identity.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createActionStore } from './action-store.mjs';
@@ -42,7 +43,18 @@ export const ghEnvFor = (actor, env = process.env) => actor === JUDGE_ACTOR ? re
 /** The posting identity: the bot for a judge (a named refusal when no App token resolves, never the operator's login). */
 export function resolveRulingIdentity(actor, { env = process.env, run } = {}) {
   if (actor !== JUDGE_ACTOR) return resolveOperatorIdentity({ env, ...(run ? { run } : {}) });
-  try { return resolveOperatorIdentity({ env: ghEnvFor(actor, env), automation: true, ...(run ? { run } : {}) }); }
+  try {
+    const probe = appWriterProbeFor({ env, ...(run ? { gh: (args, options) => {
+      const r = run('gh', args, options);
+      if (r.status !== 0) throw new Error(String(r.stderr ?? r.error?.message ?? 'installation probe failed').trim().slice(0, 200));
+      return r.stdout;
+    } } : {}) });
+    const count = String(probe() ?? '').trim();
+    if (!/^(0|[1-9]\d*)$/.test(count) || !Number.isSafeInteger(Number(count))) throw new Error('invalid installation repository count');
+    // The writer env pins the legacy WE App. Its shared REST bot login identifies the poster;
+    // GET /user cannot resolve an installation token, and role-App logins must not stand in for it.
+    return { login: LEGACY_BOT_LOGINS.find(login => login.endsWith('[bot]')), type: 'Bot' };
+  }
   catch (error) { throw new Error(`judge ruling refused: WE App token unavailable, no operator-login fallback (${String(error?.message ?? error).slice(0, 200)})`); }
 }
 export const judgeAuditLine = ({ repo, pr, head, login }) => `judge-ruling-audit actor=orchestrator channel=judge repo=${repo} pr=${pr} head=${head} poster=${login}`;
