@@ -50,6 +50,9 @@ on:
   # and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
   merge_group:
   workflow_dispatch:
+  # Called only by ci-self.yml (manual dry run of a branch's own ci.yml). github.event_name stays the
+  # caller's `workflow_dispatch`, so the existing "manual dispatch runs the full suite" rules apply.
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}

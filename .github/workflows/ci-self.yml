@@ -1,0 +1,16 @@
+name: CI self-test
+
+# Manual dry run of the dispatched branch's own ci.yml (batch-5 item 4). The `ci.yml` that GitHub runs
+# for a PR is the ruleset-pinned one from main, so an edit to ci.yml was never exercised before merge.
+# `gh workflow run ci-self.yml --ref <branch>` calls ./.github/workflows/ci.yml from THAT branch.
+# Check names come out as `self / <job>`, so they never satisfy or shadow the required `test`, `smoke`
+# or `daemon-soak` checks. Manual dispatch only: no push, pull_request or merge_group trigger.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self:
+    uses: ./.github/workflows/ci.yml
