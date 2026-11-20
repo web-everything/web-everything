@@ -85,3 +85,19 @@ export function readPartialFree(lockDir, owner) {
 export function resetBlockedByProbe({ dirty = false, probeFailed = false } = {}) {
   return dirty === true || probeFailed === true;
 }
+
+/**
+ * Error-preserving alternative to tryGit for read-only safety probes. Retry once, with identical args,
+ * for transient spawn/environment failures; persistent failure remains unknown (output: null).
+ * The injected git runner retains the CLI's existing output bounds, environment and timeout budget.
+ */
+export function retryGitProbe(args, cwd, git) {
+  let error;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { return { output: git(args, cwd), error: null }; }
+    catch (e) {
+      error = String(e?.stderr ?? '').trim() || String(e?.cause?.stderr ?? '').trim() || String(e?.message ?? e);
+    }
+  }
+  return { output: null, error };
+}

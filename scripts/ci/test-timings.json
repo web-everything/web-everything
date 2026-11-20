@@ -2254,6 +2254,7 @@
   "scripts/conveyor/soak/breaks/review-human-conflict-idle.soak.test.mjs": 0.77,
   "scripts/conveyor/soak/breaks/review-human-red-ci-never-healed.soak.test.mjs": 62.1,
   "scripts/conveyor/soak/breaks/review-label-body-child-cwd.soak.test.mjs": 3.4,
+  "scripts/conveyor/soak/breaks/review-label-stale-guard-retryable.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
   "scripts/conveyor/soak/breaks/review-seat-starved-by-repo-order.soak.test.mjs": 2,
