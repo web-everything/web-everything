@@ -5030,6 +5030,14 @@ a live target replacing a stale cached target with a different head and red chec
 Run it with `fast-drain-scope.test.mjs` and `merge-ai-prs.test.mjs` through heavy-admission. Keep `listing.*` phase timers for
 comparison against daemon observations; fixtures prove IO counts without live GitHub calls.
 
+Drain heavy-field hydration uses the shared ordered pool at width six. Keep seed/freshness and
+cache assembly shared with the synchronous reader; a failed or incomplete heavy read rejects
+the whole listing. Join outstanding reads before retrying so retries cannot exceed the pool
+bound. Async listings need `withListRetryAsync` to observe rejected reads. Default-branch names
+are static per process, with concurrent round/listing lookups sharing one pending read; gate
+evidence still comes from live reads. The `listing hydrates heavy fields with bounded concurrency`
+tests in `pr-list-paged.test.mjs` and `merge-ai-prs.test.mjs` cover these guarantees.
+
 ## Drain read-migration fixture imports
 
 Load the drain/adoption graph with static imports during collection in

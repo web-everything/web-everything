@@ -184,8 +184,8 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
-import { listOpenPrsPagedHydratedComplete as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
-import { withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
+import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
+import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
@@ -5388,6 +5388,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // reused across `--watch` passes. A failed read stays unresolved (retried next pass) and leaves the
   // non-default-base arm inert for that repo, so the chain degrades to its pre-#3674 behaviour, never to a land.
   const defaultBranchByRepo = new Map();
+  const defaultBranchReadsByRepo = new Map(); // Coalesce round/listing reads until the static value is cached.
   // #3383 — a REAL local binding (not just the `defaultBranchOf:` shorthand-property below, which only names a
   // VALUE inside the `prepareDrainVerdicts` call's argument object and is invisible everywhere else in this
   // closure). The stacked-PR retarget call further down needs the SAME lookup by NAME, not re-derived.
@@ -5465,7 +5466,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       if (slug) {
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging: resolvePrListPaging(),
+        const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging: resolvePrListPaging(),
           heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -5867,7 +5868,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
-          listed = __t.time('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, paging,
+          listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
             heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
@@ -5902,6 +5903,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   };
   const resolveDefaultBranch = async (repo) => {
     if (defaultBranchByRepo.has(repo)) return;
+    if (defaultBranchReadsByRepo.has(repo)) return defaultBranchReadsByRepo.get(repo);
     if (listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })) {
       const snap = readFastDrainRoundSnapshot({ path: listingSnapshot, repo: repo || localSlug });
       if (typeof snap?.defaultBranch === 'string' && snap.defaultBranch.trim()) {
@@ -5909,13 +5911,18 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         return;
       }
     }
-    try {
-      const { stdout } = await execFileP('gh', ['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], { encoding: 'utf8' });
-      const name = stdout.trim();
-      if (name) defaultBranchByRepo.set(repo, name);
-    } catch (e) {
-      if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
-    }
+    const read = (async () => {
+      try {
+        const { stdout } = await execFileP('gh', ['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], { encoding: 'utf8' });
+        const name = stdout.trim();
+        if (name) defaultBranchByRepo.set(repo, name);
+      } catch (e) {
+        if (!AS_JSON) process.stderr.write(`  ⚠ ${repo || 'cwd repo'}: default branch unresolved (${String(e.message || e).split('\n')[0]}) — the non-default-base hold is off for it this pass (#3674)\n`);
+      }
+    })();
+    defaultBranchReadsByRepo.set(repo, read);
+    try { await read; }
+    finally { defaultBranchReadsByRepo.delete(repo); }
   };
   let [listings] = await __t.timeAsync('listing', () => Promise.all([mapWithConcurrency(REPOS, REPOS.length, listOne), __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)))]));
   if (listingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));

@@ -53,7 +53,7 @@ function appendEvent(ev, env) {
  * @param {{repo?:string, op?:string, attempts?:number, backoffMs?:number[], sleep?:Function, streaks?:Map,
  *   persist?:boolean, threshold?:number, onEvent?:Function, env?:object, daemon?:string}} [o]
  */
-export function withListRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep = syncSleep, streaks, persist = true,
+function* listRetry(fn, { repo = '', op = 'pr-list', attempts, backoffMs, sleep = syncSleep, streaks, persist = true,
   threshold = GH_LIST_FAIL_THRESHOLD, onEvent, env = process.env, daemon } = {}) {
   backoffMs ??= listBackoffFromEnv(env);
   attempts ??= backoffMs.length + 1;
@@ -63,13 +63,13 @@ export function withListRetry(fn, { repo = '', op = 'pr-list', attempts, backoff
   let lastError;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
-      const out = fn();
+      const out = yield fn;
       if (map.delete(key)) save();
       return out;
     } catch (e) {
       lastError = e;
       if (!isTransientListFailure(e) || attempt === attempts - 1) break;
-      sleep(backoffMs[Math.min(attempt, backoffMs.length - 1)]);
+      yield () => sleep(backoffMs[Math.min(attempt, backoffMs.length - 1)]);
     }
   }
   if (isTransientListFailure(lastError)) {
@@ -83,4 +83,31 @@ export function withListRetry(fn, { repo = '', op = 'pr-list', attempts, backoff
     }
   }
   throw lastError;
+}
+
+
+/** Synchronous callers retain the same retries, backoff and persistent failure signal. */
+export function withListRetry(fn, options) {
+  const retry = listRetry(fn, options);
+  let step = retry.next();
+  while (!step.done) {
+    let value;
+    try { value = step.value(); }
+    catch (error) { step = retry.throw(error); continue; }
+    step = retry.next(value);
+  }
+  return step.value;
+}
+
+/** Await list failures before applying the same retry policy (including async hydration). */
+export async function withListRetryAsync(fn, options) {
+  const retry = listRetry(fn, options);
+  let step = retry.next();
+  while (!step.done) {
+    let value;
+    try { value = await step.value(); }
+    catch (error) { step = retry.throw(error); continue; }
+    step = retry.next(value);
+  }
+  return step.value;
 }

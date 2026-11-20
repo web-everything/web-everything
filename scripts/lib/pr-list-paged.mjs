@@ -13,6 +13,7 @@
  *   → env WE_PR_LIST_PAGE_SIZE (pageSize only). resolvePrListPaging returns each leaf's source; policy-cascade
  *   logs those sources in daemons. All GitHub execution is injected so pure transforms and tests need no network.
  */
+import { mapWithConcurrency } from './drain-concurrency.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { GH_TRANSIENT_SERVER_PATTERNS, GH_JSON_PARSE_FAILURE_PATTERNS } from './gh-throttle.mjs';
@@ -301,9 +302,11 @@ export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, m
   return { rows, pages, bytes, ms: Date.now() - started, truncated: hasNextPage && rows.length >= maxRows, totalCount };
 }
 
+const heavyArgs = (repo, row, fields) => ['pr', 'view', String(row.number), '--repo', repo, '--json', fields.join(',')];
+
 function readHeavy({ repo, row, exec, fields, execOpts }) {
   try {
-    const text = exec('gh', ['pr', 'view', String(row.number), '--repo', repo, '--json', fields.join(',')], execOptions(execOpts));
+    const text = exec('gh', heavyArgs(repo, row, fields), execOptions(execOpts));
     const data = JSON.parse(String(text));
     if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))) {
       throw new Error('missing PR heavy-field data');
@@ -335,8 +338,27 @@ export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.
 }
 
 
-/** SYNC: page the live set, then hydrate selected rows; unreadable never means partial or empty. */
-export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, needsHeavy = () => true,
+/** Async exec follows promisified execFile's { stdout } shape. Join the bounded pool before
+ * throwing so a retry cannot overlap outstanding reads. The sync hydrator owns validation/cache rules. */
+export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {}, nowMs = Date.now(), maxAgeMs,
+  fields = HEAVY_FIELDS, execOpts = {} }) {
+  const reads = await mapWithConcurrency(rows.filter(row => !heavyIsFresh(cache[row.number], row, { nowMs, maxAgeMs })), 6, async row => {
+    try {
+      const { stdout } = await execAsync('gh', heavyArgs(repo, row, fields), execOptions(execOpts));
+      return { number: row.number, stdout };
+    } catch (cause) {
+      return { error: new PrListUnreadableError({ repo, stage: 'hydrate', number: row.number, cause }) };
+    }
+  });
+  const failed = reads.find(read => read.error);
+  if (failed) throw failed.error;
+  const byNumber = new Map(reads.map(read => [read.number, read.stdout]));
+  return hydrateHeavyFields({ repo, rows, cache, nowMs, maxAgeMs, fields, execOpts,
+    exec: (_cmd, args) => byNumber.get(Number(args[2])) });
+}
+
+/** Share seed preparation and final row/cache assembly between sync and async hydration. */
+function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => true,
   cache = {}, seed = [], nowMs = Date.now(), maxRows = 500, execOpts = {} }) {
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize,
     pageRetries: paging.pageRetries, maxRows, execOpts });
@@ -360,8 +382,8 @@ export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, need
     for (const row of need) {
       if (!hasFields(working[row.number])) delete working[row.number];
     }
-    const result = hydrateHeavyFields({ repo, rows: need, exec, cache: working, nowMs, maxAgeMs,
-      fields: heavyFields, execOpts });
+    const result = yield { repo, rows: need, exec, cache: working, nowMs, maxAgeMs,
+      fields: heavyFields, execOpts };
     const heavyByNumber = new Map(result.rows.map(row => [row.number, row]));
     rows = light.rows.map(row => heavyByNumber.get(row.number) || row);
     Object.assign(working, result.cache);
@@ -372,6 +394,21 @@ export function listOpenPrsPagedHydrated({ repo, exec, paging, heavyFields, need
     .map(row => [row.number, working[row.number]]));
   return { rows, truncated: light.truncated, totalCount: light.totalCount, pages: light.pages,
     ms: light.ms, hydrated, reused, cache: nextCache };
+}
+
+/** SYNC: page the live set, then hydrate selected rows; unreadable never means partial or empty. */
+export function listOpenPrsPagedHydrated(options) {
+  const listing = pagedHydration(options);
+  const step = listing.next();
+  return step.done ? step.value : listing.next(hydrateHeavyFields(step.value)).value;
+}
+
+/** Same live pages and freshness rules, with at most six asynchronous heavy reads in flight. */
+export async function listOpenPrsPagedHydratedAsync(options) {
+  const listing = pagedHydration(options);
+  const step = listing.next();
+  return step.done ? step.value
+    : listing.next(await hydrateHeavyFieldsAsync({ ...step.value, execAsync: options.execAsync })).value;
 }
 
 /** PURE: a PR-list read must never look complete when it is not. Unique PR numbers (duplicates cannot hide an
@@ -408,6 +445,14 @@ export function parseListOutput(text, { repo = '' } = {}) {
 /** {@link listOpenPrsPagedHydrated} that refuses a short inventory (drain-facing). */
 export function listOpenPrsPagedHydratedComplete(o) {
   const listed = listOpenPrsPagedHydrated(o);
+  assertInventoryComplete({ repo: o.repo, rows: listed.rows, totalCount: listed.totalCount, truncated: listed.truncated });
+  return listed;
+}
+
+
+/** Async drain-facing listing with the same complete-inventory requirement. */
+export async function listOpenPrsPagedHydratedCompleteAsync(o) {
+  const listed = await listOpenPrsPagedHydratedAsync(o);
   assertInventoryComplete({ repo: o.repo, rows: listed.rows, totalCount: listed.totalCount, truncated: listed.truncated });
   return listed;
 }

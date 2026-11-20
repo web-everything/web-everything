@@ -633,8 +633,8 @@ it('retries a failed default-branch read on a later call and caches the successf
   const cache = new Map();
   const read = vi.fn().mockRejectedValueOnce(new Error('transient read failure'))
     .mockResolvedValueOnce({ stdout: 'trunk\n' });
-  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
-    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, read, null, true);
+  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'defaultBranchReadsByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
+    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, new Map(), read, null, true);
   await resolveDefaultBranch('fixture/repo');
   expect(cache.has('fixture/repo')).toBe(false);
   await resolveDefaultBranch('fixture/repo');
@@ -715,4 +715,19 @@ describe('fresh queue rollup completeness', () => {
     expect(retained(fresh)).toBe(fresh);
     if (kind === 'oversized connection') expect(exec).toHaveBeenCalledTimes(10);
   });
+});
+
+
+it('listing hydrates heavy fields with bounded concurrency: defaultBranch is read once per process across concurrent round and listing reads', async () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+  const start = source.indexOf('  const resolveDefaultBranch = async (repo) => {');
+  const end = source.indexOf('\n  let [listings]', start);
+  const cache = new Map(), pending = new Map();
+  const read = vi.fn(async () => { await Promise.resolve(); return { stdout: 'trunk\n' }; });
+  const resolveDefaultBranch = new Function('defaultBranchByRepo', 'defaultBranchReadsByRepo', 'execFileP', 'listingSnapshot', 'AS_JSON',
+    `${source.slice(start, end)}; return resolveDefaultBranch;`)(cache, pending, read, null, true);
+  await Promise.all([resolveDefaultBranch('fixture/repo'), resolveDefaultBranch('fixture/repo')]);
+  await resolveDefaultBranch('fixture/repo');
+  expect(cache.get('fixture/repo')).toBe('trunk');
+  expect(read).toHaveBeenCalledTimes(1);
 });
