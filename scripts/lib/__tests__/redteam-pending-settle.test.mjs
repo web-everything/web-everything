@@ -739,6 +739,42 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(scan(f)).toBe(false);
     expect(f.read).not.toHaveBeenCalled();
   });
+  describe.each(['review-ledger-check', 'review-future-operation'])('unrelated %s run-store records', op => {
+    const id = `${op}-00000000-0000-0000-0000-000000000000`;
+    const record = () => newRunRecord({ id, op, input: { repo } });
+    it('valid payloads permit a full review and reuse the summary cache', () => {
+      const f = scanFixture({ 'review-pr-old': run(), [id]: record() });
+      expect(scan(f)).toBe(true);
+      const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
+        headNeverReviewed: () => scan(f) });
+      expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review' });
+      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+      expect(o.settlePending).not.toHaveBeenCalled();
+      expect(f.read).toHaveBeenCalledTimes(2);
+    });
+    it.each(['malformed', 'unreadable', 'wrong id', 'wrong operation', 'live review'])('%s payload refuses proof', kind => {
+      const f = scanFixture({ [id]: kind === 'malformed' ? {} : { ...record(),
+        ...(kind === 'wrong id' ? { id: `${op}-other` } : {}),
+        ...(kind === 'wrong operation' ? { op: 'review-unrelated' } : {}),
+        ...(kind === 'live review' ? { op: 'review-pr', input: { repo, pr }, ...payload('accept') } : {}),
+      } });
+      if (kind === 'unreadable') f.read.mockImplementation(() => { throw Error('unreadable record'); });
+      expect(scan(f)).toBe(false);
+      expect(f.read).toHaveBeenCalledTimes(1);
+    });
+    it('shares the parse budget and invalidates a rewritten summary', () => {
+      const records = { 'review-pr-old': run(), [id]: record() }, f = scanFixture(records);
+      f.scanSettings.file.runs.scan.maxParses = 1;
+      expect(scan(f)).toBe(false);
+      expect(f.read).toHaveBeenCalledTimes(1);
+      expect(scan(f)).toBe(true);
+      expect(f.read).toHaveBeenCalledTimes(2);
+      records[id] = {};
+      f.stat.mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
+      expect(scan(f)).toBe(false);
+      expect(scan(f)).toBe(false);
+    });
+  });
   it('ignores old heads and exact-head records belonging to another repo or PR', () => {
     expect(scan(scanFixture({ 'review-pr-old': run(),
       'review-pr-other-repo': run({ input: { repo: 'other/repo', pr }, ...payload('accept') }),
@@ -808,11 +844,16 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(scan(f)).toBe(true);
     expect(f.read).toHaveBeenCalledTimes(1);
   });
-  it.each(['review-pr-invalid!.json', 'review-other.json'])('omitted review-like file %s refuses proof', name => {
+  it('an invalid omitted review filename refuses proof before reading it', () => {
     const f = scanFixture();
-    f.readdir.mockReturnValue([name]);
+    f.readdir.mockReturnValue(['review-pr-invalid!.json']);
     expect(scan(f)).toBe(false);
     expect(f.read).not.toHaveBeenCalled();
+  });
+  it('an omitted review-like file without validated payload refuses proof', () => {
+    const f = scanFixture();
+    f.readdir.mockReturnValue(['review-other.json']);
+    expect(scan(f)).toBe(false);
   });
   it('an invalid review filename appearing after parsing refuses proof', () => {
     const f = scanFixture({ 'review-pr-old': run() });
@@ -869,6 +910,24 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     f.stat.mockReturnValueOnce({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 }).mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
     expect(scan(f)).toBe(false);
   });
+  it.each(['review-pr', 'review-prep', 'review-ledger-check'])('cached %s candidate rewritten during final snapshot refuses proof', op => {
+    const id = `${op}-old`;
+    const records = { [id]: op === 'review-pr' ? run() : newRunRecord({ id, op, input: { repo } }) };
+    const f = scanFixture(records);
+    expect(scan(f)).toBe(true);
+    f.stat.mockClear();
+    // The warm-cache lookup sees the old identity; only the final sweep sees the rewrite.
+    f.stat.mockReturnValueOnce({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 })
+      .mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
+    expect(scan(f)).toBe(false);
+    expect(f.stat).toHaveBeenCalledTimes(2);
+    expect(f.read).toHaveBeenCalledTimes(1);
+    // The failed final sweep must evict its cached summary even if metadata returns to its old value.
+    records[id] = op === 'review-pr' ? run(payload('accept')) : {};
+    f.stat.mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 });
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(2);
+  });
   it.each(['mtimeMs', 'ctimeMs', 'dev', 'size', 'ino'])('missing %s metadata refuses proof', key => {
     const f = scanFixture({ 'review-pr-old': run() });
     const identity = { mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 }; delete identity[key];
@@ -920,15 +979,15 @@ describe('R640 full review preserves pending', () => {
 });
 
 describe('R640 default never-reviewed scan', () => {
-  it.each([false, true])('allows this head with a persisted unfinished review and prep present: %s', withPrep => {
+  it.each([null, 'review-prep', 'review-ledger-check'])('allows this head with a persisted unfinished review and unrelated operation: %s', op => {
     const dir = mkdtempSync(join(tmpdir(), 'r640-review-runs-'));
     try {
       writeFileSync(join(dir, 'review-pr-old.json'), JSON.stringify(assertRunRecord({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
         findings: payload('needs-human', old).findings, verdict: null,
         pending: { kind: 'confirm', step: 'verdict', stepIndex: 1 }, effects: [] })));
-      if (withPrep) {
-        const id = 'review-prep-00000000-0000-0000-0000-000000000000';
-        writeFileSync(join(dir, `${id}.json`), JSON.stringify(newRunRecord({ id, op: 'review-prep', input: { repo, item: '1234' } })));
+      if (op) {
+        const id = `${op}-00000000-0000-0000-0000-000000000000`;
+        writeFileSync(join(dir, `${id}.json`), JSON.stringify(newRunRecord({ id, op, input: { repo, item: '1234' } })));
       }
       const o = runFixture({ env: { OPERATION_RUNS_DIR: dir }, readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) });
       expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('review');

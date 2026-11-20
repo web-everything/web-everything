@@ -5496,10 +5496,12 @@ hold. Every candidate, including ids named for other PRs, is read and validated 
 `assertReviewRunEvidence` on a cache miss. Payload repo/PR determines relevance
 regardless of the filename's PR; corrupt or unreadable unrelated records refuse proof.
 Independently list the directory before and after parsing: any review-like JSON file
-omitted by candidate discovery refuses proof, except valid `review-prep-*` records.
-These share the run store but are unrelated operations: validate their run-record schema,
-payload ID and `review-prep` operation under the same parse budget, summary cache and
-file-identity checks before excluding them. Malformed or unreadable prep records,
+omitted by candidate discovery refuses proof unless its payload validates as another
+`review-*` operation (such as `review-prep` or `review-ledger-check`). These share the
+run store but are unrelated operations: validate their run-record schema, payload ID,
+and operation matching the filename prefix under the same parse budget, summary cache
+and file-identity checks before excluding them. An omitted `review-pr-*` filename
+still refuses proof. Malformed or unreadable unrelated records,
 invalid filenames and mismatched IDs or operations retain the hold.
 Known `.abandoned.json` tombstones and
 temporary files ending in `.tmp` remain excluded. Operators must inspect and repair
@@ -5523,6 +5525,12 @@ null candidate discovery, and planner cooldown/formal-review/publishability hold
 Prep fixtures cover valid coexisting records, malformed/unreadable payloads, ID/operation
 mismatches, shared budget resumption, cache invalidation, and the real-file default
 scanner dispatching a full review while preserving the pending red-team label.
+The `unrelated %s run-store records` tests cover ledger checks and a future operation
+through the same validation path. The real-file default scanner also includes a
+persisted ledger check. `cached %s candidate rewritten during final snapshot refuses
+proof` warms the cache for PR, prep and ledger-check records, changes metadata only
+at the final identity sweep, and asserts refusal without rereading the payload plus
+eviction of the stale summary. This isolates the final sweep from the parse-time check.
 Keep index integrity/backfill tests in `review-run-index.test.mjs`; index corruption,
 poison, overflow or eviction alone no longer determines the never-reviewed proof.
 This proof only permits a full review. Red-team release still requires the unchanged

@@ -427,9 +427,9 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
         if (!name.startsWith('review-') || !name.endsWith('.json') || name.endsWith('.abandoned.json')) continue;
         const id = name.slice(0, -5);
         if (ids.has(id)) continue;
-        // review-prep shares the store but is not PR review evidence. Validate
-        // its payload under the same budget/cache before classifying it as unrelated.
-        if (!isValidRunId(id) || !id.startsWith('review-prep-')) {
+        // Other review operations share the store. Validate their payloads under
+        // the same budget/cache before classifying them as unrelated.
+        if (!isValidRunId(id) || id.startsWith('review-pr-')) {
           throw Error('review run filename omitted from candidates; inspect stored evidence');
         }
         ids.add(id);
@@ -455,9 +455,11 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
         summary = { identity: before, valid: false };
         try {
           const run = read(id, runsDir);
-          if (id.startsWith('review-prep-')) {
+          if (!id.startsWith('review-pr-')) {
             assertRunRecord(run);
-            if (run.op !== 'review-prep') throw Error('review-prep filename and operation disagree');
+            if (run.op === 'review-pr' || !run.op.startsWith('review-') || !id.startsWith(`${run.op}-`)) {
+              throw Error('unrelated review filename and operation disagree');
+            }
           } else assertReviewRunEvidence(run);
           if (run.id !== id) throw Error('review run filename and payload id disagree');
           summary = { ...summary, valid: true, op: run.op, repo: run.input?.repo,
