@@ -1,7 +1,7 @@
 /**
  * @file scripts/__tests__/vitest-worker-cap.test.mjs
  * @description Host-overload fix (heavy-enforce): every vitest config reads ONE worker ceiling,
- *   `WE_VITEST_MAX_WORKERS`, defaulting to max(1, min(4, floor(cpu count / heavy-admission cap))). Pins the
+ *   `WE_VITEST_MAX_WORKERS` (CI-only integer 1..8), otherwise max(1, min(4, floor(cpu count / heavy-admission cap))). Pins the
  *   resolver, its parity with heavy-admission's own cap parsing, and that every config file applies it.
  */
 import { describe, it, expect } from 'vitest';
@@ -33,13 +33,12 @@ describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () 
 
   it('an explicit WE_VITEST_MAX_WORKERS wins', () => {
     expect(VITEST_MAX_WORKERS_ENV).toBe('WE_VITEST_MAX_WORKERS');
-    expect(resolveMaxTestWorkers({ WE_VITEST_MAX_WORKERS: '6' }, 12)).toBe(6);
-    expect(resolveMaxTestWorkers({ WE_VITEST_MAX_WORKERS: '3.9' }, 12)).toBe(3);
+    expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: '6' }, 12)).toBe(6);
   });
 
   it('ignores an invalid WE_VITEST_MAX_WORKERS and falls back to the default', () => {
     for (const bad of ['0', '-2', '0.9', 'lots', '', 'Infinity', 'NaN']) {
-      expect(resolveMaxTestWorkers({ WE_VITEST_MAX_WORKERS: bad }, 12)).toBe(4);
+      expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: bad }, 12)).toBe(4);
     }
   });
 
@@ -50,6 +49,26 @@ describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () 
       const env = v === undefined ? { LANE_POOL_ROOT: '/private-test-pool' } : { LANE_POOL_ROOT: '/private-test-pool', WE_HEAVY_ADMISSION_CAP: v };
       expect(resolveMaxTestWorkers(env, 24)).toBe(Math.max(1, Math.min(4, Math.floor(24 / resolveCap(env)))));
     }
+  });
+});
+
+describe('ci worker count', () => {
+  it.each(['1', '4', '8', ' 6 '])('uses valid CI override %j', (value) => {
+    expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value }, 4)).toBe(Number(value));
+  });
+
+  it('uses the cpu/heavy-cap rule in CI without an override', () => {
+    expect(resolveMaxTestWorkers({ CI: 'true' }, 4)).toBe(2);
+    expect(resolveMaxTestWorkers({ CI: 'true', WE_HEAVY_ADMISSION_CAP: '4' }, 4)).toBe(1);
+  });
+
+  it.each([undefined, 'false', '1', 'TRUE'])('ignores the local override with CI=%j', (CI) => {
+    expect(resolveMaxTestWorkers({ CI, WE_VITEST_MAX_WORKERS: '8' }, 4)).toBe(2);
+  });
+
+  it.each(['', '  ', '0', '-1', '9', '100', '3.9', 'lots', 'Infinity', 'NaN'])('falls back for invalid CI override %j', (value) => {
+    expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value }, 4)).toBe(2);
+    expect(resolveMaxTestWorkers({ CI: 'true', WE_VITEST_MAX_WORKERS: value, WE_HEAVY_ADMISSION_CAP: '4' }, 4)).toBe(1);
   });
 });
 
