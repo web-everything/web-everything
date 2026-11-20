@@ -445,18 +445,15 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         }
         const listed = listRows();
         if (!listed.ok) return stop('remove-refused', { detail: 'unreadable-registry' });
-        if (listed.rows.some((r) => r.stackBases !== undefined && (!Array.isArray(r.stackBases) || !r.stackBases.every(safeRegistrationRef))))
-          return stop('remove-refused', { detail: 'unreadable-stack-evidence' });
         const targets = listed.rows.filter((r) => r.ref === input.remove);
         if (targets.length !== 1) return stop('remove-refused', { detail: 'expected-one-registration' });
-        const dependents = listed.rows.filter((r) => r.ref !== input.remove &&
-          (r.stackBases?.includes(input.remove) || Object.values(r.stackVia || {}).flat().includes(input.remove)));
-        if (dependents.length) return stop('remove-refused', { detail: 'stacked-dependents', dependents: dependents.map((r) => r.ref) });
+        if (input.acceptOmission !== true && input.acceptUncontained !== true)
+          return stop('remove-refused', { detail: 'accept-omission-required', fallback: 'Pass --accept-omission to acknowledge content omission.' });
         requireGit('fetch', 'origin', `+refs/heads/${input.remove}:refs/remotes/origin/${input.remove}`);
         const tip = requireGit('rev-parse', '--verify', `refs/remotes/origin/${input.remove}^{commit}`);
         if (!validSha(tip)) return stop('remove-refused', { detail: 'invalid-tip' });
         if (input.dryRun) { out.ok = true; out.wouldRemove = [input.remove]; return out; }
-        const removeOne = removeRegistration || ((args) => withdrawRegisteredOverlay({ ...args, env: childEnv, reason: input.reason, git,
+        const removeOne = removeRegistration || ((args) => withdrawRegisteredOverlay({ ...args, env: childEnv, reason: input.reason, acceptOmission: input.acceptOmission, acceptUncontained: input.acceptUncontained,
           deps: {
             // Explicit operator withdrawal uses the existing guarded retirement transaction:
             // entry identity, durable drop intent and post-drop tip check all stay enforced.
@@ -465,7 +462,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         const data = await removeOne({ root: out.clone, ref: input.remove, expectedTip: tip, expectedEntry: targets[0], by: env.USER || 'prototype-load',
           ...(actor ? { actor } : {}) });
         if (data?.retired !== true) return stop('remove-refused', {
-          detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip or stacked dependents, then retry --remove.' });
+          detail: data?.refused || 'removal-unproved', fallback: 'Retain the entry; resolve changed entry/tip, then retry --remove.' });
         out.removed = [input.remove]; out.ok = true; return out;
       }
       if (input.retire) {

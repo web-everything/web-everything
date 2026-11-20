@@ -48,17 +48,11 @@ export default {
       addOverlay(scratch, { ref }, { env });
       appendOverlayEvent(scratch, { kind: 'added', ref, at: '2026-11-14T10:00:00Z' }, { env });
       const expectedEntry = readOverlays(scratch, { env }).find((entry) => entry.ref === ref);
-      // Model complete history through the Git seam; the private scratch has no shallow boundary file.
-      const git = (cmd, ...args) => {
-        if (cmd === 'rev-parse' && args[0] === '--is-shallow-repository') return { code: 0, stdout: 'false\n' };
-        if (cmd === 'rev-parse' && args[0] === '--git-path' && args[1] === 'shallow') return { code: 0, stdout: '.git/shallow\n' };
-        return { code: 0, stdout: cmd === 'ls-remote' ? `${sha}\trefs/heads/${ref}` : '' };
-      };
-      const removal = await withdrawRegisteredOverlay({ reason, git, root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
+      const removal = await withdrawRegisteredOverlay({ reason, acceptOmission: true, root: scratch, ref, expectedTip: sha, expectedEntry, by: 'operator', actor, env,
         deps: { tip: () => sha } });
       const events = readOverlayEventLog(scratch, env);
       const removed = events.at(-1);
-      if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true) {
+      if (!removal.retired || removed?.kind !== 'auto-retired' || removed.ref !== ref || removed.tip !== sha || removed.reason !== reason || removed.actor !== actor || removed.operatorReason !== true || removed.acceptedOmission !== true) {
         violations.push({ invariant: 'sanctioned-removal-missing-proof', detail: `reasoned removal did not record the exact live tip: ${JSON.stringify({ removal, event: removed })}` });
       }
       const m = (history) => matchReadyCandidate({

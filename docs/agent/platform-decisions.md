@@ -5758,6 +5758,13 @@ clauses:
      over the re-prep's "never in a clone that reviews, labels or merges PRs". **Carve-out:** the drain daemon
      and the `merge-orphan-sweep` pass merge to `main`, so they stay `main`-only and never share a clone that
      runs overlays.
+   - **Explicit operator withdrawal** (checklist line 14, operator amendment 2026-11-19) requires
+     `--accept-omission` (`--accept-uncontained` is an alias), a non-empty non-automatic reason,
+     authenticated human actor and exact tip. An already-unregistered ref must match a live rebuild
+     merge's applied second parent. Record `operatorReason: true`, `acceptedOmission: true` and the
+     actor. Containment in origin/main never substitutes for acknowledgement; dependent-independence
+     proof and its overlay refresh/shallow guard do not gate operator withdrawal. The rebuild's merge
+     and smoke remain the safety net. Ordinary in-main retirement grants no operator omission authority.
    - (f) **Graduation is unchanged.** Overlay code reaches `main` only through its own normal PR and review.
    - (g) **This supersedes the long-lived POC-branch approach for daemons** (`lane/daemon-poc`, tracking epic
      3999): a daemon never tracks a POC branch as its steady state. It is the daemon exception written into

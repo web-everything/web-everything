@@ -262,6 +262,8 @@ export function refusal(records, ref, since, alerts = false) {
 }
 export function prototypeLoadOperation() {
   const input = Object.fromEntries(['branch', 'sha', 'daemon', 'why', 'tests-run', 'audit', 'replace', 'wait-adoption-ms', 'ruling', 'quote', 'remove', 'reason', 'actor'].map((key) => [key, { type: 'string', required: false, default: '' }]));
+  input['accept-omission'] = { type: 'boolean', required: false, default: false };
+  input['accept-uncontained'] = { type: 'boolean', required: false, default: false };
   input['dry-run'] = { type: 'boolean', required: false, default: false };
   // Urgent authorizes prototype loading only; merging still requires real CI.
   input.urgent = { type: 'boolean', required: false, default: false };
@@ -274,7 +276,7 @@ export function prototypeLoadOperation() {
     input, verdictFrom: 'assess',
     load: effect({ reads: Object.keys(input).map((key) => `input.${key}`),
       effects: ({ input: values }) => [{ type: PROTOTYPE_LOAD_EFFECT,
-        payload: { ...values, testsRun: values['tests-run'], dryRun: values['dry-run'], forceAdopt: values['force-adopt'], waitAdoptionMs: values['wait-adoption-ms'] }, idempotent: false }] }),
+        payload: { ...values, acceptOmission: values['accept-omission'], acceptUncontained: values['accept-uncontained'], testsRun: values['tests-run'], dryRun: values['dry-run'], forceAdopt: values['force-adopt'], waitAdoptionMs: values['wait-adoption-ms'] }, idempotent: false }] }),
     assess: compute({ reads: ['findings.load'], fn: ({ findings }) => {
       const entry = findings.load?.effects?.[0];
       if (entry?.status !== 'applied' || !entry.result) throw new Error('prototype-load: transaction did not complete');

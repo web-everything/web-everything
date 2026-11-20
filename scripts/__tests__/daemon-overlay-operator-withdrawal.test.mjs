@@ -34,243 +34,46 @@ function fixture() {
   const tip = git('rev-parse', 'HEAD');
   git('checkout', '-q', 'main');
   git('merge', '--no-ff', '-m', 'daemon-rebuild: merge overlay lane/withdraw onto main', 'lane/withdraw');
-  const args = { root, ref: 'lane/withdraw', tip, actor: 'CHALBERT', reason: 'operator withdrawal', acceptUncontained: true, env,
-    deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'User' }),
-      fetchMainAndOverlays: vi.fn(() => ({ ok: true, goneRefs: [] })) } };
+  const args = { root, ref: 'lane/withdraw', tip, actor: 'CHALBERT', reason: 'operator withdrawal', acceptOmission: true, env,
+    deps: { resolveOperatorIdentity: () => ({ login: 'chalbert', type: 'User' }) } };
   const events = () => { try { return readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse); } catch { return []; } };
   return { root, env, git, args, tip, events };
 }
 
-describe.each(['registered', 'unregistered'])('%s withdrawal history guard', path => {
-  it.each([true, false])('refuses shallow clones and accepts complete clones (shallow: %s)', async shallow => {
-    const f = fixture();
-    const root = join(f.root, 'clone');
-    const cloned = spawnSync('git', ['clone', ...(shallow ? ['--depth=2'] : []), '--branch=main', `file://${f.root}`, root], { encoding: 'utf8' });
-    expect(cloned.status, cloned.stderr).toBe(0);
-    const env = { ...f.env, WE_DAEMON_OVERLAY_DIR: join(root, 'store') };
-    const runGit = (...args) => spawnSync('git', args, { cwd: root, env, encoding: 'utf8' });
-    expect(runGit('rev-parse', '--is-shallow-repository').stdout.trim()).toBe(String(shallow));
-    expect(runGit('update-ref', 'refs/remotes/origin/main', f.git('rev-parse', 'refs/remotes/origin/main')).status).toBe(0);
-    if (path === 'registered') addOverlay(root, { ref: f.args.ref }, { env });
-    const before = readOverlays(root, { env });
-    const withdraw = () => path === 'unregistered'
-      ? withdrawUnregisteredOverlay({ ...f.args, root, env })
-      : withdrawRegisteredOverlay({ root, env, ref: f.args.ref, expectedTip: f.tip, actor: 'chalbert', reason: f.args.reason,
-        deps: { tip: () => f.tip },
-        git: (...args) => {
-          const r = args[0] === 'ls-remote' ? { status: 0, stdout: `${f.tip}\trefs/heads/${f.args.ref}` } : runGit(...args);
-          return { code: r.status, stdout: r.stdout ?? '' };
-        } });
-    if (shallow) {
-      await expect(withdraw()).rejects.toThrow(
-        'history is shallow; cannot prove no registered overlay depends on lane/withdraw; restore complete clone history and retry withdrawal');
-      expect(readOverlays(root, { env })).toEqual(before);
-      expect(() => readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'))).toThrow();
-    } else {
-      expect(await withdraw()).toMatchObject({ retired: true });
-      const events = readFileSync(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
-      expect(events.at(-1)).toMatchObject({ operatorReason: true });
-    }
-  });
-});
-
 describe('operator withdrawal of an unregistered live overlay', () => {
-  it.each(['stackBases', 'stackVia', 'ancestry'])('refuses a registered stacked dependent via %s even with acceptance', async (via) => {
+  it.each([false, true])('requires acknowledgement regardless of containment in main (contained: %s)', async contained => {
     const f = fixture();
-    addOverlay(f.root, { ref: 'lane/top', ...(via === 'stackBases' ? { stackBases: [f.args.ref] } : {}) }, { env: f.env });
-    if (via === 'stackVia') {
-      const store = JSON.parse(readFileSync(overlayFilePath(f.root, f.env), 'utf8'));
-      store.overlays[0].stackVia = { pr: [f.args.ref] };
-      writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify(store));
-    }
-    f.git('update-ref', 'refs/remotes/origin/lane/top', f.tip);
-    const before = f.events();
-    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/stacked/);
-    expect(f.events()).toEqual(before);
-  });
-  it.each([{ stackBases: 'unknown' }, { stackVia: { ancestry: null } }])('refuses malformed stored stack evidence %j', async fields => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
-    const store = JSON.parse(readFileSync(overlayFilePath(f.root, f.env), 'utf8'));
-    Object.assign(store.overlays[0], fields);
-    writeFileSync(overlayFilePath(f.root, f.env), JSON.stringify(store));
-    const before = f.events();
-    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/unreadable-stack-evidence/);
-    expect(f.events()).toEqual(before);
-  });
-  it('refuses uncontained content without explicit acceptance', async () => {
-    const f = fixture();
-    await expect(withdrawUnregisteredOverlay({ ...f.args, acceptUncontained: undefined })).rejects.toThrow(/--accept-uncontained/);
+    if (contained) f.git('update-ref', 'refs/remotes/origin/main', f.tip);
+    await expect(withdrawUnregisteredOverlay({ ...f.args, acceptOmission: undefined })).rejects.toThrow(/--accept-omission/);
     expect(f.events()).toEqual([]);
   });
-  it('accepts uncontained content with explicit acceptance and records it', async () => {
+  it('accepts the exact live tip with acknowledgement despite registered dependents', async () => {
     const f = fixture();
-    expect(await withdrawUnregisteredOverlay(f.args)).toMatchObject({ retired: true });
-    expect(f.events().at(-1)).toMatchObject({ operatorReason: true, acceptUncontained: true });
-  });
-  it('accepts contained content without acceptance override', async () => {
-    const f = fixture();
-    f.git('update-ref', 'refs/remotes/origin/main', f.tip);
-    expect(await withdrawUnregisteredOverlay({ ...f.args, acceptUncontained: undefined })).toMatchObject({ retired: true });
-    expect(f.events().at(-1)).not.toHaveProperty('acceptUncontained');
-  });
-  it('refuses an unresolvable dependent tip with a fetch-first fallback', async () => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/missing' }, { env: f.env });
-    const before = f.events();
-    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(
-      "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
-    expect(f.events()).toEqual(before);
-  });
-  it('refuses a fresh remote dependent hidden by an independent stale cached tip', async () => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
-    const stale = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'old independent top');
-    const remoteTip = f.git('commit-tree', 'HEAD^{tree}', '-p', f.tip, '-m', 'fresh stacked top');
-    f.git('update-ref', 'refs/remotes/origin/lane/top', stale);
-    expect(f.git('merge-base', f.tip, stale)).toBe(f.git('rev-parse', 'refs/remotes/origin/main'));
-    const before = f.events();
-    f.args.deps.fetchMainAndOverlays.mockImplementation(({ git, overlays }) => {
-      expect(overlays.map(o => o.ref)).toEqual(['lane/top']);
-      expect(git(['update-ref', 'refs/remotes/origin/lane/top', remoteTip]).status).toBe(0);
-      return { ok: true, goneRefs: [] };
-    });
-    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/stacked-dependents/);
-    expect(f.args.deps.fetchMainAndOverlays).toHaveBeenCalledTimes(1);
-    expect(f.events()).toEqual(before);
-  });
-  it.each(['throws', 'failed', 'unrefreshed', 'missing result'])('refuses overlay refresh %s with an operator fallback', async failure => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
-    f.git('update-ref', 'refs/remotes/origin/lane/other', f.git('rev-parse', 'refs/remotes/origin/main'));
-    const before = f.events();
-    f.args.deps.fetchMainAndOverlays.mockImplementation(() => {
-      if (failure === 'throws') throw new Error('remote unavailable');
-      if (failure === 'failed') return { ok: false, reason: 'fetch-failed' };
-      if (failure === 'unrefreshed') return { ok: true, goneRefs: ['lane/other'] };
-      return undefined;
-    });
-    await expect(withdrawUnregisteredOverlay(f.args)).rejects.toThrow(/could not refresh.*restore.*retry/);
-    expect(f.events()).toEqual(before);
-  });
-  it('refuses a stale tracking ref with no cached relationship and truncated local history', async () => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
-    const stale = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'old top');
-    f.git('update-ref', 'refs/remotes/origin/lane/top', stale);
-    // The remote may have advanced to depend on the withdrawn tip. Locally the stale
-    // tip's history is truncated: --is-ancestor returns 1 without proving independence.
-    writeFileSync(join(f.root, '.git', 'shallow'), `${stale}\n`);
-    const ancestry = spawnSync('git', ['merge-base', '--is-ancestor', f.tip, stale], { cwd: f.root, encoding: 'utf8' });
-    expect(ancestry.status).toBe(1);
-    const before = f.events();
+    addOverlay(f.root, { ref: 'lane/top', stackBases: [f.args.ref], edgeResolution: { sha: f.tip } }, { env: f.env });
     const run = vi.fn((cmd, args, opts) => {
-      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('fetch must use the injected helper');
-      return spawnSync(cmd, args, opts);
-    });
-    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
-      "history is shallow; cannot prove no registered overlay depends on lane/withdraw");
-    expect(f.events()).toEqual(before);
-  });
-  it.each([false, true])('refuses a fetched dependent with a shallow merge parent despite a common ancestor (reported shallow: %s)', async reportedShallow => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/top' }, { env: f.env });
-    const base = f.git('rev-parse', 'refs/remotes/origin/main');
-    const boundary = f.git('commit-tree', 'HEAD^{tree}', '-p', f.tip, '-m', 'hidden descent');
-    const top = f.git('commit-tree', 'HEAD^{tree}', '-p', boundary, '-p', base, '-m', 'dependent merge');
-    const before = f.events();
-    f.args.deps.fetchMainAndOverlays.mockImplementation(() => {
-      f.git('update-ref', 'refs/remotes/origin/lane/top', top);
-      writeFileSync(join(f.root, '.git', 'shallow'), `${boundary}\n`);
-      expect(f.git('merge-base', f.tip, top)).toBe(base);
-      expect(spawnSync('git', ['merge-base', '--is-ancestor', f.tip, top], { cwd: f.root }).status).toBe(1);
-      return { ok: true, goneRefs: [] };
-    });
-    const run = (cmd, args, opts) => args[1] === '--is-shallow-repository'
-      ? { status: 0, stdout: `${reportedShallow}\n` } : spawnSync(cmd, args, opts);
-    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
-      'history is shallow; cannot prove no registered overlay depends on lane/withdraw');
-    expect(f.args.deps.fetchMainAndOverlays).toHaveBeenCalledTimes(1);
-    expect(f.events()).toEqual(before);
-  });
-  it.each(['query fails', 'query throws', 'query malformed', 'path fails', 'path empty', 'file unreadable'])(
-    'refuses unknown shallow history state: %s', async failure => {
-      const f = fixture();
-      const before = f.events();
-      const run = (cmd, args, opts) => {
-        if (args[1] === '--is-shallow-repository') {
-          if (failure === 'query throws') throw new Error('unreadable state');
-          if (failure === 'query fails') return { status: 128, stdout: '' };
-          if (failure === 'query malformed') return { status: 0, stdout: 'unknown' };
-        }
-        if (args[1] === '--git-path') {
-          if (failure === 'path fails') return { status: 128, stdout: '' };
-          if (failure === 'path empty') return { status: 0, stdout: '' };
-          if (failure === 'file unreadable') return { status: 0, stdout: '.git' };
-        }
-        return spawnSync(cmd, args, opts);
-      };
-      await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
-        /cannot prove no registered overlay depends on lane\/withdraw.*retry/);
-      expect(f.events()).toEqual(before);
-    });
-  it.each(['merge-base', 'ancestry'])('refuses unreadable local %s evidence for a resolvable overlay', async stage => {
-    const f = fixture();
-    addOverlay(f.root, { ref: 'lane/other' }, { env: f.env });
-    const otherTip = f.git('rev-parse', 'refs/remotes/origin/main');
-    f.git('update-ref', 'refs/remotes/origin/lane/other', otherTip);
-    const run = (cmd, args, opts) => {
-      if (args[0] === 'merge-base' && args.at(-1) === otherTip
-        && (args[1] === '--is-ancestor') === (stage === 'ancestry')) return { status: 128, stdout: '' };
-      return spawnSync(cmd, args, opts);
-    };
-    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(
-      "cannot prove no registered overlay depends on lane/withdraw; fetch the clone's overlays first");
-    expect(f.events()).toEqual([]);
-  });
-  it('refuses unreadable containment even with explicit acceptance', async () => {
-    const f = fixture();
-    const run = (cmd, args, opts) => args[0] === 'merge-base' && args[1] === '--is-ancestor'
-      ? { status: 128, stdout: '' } : spawnSync(cmd, args, opts);
-    await expect(withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).rejects.toThrow(/containment unreadable/);
-    expect(f.events()).toEqual([]);
-  });
-  it('accepts freshly fetched independent registered overlays', async () => {
-    const f = fixture();
-    expect(f.git('rev-parse', '--is-shallow-repository')).toBe('false');
-    addOverlay(f.root, { ref: 'lane/independent' }, { env: f.env });
-    f.git('update-ref', 'refs/remotes/origin/lane/independent', f.git('rev-parse', 'refs/remotes/origin/main'));
-    addOverlay(f.root, { ref: 'lane/second' }, { env: f.env });
-    const secondTip = f.git('commit-tree', 'HEAD^{tree}', '-p', 'refs/remotes/origin/main', '-m', 'independent');
-    f.git('update-ref', 'refs/remotes/origin/lane/second', f.tip);
-    f.args.deps.fetchMainAndOverlays.mockImplementation(({ git, overlays }) => {
-      expect(overlays.map(o => o.ref)).toEqual(['lane/independent', 'lane/second']);
-      expect(git(['update-ref', 'refs/remotes/origin/lane/second', secondTip]).status).toBe(0);
-      return { ok: true, goneRefs: [] };
-    });
-    const run = vi.fn((cmd, args, opts) => {
-      if (['fetch', 'ls-remote'].includes(args[0])) throw new Error('fetch must use the injected helper');
+      expect(['merge-base', 'log']).toContain(args[0]);
+      expect(args).not.toContain('--is-ancestor');
       return spawnSync(cmd, args, opts);
     });
     expect(await withdrawUnregisteredOverlay({ ...f.args, deps: { ...f.args.deps, run } })).toMatchObject({ retired: true });
-    expect(run).toHaveBeenCalled();
-    expect(f.args.deps.fetchMainAndOverlays).toHaveBeenCalledTimes(1);
+    expect(f.events().at(-1)).toMatchObject({ operatorReason: true, acceptedOmission: true, actor: 'chalbert', tip: f.tip });
+    expect(readOverlays(f.root, { env: f.env }).map(o => o.ref)).toEqual(['lane/top']);
   });
   it('refuses automatic reasons as explicit withdrawal authority', async () => {
     const f = fixture();
     await expect(withdrawUnregisteredOverlay({ ...f.args, reason: 'in-main' })).rejects.toThrow(/operator withdrawal/);
     expect(f.events()).toEqual([]);
   });
-  it('CLI requires --accept-uncontained and records explicit acceptance', async () => {
+  it.each(['--accept-omission', '--accept-uncontained'])('CLI requires explicit acknowledgement and accepts %s', async flag => {
     const f = fixture();
     vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.env.WE_DAEMON_OVERLAY_DIR);
     vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const argv = ['retire', `--clone=${f.root}`, `--ref=${f.args.ref}`, `--tip=${f.tip}`, '--actor=chalbert', '--reason=withdraw live work'];
     const deps = { pruneStaleOverlayRecords: () => {}, ...f.args.deps };
-    await expect(main(argv, deps)).rejects.toThrow(/--accept-uncontained/);
+    await expect(main(argv, deps)).rejects.toThrow(/--accept-omission/);
     expect(f.events()).toEqual([]);
-    await main([...argv, '--accept-uncontained'], deps);
-    expect(f.events().at(-1)).toMatchObject({ acceptUncontained: true, operatorReason: true });
+    await main([...argv, flag], deps);
+    expect(f.events().at(-1)).toMatchObject({ acceptedOmission: true, operatorReason: true });
   });
   it('refuses a registered ref without writing events', async () => {
     const f = fixture();
@@ -335,7 +138,7 @@ describe('operator withdrawal of an unregistered live overlay', () => {
     ]) appendOverlayEvent(f.root, { ref: f.args.ref, ...event }, { env: f.env });
     expect(overlayRetiredByOperator({ ref: f.args.ref, sha: f.tip, registered: () => false, events: f.events() })).toBe(false);
     expect(await withdrawUnregisteredOverlay(f.args)).toMatchObject({ retired: true });
-    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, tip: f.tip, actor: 'chalbert', operatorReason: true, reason: f.args.reason });
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, tip: f.tip, actor: 'chalbert', operatorReason: true, acceptedOmission: true, reason: f.args.reason });
     expect(overlayRetiredByOperator({ ref: f.args.ref, sha: f.tip, registered: () => false, events: f.events() })).toBe(true);
   });
   describe.each(['remove', 'retire'])('ordinary %s CLI', cmd => {
@@ -397,5 +200,50 @@ describe('operator withdrawal of an unregistered live overlay', () => {
         check: () => ({ ok: true, clean: true, candSha: f.tip }) } });
     expect(result).toMatchObject({ ok: true, replaced: true });
     expect(f.events().at(-1)).toMatchObject({ kind: 'replaced', actor: 'chalbert' });
+  });
+});
+
+
+describe('registered explicit withdrawal acknowledgement and tip guards', () => {
+  function registeredFixture() {
+    const f = fixture();
+    addOverlay(f.root, { ref: f.args.ref }, { env: f.env });
+    const options = { root: f.root, env: f.env, ref: f.args.ref, expectedTip: f.tip,
+      reason: 'withdraw live fix', actor: 'chalbert', acceptOmission: true, deps: { tip: () => f.tip } };
+    return { ...f, options };
+  }
+  it.each([undefined, false, 'true'])('refuses missing or non-boolean acknowledgement (%s) without mutation', async acceptOmission => {
+    const f = registeredFixture();
+    await expect(async () => withdrawRegisteredOverlay({ ...f.options, acceptOmission })).rejects.toThrow(/--accept-omission/);
+    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
+    expect(f.events()).toEqual([]);
+  });
+  it.each(['acceptOmission', 'acceptUncontained'])('accepts %s with an exact tip and records acknowledgement and actor', async flag => {
+    const f = registeredFixture();
+    expect(await withdrawRegisteredOverlay({ ...f.options, acceptOmission: false, [flag]: true })).toMatchObject({ retired: true });
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired', ref: f.args.ref, tip: f.tip,
+      operatorReason: true, acceptedOmission: true, actor: 'chalbert', reason: 'withdraw live fix' });
+  });
+  it.each([' ', 'in-main'])('refuses empty or automatic reason %j', async reason => {
+    const f = registeredFixture();
+    await expect(async () => withdrawRegisteredOverlay({ ...f.options, reason })).rejects.toThrow(/reason required/);
+    expect(f.events()).toEqual([]);
+    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
+  });
+  it('refuses an inexact tip before removal', async () => {
+    const f = registeredFixture();
+    expect(await withdrawRegisteredOverlay({ ...f.options, expectedTip: 'a'.repeat(40) })).toMatchObject({ retired: false, refused: 'tip-moved' });
+    expect(f.events()).toEqual([]);
+    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
+  });
+  it('restores the registration if the tip moves after removal without granting operator authority', async () => {
+    const f = registeredFixture();
+    let moved = false;
+    expect(await withdrawRegisteredOverlay({ ...f.options, deps: {
+      tip: () => moved ? 'a'.repeat(40) : f.tip, afterDrop: () => { moved = true; },
+    } })).toMatchObject({ retired: false, refused: 'tip-moved-restored' });
+    expect(readOverlays(f.root, { env: f.env })).toHaveLength(1);
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retire-reverted' });
+    expect(f.events().at(-1)).not.toHaveProperty('operatorReason');
   });
 });

@@ -64,8 +64,6 @@ describe('operator retirement of a live overlay', () => {
         if (command === 'node' && args[1] === 'list') return JSON.stringify({ list: readOverlays(root, { env }) });
         if (command === 'git' && args[0] === 'fetch') return '';
         if (command === 'git' && args[0] === 'rev-parse') {
-          if (args[1] === '--is-shallow-repository') return 'false';
-          if (args[1] === '--git-path') return '.git/shallow';
           return sha;
         }
         if (command === 'git' && args[0] === 'ls-remote') return `${sha}\trefs/heads/${ref}`;
@@ -74,10 +72,10 @@ describe('operator retirement of a live overlay', () => {
   }
 
   it('real prototype-load --remove verifies the actor and produces adoptable auto-retired evidence', async () => {
-    expect(await loader()({ daemon: 'control', remove: ref, actor: actor.toUpperCase(), reason: 'withdraw live fix' }))
+    expect(await loader()({ daemon: 'control', remove: ref, acceptOmission: true, actor: actor.toUpperCase(), reason: 'withdraw live fix' }))
       .toMatchObject({ ok: true, removed: [ref] });
     expect(readOverlayEventLog(root, env).at(-1)).toMatchObject({ kind: 'auto-retired', ref, actor,
-      operatorReason: true, by: env.USER || 'prototype-load', reason: 'withdraw live fix', tip: sha });
+      operatorReason: true, acceptedOmission: true, by: env.USER || 'prototype-load', reason: 'withdraw live fix', tip: sha });
     expect(match()).toMatchObject({ adopt: { finalSha: 'candidate' }, retired: [ref] });
   });
 
@@ -88,7 +86,7 @@ describe('operator retirement of a live overlay', () => {
     ['unreadable identity', actor, () => { throw new Error('identity unavailable'); }],
   ])('prototype-load refuses %s --actor without removing anything', async (_name, declared, identity) => {
     const before = readOverlays(root, { env });
-    expect(await loader(identity)({ daemon: 'control', remove: ref, actor: declared, reason: 'withdraw' }))
+    expect(await loader(identity)({ daemon: 'control', remove: ref, acceptOmission: true, actor: declared, reason: 'withdraw' }))
       .toMatchObject({ ok: false, stopReason: 'operator-identity-refused', removed: [] });
     expect(readOverlays(root, { env })).toEqual(before);
     expect(readOverlayEventLog(root, env)).toEqual([added]);
@@ -124,7 +122,7 @@ describe('operator retirement of a live overlay', () => {
   });
 
   it('prototype-load without an actor removes but cannot authorize omission of a live overlay', async () => {
-    expect(await loader(() => { throw new Error('must not resolve absent actor'); })({ daemon: 'control', remove: ref, reason: 'withdraw' }))
+    expect(await loader(() => { throw new Error('must not resolve absent actor'); })({ daemon: 'control', remove: ref, acceptOmission: true, reason: 'withdraw' }))
       .toMatchObject({ ok: true, removed: [ref] });
     expect(readOverlayEventLog(root, env).at(-1)).not.toHaveProperty('actor');
     refused();
@@ -175,7 +173,7 @@ describe('operator retirement of a live overlay', () => {
         plan.decisions.push({ ref, action: 'remove', reason: 'pr-closed' });
       } else if (removal === 'hand-removed' || removal === 'retirement-recorded-during-plan') removeOverlay(root, ref, { env });
       else {
-        expect(await loader()({ daemon: 'control', remove: ref, actor, reason: 'withdraw live fix' }))
+        expect(await loader()({ daemon: 'control', remove: ref, acceptOmission: true, actor, reason: 'withdraw live fix' }))
           .toMatchObject({ ok: true, removed: [ref] });
         if (removal === 're-registered') addOverlay(root, { ref }, { env });
         if (removal === 'unreadable-events') {
