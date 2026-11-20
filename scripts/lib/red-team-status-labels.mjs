@@ -99,6 +99,9 @@ export function createFreshGh(run = runGhSync, baseEnv = process.env) {
   };
 }
 
+/** The fresh (memo-free) runner a daemon caller passes as `gh` to enable the settle; none under a test run. */
+export const settleGhFor = (env = process.env) => (isUnderTest() || isUnderTest(env) ? undefined : createFreshGh(runGhSync, env));
+
 /** Is the head's red-team check run a trusted, completed success with no open publication hold? Every unreadable or
  * missing input is false (unknown means pending). Reuses the merge gate's own evaluators. */
 export function readCheckClearFact({ repo, pr, head, env = process.env, gh = createFreshGh(runGhSync, env) } = {}) {
@@ -116,7 +119,8 @@ export function readCheckClearFact({ repo, pr, head, env = process.env, gh = cre
 /** Uses the existing label provider/writer, including the known-label metadata provisioning path. */
 export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = process.env,
   provider: injectedProvider, recheckProvider, log = () => {}, live, comments, dryRun = false, standingRuling, readGrantScope = standingRulingScope,
-  gh, readCheckClear = args => (!gh && (isUnderTest() || isUnderTest(env)) ? false : readCheckClearFact({ ...args, env, gh })) } = {}) {
+  // No injected runner means unknown (pending stays): the settle never builds a hidden live gh of its own.
+  gh, readCheckClear = args => (typeof gh === 'function' ? readCheckClearFact({ ...args, env, gh }) : false) } = {}) {
   const provider = injectedProvider ?? createGhProvider();
   // Head rechecks decide a label swap, so they read fresh (no gh read memo), like the check reads.
   const freshGh = createFreshGh(runGhSync, env);
@@ -143,7 +147,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
       // The files API lists at most 3000 files: a list at the cap may be truncated, so it classifies nothing. The head is
       // re-read AFTER the files, and a head that moved meanwhile makes the files someone else's: unclassified.
       if (!Array.isArray(headFiles) || headFiles.length >= 3000) { headFiles = null; headVerified = false; }
-      if (recheck.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
+      if (provider.readPrState(repo, pr)?.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };
     } catch { headFiles = null; headVerified = false; }
   }
   // The head's check run settles a held pending label. Read only when pending is live; a throw or non-true is no proof.

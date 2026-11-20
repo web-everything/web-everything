@@ -150,6 +150,15 @@ describe('red-team label settles from the head\'s check', () => {
     });
     const brk = [{ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n1. [**confirmed**] (edge-case, broken) \`scripts/x.mjs:1\` — break` },
       { author: { login: 'web-everything' }, body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=sent-back -->` }];
+    it('no injected runner is unknown: pending stays and no live gh is made (even outside a test run)', () => {
+      vi.stubEnv('VITEST', ''); vi.stubEnv('WE_UNDER_TEST', '');
+      try {
+        const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live), readPrFiles: vi.fn(() => null), readComments: vi.fn(() => []) };
+        const plan = syncRedTeamStatusLabels({ ...input, live, provider, standingRuling: null });
+        expect(plan.add).not.toBe('red-team:clear');
+        expect(provider.setLabels).not.toHaveBeenCalledWith('o/n', 42, expect.objectContaining({ add: 'red-team:clear' }));
+      } finally { vi.unstubAllEnvs(); }
+    });
     it('a block arriving during a settle ends up red-team:blocked (a block always wins)', () => {
       const { provider, run: go } = make(() => true);
       provider.readComments.mockReturnValue(brk);
