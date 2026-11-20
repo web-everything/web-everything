@@ -1207,6 +1207,37 @@ describe('policy journal', () => {
     expect(() => statSync(env.WE_POLICY_EVENTS_FILE + '.lock')).toThrow(/ENOENT/);
   });
 
+  it('retries instead of dropping the event when a rival removes the stale lock mid-reclaim (main-red bc7954596)', async () => {
+    writeFileSync(env.WE_POLICY_EVENTS_FILE + '.lock', 'stale');
+    utimesSync(env.WE_POLICY_EVENTS_FILE + '.lock', 1, 1);
+    const script = `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { recordPolicyEvent } from './scripts/lib/delivery-policy.mjs';
+      const env = JSON.parse(process.argv[1]);
+      const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
+      const original = fs.openSync;
+      let raced = false;
+      fs.openSync = (path, flags, ...args) => {
+        // The rival writer wins the reclaim: the stale lock vanishes right as we inspect its owner.
+        if (!raced && path === lock && flags === (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)) {
+          raced = true;
+          fs.unlinkSync(lock);
+        }
+        return original(path, flags, ...args);
+      };
+      syncBuiltinESMExports();
+      recordPolicyEvent({ key: 'mergeGate', event: 'raced', subject: 'only' }, env);
+      process.stdout.write(JSON.stringify({ raced }), () => process.exit(0));
+    `;
+    const child = await promisify(execFile)(process.execPath,
+      ['--input-type=module', '-e', script, JSON.stringify(env)],
+      { cwd: resolve('.'), encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL', maxBuffer: 65536 });
+    expect(JSON.parse(child.stdout).raced).toBe(true);
+    expect(readPolicyEvents({ env }).map(event => event.subject)).toEqual(['only']);
+    expect(() => statSync(env.WE_POLICY_EVENTS_FILE + '.lock')).toThrow(/ENOENT/);
+  });
+
   it('waits out a lock holder that is slow under host load instead of dropping the event (main-red 545e68a5b)', () => {
     const lock = env.WE_POLICY_EVENTS_FILE + '.lock';
     writeFileSync(lock, 'held');
