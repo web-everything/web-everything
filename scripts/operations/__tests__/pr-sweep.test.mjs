@@ -638,3 +638,10 @@ describe('awaiting-advisory waits on the review daemon', () => {
     expect(sweep([mkPr({ labels: L('review:awaiting-whatever') })]).prs[0].waitingOn).toBe('unclassified');
   });
 });
+
+describe('awaiting-advisory never hides an explicit drain hold', () => {
+  it('a not-certified skip on a ready PR with the advisory label stays the operator\'s', () => {
+    const p = mkPr({ number: 4, labels: L('ready-to-merge', 'review:awaiting-advisory') });
+    expect(row(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind: 'not-certified', reason: 'x' }] }), 4)).toMatchObject({ actor: 'operator', stalled: true });
+  });
+});
