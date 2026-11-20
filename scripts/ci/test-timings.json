@@ -1907,6 +1907,7 @@
   "skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs": 4.36,
   "skills-src/conveyor/__tests__/review-daemon-app-auth.test.mjs": 0.1,
   "skills-src/conveyor/__tests__/review-daemon-interval.test.mjs": 0.02,
+  "skills-src/conveyor/__tests__/review-daemon-partial-list-red-team.test.mjs": 5.42,
   "skills-src/conveyor/__tests__/review-daemon-red-team-floor-refresh.test.mjs": 11.34,
   "skills-src/conveyor/__tests__/review-daemon-red-team-on-skip.test.mjs": 0.76,
   "skills-src/conveyor/__tests__/review-daemon-shared-plan.test.mjs": 0.12,

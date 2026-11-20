@@ -39,7 +39,7 @@ export default {
         writeFile: (path, data) => files.set(path, data),
         rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
         unlink: path => files.delete(path),
-        readLivePr: () => ({ state: 'OPEN', headRefOid: head, comments: [] }),
+        readLivePr: ({ pr }) => ({ number: pr, state: 'OPEN', isDraft: false, headRefOid: head, comments: [] }),
       });
       const seen = new Set();
       for (let tick = 0; tick < 2; tick++) {
@@ -60,6 +60,30 @@ export default {
         check(open().entries().length === 10, 'blocked entries did not survive restart');
       }
       check(seen.size === 10, `only ${seen.size} of ten blocked heads probed within two ticks`);
+      for (const cap of [-1, 2.5, 51, '7', null]) {
+        check(open().admit(repo, 0, { maxProbes: cap }).length === 6,
+          `invalid cap ${JSON.stringify(cap)} stopped bounded recovery instead of using six`);
+      }
+      const queue = open(), before = queue.entries();
+      const partialSeen = [];
+      await runWithRedTeamQueue({ queue, repo, inventoryComplete: false,
+        floor: { maxProbesPerTick: 10 },
+        readLivePr: ({ pr }) => pr === 5 ? null : ({ number: pr, state: pr === 3 ? 'CLOSED' : 'OPEN',
+          isDraft: pr === 2, headRefOid: pr === 4 ? 'b'.repeat(40) : head, comments: [] }),
+        plan: { refusals: [...before, { pr: 999, head }].map(entry => ({
+          kind: 'already-reviewed-head', prNumber: entry.pr, headSha: entry.head })) },
+        capacity: { lanes: 0, remainingStarts: 0 },
+        run: ({ plan, rawPrs }) => {
+          partialSeen.push(...plan.refusals.map(row => row.prNumber));
+          check(rawPrs.every(pr => partialSeen.includes(pr.number)), 'partial recovery passed unknown raw PRs');
+          return { dispatched: [{ prNumber: 1 }], rows: [{ prNumber: 6, action: 'clear' }] };
+        },
+      });
+      check(JSON.stringify(partialSeen) === JSON.stringify([1, 6, 7, 8, 9, 10]),
+        `partial inventory probed unsafe or unknown heads: ${partialSeen}`);
+      const withoutTurn = entries => entries.map(({ lastProbeTurn, ...entry }) => entry);
+      check(JSON.stringify(withoutTurn(open().entries())) === JSON.stringify(withoutTurn(before)),
+        'partial inventory changed queue membership, head or retry state');
     } catch (error) { violations.push(`scenario failed: ${error.stack ?? error}`); }
     return { violations };
   },

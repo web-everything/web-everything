@@ -90,6 +90,7 @@ it.each(['corrupt', 'unreadable'])('R907 a %s operator store disables floor rais
   tick();
 
   const floor = queueRun.mock.calls[1][0].floor;
+  expect(floor.maxProbesPerTick).toBe(6);
   const capacity = { lanes: 12, startsCeiling: 12, remainingStarts: 1, budget: { left: 12 } };
   queueModule.applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct: 100 });
   expect.soft(passedMinimums()).toEqual([12, 0]);
