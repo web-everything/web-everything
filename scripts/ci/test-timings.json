@@ -2168,6 +2168,7 @@
   "scripts/conveyor/soak/breaks/overlay-pin-refusal-retry.soak.test.mjs": 1.48,
   "scripts/conveyor/soak/breaks/owed-ci-rerun-planned-but-never-executed.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/owed-main-rule-strands-repair.soak.test.mjs": 0.6,
+  "scripts/conveyor/soak/breaks/parked-watch-skips-draft-withdrawn.soak.test.mjs": 4.5,
   "scripts/conveyor/soak/breaks/pass-exit-leaves-process-group.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/pass-reattach-during-launch.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/pinned-overlay-conflict-skipped.soak.test.mjs": 160.75,
