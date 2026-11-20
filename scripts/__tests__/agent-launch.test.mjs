@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync,
 import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary, buildAgentPath } from '../lib/agent-launch.mjs';
 import { defaultShimDir, checkoutShimDir, isDaemonCaller } from '../lib/gh-app-shim.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
-import { laneGitHardeningEnv, laneHistoryProofEnv } from '../lib/lane-git-hardening.mjs';
+import { laneGitHardeningEnv, laneHistoryProofEnv, LANE_GIT_CONFIG_PINS, LANE_HISTORY_CONFIG_PINS } from '../lib/lane-git-hardening.mjs';
 import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
 import { clearEnv, clearRestrictiveEnv } from './fixtures/agent-launch-env.mjs';
 
@@ -593,6 +593,24 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'x',
       GIT_CONFIG_KEY_1: key, GIT_CONFIG_VALUE_1: value });
     expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value });
+  });
+  it('keeps every boolean hardening pin in each Git boolean spelling, so a new boolean pin cannot silently go exact-only', () => {
+    const booleans = [...LANE_GIT_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS]
+      .filter(([key, value]) => ['true', 'false'].includes(value) && key !== 'core.alternateRefsCommand');
+    expect(booleans.length).toBeGreaterThan(5);
+    for (const [key, value] of booleans) {
+      for (const spelling of value === 'true' ? ['TRUE', 'Yes', 'on', '1'] : ['FALSE', 'No', 'off', '0']) {
+        setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key.toUpperCase(), GIT_CONFIG_VALUE_0: spelling });
+        expect(configOf(envOf({})), `${key}=${spelling}`).toEqual({ GIT_CONFIG_COUNT: '1',
+          GIT_CONFIG_KEY_0: key.toUpperCase(), GIT_CONFIG_VALUE_0: spelling });
+      }
+    }
+  });
+  it.each(['USER', 'User'])('does not widen the transport value user to the spelling %s', value => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: value });
+    expect(configOf(envOf({}))).toEqual({});
+    clearEnv('GIT_CONFIG_COUNT');
+    expect(configOf(envOf({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: value }))).toEqual({});
   });
   it('a differently cased parent transport prohibition still blocks caller transport exceptions', () => {
     setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: 'NEVER' });

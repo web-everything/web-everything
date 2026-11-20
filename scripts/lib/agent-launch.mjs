@@ -144,8 +144,10 @@ function gitValue(key, value) {
 const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValue(k1, v1) === gitValue(k2, v2);
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
+// Only `never` is case-normalized here: `user` can loosen Git's default for some protocols (ext), so its
+// spellings are not widened beyond the exact lowercase form this filter already accepted.
 const tighteningGitPair = (key, value) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
-  || (['never', 'user'].includes(gitValue(key, value)) && GIT_TRANSPORT_POLICY.test(key));
+  || ((gitValue(key, value) === 'never' || value === 'user') && GIT_TRANSPORT_POLICY.test(key));
 function gitConfigPairs(env) {
   const raw = env.GIT_CONFIG_COUNT;
   if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
