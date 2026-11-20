@@ -101,7 +101,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
-import { gateOutcomesForHead, parseRedTeamGateMarker, sendBackStepState, gateRoundGrants, GATE_OUTCOMES } from './lib/red-team-gate.mjs';
+import { gateOutcomesForHead, parseRedTeamGateMarker, sendBackStepState, gateRoundGrants, GATE_OUTCOMES, readRedTeamDisposition, redTeamResultId, liveResultGateState } from './lib/red-team-gate.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
@@ -1511,14 +1511,27 @@ export function runReviewLabelCli({
       // Resolve each result separately: a cap for another result cannot cancel its send-back.
       // Legacy unbound gate records share their own step, preserving their raced-cap semantics.
       const steps = new Map();
+      let precedingResultId = null;
       thread.forEach((c, at) => {
+        precedingResultId = liveResultGateState([c], pr, head).resultId ?? precedingResultId;
         if (!gateOutcomesForHead([c], pr, head).size) return;
         const gate = parseRedTeamGateMarker(c.body);
         const key = gate.result ?? null;
         if (!steps.has(key)) steps.set(key, []);
-        steps.get(key).push({ at, i: at, ts: 0, gate });
+        steps.get(key).push({ at, i: at, ts: 0, gate, resultId: gate.result ?? precedingResultId });
       });
-      return [...steps.values()].some(gates => sendBackStepState(gates, grants).outcome === GATE_OUTCOMES.SENT_BACK);
+      const sentBackSteps = [...steps].filter(([, gates]) => sendBackStepState(gates, grants).outcome === GATE_OUTCOMES.SENT_BACK);
+      if (!sentBackSteps.length) return false;
+      // A historical send-back remains unless the shared per-finding reader validates
+      // an operator release for that exact result and no finding still holds. Missing,
+      // or other-result evidence cannot borrow the live result's release. Legacy records
+      // bind to their preceding result, while retaining the cap semantics above.
+      const disposition = readRedTeamDisposition({ comments: thread, pr, head, repo, standingRuling });
+      const resultId = redTeamResultId(disposition.result);
+      const operatorReleased = [...disposition.dispositions.values()].some(({ state, by }) =>
+        by?.source === 'operator' && (state === 'released carded' || state === 'released not-real'));
+      return sentBackSteps.some(([, gates]) => gates.some(g => g.gate.outcome === GATE_OUTCOMES.SENT_BACK && g.resultId !== resultId))
+        || !operatorReleased || disposition.sendBack.length > 0 || disposition.held.length > 0;
     } catch {
       // Unknown evidence must never erase a send-back. Retry the read or push the fix.
       return true;

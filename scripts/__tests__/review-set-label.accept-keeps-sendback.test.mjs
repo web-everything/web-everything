@@ -1,10 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment, REVIEW_LABEL_TARGETS } from '../review-set-label.mjs';
-import { gateOutcomesForHead, sendBackStepOutcome, gateRoundGrants, GATE_OUTCOMES, redTeamGateMarker } from '../lib/red-team-gate.mjs';
+import { gateOutcomesForHead, sendBackStepOutcome, gateRoundGrants, GATE_OUTCOMES, redTeamGateMarker, liveResultGateState } from '../lib/red-team-gate.mjs';
+import { renderRedTeamComment } from '../operations/review-extra-seats.mjs';
 import { buildRoundExtensionComment } from '../conveyor/round-extension-mark.mjs';
 import { OPERATOR_LOGINS } from '../lib/marker-authorship.mjs';
 import { normalizeFinding, referralFindingKey, mandatoryReferralReviewer, renderReferralRecord } from '../lib/jury-core.mjs';
 import { PR_COMMENTS_PAGE_SIZE } from '../lib/review-label-provider.mjs';
+import { sealedStatusPath } from '../lib/red-team-sealed-status.mjs';
 
 const PR = 7031;
 const HEAD = 'a'.repeat(40);
@@ -57,7 +62,121 @@ function expectRefused(result, labels = ['review:changes']) {
   expect(result.result.decision?.reason ?? result.result.error).toMatch(/send.back|unreadable|head changed|malformed|unavailable/i);
 }
 
+function operatorReleaseThread({ count = 1, releaseLine } = {}) {
+  const result = { author: { login: 'web-everything' }, body: renderRedTeamComment({
+    pr: PR, rev: HEAD, provider: 'codex', model: 'gpt-6.1-sol', recheckStatus: 'ok', foldedVerdict: 'changes',
+    findings: Array.from({ length: count }, (_, i) => ({ summary: `confirmed break ${i + 1}`, category: 'edge-case', impactIfUnfixed: 'broken',
+      file: 'scripts/review-set-label.mjs', line: 1521 + i, confirmedByRecheck: true })),
+  }) };
+  const resultId = liveResultGateState([result], PR, HEAD).resultId;
+  expect(resultId).toBeTruthy();
+  const indices = Array.from({ length: count }, (_, i) => `#${i + 1}`).join(', ');
+  return [result,
+    { author: { login: 'web-everything' }, body: `${redTeamGateMarker(PR, HEAD, 'sent-back', resultId)}\n- ${count} confirmed break(s) sent back to the fixer (${indices}).` },
+    { author: { login: OPERATOR_LOGINS[0] }, body: `${redTeamGateMarker(PR, HEAD, 'operator-card', resultId)}\n${releaseLine ?? `- ${count} finding(s) carded by the operator to \`we:backlog/x1b8hlo-follow-up.md@pr7031\` (${indices}).`}` },
+  ];
+}
+
 describe('accept refuses a red-team send-back without writes', () => {
+  it.each(['initial', 'fresh', 'post-comment', 'paginated'])('accepts after an authorized operator cards the same-head sent-back finding on the %s read', stage => {
+    const comments = operatorReleaseThread();
+    expectRefused(accept({ comments: comments.slice(0, 2) }));
+    const page = Array.from({ length: PR_COMMENTS_PAGE_SIZE }, (_, i) => ({ body: `ordinary ${i}` }));
+    const accepted = accept(stage === 'initial' ? { comments }
+      : stage === 'fresh' ? { comments: [], freshComments: comments }
+        : stage === 'post-comment' ? { comments: [], postCommentState: { comments } }
+          : { comments: page, readComments: () => [...page, ...comments] });
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.labels).toEqual(['review:accepted']);
+    expect(accepted.setLabels).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['operator card', undefined],
+    ['follow-up card', '- 1 finding(s) filed as a follow-up card (#1) — landing job j.'],
+    ['advisory/not-real', '- 1 finding(s) left advisory (#1).'],
+  ])('honors the shared reader release spelling: %s', (_name, releaseLine) => {
+    const accepted = accept({ comments: operatorReleaseThread({ releaseLine }) });
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.labels).toEqual(['review:accepted']);
+  });
+
+  it('releases all findings only when each one is covered', () => {
+    const comments = operatorReleaseThread({ count: 2 });
+    expect(accept({ comments }).exitCode).toBe(0);
+    comments[2].body = comments[2].body.replace('(#1, #2)', '(#1)');
+    expectRefused(accept({ comments }));
+  });
+
+  it.each(['mallory', 'web-everything', 'web-everything[bot]'])('rejects an operator-card authored by %s', login => {
+    const comments = operatorReleaseThread();
+    comments[2].author.login = login;
+    expectRefused(accept({ comments }));
+  });
+
+  it.each([
+    ['PR', body => body.replace(`pr=${PR}`, 'pr=7210')],
+    ['head', body => body.replace(HEAD, NEW_HEAD)],
+    ['result', body => body.replace(/result=[a-f0-9]{16}/, 'result=1111111111111111')],
+    ['missing result', body => body.replace(/ result=[a-f0-9]{16}/, '')],
+    ['finding', body => body.replace('(#1)', '(#2)')],
+  ])('rejects a ruling with a different or missing %s binding', (_name, change) => {
+    const comments = operatorReleaseThread();
+    comments[2].body = change(comments[2].body);
+    expectRefused(accept({ comments }));
+  });
+
+  it('honors the anyState=false kill switch for operator releases over send-backs', () => {
+    vi.stubEnv('WE_RED_TEAM_OPERATOR_RULINGS_ANY_STATE', 'false');
+    try { expectRefused(accept({ comments: operatorReleaseThread() })); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
+  it('does not let an operator card override an operator block', () => {
+    const [result, sendBack, ruling] = operatorReleaseThread();
+    const block = { author: { login: OPERATOR_LOGINS[0] }, body: sendBack.body.replace('outcome=sent-back', 'outcome=operator-block') };
+    expectRefused(accept({ comments: [result, sendBack, block, ruling] }));
+  });
+
+  it('does not let a ruling before the send-back or result release a later hold', () => {
+    const [result, sendBack, ruling] = operatorReleaseThread();
+    expectRefused(accept({ comments: [result, ruling, sendBack] }));
+    expectRefused(accept({ comments: [ruling, result, sendBack] }));
+  });
+
+  it('honors an operator release for a legacy send-back bound to its preceding result', () => {
+    const comments = operatorReleaseThread();
+    comments[1].body = comments[1].body.replace(/ result=[a-f0-9]{16}/, '');
+    expect(accept({ comments }).exitCode).toBe(0);
+  });
+
+  it('does not borrow the live release for another result or an unbound send-back without a preceding result', () => {
+    const comments = operatorReleaseThread();
+    expectRefused(accept({ comments: [record(), ...comments] }));
+    const other = { ...comments[1], body: comments[1].body.replace(/result=[a-f0-9]{16}/, 'result=1111111111111111') };
+    expectRefused(accept({ comments: [...comments, other] }));
+  });
+
+  it('refuses when the result or grant evidence needed to validate a release is unavailable', () => {
+    const [, sendBack, ruling] = operatorReleaseThread();
+    expectRefused(accept({ comments: [sendBack, ruling] }));
+    expectRefused(accept({ comments: operatorReleaseThread(), readGrantScope: () => { throw new Error('grant evidence unreadable'); } }));
+  });
+
+  it('refuses an operator release when the shared reader finds unreadable sealed evidence', () => {
+    const root = mkdtempSync(join(tmpdir(), 'accept-sendback-seal-'));
+    vi.stubEnv('WE_SHARED_RUNS_DIR', join(root, 'runs'));
+    try {
+      const path = sealedStatusPath({ repo: 'o/n', pr: PR, head: HEAD });
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, '{unreadable');
+      expectRefused(accept({ comments: operatorReleaseThread() }));
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('enumerates every acceptance target: accepted refuses; clear-human and restamp are explicit hardening exemptions (x6nxokb)', () => {
     const contexts = [
       { currentLabels: ['review:pending'] },
