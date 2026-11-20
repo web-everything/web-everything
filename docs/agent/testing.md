@@ -411,6 +411,26 @@ The sequential and speculative paths skip before budget reservation and record t
 `red team skipped: card-only`. Setting `recheckReadsRepo=false` restores a tool-free re-check;
 negative answers without file reads remain unverifiable.
 
+Red-team cap deferrals retain the reservation provider's daily-cap reason when the operator's
+routing chain is exhausted; a roster provider outside that chain is never a fallback. Explicit
+operator cap env values survive launcher settings overlays that omit caps (or contain invalid caps)
+and the speculative spawn. A valid settings cap takes precedence, including lowering to zero;
+an own provider cap still takes precedence over the legacy Codex fallback. The
+reservation union includes today's scorecards and outstanding ledger IDs, so a scorecard-only
+availability snapshot can still lose the reservation race. Regressions live in
+`review-extra-seats.test.mjs`, `review-job.test.mjs`, and the behavior-probed
+`red-team-reservation-route-exhaustion` soak break.
+Named coverage: **launch cap precedence matrix** crosses valid, invalid and absent parent/overlay
+values for each cap key; **settings overlay can lower a cap to zero through both the job and
+speculative launch** pins the wiring. **default settings resolver forwards the passed** and
+**default settings resolver refuses failed shim setup** exercise dispatch without replacing its
+resolver, including both daemon markers. **logs each resolved provider cap and its source** covers
+explicit caps, defaults, legacy caps and routing controls; **retains codex daily-cap denial** also
+asserts the deferral log. **counts the union of scorecards and outstanding reservation IDs**
+asserts overlap deduplication and denial at the combined cap for every provider;
+**defers red team when the scorecard and outstanding ledger union exhausts codex capacity**
+reaches that accounting through speculative routing without a reservation stub.
+
 ## Drain red-team disposition and retry evidence
 
 Stale abandonment publishes a complete marker before replacing the writer, under the shared status
@@ -1126,7 +1146,10 @@ positive integers, and adds the Codex simplicity and then correctness advisory s
 as needed. These answers stay advisory. A skipped/unavailable answer does not count;
 a shortfall (including a minimum above the two available Codex lenses) is recorded on
 the verdict and printed in both the verdict write-up and human advisory note. Saved
-runs retain their original roster, with the same explicit shortfall reporting.
+runs retain their original roster and persisted minimum. Historical runs saved before
+both `seatSteps` and `minNonClaudeSeats` existed resume with their original zero minimum;
+incomplete modern policy records still use the live minimum. `review-ruling-resume.test.mjs`
+pins that migration and drives a historical two-seat panel through reduction.
 These settings resolve through standard → platform `review` → tool
 `scripts/settings/review.json` → env, logging effective values and sources.
 Validate each complete scalar before cascading: nested and empty objects, arrays,
@@ -1439,11 +1462,14 @@ concurrent-hook regression starts every `Edit|Write` hook at once and requires e
 ready while all leases are held, then exit 0. Keep test coordination event-driven (stdout and
 stderr lines), without sleep/poll loops.
 
-For macOS scheduling, initialize the clone first, then copy
-`scripts/hooks/com.we.guard-main-sync.plist.template` to
-`~/Library/LaunchAgents/com.we.guard-main-sync.plist`. Replace every placeholder with an
-XML-escaped absolute value: node executable, canonical guard clone, origin URL, executable
-search PATH (including Git), and an existing log directory. launchd does not expand shell
+For macOS scheduling, initialize the clone first, then render
+`scripts/hooks/com.we.guard-main-sync.plist.template` with
+`node scripts/hooks/render-guard-sync-plist.mjs --node-path=<absolute-node> --guard-clone-path=<absolute-clone> --origin-url=<origin> --executable-path=<PATH-including-Git> --log-directory=<existing-absolute-log-directory>`.
+Quote each argument as needed and redirect stdout to
+`~/Library/LaunchAgents/com.we.guard-main-sync.plist`. The renderer XML-escapes values,
+preserves an explicit `DEVELOPER_DIR`, and pins standalone Command Line Tools only when
+that directory exists; otherwise it omits the variable so full Xcode can remain selected.
+Use the renderer rather than copying the raw template. launchd does not expand shell
 variables or tildes. Install with
 `launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.we.guard-main-sync.plist"`;
 remove with `launchctl bootout gui/$(id -u)/com.we.guard-main-sync`.
@@ -2551,6 +2577,12 @@ retained attempts must stay within the latest room, and cannot use a failed snap
 Catch-up concurrency tests use manually completed child processes to prove the cap while siblings
 remain active, including concurrency 1. Re-read live queue depth/capacity before each start and
 reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
+Snapshot-first catch-up fixtures must model whether the fast-drain snapshot reader accepts the round file:
+legacy concurrency contracts inject an already-published snapshot; writer tests hold it absent, publish during an active child,
+and cover invalid/unreadable files and throwing checks keeping starts serial, plus failed/timed-out writers
+releasing the next attempt. A published fixture must pass the real reader; released children must reuse it.
+Clean-first applies within the same priority class and known-hold/recent-miss demotion group; test a BLOCKED P0 incident fix against an ordinary CLEAN PR at capacity one and retain every non-clean candidate.
+Snapshot readiness and released-child reuse must require `defaultBranch`, as production does; a round file missing it keeps catch-up serial.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
 scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
@@ -4875,6 +4907,66 @@ Keep binary health/cache under the evidence directory's `binary/` subfolder; roo
 Register binary maintenance's exclusive lock in `LOCK_HOLDERS` in `scripts/lib/audit-settings.mjs`.
 The source scan in `scripts/operations/__tests__/audit-verdict.test.mjs` requires every lock holder
 to stay on the protected audit floor, so concurrency findings block publication.
+## Capability dispatch boundary audit (2026-11-18)
+
+Capability admission belongs to the first write/launch of each repo's dispatch path,
+never to constellation roster selection. Capability-off and unknown repos retain evidence
+reads, cancellation/dequeue, escalation/hold reconciliation, owed-result flushes, timeout
+recovery and release/cleanup. The operator sees a refusal and can enable the capability
+or handle the held action manually. No refusal consumes a scope-refresh attempt.
+
+The audited lander (`scripts/merge-ai-prs.mjs`) action inventory is:
+
+- `enqueueWithSameHeadGuard`: same-head branch refresh/update, CI restart, enqueue.
+- `announceAndRetargetBeforeLand`: green-event coverage publication and stacked-PR retarget;
+  the enqueue itself independently admits through the helper above.
+- `runRenamedPrRefresh`: renamed-card/evidence-conflict branch refresh and resulting CI.
+- `healNnnCollision`: collision repair push and resulting CI (dry-run probe stays read-only).
+- `rebaseDropManifest`, then `rebaseDropContent`: manifest/content rebuild pushes, collision
+  renumbering, resulting CI and acceptance restamps; one admission before either rebuild.
+- `refreshApprovedHead`: shared admission before `refreshApprovedHeadChecked`, covering
+  `mergeQueueGate`'s carrier/sibling prechecks and candidate freshness, required-workflow
+  recovery and stale-merge recovery. Refresh can push or rerun CI; a refusal returns a
+  failed refresh and cannot restamp acceptance.
+- `sweepQueuedHashCards`: dequeue stays available; injected `prepare` admits before
+  branch numbering/rewrite/push.
+- `runCardGroupPass`: group reconciliation stays available; injected `form` admits before
+  a combined branch push, PR creation and its result publication.
+- Candidate cascade: admission after successful fresh revalidation, before freshness
+  recovery, land/coverage stamps, retargeting, branch preparation, direct merge/enqueue
+  and confirmed-land result/ledger publication. Already-merged cleanup remains available.
+- Local post-land writers: admission before detached `handOffDrainFollowup`; refusal also
+  prevents inline branch sync, hash repair, numbering/resolve push and derived-artifact
+  push. Stranded-sweep discovery remains available in dry-run mode; its apply/push is held.
+  Queue evidence probes and follow-up bookkeeping remain readable.
+
+The audited review daemon (`skills-src/conveyor/review-daemon.mjs`) action inventory is:
+
+- Scope-bloat recovery: admission before refresh/push, attempt recording and marker publication.
+- Recovery red-team callback: admission before result-label sync, gate catch-up CI rerun,
+  queued/unqueued review-job launches and their publication.
+- Ordinary review: admission before review job/session launch and round/result tagging.
+- Convert-advisory: admission before the targeted judge and note/label publication,
+  including dry-run judging and already-converted label repair.
+- Prep-review: admission before the review stage; refusal runs its existing `off` mode,
+  preserving stale-label/owned-hold cleanup while suppressing judges and review publication.
+
+Other branch-touched dispatchers audited: `reconcile-fix-dispatch.mjs` admits before MQ
+failure refresh/push/rerun, idle restack, fresh/resumed/routed fixer launches and notices;
+`review-dispatch.mjs` plans/admit before wrapped or background reviewer launch;
+`ci-heal-pr-dispatch.mjs` admits before healer launch/publication while timeout reruns and
+flushes stay available; `promote-draft-pr-dispatch.mjs` admits before ready/promotion;
+`orphan-fix-round.mjs` admits redispatch while rearm/escalation stays available;
+`load-flake-reverify.mjs` admits redispatch before merge-main/push and redispatch publication,
+and saved-fix push before pushed-result/rearm publication. Obsolete/exhausted holds still end.
+
+Regressions live in `merge-ai-prs-capability.test.mjs`, `review-daemon.test.mjs`,
+`prep-review.test.mjs` and the dispatchers' existing capability suites. The structural
+`capability-dispatch-only.test.mjs` pins admitted boundaries and rejects roster filtering.
+Run affected files through heavy-admission; test effects are injected, never live forge writes.
+Dispatching fixtures, including soak scenarios, must use registered repo identities with
+the required capability. An injected dispatch callback still passes through capability
+admission; keep unknown identities for tests that assert refusal.
 
 ## Review index completeness proof
 
@@ -5031,7 +5123,32 @@ The review daemon executes its planned `ci-timeout-rerun` rows independently of 
 Keep `owed-ci-rerun-executor.test.mjs` in the scoped gate with the timeout dispatcher and review
 daemon suites. Cover oldest-first cap, non-fatal effects, an unknown-freshness (offline) checkout
 refusing reruns, and executor refusals carrying `why` so logs never read "(no reason given)".
+External agy review jurors bound silent launches with `review.externalJurors.firstOutputMs`
+(default 120000; 0 disables). A silent kill records `provider-unresponsive` and uses the
+existing quota evidence store's root for a hold across every backend, for `cooldownMs`
+(default 1800000). Advisory skips retain the window and cooldown in their summary;
+mandatory skips and an unmet `minNonClaudeSeats` block on infrastructure. New runs seat
+the fifth juror through `advisorySeats.antigravityReview` (default off), independently of
+probation; a saved run retains its roster. Regressions: `external-juror-liveness.test.mjs`,
+`review-pr.test.mjs`, and `agy-juror-first-output.soak.test.mjs` (the latter uses the soak
+Vitest config). Run only the affected files through heavy-admission.
 
+## Antigravity advisory seating and unavailable-provider evidence
+
+`external-juror-liveness.test.mjs` pins `advisorySeats.antigravityReview=probation` to the
+old unset-env model-probation check, forced on/off and environment precedence. Antigravity
+graceful skips require an existing explicit `fallbackDecision` skip decision; absent, unknown
+or `none` evidence must propagate validation and tool-denial errors. The #3481 replay in
+`review-pr-io.test.mjs` checks that unset-env probation retains unruled referral holds.
+
+## Forge pool grow failure fixtures
+
+`forge-slots.test.mjs` executes setup's account/directory preparation and final
+enable transaction with host IO stubbed. New directories use `.disabled-slot-N`:
+old and new runners discover only `slot-N`. Sudoers is prepared privately and
+published only after the installed runner verifies every target UID's egress.
+Keep failure cases before runner replacement as well as during final publication;
+restoring an old refresh timer must never make the staged slots discoverable.
 
 ## Verify failed-file recovery
 
@@ -5252,6 +5369,76 @@ repaired bare-paths: blocking=false, publishable=true
 repaired card finding: we:blocks/widget.ts:2 unsafe return; we:backlog/debt.md
 ```
 
+### Audit-waiver compaction and host preference bounds
+
+New audit waivers belong in the ops JSONL store; legacy platform/tool waivers remain readable.
+The audited-tip gate uses the same union as prototype-load. Pruning retains entries on lookup errors;
+run `node scripts/operations/ruled-weakened-prune.mjs --dry-run` before applying compaction.
+The CLI uses remote heads and local commit objects against `origin/main`; refresh those objects
+separately before pruning. New recorder entries carry a repository ownership key derived from
+the selected checkout's origin. Pruning only removes entries with that same key; foreign entries
+and legacy entries without ownership survive even if their branch is absent or collides with a
+local branch. Origin aliases conservatively retain entries, and an unreadable origin retains all.
+Legacy ownership is never inferred from a branch name or retroactively assigned by replay;
+inspect the original repository before manually retiring those entries.
+Host platform-preference reads default to 2 MiB, independently of other
+bounded reads. An oversized file names its path and byte count; prune waivers or set
+`WE_HOST_OVERLOAD_PREFS_MAX_BYTES` to an explicit larger bound and retry.
+
+Waiver append and pruning share the ledger writer lock, keyed by the store parent's realpath
+and filename. Pruning holds it from the initial read through git probes and atomic replacement;
+lock contention refuses mutation with retry guidance. The process-interleaving regression in
+`scripts/operations/__tests__/ruled-weakened-concurrency.test.mjs` pauses pruning after its snapshot,
+proves a concurrent append waits, then verifies the new ruling survives compaction.
+
+Pruning also retains a waiver when either its recorded or current-head net-diff fingerprint is
+unavailable. The prune CLI regression injects each missing fingerprint separately and forces
+compaction of another entry, proving the retained ruling survives the rewrite. Unknown carry
+evidence is distinct from two readable, unequal fingerprints, which still drop a stale waiver.
+
+
+The repo-owned `scripts/operations/ruled-weakened-record.mjs` replaces approval replay in the
+external handoff recorder. Run it from the target repository: it checks current origin heads
+with one bounded `ls-remote` lookup and permits older approved heads only with the shared
+net-diff carry proof. Approvals supply rulings and `findingsHash` (SHA-256 of
+`JSON.stringify(findings)`); the latest canonical WEAKENED audit supplies verbatim findings,
+and WITHDRAWN requests veto recording. Replays deduplicate `(repository, ref, sha, ruling)`
+inside the append/prune lock. Unreadable evidence refuses writes; inputs above 16 MiB require
+archiving old records before retrying. Hermetic recorder proofs live in
+`scripts/operations/__tests__/ruled-weakened-record.test.mjs`.
+
+Prototype-load requires a fix-ready record carrying the waiver's ruling and verbatim disclosure
+before admitting a canonical WEAKENED audit. A waiver alone refuses and names
+`scripts/operations/fix-ready-record.mjs` as the recovery step. These regressions live in
+`scripts/operations/__tests__/prototype-load.test.mjs`.
+The recorder, store and load gate share the handoff R-number shape, including one lowercase
+letter suffix such as `R1063a` and combined rulings joined by `+`.
+
+
+Carry recording must persist the proof consumed by admission. The recorder's injected
+`carries(entry, head)` returns the proven net-diff fingerprint (not just `true`); the CLI
+returns it only after the shared `carriesAcross` comparison succeeds. The store accepts and
+preserves this optional 64-hex fingerprint, while legacy entries without it remain readable
+and malformed fingerprints refuse validation. Exact-head recording also saves available proof
+for future rebases. A replay can enrich a duplicate missing that proof only after the current
+head, canonical audit and approved verbatim findings validate again. The locked store rewrite
+preserves the original approval timestamp, findings and repository ownership; repeated or stale
+snapshots do not add duplicate rows. The recorder tests cover readiness before and after an
+unchanged rebase, legacy replay, changed code and cross-repository pruning through the real store.
+The named `recorder-to-load same-diff waiver
+admission` regression records an old approval through the real append/read store path, then
+loads the equivalent live head with matching carried fix-ready evidence. It also rejects changed code
+and changed canonical findings; an added-count assertion alone does not prove usable carry.
+## Review capability admission at maintenance boundaries
+
+Same-tick draft promotion and follow-up cards can start work before ordinary review dispatch.
+Test their capability refusals independently. Overdue send-backs, including mixed send-back/card
+plans, remain safety maintenance for capability-off and unknown repos. Catch-up must reach the
+live gate, record the send-back, and refuse only the card launch. Keep admission at the live
+gate's card-launch boundary because it re-reads evidence after the tick snapshot. Pin both queue
+modes and verify that card refusal cannot repeat an already recorded send-back.
+Saved-fix admission precedes lane acquisition and branch verification; retain the final pre-push
+check because verification may outlive a capability change. Refusal must not consume an attempt.
 
 ## Negative review-run proofs
 
@@ -5287,6 +5474,14 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## CI-only PR opening (R1086)
+
+`pr-land --verify=ci-only` is restricted to open modes and observed host saturation.
+It ignores the local finish marker and reuses the deferred disclosure/body-sync and exact-SHA
+CI `test` label gate. Unknown CPU/load evidence and memory-only admission refusals cannot
+authorize it. Audit records live in `verify-ci-only`, separately from `verify-green`;
+`WE_VERIFY_CI_ONLY_LEDGER_DIR` explicitly selects an audit directory for fixtures.
+The scoped `scripts/lib/__tests__/verify-ci-only.test.mjs` exercises these boundaries.
 ## Open-pr preflight
 
 `open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
@@ -5298,3 +5493,32 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Malformed canonical audit carry evidence (R1053)
+
+PR admission may isolate a malformed audit only after proving its full head and base differ
+from the live head and refreshed main, and its valid fingerprint differs from the live net diff.
+Missing or unreadable identities and failed live lookups refuse with `canonical-audit-missing`.
+Compare hex identities without case sensitivity and reject trailing separators. Keep the
+malformed record in the fingerprint lookup input until that comparison finishes; dropping it
+first can hide the reason a live fingerprint must be computed.
+
+`canonical-audit-gate.test.mjs` restores the carried-malformed refusal and exercises the real
+`checkCanonicalAuditForOpen` entry point with invalid timestamps/findings, matching fingerprints,
+different fingerprints, matching bases, unreadable identities, and failed live lookups.
+The unrelated poisoned-record fixture supplies both a different base and fingerprint explicitly.
+
+Operator send-back IC_kwDORBt1-c8AAAABot6jlw, item 3, PR body evidence:
+the same direct Node probe called the real admission function with an older exact-head green
+record and a newer foreign-head WEAKENED record whose findings were a string. Both records
+held the live fingerprint. Git/settings ports were injected; no repository or remote was changed.
+Observed before the source repair and after it, respectively:
+
+```json
+{"scenario":"malformed WEAKENED, foreign head, same live fingerprint","ok":true,"reason":null}
+{"scenario":"malformed WEAKENED, foreign head, same live fingerprint","ok":false,"reason":"canonical-audit-missing"}
+```
+
+The pre-fix regression run reported 19 failed and 108 passed tests. Per proof-only dispatch
+policy, the test file is not rerun locally after repair; the launcher's verify verdict supplies
+the after-test evidence. The direct admission probe above was repeated after repair.

@@ -49,7 +49,7 @@ export function testWorkflowBound(evidence, runsData, sha, path = TEST_WORKFLOW_
  *  `auditRuling` and a non-empty `auditDisclosed`, AND the settings allowlist `ruledWeakened` must hold an entry whose
  *  ref, full 40-hex sha and ruling match the record exactly. Anything else stays refused; a `--audit` argument can
  *  never claim it. Never a blanket bypass. */
-const RULING = /^R\d+(?:\+R\d+)*$/;
+const RULING = /^R\d+[a-z]?(?:\+R\d+[a-z]?)*$/;
 /** Operator rulings may live in the platform prefs or the repo settings. The allowlist is the UNION of both layers,
  *  de-duplicated by ref+sha+ruling (the tool entry wins); each entry carries its source `layer`. Platform entries get
  *  the same shape checks as repo entries; a malformed one is ignored with a warning, never trusted. */
@@ -71,6 +71,15 @@ export function mergeRuledWeakened(platform, tool, warn = () => {}) {
   });
   return out;
 }
+/** A waiver binds only to this branch's exact head or its unchanged net diff. */
+export function waiverForHead(entries, input, liveFp = null) {
+  return (Array.isArray(entries) ? entries : []).find(e => e?.ref === input.branch && validSha(e.sha)
+    && (lowerSha(e.sha) === lowerSha(input.sha) || carriesAcross(e.fingerprint, liveFp))
+    && typeof e.ruling === 'string' && RULING.test(e.ruling)
+    && Array.isArray(e.findings) && e.findings.length > 0
+    && e.findings.every(f => typeof f === 'string' && f.trim())) ?? null;
+}
+
 export function readyEvidence(records, input, ruledWeakened = [], liveFpSource = null) {
   // Arguments are labels only; readiness comes from persisted evidence.
   const liveFp = typeof liveFpSource === 'function' ? liveFpSource() : liveFpSource;
@@ -167,8 +176,8 @@ export function canonicalAuditEvidence(records, sha, covers = () => true, liveFp
     return gate?.ruledWeakened && record.questionHash === QUESTION_HASH
       // The ruled audit is the gate record's own (exact sha), or the carried audit of the same net diff: readiness
       // appended by an earlier carry names the NEW sha, and must keep binding to the audit it was carried from.
-      && (record.head === lowerSha(gate.record.sha)
-        || (carriesAcross(record.fingerprint, liveFp) && carriesAcross(gate.record.fingerprint, liveFp)))
+      && (record.head === lowerSha(gate.record?.sha ?? sha)
+        || (carriesAcross(record.fingerprint, liveFp) && (!gate.record || carriesAcross(gate.record.fingerprint, liveFp))))
       && Array.isArray(record.findings)
       && JSON.stringify(record.findings) === JSON.stringify(gate.ruledWeakened.findings)
       && covered(record.base);

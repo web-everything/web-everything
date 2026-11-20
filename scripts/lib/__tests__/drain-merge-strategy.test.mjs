@@ -1003,7 +1003,11 @@ describe('merge-ai-prs hook wiring', () => {
     expect(i).toBeLessThan(src.indexOf('merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;'));
   });
   it('follow-up collection runs before the post-land steps read `merged`', () => {
-    expect(src.indexOf('mergeStrategy.collectQueueMerged(')).toBeLessThan(src.indexOf('const landedLocalAny = !DRY_RUN && merged.some('));
+    const collect = src.indexOf('mergeStrategy.collectQueueMerged(');
+    const followup = src.indexOf('const landedLocalAny = !DRY_RUN && !localWriteRefusal && merged.some(');
+    expect(collect).toBeGreaterThan(-1);
+    expect(followup).toBeGreaterThan(-1);
+    expect(collect).toBeLessThan(followup);
   });
   it('follow-ups are confirmed only AFTER numbering, resolve-on-land and derived regen, and only when none of them failed (review F4)', () => {
     const at = src.indexOf('mergeStrategy.confirmQueueFollowUps(');
