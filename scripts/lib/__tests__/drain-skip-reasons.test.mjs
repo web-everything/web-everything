@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { unlandableStateReason } from '../../merge-ai-prs.mjs';
-import { buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from '../drain-skip-reasons.mjs';
+import { SKIP_KINDS, buildSkipReasons, classifySkipReason, formatSkipSummary, formatSkipReasonsLine } from '../drain-skip-reasons.mjs';
 import { cardGroupHold } from '../card-group.mjs';
 
 describe('drain skip reasons (card 122 slice 1)', () => {
@@ -80,5 +80,23 @@ describe('drain skip reasons (card 122 slice 1)', () => {
     expect(classifySkipReason(unlandableStateReason('BLOCKED'))).toBe('checks-pending');
     expect(unlandableStateReason('BLOCKED')).toMatch(/ci-heal/);
     expect(classifySkipReason(unlandableStateReason('BEHIND'))).toBe('behind');
+  });
+});
+
+describe('stale acceptance re-stamp skip reasons', () => {
+  it.each([
+    'restamp-stale-code: STALE code',
+    'merge-queue: numbered card(s); acceptance re-stamp failed: restamp-stale-code: STALE code',
+    'head moved after rebase; acceptance re-stamp failed: STALE code',
+    'acceptance re-stamp failed: this checkout is 25 commit(s) behind origin/main',
+    'acceptance re-stamp failed: this checkout is 2 commits behind origin/main',
+  ])('names the retryable refusal: %s', (reason) => {
+    expect(SKIP_KINDS).toContain('restamp-stale-code');
+    expect(classifySkipReason(reason)).toBe('restamp-stale-code');
+    expect(buildSkipReasons({ revalidationAborted: [{ num: 7204, reason }] })[0])
+      .toMatchObject({ num: 7204, kind: 'restamp-stale-code', source: 'revalidationAborted' });
+  });
+  it('does not treat an unrelated acceptance failure as stale code', () => {
+    expect(classifySkipReason('acceptance re-stamp failed: permission denied')).toBe('unrecognized-reason');
   });
 });

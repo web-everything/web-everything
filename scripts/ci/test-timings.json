@@ -2167,6 +2167,7 @@
   "scripts/conveyor/soak/breaks/builder-prepare-stale-stamp-livelock.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/ci-heal-stacked-base-moved-never-rearms.soak.test.mjs": 80.28,
   "scripts/conveyor/soak/breaks/daemon-version-rolled-back-sha-rebuilt.soak.test.mjs": 1.05,
+  "scripts/conveyor/soak/breaks/drain-restamp-prefers-fresh-data-script.soak.test.mjs": 0.7,
   "scripts/conveyor/soak/breaks/drain-restamp-stale-code-clone.soak.test.mjs": 0.65,
   "scripts/conveyor/soak/breaks/fix-dispatch-stalls-on-unrelated-clone-lag.soak.test.mjs": 1.85,
   "scripts/conveyor/soak/breaks/fix-end-rearms-review.soak.test.mjs": 1.4,

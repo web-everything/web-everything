@@ -1559,9 +1559,10 @@ export function resolveRebaseBeforeEnqueue(env = {}, { platform, tool } = {}) {
  *
  * Setting the CHILD'S cwd rather than threading a flag pins EVERY git read the CLI makes, not only the one
  * that is known about today, and leaves the operator's single-PR invocation untouched. `undefined` for a
- * local-repo PR means "inherit", which is already correct. The scripts still come from THIS checkout — the
- * path below resolves from `import.meta.url`, never from cwd. `spawn` is injected so the pinning is
- * assertable without a subprocess.
+ * local-repo PR means "inherit", which is already correct. Re-stamps prefer the drain's fresh WE data
+ * checkout for the script, falling back to this code checkout when freshness cannot be proved. The script
+ * root is independent of the child's cwd, so sibling repos still use a WE CLI with their own git tree.
+ * `freshRoot`, `gitRun` and `spawn` make selection and pinning assertable without network or subprocesses.
  */
 /**
  * #1671 review finding — every internal caller of `review-set-label.mjs` needs the SINGLE-token `--repo=`
@@ -1590,12 +1591,30 @@ export function spawnReviewSetLabel({ pr, repo, to, cwd, actor, channel, reason,
   }
 }
 
-export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }) }) {
+export function restampAcceptance({ pr, repo, newHead, cwd, freshRoot = process.cwd(),
+  gitRun = (args, opts) => spawnSync('git', args, opts), spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }) }) {
   try {
     const target = repo || localRepo();
     if (!target) return { ok: false, reason: 'no repo to re-stamp (PR repo unset and the local repo slug unreadable)' };
+    let script = new URL('./review-set-label.mjs', import.meta.url).pathname;
+    // The daemon code clone may intentionally lag main. Prefer its data checkout only after a fresh
+    // fetch proves it is current; incomplete evidence retains the old path and the child's strict gate.
+    try {
+      const candidate = join(freshRoot, 'scripts/review-set-label.mjs');
+      const opts = { cwd: freshRoot, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 };
+      if (statSync(candidate).isFile()) {
+        const tree = gitRun(['rev-parse', '--is-inside-work-tree'], opts);
+        if (tree.status === 0 && String(tree.stdout).trim() === 'true') {
+          const fetched = gitRun(['fetch', 'origin', 'main'], opts);
+          if (fetched.status === 0) {
+            const behind = gitRun(['rev-list', '--count', 'HEAD..origin/main'], opts);
+            if (behind.status === 0 && String(behind.stdout).trim() === '0') script = candidate;
+          }
+        }
+      }
+    } catch { /* Unreadable script or Git failure: fall back; never bypass assertOperatorCliFresh. */ }
     const r = spawn(process.execPath, [
-      new URL('./review-set-label.mjs', import.meta.url).pathname,
+      script,
       String(pr), `--repo=${target}`, '--to=restamp', '--actor=drain',
       '--channel=drain-rebase', `--reason=head moved to ${newHead} by this drain's own content-preserving rebase`,
       // #x9krtkb (bug 2) — `newHead` used to reach the child ONLY inside `--reason`'s free text, which
@@ -1610,6 +1629,11 @@ export function restampAcceptance({ pr, repo, newHead, cwd, spawn = spawnSync, l
       // another repo's clone. A caller that needs both has to widen that allowlist deliberately.
     ], { encoding: 'utf8', cwd });
     if (r.status === 0) return { ok: true };
+    // Inspect both complete streams: progress on stdout or a trailing footer must not hide the refusal.
+    const output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim();
+    if (/STALE code|commit(?:\(s\)|s)? behind origin/i.test(output)) {
+      return { ok: false, reason: `restamp-stale-code: ${output}`, retry: true };
+    }
     return { ok: false, reason: String(r.stdout || r.stderr || `exit ${r.status}`).trim().split('\n').pop() };
   } catch (e) {
     return { ok: false, reason: String(e && e.message ? e.message : e) };

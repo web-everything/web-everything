@@ -9,7 +9,7 @@
  *   `scripts/lib/review-escalation.mjs`).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -84,6 +84,8 @@ describe('needsAcceptanceRestamp (#x5e2ldj — carrying an acceptance across the
  * the argv would have passed throughout the defect.
  */
 describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', () => {
+  // Existing cases exercise argv/cwd only; never fetch real remotes in unit tests.
+  const restamp = (options) => restampAcceptance({ gitRun: () => ({ status: 1 }), ...options });
   const spy = (status = 0) => {
     const calls = [];
     const spawn = (cmd, argv, opts) => { calls.push({ cmd, argv, opts }); return { status, stdout: '', stderr: '' }; };
@@ -95,7 +97,7 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
   it('restampAcceptance resolves the local repo when repo is falsy', () => {
     for (const repo of [null, undefined, '']) {
       const { calls, spawn } = spy();
-      restampAcceptance({ pr: 42, repo, newHead: 'f5bc7940', spawn, localRepo: () => 'owner/local' });
+      restamp({ pr: 42, repo, newHead: 'f5bc7940', spawn, localRepo: () => 'owner/local' });
       expect(calls[0].argv).toContain('--repo=owner/local');
       expect(calls[0].argv).not.toContain('--repo=null');
     }
@@ -103,7 +105,7 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
 
   it('pins the child to the sibling repo\'s clone — the wrong-tree fingerprint this exists to prevent', () => {
     const { calls, spawn } = spy();
-    const out = restampAcceptance({ pr: 42, repo: 'plateau-app', newHead: 'f5bc7940', cwd: '/ws/plateau-app', spawn });
+    const out = restamp({ pr: 42, repo: 'plateau-app', newHead: 'f5bc7940', cwd: '/ws/plateau-app', spawn });
     expect(out).toEqual({ ok: true });
     expect(calls).toHaveLength(1);
     expect(calls[0].opts.cwd).toBe('/ws/plateau-app');
@@ -113,7 +115,7 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
   // NOT acquire a pinned cwd it never needed.
   it('inherits the drain\'s cwd for a local-repo PR', () => {
     const { calls, spawn } = spy();
-    restampAcceptance({ pr: 7, repo: 'web-everything/web-everything', newHead: 'abc1234', spawn });
+    restamp({ pr: 7, repo: 'web-everything/web-everything', newHead: 'abc1234', spawn });
     expect(calls[0].opts.cwd).toBeUndefined();
   });
 
@@ -121,7 +123,7 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
   // run a sibling repo's copy of the label arc — a second implementation of the thing #2644 made singular.
   it('still runs THIS checkout\'s review-set-label.mjs, not the pinned repo\'s', () => {
     const { calls, spawn } = spy();
-    restampAcceptance({ pr: 42, repo: 'frontierui', newHead: 'f5bc7940', cwd: '/ws/frontierui', spawn });
+    restamp({ pr: 42, repo: 'frontierui', newHead: 'f5bc7940', cwd: '/ws/frontierui', spawn });
     expect(calls[0].argv[0]).toMatch(/scripts\/review-set-label\.mjs$/);
     expect(calls[0].argv[0].startsWith('/ws/frontierui')).toBe(false);
     expect(calls[0].argv).toContain('--to=restamp');
@@ -132,7 +134,7 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
   // refused by a child pinned elsewhere. The re-stamp passes none; this pins that it stays that way.
   it('passes no --body-file, which a pinned cwd would make unreadable', () => {
     const { calls, spawn } = spy();
-    restampAcceptance({ pr: 42, repo: 'plateau-app', newHead: 'f5bc7940', cwd: '/ws/plateau-app', spawn });
+    restamp({ pr: 42, repo: 'plateau-app', newHead: 'f5bc7940', cwd: '/ws/plateau-app', spawn });
     expect(calls[0].argv.some((a) => String(a).startsWith('--body-file='))).toBe(false);
   });
 
@@ -147,17 +149,87 @@ describe('restampAcceptance (#3202 — the re-stamp reads the PR\'s OWN tree)', 
    */
   it('passes --new-head=<the new commit>, so the child stamps THIS process\'s own authoritative head', () => {
     const { calls, spawn } = spy();
-    restampAcceptance({ pr: 42, repo: 'plateau-app', newHead: '1f27fd19f6841d9df5c9f8ce7b4b4f3b8319bc54', cwd: '/ws/plateau-app', spawn });
+    restamp({ pr: 42, repo: 'plateau-app', newHead: '1f27fd19f6841d9df5c9f8ce7b4b4f3b8319bc54', cwd: '/ws/plateau-app', spawn });
     expect(calls[0].argv).toContain('--new-head=1f27fd19f6841d9df5c9f8ce7b4b4f3b8319bc54');
   });
 
   it('never throws, and reports a non-zero exit as a failed re-stamp', () => {
     const { spawn } = spy(1);
-    expect(restampAcceptance({ pr: 42, repo: 'plateau-app', newHead: 'f5bc7940', cwd: '/ws/plateau-app', spawn }).ok).toBe(false);
+    expect(restamp({ pr: 42, repo: 'plateau-app', newHead: 'f5bc7940', cwd: '/ws/plateau-app', spawn }).ok).toBe(false);
     const thrower = () => { throw new Error('spawn ENOENT'); };
-    expect(restampAcceptance({ pr: 42, repo: 'plateau-app', newHead: 'f', spawn: thrower }))
+    expect(restamp({ pr: 42, repo: 'plateau-app', newHead: 'f', spawn: thrower }))
       .toEqual({ ok: false, reason: 'spawn ENOENT' });
   });
+});
+
+describe('restampAcceptance fresh data clone selection', () => {
+  const withDataClone = (test) => {
+    const root = mkdtempSync(join(tmpdir(), 'restamp-data-'));
+    const script = join(root, 'scripts/review-set-label.mjs');
+    mkdirSync(dirname(script));
+    writeFileSync(script, '// fixture');
+    try { test(root, script); } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+  const freshGit = (args) => ({ status: 0, stdout: args[0] === 'rev-parse' ? 'true\n' : args[0] === 'rev-list' ? '0\n' : '' });
+  const fallback = new URL('../review-set-label.mjs', import.meta.url).pathname;
+
+  it('stale code clone uses the fresh data clone script with unchanged argv and no freshness bypass', () => withDataClone((root, script) => {
+    const before = process.env.WE_DAEMON_MANAGED_CLONE;
+    const spawn = vi.fn(() => {
+      expect(process.env.WE_DAEMON_MANAGED_CLONE).toBe(before);
+      return { status: 0 };
+    });
+    const gitRun = vi.fn(freshGit);
+    expect(restampAcceptance({ pr: 7204, repo: 'owner/we', newHead: 'abc', freshRoot: root, gitRun, spawn })).toEqual({ ok: true });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledWith(process.execPath, [script, '7204', '--repo=owner/we', '--to=restamp', '--actor=drain', '--channel=drain-rebase',
+      "--reason=head moved to abc by this drain's own content-preserving rebase", '--new-head=abc'], { encoding: 'utf8', cwd: undefined });
+    expect(gitRun.mock.calls.map(([args]) => args)).toEqual([
+      ['rev-parse', '--is-inside-work-tree'], ['fetch', 'origin', 'main'], ['rev-list', '--count', 'HEAD..origin/main'],
+    ]);
+    for (const [, opts] of gitRun.mock.calls) {
+      expect(opts.cwd).toBe(root);
+      expect(opts.timeout).toBeGreaterThan(0);
+      expect(opts.maxBuffer).toBeGreaterThan(0);
+      expect(opts.env).toBeUndefined();
+    }
+    expect(process.env.WE_DAEMON_MANAGED_CLONE).toBe(before);
+  }));
+
+  it('defaults freshRoot to the drain data cwd, while pinning child cwd to the sibling', () => {
+    const spawn = vi.fn(() => ({ status: 0 }));
+    const gitRun = vi.fn(freshGit);
+    restampAcceptance({ pr: 1, repo: 'frontierui', newHead: 'abc', cwd: '/ws/frontierui', gitRun, spawn });
+    expect(spawn.mock.calls[0][1][0]).toBe(join(process.cwd(), 'scripts/review-set-label.mjs'));
+    expect(spawn.mock.calls[0][2].cwd).toBe('/ws/frontierui');
+    expect(gitRun.mock.calls.every(([, opts]) => opts.cwd === process.cwd())).toBe(true);
+  });
+
+  it.each(['stale', 'fetch-failed', 'not-work-tree', 'unreadable-count', 'git-throws', 'missing-script'])(
+    '%s data clone falls back and stale refusal remains failed and retryable', (failure) => withDataClone((root, script) => {
+      if (failure === 'missing-script') rmSync(script);
+      const gitRun = vi.fn((args) => {
+        if (failure === 'git-throws') throw new Error('git unavailable');
+        if (failure === 'fetch-failed' && args[0] === 'fetch') return { status: 1, stdout: '' };
+        if (failure === 'not-work-tree' && args[0] === 'rev-parse') return { status: 0, stdout: 'false' };
+        if (args[0] === 'rev-list') return { status: 0, stdout: failure === 'stale' ? '25' : failure === 'unreadable-count' ? '' : '0' };
+        return freshGit(args);
+      });
+      const spawn = vi.fn(() => ({ status: 1, stdout: 'some progress', stderr: 'this checkout is 25 commit(s) behind origin/main — STALE code\nlast line' }));
+      const out = restampAcceptance({ pr: 7204, repo: 'owner/we', newHead: 'abc', freshRoot: root, gitRun, spawn });
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(spawn.mock.calls[0][1][0]).toBe(fallback);
+      expect(out).toMatchObject({ ok: false, retry: true });
+      expect(out.reason).toMatch(/^restamp-stale-code: .*STALE code/s);
+      if (failure === 'missing-script') expect(gitRun).not.toHaveBeenCalled();
+    }));
+
+  it.each(['STALE code', 'this checkout is 2 commits behind origin/main'])(
+    'even a verified fresh data clone fails closed on child refusal: %s', (stderr) => withDataClone((root) => {
+      const spawn = vi.fn(() => ({ status: 1, stderr }));
+      expect(restampAcceptance({ pr: 1, repo: 'owner/we', newHead: 'abc', freshRoot: root, gitRun: freshGit, spawn }))
+        .toEqual({ ok: false, retry: true, reason: `restamp-stale-code: ${stderr}` });
+    }));
 });
 
 /* ------------------------------------------------------------------ #3308 review-coverage announcement */
