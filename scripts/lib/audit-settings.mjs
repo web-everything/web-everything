@@ -218,6 +218,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/operations/fix-ready-record.mjs',
   // Ghost recovery owns an operation lock as well as reserving the shared rerun budget.
   'scripts/operations/ci-ghost-rerun.mjs',
+  // The expectation babysitter serializes state updates and miss delivery with an exclusive lock directory.
+  'scripts/conveyor/pass-daemons/pr-expectation-pass.mjs',
   // The ETag eviction stamp writer uses an exclusive `wx` create.
   'scripts/lib/gh-rest-read.mjs',
   // The freeze last-good cache writer reserves its temp file with an exclusive `wx` create before the rename.
