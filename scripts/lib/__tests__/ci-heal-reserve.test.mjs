@@ -90,7 +90,7 @@ describe('ci-heal reserve slot', () => {
 // reserved heals. It falls back to the lower resolver's value, and when that is also invalid, to 0 (off).
 describe('ci-heal reserve: injected resolveReserve sanitising', () => {
   const tryOnce = (resolveReserve, env = {}) => createCiHealReserve({ listClaims: () => [], env, resolveReserve, ...idle }).tryAdmit();
-  for (const bad of [undefined, null, NaN, Infinity, -1, 1.5, '3', {}]) {
+  for (const bad of [undefined, null, NaN, Infinity, -1, 1.5, '3', {}, 13, 1e9]) {
     it(`bad value ${String(bad)} with lower 0 admits nothing`, () => {
       const v = tryOnce(() => bad, { WE_CI_HEAL_RESERVE: '0' });
       expect(v.admit).toBe(false);

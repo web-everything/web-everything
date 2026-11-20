@@ -25,7 +25,7 @@ export function createCiHealReserve({
 } = {}) {
   // An injected resolver result must be a non-negative integer. Otherwise use the lower resolver's value, and 0 (off) if
   // that is also invalid; never an unbounded reserve.
-  const valid = (v) => Number.isInteger(v) && v >= 0;
+  const valid = (v) => Number.isInteger(v) && v >= 0 && v <= 12; // 12 = the reserve ceiling (ciHeal.reserve leaf)
   const reserve = (() => {
     try { const v = resolveReserve(); if (valid(v)) return v; } catch { /* invalid */ }
     try { const v = resolveCiHealReserve({ env }); if (valid(v)) return v; } catch { /* invalid */ }
