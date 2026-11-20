@@ -5404,6 +5404,31 @@ sandboxes may deny creating such filenames before the manifest code can observe 
 The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a
 temporary Git repository. Run these scoped tests through heavy admission; the soak
 file needs `--config vitest.soak.config.ts`.
+### Orchestrator quarantine authority
+
+`resolveOrchestratorAuthority` reads repo `authority.redMainQuarantine` from the discovered
+`scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
+through `readPlatformPreferences().prefs.orchestrator` using only its default paths. Missing current
+platform or operator files deny authority; absent optional legacy files are allowed. Unreadable or
+invalid platform evidence still denies authority. Authority reads validate raw JSON in every platform
+file (including legacy files) before merging: duplicate object keys, including escape-equivalent names
+and repeated parent blocks, deny access even when a later file or the repo grants it. Fix the ambiguous
+file to restore an explicit grant. Repeated names in separate objects and punctuation inside strings
+are valid. The repo reader uses
+`readSettingsChecked`: duplicate ownership or read taint denies authority even over a platform grant.
+For this explicit authority grant, platform wins over
+repo in both directions; only boolean `true` grants access, and invalid values deny it. There is
+no authority environment override, including platform-file path overrides. Tests inject
+`platform`/`tool` or the `readFile` IO seam instead of redirecting the authority files.
+The resolver logs the effective value and actual source through the shared policy diagnostics.
+
+The IO writer and CLI add/remove/prune resolve authority; pure quarantine functions receive
+`orchestratorAuthority` explicitly. Keep owner validation, TTL limits, and actor audit records
+on the same path as operator and safety-net writes. `setMode` and `setFixPrs` remain limited to
+the safety net and operator even with orchestrator authority enabled. The authority settings tests cover closed
+defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
+verifies persisted events and commit messages against a temporary local Git origin.
+
 ## Negative review-run proofs
 
 `headNeverReviewedFromRuns` may bypass its 400-run scan only through
