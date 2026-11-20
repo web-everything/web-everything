@@ -1042,10 +1042,23 @@ describe('R1077 builder company routing', () => {
     const args = input(body);
     args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
     const result = await speculateRedTeam(args, io);
+    expect(result.reason).toBeUndefined();
     expect(result.status).toBe('speculated');
     expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual(['agy-gemini']);
     expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash' });
     expect(calls.some(c => c[0] === 'log' && /Carbon not promoted.*fallback route agy-gemini\/gemini-3\.8-flash/.test(c[1]))).toBe(true);
+  });
+
+  it('keeps the builder preference when walking past refused Carbon (Codex builder prefers agy-gemini/flash over codex)', async () => {
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:red-team'] = { provider: 'agy-gemini', model: 'carbon', effort: { 'agy-gemini': 'high', codex: 'high' },
+      fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }, { provider: 'agy-gemini', model: 'flash', effort: 'high' }] };
+    const { io, calls } = policyIo({ readRoutingPolicy: () => structuredClone(policy) });
+    const args = input(marker('codex'));
+    args.env = { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' };
+    expect((await speculateRedTeam(args, io)).status).toBe('speculated');
+    expect(calls.filter(c => c[0] === 'reserve').map(c => c[1])).toEqual(['agy-gemini']);
+    expect(calls.find(c => c[0] === 'seat')[1]).toMatchObject({ provider: 'agy-gemini', model: 'gemini-3.8-flash' });
   });
 
   it('still skips when every configured route left is unpromoted Carbon', async () => {

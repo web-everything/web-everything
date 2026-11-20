@@ -1933,10 +1933,13 @@ export async function speculateRedTeam({
         // The refusal is about this MODEL, not the provider: take the next configured route in the chain
         // (same provider or not) whose model is allowed, before dropping the provider altogether.
         const chain = configuredRoute?.fallback ?? [];
-        const nextIndex = chain.findIndex(route => candidates.includes(route.provider)
+        // The builder preference still applies: an allowed route of the preferred vendor beats chain order.
+        const allowed = chain.map(route => candidates.includes(route.provider)
           && carbonNonShadowAllowed(route.model, { env, log: io.log }));
+        let nextIndex = preferred && !operatorRoute ? chain.findIndex((route, i) => allowed[i] && route.provider === preferred) : -1;
+        if (nextIndex < 0) nextIndex = allowed.indexOf(true);
         if (nextIndex >= 0) {
-          configuredRoute = { ...configuredRoute, ...chain[nextIndex], fallback: chain.slice(nextIndex + 1) };
+          configuredRoute = { ...configuredRoute, ...chain[nextIndex], fallback: chain.filter((_, i) => i !== nextIndex) };
           delete configuredRoute.mode;
           pick = { provider: configuredRoute.provider, reasoning: 'routing-policy' };
           io.log(`red team: ${unavailable.at(-1)}; fallback route ${configuredRoute.provider}/${configuredRoute.model}`);
