@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as ghThrottle from '../gh-throttle.mjs';
-import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord, readRun, writeRun } from '../../operations/run-store.mjs';
@@ -15,6 +15,7 @@ import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.
 import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
 import { RED_TEAM_UNSEALED_HOLD_PREFIX, RED_TEAM_NO_RESULT_HOLD_PREFIX, statusOwesPublication } from '../drain-red-team-evidence.mjs';
+import { abandonedPath, runRecordVersion } from '../run-abandoned.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -39,6 +40,93 @@ const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], ca
     readSeatRow: () => seatRow(key.head, findings), publishNeedsYou: () => {} });
 };
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+
+describe('tombstone-bound advisory release (#7167 committee)', () => {
+  it.each([
+    'valid bound tombstone', 'no tombstone', 'unbound tombstone', 'mismatched recordVersion',
+    'record replaced between stat and read', 'record replaced after tombstone validation', 'needs-human verdict', 'refused outcome',
+    'refused advisory effect', 'non-advise effect step', 'non-effect pending', 'non-advisory effect',
+    'applied non-advisory effect', 'no pending step', 'malformed head', 'matching malformed live head', 'no finished accept',
+    'newer rejection on another head', 'newer finished rejection on another head', 'unreadable tombstone', 'unreadable post-read stat',
+  ])('%s', kind => {
+    const f = fixture();
+    if (kind === 'matching malformed live head') f.head += '\n';
+    const accepted = { ...newRunRecord({ id: 'review-pr-accepted', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...payload(f.head), pending: null, effects: [{ key: 'label', stepIndex: 1, index: 0, type: 'review.label-swap', status: 'applied' }],
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] };
+    const parked = { ...accepted, id: 'review-pr-parked',
+      pending: { kind: 'effect', step: 'advise', stepIndex: 2 },
+      effects: [{ key: 'note', stepIndex: 2, index: 0, type: 'review.advisory-note', status: 'pending' }],
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(15_000).toISOString() }] };
+    if (kind === 'needs-human verdict') parked.verdict = { verdict: 'needs-human', humanRequired: true,
+      lensVerdicts: { correctness: 'accept', security: 'accept' } };
+    if (kind === 'refused outcome') parked.outcome = 'refused';
+    if (kind === 'refused advisory effect') Object.assign(parked.effects[0], {
+      status: 'refused', attempts: 1, error: 'SELF-CLEAR REFUSED — nothing was changed (#2844)',
+    });
+    if (kind === 'non-advise effect step') parked.pending.step = 'record';
+    if (kind === 'non-effect pending') parked.pending.kind = 'step';
+    if (kind === 'non-advisory effect') parked.effects[0].type = 'review.label-swap';
+    if (kind === 'applied non-advisory effect') parked.effects.push({ key: 'label', stepIndex: 1, index: 0, type: 'review.label-swap', status: 'applied' });
+    if (kind === 'no pending step') parked.pending = null;
+    if (kind === 'malformed head') parked.findings = { read: { netBasis: { rev: `${f.head}\n` } } };
+    if (kind !== 'no finished accept') utimesSync(writeRun(accepted, f.runsDir), 12, 12);
+    const path = writeRun(parked, f.runsDir);
+    utimesSync(path, 20, 20);
+    const tombstone = (version = runRecordVersion(statSync(path))) => {
+      writeFileSync(abandonedPath(parked.id, f.runsDir), JSON.stringify({ at: new Date(25_000).toISOString(),
+        reason: 'owner proven dead', by: 'session-reaper', probes: version === null ? {} : { recordVersion: version } }));
+      utimesSync(abandonedPath(parked.id, f.runsDir), 25, 25);
+    };
+    if (kind !== 'no tombstone') tombstone(kind === 'unbound tombstone' ? null
+      : kind === 'mismatched recordVersion' ? 'stale-version' : undefined);
+    if (kind === 'unreadable tombstone') writeFileSync(abandonedPath(parked.id, f.runsDir), '{');
+    const ids = kind === 'no finished accept' ? [parked.id] : [accepted.id, parked.id];
+    if (kind === 'newer rejection on another head' || kind === 'newer finished rejection on another head') {
+      const rejected = { ...parked, id: 'review-pr-rejected', verdict: { verdict: 'changes' },
+        findings: { read: { netBasis: { rev: 'a'.repeat(40) } } },
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(18_000).toISOString() }] };
+      if (kind === 'newer finished rejection on another head') Object.assign(rejected, { pending: null, effects: [] });
+      utimesSync(writeRun(rejected, f.runsDir), 22, 22);
+      ids.push(rejected.id);
+    }
+    rmSync(reviewRunIndexPath(f.runsDir), { force: true }); // Exercise the bounded reader without locator hints.
+    let wasRead = false, replacedAfterValidation = false;
+    const read = id => {
+      const run = readRun(id, f.runsDir);
+      if (id === parked.id) {
+        wasRead = true;
+        if (kind === 'record replaced between stat and read') {
+          const replacement = `${path}.replacement`;
+          writeFileSync(replacement, JSON.stringify({ ...parked, verdict: { verdict: 'changes' } }));
+          utimesSync(replacement, 20, 20);
+          renameSync(replacement, path);
+          tombstone(); // Even a tombstone bound to the replacement cannot authorize the old read.
+        }
+      }
+      return run;
+    };
+    const result = readRecoveryWitness({ ...f, now: 30_000, list: () => ids, read,
+      stat: name => {
+        if (kind === 'unreadable post-read stat' && wasRead && name === path) throw Error('metadata unreadable');
+        const metadata = statSync(name);
+        if (kind === 'record replaced after tombstone validation' && wasRead && name === path && !replacedAfterValidation) {
+          replacedAfterValidation = true;
+          const replacement = `${path}.replacement`;
+          writeFileSync(replacement, JSON.stringify(parked));
+          utimesSync(replacement, 20, 20);
+          renameSync(replacement, path);
+        }
+        return metadata;
+      },
+      // Legacy comment-shaped evidence has no release authority, even when supplied by a caller.
+      clearance: { sha: f.head, at: 30_000 } });
+    if (kind === 'valid bound tombstone') {
+      expect(result.ok).not.toBe(false);
+      expect(result.newest).toEqual(accepted);
+    } else expect(result).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+});
 
 describe('status persistence and check publication share one claim', () => {
   it.each(['pending', 'running', 'finished'])('under-test %s writes without an injected publisher never call gh or create a publication hold', status => {
@@ -1046,131 +1134,7 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
 
 import { readRecoveryWitness, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
-describe('#7167 rebase audit', () => {
-  const parked = f => ({ id: 'review-pr-parked', op: 'review-pr', input: { repo: f.repo, pr: f.pr },
-    ...payload(f.head), verdict: { verdict: 'needs-human', humanRequired: true,
-      lensVerdicts: { correctness: 'accept', security: 'accept' } },
-    stepTimings: [{ step: 'read', startedAt: new Date(10_000).toISOString() }],
-    pending: { kind: 'effect', step: 'advise' }, effects: [{ type: 'review.advisory-note', status: 'pending' }] });
-
-  it.each(['missing identity', 'filename PR mismatch', 'replacement', 'listing changed'])(
-    'S1 refuses quarantine evidence with %s; inspect quarantine before recovery', kind => {
-      const f = fixture(), id = `review-pr-pr${f.pr}-12345678-1234-1234-1234-123456789abc`;
-      const run = { ...newRunRecord({ id, op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
-      const invalid = { ...run, id: 'review-pr-invalid', verdict: { verdict: 'changes' }, input: { pr: f.pr } };
-      if (kind === 'filename PR mismatch') run.input.pr++;
-      let lists = 0, stats = 0;
-      const args = { ...f, clearance: { sha: f.head, at: 30_000 }, list: () => [],
-        quarantine: {
-          list: () => { lists++; return kind === 'listing changed' && lists > 1 ? [id, invalid.id]
-            : kind === 'missing identity' ? [id, invalid.id] : [id]; },
-          read: name => name === id ? run : invalid,
-          stat: path => ({ mtimeMs: path.endsWith('.json') && kind === 'replacement' && ++stats > 1 ? 40_000 : 10_000 }),
-        } };
-      expect(() => readRecoveryWitness(args)).toThrow();
-    });
-
-  it.each(['rejecting lens', 'missing advisory accept'])(
-    'F4 keeps needs-human unfinished without an advisory accept: %s', kind => {
-      const f = fixture(), run = parked(f);
-      if (kind === 'rejecting lens') Object.assign(run.verdict, {
-        lensVerdicts: { correctness: 'changes', security: 'accept' }, pendingReferrals: [{ lens: 'correctness' }] });
-      else delete run.verdict.lensVerdicts;
-      expect(readRecoveryWitness({ ...f, clearance: { sha: f.head, at: 30_000 }, now: 40_000,
-        list: () => [run.id], read: () => run, stat: () => ({ mtimeMs: 20_000 }) }))
-        .toMatchObject({ ok: false, reason: 'review-unfinished' });
-    });
-
-  it.each(['active', 'quarantine'])('F5 rejects equal and coarse-tick clearance ordering in %s evidence', kind => {
-    const f = fixture(), run = kind === 'active' ? parked(f)
-      : { ...newRunRecord({ id: 'review-pr-quarantined', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }), ...payload(f.head) };
-    for (const gap of [0, RUN_MTIME_SLACK_MS - 1, RUN_MTIME_SLACK_MS, RUN_MTIME_SLACK_MS + 1]) {
-      const io = { list: () => [run.id], read: () => run, stat: () => ({ mtimeMs: 20_000 }) };
-      const read = () => readRecoveryWitness({ ...f, clearance: { sha: f.head, at: 20_000 + gap }, now: 40_000,
-        ...(kind === 'active' ? io : { list: () => [], quarantine: io }) });
-      if (gap > RUN_MTIME_SLACK_MS) expect(read().newest).toEqual(run);
-      else if (kind === 'active') expect(read()).toMatchObject({ ok: false, reason: 'review-unfinished' });
-      else expect(read).toThrow(/quarantined review conflict.*inspect/);
-    }
-  });
-
-  it('F7 refuses unknown advisory effect types instead of treating their prefix as authority', () => {
-    const f = fixture(), run = parked(f);
-    run.effects = [{ type: 'review.advisory-unknown-security-action', status: 'pending' }];
-    expect(readRecoveryWitness({ ...f, clearance: { sha: f.head, at: 30_000 }, now: 40_000,
-      list: () => [run.id], read: () => run, stat: () => ({ mtimeMs: 20_000 }) }))
-      .toMatchObject({ ok: false, reason: 'review-unfinished' });
-  });
-});
-
-describe('active clearance record revalidation', () => {
-  it.each(['new mtime', 'same mtime replacement', 'unreadable metadata'])(
-    'holds advisory evidence replaced during read: %s', kind => {
-      const f = fixture();
-      const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
-        stepTimings: [{ step: 'read', startedAt: new Date(10_000).toISOString() }],
-        pending: { kind: 'effect', step: 'advise' },
-        effects: [{ type: 'review.advisory-note', status: 'pending' }] };
-      let read = false;
-      const args = { ...f, clearance: { sha: f.head, at: 20_000 }, now: 30_000,
-        list: () => ['review-pr-parked'], read: () => { read = true; return run; },
-        stat: () => {
-          if (read && kind === 'unreadable metadata') throw Error('metadata unreadable');
-          return { mtimeMs: read && kind === 'new mtime' ? 21_000 : 17_000,
-            ino: read && kind === 'same mtime replacement' ? 2 : 1 };
-        } };
-      if (kind === 'unreadable metadata') expect(() => readRecoveryWitness(args)).toThrow(/metadata unreadable/);
-      else expect(readRecoveryWitness(args)).toMatchObject({ ok: false, reason: 'review-unfinished' });
-    });
-});
-
-describe('head clearance for parked recovery reviews', () => {
-  it.each([
-    ['advisory parked safely before clearance', {}, {}, true],
-    ['failed advisory bookkeeping', { effects: [{ type: 'review.scoped-rereview-shadow', status: 'failed' }] }, {}, true],
-    ['advisory parked without clearance', {}, { clearance: undefined }, false],
-    ['clearance on another head', {}, { clearance: { sha: 'a'.repeat(40), at: 20_000 } }, false],
-    ['written after clearance', {}, { stat: () => ({ mtimeMs: 20_001 }) }, false],
-    ['pending label', { effects: [{ type: 'review.label-swap', status: 'pending' }] }, {}, false],
-    ['in-flight label', { effects: [{ type: 'review.label-swap', status: 'in-flight' }] }, {}, false],
-    ['no verdict', { verdict: null }, {}, false],
-    ['rejection', { verdict: { verdict: 'changes' } }, {}, false],
-    ['non-advisory pending step', { pending: { kind: 'effect', step: 'label' } }, {}, false],
-    ['refused label effect', { pending: null, effects: [{ type: 'review.label-swap', status: 'refused' }] }, {}, false],
-    ['failed label effect', { effects: [{ type: 'review.label-swap', status: 'failed' }] }, {}, false],
-    ['refused advisory effect', { pending: null, effects: [{ type: 'review.advisory-note', status: 'refused' }] }, {}, false],
-    ['refused advisory outcome', { pending: null, outcome: 'refused', effects: [{ type: 'review.advisory-note', status: 'refused' }] }, {}, false],
-    ['refused label outcome', { pending: null, outcome: 'refused', effects: [{ type: 'review.label-swap', status: 'refused' }] }, {}, false],
-    ['unexplained refused outcome', { pending: null, effects: [], outcome: 'refused' }, {}, false],
-    ['refused effect without clearance', { pending: null, effects: [{ status: 'refused' }] }, { clearance: undefined }, false],
-    ['refused outcome without clearance', { pending: null, effects: [], outcome: 'refused' }, { clearance: undefined }, false],
-    ['unreadable record', {}, { read: () => { throw Error('unreadable'); } }, false],
-    ['unreadable clearance time', {}, { clearance: { sha: 'b'.repeat(40), at: null } }, false],
-  ])('%s', (_name, patch, options, passes) => {
-    const f = fixture();
-    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
-      verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept', security: 'accept' } },
-      stepTimings: [{ step: 'read', startedAt: new Date(10_000).toISOString() }],
-      pending: { kind: 'effect', step: 'advise' }, effects: [
-        { type: 'review.advisory-note', status: 'applied' },
-        { type: 'review.scoped-rereview-shadow', status: 'pending' },
-      ], ...patch };
-    const args = { ...f, clearance: { sha: f.head, at: 20_000 }, now: 30_000,
-      list: () => ['review-pr-parked'], read: () => run, stat: () => ({ mtimeMs: 17_000 }), ...options };
-    if (_name === 'unreadable record') {
-      expect(() => readRecoveryWitness(args)).toThrow('unreadable');
-      return;
-    }
-    const result = readRecoveryWitness(args);
-    if (passes) expect(result.newest).toEqual(run);
-    else expect(result.ok).toBe(false);
-    if (!passes) expect(result.reason).toBe('review-unfinished');
-    // Clearance is a recovery-only authority, never a new drain settlement path.
-    if (passes) expect(readDrainRedTeamEvidence(args)).toMatchObject({ ok: false, reason: 'review-unfinished' });
-  });
-});
-
-describe('completed accepts never release later advisory work without clearance', () => {
+describe('completed accepts never release later advisory work without a tombstone', () => {
   it.each(['accept', 'prevention-outstanding', 'accept-written-later', 'in-flight-advisory', 'alone', 'other-head', 'other-pr', 'other-repo',
     'label', 'no-verdict', 'changes', 'refused-effect', 'refused-outcome', 'incomplete-accept', 'empty-effects', 'missing-effects', 'no-applied-label', 'failed-accept-label', 'unreadable', 'scan-capped'])(
     'holds later advisory work even beside a completed accept: %s', kind => {
@@ -1207,89 +1171,6 @@ describe('completed accepts never release later advisory work without clearance'
     });
 });
 
-describe('cleared quarantined recovery reviews', () => {
-  it.each(['accept', 'prevention-outstanding', 'advisory', 'no-clearance', 'other-clearance', 'other-head', 'late',
-    'changes', 'other-pr', 'other-repo', 'read-error', 'parse-error', 'conflict', 'scan-capped'])(
-    'requires exact, readable, pre-clearance quarantine evidence: %s', kind => {
-      const f = fixture(), dir = join(f.runsDir, '..', 'runs-quarantine');
-      const run = { ...newRunRecord({ id: 'review-pr-quarantined', op: 'review-pr', input: {
-        repo: kind === 'other-repo' ? 'other/repo' : f.repo, pr: kind === 'other-pr' ? f.pr + 1 : f.pr } }),
-        ...payload(kind === 'other-head' ? 'a'.repeat(40) : f.head),
-        verdict: kind === 'advisory' ? { verdict: 'needs-human', humanRequired: true,
-          lensVerdicts: { correctness: 'accept', security: 'accept' } }
-          : { verdict: ['changes', 'prevention-outstanding'].includes(kind) ? kind : 'accept' },
-        pending: null };
-      const path = writeRun(run, dir);
-      utimesSync(path, 17, kind === 'late' ? 21 : 17);
-      if (kind === 'parse-error') writeFileSync(path, '{');
-      if (['conflict', 'scan-capped'].includes(kind)) {
-        const other = writeRun({ ...run, id: 'review-pr-conflict', verdict: { verdict: 'changes' } }, dir);
-        utimesSync(other, 17, 17);
-      }
-      const args = { ...f, clearance: kind === 'no-clearance' ? undefined
-        : { sha: kind === 'other-clearance' ? 'a'.repeat(40) : f.head, at: 20_000 },
-        ...(kind === 'read-error' ? { quarantine: { read: () => { throw Error('quarantine unreadable'); } } } : {}),
-        ...(kind === 'scan-capped' ? { scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, platform: {}, env: {} }, warn: () => {} } : {}) };
-      if (['other-head', 'late', 'changes', 'read-error', 'parse-error', 'conflict', 'scan-capped'].includes(kind)) {
-        expect(() => readRecoveryWitness(args)).toThrow(kind === 'scan-capped' ? /scan-capped.*inspect/ : /quarantin|refusing to read/);
-      } else {
-        const result = readRecoveryWitness(args);
-        if (['accept', 'prevention-outstanding', 'advisory'].includes(kind)) {
-          expect(result.newest).toEqual(run);
-          expect(redTeamOwedFor(result.newest)).toBe(kind !== 'prevention-outstanding');
-        } else expect(result.newest).toBeNull();
-      }
-    });
-});
-
-describe('same-PR quarantine conflicts across heads', () => {
-  it.each(['missing', 'different'].flatMap(headKind => ['rejection', 'unfinished'].map(state => [headKind, state])))(
-    'holds a cleared accept beside %s-head %s evidence', (headKind, state) => {
-      const f = fixture(), dir = join(f.runsDir, '..', 'runs-quarantine');
-      const accepted = { ...newRunRecord({ id: 'review-pr-accepted', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
-        ...payload(f.head) };
-      const conflict = { ...accepted, id: 'review-pr-conflict',
-        findings: { read: { netBasis: { rev: headKind === 'missing' ? null : 'a'.repeat(40) } } },
-        ...(state === 'rejection' ? { verdict: { verdict: 'changes' } }
-          : { pending: { kind: 'effect', step: 'record', stepIndex: 3 },
-            effects: [{ key: 'notice', type: 'review.notice', status: 'pending', stepIndex: 3, index: 0 }] }) };
-      for (const run of [accepted, conflict]) utimesSync(writeRun(run, dir), 17, 17);
-      expect(() => readRecoveryWitness({ ...f, clearance: { sha: f.head, at: 20_000 } }))
-        .toThrow(/quarantined review conflict.*inspect/);
-    });
-});
-
-describe('quarantine clearance requires completed recording', () => {
-  const effects = [
-    ['review.label-swap', 'failed', false], ['review.label-swap', 'pending', false], ['review.label-swap', 'declared', false],
-    ['verdict-ledger.append', 'declared', false], ['verdict-ledger.append', 'pending', false],
-    ['review.notice', 'declared', false], ['review.notice', 'pending', false],
-    ['review.label-swap', 'refused', false], ['review.label-swap', 'in-flight', false],
-    ['verdict-ledger.append', 'failed', false], ['review.notice', 'failed', false],
-    ['review.notice', 'refused', false], ['review.notice', 'in-flight', false],
-    ['review.other', 'pending', false], ['review.other', 'failed', false], ['review.other', 'refused', false],
-  ];
-  it.each([...effects.map(([type, status, ok]) => [type + ' ' + status, { type, status }, {}, ok]),
-    ['wrong effect step', { type: 'review.label-swap', status: 'failed', stepIndex: 2 }, {}, false],
-    ['wrong pending step', { type: 'review.label-swap', status: 'failed' }, { pending: { kind: 'effect', step: 'advise', stepIndex: 3 } }, false],
-    ['refused outcome', { type: 'review.label-swap', status: 'pending' }, { outcome: 'refused' }, false],
-    ['null pending with recorded step', { type: 'review.label-swap', status: 'failed' }, { pending: null }, false],
-    ['null pending without recorded step', { type: 'review.label-swap', status: 'failed' }, { pending: null, stepTimings: [] }, false],
-    ['pending record with all applied', { type: 'review.other', status: 'applied' }, { pending: { kind: 'effect', step: 'record', stepIndex: 3 } }, false],
-    ['all applied', { type: 'review.other', status: 'applied' }, { pending: null }, true],
-  ])('%s', (_name, effect, patch, ok) => {
-    const f = fixture(), dir = join(f.runsDir, '..', 'runs-quarantine');
-    const run = { ...newRunRecord({ id: 'review-pr-record', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
-      ...payload(f.head), pending: null,
-      stepTimings: [{ step: 'record', stepIndex: 3, startedAt: new Date(10_000).toISOString() }],
-      effects: [{ key: 'record-effect', index: 0, stepIndex: 3, ...effect,
-        ...(effect.status === 'refused' ? { attempts: 1, error: 'SELF-CLEAR REFUSED — nothing was changed (#2844)' } : {}) }], ...patch };
-    utimesSync(writeRun(run, dir), 17, 17);
-    const read = () => readRecoveryWitness({ ...f, clearance: { sha: f.head, at: 20_000 } });
-    if (ok) expect(read().newest).toEqual(run);
-    else expect(read).toThrow(/quarantined review conflict.*inspect/);
-  });
-});
 
 describe('bounded review evidence scans', () => {
   // Records 10 s apart by mtime. A record is written after its read step starts, so its mtime bounds that start.

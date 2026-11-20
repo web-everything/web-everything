@@ -401,12 +401,11 @@ export function latestAcceptRecord(comments, reviews = undefined, { sha: sourceS
   });
   if (!rec) return null;
   const later = list.slice(rec.index + 1);
-  const laterBodyDerivedHold = list.slice(rec.index).filter((c) => isTrustedMarkerAuthor(c))
+  const laterBodyDerivedHold = later.filter((c) => isTrustedMarkerAuthor(c))
     .some((c) => BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
   // ANY author: an unrecognised comment is a possible hold (see the file's "inverted rule" note), a recognised verdict
   // shape is one. A formal review that stands against the accept is the other channel.
-  const laterVerdict = isLaterVerdictBody(list[rec.index]?.body)
-    || later.some((c) => !isKnownMachineBody(c?.body, c)) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
+  const laterVerdict = later.some((c) => !isKnownMachineBody(c?.body, c)) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
   return { ...rec, laterBodyDerivedHold, laterVerdict, reviewsUnreadable: reviews === null };
 }
 

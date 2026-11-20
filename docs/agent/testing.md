@@ -487,11 +487,6 @@ The moved-card cases in `review-red-team-on-skip.test.mjs`, `drain-red-team-evid
 and `review-job-red-team-only.test.mjs` pin selection, fail-closed proof and real comment settlement.
 Keep these files in the affected-test gate whenever the moved-card readers, proof or job wiring change:
 `npm run test:unit -- scripts/lib/__tests__/review-red-team-on-skip.test.mjs scripts/lib/__tests__/drain-red-team-evidence.test.mjs scripts/operations/__tests__/review-job-red-team-only.test.mjs`.
-Red-team-only head clearance may ignore only pre-clearance advisory/refused
-bookkeeping on that exact head; test missing or unreadable clearance, later writes, pending label work,
-and missing/rejecting verdicts as holds. Pin that refused effects still hold without clearance and
-that clearance preserves the advisory accept's red-team ownership. The drain settlement path is unchanged.
-
 Exercise new factory IO members through `createReviewJobIo` with temporary persisted evidence and an
 injected command reader; cover runner defaults as well as injected proofs. History cases must include
 20 and 21 commits, a root, an intermediate code change, and a code-to-card rename whose source becomes
@@ -5534,21 +5529,21 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
-## Advisory recovery clearance (round-2 audit)
+## Tombstone-bound advisory recovery (#7167)
 
-`drain-red-team-evidence.test.mjs` and `review-job-red-team-only.test.mjs` pin recovery's
-fail-closed boundaries: a completed accept cannot release a newer advisory run; refused
-outcomes/effects always hold. Clearance compares active record identity before and after
-the payload read (including same-mtime replacement). Quarantine recovery requires no pending
-step and every effect applied; any same-PR record with an unknown or different head holds
-for operator inspection. Finish recording or inspect the conflicting evidence before retrying.
+Only an exact-head accepting review parked on an `advise` effect can stop holding
+through a version-bound R755 abandonment tombstone. The bounded reader rechecks
+record identity after reading; missing, unreadable, unbound or stale evidence keeps
+the hold. Refused effects/outcomes and needs-human verdicts retain the hold.
+The abandoned record supplies no payload: recovery still needs a finished same-head
+accept from the existing reader, and a newer rejection on another head retains the hold.
+Restore or finish review evidence before retrying
+when none exists; PR comments and quarantined records cannot authorize release.
+`drain-red-team-evidence.test.mjs` covers these refusals and a record replacement
+during the read. `red-team-advisory-parked-after-accept.soak.test.mjs` exercises
+valid release and missing/stale tombstone holds against persisted records.
 
-Recovery's clearance reader deliberately accepts only a complete marker-only comment with a
-nonempty actor, an exact reviewed SHA and optional diff/contribution markers. Quoted markers
-and prose retain the hold; this narrower recovery authority does not change the shared carry
-parser. The clearance comment itself must have readable edit metadata equal to its creation
-time; earlier comments must have readable edit times strictly before clearance. Missing,
-invalid or changed metadata requires thread inspection and fresh clearance. Keep the negative
-fixtures failing against the pre-fix implementation before changing these boundaries.
-Liveness-only `review-recovery-witness.test.mjs` fixtures inject explicit absent clearance;
-thread authority stays covered by the production-reader cases in `review-job-red-team-only.test.mjs`.
+The shared accept-carry parser must still detect holds in the selected comment itself:
+a trusted revocation can quote previous clearance markers. Keep the parameterized
+`#7167 S2` regression in `accept-carry-forward.replay.test.mjs` when changing recovery
+authority; both manifest-mismatch and standing-hold prose must refuse carry-forward.

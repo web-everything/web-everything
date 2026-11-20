@@ -1,19 +1,20 @@
-/** A later advisory-only run must not strand a completed same-head accept's red team. */
-import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
+/** Only a version-bound tombstone releases parked advisory work; it never supplies the payload. */
+import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { newRunRecord, writeRun } from '../../../operations/run-store.mjs';
+import { abandonedPath, runRecordVersion } from '../../../lib/run-abandoned.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const SOURCE = 'scripts/lib/drain-red-team-evidence.mjs';
 
 export default {
   id: 'red-team-advisory-parked-after-accept',
-  title: 'a completed same-head accept releases a later advisory-only unfinished review',
-  card: 'PR #7151 advisory-parked red-team recovery',
-  fixedBy: { sha: 'pending', where: 'lane-59', paths: [SOURCE] },
+  title: 'a valid tombstone releases advisory work; missing or stale tombstones hold',
+  card: '#7167 tombstone-bound advisory recovery',
+  fixedBy: { sha: 'pending', where: 'committee decision', paths: [SOURCE] },
   fixPresent(root) {
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
       const { default: scenario } = await import(process.argv[1]);
@@ -37,11 +38,26 @@ export default {
         effects: [{ key: 'shadow', type: 'review.scoped-rereview-shadow', stepIndex: 2, index: 0, status: 'pending' }],
         stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(15_000).toISOString() }] };
       utimesSync(writeRun(accepted, runsDir), 12, 12);
-      utimesSync(writeRun(parked, runsDir), 20, 20);
-      const witness = readRecoveryWitness({ repo, pr, head, runsDir, env: { WE_SHARED_RUNS_DIR: runsDir },
+      const parkedPath = writeRun(parked, runsDir);
+      utimesSync(parkedPath, 20, 20);
+      const read = () => readRecoveryWitness({ repo, pr, head, runsDir, env: { WE_SHARED_RUNS_DIR: runsDir },
         now: 30_000, readScorecards: () => [], scanSettings: { file: {}, platform: {}, env: {} } });
-      return { violations: witness?.ok === false || witness?.newest?.id !== parked.id
-        ? [{ invariant: 'accepted-head-red-team-not-held-by-advisory', detail: witness?.reason ?? 'same-head payload missing' }] : [] };
+      const missing = read();
+      const sidecar = abandonedPath(parked.id, runsDir);
+      writeFileSync(sidecar, JSON.stringify({ at: new Date(25_000).toISOString(), reason: 'owner proven dead',
+        by: 'session-reaper', probes: { recordVersion: runRecordVersion(statSync(parkedPath)) } }));
+      utimesSync(sidecar, 25, 25);
+      const valid = read();
+      // Atomic replacement at the same mtime invalidates the old version binding.
+      utimesSync(writeRun(parked, runsDir), 20, 20);
+      const stale = read();
+      const observations = {
+        missingHolds: missing?.ok === false && missing.reason === 'review-unfinished',
+        validReleases: valid?.ok !== false && valid?.newest?.id === accepted.id,
+        staleHolds: stale?.ok === false && stale.reason === 'review-unfinished',
+      };
+      return { observations, violations: Object.entries(observations).filter(([, passed]) => !passed)
+        .map(([invariant]) => ({ invariant, detail: 'tombstone-bound advisory recovery behaviour violated' })) };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   },
   judge: report => report.violations,
