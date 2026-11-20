@@ -16,29 +16,69 @@ function stringEnd(text, start) {
   return Math.min(i, text.length);
 }
 
-/** Linear lexical pass; preserve strings/templates and line breaks in comments. */
-export function stripComments(text) {
+/** Linear lexical pass; preserve literals and expose uncertain slash contexts. */
+export function stripCommentsWithStatus(text) {
   text = String(text ?? '');
   const chunks = [];
   let i = 0;
   let start = 0;
+  let expressionStart = true;
+  let ambiguous = false;
   while (i < text.length) {
     const ch = text[i];
-    if (ch === "'" || ch === '"' || ch === '`') { i = stringEnd(text, i); continue; }
-    if (ch !== '/' || (text[i + 1] !== '/' && text[i + 1] !== '*')) { i++; continue; }
+    if (ch === '\n' || ch === '\r') { expressionStart = true; i++; continue; }
+    if (/\s/.test(ch)) { i++; continue; }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      i = stringEnd(text, i);
+      expressionStart = false;
+      continue;
+    }
+    if (/[\w$]/.test(ch)) {
+      const tokenStart = i++;
+      while (i < text.length && /[\w$]/.test(text[i])) i++;
+      expressionStart = text.slice(tokenStart, i) === 'return';
+      continue;
+    }
+    if (ch !== '/') {
+      expressionStart = '(,=:[!&|?{};'.includes(ch);
+      i++;
+      continue;
+    }
+    if (text[i + 1] !== '/' && text[i + 1] !== '*') {
+      if (!expressionStart) { ambiguous = true; i++; continue; }
+      let inClass = false;
+      let closed = false;
+      i++;
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') {
+        const current = text[i++];
+        if (current === '\\') {
+          if (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++;
+        } else if (current === '[') inClass = true;
+        else if (current === ']') inClass = false;
+        else if (current === '/' && !inClass) { closed = true; break; }
+      }
+      ambiguous ||= !closed;
+      expressionStart = false;
+      continue;
+    }
     chunks.push(text.slice(start, i), ' ');
     const block = text[i + 1] === '*';
     i += 2;
     while (i < text.length) {
       if (!block && (text[i] === '\n' || text[i] === '\r')) break;
       if (block && text[i] === '*' && text[i + 1] === '/') { i += 2; break; }
-      if (text[i] === '\n' || text[i] === '\r') chunks.push(text[i]);
+      if (text[i] === '\n' || text[i] === '\r') { chunks.push(text[i]); expressionStart = true; }
       i++;
     }
     start = i;
   }
   chunks.push(text.slice(start));
-  return chunks.join('');
+  return { text: chunks.join(''), ambiguous };
+}
+
+/** String-only compatibility wrapper. */
+export function stripComments(text) {
+  return stripCommentsWithStatus(text).text;
 }
 
 const PATH_CALLS = new Set(['execFileSync', 'spawn', 'spawnSync', 'exec', 'readFileSync', 'readFile']);
@@ -82,7 +122,7 @@ function callPaths(text, add) {
 export function staticEdgesOf(fromFile, text, fileSet, { aliases = {} } = {}) {
   text = String(text ?? '');
   if (text.length > MAX_INPUT_BYTES || Buffer.byteLength(text, 'utf8') > MAX_INPUT_BYTES) return { edges: [], partial: true };
-  const source = stripComments(text);
+  const { text: source, ambiguous } = stripCommentsWithStatus(text);
   const edges = new Set();
   const add = (target) => { if (target && target !== fromFile) edges.add(target); };
   const aliasEntries = Object.entries(aliases).filter(([prefix]) => prefix).sort((a, b) => b[0].length - a[0].length);
@@ -100,18 +140,18 @@ export function staticEdgesOf(fromFile, text, fileSet, { aliases = {} } = {}) {
     if (fileSet.has(literal)) add(literal);
     else add(resolveSpecifier(fromFile, literal, fileSet));
   });
-  return { edges: [...edges], partial: false };
+  return { edges: [...edges], partial: ambiguous };
 }
 
 /** Reverse reachability for diagnostics only; unreadable or bounded evidence stays partial. */
-export function shadowSelection({ changedFiles, files, readFile, maxTests }) {
+export function shadowSelection({ changedFiles, files, readFile, maxTests, aliases = {} }) {
   const tracked = files.filter((f) => !f.startsWith('node_modules/') && !f.includes('/node_modules/'));
   const fileSet = new Set(tracked);
   const reverse = new Map();
   let partial = false;
   for (const file of tracked.filter(isGraphSourceFile)) {
     let result;
-    try { result = staticEdgesOf(file, readFile(file), fileSet); }
+    try { result = staticEdgesOf(file, readFile(file), fileSet, { aliases }); }
     catch { partial = true; continue; }
     partial ||= result.partial;
     for (const target of result.edges) {

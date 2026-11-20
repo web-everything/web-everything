@@ -111,3 +111,111 @@ describe('related-test-selection stays byte-identical to main (checklist 2)', ()
     expect(resolvedImportsOf('a/t.test.mjs', 'import {q} from /* c\n */ "./x.mjs"', files)).toEqual([]);
   });
 });
+
+describe('audit regressions: regex literals and aliases', () => {
+  it('preserves regex comment markers, classes and escapes in every expression-start context', () => {
+    const prefixes = ['(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', 'return ', '\n'];
+    const literals = ['/[//]/', '/[/*]/', String.raw`/[\]/]/`, String.raw`/a\/b/`];
+    for (const prefix of prefixes) {
+      for (const literal of literals) {
+        const source = `${prefix}${literal}; /* gone */ import "./x.mjs"; // gone`;
+        expect(stripComments(source)).toContain(literal);
+        expect(stripComments(source)).not.toContain('gone');
+        expect(staticEdgesOf('scripts/lib/a.mjs', source, FILES)).toEqual({ edges: ['scripts/lib/x.mjs'], partial: false });
+      }
+    }
+  });
+
+  it('marks uncertain slash contexts and unterminated single-line regexes partial', () => {
+    for (const source of ['if (ok) /[/*]/;', 'value / divisor;', 'const r = /[abc\nimport "./x.mjs";', 'return /abc\\\nimport "./x.mjs";']) {
+      expect(staticEdgesOf('scripts/lib/a.mjs', source, FILES).partial).toBe(true);
+      expect(shadowSelection({ changedFiles: [], files: ['scripts/lib/a.mjs'], readFile: () => source }).partial).toBe(true);
+    }
+  });
+
+  it('scans repeated regex classes and malformed single-line literals linearly under the cap', () => {
+    const source = ('/[/*]/; // gone\n/[unterminated\n').repeat(10000) + 'import "./x.mjs";';
+    const started = Date.now();
+    expect(staticEdgesOf('scripts/lib/a.mjs', source, FILES)).toEqual({ edges: ['scripts/lib/x.mjs'], partial: true });
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  it('passes aliases through shadowSelection to reach importing tests', () => {
+    const contents = { 'scripts/lib/__tests__/alias.test.mjs': 'import "@lib/x.mjs";', 'scripts/lib/x.mjs': '' };
+    const options = { changedFiles: ['scripts/lib/x.mjs'], files: Object.keys(contents), readFile: (file) => contents[file] };
+    expect(shadowSelection(options)).toEqual({ tests: [], partial: false });
+    expect(shadowSelection({ ...options, aliases: { '@lib/': 'scripts/lib/' } })).toEqual({ tests: ['scripts/lib/__tests__/alias.test.mjs'], partial: false });
+  });
+});
+
+describe('audit regression: measure CLI report evidence', () => {
+  it('fails closed for missing or malformed reports and preserves mode/tests with valid reports', async () => {
+    const { vi } = await import('vitest');
+    const { resolve } = await import('node:path');
+    const cliPath = resolve('scripts/readiness/test-selection.mjs');
+    const argv = process.argv;
+    let output;
+    let recorded;
+    let reportText;
+    vi.stubEnv('WE_STATIC_EDGES_SHADOW', '1');
+    vi.stubEnv(SELECTION_FLAG, '0');
+    vi.doMock('node:child_process', async () => {
+      const actual = await vi.importActual('node:child_process');
+      const execFileSync = (file, args) => {
+        if (file !== 'git') throw new Error('unexpected child process');
+        if (args[0] === 'merge-base') return 'abc\n';
+        if (args[0] === 'diff') return 'scripts/lib/x.mjs\n';
+        if (args[0] === 'ls-files') return 'scripts/lib/x.mjs\0';
+        throw new Error(`unexpected git command: ${args[0]}`);
+      };
+      return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
+    });
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual('node:fs');
+      const fixture = {
+      readFileSync: (path, ...rest) => {
+        if (String(path) === 'audit-report.json') {
+          if (reportText === undefined) throw new Error('ENOENT');
+          return reportText;
+        }
+        if (String(path).endsWith('/scripts/lib/x.mjs')) return '';
+        return actual.readFileSync(path, ...rest);
+      },
+      mkdirSync: () => {},
+      writeFileSync: (_path, text) => { recorded = JSON.parse(text).at(-1); },
+      renameSync: () => {},
+      };
+      return { ...actual, ...fixture, default: { ...actual.default, ...fixture } };
+    });
+    vi.doMock('../../readiness/heavy-admission.mjs', () => ({ admittedArgv: () => { throw new Error('unexpected related run'); } }));
+    vi.doMock('../write-all-sync.mjs', () => ({ writeAllSync: (_fd, text) => { output = JSON.parse(text); } }));
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {});
+    try {
+      let baseline;
+      const reports = [undefined, null, '{invalid', '{}', '[]', '"text"', '{"testResults":{}}', '{"testResults":[]}', '{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}'];
+      for (const report of reports) {
+        reportText = report ?? undefined;
+        vi.resetModules();
+        process.argv = [argv[0], cliPath, '--measure', '--no-related', ...(report === undefined ? [] : ['--vitest-json=audit-report.json'])];
+        await import('../../readiness/test-selection.mjs');
+        const valid = report?.startsWith('{"testResults":[') === true;
+        expect(output.recorded).toEqual(recorded);
+        expect(recorded.hadReport).toBe(valid);
+        expect(output.shadow.partial).toBe(!valid);
+        expect(output.decision.shadow).toEqual(output.shadow);
+        expect(output.shadowEscaped).toEqual(valid ? (report.includes('escaped.test.mjs') ? ['escaped.test.mjs'] : []) : null);
+        expect(recorded.shadowEscaped).toEqual(output.shadowEscaped);
+        const { shadow, ...decision } = output.decision;
+        baseline ??= decision;
+        expect(decision).toEqual(baseline);
+      }
+      expect(exit).toHaveBeenCalledTimes(reports.length);
+    } finally {
+      process.argv = argv;
+      exit.mockRestore();
+      vi.unstubAllEnvs();
+      for (const name of ['node:child_process', 'node:fs', '../../readiness/heavy-admission.mjs', '../write-all-sync.mjs']) vi.doUnmock(name);
+      vi.resetModules();
+    }
+  });
+});

@@ -600,6 +600,7 @@ function runCli(argv) {
   // A false-green = a full-suite FAILURE that falls OUTSIDE what `vitest related` on the diff would have run.
   if (flags.measure) {
     const report = typeof flags['vitest-json'] === 'string' ? readJsonFile(flags['vitest-json'], null) : null;
+    const hadReport = report !== null && typeof report === 'object' && !Array.isArray(report) && Array.isArray(report.testResults);
     const failedTestFiles = failedFilesFromVitestJson(report);
     // The TRUE selected set is the TEST files `vitest related <changedFiles>` resolves — not the changed source
     // files. Prefer a caller-supplied `--selected-json` (a vitest-related report), else compute it here, else
@@ -617,9 +618,10 @@ function runCli(argv) {
       }
     }
     const fg = assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode });
+    if (decision.shadow && !hadReport) decision.shadow.partial = true;
     const shadowFields = decision.shadow ? {
       shadow: decision.shadow,
-      shadowEscaped: [...new Set(failedTestFiles)].filter((file) => !decision.shadow.tests.includes(file)).sort(),
+      shadowEscaped: hadReport ? [...new Set(failedTestFiles)].filter((file) => !decision.shadow.tests.includes(file)).sort() : null,
     } : {};
     const sample = {
       at: new Date().toISOString(),
@@ -630,7 +632,7 @@ function runCli(argv) {
       failedCount: fg.failedCount,
       falseGreen: fg.falseGreen,
       escaped: fg.escaped,
-      hadReport: report != null,
+      hadReport,
       ...shadowFields,
       approx, // true ⇒ selectedTestFiles is the changed-file approximation, not the real `vitest related` set
     };
