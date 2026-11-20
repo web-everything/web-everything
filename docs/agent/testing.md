@@ -5589,11 +5589,16 @@ inventories retain the human escalation. Tombstone probes must include a dead-ow
 equal to the current record identity; unbound legacy sidecars cannot authorize recovery. Require a complete
 head read without `blocked`, and inspect current and saved verdicts/referrals. The record and sidecar stay bound, with
 abandonment rechecked after reading the record and immediately before dispatch. Confirmation waits, mandatory
-referrals/rulings and unresolved non-idempotent writes retain escalation. This planner fence preserves the CLI's
+referrals/rulings and unresolved non-idempotent writes retain escalation. This shared admission fence preserves the CLI's
 saved-run advisory-effect refusal when tombstone selection would otherwise bypass it. The soak exercises an
 unknown advisory outcome refusing dispatch, then an explicitly resolved outcome allowing a fresh review.
 
-Round 3 recovery shares the existing full-review guards and saved-run retry refusal helper. Keep custom-ID
-review records in both inventory discovery paths. Revalidate live PR evidence and the planned tombstone/record
-at dispatch, and pass `expectedHead` to the executor. The CLI must retain tombstoned resume candidates until
-advisory-effect, referral-ruling and retry-budget safeguards pass; only then can a tombstone select a fresh panel.
+Round 4 uses one exported `freshReviewAllowed(record, tombstone, ctx)` authority for planner and CLI.
+Each blocker and every other same-head run (including custom operation IDs) must pass its verdict,
+referral, confirmation and effect checks. The inventory is bounded at 400; incomplete, oversized or
+throwing reads retain escalation for operator inspection. The two-owner cap still counts legacy sidecars.
+The dispatcher carries `freshAfterDead` and `expectedHead` through review-job to
+`--fresh-after-dead=<runId> --expected-head=<sha>`. The CLI gathers live evidence and calls the same
+predicate before starting a panel; false or exceptions refuse. With no flag it resumes exactly as before,
+without reading abandonment as a reason to replace a resume. `fresh-review-allowed.test.mjs` table-tests
+the shared conditions; CLI tests pin explicit admission, refusal and unchanged unflagged resume.

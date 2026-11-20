@@ -422,6 +422,73 @@ function readFreshReviewInventory({ repo, pr, runsDir, blocking }) {
   }).filter(run => run.op === 'review-pr');
 }
 
+/** The sole authority for replacing a dead review with a fresh panel. Unknown evidence refuses. */
+export function freshReviewAllowed(record, tombstone, ctx) {
+  const refuse = reason => ({ ok: false, reason });
+  try {
+    const { repo, pr, head, now, bounds, rawPr, runsDir,
+      readHead = () => rawPr?.headRefOid,
+      isRunAbandoned = defaultIsRunAbandoned, readReviewInventory = readFreshReviewInventory,
+      readRecordVersion = (id, dir) => runRecordVersion(statSync(join(dir, `${id}.json`))),
+      readAbandonment = (id, dir) => JSON.parse(readFileSync(abandonedPath(id, dir), 'utf8')) } = ctx;
+    const id = record?.id;
+    assertReviewRunEvidence(record);
+    if (!id || record.op !== 'review-pr' || record.input.repo !== repo || Number(record.input.pr) !== Number(pr)
+      || !isRealHead(head) || rawPr?.headRefOid !== head || readHead() !== head) return refuse('review identity or head changed');
+    const version = readRecordVersion(id, runsDir), probes = tombstone?.probes;
+    if (typeof version !== 'string' || !version || probes?.recordVersion !== version
+      || (ctx.recordVersion !== undefined && ctx.recordVersion !== version)
+      || !(probes.owner === 'dead' || (probes.reviewJobs === 'dead' && probes.handles === 'dead'
+        && probes.writers === 'dead' && probes.leases === 'absent' && probes.sessions === 'absent'))
+      || isRunAbandoned(id, runsDir) !== true) return refuse('bound dead-owner proof required');
+    if (!bounds || Object.hasOwn(bounds, 'unreadBoundaryAt')) return refuse('review head scan incomplete; inspect stored evidence');
+    const scan = typeof bounds.completeHeadRead === 'function'
+      ? bounds.completeHeadRead({ pr, head, at: now }) : { complete: bounds.completeHeadRead, blocked: bounds.blocked };
+    if (scan?.complete !== true || scan.blocked) return refuse('review head scan incomplete or held; inspect stored evidence');
+    const inventory = readReviewInventory({ repo, pr, head, runsDir, blocking: record });
+    if (!Array.isArray(inventory) || inventory.length > 400 || !inventory.some(run => run?.id === id))
+      return refuse('review inventory incomplete or capped; inspect stored evidence');
+    const dead = new Set();
+    // Include the supplied blocker even when an injected inventory has an older copy.
+    for (const run of [record, ...inventory]) {
+      assertReviewRunEvidence(run);
+      if (typeof run.id !== 'string' || !run.id) return refuse('review identity unreadable');
+      if (run.op !== 'review-pr' || run.input.repo !== repo || Number(run.input.pr) !== Number(pr)) continue;
+      const rev = run.findings?.read?.netBasis?.rev;
+      if (isRealHead(rev) && rev !== head && run !== record) continue;
+      if (!isRealHead(rev) || (rev === head && isRunAbandoned(run.id, runsDir) === true)) dead.add(run.id);
+      for (const verdict of [run.verdict, run.resumeOf?.verdict, run.findings?.referralVerdict]) {
+        if (verdict == null) continue;
+        if (!Object.values(VERDICTS).includes(verdict.verdict)
+          || (verdict.pendingReferrals !== undefined && !Array.isArray(verdict.pendingReferrals))
+          || (verdict.verdict === 'needs-human' && !Array.isArray(verdict.pendingReferrals))
+          || verdict.pendingReferrals?.some(item => typeof item !== 'string' || !item.trim())
+          || verdict.pendingReferrals?.length > 0 || verdict.verdict === 'changes') return refuse('review verdict or referrals held');
+      }
+      if (savedReviewRetryRefusal(run)) return refuse('saved review retry held');
+      const pending = run.pending;
+      if (pending?.kind === 'confirm'
+        || (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of')))
+        || pending?.step === 'mandatoryReferrals'
+        || run.effects.some(e => ['pending', 'in-flight'].includes(e?.status) && e.step === 'mandatoryReferrals'))
+        return refuse('review awaits confirmation or mandatory referral ruling');
+      if (run.effects.some(e => !e || (e.idempotent !== true
+        && (!['applied', 'declared', 'failed'].includes(e.status)
+          || !Number.isSafeInteger(e.unknownAttempts) || e.unknownAttempts !== 0))))
+        return refuse('non-idempotent write outcome unknown');
+    }
+    if (dead.size >= 2) return refuse('re-review owners keep dying; inspect the two tombstoned runs on the live head');
+    const reviews = Array.isArray(rawPr.reviews) ? rawPr.reviews : null;
+    const guard = publishableClearGuard({ labels: rawPr.labels, acceptance: latestAcceptRecord(rawPr.comments, reviews),
+      comments: rawPr.comments, reviews, settlesPending: true });
+    if (guard || reviews === null || laterReviewHold(reviews)) return refuse(guard ?? 'formal review evidence unreadable or held');
+    if (readRecordVersion(id, runsDir) !== version || isRunAbandoned(id, runsDir) !== true
+      || JSON.stringify(readAbandonment(id, runsDir)) !== JSON.stringify(tombstone) || readHead() !== head)
+      return refuse('dead review evidence or head changed');
+    return { ok: true };
+  } catch { return refuse('fresh review evidence unreadable; inspect the run and head before retrying'); }
+}
+
 /** Complete bounded proof; unknown state never establishes a never-reviewed head. */
 export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
@@ -567,15 +634,6 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       if (laterReviewHold(guard.reviews)) return skip('formal review hold prevents full review; inspect formal reviews');
       return dispatchDecision({ action: 'review', why, ...extra });
     };
-    const boundDeadRun = (id, version = readRecordVersion(id, runsDir)) => {
-      if (isRunAbandoned(id, runsDir) !== true) return null;
-      const tombstone = readAbandonment(id, runsDir);
-      const probes = tombstone?.probes;
-      return typeof version === 'string' && version.length > 0 && probes?.recordVersion === version
-        && (probes.owner === 'dead' || (probes.reviewJobs === 'dead' && probes.handles === 'dead'
-          && probes.writers === 'dead' && probes.leases === 'absent' && probes.sessions === 'absent'))
-        && isRunAbandoned(id, runsDir) === true ? tombstone : null;
-    };
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
         try {
@@ -603,63 +661,18 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           // R755 is dispatch authority only. The reader still holds until a newer panel finishes.
           if (typeof result.unfinishedId !== 'string' || !result.unfinishedId) throw Error('blocking review id missing');
           if (abandoned === true) {
-            const bounds = result.settleBounds ?? result;
-            if (Object.hasOwn(bounds, 'unreadBoundaryAt')) return refused();
-            const scan = typeof bounds.completeHeadRead === 'function'
-              ? bounds.completeHeadRead({ pr, head, at: now }) : { complete: bounds.completeHeadRead, blocked: bounds.blocked };
-            if (scan?.complete !== true || scan.blocked) return refused();
             const version = readRecordVersion(blockingId, runsDir);
-            if (typeof version !== 'string' || !version) return refused();
             const blocking = readReviewRun(blockingId, runsDir);
-            // Validate abandonment AFTER the single record read; a concurrent writer invalidates the proof.
-            if (isRunAbandoned(blockingId, runsDir) !== true) return refused();
-            assertReviewRunEvidence(blocking);
-            if (blocking.id !== blockingId || blocking.op !== 'review-pr'
-              || blocking.input?.repo !== repo || Number(blocking.input?.pr) !== pr
-              || (blocking.verdict != null && !Object.values(VERDICTS).includes(blocking.verdict?.verdict))) return refused();
-            const tombstone = boundDeadRun(blockingId, version);
-            if (!tombstone) return refused();
-            // A rewind may have saved an earlier verdict; no payload can mask another's hold.
-            for (const verdict of [blocking.verdict, blocking.resumeOf?.verdict, blocking.findings?.referralVerdict]) {
-              if (verdict == null) continue;
-              if (!Object.values(VERDICTS).includes(verdict.verdict)
-                || (verdict.pendingReferrals !== undefined && !Array.isArray(verdict.pendingReferrals))
-                || (verdict.verdict === 'needs-human' && !Array.isArray(verdict.pendingReferrals))
-                || verdict.pendingReferrals?.some(item => typeof item !== 'string' || !item.trim())
-                || verdict.pendingReferrals?.length > 0 || verdict.verdict === 'changes') return refused();
-            }
-            if (savedReviewRetryRefusal(blocking)) return refused();
-            const pending = blocking.pending;
-            if (pending?.kind === 'confirm'
-              || (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of')))
-              || pending?.step === 'mandatoryReferrals'
-              || blocking.effects.some(e => ['pending', 'in-flight'].includes(e?.status) && e.step === 'mandatoryReferrals')) return refused();
-            // A fresh panel cannot resolve an unknown external write. Preserve the CLI's advisory fence,
-            // including failed writes with unknown outcomes and malformed effect evidence.
-            if (blocking.effects.some(e => !e || (e.idempotent !== true
-              && (!['applied', 'declared', 'failed'].includes(e.status)
-                || !Number.isSafeInteger(e.unknownAttempts) || e.unknownAttempts !== 0)))) return refused();
-            const inventory = readReviewInventory({ repo, pr, head, runsDir, blocking });
-            if (!Array.isArray(inventory) || inventory.length > 400 || !inventory.some(run => run?.id === blockingId)) return refused();
-            const dead = new Set();
-            for (const run of inventory) {
-              assertReviewRunEvidence(run);
-              if (typeof run.id !== 'string' || !run.id) return refused();
-              if (run.input.repo === repo && Number(run.input.pr) === pr) {
-                const rev = run.findings?.read?.netBasis?.rev;
-                // Unknown heads count conservatively; missing start times never omit a run.
-                // Attempt accounting is conservative: a legacy tombstone still spends capacity,
-                // even though only a bound dead-owner proof can authorize the current recovery.
-                if (!isRealHead(rev) || (rev === head && isRunAbandoned(run.id, runsDir) === true)) dead.add(run.id);
-              }
-            }
-            if (dead.size >= 2) return { ...skip(result.reason), escalate: true,
-              escalationContext: 're-review owners keep dying; inspect the two tombstoned runs on the live head' };
-            if (readRecordVersion(blockingId, runsDir) !== version
-              || JSON.stringify(readAbandonment(blockingId, runsDir)) !== JSON.stringify(tombstone)
-              || isRunAbandoned(blockingId, runsDir) !== true) return refused();
-            return guardedFullReview('unfinished review owner proven dead (R755); fresh review on live head', null,
-              { abandonedReview: { id: blockingId, recordVersion: version, tombstone } });
+            const tombstone = readAbandonment(blockingId, runsDir);
+            const allowed = freshReviewAllowed(blocking, tombstone, {
+              repo, pr, head, now, rawPr, runsDir, recordVersion: version,
+              bounds: result.settleBounds ?? result, isRunAbandoned, readReviewInventory,
+              readRecordVersion, readAbandonment,
+            });
+            if (!allowed.ok) return { ...refused(), escalationContext: allowed.reason };
+            return dispatchDecision({ action: 'review',
+              why: 'unfinished review owner proven dead (R755); fresh review on live head',
+              abandonedReview: { id: blockingId, recordVersion: version, tombstone } });
           }
         } catch {
           return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
@@ -1089,7 +1102,8 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
         holdUnfinishedReview(row);
         return null;
       }
-      if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head) {
+      if (fresh?.action !== row.action || fresh.settle !== row.settle || fresh.head !== row.head
+        || JSON.stringify(fresh.abandonedReview) !== JSON.stringify(row.abandonedReview)) {
         throw Error('evidence changed before settlement');
       }
       return rawPr;
@@ -1241,18 +1255,14 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           try {
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             if (row.abandonedReview) {
-              // Re-run the same planner guards against live PR evidence, then bind to the exact planned record.
+              // Re-plan through freshReviewAllowed against live PR evidence and the planned binding.
               try {
                 if (!freshSettlement(row)) throw new PreStartDispatchRefusalError('dead review evidence changed');
-                const proof = row.abandonedReview, dir = runsDirectory(env);
-                if (runRecordVersion(statSync(join(dir, `${proof.id}.json`))) !== proof.recordVersion
-                  || !defaultIsRunAbandoned(proof.id, dir)
-                  || JSON.stringify(JSON.parse(readFileSync(abandonedPath(proof.id, dir), 'utf8'))) !== JSON.stringify(proof.tombstone)) {
-                  throw new PreStartDispatchRefusalError('dead review binding changed before dispatch');
-                }
+
               } catch (error) { throw new PreStartDispatchRefusalError(safeErrorText(error)); }
             }
             const result = dispatch({ pr: row.prNumber, repo, expectedHead: row.head,
+              ...(row.abandonedReview ? { freshAfterDead: row.abandonedReview.id } : {}),
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {

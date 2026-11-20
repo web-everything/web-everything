@@ -3232,7 +3232,7 @@ describe('D: dead unfinished review starts a fresh panel', () => {
           if (change === 'tombstone') rmSync(join(dir, `${id}.abandoned.json`));
           return { ...live, headRefOid: change === 'head' ? 'b'.repeat(40) : head };
         } } });
-      if (change === 'unchanged') expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ expectedHead: head }));
+      if (change === 'unchanged') expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ expectedHead: head, freshAfterDead: id }));
       else { expect(dispatch).not.toHaveBeenCalled(); expect(result.dispatched).toHaveLength(0); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

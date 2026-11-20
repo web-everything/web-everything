@@ -410,7 +410,7 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
 }
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, spawnNode = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
@@ -425,7 +425,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
+  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnNode(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -629,10 +629,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
-    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
+    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, freshAfterDead, expectedHead }) => {
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
+        ...(freshAfterDead === undefined ? [] : [`--fresh-after-dead=${freshAfterDead}`]),
+        ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
       ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       return {
         status: r.status, signal: r.signal ?? null, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
@@ -1306,7 +1308,7 @@ function expectedHeadRefusal(expectedHead, input, io) {
 }
 
 function runReviewArc({
-  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
+  pr, repo, expectedHead, freshAfterDead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1566,7 +1568,7 @@ function runReviewArc({
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
+    const loop = io.runLoop({ ...(freshAfterDead === undefined ? {} : { freshAfterDead, expectedHead }), pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
@@ -1633,7 +1635,7 @@ export function dispatchReviewJob({
   readCompletion = (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
-  checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
+  checkoutExists = existsSync, home = homedir(), expectedHead, freshAfterDead, io = createReviewJobIo({ root, env }),
 } = {}) {
   const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io);
   if (refusal) return { pr, repo, ...refusal };
@@ -1673,6 +1675,7 @@ export function dispatchReviewJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
+      ...(freshAfterDead === undefined ? [] : [`--fresh-after-dead=${freshAfterDead}`]),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1840,6 +1843,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
+        ...(flag('fresh-after-dead') === undefined ? {} : { freshAfterDead: flag('fresh-after-dead') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       onSessionSlug?.(out.sessionSlug);
       writeAllSync(1, `${JSON.stringify(out)}\n`);

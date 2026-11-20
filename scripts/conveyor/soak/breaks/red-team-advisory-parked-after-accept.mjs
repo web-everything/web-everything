@@ -44,10 +44,15 @@ export default {
       rmSync(join(runsDir, `${id}.abandoned.json`));
       markRunAbandoned({ id, dir: runsDir, reason: 'owner dead', by: 'soak',
         probes: { owner: 'dead', recordVersion: runRecordVersion(statSync(join(runsDir, `${id}.json`))) } });
+      const customId = 'operator-selected-review';
+      writeRun({ ...make(customId, 1500), verdict: { verdict: 'changes' } }, runsDir);
+      const customHold = plan();
+      rmSync(join(runsDir, `${customId}.json`));
       const decision = plan();
       writeRun(make('review-pr-fresh-accept', 3000), runsDir);
       const released = readDrainRedTeamEvidence(key);
       const checks = {
+        customRunHoldEscalates: customHold.action === 'skip' && customHold.escalate === true,
         unboundTombstoneEscalates: legacy.action === 'skip' && legacy.escalate === true,
         unknownWriteEscalates: refused.action === 'skip' && refused.escalate === true,
         tombstoneAloneHolds: held.ok === false && held.reason === 'review-unfinished',

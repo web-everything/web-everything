@@ -71,3 +71,15 @@ describe('expected review head admission', () => {
     } finally { process.exitCode = prior; }
   });
 });
+
+
+it('forwards explicit fresh-after-dead authority through dispatch and job CLI', () => {
+  const { options } = fixture();
+  dispatchReviewJob({ ...options, freshAfterDead: 'custom-dead' });
+  expect(options.spawnJob.mock.calls[0][0].argv).toContain('--fresh-after-dead=custom-dead');
+  const runJob = vi.fn(() => ({ refused: true })), prior = process.exitCode;
+  try {
+    runReviewJobCli(['run', `--pr=${pr}`, `--repo=${repo}`, '--fresh-after-dead=custom-dead', `--expected-head=${head}`], { runJob });
+    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ freshAfterDead: 'custom-dead', expectedHead: head }));
+  } finally { process.exitCode = prior; }
+});

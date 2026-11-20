@@ -56,9 +56,11 @@
  * nothing here decides, it only wires and reports.
  */
 
-import { isRunAbandoned } from '../lib/run-abandoned.mjs';
+import { abandonedPath, runRecordVersion } from '../lib/run-abandoned.mjs';
+import { readDrainRedTeamEvidence } from '../lib/drain-red-team-evidence.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -76,7 +78,7 @@ import {
   buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
   roundCardsFindingsMarker, roundCardsHeadMarker, postAcceptAdvisoryDecision,
 } from '../lib/review-loop-policy.mjs';
-import { resolveReviewRedTeamOnSkip } from '../lib/review-red-team-on-skip.mjs';
+import { freshReviewAllowed, resolveReviewRedTeamOnSkip } from '../lib/review-red-team-on-skip.mjs';
 import { resolvePostAcceptAdvisorySettings } from '../lib/post-accept-advisory-settings.mjs';
 import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating } from './review-pr-io.mjs';
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
@@ -414,6 +416,20 @@ export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { re
   } catch { return null; }
 }
 
+/** Gather evidence only; freshReviewAllowed owns every admission decision. */
+function defaultFreshReviewContext({ repo, pr, expectedHead }) {
+  const env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env);
+  const provider = createGhProvider();
+  const rawPr = { ...provider.readPrState(repo, pr), comments: provider.readComments(repo, pr),
+    reviews: provider.readPrReviews(repo, pr) };
+  const now = Date.now();
+  const evidence = readDrainRedTeamEvidence({ repo, pr, head: expectedHead, runsDir, env, now });
+  return { repo, pr, head: expectedHead, now, runsDir, rawPr, bounds: evidence.settleBounds ?? evidence,
+    readHead: () => provider.readPrState(repo, pr).headRefOid,
+    readRecordVersion: (id, dir) => runRecordVersion(statSync(join(dir, `${id}.json`))),
+    readAbandonment: (id, dir) => JSON.parse(readFileSync(abandonedPath(id, dir), 'utf8')) };
+}
+
 /** Does this `review-pr` declaration seat the security juror? PURE. */
 export function declaresSecuritySeat(declaration) {
   return Array.isArray(declaration?.steps) && declaration.steps.some((s) => s.name === SECURITY_SEAT_STEP);
@@ -586,7 +602,7 @@ export async function runReviewLoopOnce({
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
   findFiledRoundCards = findFiledRoundCardsCard,
-  isAbandoned = id => isRunAbandoned(id, process.env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(process.env)),
+  freshReviewContext = defaultFreshReviewContext,
   redTeamOnSkipSettings = resolveReviewRedTeamOnSkip,
   // `review.parallelSeats` — start every independent juror seat at once (`./parallel-judges.mjs`); `seatLanes` gives a
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
@@ -599,7 +615,10 @@ export async function runReviewLoopOnce({
   recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
   advisoryLog = line => console.error(line),
 } = {}) {
-  const parsed = parseOperationArgv(declaration, argv);
+  const freshAfterDead = argvFlag(argv, 'fresh-after-dead');
+  const expectedHead = argvFlag(argv, 'expected-head');
+  const parsed = parseOperationArgv(declaration, argv.filter(arg =>
+    !arg.startsWith('--fresh-after-dead=') && !arg.startsWith('--expected-head=')));
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
   // `filed: true` (an accept about to be recorded) admits a round-cards `changes` round only once its card is filed:
   // the run's own filing receipt names this reviewed head and this finding set. A bare `--answer=accept` has none.
@@ -670,6 +689,20 @@ export async function runReviewLoopOnce({
     };
   }
 
+  let freshAllowed = false;
+  if (freshAfterDead !== undefined) {
+    let reason = 'fresh review evidence unreadable; resume or inspect the saved run';
+    try {
+      const ctx = freshReviewContext({ repo: parsed.input.repo, pr: parsed.input.pr, expectedHead });
+      const recordVersion = ctx.readRecordVersion(freshAfterDead, ctx.runsDir);
+      const record = store.read(freshAfterDead);
+      const result = freshReviewAllowed(record, ctx.readAbandonment(freshAfterDead, ctx.runsDir), { ...ctx, recordVersion });
+      freshAllowed = result.ok === true;
+      reason = result.reason ?? reason;
+    } catch { /* An explicit replacement request never falls through to a fresh run on error. */ }
+    if (!freshAllowed) return { code: 2, run: null, stopped: 'refused', lines: [`error: fresh review refused: ${reason}`] };
+  }
+
   const activeJudge = makeJudge({
     cwd: parsed.control.cwd || null, model: parsed.control.model || null, provider: parsed.control.provider || null,
   });
@@ -701,28 +734,28 @@ export async function runReviewLoopOnce({
   };
 
   let run;
-  if (parsed.control.resume) {
+  if (!freshAllowed && parsed.control.resume) {
     run = store.read(parsed.control.resume);
     if (!run) return { code: 2, lines: [`error: no run record for ${JSON.stringify(parsed.control.resume)}`], run: null, stopped: 'refused' };
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
   }
-  if (parsed.control.resume && reviewRunEvidence(run)?.ciHeldRecordRetry) {
+  if (!freshAllowed && parsed.control.resume && reviewRunEvidence(run)?.ciHeldRecordRetry) {
     const { ciHeldRecordRetryMax } = redTeamOnSkipSettings({ log: advisoryLog }).value;
     const prepared = resumeCiHeldRecord(run, ciHeldRecordRetryMax);
     if (prepared.refusal) return prepared.refusal;
     run = prepared.run;
     store.write(run);
   }
-  if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
+  if (freshAllowed || !parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
     // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
     // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
     // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
     // goes back to the step that reads the rulings and carries on from there. New referrals come only from a new push.
     const { ciHeldRecordRetryMax } = redTeamOnSkipSettings({ log: advisoryLog }).value;
-    let resumedId = parsed.control.resume ?? null;
-    if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
+    let resumedId = freshAllowed ? null : parsed.control.resume ?? null;
+    if (!freshAllowed && !resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
       try { resumedId = findResumableRun === defaultFindResumableRun
         ? defaultFindResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }, { readPr: readResumePr })
         : findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }); } catch { resumedId = null; }
@@ -776,7 +809,7 @@ export async function runReviewLoopOnce({
         // Continue an interrupted advisory step in place: its effect history skips applied writes and refuses
         // unknown non-idempotent outcomes. Rewinding it would discard both protections. Persistence attempts do
         // not consume this later step's retry budget.
-        rewound = isAbandoned(parked.id) ? null : prepared ? prepared.run : retryableRecordEffect ? { ...parked, resumedAt: now(), recordEffectResumeAttempts: recordAttempts + 1 }
+        rewound = prepared ? prepared.run : retryableRecordEffect ? { ...parked, resumedAt: now(), recordEffectResumeAttempts: recordAttempts + 1 }
           : suspendedEffect ? { ...parked, resumedAt: now(), referralEffectResumeAttempts: effectAttempts + 1 } : resumeAdvise ? { ...parked, resumedAt: now() }
           : rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass

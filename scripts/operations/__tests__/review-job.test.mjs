@@ -719,3 +719,11 @@ describe('CLI exit evidence', () => {
     expect(() => proc.emit('exit', 1)).not.toThrow();
   });
 });
+
+
+it('carries fresh-after-dead and the pinned head into the queued loop invocation', () => {
+  const head = 'a'.repeat(40);
+  const { io, calls } = fakeIo({ liveHead: () => head });
+  runReviewJob({ pr: 10, repo: REPO, pid: 99, expectedHead: head, freshAfterDead: 'custom-dead' }, io);
+  expect(calls.find(c => c[0] === 'loop')?.[1]).toMatchObject({ expectedHead: head, freshAfterDead: 'custom-dead' });
+});

@@ -30,7 +30,7 @@ import { join } from 'node:path';
 import { describe, it, expect, vi, onTestFinished } from 'vitest';
 
 import { createRegistry } from '../registry.mjs';
-import { NAME_RE, createMemoryRunStore } from '../run-store.mjs';
+import { NAME_RE, newRunRecord, createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
@@ -2366,8 +2366,8 @@ describe('D: tombstoned advisory resume selection', () => {
       const fresh = vi.fn(() => 'fresh-D');
       const result = await runReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
         sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: fresh,
-        findResumableRun: () => record.id, isAbandoned: () => true });
-      if (scenario === 'safe') { expect(result.run.id).toBe('fresh-D'); expect(fresh).toHaveBeenCalledOnce(); }
+        findResumableRun: () => record.id });
+      if (scenario === 'safe') { expect(result.run.id).toBe(record.id); expect(fresh).not.toHaveBeenCalled(); }
       else { expect(result.stopped).toBe('refused'); expect(fresh).not.toHaveBeenCalled(); }
     });
 
@@ -2385,4 +2385,64 @@ describe('D: tombstoned advisory resume selection', () => {
         .toBe(id);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+
+describe('explicit fresh-after-dead authority', () => {
+  it.each(['false', 'exception'])('a %s shared predicate never starts a fresh panel', async mode => {
+    const { declaration, registry } = registryFor({});
+    const mint = vi.fn(() => 'forbidden-panel');
+    const out = await runReviewLoopOnce({ declaration, registry,
+      argv: [...BASE_ARGV, '--fresh-after-dead=custom-dead', `--expected-head=${HEAD_A}`],
+      store: createMemoryRunStore(), sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: mint,
+      freshReviewContext: () => { if (mode === 'exception') throw Error('IO'); return {}; },
+    });
+    expect(out.stopped).toBe('refused');
+    expect(mint).not.toHaveBeenCalled();
+    expect(out.lines.join(' ')).toContain('fresh review refused');
+  });
+});
+
+
+it.each([false, true])('fresh-after-dead=%s alone controls replacing a safe resumable run', async flagged => {
+  const { declaration, registry } = registryFor({ rev: HEAD_A });
+  const store = createMemoryRunStore(), repo = BASE_ARGV[1].slice(7);
+  const args = { declaration, registry, store, argv: BASE_ARGV, sinks: recordingSinks([]),
+    makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'custom-saved' };
+  const first = await runReviewLoopOnce(args);
+  const parked = { ...first.run, cursor: declaration.steps.findIndex(step => step.name === 'confirm'),
+    pending: { kind: 'confirm', step: 'confirm', stepIndex: declaration.steps.findIndex(step => step.name === 'confirm'), options: [] }, effects: [] };
+  // Main resumes this parked confirm; admission must refuse replacing it, even with a tombstone.
+  store.write(parked);
+  const sidecar = { probes: { owner: 'dead', recordVersion: 'v1' } };
+  const ctx = { repo, pr: 1234, head: HEAD_A, now: 1000, rawPr: { headRefOid: HEAD_A, comments: [], labels: [], reviews: [] },
+    bounds: { completeHeadRead: true }, isRunAbandoned: () => true, readRecordVersion: () => 'v1',
+    readAbandonment: () => sidecar, readReviewInventory: () => [parked] };
+  const freshReviewContext = vi.fn(() => ctx), mint = vi.fn(() => 'new-panel');
+  const out = await runReviewLoopOnce({ ...args, mintRunId: mint, findResumableRun: () => parked.id, freshReviewContext,
+    argv: [...BASE_ARGV, ...(flagged ? ['--fresh-after-dead=custom-saved', `--expected-head=${HEAD_A}`] : [])] });
+  expect(mint).not.toHaveBeenCalled();
+  if (flagged) {
+    expect(out.stopped).toBe('refused'); expect(freshReviewContext).toHaveBeenCalledTimes(1);
+  } else {
+    expect(out.run.id).toBe(parked.id); expect(freshReviewContext).not.toHaveBeenCalled();
+  }
+});
+
+it('an explicit flag revalidates safe dead evidence before minting a fresh panel', async () => {
+  const { declaration, registry } = registryFor({ rev: HEAD_A });
+  const store = createMemoryRunStore(), repo = BASE_ARGV[1].slice(7);
+  const saved = { ...newRunRecord({ id: 'custom-dead', op: 'review-pr', input: { repo, pr: 1234 } }), effects: [], pending: null,
+    verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: HEAD_A } } } };
+  store.write(saved);
+  const sidecar = { probes: { owner: 'dead', recordVersion: 'v1' } };
+  const ctx = { repo, pr: 1234, head: HEAD_A, now: 1000, rawPr: { headRefOid: HEAD_A, comments: [], labels: [], reviews: [] },
+    bounds: { completeHeadRead: true }, isRunAbandoned: () => true, readRecordVersion: () => 'v1',
+    readAbandonment: () => sidecar, readReviewInventory: () => [saved] };
+  const mint = vi.fn(() => 'new-panel'), find = vi.fn(() => saved.id);
+  const out = await runReviewLoopOnce({ declaration, registry, store, sinks: recordingSinks([]),
+    argv: [...BASE_ARGV, '--fresh-after-dead=custom-dead', `--expected-head=${HEAD_A}`],
+    makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: mint, findResumableRun: find, freshReviewContext: () => ctx });
+  expect(out.run.id).toBe('new-panel'); expect(mint).toHaveBeenCalledTimes(1); expect(find).not.toHaveBeenCalled();
+  expect(store.read(saved.id)).toEqual(saved);
 });
