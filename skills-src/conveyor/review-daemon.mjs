@@ -72,6 +72,7 @@
  * pass in this repo (`runner.mjs`'s `makeCliMechanicalPasses`) — it never fails the review tick itself.
  */
 
+import { reapDeadReviewRuns } from '../../scripts/lib/reap-dead-review-runs.mjs';
 import { readFileSync, statSync } from 'node:fs';
 import { cascadePolicy } from '../../scripts/lib/policy-cascade.mjs';
 import { executeOwedCiReruns } from '../../scripts/conveyor/owed-ci-rerun-executor.mjs';
@@ -1928,6 +1929,7 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
   reapSessions = defaultReapSessions,
+  reapDeadRuns = reapDeadReviewRuns, now = Date.now,
   // Keep the production runReview closure testable without replacing its executor bindings.
   tick = runReviewTick,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
@@ -1962,6 +1964,7 @@ export function buildCliDaemonEffects({
   // correct here (never a race): `runDaemonLoop` awaits ONE `tickOnce()` to completion before ever calling it
   // again — see that function's own `for (;;) { await tickOnce(); ... }` shape — so there is never a second,
   // concurrent tick reading or writing this while one is in flight.
+  let lastDeadRunReap = null;
   let priorityNames = new Set();
   let passCount = 0;
   return {
@@ -1996,6 +1999,18 @@ export function buildCliDaemonEffects({
         sessionReap = reapSessions({ priorityNames });
       } catch (e) {
         log.error(`review-daemon: session-reap failed (non-fatal): ${String((e && e.message) || e).split('\n')[0]}`);
+      }
+      const reapAt = now();
+      if (lastDeadRunReap === null || reapAt - lastDeadRunReap >= 30 * 60_000) {
+        // Stamp attempts too: a failed lane-pool probe must not repeat every 120s tick.
+        lastDeadRunReap = reapAt;
+        try {
+          const swept = await reapDeadRuns({ apply: true, log: line => log.error(line) });
+          const kept = Object.entries(swept.kept).map(([reason, ids]) => `${reason}=${ids.length}`).join(',') || 'none';
+          log.error(`review-daemon: dead-review-runs: ${swept.scanned} scanned · ${swept.reaped.length} reaped · kept=${kept}`);
+        } catch (e) {
+          log.error(`review-daemon: dead-review-runs failed (non-fatal): ${String(e?.message ?? e).split('\n')[0]}`);
+        }
       }
       phaseMs.reap = Date.now() - phaseStarted;
       phaseStarted = Date.now();

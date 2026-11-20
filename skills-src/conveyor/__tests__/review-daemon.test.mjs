@@ -1,3 +1,4 @@
+vi.mock('../../../scripts/lib/reap-dead-review-runs.mjs', () => ({ reapDeadReviewRuns: vi.fn(() => ({ scanned: 0, reaped: [], kept: {} })) }));
 import { dispatchReview } from '../../../scripts/operations/review-dispatch.mjs';
 import { readReviewCiGate } from '../../../scripts/lib/review-ci-gate-io.mjs';
 import { sweepAuthorStamps } from '../../../scripts/lib/author-stamp-restore.mjs';
@@ -3300,4 +3301,33 @@ it('capability-off blocks same-tick draft promotion before ready or replanning',
   expect(notePromotions).toHaveBeenCalledWith(expect.objectContaining({
     promotions: [expect.objectContaining({ pr: 91, action: 'skip', why: expect.stringContaining('capability unavailable') })],
   }));
+});
+
+
+describe('D: dead review sweep scheduling', () => {
+  const setup = over => buildCliDaemonEffects({ owner: 'D', reapSessions: () => null,
+    runReview: () => ({ repos: [], dispatched: [], failed: [] }), runConvertAdvisories: () => null,
+    runPrepReview: noPrepReview, log: { error: vi.fn() }, ...over });
+  it('applies the sweep once per 30 minutes, including the boundary', async () => {
+    let time = 0;
+    const reapDeadRuns = vi.fn(() => ({ scanned: 3, reaped: ['dead'], kept: { live: ['alive'] } }));
+    const log = { error: vi.fn() };
+    const effects = setup({ reapDeadRuns, now: () => time, log });
+    await effects.tickOnce();
+    expect(reapDeadRuns).toHaveBeenCalledWith({ apply: true, log: expect.any(Function) });
+    expect(log.error).toHaveBeenCalledWith('review-daemon: dead-review-runs: 3 scanned · 1 reaped · kept=live=1');
+    time = 120000; await effects.tickOnce();
+    time = 1799999; await effects.tickOnce();
+    expect(reapDeadRuns).toHaveBeenCalledTimes(1);
+    time = 1800000; await effects.tickOnce();
+    expect(reapDeadRuns).toHaveBeenCalledTimes(2);
+  });
+  it('logs sweep failures, continues the tick, and throttles failed attempts too', async () => {
+    const reapDeadRuns = vi.fn(() => { throw Error('probe unreadable'); }), log = { error: vi.fn() };
+    const effects = setup({ reapDeadRuns, now: () => 0, log });
+    expect(await effects.tickOnce()).toHaveProperty('repos');
+    await effects.tickOnce();
+    expect(reapDeadRuns).toHaveBeenCalledTimes(1);
+    expect(log.error).toHaveBeenCalledWith('review-daemon: dead-review-runs failed (non-fatal): probe unreadable');
+  });
 });

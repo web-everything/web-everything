@@ -1491,7 +1491,7 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
   it.each(both)('%s holds a newer verdict-less run while it may still be live, then ignores it once abandoned', (_name, reader) => {
     const f = fixture();
     const { accepted, args } = setup(f, a => ({ ...a, verdict: null, ...started(15_000) }), 20_000);
-    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
     const result = reader({ ...args, now: 20_000 + HOUR });
     expect(result.ok).not.toBe(false);
     expect(result.newest ?? result.loopPayload).toEqual(accepted);
@@ -1504,8 +1504,8 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     '%s holds a verdict-bearing newer run with %s as review-unfinished', (_name, _what, reader, work) => {
       const f = fixture();
       const { args } = setup(f, a => ({ ...a, verdict: { verdict: 'accept' }, ...work, ...started(15_000) }), 20_000);
-      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
-      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
     });
   // PR #6584: a refused clearance ends the run (`pending: null`, `outcome: 'refused'`) without applying the label, so it must
   // never read as a finished accept or rejection.
@@ -1515,8 +1515,8 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     '%s holds a refused %s run as review-unfinished (never completed evidence)', (_name, _what, reader, verdict) => {
       const f = fixture();
       const { args } = setup(f, a => ({ ...a, ...verdict, pending: null, outcome: 'refused', effects: [refusedEffect], ...started(15_000) }), 20_000);
-      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished' });
-      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 60_000 })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
     });
   it.each(both)('%s selects the same verdict-bearing newer run once nothing is pending (control)', (_name, reader) => {
     const f = fixture();
@@ -1529,14 +1529,14 @@ describe('abandoned and start-less review runs have a defined outcome', () => {
     const f = fixture();
     for (const waiting of [{ pending: { kind: 'judge' } }, { effects: [{ status: 'pending' }] }, { effects: [{ status: 'in-flight' }] }]) {
       const { args } = setup(f, a => ({ ...a, verdict: null, ...waiting, ...started(15_000) }), 20_000);
-      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+      expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
     }
   });
   it.each(both)('%s never treats a rewound resume the review loop may still finish as abandoned', (_name, reader) => {
     const f = fixture();
     // rewindRunToStep clears verdict and pending but keeps the read start; the loop marks it resumeOf.
     const { args } = setup(f, a => ({ ...a, verdict: null, resumeOf: { attempts: 1 }, ...started(15_000) }), 20_000);
-    expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(reader({ ...args, now: 20_000 + 30 * 24 * HOUR })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other' });
   });
   it.each(both)('%s keeps an older stale verdict-less run from blocking a newer finished accept', (_name, reader) => {
     const f = fixture();
@@ -1735,7 +1735,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(p.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' });
     expect(p.decide().escalate).toBeUndefined();
     expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
-    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(readDrainRedTeamEvidence({ ...p.f, now })).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: p.run.id });
   });
 
   it('keeps a live owner held even when the pending review is quiet', () => {
@@ -1782,14 +1782,14 @@ describe('recovery while a quiet review awaits human confirm', () => {
     ['other head', { change: r => { r.findings.read.netBasis.rev = 'c'.repeat(40); } }],
   ])('holds review-unfinished for %s', (_name, options) => {
     const p = parked(options);
-    expect(p.witness()).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(p.witness()).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: p.run.id });
     expect(p.decide()).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
     expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
   });
 
   it('carries the unfinished hit only in non-enumerable settle bounds', () => {
     const p = parked({ status: 'finished' }), failure = p.witness();
-    expect(Object.keys(failure)).toEqual(['ok', 'reason']);
+    expect(Object.keys(failure)).toEqual(['ok', 'reason', 'unfinishedId']);
     expect(failure.settleBounds.unfinishedHit).toMatchObject({ id: p.run.id, run: p.run, at: now - ABANDONED_REVIEW_AFTER_MS });
   });
 
@@ -1819,7 +1819,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
     write({ ...p.run, id: 'review-pr-other-head', findings: { read: { netBasis: { rev: 'c'.repeat(40) } } } },
       2 * ABANDONED_REVIEW_AFTER_MS, ABANDONED_REVIEW_AFTER_MS);
     const witness = p.witness();
-    expect(witness).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(witness).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: 'review-pr-other-head' });
     expect(witness.settleBounds.unfinishedHit).toBeUndefined();
     expect(p.decide()).toMatchObject({ action: 'skip', why: 'review-unfinished' });
     expect(readFileSync(p.runPath, 'utf8')).toBe(p.before);
@@ -1832,8 +1832,27 @@ describe('recovery while a quiet review awaits human confirm', () => {
       scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, env: {} }, warn: () => {},
       list: () => [p.run.id, 'review-pr-unread'], read: () => p.run,
       stat: () => ({ mtimeMs: now - ABANDONED_REVIEW_AFTER_MS }) });
-    expect(result).toEqual({ ok: false, reason: 'review-unfinished' });
+    expect(result).toEqual({ ok: false, reason: 'review-unfinished', unfinishedId: p.run.id });
     expect(result.settleBounds.unreadBoundaryAt).toBeDefined();
     expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
+  });
+});
+
+
+describe('D: a tombstone never releases an unfinished advisory', () => {
+  it.each([false, true])('newer finished accept=%s is the only supersession', async fresh => {
+    const { markRunAbandoned } = await import('../run-abandoned.mjs');
+    const f = fixture(), id = 'review-pr-parked';
+    const parked = { ...newRunRecord({ id, op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...payload(f.head), pending: { kind: 'effect', step: 'advise', stepIndex: 1 },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(2000).toISOString() }] };
+    writeRun(parked, f.runsDir);
+    markRunAbandoned({ id, dir: f.runsDir, reason: 'dead', by: 'test', probes: {} });
+    const completed = { ...newRunRecord({ id: 'review-pr-finished', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      ...payload(f.head), stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(fresh ? 3000 : 1000).toISOString() }] };
+    writeRun(completed, f.runsDir);
+    const result = readDrainRedTeamEvidence(f);
+    if (fresh) expect(result.loopPayload).toMatchObject({ id: completed.id });
+    else expect(result).toMatchObject({ ok: false, reason: 'review-unfinished', unfinishedId: id });
   });
 });

@@ -23,7 +23,7 @@
  *      (property 3's actor refusal fires first; `file-item` is never even called).
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -2339,4 +2339,22 @@ it('default review-loop minting keys the persisted run by its parsed PR', async 
   });
   expect(out.code).toBe(0);
   expect(out.run.id.match(NAME_RE)?.[1]).toBe(String(out.run.input.pr));
+});
+
+
+describe('D: tombstoned advisory resume selection', () => {
+  it.each([false, true])('stale tombstone=%s resumes only a rewritten record', async stale => {
+    const { markRunAbandoned } = await import('../../lib/run-abandoned.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'D-resume-'));
+    const id = 'review-pr-advisory', repo = 'web-everything/web-everything', pr = 7116, head = 'a'.repeat(40);
+    try {
+      writeFileSync(join(dir, `${id}.json`), '{}');
+      markRunAbandoned({ id, dir, reason: 'dead', by: 'test', probes: {} });
+      if (stale) utimesSync(join(dir, `${id}.json`), new Date(Date.now() + 10000), new Date(Date.now() + 10000));
+      expect(defaultFindResumableRun({ repo, pr }, { runsDir: dir,
+        readPr: () => ({ headRefOid: head, comments: [] }),
+        readRuns: () => [{ id, repo, pr, head, startedAt: 1, completedAt: 2, resumeAdvise: true }] }))
+        .toBe(stale ? id : null);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

@@ -1,4 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
+import { isRunAbandoned as defaultIsRunAbandoned } from './run-abandoned.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -485,7 +486,8 @@ export function storedSealRefusal({ repo, pr, head, env, readSeal, readStatus, s
 export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, readStatus, now, env = process.env,
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
-  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false }) {
+  headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false,
+  runsDir = runsDirectory(env), isRunAbandoned = defaultIsRunAbandoned, readReviewRun = readRun }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -556,7 +558,35 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
             && matching.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS) {
             return dispatchDecision({ action: 'review', why: 'unfinished review is held only on pending CI at record; resume it (bounded)' });
           }
-        } catch { /* Unreadable evidence keeps the human hold. */ }
+          // R755 is dispatch authority only. The reader still holds until a newer panel finishes.
+          if (typeof result.unfinishedId !== 'string' || !result.unfinishedId) throw Error('blocking review id missing');
+          if (isRunAbandoned(result.unfinishedId, runsDir) === true) {
+            const blocking = readReviewRun(result.unfinishedId, runsDir);
+            if (!blocking || blocking.id !== result.unfinishedId || blocking.op !== 'review-pr'
+              || blocking.input?.repo !== repo || Number(blocking.input?.pr) !== pr
+              || (blocking.verdict != null && !Object.values(VERDICTS).includes(blocking.verdict?.verdict))) {
+              throw Error('blocking review record unreadable');
+            }
+            if (blocking.verdict?.verdict === 'changes') {
+              return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
+            }
+            if (!Array.isArray(runs)) throw Error('review hints unreadable');
+            const dead = new Set();
+            for (const run of runs) {
+              if (!run || typeof run.id !== 'string' || !run.id || !isRealHead(run.head)
+                || typeof run.repo !== 'string' || !run.repo || !Number.isSafeInteger(run.pr) || run.pr <= 0) {
+                throw Error('review hint unreadable');
+              }
+              if (run.repo === repo && Number(run.pr) === pr && run.head === head
+                && isRunAbandoned(run.id, runsDir) === true) dead.add(run.id);
+            }
+            if (dead.size >= 2) return { ...skip(result.reason), escalate: true,
+              escalationContext: 're-review owners keep dying; inspect the two tombstoned runs on the live head' };
+            return dispatchDecision({ action: 'review', why: 'unfinished review owner proven dead (R755); fresh review on live head' });
+          }
+        } catch {
+          return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
+        }
         let neverReviewed = false;
         try { neverReviewed = headNeverReviewed({ repo, pr, head }) === true; } catch { /* Unknown scan keeps escalation. */ }
         if (neverReviewed) {

@@ -5568,3 +5568,15 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+
+## Dead review re-review (design D / R755)
+
+A run tombstone authorizes a fresh review, never release of the unfinished-review hold.
+Keep the reader, planner, CLI resume selection and daemon scheduling tests scoped through
+`node scripts/readiness/heavy-admission.mjs run -- npx vitest run <test-files>`.
+Run `red-team-advisory-parked-after-accept.soak.test.mjs` with `--config vitest.soak.config.ts`:
+it observes tombstone-only hold, planner review dispatch, then release on a newer finished accept.
+Missing IDs, unreadable evidence, stale tombstones and recorded `changes` retain escalation;
+two tombstoned runs on the live head escalate with “re-review owners keep dying”.
+The 30-minute sweep throttle includes failed attempts; retry cooldown and existing resume precedence remain covered.

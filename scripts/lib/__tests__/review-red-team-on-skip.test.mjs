@@ -3169,3 +3169,60 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
 });
+
+
+describe('D: dead unfinished review starts a fresh panel', () => {
+  const id = 'review-pr-dead';
+  const record = { id, op: 'review-pr', input: { repo, pr }, verdict: { verdict: 'needs-human' } };
+  const hints = [{ id, repo, pr, head }];
+  const options = over => ({ readEvidence: () => ({ ok: false, reason: 'review-unfinished', unfinishedId: id }),
+    headNeverReviewed: () => false, readReviewRuns: () => hints,
+    readReviewRun: () => record, isRunAbandoned: () => true, ...over });
+  it('dispatches a fresh review for a proven dead blocking owner', () => {
+    expect(decide(options())).toMatchObject({ action: 'review',
+      why: 'unfinished review owner proven dead (R755); fresh review on live head' });
+  });
+  it.each([
+    ['no tombstone', { isRunAbandoned: () => false }],
+    ['unreadable tombstone', { isRunAbandoned: () => { throw Error('unreadable'); } }],
+    ['changes verdict', { readReviewRun: () => ({ ...record, verdict: { verdict: 'changes' } }) }],
+    ['missing id', { readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) }],
+    ['unreadable id', { readReviewRun: () => { throw Error('unreadable'); } }],
+    ['missing record', { readReviewRun: () => null }],
+    ['unknown verdict', { readReviewRun: () => ({ ...record, verdict: { verdict: 'unknown' } }) }],
+    ['unreadable hints', { readReviewRuns: () => null }],
+    ['incomplete hint', { readReviewRuns: () => [{ id, head }] }],
+    ['missing id despite never-reviewed hint', { headNeverReviewed: () => true, readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) }],
+  ])('keeps escalation for %s', (_name, over) => {
+    expect(decide(options(over))).toMatchObject({ action: 'skip', why: 'review-unfinished', escalate: true });
+  });
+  it.each([2, 3])('escalates when %s owners on the live head have died', count => {
+    expect(decide(options({ readReviewRuns: () => Array.from({ length: count }, (_, i) => ({ ...hints[0], id: `${id}-${i}` })) })))
+      .toMatchObject({ action: 'skip', escalate: true, escalationContext: expect.stringContaining('re-review owners keep dying') });
+  });
+  it('does not count old-head tombstones toward the live-head cap', () => {
+    expect(decide(options({ readReviewRuns: () => [...hints, { ...hints[0], id: 'review-pr-old', head: 'b'.repeat(40) }] })).action).toBe('review');
+  });
+  it('keeps the retry cooldown', () => {
+    expect(decide(options({ lastDispatch: new Map([[`${repo}#${pr}@${head}`, 2_000_000]]) })))
+      .toMatchObject({ action: 'skip', why: 'retry cooldown active' });
+  });
+  it.each(['retryableRecordEffect', 'ciHeldRecordRetry'])('keeps %s resume precedence', kind => {
+    const row = { ...hints[0], startedAt: 1, completedAt: 2,
+      ...(kind === 'retryableRecordEffect' ? { retryableRecordEffect: true } : { ciHeldRecordRetry: { attempts: 1, resumeAttempts: 0 } }) };
+    expect(decide(options({ readReviewRuns: () => [row],
+      setting: { enabled: true, retryCooldownMin: 30, ciHeldRecordRetryMax: 3 } })))
+      .toMatchObject({ action: 'review', why: expect.stringContaining('resume it') });
+  });
+  it('a rewritten record makes its real tombstone stale and keeps escalation', async () => {
+    const { markRunAbandoned } = await import('../run-abandoned.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'D-stale-'));
+    try {
+      writeFileSync(join(dir, `${id}.json`), JSON.stringify(record));
+      markRunAbandoned({ id, dir, reason: 'dead', by: 'test', probes: {} });
+      utimesSync(join(dir, `${id}.json`), new Date(Date.now() + 10000), new Date(Date.now() + 10000));
+      const { isRunAbandoned } = await import('../run-abandoned.mjs');
+      expect(decide(options({ runsDir: dir, isRunAbandoned }))).toMatchObject({ action: 'skip', escalate: true });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

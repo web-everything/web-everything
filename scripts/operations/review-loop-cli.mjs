@@ -56,6 +56,7 @@
  * nothing here decides, it only wires and reports.
  */
 
+import { isRunAbandoned } from '../lib/run-abandoned.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -65,7 +66,7 @@ import {
   cwdFlagValue, driveRun, hasJsonFlag, outcomePayload, parseOperationArgv, renderOutcome, runOperationCli,
 } from './cli-adapter.mjs';
 import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
-import { createFileRunStore, newRunId, newReviewRunId } from './run-store.mjs';
+import { createFileRunStore, newRunId, newReviewRunId, sharedRunsDir } from './run-store.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
 import { appendEntry } from '../conveyor/learnings-drop.mjs';
@@ -403,12 +404,14 @@ export { RESUME_MAX_ATTEMPTS } from '../conveyor/review-referral-hold.mjs';
  * unreadable PR or store answers `null`, which means "start a fresh review" exactly as before this existed.
  * @returns {string|null} the run id to resume.
  */
-export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
+export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env,
+  runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env), isAbandoned = isRunAbandoned } = {}) {
   try {
     const view = readPr({ repo, pr });
     if (!view?.headRefOid) return null;
-    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
+    const id = findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
       ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
+    return id && isAbandoned(id, runsDir) ? null : id;
   } catch { return null; }
 }
 
