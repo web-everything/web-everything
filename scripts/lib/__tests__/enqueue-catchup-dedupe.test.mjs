@@ -41,30 +41,51 @@ describe('catch-up decline memory', () => {
     const declines = new Map([[1, decline({ at: now - 31 * 60_000, ttlMs: 30 * 60_000 })]]);
     expect(plan({ prs: fresh, declines }).run.map(p => p.num)).toEqual([1, 2]);
   });
-  it('re-checks when main CI newest completed run changes', () => expect(plan({ mainCiRunId: 101 }).run).toHaveLength(1));
+  it.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('re-checks %s when main CI newest completed run changes', reason => {
+    expect(plan({ mainCiRunId: 101, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
+  });
+  describe.each(['red-team-pending'])('%s head-scoped memory', reason => {
+    it.each([101, undefined, null])('skips across main CI run %s, even without a stored main run', mainCiRunId => {
+      for (const storedRun of [100, undefined, null]) {
+        expect(plan({ mainCiRunId, declines: new Map([[42, decline({ reason, mainCiRunId: storedRun })]]) }))
+          .toMatchObject({ run: [], skippedUnchanged: [{ num: 42, reason }] });
+      }
+    });
+    it('re-drains a different head', () => {
+      expect(plan({ prs: [pr(42, { headRefOid: 'head-b' })], declines: new Map([[42, decline({ reason })]]) }).run)
+        .toEqual([{ num: 42, readyAt: 42 }]);
+    });
+  });
   it.each([undefined, null, {}, 'bad json', new Map([[42, {}]])])('unreadable memory fails open (%s)', declines => {
     expect(plan({ declines }).run).toHaveLength(1);
   });
   it.each(['headRefOid', 'labelsDigest', 'lastCheckCompletedAt', 'checksDigest'])('missing %s evidence fails open', field => {
     expect(plan({ prs: [pr(42, { [field]: null })] }).run).toHaveLength(1);
   });
-  it('missing main CI evidence fails open', () => expect(plan({ mainCiRunId: null }).run).toHaveLength(1));
+  it.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('missing main CI evidence fails open for %s', reason => {
+    for (const mainCiRunId of [undefined, null, 0, -1, 1.5, '100']) {
+      expect(plan({ mainCiRunId, declines: new Map([[42, decline({ reason })]]) }).run).toHaveLength(1);
+    }
+    for (const mainCiRunId of [undefined, null]) {
+      expect(plan({ declines: new Map([[42, decline({ reason, mainCiRunId })]]) }).run).toHaveLength(1);
+    }
+  });
   it('puts no-hold PRs first, retaining existing order in each partition', () => {
     const result = plan({ prs: [pr(4), pr(3), pr(2), pr(1)], mainCiRunId: 101,
-      declines: new Map([[1, decline()], [3, decline()]]), capacity: 2, deprioritize: [2] });
+      declines: new Map([[1, decline({ reason: 'sent-back' })], [3, decline({ reason: 'bornas-collision' })]]), capacity: 2, deprioritize: [2] });
     expect(result.run.map(p => p.num)).toEqual([4, 2]);
     expect(result.later).toEqual([1, 3]);
   });
 });
 
-function daemon({ result, evidence = {}, catchUp = {}, code = { v: 'a'.repeat(40) } } = {}) {
+function daemon({ result, evidence = {}, catchUp = {}, main = { run: 100 }, code = { v: 'a'.repeat(40) } } = {}) {
   let time = now; let calls = 0;
   const lines = [];
   const handle = createEnqueueOnEvent({ cwd: '.', localSlug: 'example/web', defaultBranch: 'main', env: {},
     now: () => time, log: line => lines.push(line), refreshPending: () => ({ pending: false }),
     readPendingChange: () => ({ ok: true, paths: [] }), readPriorities: () => ({}),
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, catchUp: { enabled: true, intervalMinutes: 10, concurrency: 1, maxQueued: 10, ...catchUp } }),
-    readCandidates: async () => ({ ok: true, queued: 0, prs: [pr(42, evidence)], mainCiRunId: 100 }),
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [pr(42, evidence)], mainCiRunId: main.run }),
     readCapacity: () => ({ capacity: 10, source: 'test' }), readQueueDepth: async () => ({ ok: true, queued: 0 }),
     readPr: async () => ({ ...pr(), state: 'OPEN', statusCheckRollup: [] }), readCodeVersion: () => code.v,
     spawnImpl: () => {
@@ -75,7 +96,7 @@ function daemon({ result, evidence = {}, catchUp = {}, code = { v: 'a'.repeat(40
       return child;
     },
   });
-  return { code, handle, lines, calls: () => calls, advance: () => { time += 600_000; } };
+  return { main, code, handle, lines, calls: () => calls, advance: () => { time += 600_000; } };
 }
 
 it('records actual declines and prints skipped-unchanged: #n (reason) in the listing log', async () => {
@@ -83,6 +104,44 @@ it('records actual declines and prints skipped-unchanged: #n (reason) in the lis
   await d.handle.catchUp(); d.advance(); await d.handle.catchUp();
   expect(d.calls()).toBe(1);
   expect(d.lines.find(line => line.includes('skipped-unchanged:'))).toContain('skipped-unchanged: #42 (mq-same-head-failed)');
+});
+
+describe.each(['red-team-pending', 'mq-same-head-failed'])('%s daemon memory', kind => {
+  const result = { enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind, reason: 'same head failed' }] };
+  it.each([101, undefined, null])('retains only a main-independent decline across main CI run %s', async run => {
+    const d = daemon({ result });
+    await d.handle.catchUp(); d.advance(); d.main.run = run;
+    await d.handle.catchUp();
+    expect(d.calls()).toBe(kind === 'red-team-pending' ? 1 : 2);
+    if (kind === 'red-team-pending') expect(d.lines.at(-1)).toContain('nothing runnable');
+  });
+  it.each([
+    'pull_request.labeled(other)@1', 'pull_request.unlabeled(other)@2',
+    'pull_request_review.submitted@3', 'pull_request_review_comment.created@4',
+    'check_run.completed=failure@5', 'check_suite.completed=success@6',
+    'status.=failure@7', 'push.@8', 'pull_request.synchronize@9',
+    'issue_comment.created@10', 'pull_request.labeled(ready-to-merge)@11',
+  ])('any local PR event clears memo and backoffs and re-drains: %s', async cause => {
+    const d = daemon({ result });
+    await d.handle.catchUp(); d.advance(); await d.handle.catchUp();
+    expect(d.calls()).toBe(1);
+    d.handle.notePoll({ ok: true, marked: [{ key: 'example/web#42', cause }] });
+    expect(d.handle.blocked().size).toBe(0);
+    expect(d.handle.missBackoff().size).toBe(0);
+    d.advance(); await d.handle.tick();
+    if (d.calls() < 2) await d.handle.catchUp(); // eligible causes wake via the event tick; others via catch-up
+    expect(d.calls()).toBe(2);
+  });
+  it.each([
+    { ok: false, marked: [{ key: 'example/web#42', cause: 'issue_comment.created@1' }] },
+    { ok: true, marked: [{ key: 'other/web#42', cause: 'issue_comment.created@1' }] },
+    { ok: true, marked: [{ key: 'example/web#43', cause: 'issue_comment.created@1' }] },
+    { ok: true, marked: [{ key: '*', cause: 'issue_comment.created@1' }] },
+  ])('unrelated or failed polls retain memory: %j', async poll => {
+    const d = daemon({ result });
+    await d.handle.catchUp(); d.handle.notePoll(poll); d.advance(); await d.handle.catchUp();
+    expect(d.calls()).toBe(1);
+  });
 });
 
 it.each(['batching-deferred', 'merge-lock-held', 'live-state-unreadable', 'some-future-kind'])('retries %s next catch-up with unchanged head, labels, checks and main CI', async (kind) => {
@@ -188,19 +247,21 @@ describe('batched listing change evidence', () => {
       lastCheckCompletedAt: now - 120_000, lastLabelChangedAt: now - 1,
       checksDigest: expect.any(String), readyAt: now - 180_000 });
   });
+  describe.each(['mq-same-head-failed', 'sent-back', 'bornas-collision'])('%s listing evidence', reason => {
   it.each([
     { incompleteChecks: true }, { missingStatus: true }, { partialStatus: true }, { statusState: 'FAILURE' }, { conclusion: 'FAILURE' }, { noConclusion: true }, { incompleteRuns: true }, { incompleteMain: true }, { partialMain: true }, { wrongHead: true }, { failedBatch: true },
   ])('fails open on incomplete or unreadable evidence %j', async options => {
     const baseline = await listing();
     const complete = baseline.prs[0];
     const declines = new Map([[complete.num, decline({
-      headSha: complete.headRefOid, labelsDigest: complete.labelsDigest,
+      reason, headSha: complete.headRefOid, labelsDigest: complete.labelsDigest,
       checksDigest: complete.checksDigest, mainCiRunId: baseline.mainCiRunId, at: now,
     })]]);
     expect(plan({ ...baseline, declines })).toMatchObject({
-      run: [], skippedUnchanged: [{ num: 42, reason: 'mq-same-head-failed' }],
+      run: [], skippedUnchanged: [{ num: 42, reason }],
     });
     const result = await listing(options);
     expect(plan({ ...result, mainCiRunId: result.mainCiRunId, declines })).toMatchObject({ run: [{ num: 42 }], skippedUnchanged: [] });
+  });
   });
 });
