@@ -1,6 +1,7 @@
 // Per-pass heap record for the long-running daemons (operator ruling R368): one bounded structured line so a V8
 // heap cap can be sized from data instead of RSS alone. On by default; switch off via env WE_DAEMON_HEAP_LOG=0 or the
 // `daemonHeapLog.enabled` platform preference. Observation only — never changes daemon behaviour.
+// (R1100 hot-patch live proof, comment-only change.)
 import { cascadePolicy } from './policy-cascade.mjs';
 
 const STANDARD = Object.freeze({ enabled: true });
