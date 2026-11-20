@@ -211,7 +211,7 @@ describe('rebuildClone coordination events', () => {
   it.each([
     'tick-in-progress', 'reader-priority', 'concurrent-mover', 'smoke-backoff', 'held-after-rollback',
     'disabled', 'dirty', 'dirty-tree', 'local-commits', 'index-locked', 'switch-busy',
-    'smoke-env-load', 'closure-opaque', 'future-benign-reason',
+    'smoke-env-load', 'closure-opaque', 'ready-pin-stale', 'future-benign-reason',
   ])('does not announce a failure for a hold or unknown reason: %s', async (reason) => {
     terminal({ moved: false, reason });
     await rebuildClone(options);
@@ -314,7 +314,8 @@ describe('rebuildClone coordination events', () => {
       'pinned-contained-in-applied', 'pinned-overlay-conflict-skipped', 'pr-closed', 'pr-merged',
       'ready-adopted', 'ready-pending', 'ready-recorded', 'rebuild-in-progress', 'rebuild-job-running',
       'rebuild-job-spaced', 'rebuild-job-started', 'recovered-adopted', 'ref-gone', 'ref-unresolved',
-      'ready-audit-revoked', 'rejected-since', 'root-changed-during-smoke', 'skipped-unrelated', 'smoke-backoff',
+      // Discarding an expired pin's ready candidate still permits a fresh build.
+      'ready-audit-revoked', 'ready-pin-stale', 'rejected-since', 'root-changed-during-smoke', 'skipped-unrelated', 'smoke-backoff',
       'smoke-env-load', 'smoke-env-timeout-backoff', 'smoke-harness-broken-backoff', 'smoke-load-confirm-passed', 'smoke-queue-timeout', 'stack-base-moved',
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unaudited-tip-held', 'unknown', 'unsafe-ref',
