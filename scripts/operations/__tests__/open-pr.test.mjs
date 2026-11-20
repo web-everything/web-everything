@@ -120,7 +120,7 @@ describe('planOpen — the home\'s rules as a pre-flight, and nothing more', () 
   it('does NOT re-decide the lane-verification gate — that has one home', () => {
     const plan = planOpen(good());
     expect(Object.keys(plan).sort())
-      .toEqual(['actor', 'argv', 'base', 'bodyFile', 'dryRun', 'mode', 'operatorInstruction', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title']);
+      .toEqual(['actor', 'argv', 'base', 'bodyFile', 'dryRun', 'mode', 'operatorInstruction', 'parkLabel', 'ref', 'requireVerified', 'sha', 'skipPrePrReview', 'title', 'verify']);
     // No marker, no verdict, no gate decision — only the caller's own request, echoed back.
     expect(plan.requireVerified).toBe(false);
     expect(JSON.stringify(plan)).not.toMatch(/marker|break-glass|verifyGate/i);
@@ -677,5 +677,21 @@ describe('R502: a parked PR whose review label did not apply is loud, not a clea
   it('describeSubmit fails the call and names the repair', () => {
     const d = describeSubmit({ outcome: 'opened', labelStep: 'missing', pr: 7, url: 'u', reviewLabel: 'review:pending' });
     expect(d.failed).toBe(true); expect(d.line).toContain('NO review:pending label'); expect(d.line).toContain('gh pr edit 7 --repo <owner/repo> --add-label review:pending');
+  });
+});
+
+// R1086: the operation forwards posture; only pr-land judges host saturation.
+describe('ci-only opening', () => {
+  it('carries the sanctioned flag, omits empty input, and refuses invalid values', () => {
+    expect(planOpen(good({ verify: 'ci-only' })).argv).toContain('--verify=ci-only');
+    expect(planOpen(good({ verify: '' })).argv.some(a => a.startsWith('--verify='))).toBe(false);
+    for (const verify of ['local', true, null]) expect(() => planOpen(good({ verify }))).toThrow(/verify.*ci-only/);
+    const planStep = step(ops(), 'plan');
+    expect(planStep.reads).toContain('input.verify');
+    const planned = planStep.fn({ input: good({ verify: 'ci-only' }) });
+    expect(planned.verify).toBe('ci-only');
+    expect(planned.argv).toContain('--verify=ci-only');
+    expect(ops().input.verify.default).toBe('');
+    expect(HOME_REASONS['ci-only-not-saturated']).toBe('refused');
   });
 });
