@@ -562,7 +562,9 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
   it.each([
     ['core.sshCommand', '/untrusted/ssh'], ['core.hooksPath', '.githooks'],
     ['credential.helper', '/untrusted/helper'], ['unregistered.config', 'false'],
-    ['core.hookspath', '/dev/null'], ['core.fsmonitor', 'FALSE'],
+    // Git compares subsections and program values exactly, so these are not spellings of a pin.
+    ['gpg.SSH.program', 'ssh-keygen'], ['core.alternateRefsCommand', 'TRUE'], ['core.sshCommand', 'SSH'],
+    ['core.hooksPath', '/DEV/NULL'], ['core.fsmonitor', 'nope'],
     // Exec-redirect keys are never accepted, whatever their value.
     ['core.pager', 'less'], ['core.editor', 'vi'], ['diff.external', '/untrusted/diff'],
     ['diff.any.textconv', '/untrusted/conv'], ['protocol.ext.allow', 'always'],
@@ -581,6 +583,38 @@ describe('final audit: ambient hardening pins and unregistered parent restrictio
     expect(pinsOf(child)).toEqual(expected);
     expect(pinsOf(child)).toContainEqual(['core.hooksPath', '/dev/null']);
     expect(pinsOf(child)).not.toContainEqual([key, value]);
+  });
+  it.each([
+    ['CORE.HOOKSPATH', '/dev/null'], ['core.hookspath', '/dev/null'], ['Gpg.ssh.Program', 'ssh-keygen'],
+    ['Core.FsMonitor', 'false'], ['core.fsmonitor', 'FALSE'], ['commit.gpgsign', 'off'], ['PUSH.GPGSIGN', 'No'],
+    ['core.trustCtime', 'Yes'], ['core.ignoreStat', '0'], ['core.commitgraph', 'OFF'], ['log.showsignature', 'False'],
+    ['core.checkstat', 'DEFAULT'], ['PROTOCOL.ALLOW', 'NEVER'], ['protocol.file.ALLOW', 'Never'],
+  ])('keeps the parent hardening pair %s=%s that Git reads as a pin despite its case', (key, value) => {
+    setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'user.name', GIT_CONFIG_VALUE_0: 'x',
+      GIT_CONFIG_KEY_1: key, GIT_CONFIG_VALUE_1: value });
+    expect(configOf(envOf({}))).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: key, GIT_CONFIG_VALUE_0: value });
+  });
+  it('a differently cased parent transport prohibition still blocks caller transport exceptions', () => {
+    setParent({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: 'NEVER' });
+    const child = configOf(envOf(laneHistoryProofEnv({}, { remoteProbe: true })));
+    expect(child).toMatchObject({ GIT_CONFIG_KEY_0: 'PROTOCOL.ALLOW', GIT_CONFIG_VALUE_0: 'NEVER' });
+    expect(Object.values(child)).not.toContain('always');
+  });
+  it('a caller pin cannot repeat or override a differently cased parent pin for the same Git key', () => {
+    setParent({ GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'CORE.HOOKSPATH', GIT_CONFIG_VALUE_0: '/dev/null',
+      GIT_CONFIG_KEY_1: 'protocol.https.allow', GIT_CONFIG_VALUE_1: 'NEVER' });
+    const bag = { GIT_CONFIG_COUNT: '3', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+      GIT_CONFIG_KEY_1: 'Protocol.https.Allow', GIT_CONFIG_VALUE_1: 'never',
+      GIT_CONFIG_KEY_2: 'protocol.https.allow', GIT_CONFIG_VALUE_2: 'always' };
+    expect(configOf(envOf(bag))).toEqual({ GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'CORE.HOOKSPATH', GIT_CONFIG_VALUE_0: '/dev/null',
+      GIT_CONFIG_KEY_1: 'protocol.https.allow', GIT_CONFIG_VALUE_1: 'NEVER' });
+  });
+  it('real Git reads a differently cased parent pin as the pin it hardens', () => {
+    const result = spawnSync('git', ['config', '--get', 'core.hooksPath'], { cwd, encoding: 'utf8', timeout: 5000,
+      maxBuffer: 1024 * 1024, env: { ...process.env, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'CORE.HOOKSPATH',
+        GIT_CONFIG_VALUE_0: '/dev/null' } });
+    expect(result.stdout.trim(), result.stderr).toBe('/dev/null');
   });
   it('a harmless extra entry such as user.name cannot discard the pins (final audit)', () => {
     const parent = laneGitHardeningEnv({}), at = Number(parent.GIT_CONFIG_COUNT);

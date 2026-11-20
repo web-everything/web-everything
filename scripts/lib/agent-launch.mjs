@@ -119,15 +119,33 @@ function classOf(rule, value, ceiling) {
   return rule?.class;
 }
 // The sole indexed-config exception to GIT_*: the parent's hardening pins pass, nothing else does.
-// Each entry is kept only if its (key, value) pair EXACTLY equals a hardening pin; every other entry
+// Each entry is kept only if Git reads its (key, value) pair as a hardening pin; every other entry
 // (core.sshCommand, core.pager, url.*.insteadOf, even a harmless user.name) is dropped on its own, and the
 // kept pins are re-indexed in their original order, so one extra entry can never discard the protections.
 const GIT_PINS = [...LANE_GIT_CONFIG_PINS, ...REMOTE_PROBE_CONFIG_PINS, ...LANE_HISTORY_CONFIG_PINS];
 const GIT_TRANSPORT_POLICY = /^protocol\.(?:[a-z0-9+.-]+\.)?allow$/i;
+// Git compares the section and the variable name case-insensitively and the subsection exactly
+// (CORE.HOOKSPATH is core.hooksPath; gpg.SSH.program is not gpg.ssh.program).
+function gitKey(key) {
+  const first = key.indexOf('.'), last = key.lastIndexOf('.');
+  return key.slice(0, first).toLowerCase() + key.slice(first, last + 1) + key.slice(last + 1).toLowerCase();
+}
+// Git reads these pin values case-insensitively: booleans in all their spellings, and the enums
+// core.checkStat and protocol.*.allow. Paths and program names (hooksPath, sshCommand, gpg.program,
+// alternateRefsCommand=true, which is a command) are compared exactly.
+const GIT_BOOLEAN_PINS = new Set(['core.fsmonitor', 'commit.gpgsign', 'push.gpgsign', 'log.showsignature',
+  'core.trustctime', 'core.ignorestat', 'core.commitgraph']);
+const GIT_BOOLEANS = { true: ['true', 'yes', 'on', '1'], false: ['false', 'no', 'off', '0'] };
+function gitValue(key, value) {
+  const k = gitKey(key), lower = value.toLowerCase();
+  if (GIT_BOOLEAN_PINS.has(k)) return GIT_BOOLEANS.true.includes(lower) ? 'true' : GIT_BOOLEANS.false.includes(lower) ? 'false' : value;
+  return k === 'core.checkstat' || GIT_TRANSPORT_POLICY.test(key) ? lower : value;
+}
+const sameGitPair = ([k1, v1], [k2, v2]) => gitKey(k1) === gitKey(k2) && gitValue(k1, v1) === gitValue(k2, v2);
 // Transport candidates are also checked against the parent's policy in childGitConfig:
 // a protocol-specific exception takes precedence over Git's global protocol.allow setting.
-const tighteningGitPair = (key, value) => GIT_PINS.some(([k, v]) => key === k && value === v)
-  || ((value === 'never' || value === 'user') && GIT_TRANSPORT_POLICY.test(key));
+const tighteningGitPair = (key, value) => GIT_PINS.some(pin => sameGitPair([key, value], pin))
+  || (['never', 'user'].includes(gitValue(key, value)) && GIT_TRANSPORT_POLICY.test(key));
 function gitConfigPairs(env) {
   const raw = env.GIT_CONFIG_COUNT;
   if (typeof raw !== 'string' || !raw || /[^0-9]/.test(raw)) return null;
@@ -156,16 +174,16 @@ function childGitConfig(ambient, inherit) {
   }
   const bag = gitConfigPairs(inherit);
   // Git applies later entries over earlier ones, so a caller pair is added only for a key the parent's KEPT
-  // pairs do not set (git keys compare case-insensitively): the caller can add hardening, never override the
+  // pairs do not set (compared as Git compares keys, see gitKey): the caller can add hardening, never override the
   // parent's. A parent pair that was dropped as non-tightening is absent from the child, so it does not block one.
-  const parentKeys = new Set((parent?.kept ?? []).map(([k]) => String(k).toLowerCase()));
+  const parentKeys = new Set((parent?.kept ?? []).map(([k]) => gitKey(k)));
   const kept = [...(parent?.kept ?? [])];
   const parentTransportPolicy = kept.some(([key]) => GIT_TRANSPORT_POLICY.test(key));
   for (const pair of bag?.kept ?? []) {
     // Only a prohibition is always safe under an inherited transport policy. This also blocks
     // exported remote-probe "always" pins from reopening a transport the parent prohibited.
-    if (parentTransportPolicy && GIT_TRANSPORT_POLICY.test(pair[0]) && pair[1] !== 'never') continue;
-    if (!parentKeys.has(pair[0].toLowerCase()) && !kept.some(([k, v]) => k === pair[0] && v === pair[1])) kept.push(pair);
+    if (parentTransportPolicy && GIT_TRANSPORT_POLICY.test(pair[0]) && gitValue(...pair) !== 'never') continue;
+    if (!parentKeys.has(gitKey(pair[0])) && !kept.some(k => sameGitPair(k, pair))) kept.push(pair);
   }
   if (!kept.length) return parent?.count === 0 ? { GIT_CONFIG_COUNT: '0' } : {};
   const out = { GIT_CONFIG_COUNT: String(kept.length) };
