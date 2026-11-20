@@ -152,6 +152,7 @@ import { childFailure } from '../lib/child-failure.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 import { normNum } from './queue-store.mjs';
 import { capToConcurrency, resolveMaxConcurrentLanes } from '../lib/lane-concurrency.mjs';
+import { resolveCapacityLeaf } from '../lib/capacity-leaf.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // The kind-scoped pause's PURE half (epic #3383) — the same predicate `dispatch-plan.mjs` uses for its own
 // `build` gate, so the two cores can never disagree about what a given marker holds. No fs comes in with it.
@@ -2108,10 +2109,9 @@ async function main(argv) {
       lastOperatorTurn = parsed.lastOperatorTurn ?? null;
     }
   }
-  // #xupukxa — resolve the concurrency ceiling from env exactly like dispatch-plan.mjs's own IO shell, unless
-  // the caller's piped-in bookkeeping already named one explicitly (an operator override rides through
-  // `config.maxConcurrentLanes` on STDIN same as any other config knob).
-  if (config.maxConcurrentLanes == null) config.maxConcurrentLanes = resolveMaxConcurrentLanes(process.env);
+  // Resolve the same ceiling as dispatch-plan; valid explicit config can only lower it.
+  const resolved = resolveCapacityLeaf('lanes.maxConcurrent', { lower: resolveMaxConcurrentLanes(process.env) }).value;
+  config.maxConcurrentLanes = Number.isInteger(config.maxConcurrentLanes) && config.maxConcurrentLanes >= 1 ? Math.min(config.maxConcurrentLanes, resolved) : resolved;
 
   const stateArgs = ['--json'];
   const planArgs = ['--json'];
