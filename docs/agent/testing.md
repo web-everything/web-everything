@@ -3650,7 +3650,7 @@ integration case that runs prune as root then reserves every slot as the operato
 
 ### Remote diff coverage inputs
 
-Remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
+Legacy remote coverage fixtures must create the ignored `coverage/coverage-final.json` locally,
 then assert its manifest digest and snapshot bytes. Preserve source mtimes through staging
 and full shipping so the freshness guard retains local semantics; warm delta assembly
 recreates mtimes. Compare coverage scope with an explicit `DIFF_COVERAGE_BASE`, including
@@ -3661,7 +3661,7 @@ projected from `agent-memory-src/` into regular snapshot leaves. Require `MEMORY
 and the complete target corpus; reject unsafe links or incomplete inputs before
 transfer. These projected inputs require full shipping.
 
-For remote `check:standards`, observe both output streams for skipped gates,
+For legacy remote `check:standards`, observe both output streams for skipped gates,
 `no-scope`, and `ENOENT`. A matching protected completion receipt permits a failed
 remote result to fall back through local admission; an invalid receipt keeps the
 result unconfirmed. The single standards input parity test in `remote-exec.test.mjs`
@@ -3970,7 +3970,7 @@ Remote transport stubs must answer the worktree-binding probe before inventory o
 use `fixtures/forge-bound-git.mjs` in injected-Git fixtures so transport-failure tests
 reach their intended run/finish branch. Keep their exact dispatch and no-local-rerun assertions.
 
-Coverage report rewrites must restore the timestamp captured from the open source file.
+Legacy coverage report rewrites must restore the timestamp captured from the open source file.
 Re-reading the staged timestamp and converting it again can truncate another microsecond,
 making coverage older than a source with the same original mtime. The absolute-path coverage
 table in `scripts/readiness/__tests__/remote-exec.test.mjs` pins equal fractional mtimes and
@@ -5028,6 +5028,46 @@ planner together using a rollup with `detailsUrl` and no check id. Workflow prot
 head-bound job evidence and the failed evaluation step; unreadable evidence, another failed
 step, and real CI failures retain CI ownership. Keep fix detection behavioural, including
 negative cases, rather than matching planner source text.
+## Live review seat policy (R1077)
+
+`review-seat-caps.test.mjs` covers live `review.seatDailyCaps` reads through the shared
+policy cascade, injected settings IO, invalid layers and legacy environment precedence.
+`review-red-team.test.mjs` exercises the launcher with both builder companies, unknown
+builder evidence, `review.redTeam.routeByBuilder=false`, daily-cap fallback and a raced
+reservation. Keep the pinned-head co-author read ahead of routing; the scratch checkout
+is created only after provider selection. Standard daily caps are Codex 80 (the tool
+settings explicitly raise it to 600), agy-gemini 0
+(off; operator opt-in through `review.seatDailyCaps.agy-gemini` or `enabledProviders`), agy-claude 10 (red-team emergency only). Codex builders prefer agy-gemini;
+if disabled or capped, use Codex and log same-vendor acceptance. Claude builders prefer
+Codex, then agy-gemini at cap. Unknown builders and `routeByBuilder=false` retain policy
+routing among the ordinary providers. Log each cap fallback, including reservation races.
+Never choose agy-claude by default: only exhaustion of both ordinary providers' budgets
+permits the logged emergency route. Exhausting even the emergency budget retains the
+existing cap hold. Tests cover emergency selection, all budgets exhausted, and missing
+CLIs with ordinary budget left (no emergency).
+
+Pin historical cap-warning fixtures to their original cap. Provider-unavailable fixtures
+need explicit positive provider budgets: cap checks precede CLI probes, and a zero cap
+marks the result retryable rather than a completed unavailable-CLI result.
+Red-team routing fakes inject `readSeatSettings` with empty tool/platform layers when
+asserting standard caps, so live settings cannot change their budgets. Keep cap source
+labels aligned with the settings cascade and assert the final skipped log contains the
+returned budget refusal, while retaining reservation-count and no-launch assertions.
+
+R1077 audit: builder preference stays within the resolved policy chain or inherited
+red-team roster; operator routing overrides win, and policy model/effort validation
+still runs. Exhausting an explicit chain refuses dispatch rather than inventing a
+route. `ai-routing-red-team-sites.test.mjs` retains the cap/quota refusal cases and
+covers builder policy models, efforts, operator precedence and disabled fallbacks.
+Explicit settings zero defeats `enabledProviders`; unreadable or malformed seat
+settings warn and use repo defaults, including Gemini's disabled default.
+
+Red-team admission checks the resolved model against the same Carbon promotion guard
+as execution before reserving budget. A positive Gemini cap alone does not promote
+Carbon: builder, policy and AI-overlay routes retry the remaining allowed providers.
+Keep fixtures for unpromoted fallback, promoted Carbon, non-Carbon Gemini aliases and
+an operator chain with no permitted fallback. Historical budget-race fixtures must
+explicitly promote Carbon so they continue exercising reservation denial.
 ## Overlay main-sync interrupted test evidence
 
 A heavy-admission test timeout or killed process is incomplete evidence even if it left a green
@@ -5345,6 +5385,120 @@ modes and verify that card refusal cannot repeat an already recorded send-back.
 Saved-fix admission precedes lane acquisition and branch verification; retain the final pre-push
 check because verification may outlive a capability change. Refusal must not consume an attempt.
 
+## Concurrent added review seats
+
+Added-seat evidence uses the loop read sink with `review.extraSeats.concurrent` (standard true,
+platform → tool → environment `WE_REVIEW_EXTRA_SEATS_CONCURRENT`; the job logs value and source).
+The extra-seats kill switch still wins. The single-shot `run` command remains speculate then finish.
+A speculative pass writes reservations before calling providers, and writes comparison rows only
+against the final pinned loop head. Bounce, park, infra block, missing input, failed pass, moved
+head, and final-head skip discard spend without a sequential rerun. The red team and added seats
+share the sink when both start; only its owner removes it. Job-summary timings include `loopMs`,
+`seatsMs` (pass duration when available), `seatsConcurrent`, and total wall time including settlement.
+Scoped regressions live in the review-extra-seats and review-job-speculative-red-team tests; the
+`added-seats-concurrent-head-binding` soak break decides fix presence by executing both head cases.
+
+Discarded added-seat quota rows retain each call’s `finishedAt` (falling back to `startedAt`),
+so settlement order cannot let an older clean call clear a newer exhaustion hold.
+`review-extra-seats-discard-quota-order.test.mjs` covers both timestamp sources and append orders,
+including a newer clean call clearing an older hold. Replaying an old discarded call must not
+re-arm the probe interval; a fresh exhausted call does.
+## Forge tracked-at-HEAD manifests (S1)
+
+`remote.manifest` defaults to `legacy`; `tracked` binds shipped regular files to the
+pinned HEAD blob and executable mode. Resolve it from the standard and platform preferences
+only; checkout settings and `WE_HEAVY_ADMISSION_REMOTE_MANIFEST` cannot override it, even
+in private pools. The policy log includes its source.
+Tracked runs use a full inventory so warm-leaf reuse cannot bypass the boundary.
+Tracked transport is always rsync: Git bundles contain history outside the validated
+leaf manifest. Git-dependent tests refuse with `bundle-local`, including needsGit
+routing with a cached bundle capability and the host-overload route. Tracked rsync uses
+the same route plus full-selection proof as legacy bundles: a readable pure-test filter
+can also select a Git-dependent test by substring, and must fall back locally. Record the refusal
+in the manifest log before local execution. Presync resolves the same canonical policy
+as admission and skips tracked or manifest-related fail-closed policies before any Git,
+SSH, rsync, lock or cache-state operation. Its legacy delta behavior is unchanged.
+The explicit remote CLI may force enablement only when manifest policy has not failed
+closed; retain and log the canonical refusal reason when entering local admission.
+Tracked admission refuses external client overrides before importing them: an older
+installed client may ignore the manifest option. The built-in client enforces the boundary.
+Coverage is never shipped in tracked mode, including `coverage/coverage-final.json` when
+ignored, untracked, staged or committed. Structure validation cannot bind coverage counters
+to genuine execution or HEAD. Commands that consume coverage input (`check:standards` or
+an explicitly supplied `DIFF_COVERAGE_BASE`, the existing standards/Git-input signal) refuse
+with `coverage-local` and run locally, even if the report is absent. Ordinary test commands
+omit the report without reading it. Generating coverage with `--coverage` does not itself
+consume a local coverage report. Legacy coverage inclusion, portability rewriting and
+full-ship selection remain unchanged.
+Sibling snapshots keep their existing index-based selection and identity checks; tracked
+runs bind every shipped sibling file's bytes and executable bit to the sibling's pinned HEAD
+tree, independently of the index and `core.fileMode`. Mode or content mismatches refuse as
+`dirty` before the final sibling status check. They also apply the path+oid size exceptions
+and binary allowlist, and count sibling bytes
+against the main manifest's total cap. Size/type refusals keep their manifest reason and
+are logged; operators can run locally or review a path+oid size exception.
+
+`remote.manifest` comes only from the canonical host preferences path, including when
+`WE_PLATFORM_PREFERENCES` redirects other settings for a private pool or test. Inject `home`
+into `loadAdmissionPolicy` to test that path without reading the real home file. Missing,
+unreadable, oversized, malformed or structurally invalid canonical evidence disables remote
+execution for every caller, with a policy source explaining the local fallback. A valid,
+existing canonical object without `remote.manifest` uses the standard manifest default.
+Direct `ENOENT` also fails closed, including after a previously tracked policy's cache expires.
+Remote-capable fixtures must inject an existing canonical preferences file via `home`.
+Neither CLI enablement nor last-good settings may override that manifest refusal.
+The shared `loadAdmissionPolicy` resolver is
+the only canonical manifest source for admission, the explicit CLI and presync. Failed reads
+are retried on the next call; they never use the redirected manifest or a cached last-good
+host manifest. An invalid
+platform manifest value disables remote execution with a policy source explaining the local
+execution requirement, even if private tool/environment settings enable remote execution.
+
+Every tracked refusal and every legacy shadow verdict appends metadata only to
+`~/.plateau/forge-manifest-refusals.jsonl`; `FORGE_MANIFEST_REFUSALS_LOG` overrides the path.
+`buildManifest` takes an explicit `shadow` option, default false. `runRemote` selects
+it once from the original options, before `bindGit` wraps the executor, and carries
+it through delta assembly and full retries. Shadow evaluation runs only when the
+caller supplied no executor, filesystem or inventory (`listFiles`); injected callers
+retain the legacy exec/fs call sequence.
+`FORGE_MANIFEST_SHADOW=0` disables the default-on shadow for costly trees. Logging and
+shadow failures never alter legacy admission. Tests must point the log at their temp root.
+The real-Git `runRemote` regression replaces only SSH/rsync executables on PATH and
+asserts a completed legacy run still ships an untracked file while logging its
+shadow refusal; the injected-executor case compares calls against shadow disabled.
+`forge-manifest-tracked.test.mjs` exercises local fallback without remote dispatch,
+HEAD hashes, size bounds, binary extensions, coverage omission and setting provenance.
+`heavy-admission.test.mjs` covers canonical manifest authority and invalid-policy local execution.
+For the non-UTF-8 refusal-log case, inject the raw Git inventory record: filesystem
+sandboxes may deny creating such filenames before the manifest code can observe them.
+The `forge-manifest-untracked-shipped` soak break uses the real manifest builder in a
+temporary Git repository. Run these scoped tests through heavy admission; the soak
+file needs `--config vitest.soak.config.ts`.
+### Orchestrator quarantine authority
+
+`resolveOrchestratorAuthority` reads repo `authority.redMainQuarantine` from the discovered
+`scripts/settings/orchestrator-authority.json` and platform `orchestrator.authority.redMainQuarantine`
+through `readPlatformPreferences().prefs.orchestrator` using only its default paths. Missing current
+platform or operator files deny authority; absent optional legacy files are allowed. Unreadable or
+invalid platform evidence still denies authority. Authority reads validate raw JSON in every platform
+file (including legacy files) before merging: duplicate object keys, including escape-equivalent names
+and repeated parent blocks, deny access even when a later file or the repo grants it. Fix the ambiguous
+file to restore an explicit grant. Repeated names in separate objects and punctuation inside strings
+are valid. The repo reader uses
+`readSettingsChecked`: duplicate ownership or read taint denies authority even over a platform grant.
+For this explicit authority grant, platform wins over
+repo in both directions; only boolean `true` grants access, and invalid values deny it. There is
+no authority environment override, including platform-file path overrides. Tests inject
+`platform`/`tool` or the `readFile` IO seam instead of redirecting the authority files.
+The resolver logs the effective value and actual source through the shared policy diagnostics.
+
+The IO writer and CLI add/remove/prune resolve authority; pure quarantine functions receive
+`orchestratorAuthority` explicitly. Keep owner validation, TTL limits, and actor audit records
+on the same path as operator and safety-net writes. `setMode` and `setFixPrs` remain limited to
+the safety net and operator even with orchestrator authority enabled. The authority settings tests cover closed
+defaults and conflicting layers; quarantine tests cover validation and removal; the IO test
+verifies persisted events and commit messages against a temporary local Git origin.
+
 ## Negative review-run proofs
 
 `headNeverReviewedFromRuns` may bypass its 400-run scan only through
@@ -5379,6 +5533,34 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+
+## Review-run filename discovery (R1099)
+
+`review-run-names.fs.test.mjs` covers 6,000 real files, full-scan parity across PR-keyed names,
+legacy parsing, in-place corruption, shared parse budgets, filename churn, archive
+claims and age-gated archives. Run it with `review-run-index.test.mjs`,
+`drain-red-team-evidence.test.mjs`, `archive-closed-review-runs.test.mjs`, and
+`red-team-skip-settle-r622.test.mjs` through heavy admission.
+
+`writeRun` validates keyed filename/payload identity before atomic publication.
+Archiving keeps keyed filename/payload PR mismatches live in `kept.mismatch`,
+including dry-run proposals. `archive-closed-review-runs.test.mjs` covers old
+mismatched files, matching numeric/string PRs, claim-time mismatch rollback,
+and CLI mismatch counts and IDs. Legacy IDs retain their existing behavior.
+Discovery lists every review-pr ID without name-based exclusion, using the ordinary
+scan order, parse cap and liveness bounds. Every examined candidate is
+parsed; keyed ID, operation or PR disagreement holds through fallback. Compare
+names around parsing, retry once on churn, then use the bounded scan and HOLD.
+Claims or a nonempty target archive require operator restoration before absence
+can be proven. Archives default to closed/merged terminal records at least 14 days
+old under `archive/review-pr/<owner>/<repo>/<pr>/`; race fixtures explicitly use
+`minAgeDays: 0` to exercise fresh-record claims. The probe CLI is
+`scripts/review-run-probe.mjs --probe <repo>#<pr> [--head=] [--runs-dir=]`.
+
+Filesystem mtime fixtures must restore numeric seconds (`mtimeMs / 1000`), not a
+`Date`: Date truncates fractional milliseconds and cannot verify unchanged mtime
+at sub-millisecond precision. The retained JSON index sidecar is expected; the
+filename contract removes journal JSONL and seals, not the existing index writer.
 ## CI-only PR opening (R1086)
 
 `pr-land --verify=ci-only` is restricted to open modes and observed host saturation.

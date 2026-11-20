@@ -15,6 +15,10 @@ import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
+const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
+  'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
+]);
+
 /**
  * PURE: may the ready candidate `ready` be adopted now, instead of smoking `plan`? Returns
  * `{adopt, dropRefs, match}` or `{adopt:null, reason}`. Only ever a candidate verified on top of `prevHead` (the
@@ -152,16 +156,23 @@ export function matchReadyCandidate({
   return { adopt: ready.adopt, dropRefs: [], match: 'superseded', ...(retired.length ? { retired } : {}) };
 }
 
-/** Only authenticated operator auto-retirement retires its exact tip, after every recorded add. Unknown evidence refuses. */
+/** Only authenticated operator auto-retirement retires its exact tip, after every recorded registration. Unknown evidence refuses. */
 export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) {
   try {
     if (!ref || !/^[a-f0-9]{40}$/.test(sha || '') || registered(ref) !== false || !Array.isArray(events)) return false;
-    const history = events.filter((e) => e?.ref === ref);
+    // Auto-rebase records registration on the original ref with `new` naming the replacement.
+    // Normalize that registration so it supplies add chronology and also vetoes an older retirement.
+    const history = events.flatMap((e) => e?.kind === 'auto-rebase-registered' && e.new === ref
+      ? [{ ...e, kind: 'added', ref }] : e?.ref === ref ? [e] : []);
     const removed = history.at(-1)?.kind === 'auto-retired' ? history.at(-1) : null; // `removed` never carries authenticated operator evidence; any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
-    if (!removed || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+    // daemon-load-overlay can register without an add event. Only explicit withdrawal,
+    // whose writer proved this exact live merge tip, may stand without that chronology.
+    const liveWithdrawal = removed?.acceptedOmission === true && removed?.liveApplied === true;
+    if (!removed || removed.operatorReason !== true || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
+      || AUTOMATIC_RETIREMENT_REASONS.includes(removed.reason.trim().toLowerCase())
       || typeof removed.actor !== 'string' || !OPERATOR_LOGINS.includes(removed.actor.toLowerCase())
-      || typeof removed.at !== 'string' || !added.length) return false;
+      || typeof removed.at !== 'string' || (!added.length && !liveWithdrawal)) return false;
     const removedAt = Date.parse(removed.at);
     return Number.isFinite(removedAt)
       && history.lastIndexOf(removed) > history.findLastIndex((e) => e.kind === 'added')

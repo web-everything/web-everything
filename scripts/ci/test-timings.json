@@ -378,6 +378,7 @@
   "scripts/ci/__tests__/ci-shard-steps.test.mjs": 0.18,
   "scripts/ci/__tests__/ci-shard-timeout-headroom.test.mjs": 0,
   "scripts/ci/__tests__/ci-smoke-runner-pin.test.mjs": 0.01,
+  "scripts/ci/__tests__/ci-soak-merge-queue-only.test.mjs": 0,
   "scripts/ci/__tests__/ci-test-gate-light.test.mjs": 0.8,
   "scripts/ci/__tests__/ci-timings-refresh-workflow.test.mjs": 1.19,
   "scripts/ci/__tests__/ci-unit-shard-step.test.mjs": 0.09,
@@ -1341,6 +1342,7 @@
   "scripts/lib/__tests__/review-round-rules.replay.test.mjs": 0.05,
   "scripts/lib/__tests__/review-round-rules.test.mjs": 0.06,
   "scripts/lib/__tests__/review-runner-core.test.mjs": 0.02,
+  "scripts/lib/__tests__/review-seat-caps.test.mjs": 0.1,
   "scripts/lib/__tests__/review-settings.test.mjs": 1.6,
   "scripts/lib/__tests__/review-shadow-budget.test.mjs": 0.09,
   "scripts/lib/__tests__/review-shadow-model.test.mjs": 0.2,
@@ -1970,6 +1972,7 @@
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
@@ -2203,6 +2206,7 @@
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
+  "scripts/conveyor/soak/breaks/added-seats-concurrent-head-binding.soak.test.mjs": 4.67,
   "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 8.81,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
   "scripts/conveyor/soak/breaks/approved-human-head-review-churn.soak.test.mjs": 1.4,
