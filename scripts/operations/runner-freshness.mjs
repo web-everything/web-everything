@@ -43,15 +43,23 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
       lane = parts.length === 2 && parts[0] !== '..' && parts[0] !== '' && /^lane-\d+$/.test(parts[1]);
     } catch { /* A missing pool grants no exemption. */ }
     if (lane && declaration.name === 'open-pr') {
-      // Read the lease even when attached: attachment cannot bypass a recorded pin.
+      // Unreadable detached evidence must fail closed, but ordinary attached lanes
+      // retain their exemption without requiring a lease.
       pinnedRunner = true;
-      const leasePath = resolve(root, readGit(['rev-parse', '--git-path', '.lane-lease']));
-      const lease = JSON.parse(filesystem.readFileSync(leasePath, 'utf8'));
-      if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new Error('invalid runner lease; reacquire the lane');
       let attached = '';
       try { attached = readGit(['symbolic-ref', '--quiet', '--short', 'HEAD']); }
       catch (error) { if (error.status !== 1) throw error; }
-      if (!attached || lease?.at !== undefined || lease?.branch !== undefined) {
+      let lease;
+      try {
+        const leasePath = resolve(root, readGit(['rev-parse', '--git-path', '.lane-lease']));
+        lease = JSON.parse(filesystem.readFileSync(leasePath, 'utf8'));
+        if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new Error('invalid runner lease; reacquire the lane');
+      } catch (error) {
+        if (attached) return { exempt: true };
+        throw error;
+      }
+      // Attachment must not bypass a recorded pin; detachment alone is not a pin.
+      if (lease.at !== undefined || lease.branch !== undefined) {
         if (!lease || typeof lease !== 'object' || typeof lease.session !== 'string' || !lease.session
           || !Number.isFinite(Date.parse(lease.acquiredAt)) || Date.parse(lease.acquiredAt) > now()
           || (lease.renewedAt !== undefined && (!Number.isFinite(Date.parse(lease.renewedAt)) || Date.parse(lease.renewedAt) > now()))

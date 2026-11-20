@@ -3041,7 +3041,8 @@ async function cmdAcquire(repo) {
       if (!/^[a-f0-9]{40}$/.test(tip) || tip !== flags.at) throw new Error('--at must equal the fetched origin branch tip; inspect the branch and retry');
       git(['cat-file', '-e', `${flags.at}^{commit}`], dir);
       git(['checkout', '--detach', flags.at, '--quiet'], dir);
-      if (!flags['no-install']) ensureDeps(dir);
+      // Do not execute branch-controlled install/lifecycle scripts in the acquirer's
+      // context. Dependencies for a pinned checkout must be prepared during verification.
       journalLaneEvent(dir, { action: 'acquire-detach', headAfter: laneHead(dir), reason: `pinned ${flags.branch} at ${flags.at}` });
     } catch (e) {
       // All target checks precede checkout; restore main even if checkout partially failed.

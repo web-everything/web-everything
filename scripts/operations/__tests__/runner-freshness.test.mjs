@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { withBareOrigin } from './helpers/real-repo.mjs';
@@ -39,6 +39,32 @@ function fixture(options = {}) {
 }
 
 describe('runner freshness policy', () => {
+  it.each([
+    ['attached', 'absent', true], ['attached', 'malformed', true],
+    ['attached', 'ordinary', true], ['attached', 'pinned', false],
+    ['detached', 'absent', false], ['detached', 'malformed', false],
+    ['detached', 'ordinary', true], ['detached', 'pinned', true],
+  ])('open-pr real lane regression matrix: %s HEAD, %s lease (exempt=%s)', async (head, kind, exempt) => {
+    await withBareOrigin(async ctx => {
+      ctx.git(['push', 'origin', 'HEAD:lane/target']);
+      const at = ctx.git(['rev-parse', 'HEAD']).trim();
+      if (head === 'detached') ctx.git(['checkout', '--detach', '--quiet', at]);
+      const pool = join(ctx.tmp, 'pool'), lane = join(pool, 'repo', 'lane-1');
+      mkdirSync(join(pool, 'repo'), { recursive: true });
+      renameSync(ctx.clone, lane);
+      if (kind !== 'absent') {
+        const ordinary = { session: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
+        writeFileSync(join(lane, '.git', '.lane-lease'), kind === 'malformed' ? '{' :
+          JSON.stringify(kind === 'pinned' ? { ...ordinary, at, branch: 'lane/target' } : ordinary));
+      }
+      const check = () => assertRunnerFreshness({ declaration: resolveOperation('open-pr').declaration,
+        moduleUrl: pathToFileURL(join(lane, 'run.mjs')).href }, {
+        env: { ...process.env, LANE_POOL_ROOT: pool, WE_OPERATION_ALLOW_STALE: '1' },
+      });
+      if (exempt) expect(check()).toEqual({ exempt: true });
+      else expect(check).toThrow(/Refusing open-pr pinned runner/);
+    });
+  });
   it('scrubs repository redirection and disables lane-config executable helpers on real Git calls', async () => {
     await withBareOrigin(async ctx => {
       ctx.git(['config', 'core.fsmonitor', 'false']);

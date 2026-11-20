@@ -8,13 +8,13 @@ import { assertRunnerFreshness } from '../runner-freshness.mjs';
 
 const live = { session: 'holder', acquiredAt: new Date().toISOString(), ttlMinutes: 240 };
 const sha = 'a'.repeat(40);
-function run({ lease = { ...live, at: sha, branch: 'lane/target' }, head = sha, tip = sha, unreadable = false, fetchFails = false, attached = false, symbolic = false, symbolicUnreadable = false, headUnreadable = false, env = {} } = {}) {
+function run({ lease = { ...live, at: sha, branch: 'lane/target' }, rawLease, head = sha, tip = sha, unreadable = false, fetchFails = false, attached = false, symbolic = false, symbolicUnreadable = false, headUnreadable = false, env = {} } = {}) {
   const calls = [];
   const check = () => assertRunnerFreshness({ declaration: { name: 'open-pr' }, moduleUrl: 'file:///pool/repo/lane-1/scripts/operations/run.mjs' }, {
     env: { LANE_POOL_ROOT: '/pool', ...env },
     filesystem: {
       realpathSync: p => p,
-      readFileSync: () => { if (unreadable) throw new Error('unreadable lease'); return JSON.stringify(lease); },
+      readFileSync: () => { if (unreadable) throw new Error('unreadable lease'); return rawLease ?? JSON.stringify(lease); },
     },
     git: args => {
       calls.push(args);
@@ -35,6 +35,17 @@ function run({ lease = { ...live, at: sha, branch: 'lane/target' }, head = sha, 
   return { check, calls };
 }
 describe('open-pr pinned runner lease', () => {
+  it.each([
+    ['attached without a readable lease', { attached: true, unreadable: true }],
+    ['attached with malformed lease JSON', { attached: true, rawLease: '{' }],
+    ['attached with an ordinary lease', { attached: true, lease: live }],
+    ['detached with an ordinary lease', { lease: live }],
+    ['detached with an empty ordinary lease', { lease: {} }],
+  ])('preserves the pool exemption: %s', (_name, options) => {
+    const f = run(options);
+    expect(f.check()).toEqual({ exempt: true });
+    expect(f.calls.some(args => args[0] === 'fetch')).toBe(false);
+  });
   it('hardens the real pinned fetch and scrubs inherited repository locations', async () => {
     await withBareOrigin(async ctx => {
       ctx.git(['push', 'origin', 'HEAD:lane/target']);
@@ -63,6 +74,10 @@ describe('open-pr pinned runner lease', () => {
     expect(f.calls).toContainEqual(['fetch', '--quiet', 'origin', '+refs/heads/lane/target:refs/remotes/origin/lane/target']);
   });
   it('refuses an attached HEAD carrying a valid pinned lease', () => expect(run({ attached: true }).check).toThrow(/attached/));
+  it.each([{ at: sha }, { branch: 'lane/target' }, { at: null }, { branch: null }])(
+    'refuses an attached HEAD carrying incomplete pin evidence %j', lease => {
+      expect(run({ attached: true, lease, env: { WE_OPERATION_ALLOW_STALE: '1' } }).check).toThrow(/pinned runner/);
+    });
   it('refuses a symbolic tracking ref after fetch', () => expect(run({ symbolic: true }).check).toThrow(/symbolic/));
   it('refuses unreadable HEAD attachment evidence', () => expect(run({ headUnreadable: true }).check).toThrow());
   it('refuses unreadable tracking-ref evidence', () => expect(run({ symbolicUnreadable: true }).check).toThrow());
@@ -76,7 +91,7 @@ describe('open-pr pinned runner lease', () => {
   it('refuses lease at different from HEAD', () => expect(run({ head: 'b'.repeat(40) }).check).toThrow());
   it('refuses a moved branch tip', () => expect(run({ tip: 'b'.repeat(40) }).check).toThrow());
   it('refuses unreadable origin despite a matching cached tip', () => expect(run({ fetchFails: true }).check).toThrow());
-  it.each([{ at: sha }, { branch: 'lane/target' }, {}, { at: 'short', branch: 'lane/target' }])('refuses incomplete lease %j', lease => expect(run({ lease }).check).toThrow());
+  it.each([{ at: sha }, { branch: 'lane/target' }, { at: 'short', branch: 'lane/target' }])('refuses incomplete lease %j', lease => expect(run({ lease }).check).toThrow());
   it('stale-runner override cannot bypass an invalid pin', () => expect(run({ head: 'b'.repeat(40), env: { WE_OPERATION_ALLOW_STALE: '1' } }).check).toThrow());
   it('refuses an unreadable lease', () => expect(run({ unreadable: true }).check).toThrow());
 });

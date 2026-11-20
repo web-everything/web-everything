@@ -31,7 +31,7 @@ function refused(result) {
 }
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'lane-at-sha-'));
-  origin = join(root, 'origin.git'); reference = join(root, 'reference'); pool = join(root, 'pool');
+  origin = join(root, 'origin.git'); reference = join(root, 'reference'); pool = join(root, '.lanes');
   git(['init', '--quiet', '--bare', '--initial-branch=main', origin], root);
   git(['clone', '--quiet', origin, reference], root);
   writeFileSync(join(reference, 'file.txt'), 'initial'); git(['add', '.']); git(['commit', '--quiet', '-m', 'initial']);
@@ -97,20 +97,59 @@ describe('acquire at an exact pushed branch tip', () => {
     const r = acquire(tip, ['--purpose=conveyor-prepare-item']); refused(r);
     expect(r.stderr).toMatch(/requires a fresh origin\/main/);
   });
-  it.each([[false, false], [true, false], [false, true]])('prepares target dependencies and rolls back failed installs (skip=%s fail=%s)', (skip, installFails) => {
-    writeFileSync(join(reference, 'package.json'), JSON.stringify({ name: 'target-only', version: '1.0.0' }));
+  it.each([false, true])('never installs branch-controlled target dependencies (no-install=%s)', skip => {
+    writeFileSync(join(reference, 'package.json'), JSON.stringify({ name: 'target-only', version: '1.0.0',
+      scripts: { postinstall: 'node -e "process.exit(42)"' } }));
     git(['add', 'package.json']); git(['commit', '-m', 'deps', '--quiet']);
     tip = git(['rev-parse', 'HEAD']); git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
     const bin = join(root, 'npm-bin'); mkdirSync(bin);
     const evidence = join(root, 'install-head');
     writeFileSync(join(bin, 'npm'), '#!/usr/bin/env node\n' +
-      `require('node:fs').writeFileSync(${JSON.stringify(evidence)}, require('node:fs').readFileSync('.git/HEAD', 'utf8')); process.exit(${installFails ? 1 : 0});\n`);
+      `require('node:fs').writeFileSync(${JSON.stringify(evidence)}, require('node:fs').readFileSync('.git/HEAD', 'utf8')); process.exit(1);\n`);
     chmodSync(join(bin, 'npm'), 0o755);
     const r = acquire(tip, [], { TEST_INSTALL: skip ? '' : '1', PATH: `${bin}:${process.env.PATH}` });
-    if (installFails) refused(r);
-    else expect(r.status, r.stderr).toBe(0);
-    expect(existsSync(evidence)).toBe(!skip);
-    if (!skip) expect(readFileSync(evidence, 'utf8').trim()).toBe(tip);
+    expect(r.status, r.stderr).toBe(0);
+    expect(existsSync(evidence)).toBe(false);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
+  });
+  it('rejects an explicit HEAD push to main from a pinned lane after a worker commit', () => {
+    expect(acquire().status).toBe(0);
+    const hooks = join(lane, '.git', 'hooks');
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, 'pre-push'), '#!/bin/sh\nexec ' +
+      `'${process.execPath}' '${resolve('scripts/guard-git-push.mjs')}' "$@"\n`);
+    chmodSync(join(hooks, 'pre-push'), 0o755);
+    git(['config', 'core.hooksPath', hooks], lane);
+    writeFileSync(join(lane, 'file.txt'), 'worker edit');
+    git(['commit', '-am', 'worker edit', '--quiet'], lane);
+    const workerHead = git(['rev-parse', 'HEAD'], lane);
+    const r = spawnSync('git', ['push', 'origin', 'HEAD:refs/heads/main'], {
+      cwd: lane, encoding: 'utf8', env: { ...process.env, MAIN_PUSH_OK: '' },
+    });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/pre-push BLOCKED/);
+    expect(git(['rev-parse', 'refs/heads/main'], origin)).toBe(initial);
+    expect(git(['rev-parse', 'refs/heads/lane/target'], origin)).toBe(tip);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(workerHead);
+    expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('worker edit');
+  });
+  it('bash guard rejects destructive operations from a foreign pinned-lane holder', () => {
+    expect(acquire(tip, [], { CLAUDE_CODE_SESSION_ID: 'pinned-owner' }).status).toBe(0);
+    writeFileSync(join(lane, 'file.txt'), 'precious edit');
+    const beforeLease = readFileSync(lease(), 'utf8');
+    const r = spawnSync(process.execPath, [resolve('scripts/guard-bash.mjs')], {
+      cwd: lane, encoding: 'utf8',
+      input: JSON.stringify({ cwd: lane, session_id: 'foreign-worker',
+        tool_input: { command: 'git checkout -- .' } }),
+      env: { ...process.env, WE_HOOK_ROOT: reference, CLAUDE_CODE_SESSION_ID: 'foreign-worker', LANE_SESSION: '', LANE_CLOBBER_OK: '' },
+    });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).hookSpecificOutput).toMatchObject({ permissionDecision: 'deny' });
+    expect(r.stdout).toMatch(/ANOTHER session/);
+    expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('precious edit');
+    expect(readFileSync(lease(), 'utf8')).toBe(beforeLease);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
+    expect(git(['rev-parse', 'refs/heads/lane/target'], origin)).toBe(tip);
   });
   it('restores the original live lease when its own pinned target is refused', () => {
     expect(run('acquire', ['--lane=1']).status).toBe(0);
