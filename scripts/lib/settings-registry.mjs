@@ -93,7 +93,7 @@ function leafCount(value) {
   if (!object(value)) return 1;
   return settingsLeaves(value).filter(path => !path.split('.').some(k => k.startsWith('$comment'))).length;
 }
-const cell = value => String(value ?? '').replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
+const cell = value => String(value ?? '').replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
 const abbreviated = value => {
   const str = JSON.stringify(value);
   return str.length > 60 ? `${str.slice(0, 59)}…` : str;

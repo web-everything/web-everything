@@ -5,6 +5,7 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import MarkdownIt from 'markdown-it';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -95,6 +96,25 @@ test('render escapes table cells, bounds defaults and sorts constants by impact 
   const md = renderMarkdown(f.build()); assert.ok(md.includes('Pipe \\| and newline.'));
   assert.ok(md.includes('"' + 'v'.repeat(58) + '…')); assert.ok(!md.includes('v'.repeat(60)));
   assert.ok(md.indexOf('HIGH_A') < md.indexOf('HIGH_Z')); assert.ok(md.indexOf('HIGH_Z') < md.indexOf('LOW'));
+});
+test('render round-trips backslashes and pipes in one table cell', t => {
+  const f = fixture(t);
+  const markdown = new MarkdownIt();
+  const betaCells = registry => {
+    const tokens = markdown.parse(renderMarkdown(registry), {});
+    const rows = tokens.flatMap((token, index) => token.type === 'tr_open'
+      ? [tokens.slice(index + 1, tokens.findIndex((next, end) => end > index && next.type === 'tr_close'))
+        .filter(next => next.type === 'inline').map(next => next.children.map(child => child.content).join(''))]
+      : []);
+    return rows.find(cells => cells[0] === 'beta');
+  };
+  const original = betaCells(f.build());
+  ['a\\|b\\', 'a\\', 'a\\\\|b\\', 'a|b', 'a\\\\'].forEach(value => {
+    f.meta.settings.beta.description = value;
+    const actual = betaCells(f.build());
+    assert.equal(actual.length, original.length, 'escaping must preserve the table column count');
+    assert.deepEqual(actual, original.map(cell => cell === 'Fixture beta.' ? value : cell));
+  });
 });
 test('real repository metadata is complete and committed documentation matches the render', () => {
   const registry = buildRegistry({ root: ROOT }); assert.deepEqual(registry.problems, []);
