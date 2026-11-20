@@ -33,7 +33,8 @@ import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
-import { isRunAbandoned, runRecordVersion } from './run-abandoned.mjs';
+import { effectKey } from '../operations/run-record.mjs';
+import { abandonedPath, isRunAbandoned, runRecordVersion } from './run-abandoned.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 /** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
@@ -435,22 +436,35 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const abandonedAdvisory = (run, id, metadata) => {
     const rev = run.findings?.read?.netBasis?.rev;
     if (typeof rev !== 'string' || rev.length !== 40 || cleanRev(rev) === null || rev !== head
-      || verdictOf(run) !== 'accept' || run.outcome === 'refused'
-      || run.pending?.kind !== 'effect' || run.pending.step !== 'advise' || !Array.isArray(run.effects)
+      || verdictOf(run) !== 'accept' || run.outcome === 'refused' || run.verdict?.humanRequired === true || run.humanRequired === true
+      // Match the reaper's protected resumed / awaiting-answer states. An answer field never authorizes abandonment.
+      || run.resumeOf != null || run.resumedAt != null
+      || run.pending?.kind !== 'effect' || run.pending.step !== 'advise'
+      || ['options', 'asks', 'of'].some(key => Object.hasOwn(run.pending, key))
+      || !Number.isInteger(run.pending.stepIndex) || run.pending.stepIndex < 0
+      || !Array.isArray(run.effects) || run.effects.length === 0
       || !run.effects.every(effect => ['review.advisory-note', 'review.advisory-label', 'review.scoped-rereview-shadow'].includes(effect?.type)
+        && effect.stepIndex === run.pending.stepIndex && Number.isInteger(effect.index) && effect.index >= 0
+        && effect.key === effectKey(id, run.pending.stepIndex, effect.index)
         && ['applied', 'declared', 'pending', 'in-flight', 'failed'].includes(effect?.status))) return false;
     try {
       const version = runRecordVersion(metadata);
+      const tombstonePath = abandonedPath(id, runsDir);
+      const tombstoneVersion = runRecordVersion(stat(tombstonePath));
       let bound = false;
       const abandoned = isRunAbandoned(id, runsDir, { fs: {
         readFileSync: (path, encoding) => {
           const bytes = readFileSync(path, encoding);
-          bound = JSON.parse(bytes)?.probes?.recordVersion === version;
+          const probes = JSON.parse(bytes)?.probes;
+          // These are the structured results emitted by --reap-dead-review-runs; by/reason are not death evidence.
+          bound = probes?.recordVersion === version && probes.reviewJobs === 'dead' && probes.handles === 'dead'
+            && probes.writers === 'dead' && probes.leases === 'absent' && probes.sessions === 'absent';
           return bytes;
         },
         statSync: stat,
       } });
-      return abandoned && bound && currentIdentity(id) === currentIdentity(id, () => metadata);
+      return abandoned && bound && currentIdentity(id) === currentIdentity(id, () => metadata)
+        && runRecordVersion(stat(tombstonePath)) === tombstoneVersion;
     } catch { return false; } // Unknown evidence retains the unfinished hold.
   };
   const discardChangedRead = (id, identity) => {
@@ -469,7 +483,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     const mtimes = new Map(), metadataById = new Map();
-    let advisoryAbandoned = false;
+    let advisoryAbandoned = false, newestRejectionStart = -Infinity;
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
@@ -522,6 +536,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     try { end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
+        // Track every non-accept verdict independently of lexical slot ranking, including equal starts on another head.
+        if (hasVerdict(run) && verdictOf(run) !== 'accept') newestRejectionStart = Math.max(newestRejectionStart, reviewStartedAt(hit));
         if (abandonedAdvisory(run, id, metadataById.get(id))) {
           // Neither payload nor unfinished slot: the ordinary reader must still
           // select a finished same-head accept, and newer rejections still hold.
@@ -555,12 +571,15 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       if (error !== budgetExhausted) throw error;
       end = RUN_SCAN_CAPPED;
     }
-    scan = { slots, startless, count, end, newestSettled, boundary, advisoryAbandoned };
+    scan = { slots, startless, count, end, newestSettled, boundary, advisoryAbandoned, newestRejectionStart };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
     const { newest, exact, unfinished, unfinishedExact, since, undecided, active } = scan.slots[order];
     if (scan.advisoryAbandoned && (!exact || unfinishedReview(exact.run) || verdictOf(exact.run) !== 'accept'
-      || (newest && scan.slots[order].newer(newest, exact) && verdictOf(newest.run) !== 'accept'))) {
+      || exact.run.verdict?.humanRequired === true || exact.run.humanRequired === true
+      || !exact.run.effects?.length || !exact.run.effects.every(effect => effect?.status === 'applied')
+      || !exact.run.effects.some(effect => effect.type === 'review.label-swap')
+      || !(scan.newestRejectionStart < reviewStartedAt(exact)))) {
       return { ok: false, reason: 'review-unfinished' };
     }
     const selected = exact ?? newest;

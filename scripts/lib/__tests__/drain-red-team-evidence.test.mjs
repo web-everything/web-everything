@@ -43,6 +43,13 @@ const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { n
 
 describe('tombstone-bound advisory release (#7167 committee)', () => {
   it.each([
+    'humanRequired accepting verdict', 'humanRequired run',
+    'pending options', 'pending asks', 'pending of', 'resumeOf present', 'resumedAt present',
+    'empty advisory effects', 'unbound effect key', 'wrong effect run', 'wrong effect stepIndex',
+    'payload empty effects', 'payload missing label', 'payload failed label', 'payload declared label', 'payload failed extra effect',
+    'missing dead-owner probes', 'incomplete dead-owner probes', 'live owner probe', 'unknown lease probe',
+    'tombstone replaced with empty object', 'tombstone replaced with valid contents', 'tombstone changed in place',
+    'equal-start rejection same head', 'equal-start rejection another head',
     'valid bound tombstone', 'no tombstone', 'unbound tombstone', 'mismatched recordVersion',
     'record replaced between stat and read', 'record replaced after tombstone validation', 'needs-human verdict', 'refused outcome',
     'refused advisory effect', 'non-advise effect step', 'non-effect pending', 'non-advisory effect',
@@ -56,8 +63,24 @@ describe('tombstone-bound advisory release (#7167 committee)', () => {
       stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] };
     const parked = { ...accepted, id: 'review-pr-parked',
       pending: { kind: 'effect', step: 'advise', stepIndex: 2 },
-      effects: [{ key: 'note', stepIndex: 2, index: 0, type: 'review.advisory-note', status: 'pending' }],
+      effects: [{ key: 'review-pr-parked#2#0', stepIndex: 2, index: 0, type: 'review.advisory-note', status: 'pending' }],
       stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(15_000).toISOString() }] };
+    if (kind === 'humanRequired accepting verdict') parked.verdict = { verdict: 'accept', humanRequired: true };
+    if (kind === 'humanRequired run') parked.humanRequired = true;
+    if (kind === 'pending options') parked.pending.options = [];
+    if (kind === 'pending asks') parked.pending.asks = null;
+    if (kind === 'pending of') parked.pending.of = null;
+    if (kind === 'resumeOf present') parked.resumeOf = 'review-pr-earlier';
+    if (kind === 'resumedAt present') parked.resumedAt = new Date(16_000).toISOString();
+    if (kind === 'empty advisory effects') parked.effects = [];
+    if (kind === 'unbound effect key') parked.effects[0].key = 'note';
+    if (kind === 'wrong effect run') parked.effects[0].key = `${accepted.id}#2#0`;
+    if (kind === 'wrong effect stepIndex') parked.effects[0].stepIndex = 1;
+    if (kind === 'payload empty effects') accepted.effects = [];
+    if (kind === 'payload missing label') accepted.effects[0].type = 'review.advisory-note';
+    if (kind === 'payload failed label') accepted.effects[0].status = 'failed';
+    if (kind === 'payload declared label') accepted.effects[0].status = 'declared';
+    if (kind === 'payload failed extra effect') accepted.effects.push({ key: 'note', stepIndex: 1, index: 1, type: 'review.advisory-note', status: 'failed' });
     if (kind === 'needs-human verdict') parked.verdict = { verdict: 'needs-human', humanRequired: true,
       lensVerdicts: { correctness: 'accept', security: 'accept' } };
     if (kind === 'refused outcome') parked.outcome = 'refused';
@@ -74,8 +97,14 @@ describe('tombstone-bound advisory release (#7167 committee)', () => {
     const path = writeRun(parked, f.runsDir);
     utimesSync(path, 20, 20);
     const tombstone = (version = runRecordVersion(statSync(path))) => {
+      const probes = { recordVersion: version, reviewJobs: 'dead', handles: 'dead', writers: 'dead',
+        leases: 'absent', sessions: 'absent', ageMs: 20_000, thresholdMs: 10_000 };
+      if (kind === 'missing dead-owner probes') for (const key of Object.keys(probes)) if (key !== 'recordVersion') delete probes[key];
+      if (kind === 'incomplete dead-owner probes') delete probes.writers;
+      if (kind === 'live owner probe') probes.reviewJobs = 'alive';
+      if (kind === 'unknown lease probe') probes.leases = 'unknown';
       writeFileSync(abandonedPath(parked.id, f.runsDir), JSON.stringify({ at: new Date(25_000).toISOString(),
-        reason: 'owner proven dead', by: 'session-reaper', probes: version === null ? {} : { recordVersion: version } }));
+        reason: 'owner proven dead', by: 'session-reaper', probes: version === null ? {} : probes }));
       utimesSync(abandonedPath(parked.id, f.runsDir), 25, 25);
     };
     if (kind !== 'no tombstone') tombstone(kind === 'unbound tombstone' ? null
@@ -88,6 +117,13 @@ describe('tombstone-bound advisory release (#7167 committee)', () => {
         stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(18_000).toISOString() }] };
       if (kind === 'newer finished rejection on another head') Object.assign(rejected, { pending: null, effects: [] });
       utimesSync(writeRun(rejected, f.runsDir), 22, 22);
+      ids.push(rejected.id);
+    }
+    if (kind.startsWith('equal-start rejection')) {
+      // Lexically earlier than the accept: recovery's id-desc tie-break wrongly hides it.
+      const rejected = { ...accepted, id: 'review-pr-0-rejected', verdict: { verdict: 'changes' },
+        findings: { read: { netBasis: { rev: kind.endsWith('another head') ? 'a'.repeat(40) : f.head } } } };
+      utimesSync(writeRun(rejected, f.runsDir), 12, 12);
       ids.push(rejected.id);
     }
     rmSync(reviewRunIndexPath(f.runsDir), { force: true }); // Exercise the bounded reader without locator hints.
@@ -110,6 +146,17 @@ describe('tombstone-bound advisory release (#7167 committee)', () => {
       stat: name => {
         if (kind === 'unreadable post-read stat' && wasRead && name === path) throw Error('metadata unreadable');
         const metadata = statSync(name);
+        if (kind.startsWith('tombstone ') && wasRead && name === path && !replacedAfterValidation) {
+          replacedAfterValidation = true;
+          const sidecar = abandonedPath(parked.id, f.runsDir);
+          const bytes = kind === 'tombstone replaced with empty object' ? '{}' : readFileSync(sidecar, 'utf8');
+          if (kind === 'tombstone changed in place') writeFileSync(sidecar, `${bytes} `);
+          else {
+            writeFileSync(`${sidecar}.replacement`, bytes);
+            utimesSync(`${sidecar}.replacement`, 25, 25);
+            renameSync(`${sidecar}.replacement`, sidecar);
+          }
+        }
         if (kind === 'record replaced after tombstone validation' && wasRead && name === path && !replacedAfterValidation) {
           replacedAfterValidation = true;
           const replacement = `${path}.replacement`;

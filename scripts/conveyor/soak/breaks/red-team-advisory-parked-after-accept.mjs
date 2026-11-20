@@ -35,7 +35,7 @@ export default {
         stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] };
       const parked = { ...accepted, id: 'review-pr-advisory',
         pending: { kind: 'effect', step: 'advise', stepIndex: 2 },
-        effects: [{ key: 'shadow', type: 'review.scoped-rereview-shadow', stepIndex: 2, index: 0, status: 'pending' }],
+        effects: [{ key: 'review-pr-advisory#2#0', type: 'review.scoped-rereview-shadow', stepIndex: 2, index: 0, status: 'pending' }],
         stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(15_000).toISOString() }] };
       utimesSync(writeRun(accepted, runsDir), 12, 12);
       const parkedPath = writeRun(parked, runsDir);
@@ -45,7 +45,8 @@ export default {
       const missing = read();
       const sidecar = abandonedPath(parked.id, runsDir);
       writeFileSync(sidecar, JSON.stringify({ at: new Date(25_000).toISOString(), reason: 'owner proven dead',
-        by: 'session-reaper', probes: { recordVersion: runRecordVersion(statSync(parkedPath)) } }));
+        by: 'session-reaper', probes: { recordVersion: runRecordVersion(statSync(parkedPath)),
+          reviewJobs: 'dead', handles: 'dead', writers: 'dead', leases: 'absent', sessions: 'absent' } }));
       utimesSync(sidecar, 25, 25);
       const valid = read();
       // Atomic replacement at the same mtime invalidates the old version binding.
