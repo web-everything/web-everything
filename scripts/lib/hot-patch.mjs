@@ -19,7 +19,7 @@ import { resolveHotPatchSettings, hotPatchDefaults } from './hot-patch-settings.
 import { readMergeQueueMembership } from './enqueue-on-event.mjs';
 import { repoSlugFromRemote } from './lane-verify.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
-import { readVerifyResult } from './hot-patch-verify-marker.mjs';
+import { ciVerdict } from './hot-patch-verify-marker.mjs';
 
 const validSha = s => typeof s === 'string' && /^[a-f0-9]{40}$/.test(s);
 export const hotPatchPath = (root, env = process.env) => join(stateDir(env), `${cloneKeyOf(root)}.hot-patch.json`);
@@ -270,11 +270,12 @@ function updateResult({ root, env, sha, result, reason }) {
   });
 }
 
-export async function recordVerifyResult({ root, env = process.env, sha, runGh,
+// Caller/local results are explicitly ignored; GitHub alone supplies the verdict.
+export async function recordVerifyResult({ root, env = process.env, sha, runGh, result: _ignoredLocalResult,
   emit = e => appendDaemonEvent(e, { env }), removeOverlay = removeHotPatchOverlay }) {
-  const evidence = readVerifyResult({ sha, root, env, runGh });
-  if (!evidence.ok) return evidence;
-  const result = evidence.result;
+  const evidence = ciVerdict({ sha, root, env, runGh });
+  if (evidence.state === 'unknown') return { ok: false, ...evidence };
+  const result = evidence.state;
   const out = updateResult({ root, env, sha, result });
   if (out.record) {
     await removeOverlay({ root, env, record: out.record });

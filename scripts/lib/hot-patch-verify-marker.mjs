@@ -9,7 +9,7 @@ export function verifyUrgentMarker(sha) {
 }
 
 /** Read the exact commit's newest Actions test check, ordered solely by numeric run id. */
-export function readVerifyResult({ sha, root = process.cwd(), env = process.env, runGh = runGhSync, settings } = {}) {
+function readVerifyResult({ sha, root = process.cwd(), env = process.env, runGh = runGhSync, settings } = {}) {
   const foreign = [];
   const refuse = () => ({ ok: false, result: 'unknown', foreign,
     reason: 'CI verify unavailable; repair GitHub access/repository or wait for the exact-sha test check and retry verify-result' });
@@ -53,4 +53,14 @@ export function readVerifyResult({ sha, root = process.cwd(), env = process.env,
     }
     return result ? { ok: true, result, run: newest, foreign } : refuse();
   } catch { return refuse(); }
+}
+
+/** The sole CI verdict entry point; local verification is never evidence. */
+export function ciVerdict({ sha, root, env, runGh, settings } = {}) {
+  const evidence = readVerifyResult({ sha, root, env, runGh, settings });
+  return {
+    state: evidence.ok ? evidence.result : 'unknown',
+    reason: evidence.reason ?? `GitHub Actions test check is ${evidence.result}`,
+    runId: evidence.run?.id ?? null,
+  };
 }

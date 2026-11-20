@@ -247,3 +247,16 @@ test('round3: every transitive static relative gate import inside scripts/lib is
     classifyHotPatch({ files: [path], kind: 'incident' }).ok);
   expect(unprotected.sort()).toEqual([]);
 });
+
+for (const local of ['green', 'red']) {
+  for (const ci of ['green', 'red', 'pending', 'missing']) {
+    test(`caller ${local} is ignored when CI is ${ci}`, fixture(async ({ root, env, sha, marker, runGh }) => {
+      marker({ result: ci });
+      const result = await recordVerifyResult({ root, env, sha, result: local, runGh });
+      expect(result.ok).toBe(ci !== 'missing');
+      const record = readHotPatch(root, env);
+      expect(record.owed.verify).toBe(ci === 'missing' ? 'pending' : ci);
+      expect(Boolean(record.rollbackPending)).toBe(ci === 'red');
+    }));
+  }
+}

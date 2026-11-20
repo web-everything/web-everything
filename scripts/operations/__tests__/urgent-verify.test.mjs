@@ -7,6 +7,7 @@ import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import * as urgentIo from '../urgent-verify.mjs';
 import * as hotPatchIo from '../../lib/hot-patch.mjs';
+import * as ciIo from '../../lib/hot-patch-verify-marker.mjs';
 
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
@@ -25,7 +26,7 @@ describe('urgent marker', () => {
     try {
       await resolveOperation('urgent-verify').sinks['urgent-verify.run']({ sha });
       expect(record.mock.calls.map(([input]) => input)).toEqual([
-        { root: 'clone-a', sha, result }, { root: 'clone-c', sha, result },
+        { root: 'clone-a', sha }, { root: 'clone-c', sha },
       ]);
     } finally { verify.mockRestore(); list.mockRestore(); record.mockRestore(); }
   });
@@ -457,3 +458,18 @@ describe('FUI origin binding', () => {
     expect(spawnSync).toHaveBeenCalledTimes(1);
   });
 });
+
+for (const local of ['green', 'red']) {
+  it(`completed local ${local} re-reads CI through the real recorder`, async () => {
+    const verify = vi.spyOn(urgentIo, 'urgentVerify').mockResolvedValue({ marker: { sha, result: local } });
+    const list = vi.spyOn(hotPatchIo, 'listHotPatches').mockReturnValue([{ root: 'clone-a', sha }]);
+    const verdict = vi.spyOn(ciIo, 'ciVerdict').mockReturnValue({ state: 'unknown', reason: 'CI unavailable', runId: null });
+    const record = vi.spyOn(hotPatchIo, 'recordVerifyResult');
+    try {
+      await expect(resolveOperation('urgent-verify').sinks['urgent-verify.run']({ sha })).rejects.toThrow('CI unavailable');
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith({ root: 'clone-a', sha });
+      expect(verdict).toHaveBeenCalledWith(expect.objectContaining({ root: 'clone-a', sha }));
+    } finally { verify.mockRestore(); list.mockRestore(); verdict.mockRestore(); record.mockRestore(); }
+  });
+}

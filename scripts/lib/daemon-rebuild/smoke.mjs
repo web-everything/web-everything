@@ -29,7 +29,7 @@ import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunSc
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { openHotPatchWatch, readHotPatch } from '../hot-patch.mjs';
-import { readVerifyResult } from '../hot-patch-verify-marker.mjs';
+import { ciVerdict } from '../hot-patch-verify-marker.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -678,12 +678,12 @@ export async function smokeAndAdopt({
         const current = readHotPatch(root, stEnv);
         if (approvedHotPatch || current) {
           const watch = readForceWatch(root, stEnv);
-          const verified = readVerifyResult({ sha: current?.sha, root, env: stEnv, runGh });
+          const verified = ciVerdict({ sha: current?.sha, root, env: stEnv, runGh });
           // Pending CI permits live adoption during the full test run; unknown and red refuse.
           if (!current || current.sha !== approvedHotPatch?.sha
             || !(current.sha === p.finalSha || p.applied?.some(a => a.ref === current.branch && a.sha === current.sha))
             || current.owed.verify === 'red' || current.rollbackPending
-            || !verified.ok || verified.result === 'red'
+            || !['green', 'pending'].includes(verified.state)
             || !watch || watch.sha !== p.finalSha || watch.hotPatchSha !== current.sha || watch.rollbackPending) {
             throw new Error('hot-patch evidence changed or unavailable');
           }

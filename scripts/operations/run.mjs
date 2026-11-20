@@ -639,7 +639,7 @@ export const OPERATIONS = Object.freeze({
       const result = await urgentVerify(input);
       if (result.marker?.sha === input.sha && ['green', 'red'].includes(result.marker.result)) {
         for (const record of listHotPatches().filter(r => r.sha === input.sha)) {
-          const linked = await recordVerifyResult({ root: record.root, sha: input.sha, result: result.marker.result });
+          const linked = await recordVerifyResult({ root: record.root, sha: input.sha });
           if (!linked.ok) throw new Error(`hot-patch verify integration refused: ${linked.reason}`);
         }
       }
