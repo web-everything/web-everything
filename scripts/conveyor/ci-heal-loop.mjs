@@ -46,27 +46,31 @@ function cycleLock({ env = process.env, pid = process.pid, now = Date.now } = {}
   };
 }
 
-async function defaultTick() {
-  const { runTickAllRepos, defaultTagDispatchStatus } = await import('../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
-  return runTickAllRepos({ ciHealOnly: true, reuseReconcilePlan: true, tagDispatchStatus: defaultTagDispatchStatus });
+export async function runCiHealTick({ tickOnce, refresh, log } = {}) {
+  const { runTickAllRepos, defaultTagDispatchStatus, withFixDispatchClaimRefresh } = await import('../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+  return withFixDispatchClaimRefresh({
+    tickOnce: tickOnce ?? (() => runTickAllRepos({ ciHealOnly: true, reuseReconcilePlan: true, tagDispatchStatus: defaultTagDispatchStatus })),
+  }, { refresh, log }).tickOnce();
 }
 
-/** One cross-process single-flight iteration. Guard installation failures stop before any dispatch. */
+/** Shared by the child and the real daemon's inline fallback; busy cycles do no work. */
+export async function withCiHealCycleLock(fn, { env = process.env, now = Date.now, lock = cycleLock({ env, now }) } = {}) {
+  if (!lock.reserve().ok) return { skipped: 'busy' };
+  try { return await fn(); } finally { lock.release(); }
+}
+
+/** One cross-process single-flight iteration. Any auth refresh failure stops dispatch. */
 export async function runCiHealLoopIteration({
-  tick = defaultTick, now = Date.now, env = process.env, lock = cycleLock({ env, now }),
+  tick = runCiHealTick, now = Date.now, env = process.env, lock = cycleLock({ env, now }),
   ensureAuth = () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS), write = line => console.error(line),
 } = {}) {
-  if (!lock.reserve().ok) return { skipped: 'busy' };
-  try {
-    try { await ensureAuth(); } catch (error) {
-      if (isGithubAppAuthGuardError(error)) throw error;
-      // As in await-verify's runLoopCycle, the installed guard refuses personal-auth fallback.
-    }
+  return withCiHealCycleLock(async () => {
+    await ensureAuth();
     const start = now();
     const result = await tick();
     write(`ci-heal-loop: completed in ${now() - start}ms`);
     return result;
-  } finally { lock.release(); }
+  }, { lock });
 }
 
 export function spawnCiHealLoop({ env = process.env, spawnFn = nodeSpawn, parentPid = process.pid } = {}) {

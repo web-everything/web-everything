@@ -18,14 +18,29 @@ export default {
   },
   async run({ sourceRoot } = {}) {
     const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
-    const { runTickAllRepos } = await import(pathToFileURL(join(root, 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).href);
+    const { runTickAllRepos, buildCliDaemonEffects } = await import(pathToFileURL(join(root, 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).href);
     const empty = () => ({ dispatched: [], refusals: [], actions: [], notes: [], rows: [] });
     let ciHealCalls = 0;
     const base = { repos: [], fixTick: empty, hungCiTick: empty, mainRedRebaseTick: empty, missingRunTick: empty,
       promoteDraftTick: empty, notesTick: empty, awaitVerifyTick: empty, stuckFixerTick: empty, supersedeTick: empty,
-      rulingStandDownTick: empty, ciHealTick: () => { ciHealCalls += 1; return empty(); } };
+      rulingStandDownTick: empty, authGateOverride: () => ({ paused: false }),
+      fixSettings: { skipEmptySteps: false }, reuseReconcilePlan: false, budgetRotation: {}, prCursors: {},
+      ciHealTick: () => { ciHealCalls += 1; return empty(); } };
     await runTickAllRepos({ ...base, repos: ['x/y'], ciHealInline: false });
-    return { inlineCallsWhenLoopAlive: ciHealCalls };
+    const inlineCallsWhenLoopAlive = ciHealCalls;
+    await runTickAllRepos({ ...base, repos: ['x/y'], ciHealOnly: true });
+    const childHealCalls = ciHealCalls - inlineCallsWhenLoopAlive;
+    const ciHealLoop = { current: () => ({ pid: 42 }) };
+    const effects = buildCliDaemonEffects({ owner: 'soak', ciHealLoop });
+    // Exercise the actual tick call site with a recording effect in place of live daemon IO.
+    let daemonCiHealInline;
+    Function('runTickAllRepos', 'ciHealLoop', 'defaultTagDispatchStatus', 'adoptYieldProbe',
+      `return (${effects.tickOnce.toString()})();`)(options => { daemonCiHealInline = options.ciHealInline; }, ciHealLoop, null, undefined);
+    return { inlineCallsWhenLoopAlive, childHealCalls, daemonCiHealInline };
   },
-  judge: report => (report.inlineCallsWhenLoopAlive === 0 ? [] : ['fix pass ran ci-heal inline although the loop owns it']),
+  judge: report => [
+    ...(report.inlineCallsWhenLoopAlive === 0 ? [] : ['fix pass ran ci-heal inline although the loop owns it']),
+    ...(report.childHealCalls === 1 ? [] : ['child pass did not heal']),
+    ...(report.daemonCiHealInline === false ? [] : ['real daemon tick did not suppress inline healing for its live child']),
+  ],
 };

@@ -62,7 +62,7 @@ import {
 import { runReconcileFixDispatch, writePrivateBorrowedPrompt, routeFixExecutor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
-import { spawnCiHealLoop } from '../../scripts/conveyor/ci-heal-loop.mjs';
+import { spawnCiHealLoop, withCiHealCycleLock } from '../../scripts/conveyor/ci-heal-loop.mjs';
 import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
 import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
@@ -1124,7 +1124,7 @@ export function createPassCallRecorder() {
  */
 export async function runTickAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick, promoteDraftTick, rulingStandDownTick, notesTick, notesDryRun,
-  authGateOverride, ciHealInline = true, ciHealOnly = false,
+  authGateOverride, ciHealInline = true, ciHealOnly = false, ciHealLock = false,
   fixSettings = resolveFixSettings(),
   // Opt-in IO for injected ticks; historical fixtures never acquire a live snapshot.
   readPrs,
@@ -1168,11 +1168,11 @@ export async function runTickAllRepos({
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
-  // Keep the existing fan-outs and ci-heal's budgets/throttles; other phases have no effects in the child.
+  // Keep supersede ahead of healing and ci-heal's budgets/throttles; other phases have no effects in the child.
   if (ciHealOnly) {
     const noop = () => ({ dispatched: [], refusals: [], actions: [], notes: [], rows: [] });
     fixTick = hungCiTick = mainRedRebaseTick = missingRunTick = promoteDraftTick = notesTick = noop;
-    awaitVerifyTick = stuckFixerTick = supersedeTick = rulingStandDownTick = noop;
+    awaitVerifyTick = stuckFixerTick = rulingStandDownTick = noop;
     orphanGuardTick = null;
   }
   callRecorder.reset();
@@ -1473,9 +1473,13 @@ export async function runTickAllRepos({
   // R242 audit round 3: CI-heal must retain its historical flushOwed/flushTimeouts
   // ordering, and notes must write from fresh evidence, even on an empty snapshot.
   // Neither step participates in snapshot sharing or empty-work skipping.
-  const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused || ciHealInline === false ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick && !ciHealOnly ? {} : { queueAdmission, dispatchThrottle }),
-      ...(planCache ? { reconcile: planCache.reconcile } : {}) })));
+  const ciHeal = await timedAsync('ci-heal', async () => {
+    if (authGate.paused || ciHealInline === false) return pausedDispatchResult();
+    const heal = () => runReconcileCiHealDispatchAllRepos({ repos: budgetRepos('ci-heal', repos), tick: boundedPrTick('ci-heal', ciHealTick ?? routedCiHealTick), ...(ciHealTick && !ciHealOnly ? {} : { queueAdmission, dispatchThrottle }),
+      ...(planCache ? { reconcile: planCache.reconcile } : {}) });
+    const result = ciHealLock ? await withCiHealCycleLock(heal) : await heal();
+    return result.skipped === 'busy' ? { ...pausedDispatchResult(), skipped: 'busy' } : result;
+  });
   ciHeal.budgetSkipped = budgets['ci-heal'].skipped;
   planCache?.markTouched(ciHeal);
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
@@ -1792,7 +1796,7 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
     setAdoptYieldProbe: probe => { adoptYieldProbe = probe; },
     tickOnce: () => runTickAllRepos({
       tagDispatchStatus: defaultTagDispatchStatus, adoptYieldProbe,
-      ciHealInline: !ciHealLoop?.current(),
+      ciHealInline: !ciHealLoop?.current(), ciHealLock: true,
     }),
     // A send-back or CI-red label write signals the hand-off mailbox; this sleep wakes on it instead of the interval.
     sleep: createFixHandoffSleep(handoffDir ? { dir: handoffDir } : {}),
@@ -1953,14 +1957,15 @@ async function main() {
   // xv6fciw — keep this daemon's dedicated clone on origin/main, and restart onto new code BETWEEN ticks
   // (launchd KeepAlive brings it back), instead of refusing every dispatch until someone re-syncs by hand.
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
+  // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
+  const effects = withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner, ciHealLoop })), FIX_DISPATCH_APP_AUTH_OPTS), {
+      root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+    }), fixDaemonPrEventsOptions());
+  // withSelfSync sets WE_DAEMON_MANAGED_CLONE during construction. Start children afterwards
+  // so spawn's inherited env carries that marker and bypasses the clone's per-dispatch staleness gate.
   awaitLoop.start();
   ciHealLoop.start();
-  // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
-  const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner, ciHealLoop })), FIX_DISPATCH_APP_AUTH_OPTS), {
-      root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
-    }), fixDaemonPrEventsOptions()),
-  );
+  const { stoppedReason } = await runDaemonLoop(effects);
   exits.loopEnded(stoppedReason);
 }
 

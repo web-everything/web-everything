@@ -1,10 +1,17 @@
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { pathToFileURL } from 'node:url';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { resolveCiHealInterval, runCiHealLoopIteration, runCiHealLoop, spawnCiHealLoop } from '../ci-heal-loop.mjs';
-import { buildDaemonExits, runTickAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+import { resolveCiHealInterval, runCiHealLoopIteration, runCiHealLoop, spawnCiHealLoop, runCiHealTick } from '../ci-heal-loop.mjs';
+import { buildDaemonExits, buildCliDaemonEffects, runTickAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 import * as fixFacts from '../../lib/fix-facts.mjs';
 import * as heavyAdmission from '../../readiness/heavy-admission.mjs';
 import * as resourceGate from '../../lib/resource-gate.mjs';
 import * as authHealth from '../claude-auth-health.mjs';
+import soakBreak from '../soak/breaks/ci-heal-runs-on-own-interval.mjs';
 import { GithubAppAuthGuardError } from '../../lib/github-app-auth-env.mjs';
 
 const empty = () => ({ dispatched: [], refusals: [], actions: [], notes: [], prs: [], rows: [] });
@@ -23,7 +30,7 @@ const lockFixture = () => {
     release: vi.fn(() => { held = false; }),
   };
 };
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe('ci-heal runs on its own interval', () => {
   const resolve = (settings = {}, env = {}) => resolveCiHealInterval({ settings, env });
@@ -72,6 +79,76 @@ describe('ci-heal runs on its own interval', () => {
     expect(tick).not.toHaveBeenCalled();
     expect(lock.release).toHaveBeenCalledTimes(2);
   });
+  it('aborts on an ordinary auth refresh exception and releases the cycle lock', async () => {
+    const lock = lockFixture(), tick = vi.fn();
+    await expect(runCiHealLoopIteration({ lock, tick, ensureAuth: async () => { throw new Error('refresh failed'); } }))
+      .rejects.toThrow('refresh failed');
+    expect(tick).not.toHaveBeenCalled();
+    expect(lock.release).toHaveBeenCalledOnce();
+  });
+  it('refreshes live fix claims before the child tick dispatches', async () => {
+    const calls = [];
+    const result = await runCiHealTick({
+      refresh: async () => { calls.push('refresh'); return { refreshed: [] }; },
+      tickOnce: () => { calls.push('tick'); return 'healed'; },
+    });
+    expect(calls).toEqual(['refresh', 'tick']);
+    expect(result).toBe('healed');
+  });
+  it('initializes self-sync before spawning the child so its env includes the managed clone marker', () => {
+    const source = readFileSync(join(process.cwd(), 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'), 'utf8');
+    const main = source.slice(source.indexOf('async function main()'));
+    expect(main.indexOf('const effects = withPrEvents(withSelfSync(')).toBeGreaterThan(-1);
+    expect(main.indexOf('ciHealLoop.start()')).toBeGreaterThan(main.indexOf('const effects = withPrEvents(withSelfSync('));
+  });
+  it('inline fallback skips while the child cycle lock is held and resumes after release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ci-heal-lock-'));
+    vi.stubEnv('WE_COORDINATION_ROOT', root);
+    const options = fixture();
+    const url = pathToFileURL(join(process.cwd(), 'scripts/conveyor/ci-heal-loop.mjs')).href;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { withCiHealCycleLock } from ${JSON.stringify(url)};
+      await withCiHealCycleLock(() => new Promise(resolve => {
+        process.on('message', () => { process.disconnect(); resolve(); });
+        process.send('held');
+      }));
+    `], { env: { ...process.env, WE_COORDINATION_ROOT: root }, stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+    try {
+      expect((await once(child, 'message'))[0]).toBe('held');
+      const out = await runTickAllRepos({ ...options, ciHealLock: true });
+      expect(out.ciHeal.skipped).toBe('busy');
+      expect(options.ciHealTick).not.toHaveBeenCalled();
+      expect(options.fixTick).toHaveBeenCalledOnce();
+      const exited = once(child, 'exit');
+      child.send('release');
+      expect((await exited)[0]).toBe(0);
+      await runTickAllRepos({ ...options, ciHealLock: true });
+      expect(options.ciHealTick).toHaveBeenCalledOnce();
+    } finally {
+      if (child.exitCode === null) child.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([null, {}])('real daemon tick selects inline healing from current child %s and opts into the cycle lock', child => {
+    const ciHealLoop = { current: () => child };
+    const effects = buildCliDaemonEffects({ owner: 'test', ciHealLoop });
+    const runTickAllRepos = vi.fn();
+    // Evaluate the real factory's tick closure with only its effects replaced, avoiding live daemon IO.
+    Function('runTickAllRepos', 'ciHealLoop', 'defaultTagDispatchStatus', 'adoptYieldProbe',
+      `return (${effects.tickOnce.toString()})();`)(runTickAllRepos, ciHealLoop, null, undefined);
+    expect(runTickAllRepos).toHaveBeenCalledWith(expect.objectContaining({ ciHealInline: !child, ciHealLock: true }));
+  });
+  it('soak break observes child healing and real daemon inline suppression', async () => {
+    vi.spyOn(fixFacts, 'warmFixFacts').mockResolvedValue({});
+    vi.spyOn(heavyAdmission, 'resolveLiveQueueBaseline').mockReturnValue({ bypassed: 'fixture' });
+    vi.spyOn(resourceGate, 'createResourceFixThrottle').mockReturnValue({ tryAdmit: () => ({ admit: true }) });
+    const report = await soakBreak.run();
+    expect(report).toMatchObject({ inlineCallsWhenLoopAlive: 0, childHealCalls: 1, daemonCiHealInline: false });
+    expect(soakBreak.judge(report)).toEqual([]);
+    expect(soakBreak.judge({ ...report, childHealCalls: 0 })).not.toEqual([]);
+    expect(soakBreak.judge({ ...report, daemonCiHealInline: true })).not.toEqual([]);
+  });
   it('sleeps exactly intervalSec*1000 between iterations and exits when its parent is gone', async () => {
     const events = [];
     let alive = true;
@@ -83,7 +160,7 @@ describe('ci-heal runs on its own interval', () => {
     expect(events).toEqual(['tick', 90000, 'tick', 90000]);
   });
   it('spawns a child with the parent PID, inherited environment and stdio', () => {
-    const child = {}, spawnFn = vi.fn(() => child), env = { TEST: 'yes' };
+    const child = {}, spawnFn = vi.fn(() => child), env = { TEST: 'yes', WE_DAEMON_MANAGED_CLONE: '1' };
     expect(spawnCiHealLoop({ spawnFn, env, parentPid: 42 })).toBe(child);
     expect(spawnFn).toHaveBeenCalledWith(process.execPath,
       [expect.stringMatching(/ci-heal-loop\.mjs$/), '--parent-pid=42'], { env, stdio: 'inherit' });
@@ -96,19 +173,21 @@ describe('ci-heal runs on its own interval', () => {
     await runTickAllRepos(options);
     expect(options.ciHealTick).toHaveBeenCalledTimes(1);
   });
-  it('ciHealOnly calls ci-heal and no other half, with real admission and the existing PR budget', async () => {
+  it('ciHealOnly runs supersede before ci-heal, with real admission and the existing PR budget', async () => {
     vi.spyOn(fixFacts, 'warmFixFacts').mockResolvedValue({});
     const baseline = vi.spyOn(heavyAdmission, 'resolveLiveQueueBaseline').mockReturnValue({ bypassed: 'fixture' });
     vi.spyOn(resourceGate, 'createResourceFixThrottle').mockReturnValue({ tryAdmit: () => ({ admit: true }) });
     const options = fixture();
     const result = await runTickAllRepos({ ...options, ciHealOnly: true });
+    expect(options.supersedeTick).toHaveBeenCalledOnce();
+    expect(options.supersedeTick.mock.invocationCallOrder[0]).toBeLessThan(options.ciHealTick.mock.invocationCallOrder[0]);
     expect(options.ciHealTick).toHaveBeenCalledTimes(1);
     expect(options.ciHealTick.mock.calls[0][0]).toMatchObject({ repo: 'repo-a', deadlineAt: expect.any(Number),
       queueAdmission: expect.any(Object), dispatchThrottle: expect.any(Object) });
     expect(baseline).toHaveBeenCalledTimes(1);
     expect(result.ciHeal.refusals).toEqual([]);
     for (const [key, tick] of Object.entries(options)) {
-      if (key.endsWith('Tick') && key !== 'ciHealTick') expect(tick, key).not.toHaveBeenCalled();
+      if (key.endsWith('Tick') && key !== 'ciHealTick' && key !== 'supersedeTick') expect(tick, key).not.toHaveBeenCalled();
     }
   });
   it('ciHealOnly retains the production auth gate and refuses healing when paused', async () => {
