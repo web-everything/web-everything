@@ -1,10 +1,25 @@
 /** Canonical audit-waiver store: append operator rulings; prune explicitly. Invalid or unreadable evidence grants no waiver. */
 import nodeFs from 'node:fs';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { basename, dirname, join, resolve } from 'node:path';
 import { withLedgerAppendLock } from '../lib/ledger-append-lock.mjs';
 
 export const findingsHash = findings => createHash('sha256').update(JSON.stringify(findings)).digest('hex');
+
+/** Conservative ownership key. Different origin spellings retain entries rather than risk deleting them.
+ * Resolve local relative origins against their checkout; never persist credentials from remote URLs.
+ */
+export function waiverRepository(repo, { exec = spawnSync } = {}) {
+  try {
+    const result = exec('git', ['-C', repo, 'remote', 'get-url', 'origin'],
+      { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 });
+    const origin = String(result.stdout ?? '').trim();
+    if (result.error || result.status !== 0 || !origin || /[\s\x00-\x1f]/.test(origin)) return null;
+    const remote = /^[a-z][a-z0-9+.-]*:\/\//i.test(origin) || /^[^/]+:/.test(origin);
+    return createHash('sha256').update(remote ? origin : resolve(repo, origin)).digest('hex');
+  } catch { return null; }
+}
 
 export function storePath(env = process.env) {
   if (typeof env.HOME !== 'string' || !env.HOME.trim()) throw new Error('ruled-weakened store requires HOME');
@@ -48,10 +63,11 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
     return time !== undefined && !(isoTime(entry.at) > time);
   };
 }
-const entryFields = new Set(['ref', 'sha', 'ruling', 'findings', 'actor', 'at', 'quote', 'fingerprint']);
+const entryFields = new Set(['ref', 'sha', 'ruling', 'findings', 'actor', 'at', 'quote', 'fingerprint', 'repository']);
 export function validateEntry(e) {
   return !!e && typeof e === 'object' && !Array.isArray(e)
     && Object.keys(e).every(key => entryFields.has(key))
+    && (!Object.hasOwn(e, 'repository') || (typeof e.repository === 'string' && /^[a-f0-9]{64}$/.test(e.repository)))
     && (!Object.hasOwn(e, 'fingerprint') || (typeof e.fingerprint === 'string' && /^[a-f0-9]{64}$/i.test(e.fingerprint)))
     && nonblank(e.ref) && typeof e.sha === 'string' && /^[a-f0-9]{40}$/i.test(e.sha)
     && typeof e.ruling === 'string' && /^R\d+[a-z]?(?:\+R\d+[a-z]?)*$/.test(e.ruling)
@@ -73,6 +89,7 @@ export function readStore({ path = storePath(), fs = nodeFs, warn = console.warn
       if (!validateEntry(entry)) throw new Error('invalid entry');
       const { ref, sha, ruling, findings, actor, at, quote } = entry;
       entries.push({ ref, sha, ruling, findings, actor, at, quote,
+        ...(Object.hasOwn(entry, 'repository') ? { repository: entry.repository } : {}),
         ...(Object.hasOwn(entry, 'fingerprint') ? { fingerprint: entry.fingerprint } : {}) });
     } catch { warn(`WARNING: ruled-weakened store line ${i + 1}: malformed JSON or invalid entry; ignored`); }
   });
@@ -96,7 +113,19 @@ export function appendEntry(entry, { path = storePath(), fs = nodeFs, now = () =
     if (dedupe) {
       const store = readStore({ path, fs, warn: message => { throw Error(message); } });
       if (store.error) throw Error(`Cannot deduplicate unreadable store: ${store.error}; restore readability and retry`);
-      if (store.entries.some(e => e.ref === value.ref && e.sha.toLowerCase() === value.sha.toLowerCase() && e.ruling === value.ruling)) return null;
+      const sameTuple = e => e.ref === value.ref && e.sha.toLowerCase() === value.sha.toLowerCase() && e.ruling === value.ruling;
+      let index = store.entries.findIndex(e => e.repository === value.repository && sameTuple(e));
+      // The initial recorder snapshot may predate a legacy row; apply the same fallback while locked.
+      if (index < 0) index = store.entries.findIndex(e => !e.repository && sameTuple(e));
+      if (index >= 0) {
+        const prior = store.entries[index];
+        if (prior.fingerprint || !value.fingerprint || JSON.stringify(prior.findings) !== JSON.stringify(value.findings)) return null;
+        // Enrich only missing carry proof; preserve approval time, findings and ownership under the same lock.
+        const upgraded = { ...prior, fingerprint: value.fingerprint };
+        store.entries[index] = upgraded;
+        rewriteStore({ entries: store.entries, path, fs });
+        return upgraded;
+      }
     }
     fs.mkdirSync(dirname(path), { recursive: true });
     let separator = '';
@@ -111,9 +140,11 @@ export function appendEntry(entry, { path = storePath(), fs = nodeFs, now = () =
 }
 
 /** PURE: unknown lookup/carry evidence retains the original entry for operator inspection. */
-export function pruneEntries(entries, { headOf, isMerged, carries }) {
+export function pruneEntries(entries, { repository, headOf, isMerged, carries }) {
   const kept = [], dropped = [];
   for (const entry of entries) {
+    // A branch name (even a colliding live one) does not establish repository ownership.
+    if (!repository || entry.repository !== repository) { kept.push(entry); continue; }
     let drop = false;
     try {
       const head = headOf(entry.ref);

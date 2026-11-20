@@ -1,21 +1,34 @@
 /** Waiver retention, atomic compaction and dry-run CLI wiring, without network IO. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { pruneEntries, rewriteStore, readStore, appendEntry } from '../ruled-weakened-store.mjs';
+import { pruneEntries, rewriteStore, readStore, appendEntry, waiverRepository } from '../ruled-weakened-store.mjs';
 import { pruneStore } from '../ruled-weakened-prune.mjs';
 
 const sha = 'a'.repeat(40), head = 'b'.repeat(40);
-const entry = ref => ({ ref, sha, ruling: 'R12', findings: ['finding'], actor: 'operator', quote: 'approved', at: '2026-11-19T12:00:00Z' });
+const origin = 'https://example.test/team/a.git';
+const repository = createHash('sha256').update(origin).digest('hex');
+const withOrigin = exec => (cmd, args, opts) => args.includes('get-url') ? { status: 0, stdout: origin } : exec(cmd, args, opts);
+const entry = ref => ({ ref, sha, ruling: 'R12', findings: ['finding'], actor: 'operator', quote: 'approved', at: '2026-11-19T12:00:00Z', repository });
 let root, path;
 beforeEach(() => { root = fs.mkdtempSync(join(process.env.TMPDIR, 'waiver-prune-')); path = join(root, 'store.jsonl'); });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
 describe('pruneEntries', () => {
+  it('never probes foreign or unowned entries, even with a colliding ref', () => {
+    const foreign = { ...entry('current'), repository: 'f'.repeat(64) };
+    const legacy = entry('current');
+    delete legacy.repository;
+    const headOf = vi.fn(() => null);
+    expect(pruneEntries([foreign, legacy], { repository, headOf })).toEqual({ kept: [foreign, legacy], dropped: [] });
+    expect(headOf).not.toHaveBeenCalled();
+  });
   it('drops gone, merged and stale entries and retains current and same-diff carried entries in order', () => {
     const entries = ['gone', 'merged', 'stale', 'current', 'carried'].map(entry);
     const carries = vi.fn(e => e.ref === 'carried');
     const result = pruneEntries(entries, {
+      repository,
       headOf: ref => ref === 'gone' ? null : ref === 'current' ? sha.toUpperCase() : head,
       isMerged: ref => ref === 'merged', carries,
     });
@@ -25,7 +38,7 @@ describe('pruneEntries', () => {
   });
   it.each(['headOf', 'isMerged', 'carries'])('keeps an entry when %s throws', key => {
     const e = entry('unknown');
-    const probes = { headOf: () => head, isMerged: () => false, carries: () => false };
+    const probes = { repository, headOf: () => head, isMerged: () => false, carries: () => false };
     probes[key] = () => { throw Error('lookup failed'); };
     expect(pruneEntries([e], probes)).toEqual({ kept: [e], dropped: [] });
   });
@@ -50,6 +63,27 @@ describe('rewriteStore', () => {
 });
 
 describe('prune CLI IO', () => {
+  it('keeps owned entries when origin identity cannot be read despite a successful branch lookup', () => {
+    const e = entry('gone');
+    rewriteStore({ entries: [e], path });
+    const log = vi.fn();
+    const exec = (_cmd, args) => args.includes('get-url') ? { status: 128 } : { status: 0, stdout: '' };
+    expect(pruneStore({ path, exec, log })).toEqual({ kept: [e], dropped: [] });
+    expect(readStore({ path }).entries).toEqual([e]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('Restore origin configuration'));
+  });
+  it('keeps legacy waivers of unknown repository ownership, including absent and colliding refs', () => {
+    const entries = ['lane/we-fix', 'lane/frontier-fix'].map(ref => {
+      const value = entry(ref);
+      delete value.repository;
+      return value;
+    });
+    rewriteStore({ entries, path });
+    const exec = (_cmd, args) => args.includes('ls-remote')
+      ? { status: 0, stdout: `${head}\trefs/heads/lane/we-fix\n` } : { status: 0 };
+    expect(pruneStore({ path, repo: root, exec: withOrigin(exec), log: () => {} })).toEqual({ kept: entries, dropped: [] });
+    expect(readStore({ path }).entries).toEqual(entries);
+  });
   it('dry-run leaves bytes untouched; apply removes absent and merged refs using bounded git calls', () => {
     const entries = ['gone', 'merged', 'current'].map(entry);
     rewriteStore({ entries, path });
@@ -61,9 +95,9 @@ describe('prune CLI IO', () => {
       expect(args.slice(2)).toEqual(['merge-base', '--is-ancestor', expect.any(String), 'origin/main']);
       return { status: args.at(-2) === head ? 0 : 1 };
     });
-    expect(pruneStore({ path, repo: root, exec, dryRun: true, log: () => {} }).kept).toEqual([entries[2]]);
+    expect(pruneStore({ path, repo: root, exec: withOrigin(exec), dryRun: true, log: () => {} }).kept).toEqual([entries[2]]);
     expect(fs.readFileSync(path, 'utf8')).toBe(before);
-    pruneStore({ path, repo: root, exec, log: () => {} });
+    pruneStore({ path, repo: root, exec: withOrigin(exec), log: () => {} });
     expect(readStore({ path }).entries).toEqual([entries[2]]);
   });
   it('failed remote lookup keeps all bytes and reports recovery; failed ancestry keeps the entry', () => {
@@ -74,7 +108,7 @@ describe('prune CLI IO', () => {
     expect(pruneStore({ path, exec: () => ({ status: 128 }), log }).kept).toEqual([e]);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('Restore origin access'));
     const exec = (_cmd, args) => args.includes('ls-remote') ? { status: 0, stdout: `${head}\trefs/heads/current\n` } : { status: 128 };
-    expect(pruneStore({ path, exec, log }).kept).toEqual([e]);
+    expect(pruneStore({ path, exec: withOrigin(exec), log }).kept).toEqual([e]);
     expect(fs.readFileSync(path, 'utf8')).toBe(before);
   });
   it.each(['recorded', 'current'])('retains the waiver through pruneStore when the %s fingerprint is missing', missing => {
@@ -84,7 +118,7 @@ describe('prune CLI IO', () => {
     const exec = (_cmd, args) => args.includes('ls-remote')
       ? { status: 0, stdout: `${head}\trefs/heads/advanced\n` } : { status: 1 };
     const log = vi.fn();
-    expect(pruneStore({ path, repo: root, exec, fingerprint, log })).toEqual({ kept: [e], dropped: [entry('gone')] });
+    expect(pruneStore({ path, repo: root, exec: withOrigin(exec), fingerprint, log })).toEqual({ kept: [e], dropped: [entry('gone')] });
     expect(fingerprint.mock.calls).toEqual([[root, 'origin/main', sha], [root, 'origin/main', head]]);
     expect(readStore({ path }).entries).toEqual([e]);
     expect(log).toHaveBeenCalledWith('Fingerprint lookup failed; keeping entry. Restore local commit objects and retry.');
@@ -95,7 +129,7 @@ describe('prune CLI IO', () => {
     const fingerprint = (_repo, _base, revision) => (sameDiff || revision === sha ? 'c' : 'd').repeat(64);
     const exec = (_cmd, args) => args.includes('ls-remote')
       ? { status: 0, stdout: `${head}\trefs/heads/advanced\n` } : { status: 1 };
-    const result = pruneStore({ path, repo: root, exec, fingerprint, log: () => {} });
+    const result = pruneStore({ path, repo: root, exec: withOrigin(exec), fingerprint, log: () => {} });
     expect(result).toEqual({ kept: sameDiff ? [e] : [], dropped: sameDiff ? [] : [e] });
     expect(readStore({ path }).entries).toEqual(result.kept);
   });
@@ -119,5 +153,19 @@ describe('prune CLI IO', () => {
     fs.writeFileSync(path, '{bad\n');
     expect(() => pruneStore({ path })).toThrow('malformed JSON');
     expect(fs.readFileSync(path, 'utf8')).toBe('{bad\n');
+  });
+});
+
+describe('waiver repository ownership', () => {
+  it('uses the same remote identity across clones and distinguishes relative local origins', () => {
+    const exec = (_cmd, _args) => ({ status: 0, stdout: origin });
+    expect(waiverRepository('/fixture/a', { exec })).toBe(repository);
+    expect(waiverRepository('/fixture/b', { exec })).toBe(repository);
+    const local = () => ({ status: 0, stdout: '../remote.git' });
+    expect(waiverRepository('/fixture/a/lane', { exec: local }))
+      .not.toBe(waiverRepository('/fixture/b/lane', { exec: local }));
+  });
+  it.each(['', 'url\nsecond-url', 'url\u0000'])('rejects missing or malformed origin identity: %j', stdout => {
+    expect(waiverRepository(root, { exec: () => ({ status: 0, stdout }) })).toBeNull();
   });
 });

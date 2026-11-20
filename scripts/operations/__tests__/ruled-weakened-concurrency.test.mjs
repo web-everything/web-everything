@@ -1,6 +1,7 @@
 /** Deterministic process interleaving: an append waits across pruning's snapshot and replacement. */
 import { afterEach, expect, it } from 'vitest';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -9,7 +10,9 @@ import { setTimeout, clearTimeout } from 'node:timers';
 import { readStore, rewriteStore } from '../ruled-weakened-store.mjs';
 
 const sha = 'a'.repeat(40);
-const entry = ref => ({ ref, sha, ruling: 'R12', findings: ['finding'], actor: 'operator', quote: 'approved', at: '2026-11-19T12:00:00Z' });
+const origin = 'https://example.test/team/a.git';
+const repository = createHash('sha256').update(origin).digest('hex');
+const entry = ref => ({ ref, sha, ruling: 'R12', findings: ['finding'], actor: 'operator', quote: 'approved', at: '2026-11-19T12:00:00Z', repository });
 let root;
 afterEach(() => { if (root) fs.rmSync(root, { recursive: true, force: true }); });
 
@@ -43,6 +46,7 @@ it('an operator append during pruning waits for replacement and survives compact
       import fs from 'node:fs';
       import { pruneStore } from ${JSON.stringify(pathToFileURL(resolve('scripts/operations/ruled-weakened-prune.mjs')).href)};
       pruneStore({ path: ${JSON.stringify(path)}, log: () => {}, exec: (_cmd, args) => {
+        if (args.includes('get-url')) return { status: 0, stdout: ${JSON.stringify(origin)} };
         if (args.includes('ls-remote')) {
           process.send('snapshot-read');
           fs.readSync(0, Buffer.alloc(1), 0, 1, null);

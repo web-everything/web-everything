@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { recordEntries, recordWaivers } from '../ruled-weakened-record.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { findingsHash, readStore } from '../ruled-weakened-store.mjs';
+import { readyEvidence } from '../prototype-load.mjs';
+import { pruneStore } from '../ruled-weakened-prune.mjs';
 
 const sha = 'a'.repeat(40), head = 'b'.repeat(40), ref = 'lane/a';
 const FP = 'c'.repeat(64);
@@ -16,6 +18,10 @@ const options = overrides => ({ approvals: [approval], requests: [request], ruli
   latestAudit: () => audit, headOf: () => sha, carries: () => false, now, ...overrides });
 
 describe('bounded approved waiver selection', () => {
+  it('preserves carry proof when first recorded at the exact head', () => {
+    const result = recordEntries(options({ carries: () => FP }));
+    expect(result.entries[0]).toMatchObject({ sha, fingerprint: FP });
+  });
   it('records only current heads with approval ruling and verbatim latest audit findings', () => {
     const result = recordEntries(options({ requests: [request, { ...request, sha: head }],
       approvals: [approval, { ...approval, sha: head }] }));
@@ -110,11 +116,88 @@ function io(overrides = {}) {
     read: file => file.endsWith('rulings.md') ? '**R123**' : JSON.stringify(file.endsWith('waiver-requests.jsonl')
       ? request : file.endsWith('waiver-approvals.jsonl') ? approval : audit),
     readEntries: () => ({ entries: [], error: null }),
-    exec: vi.fn(() => ({ status: 0, stdout: `${sha}\trefs/heads/${ref}\n` })),
+    exec: vi.fn((_cmd, args) => ({ status: 0, stdout: args.includes('get-url')
+      ? 'https://example.test/team/a.git\n' : `${sha}\trefs/heads/${ref}\n` })),
+    fingerprint: () => null,
     append: vi.fn(entry => entry), log: vi.fn(), ...overrides };
 }
 
 describe('recorder IO', () => {
+  it('pruning repository A preserves repository B waivers with absent or identical branch names', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'waiver-repositories-'));
+    const path = join(dir, 'store.jsonl');
+    try {
+      const recordIn = (repo, branch) => recordWaivers(io({ repo, path, append: undefined,
+        readEntries: () => readStore({ path }),
+        read: file => file.endsWith('rulings.md') ? '**R123**' : JSON.stringify(file.endsWith('waiver-requests.jsonl')
+          ? { ...request, ref: branch } : file.endsWith('waiver-approvals.jsonl') ? { ...approval, ref: branch } : audit),
+        exec: (_cmd, args) => ({ status: 0, stdout: args.includes('get-url')
+          ? `https://example.test/team/${repo}.git` : `${sha}\trefs/heads/${branch}\n` }),
+      }));
+      expect(recordIn('a', ref).counts.added).toBe(1);
+      expect(recordIn('b', ref).counts.added).toBe(1);
+      expect(recordIn('b', 'lane/frontier-fix').counts.added).toBe(1);
+      const [a, ...b] = readStore({ path }).entries;
+      expect(a.repository).not.toBe(b[0].repository);
+      const exec = (_cmd, args) => ({ status: 0, stdout: args.includes('get-url')
+        ? 'https://example.test/team/a.git' : args.includes('ls-remote') ? `${sha}\trefs/heads/${ref}\n` : '' });
+      expect(pruneStore({ path, repo: 'a', exec, log: () => {} })).toEqual({ kept: b, dropped: [a] });
+      expect(readStore({ path }).entries).toEqual(b);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('an outdated snapshot upgrades once under the lock and preserves metadata, legacy: %s', legacy => {
+    const dir = mkdtempSync(join(tmpdir(), 'waiver-upgrade-'));
+    try {
+      const cfg = io({ path: join(dir, 'store.jsonl'), append: undefined, headOf: () => sha });
+      recordWaivers(cfg);
+      const [prior] = readStore({ path: cfg.path }).entries;
+      if (legacy) {
+        delete prior.repository;
+        writeFileSync(cfg.path, `${JSON.stringify(prior)}\n`);
+      }
+      cfg.headOf = () => head;
+      cfg.fingerprint = () => FP;
+      cfg.now = () => '2026-11-20T12:00:00Z';
+      expect(recordWaivers(cfg).counts.added).toBe(1);
+      expect(recordWaivers(cfg).counts).toMatchObject({ added: 0, 'skipped-duplicate': 1 });
+      expect(readStore({ path: cfg.path }).entries).toEqual([{ ...prior, fingerprint: FP }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('recording before rebase keeps readiness, including legacy replay: %s', legacy => {
+    const dir = mkdtempSync(join(tmpdir(), 'waiver-rebase-'));
+    try {
+      const cfg = io({ path: join(dir, 'store.jsonl'), append: undefined,
+        headOf: () => sha, fingerprint: () => legacy ? null : FP });
+      const ready = { ref, sha, fingerprint: FP, tests: 'green', audit: 'WEAKENED',
+        auditRuling: approval.ruling, auditDisclosed: audit.findings };
+      recordWaivers(cfg);
+      if (legacy) {
+        // Historical rows predate repository ownership as well as carry fingerprints.
+        const [stored] = readStore({ path: cfg.path }).entries;
+        delete stored.repository;
+        writeFileSync(cfg.path, `${JSON.stringify(stored)}\n`);
+      }
+      expect(readyEvidence([ready], { branch: ref, sha }, readStore({ path: cfg.path }).entries, FP)).not.toBeNull();
+      cfg.headOf = () => head;
+      cfg.fingerprint = () => FP;
+      cfg.readEntries = () => readStore({ path: cfg.path });
+      recordWaivers(cfg);
+      const entries = readStore({ path: cfg.path }).entries;
+      expect(entries).toHaveLength(1);
+      expect(entries[0].at).toBe(now);
+      if (legacy) expect(entries[0]).not.toHaveProperty('repository');
+      expect(readyEvidence([ready], { branch: ref, sha: head }, entries, FP)).not.toBeNull();
+      expect(readyEvidence([ready], { branch: ref, sha: head }, entries, 'd'.repeat(64))).toBeNull();
+      expect(recordWaivers(cfg).counts).toMatchObject({ added: 0, 'skipped-duplicate': 1 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('does not upgrade a legacy duplicate on changed code or replacement findings', () => {
+    const entries = [{ ref, sha, ruling: approval.ruling, findings: audit.findings,
+      actor: 'operator', quote: 'approved', at: now }];
+    expect(recordEntries(options({ entries, headOf: () => head, carries: () => null })).entries).toEqual([]);
+    expect(recordEntries(options({ entries, headOf: () => head, carries: () => FP,
+      latestAudit: () => ({ ...audit, findings: ['replacement'] }) })).entries).toEqual([]);
+  });
   it('uses remote current heads, latest ledger audit and appendEntry metadata, printing counts', () => {
     const cfg = io();
     const read = cfg.read;
@@ -143,7 +226,7 @@ describe('recorder IO', () => {
       : file.endsWith('waiver-requests.jsonl') ? `${JSON.stringify(request)}\n${JSON.stringify(request)}`
         : JSON.stringify(file.endsWith('waiver-approvals.jsonl') ? approval : audit) });
     expect(recordWaivers(cfg).counts.added).toBe(0);
-    expect(cfg.exec).toHaveBeenCalledTimes(1);
+    expect(cfg.exec.mock.calls.filter(([, args]) => args.includes('ls-remote'))).toHaveLength(1);
     expect(cfg.append).not.toHaveBeenCalled();
   });
   it('oversized input refuses all writes with archive-and-retry guidance', () => {

@@ -4,23 +4,23 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { appendEntry, readStore, storePath, validateEntry, findingsHash } from './ruled-weakened-store.mjs';
+import { appendEntry, readStore, storePath, validateEntry, findingsHash, waiverRepository } from './ruled-weakened-store.mjs';
 import { QUESTION_HASH, findAudit } from './codex-audit.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 
 const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim();
 const shaKey = sha => typeof sha === 'string' ? sha.toLowerCase() : '';
 const key = entry => JSON.stringify([bareRef(entry.ref), shaKey(entry.sha)]);
-const identity = entry => JSON.stringify([entry.ref, shaKey(entry.sha), entry.ruling]);
+const identity = entry => JSON.stringify([entry.repository ?? null, entry.ref, shaKey(entry.sha), entry.ruling]);
 const validSha = sha => typeof sha === 'string' && /^[a-f0-9]{40}$/i.test(sha);
 const validRef = ref => typeof ref === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(ref)
   && !ref.includes('..') && !ref.includes('//') && !ref.endsWith('/') && !ref.endsWith('.lock');
 
 /** Pure selection with synchronous injected lookups. carries returns the proven net-diff fingerprint, or null; a boolean alone grants no waiver. */
-export function recordEntries({ approvals, requests, rulings, entries, latestAudit, headOf, carries, now }) {
+export function recordEntries({ approvals, requests, rulings, entries, latestAudit, headOf, carries, now, repository }) {
   const approved = new Map(approvals.map(a => [key(a), a]));
   const withdrawn = new Set(requests.filter(r => r.ruling === 'WITHDRAWN').map(key));
-  const seen = new Set(entries.map(identity));
+  const seen = new Map(entries.map(entry => [identity(entry), entry]));
   const added = [];
   const counts = { added: 0, 'skipped-not-head': 0, 'skipped-duplicate': 0, 'skipped-invalid': 0 };
   for (const request of requests) {
@@ -36,15 +36,22 @@ export function recordEntries({ approvals, requests, rulings, entries, latestAud
       counts['skipped-invalid']++; continue;
     }
     let entry = { ref, sha, ruling };
-    if (seen.has(identity(entry))) { counts['skipped-duplicate']++; continue; }
+    const legacy = seen.get(identity(entry));
+    if (repository) entry.repository = repository;
+    const prior = seen.get(identity(entry)) ?? legacy;
+    if (prior?.fingerprint) { counts['skipped-duplicate']++; continue; }
     try {
       const head = headOf(ref);
       if (!validSha(head)) { counts['skipped-not-head']++; continue; }
-      if (sha !== shaKey(head)) {
-        const fingerprint = carries(entry, head);
-        if (!carriesAcross(fingerprint, fingerprint)) { counts['skipped-not-head']++; continue; }
-        entry = { ...entry, fingerprint };
+      const fingerprint = carries(entry, head);
+      const proven = carriesAcross(fingerprint, fingerprint);
+      if (sha !== shaKey(head) && !proven) { counts['skipped-not-head']++; continue; }
+      if (prior && (!proven || JSON.stringify(prior.findings) !== JSON.stringify(request.findings))) {
+        counts['skipped-duplicate']++; continue;
       }
+      if (proven) entry = { ...entry, fingerprint };
+      // Replaying a legacy row may enrich its proof, but cannot infer its original repository.
+      if (prior && !prior.repository) delete entry.repository;
       const audit = latestAudit(sha);
       if (!audit || shaKey(audit.head) !== sha || shaKey(audit.base) === sha
         || audit.questionHash !== QUESTION_HASH || audit.verdict !== 'WEAKENED'
@@ -56,7 +63,7 @@ export function recordEntries({ approvals, requests, rulings, entries, latestAud
       entry = { ...entry, findings: request.findings, actor: 'record-waivers', quote: ruling, at: now };
       if (!validateEntry(entry)) throw Error('incomplete canonical findings');
     } catch { counts['skipped-invalid']++; continue; }
-    seen.add(identity(entry));
+    seen.set(identity(entry), entry);
     added.push(entry);
   }
   counts.added = added.length;
@@ -102,6 +109,7 @@ export function recordWaivers({ env = process.env, repo = process.cwd(), path = 
     return heads.get(ref) ?? null;
   };
   const result = recordEntries({ approvals, requests, rulings, entries: store.entries,
+    repository: waiverRepository(repo, { exec }),
     latestAudit: latestAudit ?? (sha => audits.findLast(a => shaKey(a.head) === sha) ?? null),
     headOf: headOf ?? remoteHead,
     carries: carries ?? ((entry, head) => {

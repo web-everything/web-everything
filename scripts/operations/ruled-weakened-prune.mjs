@@ -4,7 +4,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { readStore, pruneEntries, rewriteStore, storePath, withRuledWeakenedLock } from './ruled-weakened-store.mjs';
+import { readStore, pruneEntries, rewriteStore, storePath, withRuledWeakenedLock, waiverRepository } from './ruled-weakened-store.mjs';
 import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 
 export function pruneStore({ dryRun = false, repo = process.cwd(), path = storePath(), exec = spawnSync, log = console.log, lockOptions, fingerprint = netDiffFingerprint } = {}) {
@@ -21,7 +21,12 @@ export function pruneStore({ dryRun = false, repo = process.cwd(), path = storeP
       else heads.set(match[2], match[1]);
     }
     if (lookupError) log('Ref lookup failed; keeping all entries. Restore origin access and retry.');
+    const repository = waiverRepository(repo, { exec });
+    if (!repository) log('Repository identity unavailable; keeping all entries. Restore origin configuration and retry.');
+    else if (store.entries.some(entry => !entry.repository))
+      log('Keeping legacy waivers without repository ownership; inspect their original repository before manual retirement.');
     const result = pruneEntries(store.entries, {
+      repository,
       headOf: ref => { if (lookupError) throw Error('ref lookup failed'); return heads.get(ref.replace(/^refs\/heads\//, '')) ?? null; },
       isMerged: ref => {
         const head = heads.get(ref.replace(/^refs\/heads\//, ''));
