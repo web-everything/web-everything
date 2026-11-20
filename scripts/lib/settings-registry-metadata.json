@@ -932,6 +932,36 @@
       "changeVia": "pr",
       "instant": false
     },
+    "forgeSlots": {
+      "description": "Forge execution pool size by host, with a default for unlisted hosts.",
+      "owner": "scripts/settings/forge-slots.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "authority": {
+      "description": "Repository grant for orchestrator red-main quarantine authority.",
+      "owner": "scripts/settings/orchestrator-authority.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "seatDailyCaps": {
+      "description": "Daily review seat caps by provider.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "advisorySeats": {
+      "description": "Provider advisory review seating policy.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
+    "externalJurors": {
+      "description": "First-output timeout and cooldown for external review jurors.",
+      "owner": "scripts/settings/review.json",
+      "changeVia": "pr",
+      "instant": false
+    },
     "deliveryPriority": {
       "description": "Delivery priority mode, aging, P0 concurrency and unblock weight.",
       "owner": "scripts/lib/delivery-priority-settings.json",
@@ -940,6 +970,16 @@
     }
   },
   "capacityLeaves": {
+    "fix.conflictFixesPerPass": {
+      "description": "Conflict-fix dispatch allowance per pass.",
+      "range": "integer 0–24",
+      "unit": "fixes/pass"
+    },
+    "fix.conflictFixExemptPerPass": {
+      "description": "Mechanical conflict-fix exemptions per pass.",
+      "range": "integer 0–10",
+      "unit": "fixes/pass"
+    },
     "reviewConcurrency.maxLiveReviewRounds": {
       "description": "Maximum live host review rounds.",
       "range": "integer 1–16",

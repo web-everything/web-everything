@@ -16,10 +16,10 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 151 (153 declaration rows).
-- Declared leaves: 562 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 151.
-- Instant capacity leaves: 9.
+- Top-level keys: 156 (158 declaration rows).
+- Declared leaves: 573 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 156.
+- Instant capacity leaves: 11.
 - Constants to settle: 312.
 - Instant gaps: 28.
 
@@ -34,6 +34,8 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | deliveryCapacity.holdUntil | positive safe integer ≤ now + 72 hours | epoch milliseconds | yes | End of a delivery capacity hold. |
 | deliveryCapacity.pinUnits | integer 1–200 | units | yes | Pinned delivery capacity. |
 | deliveryCapacity.pinUntil | positive safe integer ≤ now + 72 hours | epoch milliseconds | yes | Expiry of a delivery capacity pin. |
+| fix.conflictFixExemptPerPass | integer 0–10 | fixes/pass | yes | Mechanical conflict-fix exemptions per pass. |
+| fix.conflictFixesPerPass | integer 0–24 | fixes/pass | yes | Conflict-fix dispatch allowance per pass. |
 | host.maxReviewDispatchPerTick | integer 1–16 | dispatches/tick | yes | Maximum host review dispatches per tick. |
 | redTeamQueue.minConcurrent | integer 0–24 | jobs | yes | Minimum concurrent red-team jobs. |
 | resourceGate.fixCap.ceiling | integer 1–24 | workers | yes | Maximum adaptive fix capacity. |
@@ -52,12 +54,14 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | acceptCarryForward | scripts/settings/accept-carry-forward.json | 1 | "on" | pr | no | Carry an accept to a new head with an identical reviewed net diff. |
 | accounts | scripts/settings/claude-accounts.json | 6 | {"a":{"service":"we.claude-code.oauth","account":"acct-a","… | pr | no | Claude account IDs mapped to Keychain credentials, without secret values. |
 | adoption | scripts/settings/prototype-load.json | 2 | {"timeoutMs":600000,"pollMs":15000} | pr | no | Prototype load adoption timeout and polling interval. |
+| advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
 | audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
 | auditRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/audits.jsonl" | pr | no | Audit coordination record location. |
+| authority | scripts/settings/orchestrator-authority.json | 1 | {"redMainQuarantine":false} | pr | no | Repository grant for orchestrator red-main quarantine authority. |
 | autoRoundGrant | scripts/settings/review.json | 3 | {"cardOnly":{"enabled":true,"maxPerPr":3,"repos":["web-ever… | pr | no | Automatic bounded extra review rounds for eligible card-only work. |
 | backlog | scripts/settings/card-numbering.json, scripts/settings/number-at-birth.json | 3 | {"cardNumbering":{"mode":"rename-before-enqueue","numberAtB… | pr | no | Card numbering and remote numbering policy. |
 | benchmarkSource | scripts/settings/coroner-postmortem.json | 1 | "open-pr-time-loss.md (2026-10-16), 50 PRs; p90 upper bound… | pr | no | Source of the recorded delivery handoff benchmarks. |
@@ -99,7 +103,8 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | enforce | scripts/settings/claude-accounts.json | 1 | false | pr | no | Enable Claude daemon account enforcement. |
 | entries | scripts/settings/privacy-terms-allowlist.json | 1 | [{"path":"scripts/lib/__tests__/daemon-jobs-runtime.test.mj… | pr | no | Explicit portability exceptions pinned to matched text and line hashes. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
-| fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 17 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
+| externalJurors | scripts/settings/review.json | 2 | {"firstOutputMs":120000,"cooldownMs":1800000} | pr | no | First-output timeout and cooldown for external review jurors. |
+| fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
 | fixDispatch | scripts/dispatch-settings.json, scripts/settings/fix-empty-steps.json | 8 | {"borrowBuildSlots":"on","borrowAfterMinutes":15,"borrowExe… | pr | no | Fix slot borrowing, parked-run accounting and completion release policy. |
 | fixDispatchMaxConcurrent | scripts/dispatch-settings.json | 1 | 2 | pr | no | Maximum concurrent fix dispatches. |
 | fixExecutor | scripts/settings/fix-executor.json | 2 | {"fallbackChain":["codex","codex-alt","claude"],"criticalCl… | pr | no | Fix executor fallback chain and critical Claude routing rung. |
@@ -107,6 +112,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | fixPassBudget | scripts/settings/fix-pass-budget.json | 3 | {"stuckFixersMs":120000,"ciHealMs":180000,"promoteDraftMs":… | pr | no | Per-pass time budgets for fixer recovery and draft promotion. |
 | fixScope | scripts/settings/fix-scope.json | 1 | {"regionMarginLines":3} | pr | no | Line margin around a finding region in fix scope. |
 | floorMb | scripts/settings/node-heap-cap.json | 1 | 1024 | pr | no | Minimum child-process V8 old-space cap in megabytes. |
+| forgeSlots | scripts/settings/forge-slots.json | 3 | {"default":8,"hosts":{"forge":14,"forge-b":8}} | pr | no | Forge execution pool size by host, with a default for unlisted hosts. |
 | freeze | scripts/dispatch-settings.json | 1 | {"mainRed":"on"} | pr | no | Main-red dispatch freeze policy. |
 | freezeReadLastGoodTtlMin | scripts/settings/red-main-hold.json | 1 | 10 | pr | no | Lifetime in minutes of the last good freeze read. |
 | ghAuth | scripts/settings/github-auth.json | 1 | {"personalFallback":"refuse"} | pr | no | Policy for falling back to personal GitHub authentication. |
@@ -130,7 +136,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | mergeDelivery | scripts/settings/merge-queue.json | 6 | {"strategy":"github-merge-queue","batchSize":5,"maxGroupWai… | pr | no | Merge strategy, batch size, wait time and call concurrency. |
 | mergeFreshness | scripts/settings/merge-queue.json | 5 | {"enabled":true,"maxAgeMinutes":30,"allowDisjointMainMoves"… | pr | no | Freshness age, disjoint main moves and retest scope. |
 | mergeGate | scripts/settings/merge-gate.json | 2 | {"candidacyHoldIsNotCiFailure":"on","prEventCandidacyHoldsP… | pr | no | Treatment of candidacy holds in merge-gate checks. |
-| mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 29 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
+| mergeQueue | scripts/settings/approved-human-surface-hold.json, scripts/settings/human-only-enqueue.json, scripts/settings/merge-queue-numbering.json, scripts/settings/merge-queue-obsolete-runs.json, scripts/settings/merge-queue-refresh.json, scripts/settings/merge-queue.json | 31 | {"skipRebaseApprovedHumanSurface":"on","humanOnly":{"approv… | pr | no | Enqueue, human approval, card numbering and obsolete-run cancellation policy. |
 | mergeQueueBatching | scripts/settings/merge-queue-batching.json | 3 | {"enabled":true,"groupSize":3,"maxGroupsInFlight":8} | pr | no | Merge queue group size and groups in flight. |
 | minNonClaudeSeats | scripts/settings/review.json | 1 | 1 | pr | no | Minimum number of non-Claude review seats. |
 | modes | scripts/settings/delivery-routes.json | 4 | {"debug":"DEBUG MODE (R817/R823/R826/R852). Diagnose on the… | pr | no | Instructions defining the available delivery modes. |
@@ -177,6 +183,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | routing | scripts/settings/routing.json | 4 | {"builder":"auto","auditProvider":"codex","codexReserveForA… | pr | no | Builder and audit provider routing based on quota and reservations. |
 | ruledWeakened | scripts/settings/prototype-load.json | 1 | [{"ref":"lane/redteam-check-run","sha":"dc7a0efb1c64862460b… | pr | no | Pinned audit weakenings explicitly accepted by operator rulings. |
 | runs | scripts/settings/runs-scan.json | 0 | {"scan":{}} | pr | no | Bounds on run record parsing. |
+| seatDailyCaps | scripts/settings/review.json | 1 | {"codex":600} | pr | no | Daily review seat caps by provider. |
 | seatsByTouchSet | scripts/settings/review.json | 1 | "on" | pr | no | Select review seats using the touched paths. |
 | session | scripts/settings/orchestrator-session.json | 1 | {"orchestratorDelegateCommands":["node scripts/operations/r… | pr | no | Commands permitted for orchestrator delegation. |
 | shadowSeats | scripts/settings/review.json | 9 | {"antigravity":{"model":"gemini-4-carbon-high","trialReview… | pr | no | Shadow review provider trials, sample rate and promotion policy. |
