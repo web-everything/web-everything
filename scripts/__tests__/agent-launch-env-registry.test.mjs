@@ -478,7 +478,8 @@ describe('parent parity minus never; caller bag stays tighten-only', () => {
       expect(env, source).not.toHaveProperty(name);
     }
   });
-  it.each(['WE_DEFAULT_BRANCH_CACHE_DIR', 'WE_FAST_DRAIN_CONTEXT', 'WE_FULL_SUITE_ESCAPE_LOG',
+  it.each(['WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS',
+    'WE_DEFAULT_BRANCH_CACHE_DIR', 'WE_FAST_DRAIN_CONTEXT', 'WE_FULL_SUITE_ESCAPE_LOG',
     'WE_REVIEW_UI_FAST_LANE', 'WE_UI_FAST_LANE_REPO_DIR'])(
     'CI drift: %s is classified, preserves ambient policy and excludes caller overrides', name => {
       expect(unclassified(namesIn(`process.env.${name}`))).toEqual([]);

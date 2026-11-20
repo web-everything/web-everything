@@ -386,6 +386,7 @@
   "WE_DAEMON_OVERLAY_MAIN_SYNC": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_DAEMON_OVERLAY_MAIN_SYNC_FLAKE_RERUNS": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_DAEMON_OVERLAY_MAIN_SYNC_MAIN_RED_EXPIRY_HOURS": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
+  "WE_DAEMON_OVERLAY_MAIN_SYNC_NETWORK_BACKOFF_MS": {"class": "drop", "why": "Preserve the ambient bounded fetch retry schedule; caller-bag retry tuning stays excluded. Evidence: scripts/lib/daemon-rebuild/overlay-main-sync.mjs:104."},
   "WE_DAEMON_OVERLAY_STACK_BASES": {"class": "forward-restrictive", "why": "Presence pins overlay base evidence and suppresses live GitHub inference; preserve the parent base map. Evidence: scripts/daemon-overlay.mjs:150; scripts/daemon-overlay.mjs:832.", "precedence": "ambient"},
   "WE_DAEMON_OVERLAY_STACK_MODE": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
   "WE_DAEMON_REBUILD_AS_JOB": {"class": "drop", "why": "Caller override is not required by the agent; keep the owning tool default."},
