@@ -22,7 +22,12 @@ const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
 };
-export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo, aiRouting, capacity, now = Date.now(), quota, records, record } = {}) {
+/** Resolve each repair kind independently; a fix-filtered suffix cannot be reused for CI-heal. */
+export function resolveRepairExecutorChains(options = {}) {
+  return Object.fromEntries(['fix', 'ci-heal'].map(kind => [kind, resolveFixExecutorChain({ ...options, kind })]));
+}
+
+export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo, aiRouting, kind = 'fix', capacity, now = Date.now(), quota, records, record } = {}) {
   // Read through the declared reader so a malformed routing.json surfaces and fails closed to claude.
   const declared = repo === undefined ? readDeclaredSettings() : null;
   if (declared) repo = declared.settings;
@@ -38,7 +43,7 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   }
   // routing.builder=claude (or auto over the quota threshold) drops the codex rungs from every layer, env included.
   // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
-  const chosen = effectiveBuilder({ env, ...(declared ? { declared } : { repo }), kind: 'fix', capacity, now, quota, records, record });
+  const chosen = effectiveBuilder({ env, ...(declared ? { declared } : { repo }), kind, capacity, now, quota, records, record });
   if (chosen.decision) {
     // Unknown usage preserves preference, not eligibility: filter every decision.
     // Remove ineligible rungs, then start at the scored winner. A suffix preserves
@@ -52,7 +57,7 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
       const eligible = observations.map(c => ({ ...c, ...definition, provider, windows: c.windows, held: c.held,
         active: c.active === false ? false : definition?.active, tier: c.tier ?? definition?.tier,
         allowedKinds: c.allowedKinds ?? definition?.allowedKinds }));
-      if (eligible.some(c => capacityEligibility(c, 'fix', { ...chosen.settings.capacity, now }).eligible)) kept.push(id);
+      if (eligible.some(c => capacityEligibility(c, kind, { ...chosen.settings.capacity, now }).eligible)) kept.push(id);
     }
     const winner = chosen.decision.provider === 'agy-gemini' ? 'argon' : chosen.decision.provider;
     const start = chosen.decision.reason === 'capacity-score' ? kept.indexOf(winner) : -1;

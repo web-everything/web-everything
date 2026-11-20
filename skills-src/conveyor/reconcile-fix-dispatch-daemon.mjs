@@ -81,7 +81,7 @@ import { resolveCascade } from '../../scripts/lib/policy-cascade.mjs';
 import { stopSession } from '../../scripts/operations/dispatch-abort.mjs';
 import { runOrphanFixRoundPass } from '../../scripts/conveyor/orphan-fix-round.mjs';
 import { createStaleBaseGate } from '../../scripts/conveyor/stale-base-refresh.mjs';
-import { resolveFixExecutorChain } from '../../scripts/lib/fix-executor-chain.mjs';
+import { resolveRepairExecutorChains } from '../../scripts/lib/fix-executor-chain.mjs';
 import { resolveAiRouting, aiRoutingInputs, AI_ROUTING_STANDARD } from '../../scripts/lib/ai-routing.mjs';
 import { criticalWorkVerdict } from '../../scripts/lib/critical-work.mjs';
 import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
@@ -1268,9 +1268,9 @@ export async function runTickAllRepos({
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
-  const chain = resolveFixExecutorChain({ aiRouting: resolveFixChainInput() });
+  const chains = resolveRepairExecutorChains({ aiRouting: resolveFixChainInput() });
   const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
-    setting: executorSetting, chain, fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
+    setting: executorSetting, chain: chains[planned.kind === 'ci-heal' ? 'ci-heal' : 'fix'], fixSettings, launcherAvailable: e => fixLauncherAvailable(e),
     criticalFor: planned => criticalWorkVerdict({ taskType: planned.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: planned.scope ?? [] }).critical,
   });
   const routedCiHealTick = (options) => {

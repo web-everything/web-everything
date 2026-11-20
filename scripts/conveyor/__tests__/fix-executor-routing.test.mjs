@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 // Legacy launch assertions use shipped policy with capacity scoring switched off.
 vi.mock('../../lib/settings-files.mjs', async importOriginal => {
   const actual = await importOriginal();
@@ -13,6 +14,60 @@ import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/disp
 import { dispatchFix, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
+describe('CI-heal capacity eligibility reaches the launch boundary', () => {
+  it('the daemon selects the independently resolved chain for the planned repair kind', () => {
+    const source = readFileSync(new URL('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', import.meta.url), 'utf8');
+    expect(source).toContain('const chains = resolveRepairExecutorChains({ aiRouting: resolveFixChainInput() });');
+    expect(source).toContain("chain: chains[planned.kind === 'ci-heal' ? 'ci-heal' : 'fix']");
+  });
+  it.each([
+    ['kind restriction', { tier: 3, allowedKinds: ['fix'] }, false, false],
+    ['tier restriction', { tier: 1, allowedKinds: ['fix', 'ci-heal'] }, false, false],
+    ['both restrictions', { tier: 1, allowedKinds: ['fix'] }, false, false],
+    ['unknown usage', { tier: 1, allowedKinds: ['fix'] }, true, false],
+    ['no eligible executor', { tier: 1, allowedKinds: ['fix'] }, false, true],
+  ])('%s excludes Codex from CI-heal while preserving ordinary fixes', async (_name, restriction, unknown, excludeClaude) => {
+    const { resolveRepairExecutorChains } = await import('../../lib/fix-executor-chain.mjs');
+    const { PROVIDER_DEFAULTS } = await import('../../lib/provider-capacity.mjs');
+    const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+    const now = Date.parse('2026-11-20T15:00:00Z');
+    const providers = PROVIDER_DEFAULTS.providers.map(p => ['codex', 'codex-alt'].includes(p.id)
+      ? { ...p, ...restriction } : p.id === 'claude'
+        ? { ...p, tier: 3, allowedKinds: excludeClaude ? ['fix'] : ['fix', 'ci-heal'] } : p);
+    const capacity = [['codex', 1, 1], ['claude', 80, 120]].map(([provider, usedPercent, hours]) => ({
+      provider, health: 1, known: !unknown,
+      windows: unknown ? [] : [{ usedPercent, resetsAt: now + hours * 3600000, lengthHours: 168 }],
+    }));
+    const chains = resolveRepairExecutorChains({ env: {}, platform: {}, now, capacity,
+      repo: { routing: { builder: 'auto' }, providerCapacity: { providers, minimumTiers: { fix: 1, 'ci-heal': 3 } } },
+      quota: () => ({ used_percent: 1 }), record: () => {} });
+    expect(chains.fix.value[0]).toBe('codex');
+    const launchCodex = vi.fn(() => 'pid:1');
+    const launchClaude = vi.fn(() => ({ spawned: true }));
+    const dispatch = vi.fn(async (_planned, { sinks }) => sinks.launch({ sessionSlug: 'ci-heal-42', prompt: 'P' }));
+    const route = planned => routeFixExecutor(planned, {
+      setting, chain: chains[planned.kind ?? 'fix'], fixSettings: { strongerModelFromRound: 3 },
+      loadLadder: () => null, readRouted: () => ({}), criticalFor: () => false, launcherAvailable: () => true,
+    });
+    const run = createRoutedCiHealDispatch({ dispatch, route, launchCodex,
+      createSinks: ({ provider }) => ({ launch: provider ?? launchClaude }),
+      writePrompt: () => '/tmp/ci-heal-capacity.md', removePrompt: vi.fn(), stampExecutor: vi.fn(),
+      profileFor: () => ({ slug: 'o/r' }),
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await run({ pr: 42, scope: ['we:scripts/example.mjs'] });
+      expect(launchCodex).not.toHaveBeenCalled();
+      expect(chains['ci-heal'].value).toEqual(excludeClaude ? [] : ['claude']);
+      if (excludeClaude) {
+        expect(result.held).toBe(true);
+        expect(dispatch).not.toHaveBeenCalled();
+      } else expect(launchClaude).toHaveBeenCalledOnce();
+      expect(route({ pr: 42, kind: 'ci-heal', round: 3 }).executor).toBe(excludeClaude ? null : 'claude');
+    } finally { log.mockRestore(); }
+  });
+});
+
 it('ordinary fix starts on the capacity winner without escalating from Claude back to Codex', async () => {
   const { resolveFixExecutorChain } = await import('../../lib/fix-executor-chain.mjs');
   const now = Date.parse('2026-11-20T15:00:00Z');
