@@ -489,7 +489,7 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       const one = { ...rec, body: `${rec.body}\n- 1 finding(s) filed as a follow-up card (#1).` };
       expect(await kind([res, one], () => cardPolicy)).toBe('confirmed-break-owed-send-back');
     });
-    it.each([['missing', null], ['malformed', '{not json'], ['without findingClasses', '{}']])('readBreakPolicy refuses (strict) when the class preferences are %s', (_n, content) => {
+    it.each([['missing', null], ['malformed', '{not json'], ['without findingClasses', '{}'], ['incomplete', '{"findingClasses":{"live-reproduced":"fix-now"}}']])('readBreakPolicy refuses (strict) when the class preferences are %s', (_n, content) => {
       const dir = temp(), file = join(dir, 'prefs.json');
       if (content !== null) writeFileSync(file, content);
       expect(() => readBreakPolicy({ env: { WE_PLATFORM_PREFERENCES_FILE: file } })).toThrow(/unreadable/);

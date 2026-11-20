@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
+import { FINDING_CLASSES } from '../lib/finding-class-policy.mjs';
 import { liveResultGateState, breakClass, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
@@ -104,7 +105,10 @@ export function readBreakPolicy({ env = process.env } = {}) {
   // Unreadable or absent finding-class preferences are unreadable policy: the class reader would silently default to deferrals.
   const prefs = readPlatformPreferences({ env, warn: () => {} });
   const classes = prefs.prefs.findingClasses;
-  if (prefs.errors.length || !classes || typeof classes !== 'object' || Array.isArray(classes)) throw new Error('findingClasses preferences are unreadable');
+  // Every class must be named explicitly: the class reader defaults any omitted class to a deferral.
+  const complete = classes && typeof classes === 'object' && !Array.isArray(classes)
+    && FINDING_CLASSES.every(c => classes[c] === 'fix-now' || classes[c] === 'defer-card');
+  if (prefs.errors.length || !complete) throw new Error('findingClasses preferences are unreadable');
   const read = readConfirmedBreaks({ env, strict: true });
   if (read.source?.broken === 'default' || read.source?.degraded === 'default') throw new Error('confirmedBreaks is not set');
   return read.value;
