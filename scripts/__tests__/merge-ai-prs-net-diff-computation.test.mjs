@@ -6,7 +6,7 @@
  *   resolveNetDiffBasis, and computeNetDiffSignals — all exported from `scripts/merge-ai-prs.mjs` — plus their
  *   integration with `scoreEscalation`/`diffHunksFrom` from `scripts/lib/review-escalation.mjs`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -15,6 +15,40 @@ import { dirname, join } from 'node:path';
 import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
 import { resolveProducerReviewLabel } from '../pr-land.mjs';
 import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
+import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
+import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
+import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
+
+it('label-scoped drain parks an unverified net diff for human review without merging or enqueueing', async () => {
+  vi.doMock('node:child_process', () => childProcessMock);
+  let failedDiffs = 0;
+  const ports = { ...prestagePorts, git(args, env) {
+    const result = prestagePorts.git(args, env); // preserve the shared call log
+    while (args[0] === '-c') args = args.slice(2);
+    if (args[0] === 'diff') {
+      failedDiffs++;
+      return { status: 128, stdout: '', stderr: 'fatal: net-diff read unavailable' };
+    }
+    return result;
+  } };
+  const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports }));
+  try {
+    await world(async ({ pr, run }) => {
+      pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: pr.headRefOid };
+      const { report, calls, stderr } = await run();
+      expect(failedDiffs, 'must reach the failing git diff port').toBeGreaterThan(0);
+      expect(report.parked, stderr).toEqual(expect.arrayContaining([
+        expect.objectContaining({ num: pr.number, humanRequired: true,
+          reasons: expect.arrayContaining([expect.stringContaining('net diff unverified')]) }),
+      ]));
+      expect(calls.filter(a => a[0] === 'pr' && a[1] === 'merge')).toEqual([]);
+      expect(calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toEqual([]);
+    }, { slug: 'web-everything/web-everything' });
+  } finally {
+    vi.doUnmock('node:child_process');
+    vi.resetModules();
+  }
+}, 120_000);
 
 
 const BASE_SHA = 'a'.repeat(40);

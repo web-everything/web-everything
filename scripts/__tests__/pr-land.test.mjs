@@ -5,8 +5,12 @@
  *   check-classification that decides merge-vs-wait-vs-abort. The live gh/git driver is the I/O boundary.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { resolve, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
 import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
 import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
@@ -14,6 +18,90 @@ import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-indepe
 import { PANEL_LENSES } from '../lib/review-core.mjs';
 
 afterEach(() => vi.unstubAllEnvs());
+
+it('open-only runCli labels a failed net-diff read review:human and emits the review label', () => {
+  // A scored leaf control is necessary: omitting netDiffScored also fails closed,
+  // so the failed-read assertion alone cannot catch that wiring mutation.
+  function run(failDiff) {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-land-net-diff-'));
+    const trace = join(dir, 'effects.jsonl');
+    const root = pathToFileURL(resolve('scripts') + '/').href;
+    const sha = 'a'.repeat(40);
+    const record = `import { appendFileSync } from 'node:fs';
+      const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
+    // Substitute unrelated admission/forge effects; keep runCli, the shared Git
+    // net-diff computation and the producer rubric intact (as in pr-land-preflight).
+    const stubs = {
+      './operations/canonical-audit-gate.mjs': 'export const checkCanonicalAuditForOpen = () => ({ ok: true });',
+      './lib/lane-verify.mjs': 'export const readVerifyMarker = () => null; export const verifyGateDecision = () => ({ ok: true });',
+      './conveyor/fix-procedure.mjs': 'export const pushRefusal = () => null; export const repoKeyForCheckout = () => "we";',
+      './lib/pr-size-admission.mjs': 'export const createSizeAdmissionRunner = () => async request => ({ body: request.body, status: "small" });',
+      './lib/forge-land-provider.mjs': `${record}
+        export const createGhLandProvider = () => ({
+          listOpenByHead: () => [{ number: 7 }],
+          viewPr: () => ({ headRefOid: ${JSON.stringify(sha)}, labels: [], comments: [], body: 'Update a leaf card.' }),
+          ensureLabel: () => {},
+          addLabel: (pr, label) => effect(['add-label', pr, label]),
+          removeLabel: (pr, label) => effect(['remove-label', pr, label]),
+          editBody: () => {},
+        });`,
+    };
+    const loader = join(dir, 'loader.mjs');
+    const preload = join(dir, 'preload.mjs');
+    writeFileSync(loader, `const stubs = ${JSON.stringify(stubs)};
+      export async function resolve(specifier, context, next) {
+        if (context.parentURL === ${JSON.stringify(root + 'pr-land.mjs')} && stubs[specifier]) {
+          const original = new URL(specifier, context.parentURL).href;
+          return { url: 'data:text/javascript,' + encodeURIComponent('export * from ' + JSON.stringify(original) + ';' + stubs[specifier]), shortCircuit: true };
+        }
+        return next(specifier, context);
+      }`);
+    writeFileSync(preload, `import cp from 'node:child_process';
+      import { syncBuiltinESMExports, register } from 'node:module';
+      ${record}
+      const scoredGit = ${drainScoredGit.toString()};
+      cp.execFileSync = (cmd, args) => {
+        effect([cmd, args]);
+        if (cmd === 'node') return ''; // independently tested locus linter
+        if (cmd !== 'git') throw new Error('unexpected external effect: ' + cmd);
+        while (args[0] === '-c') args = args.slice(2);
+        if (args[0] === 'diff' && ${failDiff}) {
+          effect(['diff-failed']); throw Object.assign(new Error('net-diff read unavailable'), { status: 128 });
+        }
+        if (args[0] === 'rev-parse' && args.includes('--absolute-git-dir') && !args.includes('--git-common-dir')) return ${JSON.stringify(dir)};
+        const result = scoredGit(args, { gitDir: ${JSON.stringify(dir)}, head: ${JSON.stringify(sha)} });
+        if (result) {
+          if (result.status) throw Object.assign(new Error(result.stderr), result);
+          return result.stdout;
+        }
+        if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
+        if (args[0] === 'show') throw new Error('no manifest');
+        if (['push', 'fetch', 'log'].includes(args[0])) return '';
+        throw new Error('unexpected git command: ' + args.join(' '));
+      };
+      syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    try {
+      const child = spawnSync(process.execPath, ['--import', preload, resolve('scripts/pr-land.mjs'),
+        `--repo=${dir}`, '--ref=lane/net-diff', '--no-wait', '--json', '--body=Update a leaf card.'], {
+        cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+        env: { ...process.env, TMPDIR: dir, WE_COORDINATION_ROOT: dir, WE_POLICY_CASCADE_LOG: '0', WE_REVIEW_LEDGER_MODE: 'off' },
+      });
+      expect(child.status, child.stderr + child.stdout).toBe(0);
+      return { result: JSON.parse(child.stdout.trim()),
+        effects: readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse) };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  const failed = run(true);
+  expect(failed.effects).toContainEqual(['diff-failed']);
+  expect(failed.effects).toContainEqual(['add-label', 7, 'review:human']);
+  expect(failed.result).toMatchObject({ reason: 'opened', merged: false, pr: 7, reviewLabel: 'review:human' });
+
+  const scored = run(false);
+  expect(scored.effects).not.toContainEqual(['add-label', 7, 'review:human']);
+  expect(scored.result).toMatchObject({ reason: 'opened', merged: false, pr: 7 });
+  expect(scored.result).not.toHaveProperty('reviewLabel');
+}, 90_000);
 
 // ── #2844 · the AUTHOR STAMP pr-land writes at PR-open ─────────────────────────────────────────────────────────
 // PR #1100 review: this half had ZERO coverage. `withAuthorStamp` was module-private and read a module-scope
