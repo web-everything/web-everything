@@ -24,6 +24,8 @@ PR #5809 prevention follow-up (2026-10-22, simplicity/COVERAGE and codex-correct
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4414@7551d840758044850fb35cf5ee8b7e557145c562
 
+Also raised by PR #7134's 2026-11-20 advisory: the service-channel plan in #x6wh6fe and concurrent/interrupted log-isolation plan in #x9ffusk lacked named cases and observable assertions. Reuse acceptance item 2 below, with planned `requires_each_agy_service_and_log_guarantee_mapping` in `we:scripts/__tests__/check-backlog-item.test.mjs`: remove the test file, case or observable result for securityd, launchd, ssh-agent, sequential logging, concurrent logging and interrupted cleanup one at a time. Assert each incomplete fixture is refused with its exact unmapped guarantee, while a fully mapped plan passes. Planned tests need not already exist; prose elsewhere naming a generic probe cannot satisfy an omitted guarantee. This records the generic validation debt without claiming the gate is implemented.
+
 ## Done when
 
 1. **Executable** — planned `we:scripts/__tests__/check-backlog-item.test.mjs` → `rejects_completed_preparation_with_acceptance_placeholders`: a fixture attempting completed preparation or open-to-ready activation with executable Acceptance/Done-when TODOs is rejected with the exact item/criterion identified; fully authored fixtures pass. Cover both section names and numbered/[A#] forms. When implemented, run `npm run test:unit -- <test-file>` from WE using this planned file's path after the `we:` prefix.

@@ -4993,14 +4993,44 @@ comparison against daemon observations; fixtures prove IO counts without live Gi
 
 ## Confined Antigravity build adapter (R1062 / S7 / R37)
 
-Production launches are unavailable. The SBPL prototype starts from `(allow default)`:
-direct file restrictions do not isolate Mach/XPC services, launchd agent sockets, shared log
-state, or the real-HOME OAuth token from a worker with network egress. `AGY_BUILD_CONFINEMENT`
+Production launches are unavailable. The current SBPL prototype starts from `(deny default)`
+and explicitly denies network access. Its earlier allow-default profile did not establish
+service isolation; the replacement still requires live channel-specific proof. Shared log
+state and readable real-HOME Gemini credentials remain separate unresolved risks. `AGY_BUILD_CONFINEMENT`
 therefore declares `unavailable`, and both the fix provider and native launcher refuse before
 launch side effects. Direct builds with the default worker refuse before Git or scratch work;
 settings and explicit provider selection cannot enable them. Routing falls back to the next
 provider. Re-enabling requires an enforced service/credential boundary and independent live
 probes; the old direct-file probes do not establish that boundary.
+
+Review lens for availability claims (PR #7134): compare the PR description with
+`AGY_BUILD_CONFINEMENT.mode`, both production spawn guards and the emitted network policy.
+While mode is `unavailable`, the description must say this is an inactive adapter prototype
+with provider fallback; it must not claim live small-job repairs or allowed API egress.
+The named `keeps production unavailable until the real sandbox is proven` case in
+`scripts/lib/__tests__/agy-sandbox.test.mjs` pins runtime refusal; this review note checks
+the description separately and does not claim to be an automated PR-body check.
+
+The 2026-11-20 advisory prevention work is recorded as planned work, not implemented proofs:
+
+| Guarantee | Prevention item |
+| --- | --- |
+| Every declared secret root has a real denial probe | #x7agyp1 |
+| Credential-state reads cannot become an applied patch | #x7agyp2 |
+| Worker test code cannot run on the host before review or equivalent confinement | #x7agyp3 |
+| Detached descendants cannot yield successful evidence while alive | #x7agyp4 |
+| Repair admission requires loaded item evidence | #x7agyp5 |
+| Every snapshot limit bounds actual reads as well as rejection | #x7agyp6 |
+| Unreadable ancestors and broken secret links fail closed | #x6fx90l |
+| Securityd, launchd and agent-socket denial are independently observed | #x6wh6fe |
+| Logs stay isolated during concurrent sessions and interrupted cleanup | #x9ffusk |
+| Egress remains closed until a narrow model path is proved | #x4pdtzg |
+| Active Acceptance sections reject unfinished placeholders | #6933 |
+| Each behavioral guarantee names a planned case and observable assertion | #5360 |
+
+Before promotion, require the credential boundary, executable-diff execution boundary,
+descendant lifetime, shared-state isolation and live sandbox evidence to be resolved and
+reviewed together. Filing these cards does not authorize lifting the unavailable guard.
 
 `agy-confined-build.test.mjs` uses temporary local Git repositories and injected fake agy
 execution; it never launches agy. Admission requires kind, numeric size and literal repo-relative
@@ -5116,7 +5146,8 @@ Size-1 jobs of any kind are also admitted by R1062; neither is a confinement cla
 
 The launcher hashes clone Git redirect/configuration controls and the index with filesystem reads; unreadable or
 changed controls and a missing Git directory void the run. The detached exclusive-transcript worker
-group is stopped on exit, before pipe close returns evidence. Post-run host Git never runs against
+group receives a stop signal on exit, before pipe close returns evidence. This does not prove
+termination of descendants that create a new session; #x7agyp4 tracks that gap. Post-run host Git never runs against
 the worker clone: a second repository created before launch owns its Git metadata, index and copied
 work tree, outside all worker write grants. Regular-file bytes are copied; unchanged baseline symlinks
 are recreated from trusted Git objects without dereferencing them. New/changed links and special files

@@ -73,6 +73,12 @@ Subclass `CustomAttribute` and log in `connectedCallback`/`disconnectedCallback`
 
 ## Confined agy transcript ownership
 
+The adapter is an inactive prototype: `AGY_BUILD_CONFINEMENT.mode` remains `unavailable`,
+production launch paths refuse and routing uses the next provider. The current sandbox
+profile denies network access. Neither small-job settings nor filed prevention cards enable
+production. The outstanding credential, executable-test, process-lifetime and live-proof
+requirements are mapped under “Confined Antigravity build adapter” in `docs/agent/testing.md`.
+
 Keep build transcripts in a fresh launcher-owned 0700 temp directory outside every sandbox write grant,
 private HOME, clone, lane and workspace. The profile builder refuses overlaps; the launcher uses exclusive
 no-follow creation and retains the regular-file fd for writes. Audit before deleting the directory.
