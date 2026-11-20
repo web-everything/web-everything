@@ -4,10 +4,8 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/backlog.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/__tests__/backlog-prepare-stamp-status.test.mjs", "we:scripts/operations/probation-build-run.mjs", "we:scripts/operations/__tests__/probation-build-run.test.mjs", "we:scripts/operations/prepare-stamp-land.mjs", "we:scripts/operations/__tests__/prepare-stamp-land.test.mjs"]
+
 dateOpened: "2026-09-30"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "d8680b7e58e12912c899b2911e000b9e0daa5e0d"
 tags: []
 ---
 
@@ -111,3 +109,12 @@ Musts cover review guard 1 only.)
 1. **Executable** — `npx vitest run` over `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs` and `we:scripts/__tests__/backlog-prepare-stamp-status.test.mjs` fails before this item lands and passes after (Musts 1, 2).
 2. **Executable** — `prepare-stamp <id>` (`we:scripts/backlog.mjs`) on a card whose `## Done when` is missing or still holds the `TODO:` scaffold line exits non-zero and does not modify the file (Must 2).
 3. **Executable** — `npm run check:standards` is green, and warns on a stamped card with no numbered `## Done when` clause (Must 1).
+
+## Findings (standalone worker, 2026-11-19)
+
+The build-dispatch daemon held #4709 with:
+
+> worker-declined: Not prepared: #4709 — could-not-prepare. Its unconditional first-stamp refusal conflicts with #5399’s ratified 'advise → enforce' policy, currently 'advise' in 'we:scripts/lib/task-agreement-policy.json'. Open #5584 already owns the policy-controlled prepare/dispatch gate. The unresolved choice is whether #4709 becomes a complementary lint-only change or retains a separate mandatory stamp gate requiring a policy exception. No files changed, stamps written, or tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
