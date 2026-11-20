@@ -1998,6 +1998,7 @@
   "scripts/conveyor/soak/breaks/ready-candidate-adopted-across-overlay-churn.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-acquire-default-wait.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/lane-acquire-skips-unpushed.soak.test.mjs": 6,
   "scripts/conveyor/soak/breaks/ci-rerun-ignores-external-red-team.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-skip-reason-drops-comment-error.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-reservation-route-exhaustion.soak.test.mjs": 2,
