@@ -39,7 +39,8 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
   // routing.builder=claude (or auto over the quota threshold) drops the codex rungs from every layer, env included.
   // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
   const chosen = effectiveBuilder({ env, ...(declared ? { declared } : { repo }), kind: 'fix', capacity, now, quota, records, record });
-  if (chosen.decision && chosen.decision.reason !== 'all-readers-unknown') {
+  if (chosen.decision) {
+    // Unknown usage preserves preference, not eligibility: filter every decision.
     // Remove ineligible rungs, then start at the scored winner. A suffix preserves
     // escalation direction and cannot send a Claude-started repair back to Codex.
     const kept = [];
@@ -57,7 +58,8 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
     const start = chosen.decision.reason === 'capacity-score' ? kept.indexOf(winner) : -1;
     result.value = start < 0 ? kept : kept.slice(start);
     result.source += '+capacity';
-  } else if (chosen.builder === 'claude') {
+  }
+  if (chosen.builder === 'claude' && (!chosen.decision || chosen.decision.reason === 'all-readers-unknown')) {
     const kept = result.value.filter(id => FIX_EXECUTOR_RUNGS[id].executor !== 'codex');
     result = { value: kept, source: `${result.source}+routing.builder` };
   }

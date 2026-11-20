@@ -6,8 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { resolveDispatchRoute, readRoutingPolicy } from '../dispatch-routing-policy-io.mjs';
-import { resolveFixExecutorChain } from '../fix-executor-chain.mjs';
-import { PROVIDER_DEFAULTS, calendarReset } from '../provider-capacity.mjs';
+import { resolveFixExecutorChain, pickChainRung } from '../fix-executor-chain.mjs';
+import { PROVIDER_DEFAULTS, calendarReset, readProviderCapacity } from '../provider-capacity.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 
 // Passthrough mocks, off by default: a test points the settings readers at a temp dir, fixes the Codex quota
@@ -15,6 +15,41 @@ import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
 // redirected, so a regression from the declared reader back to readSettings() cannot fall through to the
 // shipped scripts/settings (which says builder=claude and would hide it).
 const state = vi.hoisted(() => ({ dir: null, quota: undefined, seen: [] }));
+
+it.each([
+  ['claude', { active: false }, ['codex', 'codex-alt']],
+  ['claude', { allowedKinds: ['build'] }, ['codex', 'codex-alt']],
+  ['codex-alt', { active: false }, ['codex', 'claude']],
+])('unknown readers still exclude %s with %j from fix escalation', (provider, restriction, expected) => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const env = { WE_CAPACITY_READERS: 'off' };
+  const providers = PROVIDER_DEFAULTS.providers.map(p => p.id === provider ? { ...p, ...restriction } : p);
+  const repo = { routing: { builder: 'auto' }, providerCapacity: { providers } };
+  const settings = resolveRoutingSettings({ env, repo }).capacity;
+  const capacity = readProviderCapacity({ env, now, settings, readers: {} });
+  const options = { env, repo, now, capacity, quota: () => ({ used_percent: 20 }), record: () => {} };
+  expect(effectiveBuilder({ ...options, kind: 'fix' }).decision).toMatchObject({
+    reason: 'all-readers-unknown', provider: 'codex',
+    inputs: expect.arrayContaining([expect.objectContaining({ provider, eligible: false })]),
+  });
+  const chain = resolveFixExecutorChain(options);
+  expect(chain.value).toEqual(expected);
+  expect(pickChainRung({ chain: chain.value, launcherAvailable: () => true }).executor).toBe('codex');
+  if (provider === 'claude') {
+    expect(pickChainRung({ chain: chain.value, codexUnproductive: 3, launcherAvailable: () => true }).executor).toBeNull();
+    expect(pickChainRung({ chain: chain.value, critical: true, trigger: 'takeover', launcherAvailable: () => true }).executor).toBeNull();
+  }
+});
+
+it.each([[20, ['codex', 'codex-alt', 'claude']], [80, ['claude']]])(
+  'unknown readers preserve legacy fix preference at %s percent usage', (used_percent, expected) => {
+    const env = { WE_CAPACITY_READERS: 'off' };
+    const repo = { routing: { builder: 'auto' } };
+    const now = Date.parse('2026-11-20T15:00:00Z');
+    const settings = resolveRoutingSettings({ env, repo }).capacity;
+    const capacity = readProviderCapacity({ env, now, settings, readers: {} });
+    expect(resolveFixExecutorChain({ env, repo, now, capacity, quota: () => ({ used_percent }), record: () => {} }).value).toEqual(expected);
+  });
 vi.mock('../settings-files.mjs', async (importOriginal) => {
   const actual = await importOriginal();
   const at = o => (state.dir ? { ...o, dir: state.dir, legacyPath: null } : o);
