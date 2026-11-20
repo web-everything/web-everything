@@ -7,11 +7,11 @@ vi.mock('../operator-override-reader.mjs', async importOriginal => {
     return actual.readOperatorOverrides({ ...options, file });
   } };
 });
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
+import { resolveHostOverloadSettings, loadHostOverloadSettings, boundedText } from '../host-overload-settings.mjs';
 
 let operatorRoot;
 beforeEach(() => {
@@ -47,5 +47,32 @@ describe('R559 snapshot maximum freshness policy', () => {
         : { [layer]: { host: { capacity: { snapshotMaxFreshMs: value } } } };
       expect(() => resolveHostOverloadSettings({ env: {}, ...options, log: () => {} })).toThrow('invalid policy');
     }
+  });
+});
+
+/** Platform preference size is independent of the boundedText default used by host-load. */
+describe('platform preference read bounds', () => {
+  const load = (body, extra = {}) => {
+    const path = join(operatorRoot, 'platform.json');
+    writeFileSync(path, body);
+    return loadHostOverloadSettings({
+      env: { WE_PLATFORM_PREFERENCES_FILE: path, WE_PLATFORM_PREFERENCES: path, ...extra },
+      toolPath: join(operatorRoot, 'missing-tool.json'), log: () => {},
+    });
+  };
+  it('reads unrelated legacy waivers above 256 KiB under the 2 MiB default', () => {
+    const body = JSON.stringify({ prototypeLoad: { ruledWeakened: ['x'.repeat(300 * 1024)] }, host: { maxLoadPerCore: 3 } });
+    expect(load(body).settings.host.maxLoadPerCore).toBe(3);
+    expect(() => boundedText(join(operatorRoot, 'platform.json'))).toThrow('bounded read exceeded');
+  });
+  it('names the file, actual bytes, limit and operator fallback beyond the default', () => {
+    const body = JSON.stringify({ unrelated: 'x'.repeat(2 * 1024 * 1024) });
+    expect(() => load(body)).toThrow(`platform-preferences too large (${Buffer.byteLength(body)} > 2097152 bytes): ${join(operatorRoot, 'platform.json')}`);
+    expect(() => load(body)).toThrow('raise WE_HOST_OVERLOAD_PREFS_MAX_BYTES and retry');
+    expect(load(body, { WE_HOST_OVERLOAD_PREFS_MAX_BYTES: String(3 * 1024 * 1024) }).settings).toBeDefined();
+  });
+  it('honors a smaller environment limit and rejects invalid limits', () => {
+    expect(() => load(' '.repeat(128), { WE_HOST_OVERLOAD_PREFS_MAX_BYTES: '64' })).toThrow('platform-preferences too large (128 > 64 bytes)');
+    expect(() => load('{}', { WE_HOST_OVERLOAD_PREFS_MAX_BYTES: 'bad' })).toThrow('invalid WE_HOST_OVERLOAD_PREFS_MAX_BYTES');
   });
 });
