@@ -6,6 +6,10 @@
  *   a loud audit line). The gh shell is injected (never actually called).
  */
 import { describe, it, expect, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { mergePr, assertMayMerge, buildGateMergeArgs, decideDeleteBranch, mergeMethodFlag, hasNonEmptyBody, isTestPath, isStrippableTestPath, stripStringsAndComments, parseUnifiedDiff, scanTestTampering, buildStackedPrListArgs, buildRetargetArgs, retargetStackedPrs, describeStackedTestGamingOrigin } from '../lib/pr-merge-gate.mjs';
 
 // A capturing fake gh exec + a capturing stderr sink, so nothing shells out and the audit line is observable.
@@ -620,6 +624,28 @@ describe('R1105 strict test-gaming strengthenings', () => {
 
 describe('test-gaming hunk count evidence', () => {
   const header = 'diff --git a/src/x.mjs b/src/x.mjs\n';
+  it.each(['doc.md', 'x.test.mjs'])('scores real Git blank context in %s with either suppressBlankEmpty setting', path => {
+    const cwd = mkdtempSync(join(tmpdir(), 'blank-context-diff-'));
+    const head = 'a'.repeat(40);
+    try {
+      mkdirSync(join(cwd, 'before'));
+      mkdirSync(join(cwd, 'after'));
+      writeFileSync(join(cwd, 'before', path), '\nold\n\n');
+      writeFileSync(join(cwd, 'after', path), '\nnew\n\n');
+      for (const suppress of ['false', 'true']) {
+        const diff = spawnSync('git', ['-c', `diff.suppressBlankEmpty=${suppress}`, 'diff',
+          '--no-index', '--no-color', '--no-ext-diff', '--', `before/${path}`, `after/${path}`], { cwd, encoding: 'utf8' });
+        expect(diff.status).toBe(1); // --no-index reports differences with exit 1.
+        expect(diff.stderr).toBe('');
+        expect(diff.stdout).toContain(suppress === 'true' ? '@@ -1,3 +1,3 @@\n\n' : '@@ -1,3 +1,3 @@\n \n');
+        expect(scanTestTampering({
+          netDiffText: { text: diff.stdout, scored: true, rev: head }, pinnedHeadSha: head,
+        })).toMatchObject({ tampered: false, evidenceIncomplete: false });
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
   it.each([
     '@@ -1,100 +1,100 @@\n',
     '@@ -1,2 +1,2 @@\n context\n',
@@ -627,6 +653,8 @@ describe('test-gaming hunk count evidence', () => {
     '@@ -1 +1 @@\n-old\n',
     '@@ -1,2 +1,2 @@\n context\ndiff --git a/y b/y\n',
     '@@ -1,2 +1,2 @@\n context\n@@ -0,0 +1 @@\n+new\n',
+    '@@ -1,3 +1,3 @@\n\n-old\n+new\n', // A final newline cannot supply missing blank context.
+    '@@ -1 +1 @@\n-old\n+new\n\n', // A real extra blank line still exceeds the counts.
   ])('holds mismatched hunk counts: %s', body => {
     expect(scanTestTampering({ diffText: header + body })).toMatchObject({ tampered: true, evidenceIncomplete: true });
   });
@@ -635,6 +663,9 @@ describe('test-gaming hunk count evidence', () => {
     '@@ -1,2 +1,2 @@\n context\n-old\n+new\n',
     '@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n',
     '@@ -0,0 +1 @@\n+new\n@@ -3 +4,0 @@\n-old\n',
+    '@@ -1,3 +1,3 @@\n\n-old\n+new\n\n',
+    '@@ -1,2 +1,2 @@\n\n-old\n+new', // No patch-terminating newline.
+    '@@ -1,2 +1,2 @@\n-old\n+new\n\n@@ -8,2 +8,2 @@\n\n-last\n+next\n',
   ])('keeps well-formed hunk evidence clean: %s', body => {
     expect(scanTestTampering({ diffText: header + body })).toMatchObject({ tampered: false, evidenceIncomplete: false });
   });

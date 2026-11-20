@@ -192,7 +192,10 @@ export function parseUnifiedDiff(diffText) {
     if (hunk && (hunk.old !== hunk.expectedOld || hunk.next !== hunk.expectedNext)) cur.hunkIncomplete = true;
     hunk = null;
   };
-  for (const raw of String(diffText || '').split('\n')) {
+  const lines = String(diffText || '').split('\n');
+  // The final newline terminates a line; it does not supply another context line.
+  if (lines.at(-1) === '') lines.pop();
+  for (const raw of lines) {
     if (raw.startsWith('diff --git ')) {
       finishHunk();
       const m = raw.match(/^diff --git ("(?:[^"\\]|\\.)*"|a\/.*?) ("(?:[^"\\]|\\.)*"|b\/.+)$/);
@@ -213,8 +216,10 @@ export function parseUnifiedDiff(diffText) {
       continue;
     }
     if (hunk) {
-      if (raw.startsWith(' ') || raw.startsWith('-')) hunk.old++;
-      if (raw.startsWith(' ') || raw.startsWith('+')) hunk.next++;
+      // Git's diff.suppressBlankEmpty omits the prefix on empty context lines.
+      const context = raw === '' || raw.startsWith(' ');
+      if (context || raw.startsWith('-')) hunk.old++;
+      if (context || raw.startsWith('+')) hunk.next++;
     }
     if (raw.startsWith('rename from ') || raw.startsWith('rename to ')) {
       const from = raw.startsWith('rename from ');
