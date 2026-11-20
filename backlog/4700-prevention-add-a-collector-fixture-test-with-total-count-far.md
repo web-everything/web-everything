@@ -4,10 +4,8 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/credential-inventory.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-smells/credential-inventory-stale.mjs", "we:scripts/conveyor/__tests__/credential-inventory.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/health-smells/__tests__/credential-inventory-stale.test.mjs"]
+
 dateOpened: "2026-10-01"
-preparedDate: "2026-10-02"
-preparedAgainstSha: "35f85c0f1d9f7c7ff718fa927f00ca12dd248b78"
 tags: []
 ---
 
@@ -73,3 +71,12 @@ Run the collector against a stub `gh` (fixture `exec`) shaped like the real 3355
 - Item 5: carry the run's own `updated_at` in `ciFinding` and use it (not `observedAt`) in `we:scripts/conveyor/health-smells/credential-inventory-stale.mjs` window checks. Needs a state-schema version bump + cache migration (`schemaVersion: 1` today); the collector only emits in-window rows so current behaviour is correct.
 - "Pagination-contract helper" requiring a non-`total_count` stop condition for time-ordered listings — extract once a second consumer exists.
 - Optional server-side `created=>` query narrowing on the runs endpoint to cut requests further.
+
+## Findings (standalone worker, 2026-11-20)
+
+The build-dispatch daemon held #4700 with:
+
+> worker-declined: Not prepared: #4700 — could-not-prepare. The proposed seven-day creation-time cutoff changes the existing updated-time contract: 'we:scripts/conveyor/credential-inventory.mjs:76' includes failures by 'updated_at', regardless of creation age. The card explicitly permits missing older runs updated within the window while reporting complete coverage. The unresolved choice is whether to authorize that reduced coverage or require a strategy preserving updated-time completeness. I cannot choose that policy during preparation. No files changed or stamped; no tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
