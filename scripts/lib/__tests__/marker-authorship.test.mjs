@@ -132,3 +132,38 @@ describe('env overrides (WE_AUTOMATION_LOGINS / WE_OPERATOR_LOGINS) — module-l
     expect(OPERATOR_LOGINS).toContain('chalbert');
   });
 });
+
+describe('judge may card a pre-existing break with evidence (judge path v2)', async () => {
+  const { assertJudgeAuthority, JUDGE_ACTOR } = await import('../marker-authorship.mjs');
+  const policy = { value: { enabled: true, actor: JUDGE_ACTOR } };
+  const sha = 'a'.repeat(40);
+  const evidence = { mainSha: sha, probe: 'node probe.mjs', mainResult: 'null', prResult: 'null' };
+  const read = (over = {}) => ({ judgeActorPolicy: policy, isMainAncestor: (s) => s === sha, ...over });
+  const card = (over = {}) => ({ actor: JUDGE_ACTOR, ruling: 'card', preExisting: evidence, ...over });
+
+  it('judge may card a pre-existing break with evidence', () => {
+    expect(() => assertJudgeAuthority(read(), card())).not.toThrow();
+  });
+  it('refuses a judge card without evidence', () => {
+    expect(() => assertJudgeAuthority(read(), card({ preExisting: undefined }))).toThrow(/operator-only|pre-existing/);
+  });
+  it.each(['not-real', 'accepted', 'clear-human'])('still refuses judge %s even with evidence', (ruling) => {
+    expect(() => assertJudgeAuthority(read(), card({ ruling }))).toThrow(/operator-only/);
+  });
+  it('refuses when main and PR results differ', () => {
+    expect(() => assertJudgeAuthority(read(), card({ preExisting: { ...evidence, prResult: 'key' } }))).toThrow(/pre-existing/);
+  });
+  it('refuses incomplete evidence', () => {
+    expect(() => assertJudgeAuthority(read(), card({ preExisting: { ...evidence, probe: '' } }))).toThrow(/pre-existing/);
+  });
+  it('refuses a mainSha that is not an ancestor of origin/main', () => {
+    expect(() => assertJudgeAuthority(read({ isMainAncestor: () => false }), card())).toThrow(/ancestor/);
+  });
+  it('fails closed when no ancestor check is supplied', () => {
+    expect(() => assertJudgeAuthority({ judgeActorPolicy: policy }, card())).toThrow(/ancestor/);
+  });
+  it('refuses a disabled judge or supersession even with evidence', () => {
+    expect(() => assertJudgeAuthority(read({ judgeActorPolicy: { value: { enabled: false, actor: JUDGE_ACTOR } } }), card())).toThrow(/disabled/);
+    expect(() => assertJudgeAuthority(read(), card({ supersedes: 'x' }))).toThrow(/supersede/);
+  });
+});

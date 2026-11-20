@@ -209,11 +209,29 @@ export function isSecurityClass(value) {
   return /^security(?:[-/]|$)/i.test(String(value ?? ''));
 }
 
-/** R671 v1 only adds holds; every releasing action remains operator-only. */
+/** Judges may hold a break or card a proven pre-existing break; other grants remain operator-only. */
 export function assertJudgeAuthority(read, input) {
-  if (input.actor !== JUDGE_ACTOR) return;
-  if (input.ruling !== 'block')
+  if (input.actor !== JUDGE_ACTOR) {
+    if (input.preExisting !== undefined) throw new Error('pre-existing evidence is only for judge card rulings');
+    return;
+  }
+  if (input.ruling !== 'block' && input.ruling !== 'card')
     throw new Error(`judge ${input.ruling ?? 'grant'} is refused in v1; operator-only`);
+  if (input.ruling === 'card') {
+    const evidence = input.preExisting;
+    if (evidence === undefined) throw new Error('judge card is refused in v1; operator-only without pre-existing evidence');
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)
+      || typeof evidence.mainSha !== 'string' || !/^[0-9a-f]{40}$/i.test(evidence.mainSha)
+      || typeof evidence.probe !== 'string' || !evidence.probe.trim()
+      || [evidence.mainResult, evidence.prResult].some(value => value == null || !String(value).trim())
+      || String(evidence.mainResult) !== String(evidence.prResult))
+      throw new Error('pre-existing evidence is incomplete or inconsistent; ask the operator');
+    // The IO verifier also binds this SHA to the current authoritative main tip, not a historical ancestor.
+    if (typeof read.isMainAncestor !== 'function') throw new Error('mainSha ancestor of origin/main cannot be verified');
+    if (read.isMainAncestor(evidence.mainSha) !== true) throw new Error('mainSha is not an ancestor of origin/main');
+  } else if (input.preExisting !== undefined) {
+    throw new Error('pre-existing evidence is only for judge card rulings');
+  }
   const policy = (read.judgeActorPolicy ?? readJudgeActorPolicy()).value;
   if (!policy || typeof policy.enabled !== 'boolean' || policy.actor !== JUDGE_ACTOR)
     throw new Error('invalid judge actor policy; ask the operator');

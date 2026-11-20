@@ -12,6 +12,8 @@ import { breakClass } from '../lib/red-team-gate.mjs';
  * Without --card, queues one follow-up through the detached landing job with retry-safe claims.
  * Reader and sink: ./record-red-team-ruling-io.mjs. Block resumes hold record → ledger intent → reason → review:changes → proof
  * from durable evidence, preserving the hold if a later step fails; not-real requires a cause.
+ * Judge block/card requires the App gh shim on PATH: prepend ~/.claude/github-app-token/gh-shim.d/<id>.
+ * Judge card also requires --preExisting='{"mainSha":"<current main tip, 40 hex>","probe":"<command>","mainResult":"<result>","prResult":"<same result>"}'.
  */
 import { createHash } from 'node:crypto';
 import { actionResource } from './action-record.mjs';
@@ -196,6 +198,10 @@ export function hasPendingCardIntent(comments, { pr, head, resultId, jobKey }) {
 }
 
 function validateRedTeamRulingInput(read, input) {
+  if (typeof input.preExisting === 'string') {
+    try { input = { ...input, preExisting: JSON.parse(input.preExisting) }; }
+    catch { throw new Error('--preExisting must be a JSON object of pre-existing evidence'); }
+  }
   assertJudgeReason(input.actor, input.reason);
   assertJudgeAuthority(read, input);
   const { pr, ruling, actor, channel, reason } = input;
@@ -213,6 +219,7 @@ function validateRedTeamRulingInput(read, input) {
   if (ruling === 'card' && (String(input.card ?? '').trim() || read.card) && !read.card?.readable) {
     throw new Error(`--card ${read.card?.requested ?? input.card} does not resolve to a readable backlog card (${read.card?.reason ?? 'unresolved'})`);
   }
+  return input;
 }
 
 function selectRedTeamRulingFindings(read, input) {
@@ -233,13 +240,19 @@ function selectRedTeamRulingFindings(read, input) {
 /** THE VERDICT. Validate, select, and describe the writes. PURE. */
 export function planRedTeamRuling(read, input) {
   input = withNonRegressionEvidence(read, input).input;
-  validateRedTeamRulingInput(read, input);
+  input = validateRedTeamRulingInput(read, input);
+  if (input.preExisting !== undefined) {
+    const { mainSha, probe, mainResult, prResult } = input.preExisting;
+    input = { ...input, reason: `${input.reason}\nPre-existing on main (${mainSha}): probe ${probe}; main=${mainResult} pr=${prResult}` };
+    assertJudgeReason(input.actor, input.reason);
+  }
   const { pr, ruling, actor, channel, reason } = input;
   const { head, comments, scope, state, atCap, selected } = selectRedTeamRulingFindings(read, input);
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
     reason: actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}\n${reason}` : String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
     indices: selected.map((f) => f.index), scope, scopeSources: read.scope?.sources ?? {}, atCap,
-    underChanges: labelNames(read.labels).includes('review:changes') };
+    underChanges: labelNames(read.labels).includes('review:changes'),
+    ...(input.preExisting !== undefined ? { preExisting: input.preExisting } : {}) };
   if (ruling === 'card' && read.card) {
     return { ...base, effect: RED_TEAM_RULING_CARD_EFFECT, cardRef: read.card.ref };
   }
@@ -265,8 +278,8 @@ export function planRedTeamRuling(read, input) {
 }
 
 export function planRedTeamCard(read, input) {
+  input = validateRedTeamRulingInput(read, input);
   const mode = assertCardFiling(read, input);
-  validateRedTeamRulingInput(read, input);
   const { selected, state } = selectRedTeamRulingFindings(read, input);
   const policy = read.setting?.findingClasses ?? {};
   if (!withNonRegressionEvidence(read, input).evidence && selected.some(f => f.securityReachableToday === true || !(classAction(f, policy) === 'defer-card'
@@ -296,6 +309,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       card: { type: 'string', required: false },
       fileCard: { type: 'boolean', required: false },
       notWorseThanMain: { type: 'string', required: false },
+      preExisting: { type: 'string', required: false },
       cause: { type: 'string', enum: [...FALSE_FINDING_CAUSES], required: false },
       preview: { type: 'boolean', required: false, default: false },
     },
@@ -311,7 +325,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       return selected.map(f => ({ ...f, runId: state.resultId, key: String(f.index) }));
     }),
     plan: compute({
-      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.notWorseThanMain', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
+      reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.notWorseThanMain', 'input.preExisting', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
       fn: (view) => {
         const plan = cardFilingVerdict(view) ?? planRedTeamRuling(view.findings.reread ?? view.findings.read, (landedRulingCard(view.findings)?.input ?? view.input));
         if (landedRulingCard(view.findings)?.judgeEvidence) plan.judgeEvidence = landedRulingCard(view.findings)?.judgeEvidence;
@@ -328,7 +342,7 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
           actor: view.verdict.actor, channel: view.verdict.channel, reason: view.verdict.reason, at: view.verdict.at,
           resultId: view.verdict.resultId, findings: view.verdict.findings, indices: view.verdict.indices,
           setting: view.verdict.setting, scope: view.verdict.scope, cardRef: view.verdict.cardRef, cause: view.verdict.cause, underChanges: view.verdict.underChanges,
-          judgeEvidence: view.verdict.judgeEvidence, cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
+          preExisting: view.verdict.preExisting, judgeEvidence: view.verdict.judgeEvidence, cardInput: view.verdict.cardInput, jobKey: view.verdict.jobKey, session: view.verdict.session, sendBackBody: view.verdict.sendBackBody,
         },
       }]),
     }),

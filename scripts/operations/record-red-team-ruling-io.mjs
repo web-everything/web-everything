@@ -81,6 +81,22 @@ const git = args => {
   return String(r.stdout ?? '');
 };
 
+// Historical presence cannot authorize a card: a later main commit may have fixed the defect.
+// Query the authoritative remote tip on EVERY check, including each effect-time recheck.
+const mainAncestorCheck = runGit => sha => {
+  try { runGit(['merge-base', '--is-ancestor', sha, 'origin/main']); }
+  catch { return false; }
+  let tip;
+  try {
+    const result = runGit(['ls-remote', '--exit-code', '--refs', 'origin', 'refs/heads/main']);
+    tip = /^([0-9a-f]{40})\trefs\/heads\/main$/i.exec(String(result).trim())?.[1];
+  } catch { /* Refuse unreadable remote evidence below; never trust the cached tracking ref. */ }
+  if (!tip) throw new Error('current authoritative main tip cannot be verified; retry when origin is readable or ask the operator');
+  if (tip.toLowerCase() !== sha.toLowerCase())
+    throw new Error('pre-existing evidence is not against the current authoritative main tip; re-run the probe on current main or ask the operator');
+  return true;
+};
+
 /** Unsuffixed references mean published on main, never the feature checkout. Each resolution (including
  * the final sink recheck) fetches afresh; failed refreshes cannot fall back to stale local evidence.
  * Open-PR cards require the explicit @pr<N> form and retain the shared PR-state/readability checks. */
@@ -140,7 +156,7 @@ export function readJudgeLedgerSync(repo, { env = process.env, run = execFileSyn
 export function createRecordRedTeamRulingReader({ tool, log = line => console.error(line), env = process.env, readThread = readLiveThread, readSetting = () => readConfirmedBreaks({ env }),
   readStandingRulingScope = standingRulingScope, readFile = readFileSync,
   readEvents = repo => readJudgeLedgerSync(repo, { env }),
-  readScope = () => readScopeLogged(env), runGit = git, readOnPr = readCardAtPrHead,
+  readScope = () => readScopeLogged(env), runGit = git, isMainAncestor = mainAncestorCheck(runGit), readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = actor => resolveRulingIdentity(actor, { env }), now = () => new Date().toISOString(),
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-red-team-ruling', env }) } = {}) {
@@ -167,7 +183,7 @@ export function createRecordRedTeamRulingReader({ tool, log = line => console.er
           disagreements = Math.max(0, ...indices.map(i => counts.get(i)?.size ?? 0));
         }
       }
-      return { head, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
+      return { head, isMainAncestor, ...(actor === JUDGE_ACTOR ? { judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log }) } : {}),
         ...(asJudge ? { judgeNotRealMode: readJudgeNotRealMode({ env, tool, log }),
           evidence: readJudgeEvidence(evidenceFile, readFile), disagreements } : {}),
         cardFileMode: readCardRulingFileMode({ env, tool, log }), cardAllowNonRegression: readCardAllowNonRegression({ env, tool, log }), labels: thread.labels ?? [], comments: thread.comments ?? [],
@@ -219,7 +235,7 @@ export const spawnStableCardJob = (input, session, binding, { spawnDetached = de
 export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConfirm, landRulingCard = defaultLandRulingCard, env = process.env, tool, root = REPO_ROOT, readThread = readLiveThread,
   readStandingRulingScope = standingRulingScope,
   readScope = () => readScopeLogged(env),
-  runGit = git, readOnPr = readCardAtPrHead,
+  runGit = git, isMainAncestor = mainAncestorCheck(runGit), readOnPr = readCardAtPrHead,
   resolveCard = card => resolveCardDefault(card, { runGit, readOnPr }),
   resolveIdentity = actor => resolveRulingIdentity(actor, { env }),
   coordinationRoot = resolveCoordinationRoot(), actions = createActionStore({ root: coordinationRoot }), fileCard = spawnStableCardJob,
@@ -241,7 +257,8 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     assertJudgeReason(p.actor, p.reason);
     assertJudgeReason(p.actor, p.sendBackBody);
     // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
-    if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({ judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) }, p);
+    assertJudgeAuthority(p.actor === JUDGE_ACTOR
+      ? { isMainAncestor, judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) } : {}, p);
     assertRulingIdentity(resolveIdentity(p.actor), p.actor);
     const thread = readThread({ repo: p.repo, pr: p.pr });
     if (!Array.isArray(thread.labels) || !Array.isArray(thread.comments)) throw new Error('unreadable thread or labels; retry after a complete read');
@@ -448,7 +465,7 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       return { ruling: 'card', head: p.head, indices: p.indices, card, labels: resync(p) };
     },
     [RED_TEAM_RULING_NOT_REAL_EFFECT]: async (p) => {
-      if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({}, p);
+      if (p.actor === JUDGE_ACTOR) assertJudgeAuthority({ isMainAncestor, judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) }, p);
       recheck(p);
       const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_NOT_REAL_OUTCOME, round: null, result: p.resultId,
         plan: { sendBack: [], card: [], advisory: p.findings } }) + judgeEvidenceComment(p.judgeEvidence);

@@ -2310,6 +2310,99 @@ describe('R671 v1 acting judge red-team blocks', () => {
   const judgeRead = (over = {}) => read({ identity,
     judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
   const judgeInput = (ruling = 'block', over = {}) => input({ actor: 'judge:r10', ruling, card: undefined, ...over });
+  const preExisting = { mainSha: 'a'.repeat(40), probe: 'node probe.mjs', mainResult: 'null', prResult: 'null' };
+  it('judge card preserves pre-existing evidence in the plan and durable reason; refuses missing evidence and non-ancestors', () => {
+    const context = judgeRead({ isMainAncestor: sha => sha === preExisting.mainSha });
+    const request = judgeInput('card', { card: CARD, preExisting: JSON.stringify(preExisting) });
+    const plan = planRedTeamRuling(context, request);
+    const line = `Pre-existing on main (${preExisting.mainSha}): probe node probe.mjs; main=null pr=null`;
+    expect(plan).toMatchObject({ actor: 'judge:r10', cardRef: CARD, preExisting });
+    expect(plan.reason.split('\n')).toContain(line);
+    expect(buildRuleReasonComment(plan)).toContain(line);
+    expect(() => planRedTeamRuling(context, { ...request, preExisting: undefined })).toThrow(/pre-existing/);
+    expect(() => planRedTeamRuling(judgeRead({ isMainAncestor: () => false }), request)).toThrow('mainSha is not an ancestor of origin/main');
+  });
+  it.each([
+    ['invalid JSON', '{', {}],
+    ['null evidence', 'null', {}],
+    ['array evidence', '[]', {}],
+    ['short SHA', { ...preExisting, mainSha: 'a' }, {}],
+    ['missing result', { ...preExisting, mainResult: undefined }, {}],
+    ['blank result', { ...preExisting, prResult: ' ' }, {}],
+    ['different results', { ...preExisting, prResult: 'key' }, {}],
+    ['operator actor', preExisting, { actor: OP.login }],
+    ['block ruling', preExisting, { ruling: 'block', card: undefined }],
+  ])('refuses pre-existing evidence: %s', (_name, evidence, over) => {
+    expect(() => planRedTeamRuling(judgeRead({ isMainAncestor: () => true }),
+      judgeInput('card', { card: CARD, preExisting: evidence, ...over }))).toThrow(/pre-existing/);
+  });
+  it('refuses operator evidence at effect time before any read or write', () => {
+    const plan = { ...planRedTeamRuling(read(), input()), preExisting };
+    const post = vi.fn(), readThread = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ post, readThread });
+    expect(() => sinks[plan.effect](plan)).toThrow(/pre-existing/);
+    expect(post).not.toHaveBeenCalled();
+    expect(readThread).not.toHaveBeenCalled();
+  });
+  it('rechecks judge card ancestry before any effect-time read or write', () => {
+    const plan = planRedTeamRuling(judgeRead({ isMainAncestor: () => true }),
+      judgeInput('card', { card: CARD, preExisting }));
+    const post = vi.fn(), readThread = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ post, readThread, isMainAncestor: () => false, warn: () => {} });
+    expect(() => sinks[plan.effect](plan)).toThrow('mainSha is not an ancestor of origin/main');
+    expect(post).not.toHaveBeenCalled();
+    expect(readThread).not.toHaveBeenCalled();
+  });
+  const liveJudgeRead = runGit => createRecordRedTeamRulingReader({
+    runGit, assertFresh: () => {}, log: () => {},
+    readThread: () => ({ headRefOid: HEAD, comments: thread(), labels: [{ name: 'review:human' }] }),
+    readSetting: () => ({ value: CONFIRMED_BREAKS_DEFAULTS }),
+    readScope: () => ({ value: { anyState: false }, sources: {} }),
+    readStandingRulingScope: () => null, resolveIdentity: () => identity, resolveCard: () => card,
+  })({ repo, pr: PR, actor: 'judge:r10', card: CARD });
+  it('rejects matching historical evidence when current main subsequently fixed the defect, at planning and effect time', () => {
+    let mainTip = preExisting.mainSha;
+    const runGit = vi.fn(args => {
+      if (args[0] === 'merge-base') return ''; // The defect-bearing commit remains an ancestor.
+      if (args[0] === 'ls-remote') return `${mainTip}\trefs/heads/main\n`;
+      throw new Error(`unexpected git command: ${args[0]}`);
+    });
+    const context = liveJudgeRead(runGit);
+    const request = judgeInput('card', { card: CARD, preExisting });
+    const plan = planRedTeamRuling(context, request);
+    expect(plan.preExisting).toEqual(preExisting);
+    expect(runGit).toHaveBeenCalledWith(['ls-remote', '--exit-code', '--refs', 'origin', 'refs/heads/main']);
+    mainTip = 'b'.repeat(40); // New main fixes the defect; the PR reintroduces the old result.
+    expect(() => planRedTeamRuling(context, request)).toThrow(/current authoritative main tip/);
+    const post = vi.fn(), readThread = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ runGit, post, readThread, warn: () => {} });
+    expect(() => sinks[plan.effect](plan)).toThrow(/current authoritative main tip/);
+    expect(post).not.toHaveBeenCalled();
+    expect(readThread).not.toHaveBeenCalled();
+  });
+  it.each(['unreadable', 'empty', 'malformed', 'multiple refs'])(
+    'refuses %s authoritative main evidence at planning and effect time', kind => {
+      let unavailable = false;
+      const runGit = args => {
+        if (args[0] === 'merge-base') return '';
+        if (args[0] !== 'ls-remote') throw new Error(`unexpected git command: ${args[0]}`);
+        if (!unavailable) return `${preExisting.mainSha}\trefs/heads/main\n`;
+        if (kind === 'unreadable') throw new Error('offline');
+        if (kind === 'empty') return '';
+        if (kind === 'malformed') return 'invalid\trefs/heads/main';
+        return `${preExisting.mainSha}\trefs/heads/main\n${'b'.repeat(40)}\trefs/heads/main`;
+      };
+      const context = liveJudgeRead(runGit);
+      const request = judgeInput('card', { card: CARD, preExisting });
+      const plan = planRedTeamRuling(context, request);
+      unavailable = true;
+      expect(() => planRedTeamRuling(context, request)).toThrow(/current authoritative main tip cannot be verified/);
+      const post = vi.fn(), readThread = vi.fn();
+      const sinks = createRecordRedTeamRulingSinks({ runGit, post, readThread, warn: () => {} });
+      expect(() => sinks[plan.effect](plan)).toThrow(/current authoritative main tip cannot be verified/);
+      expect(post).not.toHaveBeenCalled();
+      expect(readThread).not.toHaveBeenCalled();
+    });
   it.each(['reviewed-sha', 'ReViEwEd-ShA', 'cleared-human', 'ClEaReD-HuMaN'])(
     'judge red-team writer refuses reserved token %s in reason before producing any body', token => {
       let plan;
