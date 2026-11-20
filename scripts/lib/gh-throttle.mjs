@@ -176,6 +176,7 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync, accessSync, constants } from 'node:fs';
 import { homedir, constants as osConstants } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
@@ -2213,6 +2214,12 @@ function withDebugEnv(execOpts) {
   return { ...execOpts, env: { ...baseEnv, GH_DEBUG: 'api' } };
 }
 
+// Pass-local observation follows async phases without changing downstream call sites.
+const commandTiming = new AsyncLocalStorage();
+export function withCommandTiming(context, fn) {
+  return commandTiming.run(context, fn);
+}
+
 /**
  * The SAME throttle, shaped as an `execFileSync(file, args, opts)`-compatible 3-arg function — for a caller
  * (e.g. `ci-queue-watch.mjs#defaultListRuns`) whose injectable `exec` default is `execFileSync` itself rather
@@ -2224,8 +2231,18 @@ function withDebugEnv(execOpts) {
  * @param {object} [opts]
  */
 export function execFileSyncThrottled(file, args, opts = {}) {
-  if (file === 'gh') return runGhSync(args, opts);
-  return execFileSync(file, args, opts);
+  const context = commandTiming.getStore();
+  let start;
+  try { if (context && (file === 'gh' || file === 'git')) start = context.now(); } catch { /* Observation must not affect IO. */ }
+  try {
+    if (context?.exec) return context.exec(file, args, opts);
+    if (file === 'gh') return runGhSync(args, opts);
+    return execFileSync(file, args, opts);
+  } finally {
+    try {
+      if (start !== undefined) context.record(file, args, context.now() - start);
+    } catch { /* Preserve the command's original return value or error. */ }
+  }
 }
 
 // ── the standalone CLI passthrough — full-process transparency, including a SUCCESSFUL call's stderr ────────

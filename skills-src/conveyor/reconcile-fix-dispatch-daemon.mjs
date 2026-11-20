@@ -68,7 +68,7 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { execFileSyncThrottled } from '../../scripts/lib/gh-throttle.mjs';
+import { execFileSyncThrottled, withCommandTiming } from '../../scripts/lib/gh-throttle.mjs';
 import { readStacksForPass } from '../../scripts/conveyor/pr-stack.mjs';
 import { applyNetScopeToReconcile } from '../../scripts/conveyor/net-scope.mjs';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, enrichAgents, enrichPrsWithCodeQL, PR_LIST_LIMIT } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
@@ -1060,6 +1060,27 @@ export async function saveFixPassCursors({ path, rotation, prCursors, write = wr
 // Load once for the daemon defaults; injected state stays independent.
 const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
 
+/** Pure, bounded observation: retain only the slowest gh/git call in each phase. */
+export function createPassCallRecorder() {
+  let calls = {};
+  return {
+    reset() { calls = {}; },
+    snapshot() { return { ...calls }; },
+    record(phase, command, args, ms) {
+      try {
+        if (!['gh', 'git'].includes(command) || !Number.isFinite(ms) || ms < 0) return;
+        // Only command/subcommand words; flags, bodies, credentials and later argv never enter logs.
+        const words = [];
+        for (const arg of args.slice(0, 2)) {
+          if (typeof arg !== 'string' || !/^[a-z][a-z0-9-]*$/.test(arg)) break;
+          words.push(arg);
+        }
+        if (!calls[phase] || ms > calls[phase].ms) calls[phase] = { name: [command, ...words].join(' '), ms };
+      } catch { /* A malformed observation must never affect the call. */ }
+    },
+  };
+}
+
 /**
  * we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs#runTickAllRepos — #xngv3vn (epic #3383/#4075): the
  * daemon's WHOLE per-tick unit of work, composing BOTH halves this daemon now owns — the pre-existing `fix`
@@ -1132,6 +1153,7 @@ export async function runTickAllRepos({
   readPlanFingerprint = readPlanFingerprints, readPlanClaimSet = readPlanClaims,
   // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
   now = Date.now,
+  callRecorder = createPassCallRecorder(), exec,
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
@@ -1141,6 +1163,7 @@ export async function runTickAllRepos({
   // Off under a test run unless injected (the real pass reads GitHub).
   orphanGuardTick = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  callRecorder.reset();
   const persistCursors = budgetRotation === fixPassRotation && prCursors === fixPassPrCursors;
   const cursorsBefore = persistCursors ? JSON.stringify([budgetRotation, prCursors]) : null;
   let yieldedForAdoption = false;
@@ -1211,8 +1234,10 @@ export async function runTickAllRepos({
     phaseMs[name] = now() - start;
     if (budgets[name] && phaseMs[name] > budgets[name].budgetMs) budgets[name].hit = true;
   };
-  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return fn(); } finally { finishPhase(name, t); } };
-  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await fn(); } finally { finishPhase(name, t); } };
+  const observe = (name, fn) => withCommandTiming({ now, exec,
+    record: (command, args, ms) => callRecorder.record(name, command, args, ms) }, fn);
+  const timed = (name, fn) => { const t = phaseStarts[name] = now(); try { return observe(name, fn); } finally { finishPhase(name, t); } };
+  const timedAsync = async (name, fn) => { const t = phaseStarts[name] = now(); try { return await observe(name, fn); } finally { finishPhase(name, t); } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
@@ -1538,7 +1563,7 @@ export async function runTickAllRepos({
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
     ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}),
-    phasePrCounts, budgets, passBudgetSettings: passBudgets,
+    phasePrCounts, budgets, phaseSlowestCalls: callRecorder.snapshot(), passBudgetSettings: passBudgets,
     skippedSteps, phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
@@ -1737,7 +1762,7 @@ export function formatPassTiming(result) {
 /** Keep the historical total line intact; emit each phase exactly once alongside it. */
 export function formatPassPhaseTiming(result) {
   return Object.entries(result?.phaseMs ?? {}).filter(([, ms]) => Number.isFinite(ms))
-    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false} prs=${result?.phasePrCounts?.[name]?.handled ?? 0} deferred=${result?.phasePrCounts?.[name]?.deferred ?? 0}`);
+    .map(([name, ms]) => `pass-timing phase=${name} ms=${ms} budgetMs=${result?.budgets?.[name]?.budgetMs ?? 'none'} budgetHit=${result?.budgets?.[name]?.hit ?? false} prs=${result?.phasePrCounts?.[name]?.handled ?? 0} deferred=${result?.phasePrCounts?.[name]?.deferred ?? 0} slowest=${result?.phaseSlowestCalls?.[name] ? `${result.phaseSlowestCalls[name].name}:${result.phaseSlowestCalls[name].ms}` : 'none'}`);
 }
 
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
