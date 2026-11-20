@@ -1,8 +1,8 @@
 /** Mechanical tests only. Supplied live agy 1.2.2 streams are literal fixtures; real git regressions; no real agy processes. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import fs, { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync } from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import * as fs from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
@@ -13,6 +13,11 @@ import {
   defaultExecFn,
   setupScratchClone, captureDiff, runGate, runAgyDirectExec, geminiDirectTask, parseFlags, main, formatReport,
 } from '../gemini-direct-task.mjs';
+
+// Spy on the same module exports the runner imports. Vitest snapshots builtin named
+// exports, so patching fs.default + syncBuiltinESMExports misses the runner's openSync.
+// Keep the real, setup-guarded filesystem operations and real descriptors.
+vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
 
 const tempDirs = [];
 function tempDir() {
@@ -27,7 +32,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  syncBuiltinESMExports();
   vi.unstubAllEnvs();
   vi.useRealTimers();
   process.exitCode = 0;
@@ -570,8 +574,6 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
       opened.push({ path: args[0], fd });
       return fd;
     });
-    // Observe native ESM consumers too, while preserving the setup file's filesystem guard.
-    syncBuiltinESMExports();
     const { fn } = fakeSpawn('recorded\n', { hang: mode === 'timeout', error: mode === 'spawn error' ? 'ENOENT' : null });
     const spawnFn = mode === 'spawn throw' ? vi.fn(() => { throw new Error('ENOENT'); }) : fn;
     await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, stream: false,
