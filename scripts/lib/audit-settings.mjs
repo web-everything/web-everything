@@ -266,7 +266,7 @@ export const LOCK_USERS = Object.freeze([
   // PR #6606: the one host-local red-team check lock (withRedTeamCheckLock over atomic-json-file#withFileLock).
   'scripts/lib/red-team-check-run.mjs',
   'scripts/lib/required-status-checks.mjs', 'scripts/lib/resource-admission.mjs', 'scripts/lib/salvage-index.mjs',
-  'scripts/lib/scheduled-lane-maintenance.mjs', 'scripts/lib/target-registry.mjs',
+  'scripts/lib/scheduled-lane-maintenance.mjs', 'scripts/lib/stale-gate-update-branch.mjs', 'scripts/lib/target-registry.mjs',
   'scripts/lib/verdict-ledger-outbox-spool.mjs', 'scripts/lib/verdict-ledger.mjs', 'scripts/lib/verify-shard-run.mjs',
   'scripts/merge-ai-prs.mjs', 'scripts/operations/action-ground-truth.mjs', 'scripts/operations/action-store.mjs',
   'scripts/operations/ci-heal-pr-dispatch.mjs', 'scripts/operations/cli-adapter.mjs',
