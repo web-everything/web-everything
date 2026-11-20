@@ -22,7 +22,7 @@
  * Risk: admission is provisional; urgent-sweep withdrawal still requires the target
  * daemon to rebuild. These hermetic tests do not establish live rollback behavior.
  */
-import { verifyRuleset } from '../hot-patch.mjs';
+import { verifyRuleset, reserveHotPatch, assertHotPatchSingleton, readLedger } from '../hot-patch.mjs';
 import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
@@ -367,6 +367,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       retired: [], retireRefused: [], ...(input.replace ? { replace: input.replace } : {}),
       settings: { sources: policy.sources, values: policy.value, log: formatCascadeSourcesLine('prototypeLoad', policy), errors: platform.errors } };
     let stage = 'bad-input';
+    let hotPatchReservation;
     let readinessStep = 'readiness-unreadable';
     let pendingAdoption = null;
     const stop = (reason, details = {}) => {
@@ -507,6 +508,13 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (input.replace !== undefined && input.replace !== '' && (!safeRegistrationRef(input.replace) || input.replace === input.branch)) return stop('bad-input', { detail: 'invalid --replace ref' });
       const hotPatchMode = input.urgent === true && validSha(input.sha) && input.branch === `hotpatch/${input.sha}`;
       let hotPatch;
+      if (hotPatchMode) {
+        try {
+          hotPatchReservation = reserveHotPatch({ env, fs, inherited: true });
+          assertHotPatchSingleton(readLedger(env, 'urgent-loads', fs), readLedger(env, 'urgent-sweep-state', fs));
+        } catch (e) { return stop('no-ready', { detail: 'hot-patch-singleton', error: String(e.message),
+          fallback: 'Inspect hot-patch status and the reservation owner; settle existing loads before retrying. Remove a stale lock only after confirming its owner has stopped.' }); }
+      }
       if (hotPatchMode && (basename(out.clone) === 'wev-health-watch' || input.daemon === 'health-watch'))
         return stop('bad-input', { detail: 'health-watch-target', fallback: 'Target a different daemon; health-watch must remain outside the patch.' });
       if (!safeRef(input.branch) && !hotPatchMode) return stop('bad-input', { detail: 'bad-branch', fallback: 'Pass --branch=lane/<name>: a branch under lane/ with only letters, digits, dot, dash, underscore and slash.' });
@@ -592,7 +600,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
           } catch { /* Unknown mergeability retains the existing urgent rules. */ }
         }
         noCi('ci-checks-unreadable', 'Repair the check-runs reader and retry with complete evidence (at most 100 checks).');
-        const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100`]);
+        const result = origin.gh(['api', `repos/${origin.repo}/commits/${sha}/check-runs?per_page=100${hotPatchMode ? '&filter=all' : ''}`]);
         if (result.code !== 0) return null;
         const data = JSON.parse(result.stdout);
         // Any observed exact-SHA failure vetoes urgent loading, independently of suite selection or binding.
@@ -608,6 +616,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
             || !['queued', 'in_progress', 'completed'].includes(r.status)
             || (r.status === 'completed' ? !['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion) : r.conclusion !== null)))
           throw new Error('malformed, incomplete or oversized CI checks');
+        if (hotPatchMode && data.check_runs.some(r => r.name === 'test' && r.head_sha === sha && r.app.id === TEST_CHECK_APP_ID
+          && !(r.status === 'queued' || r.status === 'in_progress' || r.status === 'completed' && r.conclusion === 'success')))
+          throw Error('hot-patch test check is neither pending nor successful; repair CI and retry');
         const evidence = testCheckEvidence(data, sha);
         // Only "no check named test at all" can be the no-CI-run signature of a conflicting head; a test check
         // from another app, or on another sha, is mis-bound evidence and must keep refusing.
@@ -690,6 +701,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const storedFor = (r, key) => (typeof r?.[key] === 'string' && r[key].toLowerCase() === lowerLive && carriesAcross(r.fingerprint, r.fingerprint) ? [r.fingerprint] : []);
       const stored = [...new Set([...storedFor(canonical, 'head'), ...storedFor(out.gate?.record, 'sha')])];
       const producedFp = liveFp || (stored.length === 1 ? stored[0] : null);
+      // Disclosed provisional readiness: hotPatch.pr on the urgent-load record marks pending-CI loads.
       const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
         audit: canonical.verdict, testCheck: checkRun, ...(producedFp ? { fingerprint: producedFp } : {}),
         ...(auditGate?.ruledWeakened ? { auditRuling: auditGate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
@@ -733,6 +745,8 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       stage = 'check-unverifiable';
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
+      if (hotPatchMode && !contains) return stop('no-ready', { detail: 'hot-patch-behind-main',
+        fallback: 'Rebase the PR onto main, retest and audit its new SHA, then request a new immutable hot patch.' });
       let comparison = input.sha;
       // `conflict` is set only after exact-head GitHub evidence and a signed full-suite receipt.
       // Keep that tested head intact: merging main would either refuse its known conflict or
@@ -1037,6 +1051,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       return out;
     } catch (e) { return stop(stage, { ...(stage === 'no-ready' ? { detail: readinessStep } : {}), error: String(e.message || e), fallback: `Inspect the failed step evidence and rerun after resolving it.${keptNote()}` }); }
     finally {
+      hotPatchReservation?.release();
       const record = { at: new Date(now()).toISOString(), ...out };
       try { const file = expand(config.recordPath); fs.mkdirSync(dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8'); }
       catch (e) { out.ok = false; out.stopReason ||= 'check-unverifiable'; out.recordError = String(e.message || e); }

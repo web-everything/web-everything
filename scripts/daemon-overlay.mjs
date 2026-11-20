@@ -123,7 +123,7 @@ import {
 } from './lib/daemon-overlays.mjs';
 import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository } from './operations/prototype-retire.mjs';
 import { isDeepStrictEqual } from 'node:util';
-import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
+import { safeRegistrationRef, validSha, testCheckEvidence, testWorkflowBound } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
@@ -579,16 +579,34 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
       const matches = decision?.clone === root && decision.ref === load.ref && decision.sha === load.sha
         && isDeepStrictEqual(decision.registration, load.registration);
       // Only immutable hot-patch loads may use the shorter unknown clock or PR lifecycle evidence.
-      const hotPatch = typeof load.ref === 'string' && /^hotpatch\/[0-9a-f]{40}/.test(load.ref);
-      const pr = decision?.pr;
-      const prMatches = Number.isSafeInteger(load.hotPatch?.pr) && load.hotPatch.pr > 0
-        && pr?.number === load.hotPatch.pr && ['open', 'closed'].includes(pr.state)
-        && typeof pr.head?.sha === 'string' && /^[a-f0-9]{40}$/.test(pr.head.sha);
-      const hotNegative = hotPatch && (
-        decision?.reason === 'ci-unknown' && at - loadedAt >= 30 * 60 * 1000
-        || decision?.reason === 'expired' && at - loadedAt >= 24 * 60 * 60 * 1000
-        || prMatches && (decision?.reason === 'pr-head-moved' && pr.head.sha !== load.sha
-          || decision?.reason === 'pr-closed' && pr.state === 'closed' && pr.merged === false));
+      const hotPatch = validSha(load.sha) && load.ref === `hotpatch/${load.sha}`;
+      let hotNegative = false;
+      if (hotPatch && ['ci-unknown', 'expired', 'pr-head-moved', 'pr-closed'].includes(decision?.reason)) {
+        // Re-read under the add guard: a persisted decision is intent, not current evidence.
+        const { createSweepDeps, validateChecks } = await import('./operations/urgent-sweep.mjs');
+        const readers = () => createSweepDeps({ env, home: env.HOME });
+        if (decision.reason === 'ci-unknown' && at - loadedAt >= 30 * 60 * 1000) {
+          let readable = false;
+          try {
+            const checks = await (deps.readUrgentChecks ?? (r => readers().checks(r)))(load);
+            validateChecks(checks, load.sha);
+            readable = testWorkflowBound(testCheckEvidence(checks, load.sha), checks.workflows, load.sha, checks.testWorkflowPath);
+          } catch { /* Still unknown: the bounded timeout authorizes withdrawal. */ }
+          hotNegative = !readable;
+        } else if (decision.reason !== 'ci-unknown') {
+          try {
+            const pr = await (deps.readUrgentPr ?? (r => readers().pr(r)))(load);
+            const prMatches = Number.isSafeInteger(load.hotPatch?.pr) && load.hotPatch.pr > 0
+              && pr?.number === load.hotPatch.pr && ['open', 'closed'].includes(pr.state)
+              && typeof pr.merged === 'boolean' && validSha(pr.head?.sha);
+            hotNegative = prMatches && (
+              decision.reason === 'expired' && at - loadedAt >= 24 * 60 * 60 * 1000
+                && !(pr.merged && pr.head.sha === load.sha)
+              || decision.reason === 'pr-head-moved' && pr.head.sha !== load.sha
+              || decision.reason === 'pr-closed' && pr.state === 'closed' && pr.merged === false);
+          } catch { /* Unknown PR evidence cannot authorize a lifecycle withdrawal. */ }
+        }
+      }
       const negative = hotNegative || (decision?.reason === 'ci-failed'
         ? decision.check?.head_sha === load.sha && decision.check.status === 'completed'
           && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(decision.check.conclusion)

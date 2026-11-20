@@ -17,7 +17,7 @@ import { writeEscalationPacket } from './land-advance-escalations.mjs';
 const failedCheck = (c, sha) => c?.head_sha === sha && c.status === 'completed'
   && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'].includes(c.conclusion);
 const identity = r => createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
-const validateChecks = (data, sha) => {
+export const validateChecks = (data, sha) => {
   if (!Number.isInteger(data?.total_count)
     || data.total_count < 0 || data.total_count > 100 || !Array.isArray(data.check_runs)
     || data.check_runs.length !== data.total_count || new Set(data.check_runs.map(c => c?.id)).size !== data.total_count
@@ -170,7 +170,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
     const batch = [...entries.slice(start), ...entries.slice(0, start)].filter(([id]) => !settled.has(id)).slice(0, 32);
     // Persist before readers/escalations: an unreadable or pending batch must not monopolize later ticks.
     if (batch.length) await deps.settle({ id: batch.at(-1)[0], status: 'sweep-cursor', at: deps.now() });
-    // Up to four GitHub reads per hot-patch load, at most 128 per tick. Remaining entries wait for the next orchestrator tick.
+    // Up to seven GitHub reads per hot-patch load including guarded revalidation, at most 224 per tick. Remaining entries wait for the next orchestrator tick.
     for (const [id, r] of batch) {
       const notificationErrors = [];
       const report = result => results.push(notificationErrors.length
@@ -247,13 +247,12 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
         const loadedAt = Date.parse(r.at), now = Date.parse(deps.now());
         if (!Number.isFinite(loadedAt) || !Number.isFinite(now) || now < loadedAt)
           throw new Error('unreadable urgent load timestamp; inspect CI or unload manually');
-        const hotPatch = /^hotpatch\/[0-9a-f]{40}/.test(r.ref);
-        let decisionReason, prEvidence, hotFailure;
+        const hotPatch = validSha(r.sha) && r.ref === `hotpatch/${r.sha}`;
+        let decisionReason, prEvidence, mergedAtSha = false;
         let age = now - loadedAt;
-        let data, boundFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError;
+        let data, boundFailure, anyFailure, unload = false, requiredSucceeded = false, unloadReason, evidenceError, ciEvidenceError;
         try {
           data = await deps.checks(r);
-          if (hotPatch) hotFailure = data?.check_runs?.find(c => c?.app?.id === TEST_CHECK_APP_ID && failedCheck(c, r.sha));
           anyFailure = Array.isArray(data?.check_runs) && data.check_runs.some(c => failedCheck(c, r.sha));
           validateChecks(data, r.sha);
           // GitHub cannot run CI without a merge ref. Resume normal monitoring as soon as checks appear.
@@ -295,10 +294,12 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
                 && checks.every(c => c.status === 'completed' && c.conclusion === 'success');
             }
           }
-        } catch (e) { evidenceError = e; }
+        } catch (e) { evidenceError = ciEvidenceError = e; }
         if (hotPatch) {
-          if (!testWorkflowBound(testCheckEvidence(data ?? {}, r.sha), data?.workflows, r.sha, data?.testWorkflowPath))
-            evidenceError ||= Error('unreadable hot-patch CI binding; repair workflow evidence or unload manually');
+          if (!testWorkflowBound(testCheckEvidence(data ?? {}, r.sha), data?.workflows, r.sha, data?.testWorkflowPath)) {
+            ciEvidenceError ||= Error('unreadable hot-patch CI binding; repair workflow evidence or unload manually');
+            evidenceError ||= ciEvidenceError;
+          }
           try {
             prEvidence = await deps.pr(r);
             if (!Number.isSafeInteger(r.hotPatch?.pr) || r.hotPatch.pr <= 0 || prEvidence?.number !== r.hotPatch.pr
@@ -306,14 +307,20 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
               || !validSha(prEvidence.head?.sha)) throw Error('unreadable hot-patch PR evidence; repair reader or unload manually');
             if (prEvidence.head.sha !== r.sha) decisionReason = 'pr-head-moved';
             else if (prEvidence.state === 'closed' && !prEvidence.merged) decisionReason = 'pr-closed';
-            else if (!prEvidence.merged && age >= 24 * 60 * 60 * 1000) decisionReason = 'expired';
+            else {
+              if (prEvidence.merged) {
+                // A PR flag alone never proves the loaded commit reached main.
+                try { mergedAtSha = await deps.mergedOverlay(r) === true; } catch { /* Ordinary deadlines still apply. */ }
+              }
+              if (!mergedAtSha && age >= 24 * 60 * 60 * 1000) decisionReason = prEvidence.merged ? 'ci-expired' : 'expired';
+            }
           } catch (e) { evidenceError = e; }
-          if (hotFailure) { boundFailure = hotFailure; decisionReason = 'ci-failed'; }
-          else if (!decisionReason && evidenceError && age >= 30 * 60 * 1000) decisionReason = 'ci-unknown';
+          if (boundFailure) decisionReason = 'ci-failed';
+          else if (!decisionReason && ciEvidenceError && age >= 30 * 60 * 1000) decisionReason = 'ci-unknown';
           unload = Boolean(decisionReason);
           if (unload && decisionReason !== 'ci-failed') unloadReason = `Unloaded ${r.sha}: ${decisionReason}. Inspect evidence and repair before reloading.`;
         }
-        if (!hotPatch && !requiredSucceeded && everGreen.has(id)) {
+        if (!requiredSucceeded && everGreen.has(id)) {
           // A historical pass cannot authorize today's incomplete or failing evidence.
           // Persist before notifications so restarts cannot extend this verdict deadline.
           if (!nonGreen.has(id)) {
@@ -326,13 +333,13 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
             throw new Error('unreadable non-green timestamp; inspect CI or unload manually');
           age = now - since;
         }
-        if (!hotPatch && !unload && !requiredSucceeded) {
+        if (!unload && !requiredSucceeded) {
           if (!anyFailure && age >= 6 * 60 * 60 * 1000 && !ciEscalated.has(id)) {
             await escalate(`${id}-no-ci-verdict`, r.ref, 'urgent load has no CI verdict after 6h');
             await deps.settle({ id, ref: r.ref, sha: r.sha, at: deps.now(), status: 'monitoring-ci', noVerdictEscalated: true });
             ciEscalated.add(id);
           }
-          unload = age >= 24 * 60 * 60 * 1000;
+          unload = !hotPatch && age >= 24 * 60 * 60 * 1000;
           if (unload) unloadReason = `Unloaded ${r.sha}: urgent load has no CI verdict after 24h. Inspect and repair before reloading.`;
         }
         if (anyFailure && !unload) {

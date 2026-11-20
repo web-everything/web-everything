@@ -3,7 +3,7 @@
  * WHY (incident 2026-10-22): pin main preservation, ready evidence, adopt-before-remove, stale
  * replacement, and adoption refusal with injected doubles, plus real Git adoption probes.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterAll, describe, it, expect, vi } from 'vitest';
 import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -278,7 +278,7 @@ function fixture(options = {}) {
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { fs, calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
@@ -3641,6 +3641,9 @@ describe('recorder-to-load same-diff waiver admission', () => {
 
 
 // R1100 MVP: real CI reader, no urgent receipt, and one-field mutations of valid evidence.
+const hotHomes = [];
+// Temp fixtures are removed when this suite finishes.
+afterAll(() => { for (const home of hotHomes) rmSync(home, { recursive: true, force: true }); });
 describe('hot-patch urgent admission (R1100)', () => {
   const repo = 'web-everything/web-everything', branch = `hotpatch/${SHA}`;
   const validPr = () => ({ number: 42, state: 'open', head: { sha: SHA, ref: 'lane/repair', repo: { full_name: repo } },
@@ -3649,10 +3652,24 @@ describe('hot-patch urgent admission (R1100)', () => {
   function hotFixture(change = {}) {
     const prs = change.prs ?? [validPr()];
     const rules = change.rules ?? validRules();
-    const ruleset = { id: 27726920, enforcement: 'active', current_user_can_bypass: 'never', ...change.ruleset };
+    const ruleset = { id: 27726920, enforcement: 'active', current_user_can_bypass: 'never', bypass_actors: [], ...change.ruleset };
     const rows = change.rows ?? [{ id: 1, head_sha: SHA, name: 'test', status: 'in_progress', conclusion: null,
       app: { id: 15368 }, check_suite: { id: 7 } }];
     const gh = [];
+    const home = mkdtempSync(join(tmpdir(), 'hotpatch-load-'));
+    hotHomes.push(home);
+    const lockFs = Object.fromEntries(['openSync', 'closeSync', 'writeFileSync', 'unlinkSync', 'statSync'].map(k => [k, nodeFs[k]]));
+    const stat = lockFs.statSync;
+    lockFs.statSync = p => p.endsWith('/urgent-loads.jsonl') && change.loads !== undefined ? { size: Buffer.byteLength(change.loads) } : stat(p);
+    lockFs.mkdirSync = (p, ...args) => { if (p.startsWith(home)) return nodeFs.mkdirSync(p, ...args); };
+    lockFs.readFileSync = (p, ...args) => {
+      if (p.startsWith(home)) {
+        if (p.endsWith('/urgent-loads.jsonl') && change.loads !== undefined) return change.loads;
+        return nodeFs.readFileSync(p, ...args);
+      }
+      return originalRead(p, ...args);
+    };
+    let originalRead;
     const combinedIO = { fs: {}, handles: (cmd, args) => cmd === 'gh' || cmd === 'git' && args[0] === 'remote',
       exec: (cmd, args) => {
         if (cmd === 'git') return `https://github.com/${repo}.git\n`;
@@ -3660,7 +3677,7 @@ describe('hot-patch urgent admission (R1100)', () => {
         const path = args.find(a => a.startsWith('repos/'));
         if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: repo, url: `https://github.com/${repo}` });
         if (path?.includes('/check-runs')) return JSON.stringify({ total_count: rows.length, check_runs: rows });
-        if (path?.includes('/actions/runs')) return JSON.stringify({ total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml' }] });
+        if (path?.includes('/actions/runs')) return JSON.stringify({ total_count: 2, workflow_runs: [7, 8].map(check_suite_id => ({ check_suite_id, head_sha: SHA, path: '.github/workflows/ci.yml' })) });
         if (path === `repos/${repo}/commits/${SHA}/pulls` || path?.includes('/pulls?')) return JSON.stringify(prs);
         if (path === `repos/${repo}/pulls/42`) return JSON.stringify(prs[0]);
         if (path?.includes('/rules/branches/')) return JSON.stringify(rules);
@@ -3668,6 +3685,14 @@ describe('hot-patch urgent admission (R1100)', () => {
         throw new Error(`unexpected hot-patch evidence read: ${args.join(' ')}`);
       } };
     const f = fixture({ ready: '', defaultTestCheck: true, combinedIO, ...change.options });
+    originalRead = f.fs.readFileSync;
+    Object.assign(f.fs, lockFs);
+    // The loader's home stays hermetic; only lock paths are redirected to real temp IO.
+    const redirect = p => p.replace('/home/test/workspace/.operations/coordination', `${home}/coordination`);
+    for (const k of ['openSync', 'writeFileSync', 'unlinkSync', 'statSync', 'mkdirSync']) {
+      const fn = f.fs[k]; f.fs[k] = (p, ...args) => fn(typeof p === 'string' ? redirect(p) : p, ...args);
+    }
+    f.fs.readFileSync = (p, ...args) => p.includes('/coordination/') ? lockFs.readFileSync(redirect(p), ...args) : originalRead(p, ...args);
     return { ...f, gh, run: (input = {}) => f.run({ branch, urgent: true, reason: 'R1100 hot-patch PR #42', ...input }) };
   }
   it.each(['queued', 'in_progress', 'completed'])('accepts bound Actions test %s without a receipt and records hotPatch.pr', async status => {
@@ -3675,9 +3700,51 @@ describe('hot-patch urgent admission (R1100)', () => {
       app: { id: 15368 }, check_suite: { id: 7 } }] });
     expect(await f.run()).toMatchObject({ ok: true, registered: true });
     expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', ref: branch, sha: SHA, hotPatch: { pr: 42 } }));
+    expect(f.readyWrites[0]).toMatchObject({ tests: 'green', testCheck: { status } });
     expect(f.reads.some(p => p.endsWith('/urgent-full-green.jsonl'))).toBe(false);
     expect(f.gh.some(args => args.includes(`repos/${repo}/commits/${SHA}/pulls`))).toBe(true);
     expect(f.gh.some(args => args.includes(`repos/${repo}/rulesets/27726920`))).toBe(true);
+  });
+  it.each(['neutral', 'skipped', 'cancelled', 'stale'])('refuses queued test masking completed %s in any suite', async conclusion => {
+    const f = hotFixture({ rows: [
+      { id: 1, head_sha: SHA, name: 'test', status: 'queued', conclusion: null, app: { id: 15368 }, check_suite: { id: 7 } },
+      { id: 2, head_sha: SHA, name: 'test', status: 'completed', conclusion, app: { id: 15368 }, check_suite: { id: 8 } },
+    ] });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('refuses behind main before creating or publishing a merge ref', async () => {
+    const f = hotFixture({ options: { behind: true } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-behind-main' });
+    expect(f.calls.some(c => c.cmd === 'git' && ['merge-tree', 'commit-tree', 'push'].includes(c.args[0]))).toBe(false);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('direct hot-patch load refuses another unsettled hot patch', async () => {
+    const f = hotFixture({ loads: JSON.stringify({ type: 'prototype-load.urgent', ref: `hotpatch/${TREE}`, sha: TREE }) + '\n' });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-singleton' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('direct concurrent hot-patch requests reserve exclusively and release after refusal', async () => {
+    let release, entered;
+    const started = new Promise(r => { entered = r; });
+    let checks = 0;
+    const f = hotFixture({ options: { defaultTestCheck: false, testCheck: async () => { if (checks++ === 0) { entered(); await new Promise(r => { release = r; }); } return null; } } });
+    const first = f.run(); await started;
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-singleton' });
+    release(); await first;
+    expect((await f.run()).detail).not.toBe('hot-patch-singleton');
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each(['{malformed', ' '.repeat(4 * 1024 * 1024 + 1)])('refuses malformed or oversized singleton ledger (%#)', async loads => {
+    const f = hotFixture({ loads });
+    const result = await f.run();
+    expect(result).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-singleton' });
+    expect(result.fallback).toMatch(/inspect|settle/i);
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('direct admission refuses ruleset bypass actors despite current user never', async () => {
+    const f = hotFixture({ ruleset: { bypass_actors: [{ actor_id: 1, actor_type: 'Team', bypass_mode: 'always' }] } });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, detail: 'hot-patch-pr-protection' });
   });
   const refusalCases = [
     ['zero PRs', { prs: [] }, /pr/i],

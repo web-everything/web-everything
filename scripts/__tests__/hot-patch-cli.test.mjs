@@ -9,15 +9,22 @@
  * These are deliberate seams for the missing MVP, salvaged from the archived CLI;
  * force-watch, allowlists, wake, rejection ledger and rebuild changes are excluded.
  */
-import { describe, it, expect, vi } from 'vitest';
-import { main, easternIso, verifyPr, verifyRuleset, ensureRef, buildLoadArgs } from '../hot-patch.mjs';
+import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { main, easternIso, verifyPr, verifyRuleset, ensureRef, buildLoadArgs, reserveHotPatch } from '../hot-patch.mjs';
 
+const homes = [];
+afterEach(() => { for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
 const repo = 'web-everything/web-everything', prefix = `repos/${repo}`;
 const sha = 'a'.repeat(40), other = 'b'.repeat(40), branch = `hotpatch/${sha}`;
 const pr = () => ({ number: 42, state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair', baseRefName: 'main',
   headRepository: { nameWithOwner: repo }, isCrossRepository: false });
 const rules = () => ['update', 'deletion', 'non_fast_forward'].map(type => ({ type, ruleset_id: 27726920 }));
-const liveRuleset = () => ({ id: 27726920, enforcement: 'active', current_user_can_bypass: 'never' });
+const liveRuleset = () => ({ id: 27726920, enforcement: 'active', current_user_can_bypass: 'never', bypass_actors: [] });
 const ref = (value = sha) => ({ ref: `refs/heads/${branch}`, object: { sha: value } });
 function github({ ruleRows = rules(), ruleset = liveRuleset(), evidence = pr(), createError = null, readback = ref() } = {}) {
   return vi.fn(async args => {
@@ -43,7 +50,7 @@ function github({ ruleRows = rules(), ruleset = liveRuleset(), evidence = pr(), 
 }
 function cli(ghJson = github()) {
   let out = '', err = '';
-  const io = { ghJson, spawn: vi.fn(() => ({ status: 0 })), loads: () => [], state: () => [], env: {},
+  const io = { ghJson, spawn: vi.fn(() => ({ status: 0 })), loads: () => [], state: () => [], env: { HOME: (() => { const home = mkdtempSync(join(tmpdir(), 'hotpatch-cli-')); homes.push(home); return home; })() },
     stdout: s => { out += s; }, stderr: s => { err += s; } };
   return { io, output: () => out, error: () => err };
 }
@@ -84,6 +91,45 @@ describe('hot-patch MVP CLI', () => {
     ['id mismatch', { ruleset: { ...liveRuleset(), id: 27726921 } }],
   ])('refuses ruleset %s on its own field (other ids remain valid)', async (_, change) => {
     await expect(verifyRuleset({ sha, ghJson: github(change) })).rejects.toThrow(/rule|protect|immutable/i);
+  });
+  it.each([{ actors: [{ actor_id: 1, actor_type: 'Team', bypass_mode: 'always' }] }, { actors: undefined }, { actors: null }])('refuses nonempty or unreadable bypass actors: %j', async ({ actors }) => {
+    await expect(verifyRuleset({ sha, ghJson: github({ ruleset: { ...liveRuleset(), bypass_actors: actors } }) })).rejects.toThrow(/bypass|immutable/i);
+  });
+  it.each([0, 1])('allows only one concurrent request and releases reservation after spawn status %s', async status => {
+    const f = cli();
+    let release, entered;
+    const started = new Promise(r => { entered = r; });
+    f.io.spawn = vi.fn(async () => { if (f.io.spawn.mock.calls.length === 1) { entered(); await new Promise(r => { release = r; }); } return { status }; });
+    const first = main(request, f.io);
+    await started;
+    expect(await main(request, f.io)).toBe(1);
+    expect(f.error()).toMatch(/reservation|progress|locked/i);
+    release();
+    expect(await first).toBe(status);
+    f.io.spawn = vi.fn(() => ({ status: 0 }));
+    expect(await main(request, f.io)).toBe(0);
+  });
+  it('hands the held reservation to its child while excluding direct requests', async () => {
+    const f = cli();
+    f.io.spawn = vi.fn((command, _args, options) => {
+      const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/hot-patch.mjs')).href;
+      const program = `import { reserveHotPatch } from ${JSON.stringify(moduleUrl)};
+        const r = reserveHotPatch({env:process.env, inherited:true}); r.release();`;
+      execFileSync(command, ['--input-type=module', '-e', program], { env: options.env, timeout: 10000 });
+      expect(() => reserveHotPatch({ env: f.io.env })).toThrow(/reservation/i);
+      return { status: 0 };
+    });
+    expect(await main(request, f.io)).toBe(0);
+    const next = reserveHotPatch({ env: f.io.env }); next.release();
+  });
+  it('refuses forged inherited reservation ownership without releasing its lock', () => {
+    const f = cli(), owner = reserveHotPatch({ env: f.io.env });
+    try {
+      for (const token of [owner.token, 'wrong-token']) {
+        expect(() => reserveHotPatch({ env: { ...f.io.env, WE_HOT_PATCH_RESERVATION: token }, inherited: true })).toThrow(/owner/i);
+      }
+      expect(() => reserveHotPatch({ env: f.io.env })).toThrow(/reservation/i);
+    } finally { owner.release(); }
   });
   it('refuses unreadable rules evidence', async () => {
     await expect(verifyRuleset({ sha, ghJson: async () => { throw Error('HTTP 503'); } })).rejects.toThrow();

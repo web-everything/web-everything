@@ -766,9 +766,40 @@ describe('hot-patch retirement decision authorization', () => {
       trackingId: load.trackingId, env: f.env, deps: {
         prove: () => ({ action: 'keep', reason: 'pr-open', tip }), tip: () => tip,
         readUrgentLoads: () => [load], readUrgentDecisions: () => [decision],
+        readUrgentChecks: () => { throw Error('CI unavailable'); },
+        readUrgentPr: () => pr ?? (reason === 'expired' ? { number: 42, state: 'open', merged: false, head: { sha: tip } } : null),
       } };
     return { f, args, decision, ref };
   }
+  it.each(['green', 'red', 'pending'])('refuses ci-unknown when CI is readable now: %s', async verdict => {
+    const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
+    args.deps.readUrgentChecks = () => ({ total_count: 1, check_runs: [{ id: 81, name: 'test', head_sha: tip,
+      app: { id: 15368 }, check_suite: { id: 7 }, status: verdict === 'pending' ? 'queued' : 'completed',
+      conclusion: verdict === 'pending' ? null : verdict === 'red' ? 'failure' : 'success' }],
+      workflows: { total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: tip, path: '.github/workflows/ci.yml' }] } });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
+  it('refuses expired when the live PR is merged at the loaded sha', async () => {
+    const { f, args, ref } = retirement('expired', 24 * 3600_000, null);
+    args.deps.readUrgentPr = () => ({ number: 42, state: 'closed', merged: true, head: { sha: tip } });
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
+  it.each(['pr-head-moved', 'pr-closed', 'expired'])('refuses forged %s when the live PR does not authorize it', async reason => {
+    const { f, args, ref } = retirement(reason, 24 * 3600_000, { number: 42, state: 'closed', merged: false, head: { sha: other } });
+    args.deps.readUrgentPr = () => reason === 'expired' ? null : { number: 42, state: 'open', merged: false, head: { sha: tip } };
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
+  it.each(['suffix', 'mismatch'])('refuses new retirement reasons for %s ref identity', async kind => {
+    const { f, args, ref } = retirement('ci-unknown', 31 * 60_000, null);
+    const [load] = args.deps.readUrgentLoads();
+    load.ref = kind === 'suffix' ? `${ref}-m1` : `hotpatch/${other}`;
+    const [decision] = args.deps.readUrgentDecisions(); decision.ref = load.ref;
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
   it.each(reasons)('accepts %s at its threshold with exact-load evidence', async (reason, age, pr) => {
     const { f, args } = retirement(reason, age, pr);
     expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });

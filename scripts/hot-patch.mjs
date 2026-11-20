@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /** R1100: immutable hot-patch admission; urgent-sweep owns monitoring and rollback. */
-import { createHash } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import nodeFs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs';
 import { DAEMON_CLONE_SEED, daemonCloneForLabel } from './lib/daemon-clone-registry.mjs';
@@ -46,7 +46,8 @@ export async function verifyRuleset({ sha, ghJson }) {
     throw Error('immutable rules evidence incomplete (maximum 100); operator must repair protection');
   for (const id of new Set(rules.map(r => r.ruleset_id))) {
     const rule = await ghJson(['api', `${prefix}/rulesets/${id}`, '--repo', repo]);
-    if (rule?.id !== id || rule.enforcement !== 'active' || rule.current_user_can_bypass !== 'never')
+    if (rule?.id !== id || rule.enforcement !== 'active' || rule.current_user_can_bypass !== 'never'
+      || !Array.isArray(rule.bypass_actors) || rule.bypass_actors.length !== 0)
       throw Error('immutable ruleset inactive, mismatched or bypassable; operator must repair protection');
   }
 }
@@ -62,16 +63,45 @@ export async function ensureRef({ sha, ghJson }) {
   if (ref?.ref !== `refs/heads/${branch}` || ref.object?.sha !== sha) throw Error('immutable ref readback sha mismatch');
 }
 export const buildLoadArgs = ({ daemon, sha, pr }) => [`--daemon=${daemon}`, `--branch=hotpatch/${sha}`, `--sha=${sha}`, '--urgent', `--reason=R1100 hot-patch PR #${pr}`];
-function readLedger(env, name) {
+export function readLedger(env, name, fs = nodeFs) {
   const path = urgentLedger(env.HOME, name);
   try {
-    if (statSync(path).size > 4 * 1024 * 1024) throw Error('ledger exceeds 4 MiB; archive settled records and retry');
-    return readFileSync(path, 'utf8').split(/\r?\n/).filter(l => l.trim()).map(l => JSON.parse(l));
+    if (fs.statSync(path).size > 4 * 1024 * 1024) throw Error('ledger exceeds 4 MiB; archive settled records and retry');
+    return fs.readFileSync(path, 'utf8').split(/\r?\n/).filter(l => l.trim()).map(l => JSON.parse(l));
   } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+}
+/** One reservation covers the unsettled check through registration, including CLI -> child handoff.
+ * A crashed owner leaves a closed lock: inspect the owner/ledger and remove it manually before retrying. */
+export function reserveHotPatch({ env, fs = nodeFs, inherited = false }) {
+  const path = join(dirname(urgentLedger(env.HOME, 'urgent-loads')), 'hot-patch.lock');
+  if (inherited && env.WE_HOT_PATCH_RESERVATION) {
+    const owner = JSON.parse(fs.readFileSync(path, 'utf8'));
+    if (owner.token !== env.WE_HOT_PATCH_RESERVATION || owner.pid !== process.ppid)
+      throw Error('invalid hot-patch reservation owner; inspect lock and retry through hot-patch request');
+    return { token: owner.token, release() {} };
+  }
+  fs.mkdirSync(dirname(path), { recursive: true });
+  let fd;
+  try { fd = fs.openSync(path, 'wx', 0o600); }
+  catch (e) { throw Error(`hot-patch reservation unavailable (${e.code ?? 'unreadable'}); inspect active request and lock before retrying`); }
+  const token = randomUUID();
+  try { fs.writeFileSync(fd, JSON.stringify({ token, pid: process.pid }), 'utf8'); }
+  catch (e) { fs.closeSync(fd); fs.unlinkSync(path); throw e; }
+  fs.closeSync(fd);
+  return { token, release: () => fs.unlinkSync(path) };
+}
+export function assertHotPatchSingleton(records, receipts) {
+  const hot = records.filter(r => r.type === 'prototype-load.urgent' && /^hotpatch\/[a-f0-9]{40}/.test(r.ref ?? ''));
+  if (hot.some(r => {
+    const id = createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
+    return !receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha
+      && ((s.status === 'settled-unregistered' && s.ancestryVerified === true) || s.status === 'unloaded-adopted'));
+  })) throw Error('unsettled hot-patch load exists; inspect status and settle it before retrying');
 }
 export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), env = process.env, ghJson, spawn = spawnSync,
   loads = () => readLedger(env, 'urgent-loads'), state = () => readLedger(env, 'urgent-sweep-state'),
   stdout = s => process.stdout.write(s), stderr = s => process.stderr.write(s) } = {}) {
+  let reservation;
   try {
     const childEnv = { ...env }; delete childEnv.GH_REPO; delete childEnv.GH_HOST;
     ghJson ??= async args => {
@@ -82,25 +112,23 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), 
     const [command, ...args] = argv;
     if (!['request', 'status'].includes(command)) throw Error('expected request or status');
     const { values: f } = parseArgs({ args, options: command === 'request' ? { daemon: { type: 'string' }, pr: { type: 'string' } } : {} });
+    if (command === 'request') reservation = reserveHotPatch({ env });
     const records = await loads(), receipts = await state();
     const hot = records.filter(r => r.type === 'prototype-load.urgent' && /^hotpatch\/[a-f0-9]{40}/.test(r.ref ?? ''));
-    const settled = r => {
-      const id = createHash('sha256').update(JSON.stringify([r.ref, r.sha, r.clone, r.registration, r.trackingId])).digest('hex');
-      return receipts.some(s => s.id === id && s.ref === r.ref && s.sha === r.sha
-        && ((s.status === 'settled-unregistered' && s.ancestryVerified === true) || s.status === 'unloaded-adopted'));
-    };
     if (command === 'status') {
       stdout(JSON.stringify(easternTimes(hot.map(r => ({ ...r, sweep: receipts.filter(s => s.ref === r.ref && s.sha === r.sha) }))), null, 2) + '\n'); return 0;
     }
     if (!f.daemon || !/^[1-9]\d*$/.test(f.pr ?? '') || !Number.isSafeInteger(Number(f.pr))) throw Error('--daemon and a positive safe --pr required');
-    if (hot.some(r => !settled(r))) throw Error('unsettled hot-patch load exists; inspect status and settle it before retrying');
+    assertHotPatchSingleton(records, receipts);
     const pr = Number(f.pr);
     const evidence = await ghJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'number,state,headRefOid,headRefName,baseRefName,headRepository,isCrossRepository']);
     const sha = verifyPr(evidence, { pr });
     await verifyRuleset({ sha, ghJson }); await ensureRef({ sha, ghJson });
+    childEnv.WE_HOT_PATCH_RESERVATION = reservation.token;
     const result = await spawn(process.execPath, ['scripts/operations/run.mjs', 'prototype-load', ...buildLoadArgs({ daemon: f.daemon, sha, pr })], { cwd, env: childEnv, stdio: 'inherit', shell: false });
     if (result.error) throw result.error;
     return result.status === 0 ? 0 : 1;
   } catch (e) { stderr(String(e.message).replace(/[\x00-\x1f\x7f-\x9f]/g, '') + '\n'); return 1; }
+  finally { reservation?.release(); }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) process.exitCode = await main();

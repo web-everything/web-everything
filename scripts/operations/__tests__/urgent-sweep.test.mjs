@@ -1023,6 +1023,46 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.pr = vi.fn(() => openPr());
     return f;
   }
+  it.each(['unrelated', 'foreign-app', 'unbound', 'malformed', 'required-unreadable'])('refuses %s failure as hot-patch withdrawal evidence', async kind => {
+    const failed = check(kind === 'unrelated' ? 'daemon-soak' : 'test', 'failure',
+      kind === 'foreign-app' ? { app: { id: 99 } } : kind === 'unbound' ? { check_suite: { id: 8 } } : {});
+    const f = hotFixture([failed]);
+    if (kind === 'malformed') f.d.checks.mockReturnValue({ total_count: 2, check_runs: [failed], workflows });
+    if (kind === 'required-unreadable') f.d.required.mockImplementation(() => { throw Error('missing workflow'); });
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
+  it('ignores superseded hot-patch failure with a newer successful rerun', async () => {
+    const f = hotFixture([check('test', 'failure'), ...required.map(n => check(n))]);
+    expect(await f.run()).toMatchObject({ results: [{ status: 'monitoring-green' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+  });
+  it('keeps the six-hour escalation for a seven-hour pending hot patch', async () => {
+    const f = hotFixture([check('test', null, { status: 'in_progress' })]);
+    f.d.now = () => new Date(Date.parse(load.at) + 7 * 3600_000).toISOString();
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).toHaveBeenCalledWith(expect.objectContaining({ evidence: ['urgent load has no CI verdict after 6h'] }));
+  });
+  it.each([false, 'unreadable'])('expires a 48h merged-but-unproven hot patch: %s', async containment => {
+    const f = hotFixture([check('test', null, { status: 'queued' })]);
+    f.d.pr.mockReturnValue({ ...openPr(), merged: true, state: 'closed' });
+    f.d.mergedOverlay.mockImplementation(() => { if (containment === 'unreadable') throw Error('ancestry unavailable'); return containment; });
+    f.d.now = () => new Date(Date.parse(load.at) + 48 * 3600_000).toISOString();
+    await f.run();
+    expect(f.d.mergedOverlay).toHaveBeenCalled();
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+    expect(f.d.escalate).toHaveBeenCalled();
+  });
+  it.each([`hotpatch/${sha}-m1`, `hotpatch/${'b'.repeat(40)}`])('does not grant hot-patch rules to %s', async ref => {
+    const f = hotFixture();
+    f.loads[0] = { ...f.loads[0], ref, registration: { ...f.loads[0].registration, ref } };
+    f.d.pr.mockReturnValue({ ...openPr(), state: 'closed' });
+    await f.run();
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.pr).not.toHaveBeenCalled();
+  });
   function decisionBeforeRemoval(f, reason) {
     f.d.remove.mockImplementation(() => {
       expect(f.state.at(-1)).toMatchObject({ status: 'unload-decision', reason,
@@ -1030,11 +1070,17 @@ describe('hot-patch sweep (R1100)', () => {
       return { retired: true };
     });
   }
-  it.each(['bound test', 'unbound daemon-soak'])('unloads %s failure and persists evidence before removal', async kind => {
+  it.each(['bound test', 'unbound daemon-soak'])('validates %s failure before removal', async kind => {
     const greenRows = required.map(n => check(n));
     const failed = kind === 'bound test' ? check('test', 'failure')
       : check('daemon-soak', 'failure', { check_suite: { id: 8 } });
     const f = hotFixture([...greenRows, failed]);
+    if (kind === 'unbound daemon-soak') {
+      expect(await f.run()).toMatchObject({ results: [{ status: 'needs-you' }] });
+      expect(f.d.remove).not.toHaveBeenCalled();
+      expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+      return;
+    }
     decisionBeforeRemoval(f, 'ci-failed');
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledTimes(1);
@@ -1046,7 +1092,7 @@ describe('hot-patch sweep (R1100)', () => {
     expect(f.d.remove).not.toHaveBeenCalled();
     expect(f.d.escalate).toHaveBeenCalled();
   });
-  describe.each(['CI unreadable', 'PR unreadable'])('%s uses the hot-patch unknown clock', kind => {
+  describe.each(['CI unreadable', 'PR unreadable'])('%s is independently classified', kind => {
     it.each([29, 31])('at %i minutes', async minutes => {
       const f = hotFixture();
       const reader = kind === 'CI unreadable' ? f.d.checks : f.d.pr;
@@ -1054,8 +1100,9 @@ describe('hot-patch sweep (R1100)', () => {
       f.d.now = () => new Date(Date.parse(load.at) + minutes * 60_000).toISOString();
       decisionBeforeRemoval(f, 'ci-unknown');
       const result = await f.run();
-      expect(f.d.remove).toHaveBeenCalledTimes(minutes >= 30 ? 1 : 0);
-      if (minutes >= 30) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+      const shouldUnload = kind === 'CI unreadable' && minutes >= 30;
+      expect(f.d.remove).toHaveBeenCalledTimes(shouldUnload ? 1 : 0);
+      if (shouldUnload) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
       else {
         expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
         if (kind === 'PR unreadable') expect(f.d.pr).toHaveBeenCalledWith(f.loads[0]);
@@ -1089,9 +1136,11 @@ describe('hot-patch sweep (R1100)', () => {
   it('merged at the loaded sha stays for existing in-main retirement, even after 24h', async () => {
     const f = hotFixture();
     f.d.pr.mockReturnValue({ ...openPr(), state: 'closed', merged: true });
+    f.d.mergedOverlay.mockReturnValue(true);
     f.d.now = () => '2026-11-19T12:00:00Z';
     await f.run();
     expect(f.d.pr).toHaveBeenCalledWith(f.loads[0]);
+    expect(f.d.mergedOverlay).toHaveBeenCalledWith(f.loads[0]);
     expect(f.d.remove).not.toHaveBeenCalled();
   });
   it('raises NEEDS-YOU when HEAD still contains the sha 15 minutes after hot-patch unload', async () => {
