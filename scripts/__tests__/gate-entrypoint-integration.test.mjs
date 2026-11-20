@@ -48,6 +48,10 @@ if (a[0] === 'repo' && a[1] === 'view' && fields === 'url' && a[a.indexOf('--jq'
   if (fx._repoRead === 'empty') process.exit(0);
   fs.writeSync(1, '${LABEL_REPO_URL}'); process.exit(0);
 }
+// Admission verifies the default branch live, independently of the label-memo URL lookup.
+if (a[0] === 'repo' && a[1] === 'view' && fields === 'defaultBranchRef' && a[a.indexOf('--jq') + 1] === '.defaultBranchRef.name') {
+  fs.writeSync(1, 'main'); process.exit(0);
+}
 // The live head: real GitHub always has one, so a fixture whose commits carry no oid gets a stable per-PR stand-in.
 function headOf(pr) {
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
@@ -632,7 +636,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
   // assert totality over ALL park kinds — an ESCALATING review:changes wait-author is separately/pre-existingly
   // suppressed by the untouched `escalated==='yes'` skip-loop exclusion (out of finding-1's scope; see the code).
   it('#2820-review-fix (finding 1): the two silenced park kinds regain their skip comment, and the agent park still posts exactly one (not doubled)', () => {
-    const green = { mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN, body: 'a real summary', _commits: AI_COMMIT, _files: [{ path: 'backlog/u.md', additions: 1, deletions: 0 }] };
+    const green = { baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN, body: 'a real summary', _commits: AI_COMMIT, _files: [{ path: 'backlog/u.md', additions: 1, deletions: 0 }] };
     const fixture = {
       _id: 'skip-stamp',
       prs: [
@@ -673,6 +677,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
       prs: [
         {
           number: 801,
+          baseRefName: 'main',
           title: 'stale-acceptance review:human re-park (body edit forced to fail)',
           labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }, { name: 'review:human' }],
           mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN,
@@ -704,6 +709,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
   // both fixtures are held, so `toMerge` is empty and nothing is merged.
   it('#xmnl36p: a stale re-park over an OPERATOR CLEARANCE posts the revocation notice — and posts none without one', () => {
     const stale = {
+      baseRefName: 'main',
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: GREEN, body: 'a real summary',
       _commits: AI_COMMIT,
       // the declarative leash → the fresh score is humanRequired, exactly as WE PR #1106's was

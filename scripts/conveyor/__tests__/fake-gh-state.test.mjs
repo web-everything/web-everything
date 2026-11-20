@@ -15,7 +15,7 @@ import { promisify } from 'node:util';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createFakeGithub, addLabelsPure, removeLabelsPure, applyBranchDeletionPure, requirePr } from './helpers/fake-gh.mjs';
+import { createFakeGithub, addLabelsPure, removeLabelsPure, applyBranchDeletionPure, requirePr, withStore } from './helpers/fake-gh.mjs';
 import { git, writeLocalIdentity, DEFAULT_BRANCH } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { buildOpenPrPageQuery, listOpenPrsPagedHydrated, listOpenPrsLightPaged } from '../../lib/pr-list-paged.mjs';
 import { createGhProvider, GH_ARGV } from '../../lib/review-label-provider.mjs';
@@ -80,6 +80,32 @@ function ghExecAsync(gh, args, cwd) {
 }
 
 describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
+  it('repo view returns the configured default branch and observes a later branch change', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-repo-view-');
+    const gh = makeGithub(originPath, { defaultBranch: 'develop' });
+    const args = ['repo', 'view', SLUG, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'];
+    expect(ghExec(gh, args, clonePath).trim()).toBe('develop');
+    expect(JSON.parse(ghExec(gh, ['repo', 'view', '--json', 'url,defaultBranchRef'], clonePath)))
+      .toEqual({ url: `https://github.com/${SLUG}`, defaultBranchRef: { name: 'develop' } });
+    expect(ghExec(gh, ['repo', 'view', '--json', 'url', '--jq', '.url'], clonePath).trim())
+      .toBe(`https://github.com/${SLUG}`);
+    withStore(gh.env.FAKE_GH_STORE, store => { store.repos[SLUG].defaultBranch = 'main'; });
+    expect(ghExec(gh, args, clonePath).trim()).toBe('main');
+  });
+
+  it('repo view rejects unknown repositories and fields and preserves fault recovery', () => {
+    const { originPath, clonePath } = makeOrigin('fake-gh-repo-failure-');
+    const gh = makeGithub(originPath);
+    expect(() => ghExec(gh, ['repo', 'view', 'unknown/repo', '--json', 'defaultBranchRef'], clonePath))
+      .toThrow(/unknown repo/);
+    expect(() => ghExec(gh, ['repo', 'view', SLUG, '--json', 'unimplementedField'], clonePath))
+      .toThrow(/unsupported/);
+    const args = ['repo', 'view', SLUG, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'];
+    gh.fault({ verb: 'repo view', kind: '5xx', times: 1 });
+    expect(() => ghExec(gh, args, clonePath)).toThrow(/502/);
+    expect(ghExec(gh, args, clonePath).trim()).toBe(DEFAULT_BRANCH);
+  });
+
   it('api user reports the same actor that posts comments', () => {
     const { originPath, clonePath } = makeOrigin('fake-gh-identity-');
     const gh = makeGithub(originPath);

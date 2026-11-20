@@ -5110,6 +5110,10 @@ The shared drain classifier and merge revalidation refuse missing, undefined, nu
 evidence; pure callers have the same closed default. Valid-admission fixtures must supply the verified branch
 explicitly and include a readable PR base. An unreadable base fails closed globally in this shared authorization
 predicate, including full-list fallback; invalid full context rows fall back to full listing before gates.
+CLI shims must answer `repo view --json defaultBranchRef --jq .defaultBranchRef.name` separately from
+label-memo repository URL reads. The stateful fake reads its configured branch on each invocation and preserves
+fault injection for this verb. Prestage cache assertions must use the world fixture's returned `slug`, so the
+test reaches the enqueue guard even when its repository identity changes.
 ## Antigravity advisory seating and unavailable-provider evidence
 
 `external-juror-liveness.test.mjs` pins `advisorySeats.antigravityReview=probation` to the
