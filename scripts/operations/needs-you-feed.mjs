@@ -9,7 +9,7 @@ import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { handoffHome } from './handoff-home.mjs';
 import { humanReviewHold } from './pr-sweep-core.mjs';
-import { liveResultGateState, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
+import { liveResultGateState, breakClass, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, RED_TEAM_COMMENT_MARKER, readRedTeamDisposition } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
@@ -278,7 +278,7 @@ export async function gateReadyItems(items, report, { gh, cwd, now = Date.now(),
       const open = new Set([...(disposition?.sendBack ?? []), ...(disposition?.held ?? [])].map(f => f.index));
       const cardByPolicy = new Set(planRedTeamActions(state.result, policy).card.map(f => f.index));
       const settled = f => !open.has(f.index) && (disposition?.rulings.get(f.index) ?? []).some(r => r.kind !== 'block'
-        && (r.source === 'operator' || (r.kind === 'card' && cardByPolicy.has(f.index))));
+        && (r.source === 'operator' || (r.kind === 'card' && breakClass(f) !== 'broken' && cardByPolicy.has(f.index))));
       // Index 0 is the shared hold on stored evidence the thread does not show in full: no operator ruling settles it.
       // An index-0 hold that is only "publication pending" (stored evidence not sealed yet) is no break: never approve, never alarm.
       const publicationPending = (disposition?.held ?? []).some(f => f.index === 0 && f.unsealed === true);

@@ -460,10 +460,18 @@ describe('gateReadyItems: "your review" is re-checked against the live PR (#5768
       const comments = queued('degraded', 2);
       expect(await kind(comments, () => cardPolicy)).toBe('needs-you');
     });
-    it('a broken deferred-class finding still alarms under the strict fallback', async () => {
-      const [res, rec] = queued('broken');
-      const body = res.body.replace(/\bedge-case\b/, 'theoretical-race');
-      expect(await kind([{ ...res, body }, rec], () => { throw new Error('unreadable'); })).not.toBe('needs-you');
+    it.each([
+      ['a valid card policy', () => cardPolicy],
+      ['the strict fallback', () => { throw new Error('unreadable'); }],
+    ])('a broken break with a class deferral and a card record still alarms under %s', async (_n, readPolicy) => {
+      const body = renderRedTeamComment({ pr: 5768, rev: head, provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'changes',
+        findings: [{ summary: 'confirmed break', category: 'edge-case', impactIfUnfixed: 'broken', file: 'scripts/x.mjs', line: 3,
+          confirmedByRecheck: true, recheckReason: 'real', findingClass: 'theoretical-race', classBasis: 'needs a rare race' }] });
+      const id = redTeamResultId(parseRedTeamComment(body));
+      const comments = [{ user: { login: 'web-everything' }, body, created_at: '2026-10-10T02:04:41Z' },
+        { user: { login: 'web-everything' }, created_at: '2026-10-10T02:05:00Z',
+          body: `${redTeamGateMarker(5768, head, GATE_OUTCOMES.CARD_QUEUED, id)}\n- 1 finding(s) filed as a follow-up card (#1).` }];
+      expect(await kind(comments, readPolicy)).toBe('confirmed-break-owed-send-back');
     });
     it('an unreadable setting falls back to the strict policy (alarm)', async () => {
       const comments = queued('degraded', 2);
