@@ -645,3 +645,14 @@ describe('awaiting-advisory never hides an explicit drain hold', () => {
     expect(row(sweep([p], { drainSkips: [{ num: 4, repo: REPO, kind: 'not-certified', reason: 'x' }] }), 4)).toMatchObject({ actor: 'operator', stalled: true });
   });
 });
+
+describe('awaiting-advisory with an unknown clock is overdue, never quiet', () => {
+  it.each([undefined, 'not-a-date'])('missing label timestamp (updatedAt %s) escalates', (updatedAt) => {
+    const r = sweep([mkPr({ labels: L('review:awaiting-advisory'), updatedAt })]).prs[0];
+    expect(r).toMatchObject({ waitingOn: 'awaiting-review', stalled: true });
+  });
+  it('a recent comment-driven updatedAt does not postpone it when the label time is unknown', () => {
+    const r = sweep([mkPr({ labels: L('review:awaiting-advisory'), updatedAt: new Date(NOW).toISOString() })]).prs[0];
+    expect(r.stalled).toBe(true);
+  });
+});

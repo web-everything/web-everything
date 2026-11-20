@@ -354,7 +354,7 @@ export function deriveWaitingOn(pr, ctx) {
   }
   // Last resort (after every explicit drain hold): an advisory wait with nothing else says the review daemon owes the next move.
   if (has('review:awaiting-advisory')) {
-    return done('awaiting-review', 'reviewer', moved('review:awaiting-advisory'), 'an advisory review is owed', actions.rerunReview, ['label review:awaiting-advisory']);
+    return done('awaiting-review', 'reviewer', moved('review:awaiting-advisory') ?? 0, 'an advisory review is owed', actions.rerunReview, ['label review:awaiting-advisory']);
   }
   return done('unclassified', 'nobody', null, 'no signal says who moves next', actions.why, []);
 }
