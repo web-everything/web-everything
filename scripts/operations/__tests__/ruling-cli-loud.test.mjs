@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
+import { mkdtempSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { refuseDirectEntry, isDirectEntry } from '../../lib/direct-entry-guard.mjs';
 
 const here = (f) => join(dirname(fileURLToPath(import.meta.url)), '..', f);
@@ -19,10 +21,20 @@ describe('ruling CLI prints its result or refusal', () => {
       expect(r.stdout).toBe('');
     });
   }
+  it('a symlinked entry still refuses', () => {
+    const d = mkdtempSync(join(tmpdir(), 'rcl-'));
+    const link = join(d, 'link.mjs');
+    symlinkSync(here('extend-rounds.mjs'), link);
+    const r = spawnSync(process.execPath, [link], { encoding: 'utf8' });
+    expect(r.status).toBe(2);
+    expect(r.stdout).toMatch(/^refused: /);
+  });
   it('unknown or missing argv is a no-op, never a silent refusal-less pass', () => {
     expect(isDirectEntry('file:///x/y.mjs', undefined)).toBe(false);
     let out = ''; let code = null;
-    expect(refuseDirectEntry('file:///x/y.mjs', 'op', 'run.mjs op', { argv1: '/x/y.mjs', write: (s) => { out += s; }, exit: (c) => { code = c; } })).toBe(true);
+    const me = fileURLToPath(import.meta.url);
+    expect(isDirectEntry('file:///x/missing.mjs', '/x/missing.mjs')).toBe(false);
+    expect(refuseDirectEntry(import.meta.url, 'op', 'run.mjs op', { argv1: me, write: (s) => { out += s; }, exit: (c) => { code = c; } })).toBe(true);
     expect(out).toContain('use run.mjs op');
     expect(code).toBe(2);
   });

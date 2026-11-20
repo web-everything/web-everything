@@ -4,6 +4,7 @@
  * module is run as `node <file>` it used to exit 0 with no output (it only defines exports). The guard
  * prints a named refusal and exits 2, so an operator never mistakes silence for a posted result.
  */
+import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeAllSync } from './write-all-sync.mjs';
@@ -16,7 +17,7 @@ export function directEntryRefusal(opName, useCmd) {
 /** True when `metaUrl` is the file node was started with. Unknown or missing argv means false (no-op). */
 export function isDirectEntry(metaUrl, argv1 = process.argv[1]) {
   if (!argv1) return false;
-  try { return resolve(argv1) === resolve(fileURLToPath(metaUrl)); } catch { return false; }
+  try { return realpathSync(resolve(argv1)) === realpathSync(resolve(fileURLToPath(metaUrl))); } catch { return false; }
 }
 
 /** When run directly: print the refusal and exit 2. Injected `write`/`exit` keep it testable. */
