@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-pr-attempts.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-smells/index.mjs", "we:scripts/conveyor/health-smells/repeated-pr-attempts.mjs", "we:scripts/conveyor/__tests__/health-pr-attempts.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/health-smells/__tests__/index.test.mjs", "we:scripts/conveyor/health-smells/__tests__/repeated-pr-attempts.test.mjs"]
+
 dateOpened: "2026-10-01"
 tags: []
 ---
@@ -27,3 +27,12 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#3
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-11-19)
+
+The build-dispatch daemon held #4895 with:
+
+> worker-declined: Not prepared: #4895 — could-not-prepare. One unresolved choice affects behavior: should unavailable 'operationRuns' suppress evaluation, or should log-only detection continue? Currently, 'we:scripts/conveyor/health-smells/repeated-pr-attempts.mjs:10–20' requires only 'daemonLogs' and tolerates absent records. Adding 'operationRuns' to satisfy the proposed probe validation would suppress evaluation when records are unavailable ('we:scripts/conveyor/health-watch-core.mjs:943–945'). Preserving current behavior instead requires explicitly supporting optional probes. No files changed or stamps added.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
