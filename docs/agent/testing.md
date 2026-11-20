@@ -5196,6 +5196,7 @@ file is both input and the scratch miss-event sink. Evidence fixtures use the
 explicit head-bound contract documented in `pr-expectations.mjs`. Missing or capped
 evidence remains unknown. Miss receipts reserve before append to prevent duplicate
 emission after restart; a failed append or abandoned lock requires operator inspection.
+
 ## CI-only PR opening (R1086)
 
 `pr-land --verify=ci-only` is restricted to open modes and observed host saturation.
