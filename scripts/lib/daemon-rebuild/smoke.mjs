@@ -676,14 +676,21 @@ export async function smokeAndAdopt({
       // section as the reset; a refusal leaves the ready candidate for the next tick.
       try {
         const current = readHotPatch(root, stEnv);
+        const watch = (approvedHotPatch || current) ? readForceWatch(root, stEnv) : null;
+        const carriesHotPatch = current && (current.sha === p.finalSha
+          || p.applied?.some(a => a.ref === current.branch && a.sha === current.sha));
+        if (carriesHotPatch) {
+          const verified = ciVerdict({ sha: current.sha, root, env: stEnv, runGh });
+          const pendingHotPatch = current.owed.verify !== 'red' && !current.rollbackPending
+            && watch?.sha === p.finalSha && watch.hotPatchSha === current.sha && !watch.rollbackPending;
+          if (verified.state !== 'green' && !(verified.state === 'pending' && pendingHotPatch)) {
+            throw new Error(verified.reason);
+          }
+        }
         if (approvedHotPatch || current) {
-          const watch = readForceWatch(root, stEnv);
-          const verified = ciVerdict({ sha: current?.sha, root, env: stEnv, runGh });
-          // Pending CI permits live adoption during the full test run; unknown and red refuse.
           if (!current || current.sha !== approvedHotPatch?.sha
             || !(current.sha === p.finalSha || p.applied?.some(a => a.ref === current.branch && a.sha === current.sha))
             || current.owed.verify === 'red' || current.rollbackPending
-            || !['green', 'pending'].includes(verified.state)
             || !watch || watch.sha !== p.finalSha || watch.hotPatchSha !== current.sha || watch.rollbackPending) {
             throw new Error('hot-patch evidence changed or unavailable');
           }

@@ -20,8 +20,9 @@ import {
   overlayGraduated, overlayRetiredByOperator, reportDiscardedCandidate,
 } from './adopt.mjs';
 import { hostname } from 'node:os';
-import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, forceBlockedReason, dropReadyCandidate, forcedWatchStatus, readForceWatch } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
+import { ciVerdict } from '../hot-patch-verify-marker.mjs';
 import { hasHotPatch, openHotPatchWatch, readHotPatch, closeHotPatch } from '../hot-patch.mjs';
 import {
   findUnsafeLocalState, knownInputsOf, rollbackUnverified, collectUntrackedPaths, ensureSafeToMove,
@@ -715,11 +716,6 @@ export async function prepareRebuild({
           alert('untracked-collision', { paths: colliding });
           return terminal({ moved: false, reason: 'untracked-collision', untracked: colliding, plan });
         }
-        alert('ready-candidate-adopted', {
-          target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
-          ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
-          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
-        });
         writeState();
         const hot = openHotPatchWatch({ root, env: stEnv, plan: m.adopt, lastGood: state.adopted,
           smokePassed: ready.forced !== true && ready.kind === 'candidate' && !!ready.passedAt, now });
@@ -727,6 +723,31 @@ export async function prepareRebuild({
           alert('hot-patch-adoption-refused', { reason: hot.reason });
           return terminal({ moved: false, reason: 'hot-patch-adoption-refused', plan });
         }
+        // This phase holds the adoption lock. A prior refusal never grants the ready
+        // record permission: carried hot-patch CI is read again at its branch SHA on every attempt.
+        try {
+          const current = readHotPatch(root, stEnv);
+          const carriesHotPatch = current && (current.sha === m.adopt.finalSha
+            || m.adopt.applied?.some(a => a.ref === current.branch && a.sha === current.sha));
+          if (carriesHotPatch) {
+            const watch = readForceWatch(root, stEnv);
+            const verified = ciVerdict({ sha: current.sha, root, env: stEnv });
+            const pendingHotPatch = current.owed.verify !== 'red' && !current.rollbackPending
+              && watch?.sha === m.adopt.finalSha && watch.hotPatchSha === current.sha && !watch.rollbackPending;
+            if (verified.state !== 'green' && !(verified.state === 'pending' && pendingHotPatch)) {
+              throw new Error(verified.reason);
+            }
+          }
+        } catch {
+          const detail = 'repair CI and hot-patch watch evidence or wait for green CI; ready candidate retained for retry';
+          alert('hot-patch-adoption-refused', { reason: detail, target: m.adopt.finalSha });
+          return terminal({ moved: false, adopted: false, reason: 'hot-patch-adoption-refused', detail, plan });
+        }
+        alert('ready-candidate-adopted', {
+          target: m.adopt.finalSha, match: m.match, passedAt: ready.passedAt, passedBy: `${ready.pid ?? '?'}@${ready.host ?? '?'}`,
+          ...(m.dropRefs.length ? { dropping: m.dropRefs.map((s) => s.ref) } : {}),
+          ...(m.retired?.length ? { retiredInMain: m.retired } : {}),
+        });
         const fin = await finalizeRebuild({
           readyPassedAt: ready.passedAt,
           root,

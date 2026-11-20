@@ -15,11 +15,13 @@ import {
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
+import * as hotPatchModule from '../hot-patch.mjs';
+import * as verifyModule from '../hot-patch-verify-marker.mjs';
 import { requestHotPatch, recordHotPatchPr, readHotPatch, recordVerifyResult } from '../hot-patch.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
-import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason } from '../daemon-force-adopt.mjs';
+import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason, watchPath } from '../daemon-force-adopt.mjs';
 import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
@@ -111,6 +113,7 @@ function makeFixture() {
   const overlayDir = mktemp('we-daemon-rebuild-fb-overlay-');
   const env = {
     ...process.env,
+    WE_HOT_PATCH: JSON.stringify({ verifyRepo: 'owner/repo' }),
     WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,
@@ -126,6 +129,7 @@ const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
 
 beforeEach(() => {
   tempDirs.length = 0;
+  runGhSync.mockReset().mockReturnValue('[]');
 });
 
 afterEach(() => {
@@ -189,7 +193,7 @@ describe('R1100 hot-patch smoke adoption', () => {
     expect(run).toHaveBeenCalledTimes(1);
   });
 
-  it.each([false, true])('passing smoke opens 10 ticks plus 15 minutes, including ready adoption=%s', async (deferred) => {
+  it.each([[false, 'green'], [true, 'green'], [false, 'pending'], [true, 'pending']])('hot-patch branch CI opens a watch for the composed build (ready=%s, CI=%s)', async (deferred, ci) => {
     const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
     const env = forceEnv(initialEnv, base), lastGood = headOf(cloneDir);
     writeRebuildState(cloneDir, { adopted: { head: lastGood, mainSha: lastGood, inputsKey: 'initial', applied: [] } }, env);
@@ -197,6 +201,9 @@ describe('R1100 hot-patch smoke adoption', () => {
     await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
       kind: 'daemon-tooling', files: ['scripts/lib/daemon-tool.mjs'] });
     writeHotPatchVerifyMarker(env, base, target);
+    if (ci === 'pending') runGhSync.mockReturnValue(JSON.stringify([{ id: 1, name: 'test', head_sha: target,
+      app: { id: 15368, slug: 'github-actions' }, status: 'in_progress', conclusion: null }]));
+    const verdict = vi.spyOn(verifyModule, 'ciVerdict');
     const runSmoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
     const tick = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
       skipCheck: () => ({ skip: true }), forceWatchProbe: async () => ({ healthy: true }) };
@@ -209,7 +216,10 @@ describe('R1100 hot-patch smoke adoption', () => {
     }
     expect(runSmoke).toHaveBeenCalled();
     const adopted = headOf(cloneDir);
-    // Overlay composition may create a build commit distinct from the patch tip.
+    expect(adopted).not.toBe(target);
+    expect(verdict).toHaveBeenCalled();
+    expect(verdict.mock.calls.every(([opts]) => opts.sha === target)).toBe(true);
+    // Overlay composition creates a build commit distinct from the patch tip.
     gitOk(cloneDir, ['merge-base', '--is-ancestor', target, adopted]);
     expect(gitOk(cloneDir, ['show', `${adopted}:fix.mjs`])).toBe('export const fixed = true;\n');
     expect(readHotPatch(cloneDir, env).adoptedSha).toBe(adopted);
@@ -231,6 +241,106 @@ describe('R1100 hot-patch smoke adoption', () => {
     await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, forceWatchProbe: async () => ({ healthy: true }) });
     expect(runSmoke).toHaveBeenCalled(); expect(headOf(cloneDir)).toBe(lastGood);
   });
+});
+
+describe('R1099 adoption CI gate', () => {
+  it.each([false, true])('ordinary adoption with no CI and no hot-patch skips ciVerdict (ready=%s)', async (deferred) => {
+    const { cloneDir, originDir, env } = makeFixture();
+    const sha = advanceMain(originDir, dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    const verdict = vi.spyOn(verifyModule, 'ciVerdict');
+    runGhSync.mockReturnValue('[]');
+    expect(readHotPatch(cloneDir, env)).toBeNull();
+    const tick = { root: cloneDir, env, prState: async () => null, lockOpts: LOCK_OPTS,
+      runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) };
+    if (deferred) expect((await rebuildClone({ ...tick, readyOnly: true })).readyRecorded).toBe(true);
+    expect((await rebuildClone(tick)).adopted).toBe(true);
+    expect(headOf(cloneDir)).toBe(sha);
+    expect(verdict).not.toHaveBeenCalled();
+    expect(runGhSync).not.toHaveBeenCalled();
+  });
+
+  it('audit: immediate red refusal stays refused next tick despite a non-red hot-patch ledger', async () => {
+    const { cloneDir, originDir, env, base } = makeFixture();
+    const good = headOf(cloneDir);
+    const sha = advanceMain(originDir, dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    writeRebuildState(cloneDir, { adopted: { head: good, mainSha: good, inputsKey: 'base', applied: [] } }, env);
+    await requestHotPatch({ root: cloneDir, env, sha, branch: 'main', daemon: 'review', kind: 'incident', files: ['scripts/tool.mjs'] });
+    writeHotPatchVerifyMarker(env, base, sha, 'red');
+    const runSmoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    const tick = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      forceWatchProbe: async () => ({ healthy: true }) };
+    expect((await rebuildClone(tick)).adopted).not.toBe(true);
+    expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(sha);
+    expect(readHotPatch(cloneDir, env).owed.verify).toBe('pending');
+    expect((await rebuildClone(tick)).adopted).not.toBe(true);
+    expect(headOf(cloneDir)).toBe(good);
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+  });
+  it.each([true, false])('ready hot-patch pending requires an armed watch: watch=%s', async (armed) => {
+    const { cloneDir, originDir, env, base } = makeFixture();
+    const good = headOf(cloneDir);
+    const sha = advanceMain(originDir, dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+    writeRebuildState(cloneDir, { adopted: { head: good, mainSha: good, inputsKey: 'base', applied: [] } }, env);
+    await requestHotPatch({ root: cloneDir, env, sha, branch: 'main', daemon: 'review', kind: 'incident', files: ['scripts/tool.mjs'] });
+    writeHotPatchVerifyMarker(env, base, sha);
+    const tick = { root: cloneDir, env, prState: async () => null, lockOpts: LOCK_OPTS,
+      forceWatchProbe: async () => ({ healthy: true }),
+      runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) };
+    expect((await rebuildClone({ ...tick, readyOnly: true })).readyRecorded).toBe(true);
+    runGhSync.mockReturnValue(JSON.stringify([{ id: 2, name: 'test', head_sha: sha,
+      app: { id: 15368, slug: 'github-actions' }, status: 'in_progress', conclusion: null }]));
+    if (!armed) {
+      const open = hotPatchModule.openHotPatchWatch;
+      vi.spyOn(hotPatchModule, 'openHotPatchWatch').mockImplementation(opts => {
+        const result = open(opts);
+        rmSync(watchPath(cloneDir, env), { force: true });
+        return result;
+      });
+    }
+    const result = await rebuildClone(tick);
+    expect(result.adopted === true).toBe(armed);
+    expect(headOf(cloneDir)).toBe(armed ? sha : good);
+  });
+  for (const deferred of [false, true]) {
+    it.each(['red', 'unknown', 'pending'])(`hot-patch candidate gates %s CI (ready=${deferred}) and retries with green`, async (ci) => {
+      const { cloneDir, originDir, env, base } = makeFixture();
+      const good = headOf(cloneDir);
+      const branch = 'lane/ci-gate';
+      const sha = pushBranch(originDir, branch, dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
+      writeRebuildState(cloneDir, { adopted: { head: good, mainSha: good, inputsKey: 'base', applied: [] } }, env);
+      await requestHotPatch({ root: cloneDir, env, sha, branch, daemon: 'review', kind: 'incident', files: ['scripts/tool.mjs'] });
+      writeHotPatchVerifyMarker(env, base, sha);
+      const runSmoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+      const verdict = vi.spyOn(verifyModule, 'ciVerdict');
+      const tick = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+        forceWatchProbe: async () => ({ healthy: true }) };
+      if (deferred) expect((await rebuildClone({ ...tick, readyOnly: true })).readyRecorded).toBe(true);
+      const setCI = state => verdict.mockImplementation(({ sha: checkedSha }) => ({
+        state: checkedSha === sha ? state : 'unknown', reason: `fixture CI is ${state}`,
+      }));
+      setCI(ci);
+      const refused = await rebuildClone(tick);
+      const plan = refused.plan ?? readReadyCandidate(cloneDir, env)?.adopt;
+      expect(plan.applied).toEqual(expect.arrayContaining([expect.objectContaining({ ref: branch, sha })]));
+      expect(plan.finalSha).not.toBe(sha);
+      expect(verdict).toHaveBeenCalled();
+      expect(verdict.mock.calls.every(([opts]) => opts.sha === sha)).toBe(true);
+      if (ci === 'pending') {
+        expect(refused.adopted).toBe(true);
+        expect(readForceWatch(cloneDir, env)?.hotPatchSha).toBe(sha);
+        return;
+      }
+      expect(refused.adopted).not.toBe(true);
+      expect(headOf(cloneDir)).toBe(good);
+      expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(plan.finalSha);
+      // The non-red hot-patch ledger cannot substitute for fresh CI next tick.
+      expect((await rebuildClone(tick)).adopted).not.toBe(true);
+      expect(headOf(cloneDir)).toBe(good);
+      setCI('green');
+      expect((await rebuildClone(tick)).adopted).toBe(true);
+      expect(headOf(cloneDir)).toBe(plan.finalSha);
+    });
+  }
 });
 
 describe('R508 force-adopt through rebuildClone', () => {

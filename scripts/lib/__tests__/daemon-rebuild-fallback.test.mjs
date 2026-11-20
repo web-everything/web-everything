@@ -28,6 +28,8 @@ import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
+vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...(await importOriginal()), runGhSync: vi.fn() }));
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -112,6 +114,7 @@ function makeFixture() {
   const overlayDir = mktemp('we-daemon-rebuild-fb-overlay-');
   const env = {
     ...process.env,
+    WE_HOT_PATCH: JSON.stringify({ verifyRepo: 'owner/repo' }),
     WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: lockDir,
     WE_DAEMON_OVERLAY_DIR: overlayDir,
@@ -139,6 +142,7 @@ const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
 
 beforeEach(() => {
   tempDirs.length = 0;
+  runGhSync.mockReset().mockReturnValue('[]');
 });
 
 afterEach(() => {

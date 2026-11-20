@@ -44,7 +44,7 @@ const fixture = fn => async () => {
 };
 
 for (const evidence of ['green', 'pending', 'red-ci', 'missing-ci', 'unreadable-ci',
-  'red-ledger', 'missing-ledger', 'unreadable-ledger', 'rollbackPending', 'unreadable-watch']) {
+  'red-ledger', 'missing-ledger', 'unreadable-ledger', 'rollbackPending', 'unreadable-watch', 'pending-without-watch']) {
   test(`final adoption lock rechecks ${evidence} after approval and retains refused candidate`, fixture(async ({ root, env, sha, good, home, marker, git, runGh }) => {
     marker();
     writeRebuildState(root, { adopted: { head: good, mainSha: good, inputsKey: 'base', applied: [] } }, env);
@@ -84,6 +84,7 @@ for (const evidence of ['green', 'pending', 'red-ci', 'missing-ci', 'unreadable-
             if (evidence === 'rollbackPending') writeFileSync(watchPath(root, env),
               JSON.stringify({ ...readForceWatch(root, env), rollbackPending: 'verify-red' }));
             if (evidence === 'unreadable-watch') writeFileSync(watchPath(root, env), '{bad');
+            if (evidence === 'pending-without-watch') { marker({ result: 'pending' }); rmSync(watchPath(root, env)); }
             releaseRead(root, reader);
           },
         },
