@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { resolvePinnedDiffBasis, isPinnedDiffBasis, stampDiffBasis, pinnedGit, readPinnedDiff, requireScoredNetDiff, isLandableDiffText, opaqueDiffEscalation } from './lib/pinned-diff-basis.mjs';
+import { latestHumanClearanceComment } from './lib/review-escalation.mjs';
+import { isHumanOperatorComment } from './lib/operator-identity.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -797,10 +799,20 @@ export function pinnedDiffMergeRefusal({ exec, headSha, baseRev, readComments } 
   const opaque = opaqueDiffEscalation(sig.netDiffText.text);
   if (!opaque.humanRequired) return null;
   let humanClearedSha = null;
-  try { humanClearedSha = typeof readComments === 'function' ? parseLatestHumanClearedSha(readComments()) : null; }
+  try { humanClearedSha = typeof readComments === 'function' ? opaqueHumanClearedSha(readComments()) : null; }
   catch { humanClearedSha = null; }
   if (humanClearedSha && humanClearedSha === String(headSha).toLowerCase()) return null;
   return `${opaque.reasons.join('; ')} (review-set-label --to=clear-human on this head)`;
+}
+
+/**
+ * The head an ORIGINAL human clearance names, or null. A carrier (an automation comment carrying a clearance onto a
+ * new head) is proven by a diff fingerprint, and for opaque content that fingerprint rests on abbreviated blob ids,
+ * so opaque content counts only a human's own clear-human comment.
+ */
+export function opaqueHumanClearedSha(comments) {
+  const latest = latestHumanClearanceComment(comments);
+  return latest && isHumanOperatorComment(latest) ? parseLatestHumanClearedSha(comments) : null;
 }
 
 /** The drain's tamper gate, widened: opaque content is an unreadable test-tamper surface held for the exact-head clearance. */
@@ -6739,7 +6751,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           // `gh pr view --json comments` stops at one page: a full page hides a later clearance (or a later revocation),
           // so re-read the complete thread; an incomplete read throws and keeps the hold (opaque content has no carry re-read).
           if ((cd.comments || []).length >= PR_COMMENTS_PAGE_SIZE) cd.comments = readCompletePrComments(v.num, { repo: v.repo || localSlug });
-          humanClearedSha = parseLatestHumanClearedSha(cd.comments || []);
+          humanClearedSha = gaming.opaqueFiles ? opaqueHumanClearedSha(cd.comments || []) : parseLatestHumanClearedSha(cd.comments || []);
           // card xu7kxtt (#5472) — the clearance names an OLDER head (the merge queue / rebase-drop moved it), but the
           // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
           // 143107a87, reviewed-diff b945d333… on both) was re-parked here and waited for a second approval.

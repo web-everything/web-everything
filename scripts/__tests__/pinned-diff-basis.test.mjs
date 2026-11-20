@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { resolvePinnedDiffBasis, requireScoredNetDiff, pinnedGit, isScorableDiffText, opaqueDiffFiles, opaqueDiffEscalation } from '../lib/pinned-diff-basis.mjs';
-import { computeNetDiffSignals, readPinnedCarryDiff, carryHumanClearanceOnIdenticalDiff, pinnedDiffMergeRefusal, withOpaqueDiffHold } from '../merge-ai-prs.mjs';
+import { computeNetDiffSignals, readPinnedCarryDiff, carryHumanClearanceOnIdenticalDiff, pinnedDiffMergeRefusal, withOpaqueDiffHold, opaqueHumanClearedSha } from '../merge-ai-prs.mjs';
 import { scanTestTampering } from '../lib/pr-merge-gate.mjs';
-import { buildReviewedShaMarker, buildClearedHumanMarker, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
+import { buildReviewedShaMarker, buildReviewedDiffMarker, buildClearedHumanMarker, buildClearedFromMarker, parseLatestHumanClearedSha, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -457,6 +457,19 @@ describe('opaque binary content lands only on a human clearance of the exact hea
     expect(refuse(() => [])).toMatch(/opaque content/);
     expect(refuse(() => { throw new Error('gh down'); })).toMatch(/opaque content/);
     expect(refuse(undefined)).toMatch(/opaque content/);
+  });
+  it('a proven automation carrier of an older-head clearance does not clear opaque content', () => {
+    const { f, head } = binaryHead({ 'screenshot.webp': WEBP });
+    const DIFF = 'd'.repeat(64);
+    const source = { id: 'IC_original', author: { login: 'chalbert' },
+      body: [buildReviewedShaMarker(f.base), buildReviewedDiffMarker(DIFF), buildClearedHumanMarker('chalbert')].join('\n') };
+    const carrier = { id: 'IC_carrier', author: { login: 'web-everything' },
+      body: [buildReviewedShaMarker(head), buildReviewedDiffMarker(DIFF), buildClearedHumanMarker('chalbert'),
+        buildClearedFromMarker('IC_original')].join('\n') };
+    expect(parseLatestHumanClearedSha([source, carrier])).toBe(head); // the carrier is proven for text content
+    expect(opaqueHumanClearedSha([source, carrier])).toBeNull();
+    expect(opaqueHumanClearedSha([cleared(head)])).toBe(head);
+    expect(pinnedDiffMergeRefusal({ exec: f.exec, headSha: head, readComments: () => [source, carrier] })).toMatch(/opaque content/);
   });
   it('a text-only diff keeps landing on the no-review-escalation path without any comment read', () => {
     const f = fixture();
