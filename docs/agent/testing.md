@@ -2551,6 +2551,12 @@ retained attempts must stay within the latest room, and cannot use a failed snap
 Catch-up concurrency tests use manually completed child processes to prove the cap while siblings
 remain active, including concurrency 1. Re-read live queue depth/capacity before each start and
 reserve room for active siblings; retain the round attempt budget for ambiguous outcomes.
+Snapshot-first catch-up fixtures must model whether the fast-drain snapshot reader accepts the round file:
+legacy concurrency contracts inject an already-published snapshot; writer tests hold it absent, publish during an active child,
+and cover invalid/unreadable files and throwing checks keeping starts serial, plus failed/timed-out writers
+releasing the next attempt. A published fixture must pass the real reader; released children must reuse it.
+Clean-first applies within the same priority class and known-hold/recent-miss demotion group; test a BLOCKED P0 incident fix against an ordinary CLEAN PR at capacity one and retain every non-clean candidate.
+Snapshot readiness and released-child reuse must require `defaultBranch`, as production does; a round file missing it keeps catch-up serial.
 A batching deferral stops new starts but lets existing children finish their locked admission checks.
 Probe busy scheduling from round completion with room and an unqueued runnable PR, and full-interval
 scheduling with a full queue or backed-off work. Never start a second drain for an active PR; a
@@ -5292,6 +5298,14 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## CI-only PR opening (R1086)
+
+`pr-land --verify=ci-only` is restricted to open modes and observed host saturation.
+It ignores the local finish marker and reuses the deferred disclosure/body-sync and exact-SHA
+CI `test` label gate. Unknown CPU/load evidence and memory-only admission refusals cannot
+authorize it. Audit records live in `verify-ci-only`, separately from `verify-green`;
+`WE_VERIFY_CI_ONLY_LEDGER_DIR` explicitly selects an audit directory for fixtures.
+The scoped `scripts/lib/__tests__/verify-ci-only.test.mjs` exercises these boundaries.
 ## Open-pr preflight
 
 `open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
