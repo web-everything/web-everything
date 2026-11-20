@@ -308,7 +308,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (input.urgent === true && validSha(input.sha) && input.branch === `hotpatch/${input.sha}`
         && ref === input.branch && ['add', 'replace'].includes(action)) {
         // Provenance exists only in the imported function's options. No CLI flag or environment bypass.
-        const source = `const { main } = await import(${JSON.stringify(pathToFileURL(resolve(repo, config.loaderCli)).href)}); await main(process.argv.slice(1), {}, { hotPatchProvenance: true });`;
+        const source = `import { main } from ${JSON.stringify(pathToFileURL(resolve(repo, config.loaderCli)).href)}; await main(process.argv.slice(1), {}, { hotPatchProvenance: true });`;
         return execute('node', ['--input-type=module', '--eval', source, ...args], repo);
       }
       return execute('node', [resolve(repo, config.loaderCli), ...args], repo);
