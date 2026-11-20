@@ -1,5 +1,5 @@
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
-import { isRunAbandoned as defaultIsRunAbandoned } from './run-abandoned.mjs';
+import { abandonedPath, runRecordVersion, isRunAbandoned as defaultIsRunAbandoned } from './run-abandoned.mjs';
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, statSync } from 'node:fs';
@@ -408,6 +408,19 @@ function* reviewRuns({ runsDir, list, read, stat }) {
   }
 }
 
+// Unlike resume hints, this inventory must retain headless/start-less records.
+function readFreshReviewInventory({ repo, pr, runsDir, blocking }) {
+  const ids = readCompleteReviewRunsForPr(runsDir, repo, pr, { list: strictListRuns })
+    ?? strictListRuns(runsDir).filter(id => id.startsWith('review-pr-'));
+  if (ids.length > 400) throw Error('re-review inventory capped; human inspection required');
+  return ids.map(id => {
+    const run = id === blocking.id ? blocking : readRun(id, runsDir);
+    assertReviewRunEvidence(run);
+    if (run.id !== id) throw Error('review identity mismatch');
+    return run;
+  });
+}
+
 /** Complete bounded proof; unknown state never establishes a never-reviewed head. */
 export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   runsDir = runsDirectory(env), list = strictListRuns, read = readRun, stat = statSync } = {}) {
@@ -487,7 +500,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
   readSeal = isUnderTest() || isUnderTest(env) ? null : readSealedStatus,
   setting, lastDispatch, readCheckFact, proveMove = () => ({ ok: false }), readCarry = () => null, readWitness, recoveryOptions,
   headNeverReviewed = headNeverReviewedFromRuns, readReviewRuns = defaultReadReviewRuns, readCarriedCheck = () => false,
-  runsDir = runsDirectory(env), isRunAbandoned = defaultIsRunAbandoned, readReviewRun = readRun }) {
+  runsDir = runsDirectory(env), isRunAbandoned = defaultIsRunAbandoned, readReviewRun = readRun,
+  readReviewInventory = readFreshReviewInventory,
+  readAbandonment = (id, dir) => JSON.parse(readFileSync(abandonedPath(id, dir), 'utf8')),
+  readRecordVersion = (id, dir) => runRecordVersion(statSync(join(dir, `${id}.json`))) }) {
   return refusals.filter(r => r?.kind === 'already-reviewed-head').map(refusal => {
     const pr = Number(refusal.prNumber);
     const rawPr = (rawPrs ?? []).find(p => Number(p?.number) === pr);
@@ -542,6 +558,11 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
     const failedRead = result => {
       if (result.reason === 'review-unfinished') {
         try {
+          const refused = () => ({ ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT });
+          const blockingId = result.unfinishedId;
+          // Tombstones never bypass the saved-run retry fences, even when a resume hint exists.
+          const abandoned = typeof blockingId === 'string' && blockingId
+            ? isRunAbandoned(blockingId, runsDir) : false;
           const runs = readReviewRuns({ repo, pr, head });
           // The live thread goes in, so an operator comment after the saved run began (a request for a fresh look) is
           // never answered by "resume it": it falls through to the guarded paths below (PR #6784). An unreadable thread
@@ -549,10 +570,10 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           const resumable = Array.isArray(rawPr?.comments)
             ? findResumableParkedRun({ number: pr, headRefOid: head, comments: rawPr.comments }, runs, { repo, ciHeldRecordRetryMax: setting.ciHeldRecordRetryMax }) : null;
           const matching = resumable && runs.find(r => r.id === resumable.id);
-          if (matching?.retryableRecordEffect === true) {
+          if (!abandoned && matching?.retryableRecordEffect === true) {
             return dispatchDecision({ action: 'review', why: 'unfinished review has only a retryable pre-write effect; resume it' });
           }
-          if (setting.ciHeldRecordRetryMax > 0 && Number.isFinite(matching?.ciHeldRecordRetry?.attempts)
+          if (!abandoned && setting.ciHeldRecordRetryMax > 0 && Number.isFinite(matching?.ciHeldRecordRetry?.attempts)
             && matching.ciHeldRecordRetry.attempts <= setting.ciHeldRecordRetryMax
             && Number.isSafeInteger(matching.ciHeldRecordRetry.resumeAttempts) && matching.ciHeldRecordRetry.resumeAttempts >= 0
             && matching.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS) {
@@ -560,28 +581,53 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
           }
           // R755 is dispatch authority only. The reader still holds until a newer panel finishes.
           if (typeof result.unfinishedId !== 'string' || !result.unfinishedId) throw Error('blocking review id missing');
-          if (isRunAbandoned(result.unfinishedId, runsDir) === true) {
-            const blocking = readReviewRun(result.unfinishedId, runsDir);
-            if (!blocking || blocking.id !== result.unfinishedId || blocking.op !== 'review-pr'
+          if (abandoned === true) {
+            const bounds = result.settleBounds ?? result;
+            if (Object.hasOwn(bounds, 'unreadBoundaryAt')) return refused();
+            const complete = typeof bounds.completeHeadRead === 'function'
+              ? bounds.completeHeadRead({ pr, head, at: now })?.complete : bounds.completeHeadRead;
+            if (complete !== true) return refused();
+            const version = readRecordVersion(blockingId, runsDir);
+            if (typeof version !== 'string' || !version) return refused();
+            const blocking = readReviewRun(blockingId, runsDir);
+            // Validate abandonment AFTER the single record read; a concurrent writer invalidates the proof.
+            if (isRunAbandoned(blockingId, runsDir) !== true) return refused();
+            assertReviewRunEvidence(blocking);
+            if (blocking.id !== blockingId || blocking.op !== 'review-pr'
               || blocking.input?.repo !== repo || Number(blocking.input?.pr) !== pr
-              || (blocking.verdict != null && !Object.values(VERDICTS).includes(blocking.verdict?.verdict))) {
-              throw Error('blocking review record unreadable');
-            }
-            if (blocking.verdict?.verdict === 'changes') {
-              return { ...skip(result.reason), escalate: true, escalationContext: UNFINISHED_REVIEW_CONTEXT };
-            }
-            if (!Array.isArray(runs)) throw Error('review hints unreadable');
+              || (blocking.verdict != null && !Object.values(VERDICTS).includes(blocking.verdict?.verdict))) return refused();
+            const tombstone = readAbandonment(blockingId, runsDir);
+            if (!tombstone?.probes || typeof tombstone.probes !== 'object' || Array.isArray(tombstone.probes)
+              || Object.keys(tombstone.probes).length === 0) return refused();
+            if (blocking.verdict?.verdict === 'needs-human' && !Array.isArray(blocking.verdict.pendingReferrals)) return refused();
+            const pending = blocking.pending;
+            if (blocking.verdict?.verdict === 'changes'
+              || (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of')))
+              || pending?.step === 'mandatoryReferrals'
+              || blocking.effects.some(e => ['pending', 'in-flight'].includes(e?.status) && e.step === 'mandatoryReferrals')
+              || blocking.verdict?.pendingReferrals?.length > 0) return refused();
+            // A fresh panel cannot resolve an unknown external write. Preserve the CLI's advisory fence,
+            // including failed writes with unknown outcomes and malformed effect evidence.
+            if (blocking.effects.some(e => !e || (e.idempotent !== true
+              && (!['applied', 'declared', 'failed'].includes(e.status)
+                || !Number.isSafeInteger(e.unknownAttempts) || e.unknownAttempts !== 0)))) return refused();
+            const inventory = readReviewInventory({ repo, pr, head, runsDir, blocking });
+            if (!Array.isArray(inventory) || inventory.length > 400 || !inventory.some(run => run?.id === blockingId)) return refused();
             const dead = new Set();
-            for (const run of runs) {
-              if (!run || typeof run.id !== 'string' || !run.id || !isRealHead(run.head)
-                || typeof run.repo !== 'string' || !run.repo || !Number.isSafeInteger(run.pr) || run.pr <= 0) {
-                throw Error('review hint unreadable');
+            for (const run of inventory) {
+              assertReviewRunEvidence(run);
+              if (typeof run.id !== 'string' || !run.id) return refused();
+              if (run.input.repo === repo && Number(run.input.pr) === pr) {
+                const rev = run.findings?.read?.netBasis?.rev;
+                // Unknown heads count conservatively; missing start times never omit a run.
+                if (!isRealHead(rev) || (rev === head && isRunAbandoned(run.id, runsDir) === true)) dead.add(run.id);
               }
-              if (run.repo === repo && Number(run.pr) === pr && run.head === head
-                && isRunAbandoned(run.id, runsDir) === true) dead.add(run.id);
             }
             if (dead.size >= 2) return { ...skip(result.reason), escalate: true,
               escalationContext: 're-review owners keep dying; inspect the two tombstoned runs on the live head' };
+            if (readRecordVersion(blockingId, runsDir) !== version
+              || JSON.stringify(readAbandonment(blockingId, runsDir)) !== JSON.stringify(tombstone)
+              || isRunAbandoned(blockingId, runsDir) !== true) return refused();
             return dispatchDecision({ action: 'review', why: 'unfinished review owner proven dead (R755); fresh review on live head' });
           }
         } catch {

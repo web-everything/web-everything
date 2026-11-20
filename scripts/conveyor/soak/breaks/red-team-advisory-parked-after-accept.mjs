@@ -1,11 +1,11 @@
-/** D/R755: abandonment starts a new review; only its finished accept releases the hold. */
-import { mkdtempSync, rmSync } from 'node:fs';
+/** D/R755: unresolved writes keep escalation; safe abandonment permits a fresh panel. */
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 export default {
-  id: 'red-team-advisory-parked-after-accept', title: 'dead advisory owners get a fresh panel without releasing the hold',
+  id: 'red-team-advisory-parked-after-accept', title: 'dead advisory owners retain unknown-write fences before a fresh panel',
   card: 'R755', fixedBy: { sha: 'design-D', where: 'design-D', paths: ['scripts/lib/review-red-team-on-skip.mjs'] },
   // The scenario's observed decisions are the authority, including on a tree without D.
   fixPresent: () => true,
@@ -14,7 +14,7 @@ export default {
     try {
       const load = path => import(pathToFileURL(join(sourceRoot, path)).href);
       const { writeRun, newRunRecord } = await load('scripts/operations/run-store.mjs');
-      const { markRunAbandoned } = await load('scripts/lib/run-abandoned.mjs');
+      const { markRunAbandoned, runRecordVersion } = await load('scripts/lib/run-abandoned.mjs');
       const { readDrainRedTeamEvidence } = await load('scripts/lib/drain-red-team-evidence.mjs');
       const { planRedTeamOnSkip } = await load('scripts/lib/review-red-team-on-skip.mjs');
       const repo = 'web-everything/web-everything', pr = 7116, head = 'a'.repeat(40), id = 'review-pr-parked';
@@ -26,17 +26,25 @@ export default {
       writeRun(make('review-pr-old-accept', 1000), runsDir);
       writeRun({ ...make(id, 2000), pending: { kind: 'effect', step: 'advise', stepIndex: 1 },
         effects: [{ key: 'note', type: 'review.note', stepIndex: 1, index: 0, status: 'failed', attempts: 2, unknownAttempts: 2 }] }, runsDir);
-      markRunAbandoned({ id, dir: runsDir, reason: 'owner dead', by: 'soak', probes: {} });
+      markRunAbandoned({ id, dir: runsDir, reason: 'owner dead', by: 'soak', probes: { owner: 'dead', recordVersion: runRecordVersion(statSync(join(runsDir, `${id}.json`))) } });
       const held = readDrainRedTeamEvidence(key);
-      const [decision] = planRedTeamOnSkip({ repo, env, runsDir, now: 2000000,
+      const plan = () => planRedTeamOnSkip({ repo, env, runsDir, now: 2000000,
         refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }],
         rawPrs: [{ number: pr, headRefOid: head, comments: [], reviews: [], labels: [] }],
         setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
         readEvidence: () => held, readStatus: () => null, headNeverReviewed: () => false,
-        readReviewRuns: () => [{ id, repo, pr, head }] });
+        readReviewRuns: () => [{ id, repo, pr, head }] })[0];
+      const refused = plan();
+      // A person resolves the unknown advisory outcome before a safe fresh panel is permitted.
+      writeRun({ ...make(id, 2000), pending: { kind: 'effect', step: 'advise', stepIndex: 1 },
+        effects: [{ key: 'note', type: 'review.note', stepIndex: 1, index: 0, status: 'failed', attempts: 2, unknownAttempts: 0 }] }, runsDir);
+      markRunAbandoned({ id, dir: runsDir, reason: 'owner dead', by: 'soak',
+        probes: { owner: 'dead', recordVersion: runRecordVersion(statSync(join(runsDir, `${id}.json`))) } });
+      const decision = plan();
       writeRun(make('review-pr-fresh-accept', 3000), runsDir);
       const released = readDrainRedTeamEvidence(key);
       const checks = {
+        unknownWriteEscalates: refused.action === 'skip' && refused.escalate === true,
         tombstoneAloneHolds: held.ok === false && held.reason === 'review-unfinished',
         plannerDispatchesReview: decision.action === 'review'
           && decision.why === 'unfinished review owner proven dead (R755); fresh review on live head',

@@ -5579,4 +5579,12 @@ Run `red-team-advisory-parked-after-accept.soak.test.mjs` with `--config vitest.
 it observes tombstone-only hold, planner review dispatch, then release on a newer finished accept.
 Missing IDs, unreadable evidence, stale tombstones and recorded `changes` retain escalation;
 two tombstoned runs on the live head escalate with “re-review owners keep dying”.
-The 30-minute sweep throttle includes failed attempts; retry cooldown and existing resume precedence remain covered.
+The 30-minute sweep throttle includes failed attempts; retry cooldown and live-run resume precedence remain covered.
+Tombstoned record retries use the fresh-review guards instead of resuming. The planner requires a complete
+reader scan with no unread boundary and a bounded raw inventory containing the blocking ID; headless and
+start-less runs must never disappear from the cap. Unknown heads count toward it. Incomplete/oversized
+inventories retain the human escalation. Non-empty probes and a stable record version are required, with
+abandonment rechecked after reading the record and immediately before dispatch. Confirmation waits, mandatory
+referrals/rulings and unresolved non-idempotent writes retain escalation. This planner fence preserves the CLI's
+saved-run advisory-effect refusal when tombstone selection would otherwise bypass it. The soak exercises an
+unknown advisory outcome refusing dispatch, then an explicitly resolved outcome allowing a fresh review.
