@@ -492,25 +492,76 @@ export function assessFalseGreen({ failedTestFiles = [], selectedTestFiles = [],
   };
 }
 
+/** The suite-level statuses vitest's json reporter emits. Anything else is malformed evidence. */
+const SUITE_STATUSES = new Set(['passed', 'failed']);
+/** The assertion-level statuses vitest's json reporter emits. */
+const ASSERTION_STATUSES = new Set(['passed', 'failed', 'pending', 'todo', 'skipped', 'disabled']);
+// C0 controls, DEL, C1 controls and the Unicode line/paragraph separators.
+// eslint-disable-next-line no-control-regex
+const NAME_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f  ]/;
+
 /**
- * Validate full-run evidence before measuring false greens. A named failed suite is valid even without
- * assertions; declared runtime errors leave the run incomplete. Pure.
+ * Validate a vitest json report before measuring false greens. Fails closed on any malformed or incomplete
+ * evidence: a missing or empty suite list (unless `allowEmpty`), a suite name that is blank, padded, carries
+ * control or line-separator characters, has a `..` segment, normalizes to nothing, or repeats another suite;
+ * a suite status other than `passed`/`failed`; malformed assertions, or a `passed` suite with a failed
+ * assertion; and declared or malformed runtime-error fields. A named failed suite is valid without
+ * assertions. Pure.
+ * @param {unknown} report
+ * @param {{allowEmpty?: boolean}} [options] allowEmpty — accept a zero-suite report (a `vitest related` run
+ *   that resolved no tests); a full-run report is never empty.
  * @returns {{ok: boolean, reason: string|null}}
  */
-export function validateVitestReport(report) {
+export function validateVitestReport(report, { allowEmpty = false } = {}) {
   const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
-  if (!isObject(report)) return { ok: false, reason: 'report must be an object' };
-  if (!Array.isArray(report.testResults) || report.testResults.length === 0) {
-    return { ok: false, reason: 'testResults must be a non-empty array' };
-  }
-  const hasRuntimeErrors = (value) => value.numRuntimeErrorTestSuites > 0 || Boolean(value.runtimeError)
-    || Boolean(value.testExecError) || (Array.isArray(value.unhandledErrors) && value.unhandledErrors.length > 0);
-  if (hasRuntimeErrors(report)) return { ok: false, reason: 'report declares runtime errors' };
-  for (const entry of report.testResults) {
-    if (!isObject(entry) || typeof entry.name !== 'string' || typeof entry.status !== 'string') {
-      return { ok: false, reason: 'every test result must have a string name and status' };
+  const fail = (reason) => ({ ok: false, reason });
+  if (!isObject(report)) return fail('report must be an object');
+  if (!Array.isArray(report.testResults)) return fail('testResults must be an array');
+  if (report.testResults.length === 0 && !allowEmpty) return fail('testResults must be a non-empty array');
+  const runtimeErrorProblem = (value) => {
+    if (value.numRuntimeErrorTestSuites !== undefined
+      && !(Number.isInteger(value.numRuntimeErrorTestSuites) && value.numRuntimeErrorTestSuites >= 0)) {
+      return 'numRuntimeErrorTestSuites must be a non-negative integer';
     }
-    if (hasRuntimeErrors(entry)) return { ok: false, reason: 'test result declares runtime errors' };
+    if (value.unhandledErrors !== undefined && !Array.isArray(value.unhandledErrors)) {
+      return 'unhandledErrors must be an array';
+    }
+    if (value.numRuntimeErrorTestSuites > 0 || Boolean(value.runtimeError) || Boolean(value.testExecError)
+      || (Array.isArray(value.unhandledErrors) && value.unhandledErrors.length > 0)) {
+      return 'declares runtime errors';
+    }
+    return null;
+  };
+  const reportProblem = runtimeErrorProblem(report);
+  if (reportProblem) return fail(`report ${reportProblem}`);
+  const seen = new Set();
+  for (const [index, entry] of report.testResults.entries()) {
+    const at = `test result ${index}`;
+    if (!isObject(entry) || typeof entry.name !== 'string' || typeof entry.status !== 'string') {
+      return fail(`${at}: every test result must have a string name and status`);
+    }
+    const { name, status } = entry;
+    if (name.trim() === '' || name !== name.trim()) return fail(`${at}: suite name is blank or padded`);
+    if (NAME_CONTROL_CHARS.test(name)) return fail(`${at}: suite name contains control or line-separator characters`);
+    const normalized = normalizePath(name.replace(`${ROOT}/`, ''));
+    if (normalized === '' || normalized === '.') return fail(`${at}: suite name normalizes to an empty path`);
+    if (normalized.split('/').includes('..')) return fail(`${at}: suite name has a '..' segment`);
+    if (seen.has(normalized)) return fail(`${at}: duplicate suite name`);
+    seen.add(normalized);
+    if (!SUITE_STATUSES.has(status)) return fail(`${at}: suite status must be 'passed' or 'failed'`);
+    if (entry.assertionResults !== undefined) {
+      if (!Array.isArray(entry.assertionResults)) return fail(`${at}: assertionResults must be an array`);
+      for (const assertion of entry.assertionResults) {
+        if (!isObject(assertion) || !ASSERTION_STATUSES.has(assertion.status)) {
+          return fail(`${at}: every assertion must have a known status`);
+        }
+      }
+      if (status === 'passed' && entry.assertionResults.some((a) => a.status === 'failed')) {
+        return fail(`${at}: a passed suite reports a failed assertion`);
+      }
+    }
+    const entryProblem = runtimeErrorProblem(entry);
+    if (entryProblem) return fail(`${at} ${entryProblem}`);
   }
   return { ok: true, reason: null };
 }
@@ -605,7 +656,8 @@ function vitestRelatedSelectedFiles(changedFiles) {
   } catch { /* a non-zero exit (e.g. a related test failed) still writes the report — read it below */ }
   const report = readJsonFile(out, null);
   try { rmSync(out, { force: true }); } catch { /* best-effort cleanup */ }
-  return report ? allFilesFromVitestJson(report) : null;
+  // A malformed related report returns null, so the caller falls back to the conservative approximation.
+  return report && validateVitestReport(report, { allowEmpty: true }).ok ? allFilesFromVitestJson(report) : null;
 }
 
 function runCli(argv) {
@@ -623,7 +675,15 @@ function runCli(argv) {
   // A false-green = a full-suite FAILURE that falls OUTSIDE what `vitest related` on the diff would have run.
   if (flags.measure) {
     const report = typeof flags['vitest-json'] === 'string' ? readJsonFile(flags['vitest-json'], null) : null;
-    const validation = validateVitestReport(report);
+    let validation = validateVitestReport(report);
+    // A caller-supplied `--selected-json` is evidence too: a malformed one would inflate or garble the selected
+    // set and hide escapes, so it invalidates the measurement rather than being silently replaced.
+    let selReport = null;
+    if (validation.ok && decision.mode === 'shrink' && typeof flags['selected-json'] === 'string') {
+      selReport = readJsonFile(flags['selected-json'], null);
+      const selValidation = validateVitestReport(selReport, { allowEmpty: true });
+      if (!selValidation.ok) validation = { ok: false, reason: `selected-json: ${selValidation.reason}` };
+    }
     const hadReport = validation.ok;
     const failedTestFiles = hadReport ? failedFilesFromVitestJson(report) : [];
     // The TRUE selected set is the TEST files `vitest related <changedFiles>` resolves — not the changed source
@@ -633,7 +693,6 @@ function runCli(argv) {
     let selectedTestFiles = [];
     let approx = false;
     if (hadReport && decision.mode === 'shrink') {
-      const selReport = typeof flags['selected-json'] === 'string' ? readJsonFile(flags['selected-json'], null) : null;
       if (selReport) selectedTestFiles = allFilesFromVitestJson(selReport);
       else {
         const computed = flags['no-related'] ? null : vitestRelatedSelectedFiles(decision.selectedFiles);

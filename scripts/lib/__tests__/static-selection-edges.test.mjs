@@ -177,6 +177,51 @@ describe('validateVitestReport — fail closed on incomplete evidence', () => {
     expect(validateVitestReport({ testResults: [{ name: 'a.test.mjs', status }], numRuntimeErrorTestSuites: 0 }))
       .toEqual({ ok: true, reason: null });
   });
+
+  // PR #7212 ruling: malformed suite names and statuses must not pass as valid false-green evidence.
+  const one = (entry, extra = {}) => ({ testResults: [{ name: 'a.test.mjs', status: 'passed', ...entry }], ...extra });
+  it.each([
+    ['empty name', one({ name: '' })],
+    ['whitespace-only name', one({ name: '   ' })],
+    ['name with surrounding whitespace', one({ name: ' a.test.mjs ' })],
+    ['name with newline', one({ name: 'a.test.mjs\nb.test.mjs' })],
+    ['name with carriage return', one({ name: 'a.test.mjs\r' })],
+    ['name with U+2028', one({ name: 'a.test.mjs ' })],
+    ['name with NUL', one({ name: 'a\0.test.mjs' })],
+    ['name that normalizes to empty', one({ name: './' })],
+    ['name with a .. segment', one({ name: 'scripts/../../etc/a.test.mjs' })],
+    ['name with a backslash .. segment', one({ name: 'scripts\\..\\..\\a.test.mjs' })],
+    ['duplicate suite names', { testResults: [{ name: 'a.test.mjs', status: 'passed' }, { name: './a.test.mjs', status: 'failed' }] }],
+    ['empty status', one({ status: '' })],
+    ['unknown status', one({ status: 'bogus' })],
+    ['status with wrong case', one({ status: 'Failed' })],
+    ['status with whitespace', one({ status: 'failed ' })],
+    ['assertion-level status at suite level', one({ status: 'skipped' })],
+    ['non-array assertionResults', one({ assertionResults: {} })],
+    ['null assertion entry', one({ assertionResults: [null] })],
+    ['assertion without status', one({ assertionResults: [{}] })],
+    ['assertion with unknown status', one({ assertionResults: [{ status: 'bogus' }] })],
+    ['passed suite with a failed assertion', one({ status: 'passed', assertionResults: [{ status: 'failed' }] })],
+    ['non-array unhandledErrors', one({}, { unhandledErrors: { message: 'crash' } })],
+    ['non-numeric runtime-error count', one({}, { numRuntimeErrorTestSuites: 'x' })],
+    ['negative runtime-error count', one({}, { numRuntimeErrorTestSuites: -1 })],
+  ])('rejects %s with a reason', (_label, report) => {
+    const result = validateVitestReport(report);
+    expect(result.ok).toBe(false);
+    expect(typeof result.reason).toBe('string');
+    expect(result.reason.length).toBeGreaterThan(0);
+  });
+
+  it('accepts well-formed assertions on a failed suite', () => {
+    expect(validateVitestReport(one({ status: 'failed', assertionResults: [{ status: 'passed' }, { status: 'failed' }, { status: 'skipped' }] })))
+      .toEqual({ ok: true, reason: null });
+  });
+
+  it('rejects an empty selected report by default but accepts it when allowEmpty is set', () => {
+    expect(validateVitestReport({ testResults: [] }).ok).toBe(false);
+    expect(validateVitestReport({ testResults: [] }, { allowEmpty: true })).toEqual({ ok: true, reason: null });
+    expect(validateVitestReport({ testResults: [{ name: '', status: 'passed' }] }, { allowEmpty: true }).ok).toBe(false);
+  });
 });
 
 describe('audit regression: measure CLI report evidence', () => {
@@ -188,6 +233,7 @@ describe('audit regression: measure CLI report evidence', () => {
     let output;
     let recorded;
     let reportText;
+    let selectedText;
     const historical = [{ falseGreen: true }, { falseGreen: false }, { falseGreen: null, status: 'report-invalid' }];
     let persisted = [...historical];
     vi.stubEnv('WE_STATIC_EDGES_SHADOW', '1');
@@ -211,6 +257,7 @@ describe('audit regression: measure CLI report evidence', () => {
           if (reportText === undefined) throw new Error('ENOENT');
           return reportText;
         }
+        if (String(path) === 'selected.json') return selectedText;
         if (String(path).endsWith('/false-green-log.json')) return JSON.stringify(persisted);
         if (String(path).endsWith('/scripts/lib/x.mjs')) return '';
         return actual.readFileSync(path, ...rest);
@@ -232,22 +279,38 @@ describe('audit regression: measure CLI report evidence', () => {
         ['{"testResults":[{"name":"a.test.mjs","status":"passed"}],"numRuntimeErrorTestSuites":1}', false],
         ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', true],
         ['{"testResults":[{"name":"a.test.mjs","status":"passed"}]}', true],
+        // PR #7212 ruling: malformed suite names and statuses are invalid evidence end to end.
+        ['{"testResults":[{"name":"","status":"failed"}]}', false],
+        ['{"testResults":[{"name":"escaped.test.mjs\\n","status":"failed"}]}', false],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"bogus"}]}', false],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"passed","assertionResults":[{"status":"failed"}]}]}', false],
+        // A supplied --selected-json is evidence too (read only on a shrink decision, i.e. flag=1).
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', flag !== '1', '{"testResults":[{"name":"","status":"passed"}]}'],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', flag !== '1', '{"testResults":[{"name":"escaped.test.mjs","status":"bogus"}]}'],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', flag !== '1', '{"testResults":{}}'],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', true, '{"testResults":[{"name":"escaped.test.mjs","status":"passed"}]}'],
+        ['{"testResults":[{"name":"escaped.test.mjs","status":"failed"}]}', true, '{"testResults":[]}'],
       ];
-      for (const [report, valid] of reports) {
+      for (const [report, valid, selected] of reports) {
         reportText = report ?? undefined;
+        selectedText = selected;
         vi.resetModules();
-        process.argv = [argv[0], cliPath, '--measure', '--no-related', ...(report === undefined ? [] : ['--vitest-json=audit-report.json'])];
+        process.argv = [argv[0], cliPath, '--measure', '--no-related',
+          ...(report === undefined ? [] : ['--vitest-json=audit-report.json']),
+          ...(selected === undefined ? [] : ['--selected-json=selected.json'])];
         await import('../../readiness/test-selection.mjs');
         expect(exit).toHaveBeenLastCalledWith(valid ? 0 : 1);
         expect(output.recorded).toEqual(recorded);
         expect(recorded.hadReport).toBe(valid);
+        const escapes = flag === '1' && report.includes('escaped.test.mjs') && !(selected ?? '').includes('escaped.test.mjs');
         if (!valid) {
           expect(recorded).toMatchObject({ falseGreen: null, status: 'report-invalid', failedCount: null, escaped: null });
           expect(output.falseGreen).toMatchObject({ falseGreen: null, failedCount: null, escaped: null });
+          if (selected !== undefined) expect(recorded.reason).toMatch(/^selected-json: /);
         } else {
-          expect(recorded.falseGreen).toBe(flag === '1' && report.includes('escaped.test.mjs'));
+          expect(recorded.falseGreen).toBe(escapes);
           expect(recorded.failedCount).toBe(report.includes('escaped.test.mjs') ? 1 : 0);
-          expect(recorded.escaped).toEqual(flag === '1' && report.includes('escaped.test.mjs') ? ['escaped.test.mjs'] : []);
+          expect(recorded.escaped).toEqual(escapes ? ['escaped.test.mjs'] : []);
           expect(recorded.status).toBeUndefined();
         }
         expect(output.shadow.partial).toBe(!valid);
@@ -262,7 +325,9 @@ describe('audit regression: measure CLI report evidence', () => {
       expect(persisted).toHaveLength(historical.length + reports.length);
       expect(persisted.slice(0, historical.length)).toEqual(historical);
       expect(persisted.slice(historical.length).map((row) => row.falseGreen)).toEqual(
-        reports.map(([report, valid]) => valid ? flag === '1' && report.includes('escaped.test.mjs') : null),
+        reports.map(([report, valid, selected]) => valid
+          ? flag === '1' && report.includes('escaped.test.mjs') && !(selected ?? '').includes('escaped.test.mjs')
+          : null),
       );
       expect(exit).toHaveBeenCalledTimes(reports.length);
     } finally {
