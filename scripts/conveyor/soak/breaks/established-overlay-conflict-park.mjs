@@ -7,6 +7,9 @@ import { prepareRebuild, readOverlayEventLog } from '../../../lib/daemon-rebuild
 import { readRebuildState, writeRebuildState } from '../../../lib/daemon-rebuild/state.mjs';
 import { addOverlay, readOverlays } from '../../../lib/daemon-overlays.mjs';
 import { REBUILD_IDENTITY_ENV } from '../../../lib/daemon-rebuild/shared.mjs';
+import { smokeAndAdopt } from '../../../lib/daemon-rebuild/smoke.mjs';
+import { decideLastGood } from '../../../lib/daemon-last-good.mjs';
+import { assertMainNotStale } from '../../../lib/main-staleness.mjs';
 
 export default {
   id: 'established-overlay-conflict-park',
@@ -77,6 +80,51 @@ export default {
       check(r.alerts.some(a => a.kind === 'established-overlay-parked' && a.detail.ref === ref && a.detail.sha === sha), 'park must alert with the lost overlay tip');
       check(!r.alerts.some(a => a.kind === 'established-overlay-hold'), 'park must stop holding');
       check(readOverlayEventLog(root, env).some(e => e.kind === 'established-overlay-parked' && e.ref === ref), 'park must leave audit evidence');
+
+      // Same live case, next tick: candidate code fails while the last-good control passes.
+      // Retained park authorization must not erase the smoke hold or re-emit the park notice.
+      let smokeCalls = 0;
+      const rejected = await smokeAndAdopt({ root, env, stEnv: env, log: {}, run,
+        runSmoke: async () => {
+          const ok = ++smokeCalls > 1;
+          return { verdict: ok ? 'pass' : 'code', attempts: 1,
+            smoke: { results: [{ name: 'boot', ok, mayBeTransient: false, detail: 'deterministic candidate failure', ms: 1 }] } };
+        },
+        now: () => start + parkMinutes * 60_000 + 2,
+        plan: r.plan, prevHead: sha, lease: r.lease, overlaysBefore: [], prepAlerts: r.alerts,
+        finalLockOpts: { env, lockRoot: join(dir, 'locks') },
+        dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: async () => ({}), match: () => false },
+      });
+      check(rejected.reason === 'smoke-rejected' && smokeCalls === 2, 'candidate failure and passing last-good control must reject');
+      const smokeHold = readRebuildState(root, env).held;
+      check(smokeHold?.reason === 'smoke-rejected' && smokeHold.controlPassed, 'smoke must record its hold');
+      const notices = JSON.stringify(readRebuildState(root, env).pinnedNotified);
+      const parkEvents = readOverlayEventLog(root, env).filter(e => e.kind === 'established-overlay-parked').length;
+      const later = start + 3 * 3_600_000;
+      const again = await tick(later);
+      const state = readRebuildState(root, env);
+      check(again.result?.reason === 'still-rejected', 'unchanged inputs must remain rejected');
+      check(JSON.stringify(state.held) === JSON.stringify(smokeHold), 'repeated parking must preserve the smoke hold unchanged');
+      check(state.building === null && git('-C', root, 'rev-parse', 'HEAD') === sha, 'rejection must leave last-good HEAD without a build lease');
+      check(JSON.stringify(state.pinnedNotified) === notices && !again.alerts.some(a => a.kind === 'established-overlay-parked')
+        && readOverlayEventLog(root, env).filter(e => e.kind === 'established-overlay-parked').length === parkEvents,
+      'repeated parking must not rewrite notices or emit another park event');
+      const lastGood = () => decideLastGood({ headSha: sha, state, nowMs: later, maxAgeMs: 24 * 3_600_000, freshAdoptMs: 0 });
+      const onLastGood = lastGood().onLastGood;
+      let refusal = null;
+      const managedBefore = process.env.WE_DAEMON_MANAGED_CLONE;
+      process.env.WE_DAEMON_MANAGED_CLONE = '1';
+      try {
+        assertMainNotStale(root, () => ({ action: 'warn', behind: 1, dirty: false }), {
+          listBehindFiles: () => ['scripts/conveyor/review-dispatch.mjs'],
+          lastGood, rebuildGrace: () => ({ grace: false }), write: () => {},
+        });
+      } catch (error) { refusal = error.message; }
+      finally {
+        if (managedBefore === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE;
+        else process.env.WE_DAEMON_MANAGED_CLONE = managedBefore;
+      }
+      check(onLastGood && !refusal, `last-good dispatch must survive repeated parking: ${JSON.stringify({ held: state.held, onLastGood, refusal })}`);
 
       // PR #7104 round 4 — a mechanism-pinned live overlay A conflicts with main, and its registered clean repair B
       // (A + main) applies. The identity marker kept for A must not erase B's carrier proof: no hold, no needs-you.

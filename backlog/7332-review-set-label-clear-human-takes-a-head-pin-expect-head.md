@@ -2,7 +2,7 @@
 bornAs: xnpcayd
 kind: task
 status: open
-scope: ["we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label-clear-human-hold.test.mjs"]
 dateOpened: "2026-10-28"
 tags: []
 ---
@@ -13,7 +13,8 @@ tags: []
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — the clear-human pin cases in `we:scripts/__tests__/review-set-label-clear-human-hold.test.mjs`, run through the host heavy-run queue: clear-human accepts a full head pin; malformed pins, `--new-head`, initial mismatches and a push before the first write refuse without label/comment writes.
+- [A2] **Compatibility** — omitting the pin retains the existing operator ceremony and posting-identity requirements. This adds no permission to turn auto clear-human on.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 

@@ -25,8 +25,8 @@
  *   With a separate code clone, pending daemon refreshes pause new starts; in-flight drains finish normally.
  *
  * SETTING `mergeQueue.enqueueOnEvent` — `{ enabled: boolean, debounceSeconds: number, debounceMaxWaitMs: number, timeoutSeconds: number,
- *   catchUp: { enabled: boolean, intervalMinutes: number, pendingExpiryMinutes: number, concurrency: number, busyIntervalSeconds: number, maxQueued: number, missSmellAfter: number, blockedBackoffRounds: number, timeoutBackoffRounds: number, missBackoff: { enabled: boolean, ttlMinutes: number }, order: string } }`, resolved through the shared
- *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, debounceMaxWaitMs:60000, timeoutSeconds:600, catchUp:{enabled:false, intervalMinutes:10, concurrency:3, busyIntervalSeconds:60, maxQueued:12, missSmellAfter:3, blockedBackoffRounds:6, timeoutBackoffRounds:3, missBackoff:{enabled:true, ttlMinutes:30}, order:"priority-then-first-accept"}}` → platform
+ *   catchUp: { enabled: boolean, intervalMinutes: number, pendingExpiryMinutes: number, concurrency: number, cleanFirst: boolean, snapshotFirst: boolean, busyIntervalSeconds: number, maxQueued: number, missSmellAfter: number, blockedBackoffRounds: number, timeoutBackoffRounds: number, missBackoff: { enabled: boolean, ttlMinutes: number }, order: string } }`, resolved through the shared
+ *   policy cascade (`./policy-cascade.mjs`): standard default `{enabled:false, debounceSeconds:15, debounceMaxWaitMs:60000, timeoutSeconds:600, catchUp:{enabled:false, intervalMinutes:10, concurrency:3, cleanFirst:true, snapshotFirst:true, busyIntervalSeconds:60, maxQueued:12, missSmellAfter:3, blockedBackoffRounds:6, timeoutBackoffRounds:3, missBackoff:{enabled:true, ttlMinutes:30}, order:"priority-then-first-accept"}}` → platform
  *   preference `mergeQueue.enqueueOnEvent` → tool block `mergeQueue.enqueueOnEvent` in `we:scripts/settings/*.json`
  *   (this repo: `merge-queue.json`) → env `WE_ENQUEUE_ON_EVENT=on|off` (enabled only). Re-read on every tick; the
  *   source of each leaf is logged once per distinct value (`enqueue-on-event: setting …`).
@@ -57,6 +57,12 @@
  *   `enqueue-on-event: catch-up`. `tick()` runs it when due; `catchUp()` runs ONLY it, for a daemon whose passes
  *   run back to back (no post-pass sleep window) to call right before each pass.
  *
+ *   catchUp.cleanFirst (boolean, default true) stably puts CLEAN/HAS_HOOKS first within priority class and hold/miss groups;
+ *   every other state remains a candidate. False retains the previous priority order.
+ *   catchUp.snapshotFirst (boolean, default true) allows one catch-up child until the fast-drain reader accepts its round snapshot,
+ *   then uses catchUp.concurrency. Missing/invalid/unreadable evidence keeps starts serial; a failed/timed-out
+ *   child releases the next attempt. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
+ *
  *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated hold-eligible not-enqueued summaries at the same
  *   head and sorted-label SHA-256 digest until either changes or TTL (integer 1–1440 minutes) expires.
  *   Only classified enqueue outcomes authorize holds. Queue contention, independent retry timers,
@@ -70,6 +76,7 @@
  */
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
+import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
 import { tmpdir } from 'node:os';
 import { randomUUID, createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
@@ -91,7 +98,7 @@ export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
 /** Enqueue and merge decision modules: a pending change touching these pauses catch-up (path prefixes). */
 const REFRESH_PAUSE_PATHS = Object.freeze(['scripts/lib/drain-queue-safety', 'scripts/merge-ai-prs', 'scripts/lib/enqueue-on-event']);
-export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), refreshPause: Object.freeze({ paths: Object.freeze(REFRESH_PAUSE_PATHS), maxPauseMinutes: 10 }), order: 'priority-then-first-accept' }) });
+export const ENQUEUE_ON_EVENT_DEFAULTS = Object.freeze({ enabled: false, debounceSeconds: 15, debounceMaxWaitMs: 60_000, timeoutSeconds: 600, catchUp: Object.freeze({ enabled: false, intervalMinutes: 10, pendingExpiryMinutes: 15, concurrency: 3, cleanFirst: true, snapshotFirst: true, busyIntervalSeconds: 60, maxQueued: 12, missSmellAfter: 3, blockedBackoffRounds: 6, timeoutBackoffRounds: 3, missBackoff: Object.freeze({ enabled: true, ttlMinutes: 30 }), refreshPause: Object.freeze({ paths: Object.freeze(REFRESH_PAUSE_PATHS), maxPauseMinutes: 10 }), order: 'priority-then-first-accept' }) });
 /** Compatibility constant for the standard fast-drain timeout; the setting controls child runs. */
 export const FAST_DRAIN_TIMEOUT_MS = 10 * 60_000;
 // Fixed maximum: decline dedupe must never suppress a PR indefinitely.
@@ -128,6 +135,8 @@ const CATCH_UP_VALID = {
   intervalMinutes: validInterval,
   pendingExpiryMinutes: (v) => Number.isFinite(v) && v > 0,
   concurrency: (v) => Number.isInteger(v) && v >= 1,
+  cleanFirst: (v) => typeof v === 'boolean',
+  snapshotFirst: (v) => typeof v === 'boolean',
   busyIntervalSeconds: (v) => Number.isFinite(v) && v >= 1 && v <= 600,
   maxQueued: (v) => Number.isInteger(v) && v >= 1,
   missSmellAfter: (v) => Number.isInteger(v) && v >= 1,
@@ -183,7 +192,7 @@ function cleanLayer(layer, name, invalid) {
 
 /**
  * Resolve the setting. Never throws. `tool` defaults to the declared settings' `mergeQueue.enqueueOnEvent` block.
- * @returns {{enabled:boolean, debounceSeconds:number, debounceMaxWaitMs:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, pendingExpiryMinutes:number, concurrency:number, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, missBackoff:{enabled:boolean, ttlMinutes:number}, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
+ * @returns {{enabled:boolean, debounceSeconds:number, debounceMaxWaitMs:number, timeoutSeconds:number, catchUp:{enabled:boolean, intervalMinutes:number, pendingExpiryMinutes:number, concurrency:number, cleanFirst:boolean, snapshotFirst:boolean, busyIntervalSeconds:number, maxQueued:number, missSmellAfter:number, blockedBackoffRounds:number, timeoutBackoffRounds:number, missBackoff:{enabled:boolean, ttlMinutes:number}, order:string}, sources:Record<string,string>, invalid:string[], line:string}}
  */
 export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform } = {}) {
   let block = tool;
@@ -248,7 +257,7 @@ export function resolveEnqueueOnEventSetting({ env = process.env, tool, platform
   out.catchUp.refreshPause = pause.value;
   for (const [key, source] of Object.entries(pause.sources)) out.sources[`catchUp.refreshPause.${key}`] = source;
   const src = (k) => out.sources[k] || 'standard';
-  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.refreshPause.paths=${out.catchUp.refreshPause.paths.join(',')} (${src('catchUp.refreshPause.paths')}), catchUp.refreshPause.maxPauseMinutes=${out.catchUp.refreshPause.maxPauseMinutes} (${src('catchUp.refreshPause.maxPauseMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
+  out.line = `enqueue-on-event: setting ${ENQUEUE_ON_EVENT_POLICY} enabled=${out.enabled} (${src('enabled')}), debounceSeconds=${out.debounceSeconds} (${src('debounceSeconds')}), debounceMaxWaitMs=${out.debounceMaxWaitMs} (${src('debounceMaxWaitMs')}), timeoutSeconds=${out.timeoutSeconds} (${src('timeoutSeconds')}), catchUp.enabled=${out.catchUp.enabled} (${src('catchUp.enabled')}), catchUp.intervalMinutes=${out.catchUp.intervalMinutes} (${src('catchUp.intervalMinutes')}), catchUp.pendingExpiryMinutes=${out.catchUp.pendingExpiryMinutes} (${src('catchUp.pendingExpiryMinutes')}), catchUp.concurrency=${out.catchUp.concurrency} (${src('catchUp.concurrency')}), catchUp.cleanFirst=${out.catchUp.cleanFirst} (${src('catchUp.cleanFirst')}), catchUp.snapshotFirst=${out.catchUp.snapshotFirst} (${src('catchUp.snapshotFirst')}), catchUp.busyIntervalSeconds=${out.catchUp.busyIntervalSeconds} (${src('catchUp.busyIntervalSeconds')}), catchUp.maxQueued=${out.catchUp.maxQueued} (${src('catchUp.maxQueued')}), catchUp.missSmellAfter=${out.catchUp.missSmellAfter} (${src('catchUp.missSmellAfter')}), catchUp.blockedBackoffRounds=${out.catchUp.blockedBackoffRounds} (${src('catchUp.blockedBackoffRounds')}), catchUp.timeoutBackoffRounds=${out.catchUp.timeoutBackoffRounds} (${src('catchUp.timeoutBackoffRounds')}), catchUp.missBackoff.enabled=${out.catchUp.missBackoff.enabled} (${src('catchUp.missBackoff.enabled')}), catchUp.missBackoff.ttlMinutes=${out.catchUp.missBackoff.ttlMinutes} (${src('catchUp.missBackoff.ttlMinutes')}), catchUp.refreshPause.paths=${out.catchUp.refreshPause.paths.join(',')} (${src('catchUp.refreshPause.paths')}), catchUp.refreshPause.maxPauseMinutes=${out.catchUp.refreshPause.maxPauseMinutes} (${src('catchUp.refreshPause.maxPauseMinutes')}), catchUp.order=${out.catchUp.order} (${src('catchUp.order')})${out.invalid.length ? ` · ignored invalid: ${out.invalid.join('; ')}` : ''}`;
   return out;
 }
 
@@ -649,6 +658,7 @@ function unchangedDecline(pr, held, now, mainCiRunId) {
 /** PURE: ordered candidates that fit the current queue, leaving eligibility to the drain. */
 export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSince, deprioritize = [], declines, mainCiRunId,
   pendingExpiryMinutes = ENQUEUE_ON_EVENT_DEFAULTS.catchUp.pendingExpiryMinutes, order = 'priority-then-first-accept',
+  cleanFirst = ENQUEUE_ON_EVENT_DEFAULTS.catchUp.cleanFirst,
   priority, buildPriority = [], mainFix = null, repo, now = 0, defaultBranch = 'main' }) {
   const pending = new Set(pendingNums);
   const skipped = []; const candidates = []; const expired = []; const skippedUnchanged = [];
@@ -687,6 +697,14 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
     return typeof h?.reason === 'string' && !!h.reason && Number.isFinite(h.at) && now >= h.at
       && now - h.at < Math.min(CATCH_UP_DECLINE_TTL_MS, Number.isFinite(h.ttlMs) && h.ttlMs > 0 ? h.ttlMs : CATCH_UP_DECLINE_TTL_MS); };
   candidates.sort((a, b) => Number(knownHold(a.num)) - Number(knownHold(b.num)));
+  // Clean heads lead only when hold/miss and configured class keys are equal.
+  if (cleanFirst) {
+    const clean = pr => ['CLEAN', 'HAS_HOOKS'].includes(pr.mergeStateStatus);
+    candidates.sort((a, b) => Number(knownHold(a.num)) - Number(knownHold(b.num))
+      || Number(recentMisses.has(a.num)) - Number(recentMisses.has(b.num))
+      || (order === 'oldest-ready' ? 0 : classes.get(a.num) - classes.get(b.num))
+      || Number(clean(b)) - Number(clean(a)));
+  }
   const room = Math.max(0, capacity - queued);
   const plan = { run: candidates.slice(0, room).map(({ num, readyAt }) => ({ num, readyAt })),
     later: candidates.slice(room).map((p) => p.num), skipped };
@@ -782,7 +800,7 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, refreshPending?:Function, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readRoundSnapshot?:Function, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
@@ -803,6 +821,7 @@ export function createEnqueueOnEvent({
   readQueueDepth = ({ repo }) => readCatchUpQueueDepth({ repo, env }),
   readMembership = ({ repo, num }) => readMergeQueueMembership({ repo, num, env }),
   prestageCache = createPrestageCache({ env }),
+  readRoundSnapshot = readFastDrainRoundSnapshot,
   timeoutMs, readPr = ({ repo, num }) => readPrForWake({ repo, num, env }),
   // The drain's own code version (full sha). A miss-backoff recorded under older code is re-evaluated once.
   readCodeVersion = () => String(execFileSyncImpl('git', ['rev-parse', 'HEAD'], { cwd: scriptRoot(), env, encoding: 'utf8', timeout: 10_000 })).trim(),
@@ -1012,7 +1031,7 @@ export function createEnqueueOnEvent({
         const planAt = now();
         const priorities = await readPriorities();
         const inputs = { ...result, declines, defaultBranch, ...priorities, repo: localSlug, now: planAt,
-          order: s.catchUp.order, deprioritize: new Set([...[...missedAt].filter(([num, at]) => misses.has(num) && planAt - at < missSettings(s).ttlMinutes * 60_000).map(([num]) => num)]),
+          order: s.catchUp.order, cleanFirst: s.catchUp.cleanFirst, deprioritize: new Set([...[...missedAt].filter(([num, at]) => misses.has(num) && planAt - at < missSettings(s).ttlMinutes * 60_000).map(([num]) => num)]),
           pendingNums: pendingEntries.map(p => p.num), pendingSince,
           pendingExpiryMinutes: s.catchUp.pendingExpiryMinutes };
         const expiryPlan = planCatchUp({ ...inputs, capacity });
@@ -1051,6 +1070,18 @@ export function createEnqueueOnEvent({
         .filter((p) => !activeNums.has(p.num) && !attempted.has(p.num) && (!catchUpOnly || p.catchUp) && (!p.catchUp || !batchingDeferred && catchUpRoom > 0));
       if (!p) { if (active.size) { await Promise.race(active.values()); continue; } break; }
       if (!p.catchUp && active.size) { await Promise.race(active.values()); continue; }
+      if (p.catchUp && active.size && (s.catchUp?.snapshotFirst ?? ENQUEUE_ON_EVENT_DEFAULTS.catchUp.snapshotFirst) && listingSnapshot) {
+        let published = false;
+        try { published = !!readRoundSnapshot({ path: listingSnapshot, repo: p.repo, env, now: now(), requireDefaultBranch: true }); }
+        catch { log('enqueue-on-event: round snapshot check threw; keeping catch-up serial'); }
+        if (!published) {
+          // A writer may publish before it exits. Recheck while it runs; failure/timeout also releases the wait.
+          let timer;
+          try { await Promise.race([...active.values(), new Promise(resolve => { timer = setTimeout(resolve, 1000); })]); }
+          finally { clearTimeout(timer); }
+          continue;
+        }
+      }
       const key = `${p.repo}#${p.num}`;
       const taken = pending.get(key);
       const prefix = `enqueue-on-event: ${p.catchUp ? 'catch-up ' : ''}#${p.num}`;

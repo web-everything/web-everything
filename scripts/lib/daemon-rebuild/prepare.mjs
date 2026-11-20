@@ -538,7 +538,7 @@ export async function prepareRebuild({
         pinnedNow[l.ref] = `established-overlay-parked:${l.sha}`;
       }
       state.pinnedNotified = pinnedNow;
-      state.held = null;
+      if (state.held?.reason === 'established-overlay-conflict') state.held = null;
       writeState();
     } else {
       alert('established-overlay-hold', detail);

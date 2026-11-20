@@ -22,6 +22,8 @@ import { notifyDesktopChecked } from './branch-sync.mjs';
 import { repeatDue, labelNames } from './pr-sweep-core.mjs';
 import { sortUnblockersFirst } from './pr-blocked-by.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { enqueueStuckTrace, drainStuckTraces } from './stuck-trace.mjs';
+import { handoffHome } from '../operations/handoff-home.mjs';
 
 export const STALLED_KIND = 'stalled';
 const sh = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
@@ -109,21 +111,47 @@ const feedKeyOfId = (x) => { const at = x.lastIndexOf('@'); return `${x.slice(0,
  * @param {{items:object[], incomplete:boolean, settingsUnreadable?:boolean}} pass  the `runStallSweep` result
  * @param {{now?:number, env?:object, feedPath?:string, stateDir:string, notify?:Function, enabled?:boolean}} o
  */
-export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes } = {}) {
+export function publishStalledDigest(pass, { now = Date.now(), env = process.env, feedPath, stateDir, notify = notifyDesktopChecked, enabled = true, alertBackoffMinutes, enqueue = enqueueStuckTrace, drain = drainStuckTraces,
+  traceStateDir = join(handoffHome(), 'pr-merge-watch') } = {}) {
   const errors = [];
+  if (isUnderTest(env) || isUnderTest()) traceStateDir = stateDir ? join(stateDir, 'stuck-traces') : null;
   if (isUnderTest(env) && !feedPath) return { lines: [], fresh: [], notified: false, errors, skipped: 'under-test' }; // never the real feed
   // Unknown policy is not an explicit disable: preserve open items, suppression and alert obligations until recovery.
   if (pass?.settingsUnreadable) return { lines: [], fresh: [], notified: false, errors, skipped: 'settings unreadable' };
   if (!enabled) return releaseStalledSuppression({ feedPath, env, stateDir, errors, now });
   if (!Array.isArray(pass?.items)) return { lines: [], fresh: [], notified: false, errors, skipped: 'no pass' };
   const items = sortUnblockersFirst(pass.items.filter((i) => i.lane === 'operator').map(feedItem));
-  // A feed configured as digest.lock may already contain events. Reject it before lock recovery can reclaim it.
-  try { checkedDigestFeedPath(feedPath, env, stateDir); }
-  catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
+  // Validate before either queue operation: rejected feeds must leave trace state untouched.
+  try {
+    const path = checkedDigestFeedPath(feedPath, env, stateDir);
+    if (traceStateDir) {
+      const fold = file => canonicalPath(file).normalize('NFC').toLowerCase();
+      const reserved = ['stuck-trace-queue.json', 'stuck-trace-queue.json.lock'].map(name => fold(join(traceStateDir, name)));
+      const sidecars = Object.values(sidecarsOf(path));
+      if ([path, ...sidecars, ...sidecars.map(file => `${file}.lock`)].some(file => {
+        const target = fold(file);
+        return reserved.some(root => target === root || target.startsWith(`${root}${sep}`));
+      })) throw new Error('feed path is reserved for stuck trace state');
+    }
+  } catch { return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
+  // Enqueue every current operator head, including unchanged feed entries and failed delivery retries.
+  for (const item of traceStateDir ? items : []) {
+    try { enqueue({ repo: item.repo, pr: item.pr, head: item.head, kind: STALLED_KIND, stateDir: traceStateDir, now }); }
+    catch { /* best effort; never affects the digest */ }
+  }
+  try {
   // One delivery at a time: selection, sending and confirmation run under one lock, so two overlapping passes can never
   // both send the same owed alert. If the lock cannot be taken, every item is alerted (a repeat, never a drop).
+  // Use the watcher's queue directory so the two daemons cannot trace the same head twice.
   try { mkdirSync(stateDir, { recursive: true }); return withFileLock(join(stateDir, 'digest.lock'), () => deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes })); }
   catch (e) { errors.push(`digest lock: ${String(e?.message ?? e).split('\n')[0]}`); return deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked: true }); }
+  } finally {
+    // Every pass, including empty/unchanged items, drains the shared watcher queue.
+    // Detached best effort; never spawn operations under test.
+    if (!isUnderTest(env) && !isUnderTest()) {
+      void Promise.resolve().then(() => drain({ stateDir: traceStateDir, now, max: 2, env })).catch(() => {});
+    }
+  }
 }
 
 function deliver(items, pass, { now, env, feedPath, stateDir, notify, errors, alertBackoffMinutes, unlocked = false }) {

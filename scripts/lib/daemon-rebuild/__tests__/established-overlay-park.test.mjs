@@ -3,10 +3,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { gitRun } from '../../main-staleness.mjs';
+import { assertMainNotStale, gitRun } from '../../main-staleness.mjs';
+import { decideLastGood } from '../../daemon-last-good.mjs';
 import { rebuildClone } from '../rebuild.mjs';
 import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import { readRebuildState, writeRebuildState } from '../state.mjs';
+import * as rebuildState from '../state.mjs';
+import * as candidate from '../candidate.mjs';
+import * as cloneLock from '../../daemon-clone-lock.mjs';
+import { smokeAndAdopt } from '../smoke.mjs';
 import * as planner from '../plan.mjs';
 import * as edgeFetch from '../edge-fetch.mjs';
 import * as localState from '../local-state.mjs';
@@ -265,6 +270,58 @@ describe('bounded established overlay hold', () => {
       expect(parked(r)).toEqual([]);
       expect(held()).toBeNull();
     }
+  });
+  it('repeated parking preserves the smoke-rejected hold and last-good dispatch after grace expires', async () => {
+    let state = readRebuildState(root, env);
+    state.adopted.at = new Date(start - 2 * 3_600_000).toISOString();
+    vi.spyOn(rebuildState, 'readRebuildState').mockImplementation(() => structuredClone(state));
+    vi.spyOn(rebuildState, 'writeRebuildState').mockImplementation((_root, next) => { state = structuredClone(next); });
+    vi.spyOn(cloneLock, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(candidate, 'materializeCandidate').mockImplementation(({ sha }) => ({ ok: true, path: sha }));
+    vi.spyOn(candidate, 'removeCandidate').mockImplementation(() => {});
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    try {
+      const prep = await tick();
+      expect(prep.terminal).toBe(false);
+      expect(state.held).toBeNull(); // Control: parking clears its own conflict hold.
+      expect(parked(prep)).toHaveLength(1);
+      const notices = structuredClone(state.pinnedNotified);
+      const events = readOverlayEventLog(root, env);
+      const runSmoke = vi.fn(async ({ root: tree }) => ({
+        verdict: tree === head ? 'pass' : 'code', attempts: 1,
+        smoke: { results: [{ name: 'boot', ok: tree === head, mayBeTransient: false, detail: 'deterministic candidate failure', ms: 1 }] },
+      }));
+      const rejected = await smokeAndAdopt({ root, env, stEnv: env, log: {},
+        run: () => ({ status: 1, stdout: '', stderr: '' }), runSmoke, now: () => time,
+        plan: prep.plan, prevHead: head, lease: prep.lease, overlaysBefore: [], prepAlerts: prep.alerts,
+        dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: vi.fn(), match: vi.fn() },
+      });
+      expect(rejected.reason).toBe('smoke-rejected');
+      expect(runSmoke.mock.calls.map(([o]) => o.root)).toEqual([main, head]);
+      const smokeHold = structuredClone(state.held);
+      expect(smokeHold).toMatchObject({ reason: 'smoke-rejected', controlPassed: true });
+      expect(state.building).toBeNull();
+      time += 2 * 3_600_000;
+      const again = await tick();
+      expect(again.result.reason).toBe('still-rejected');
+      expect(parked(again)).toEqual([]);
+      expect(state.pinnedNotified).toEqual(notices);
+      expect(readOverlayEventLog(root, env)).toEqual(events);
+      const lastGood = () => decideLastGood({ headSha: head, state, nowMs: time,
+        maxAgeMs: 24 * 3_600_000, freshAdoptMs: 3_600_000 });
+      const fallback = lastGood();
+      let dispatch, refusal;
+      try {
+        dispatch = assertMainNotStale(root, () => ({ action: 'warn', behind: 1, dirty: false }), {
+          listBehindFiles: () => ['scripts/conveyor/review-dispatch.mjs'],
+          lastGood, rebuildGrace: () => ({ grace: false }), write: () => {},
+        });
+      } catch (error) { refusal = error.message; }
+      expect({ held: state.held, onLastGood: fallback.onLastGood, refusal, dispatch },
+        JSON.stringify({ held: state.held, onLastGood: fallback.onLastGood, refusal }))
+        .toMatchObject({ held: smokeHold, onLastGood: true, refusal: undefined,
+          dispatch: { fresh: true, onLastGood: true } });
+    } finally { vi.unstubAllEnvs(); }
   });
   it('a clean reapplication clears the park notice and a recurring conflict gets a fresh hold', async () => {
     expect(parked(await tick())).toHaveLength(1);

@@ -191,6 +191,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/conveyor/health-responder-state.mjs',
   // Landed on main since: the lane dependency installer (a no-clobber link create).
   'scripts/lib/lane-deps-installer.mjs',
+  // The ruled-weakened waiver store: a locked append/prune/rewrite (an exclusive create).
+  'scripts/operations/ruled-weakened-store.mjs',
   // Landed on main since: the fetch-only mirror sync (an exclusive create, a lock directory and a lock file name).
   'scripts/lib/mirror-sync.mjs',
   // Landed on main since: the red-main quarantine rerun marker (an exclusive `wx` create).
@@ -230,6 +232,7 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
@@ -299,7 +302,9 @@ export const LOCK_USERS = Object.freeze([
   // holder (LOCK_HOLDERS) and so a seed of the scan, never a lock user.
   'scripts/conveyor/pr-live-owner-watch-io.mjs',
   // The timeout-evidence pool probes the throttle with acquireGhSlotSync/releaseGhSlotSync.
-  'scripts/conveyor/timeout-evidence-pool.mjs']);
+  'scripts/conveyor/timeout-evidence-pool.mjs',
+  // The shared stuck-trace queue serializes enqueue, claims and completion through withFileLock.
+  'scripts/conveyor/stuck-trace.mjs']);
 // The concurrency words match ANYWHERE in the basename (`forge-slot-markers.mjs`, `lane-worker-without-lease.mjs`), not
 // only at its start (PR #6381 send-back). `**/` needs at least one folder, so each entry has a twin for scripts/ itself.
 // This also protects names holding the word inside another word (`release` holds `lease`): protecting more only ever
