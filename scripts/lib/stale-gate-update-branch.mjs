@@ -5,6 +5,7 @@ import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { resolveCascade, readPlatformPreferences } from './policy-cascade.mjs';
+import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 import { readSettingsChecked } from './settings-files.mjs';
 
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
@@ -14,6 +15,9 @@ const holds = ['review:pending', 'review:changes', 'review:human', 'review:held-
 
 /** Invalid bounds disable repair; operators can inspect and update the branch manually. */
 export function resolveStaleGateUpdateBranchMax({ platform, tool, env = {} } = {}) {
+  const invalid = [platform?.staleGateUpdateBranchMax, tool?.staleGateUpdateBranchMax]
+    .some(value => value !== undefined && (!Number.isSafeInteger(value) || value < 0 || value > 100));
+  if (invalid) return { value: 0, source: 'invalid setting; disabled — inspect and update branch manually' };
   const raw = env.WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX;
   const r = resolveCascade({ standard: 2, platform: platform?.staleGateUpdateBranchMax,
     tool: tool?.staleGateUpdateBranchMax,
@@ -41,11 +45,12 @@ export function planStaleGateUpdateBranch({ pr, head, defaultBranch, checkRuns, 
   isRequiredCheckGreen, fixClaimHeld, attempted = false } = {}) {
   if (!pr || !sha(head) || pr.headRefOid !== head || attempted !== false || fixClaimHeld !== false
     || pr.requiredCheckReadError || pr.isCrossRepository !== false || pr.mergeable !== 'MERGEABLE'
+    || ![null, '', 'APPROVED'].includes(pr.reviewDecision)
     || pr.mergeStateStatus !== 'BLOCKED' || typeof defaultBranch !== 'string' || !defaultBranch.trim() || pr.baseRefName !== defaultBranch
     || !Array.isArray(pr.labels) || pr.labels.some(l => typeof l?.name !== 'string')
     || !Array.isArray(pr.statusCheckRollup) || pr.statusCheckRollup.length >= 100
     || !Array.isArray(requiredChecks) || !requiredChecks.length
-    || requiredChecks.some(n => typeof n !== 'string' || !n.trim())
+    || requiredChecks.some(c => typeof c?.context !== 'string' || !c.context.trim())
     || typeof isRequiredCheckGreen !== 'function' || !Array.isArray(checkRuns)) return null;
   const labels = new Set(pr.labels.map(l => l.name));
   if (!['ready-to-merge', 'review:accepted', 'red-team:clear'].every(l => labels.has(l))
@@ -55,7 +60,14 @@ export function planStaleGateUpdateBranch({ pr, head, defaultBranch, checkRuns, 
   const latest = [...gates].sort((a, b) => b.id - a.id)[0];
   if (latest.status !== 'completed' || latest.conclusion !== 'failure') return null;
   try {
-    if (!requiredChecks.filter(n => n !== 'merge-gate').every(n => isRequiredCheckGreen(pr, n) === true)) return null;
+    if (!requiredChecks.filter(c => c.context !== 'merge-gate').every(({ context, appId }) => {
+      if (!Number.isSafeInteger(appId) || appId <= 0) return false;
+      const rows = checkRuns.filter(c => c?.name === context && c?.app?.id === appId);
+      if (!rows.length || rows.some(c => c.head_sha !== head || !Number.isSafeInteger(c.id) || c.id <= 0)) return false;
+      const statusCheckRollup = rows.map(c => ({ __typename: 'CheckRun', name: c.name, databaseId: c.id,
+        status: c.status?.toUpperCase(), conclusion: c.conclusion?.toUpperCase() }));
+      return isRequiredCheckGreen({ ...pr, statusCheckRollup }, context) === true;
+    })) return null;
   } catch { return null; }
   return { head };
 }
@@ -92,15 +104,15 @@ export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranc
       const requiredChecks = requiredChecksOf(c.repo);
       if (!defaultBranch || !Array.isArray(requiredChecks) || !requiredChecks.length) continue;
       const pr = JSON.parse(gh('gh', ['pr', 'view', String(c.num), '--repo', c.repo, '--json',
-        'number,headRefOid,baseRefName,isCrossRepository,mergeable,mergeStateStatus,labels,statusCheckRollup'], options));
+        'number,headRefOid,baseRefName,isCrossRepository,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup'], options));
       if (pr?.number !== c.num || pr.headRefOid !== c.head) continue;
       if (!Array.isArray(pr.statusCheckRollup) || pr.statusCheckRollup.length >= 100) {
         throw new Error('unreadable or capped check rollup');
       }
-      const checks = JSON.parse(gh('gh', ['api', `repos/${c.repo}/commits/${c.head}/check-runs?per_page=100&filter=all&check_name=merge-gate`], options));
+      const checks = JSON.parse(gh('gh', ['api', `repos/${c.repo}/commits/${c.head}/check-runs?per_page=100&filter=all`], options));
       if (!Array.isArray(checks?.check_runs) || !Number.isSafeInteger(checks.total_count)
         || checks.total_count !== checks.check_runs.length || checks.total_count > 100) {
-        throw new Error('incomplete or oversized gate evidence; inspect and update branch manually');
+        throw new Error('incomplete or oversized check evidence; inspect and update branch manually');
       }
       const plan = planStaleGateUpdateBranch({ pr, head: c.head, defaultBranch, checkRuns: checks.check_runs,
         requiredChecks, isRequiredCheckGreen, fixClaimHeld: fixClaimHeld(c.repo, c.num) });
@@ -125,4 +137,15 @@ export function updateStaleGateBranches({ candidates = [], max = 2, defaultBranc
     }
   }
   return results;
+}
+
+/** Live union only: older names-only caches cannot prove a required app's identity. */
+export function readStaleGateRequiredChecks({ repo, branch, readRequired = readRequiredStatusChecksDetailed } = {}) {
+  if (typeof repo !== 'string' || !repo.trim() || typeof branch !== 'string' || !branch.trim()) return null;
+  try {
+    const { checks, requiredCheckApps } = readRequired({ repo, branch, includeAppIds: true });
+    if (!Array.isArray(checks) || !checks.length || !Array.isArray(requiredCheckApps)
+      || checks.some(context => !requiredCheckApps.some(c => c.context === context))) return null;
+    return requiredCheckApps;
+  } catch { return null; }
 }

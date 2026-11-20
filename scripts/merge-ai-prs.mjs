@@ -229,7 +229,7 @@ import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, h
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
-import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf, readQueueRequiredChecks } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -253,7 +253,7 @@ import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIO
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
-import { readStaleGateUpdateBranchMax, updateStaleGateBranches } from './lib/stale-gate-update-branch.mjs';
+import { readStaleGateUpdateBranchMax, readStaleGateRequiredChecks, updateStaleGateBranches } from './lib/stale-gate-update-branch.mjs';
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
@@ -7354,8 +7354,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       requiredChecksOf: repo => {
         if (!staleGateRosters.has(repo)) {
           const repoKey = staleGateRepoKey(repo);
-          const names = queueRequiredChecksOf(repoKey) ?? readQueueRequiredChecks({ repo, branch: defaultBranchOf(repoKey) });
-          staleGateRosters.set(repo, names ? [...new Set(['test', REQUIRED, ...names])] : null);
+          const roster = readStaleGateRequiredChecks({ repo, branch: defaultBranchOf(repoKey) });
+          staleGateRosters.set(repo, roster);
         }
         return staleGateRosters.get(repo);
       },

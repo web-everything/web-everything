@@ -1,25 +1,29 @@
+import { readRequiredStatusChecksDetailed } from '../required-status-checks.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isRequiredCheckGreen, refreshStaleBlockedGates, unlandableStateReason } from '../../merge-ai-prs.mjs';
-import { planStaleGateUpdateBranch as plan, updateStaleGateBranches as run, resolveStaleGateUpdateBranchMax as setting, readStaleGateUpdateBranchMax } from '../stale-gate-update-branch.mjs';
+import { planStaleGateUpdateBranch as plan, updateStaleGateBranches as run, resolveStaleGateUpdateBranchMax as setting, readStaleGateUpdateBranchMax, readStaleGateRequiredChecks } from '../stale-gate-update-branch.mjs';
 
+const CHECK_APP = 1, CLASSIC_APP = 42;
 const head = 'a'.repeat(40), repo = 'example/widgets';
 const gate = { id: 10, name: 'merge-gate', head_sha: head, status: 'completed', conclusion: 'failure' };
 const pr = () => ({ number: 1, headRefOid: head, baseRefName: 'main', isCrossRepository: false,
-  mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
+  mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', reviewDecision: 'APPROVED',
   labels: ['ready-to-merge', 'review:accepted', 'red-team:clear'].map(name => ({ name })),
   statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] });
-const input = () => ({ pr: pr(), head, defaultBranch: 'main', checkRuns: [gate],
-  requiredChecks: ['merge-gate', 'test'], isRequiredCheckGreen, fixClaimHeld: false });
+const input = () => ({ pr: pr(), head, defaultBranch: 'main', checkRuns: [gate, { ...testRun }],
+  requiredChecks: structuredClone(required), isRequiredCheckGreen, fixClaimHeld: false });
+const required = [{ context: 'merge-gate', appId: CHECK_APP }, { context: 'test', appId: CHECK_APP }];
+const testRun = { id: 20, name: 'test', head_sha: head, app: { id: 1 }, status: 'completed', conclusion: 'success' };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture(extra = {}) {
   const stateRoot = mkdtempSync(join(tmpdir(), 'stale-gate-')); roots.push(stateRoot);
   const gh = vi.fn((_bin, args) => args[0] === 'pr' ? JSON.stringify({ ...pr(), number: Number(args[2]) })
-    : args[1] === '-X' ? '{}' : JSON.stringify({ total_count: 1, check_runs: [gate] }));
-  return { candidates: [{ repo, num: 1, head }], defaultBranchOf: () => 'main', requiredChecksOf: () => ['test', 'merge-gate'],
+    : args[1] === '-X' ? '{}' : JSON.stringify({ total_count: 2, check_runs: [gate, testRun] }));
+  return { candidates: [{ repo, num: 1, head }], defaultBranchOf: () => 'main', requiredChecksOf: () => structuredClone(required),
     isRequiredCheckGreen, fixClaimHeld: () => false, humanSurfaceGuardAllows: () => true, stateRoot, gh, log: vi.fn(), ...extra };
 }
 
@@ -32,7 +36,7 @@ describe('stale gate planner — fail closed', () => {
     const x = input(); x.pr.labels.push({ name }); expect(plan(x)).toBeNull();
   });
   it.each(['FAILURE', 'PENDING', undefined])('refuses another required check %s', conclusion => {
-    const x = input(); x.pr.statusCheckRollup[0].conclusion = conclusion; expect(plan(x)).toBeNull();
+    const x = input(); x.checkRuns[1].conclusion = conclusion?.toLowerCase(); expect(plan(x)).toBeNull();
   });
   it.each([{ conclusion: 'success' }, { status: 'in_progress' }, { head_sha: 'b'.repeat(40) }, { id: undefined }])('refuses newest gate %j', change => {
     const x = input(); x.checkRuns.push({ ...gate, id: 11, ...change }); expect(plan(x)).toBeNull();
@@ -55,16 +59,38 @@ describe('stale gate planner — fail closed', () => {
     ['unreadable checks', x => { x.pr.requiredCheckReadError = 'offline'; }],
     ['unknown roster', x => { x.requiredChecks = null; }],
     ['empty roster', x => { x.requiredChecks = []; }],
-    ['missing required check', x => { x.requiredChecks.push('smoke'); }],
+    ['missing required check', x => { x.requiredChecks.push({ context: 'smoke', appId: CHECK_APP }); }],
     ['unreadable gate', x => { x.checkRuns = null; }],
     ['missing gate', x => { x.checkRuns = []; }],
     ['capped rollup', x => { x.pr.statusCheckRollup = Array(100).fill(x.pr.statusCheckRollup[0]); }],
   ])('refuses %s', (_name, change) => { const x = input(); change(x); expect(plan(x)).toBeNull(); });
   it('does not trust a superseded green required check', () => {
-    const x = input(); x.pr.statusCheckRollup = [
-      { ...x.pr.statusCheckRollup[0], databaseId: 1 },
-      { ...x.pr.statusCheckRollup[0], databaseId: 2, conclusion: 'FAILURE' },
-    ]; expect(plan(x)).toBeNull();
+    const x = input(); x.checkRuns.push({ ...testRun, id: 21, conclusion: 'failure' }); expect(plan(x)).toBeNull();
+  });
+});
+
+describe('stale gate app and review evidence', () => {
+  it.each(['failure', 'missing'])('another app SUCCESS cannot hide required app %s', evidence => {
+    const x = input(); expect(plan(x)).toEqual({ head });
+    x.checkRuns = [gate, ...(evidence === 'failure' ? [{ ...testRun, conclusion: 'failure' }] : []),
+      { ...testRun, id: 21, app: { id: 2 } }];
+    expect(plan(x)).toBeNull();
+  });
+  it.each([null, undefined, {}, { id: 2 }])('unknown or wrong check app %j refuses repair', app => {
+    const x = input(); x.checkRuns[1] = { ...testRun, app }; expect(plan(x)).toBeNull();
+  });
+  it.each(['CHANGES_REQUESTED', 'REVIEW_REQUIRED', undefined, {}])('fresh review %j refuses writes', reviewDecision => {
+    const x = fixture(); const read = x.gh.getMockImplementation();
+    x.gh.mockImplementation((bin, args) => args[0] === 'pr'
+      ? JSON.stringify({ ...pr(), reviewDecision }) : read(bin, args));
+    run(x); expect(x.gh.mock.calls.some(c => c[1][1] === '-X')).toBe(false);
+  });
+  it('fresh read explicitly requests reviewDecision', () => {
+    const x = fixture(); run(x);
+    expect(x.gh.mock.calls[0][1].at(-1).split(',')).toContain('reviewDecision');
+  });
+  it.each([null, '', 'APPROVED'])('allows known review decision %j', reviewDecision => {
+    const x = input(); x.pr.reviewDecision = reviewDecision; expect(plan(x)).toEqual({ head });
   });
 });
 
@@ -152,7 +178,7 @@ describe('stale gate IO', () => {
     const x = fixture(); run(x); const next = 'b'.repeat(40);
     x.candidates[0].head = next;
     x.gh.mockImplementation((_bin, args) => JSON.stringify(args[0] === 'pr' ? { ...pr(), headRefOid: next }
-      : { total_count: 1, check_runs: [{ ...gate, head_sha: next }] }));
+      : { total_count: 2, check_runs: [{ ...gate, head_sha: next }, { ...testRun, head_sha: next }] }));
     expect(run(x)[0].ok).toBe(true); expect(readdirSync(x.stateRoot)).toHaveLength(2);
   });
 });
@@ -172,5 +198,26 @@ describe('setting cascade', () => {
   });
   it.each([-1, 101, 'unknown', 1.5])('invalid/oversized setting %s disables with operator fallback', value => {
     expect(setting({ tool: { staleGateUpdateBranchMax: value } })).toMatchObject({ value: 0, source: expect.stringContaining('manually') });
+  });
+});
+
+describe('live app roster for stale-gate repair', () => {
+  it('retains ruleset integration ids and classic protection app ids', () => {
+    const gh = (_bin) => _bin.at(-1).includes('/rules/') ? JSON.stringify([[{ type: 'required_status_checks',
+      parameters: { required_status_checks: [{ context: 'merge-gate', integration_id: 1 }] } }]])
+      : JSON.stringify({ protected: true, protection: { required_status_checks: {
+        contexts: ['test'], checks: [{ context: 'test', app_id: CLASSIC_APP }] } } });
+    expect(readStaleGateRequiredChecks({ repo, branch: 'main',
+      readRequired: args => readRequiredStatusChecksDetailed({ ...args, gh }) }))
+      .toEqual([{ context: 'merge-gate', appId: CHECK_APP }, { context: 'test', appId: CLASSIC_APP }]);
+  });
+  it.each([null, { checks: ['test'] }, { checks: ['test'], requiredCheckApps: [] }])('refuses incomplete roster %j', result => {
+    expect(readStaleGateRequiredChecks({ repo, branch: 'main', readRequired: () => result })).toBeNull();
+  });
+  it('refuses unreadable roster', () => {
+    expect(readStaleGateRequiredChecks({ repo, branch: 'main', readRequired: () => { throw new Error('offline'); } })).toBeNull();
+  });
+  it.each([undefined, null, -1])('unknown required app id %j fails closed', appId => {
+    const x = input(); x.requiredChecks[1].appId = appId; expect(plan(x)).toBeNull();
   });
 });

@@ -13,6 +13,7 @@ import {
   SETTING_KEY_CLASSES, SETTING_CLASSES, settingKeyClass,
   LEGACY_SETTINGS_LEAVES, LEGACY_SETTINGS_PATH, SETTINGS_DIR, FEATURE_FILE_RE, LEGACY_ONLY_READERS, LEGACY_FILE_GUARD_HINT,
 } from '../settings-files.mjs';
+import { readStaleGateUpdateBranchMax } from '../stale-gate-update-branch.mjs';
 import { resolveFixerSlotSettings } from '../../conveyor/fixer-slot-rules.mjs';
 import { readCostAdmissionSettings } from '../cost-admission-facts.mjs';
 import { resolveHeavyAdmissionCap, resolveCpuIdleMinPct } from '../dispatch-throttle.mjs';
@@ -498,4 +499,27 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(resolveCpuIdleMinPct('build', { env: {} })).toBe(15);
     expect(readCostAdmissionSettings({ env: {} })).toBeTruthy();
   });
+});
+
+// Exercise the production checked-file reader, including object-valued leaves.
+describe('stale-gate repair invalid persisted settings', () => {
+  it.each([null, {}, 'abc', -1, 1.5])('disables persisted %j', value => {
+    const root = mkdtempSync(join(tmpdir(), 'stale-settings-'));
+    try {
+      writeFileSync(join(root, 'repair.json'), JSON.stringify({ drain: { staleGateUpdateBranchMax: value } }));
+      expect(readStaleGateUpdateBranchMax({ env: {},
+        readTool: options => readSettingsChecked({ ...options, dir: root, legacyPath: join(root, 'absent.json') }),
+        readPlatform: () => ({ prefs: {}, errors: [] }) })).toMatchObject({ value: 0, source: expect.stringContaining('manually') });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+it('only an absent persisted stale-gate bound uses the standard default', () => {
+  const root = mkdtempSync(join(tmpdir(), 'stale-absent-'));
+  try {
+    writeFileSync(join(root, 'repair.json'), JSON.stringify({ drain: {} }));
+    expect(readStaleGateUpdateBranchMax({ env: {},
+      readTool: options => readSettingsChecked({ ...options, dir: root, legacyPath: join(root, 'absent.json') }),
+      readPlatform: () => ({ prefs: {}, errors: [] }) })).toEqual({ value: 2, source: 'standard' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
