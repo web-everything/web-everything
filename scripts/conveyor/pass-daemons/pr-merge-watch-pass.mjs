@@ -7,6 +7,7 @@
  */
 import { runReadyStuck } from './pr-ready-stuck.mjs';
 import { runMergeWatchSignals } from './pr-merge-watch-signals.mjs';
+import { enqueueStuckTrace, TRACE_TRIGGERS } from '../stuck-trace.mjs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -40,7 +41,7 @@ export function resolveMergeWatchSettings({ env = process.env, log = console.err
 
 export async function runMergeWatch({ repos = [], gh, now = new Date().toISOString(),
   stateDir = join(handoffHome(), 'pr-merge-watch'), settings, emitEvent = appendDaemonEvent,
-  log = console.error, signalLogs, readyStuck = {} } = {}) {
+  log = console.error, signalLogs, readyStuck = {}, enqueue = enqueueStuckTrace } = {}) {
   // Load the analysis graph after the shared gate graph has finished evaluating.
   const { atomicJson, readOptionalJson, ghJson, repoFilenameKey } = await import('../../operations/coroner-pr-postmortem.mjs');
   const { defaultListPrComments } = await import('../pr-comments-list.mjs');
@@ -101,6 +102,11 @@ export async function runMergeWatch({ repos = [], gh, now = new Date().toISOStri
       const send = async event => {
         if (await emitEvent(event) === false) throw Error('event delivery unavailable');
         delivered++;
+        if (TRACE_TRIGGERS.includes(event.kind)) {
+          try { enqueue({ repo, pr: event.pr, head: event.detail?.head
+            ?? open.find(p => p.number === event.pr)?.head?.sha,
+          kind: event.kind, stateDir, now }); } catch { /* enqueue must never affect alerts/self-heal */ }
+        }
       };
       const open = listOpenPrs(repo, { gh: read });
       // Persist discovery before readiness reads or budget deferral.
