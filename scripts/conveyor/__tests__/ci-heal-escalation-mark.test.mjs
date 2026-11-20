@@ -934,7 +934,7 @@ const ghCheckFacts = facts => argv => {
 };
 
 describe('default production reader gate-only provenance', () => {
-  const options = (failure = null) => {
+  const options = (failure = null, claimed = 2) => {
     const runGh = vi.fn(argv => {
       if (argv[0] === 'pr') return JSON.stringify({ headRefOid: HEAD,
         // Even purported provenance on the flattened view cannot replace REST reads.
@@ -945,14 +945,19 @@ describe('default production reader gate-only provenance', () => {
       if (failure === `${endpoint}-unreadable`) throw new Error(`${endpoint} unreadable`);
       if (failure === `${endpoint}-incomplete`) return JSON.stringify([{}]);
       return JSON.stringify(endpoint === 'checks' ? [
-        { check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] },
-        { check_runs: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] },
-      ] : [{ statuses: [{ context: 'legacy-test', state: 'success' }] }]);
+        { total_count: claimed, check_runs: [{ name: 'test', status: 'completed', conclusion: 'success' }] },
+        { total_count: claimed, check_runs: [{ name: 'review-gate', status: 'completed', conclusion: 'failure' }] },
+      ] : [{ total_count: 1, statuses: [{ context: 'legacy-test', state: 'success' }] }]);
     });
     return { pr: 6042, repo: 'example/repo', headSha: HEAD, outcome: 'needs-human',
       settings: { recheckNotCiBreak: true }, readRequired: vi.fn(() => ({ checks: ['test', 'legacy-test'] })),
       prChecksOptions: { runGh } };
   };
+
+  it('warns (no refusal) when the production read claims more rows than it delivered; complete read still refuses', async () => {
+    expect(await checkNeedsHumanEscalable(options(null, 150))).toEqual({ refusal: null, warning: expect.stringMatching(/incomplete/) });
+    expect(await checkNeedsHumanEscalable(options())).toEqual({ refusal: expect.stringContaining('review-gate') });
+  });
 
   it('refuses green tests plus failing review-gate using complete paginated production reads', async () => {
     const opts = options();

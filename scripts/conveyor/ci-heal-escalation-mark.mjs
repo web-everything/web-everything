@@ -458,7 +458,9 @@ async function checkEscalationRecordable({ pr, repo, headSha, outcome, settings 
   if (!readPr) facts = classifyPrChecks(facts, { pr, repo }, prChecksOptions);
   const refusal = facts?.readError && expectedOutcome === 'needs-human'
     ? null : refusalFor({ headSha, pr: facts, requiredChecks: checks });
-  return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) } : {}) };
+  const incomplete = !readPr && facts?.rowsComplete !== true;
+  return { refusal, ...(facts?.readError ? { warning: warningFor(facts.readError) }
+    : incomplete ? { warning: warningFor(new Error('check rows incomplete for this head')) } : {}) };
 }
 
 /** Share the not-a-ci-break setting and readers; failed reads permit needs-human with a warning. */
