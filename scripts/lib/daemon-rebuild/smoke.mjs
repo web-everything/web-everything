@@ -11,7 +11,7 @@ import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
-import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
+import { forceRequestFor, readForceAdopt, readForceWatch, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
 import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -28,7 +28,8 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
-import { openHotPatchWatch } from '../hot-patch.mjs';
+import { openHotPatchWatch, readHotPatch } from '../hot-patch.mjs';
+import { readHotPatchVerifyMarker } from '../hot-patch-verify-marker.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -619,6 +620,7 @@ export async function smokeAndAdopt({
       alert('hot-patch-adoption-refused', { reason: hot.reason, target: p.finalSha });
       return { moved: false, reason: 'hot-patch-adoption-refused', detail: hot.reason, plan: p };
     }
+    const approvedHotPatch = readHotPatch(root, stEnv);
     // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
     const busySkipped = busyPoolSkippedChecks(smokeResult);
     if (busySkipped.length) {
@@ -669,10 +671,32 @@ export async function smokeAndAdopt({
         moved: false, reason: 'ready-recorded', readyRecorded: true, target: p.finalSha, plan: p, alerts: [...prepAlerts, ...alertsList],
       };
     }
-    const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
-      auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
-    }), finalizeLockOpts);
+    const fin = await withWriteLock(root, () => {
+      // Approval predates the lock wait. Read current evidence in the same critical
+      // section as the reset; a refusal leaves the ready candidate for the next tick.
+      try {
+        const current = readHotPatch(root, stEnv);
+        if (approvedHotPatch || current) {
+          const watch = readForceWatch(root, stEnv);
+          const verified = readHotPatchVerifyMarker({ sha: current?.sha, env: stEnv });
+          if (!current || current.sha !== approvedHotPatch?.sha
+            || !(current.sha === p.finalSha || p.applied?.some(a => a.ref === current.branch && a.sha === current.sha))
+            || current.owed.verify === 'red' || current.rollbackPending
+            || !verified.ok || verified.marker.result !== 'green'
+            || !watch || watch.sha !== p.finalSha || watch.hotPatchSha !== current.sha || watch.rollbackPending) {
+            throw new Error('hot-patch evidence changed or unavailable');
+          }
+        }
+      } catch {
+        const detail = 'repair hot-patch ledger, verify marker and watch evidence; ready candidate retained for the next tick';
+        alert('hot-patch-adoption-refused', { reason: detail, target: p.finalSha });
+        return { moved: false, adopted: false, reason: 'hot-patch-adoption-refused', detail, plan: p, alerts: [] };
+      }
+      return finalizeRebuild({
+        root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+        auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
+      });
+    }, finalizeLockOpts);
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
         log.error?.(`daemon-rebuild: could not take the write lock to finalize ${p.finalSha} after a passing smoke (reader ${fin.heldBy ?? '?'} still ticking) — kept as the ready candidate; the next write-lock holder adopts it without re-smoking`);

@@ -6,6 +6,10 @@ import { spawnSync } from 'node:child_process';
 import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
 import { requestHotPatch, readHotPatch, recordVerifyResult, recordHotPatchPr, hotPatchPath } from '../hot-patch.mjs';
 import { main } from '../../hot-patch.mjs';
+import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
+import { writeRebuildState, readReadyCandidate } from '../daemon-rebuild/state.mjs';
+import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
+import { readForceWatch, watchPath } from '../daemon-force-adopt.mjs';
 
 const fixture = fn => async () => {
   const home = mkdtempSync(join(tmpdir(), 'hot-patch-round3-'));
@@ -37,6 +41,63 @@ const fixture = fn => async () => {
     await fn({ root, env, sha, good, home, marker, git });
   } finally { rmSync(home, { recursive: true, force: true }); }
 };
+
+for (const evidence of ['green', 'red-marker', 'missing-marker', 'unreadable-marker',
+  'red-ledger', 'missing-ledger', 'unreadable-ledger', 'rollbackPending', 'unreadable-watch']) {
+  test(`final adoption lock rechecks ${evidence} after approval and retains refused candidate`, fixture(async ({ root, env, sha, good, home, marker, git }) => {
+    marker();
+    writeRebuildState(root, { adopted: { head: good, mainSha: good, inputsKey: 'base', applied: [] } }, env);
+    const reader = { owner: 'race-reader', lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT };
+    let entered = false, changed = false;
+    const finalLockOpts = { owner: 'race-writer', lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, waitMs: 1000 };
+    try {
+      const result = await smokeAndAdopt({
+        root, env, stEnv: env, log: { error() {} },
+        run: (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024, ...opts }), stateOpts: { env }, now: Date.now,
+        plan: { finalSha: sha, mainSha: good, inputsKey: 'patch', applied: [{ ref: 'lane/hot', sha }] },
+        prevHead: good, lease: { token: 'race', path: join(home, 'candidate') }, overlaysBefore: [], prepAlerts: [],
+        dispatchSmoke: { settings: { dispatchSmoke: 'off' } }, finalLockOpts,
+        finalizeLockOpts: { ...finalLockOpts,
+          now: () => {
+            if (!entered) {
+              // Approval has armed a real watch; occupy the final clone lock before it can be taken.
+              expect(readForceWatch(root, env)?.hotPatchSha).toBe(sha);
+              expect(acquireRead(root, reader).ok).toBe(true);
+              entered = true;
+            }
+            return Date.now();
+          },
+          sleep: async () => {
+            expect(changed).toBe(false);
+            changed = true;
+            if (evidence === 'red-marker') marker({ result: 'red' });
+            if (evidence === 'missing-marker') rmSync(urgentLedger(home));
+            if (evidence === 'unreadable-marker') writeFileSync(urgentLedger(home), '{bad');
+            if (evidence === 'red-ledger') {
+              const hot = readHotPatch(root, env); hot.owed.verify = 'red';
+              writeFileSync(hotPatchPath(root, env), JSON.stringify(hot));
+            }
+            if (evidence === 'missing-ledger') rmSync(hotPatchPath(root, env));
+            if (evidence === 'unreadable-ledger') writeFileSync(hotPatchPath(root, env), '{bad');
+            if (evidence === 'rollbackPending') writeFileSync(watchPath(root, env),
+              JSON.stringify({ ...readForceWatch(root, env), rollbackPending: 'verify-red' }));
+            if (evidence === 'unreadable-watch') writeFileSync(watchPath(root, env), '{bad');
+            releaseRead(root, reader);
+          },
+        },
+        runSmoke: async () => ({ verdict: 'pass', smoke: { results: [] } }),
+      });
+      expect(entered && changed, JSON.stringify(result)).toBe(true);
+      if (evidence === 'green') {
+        expect(result.adopted).toBe(true); expect(git(['rev-parse', 'HEAD'])).toBe(sha);
+      } else {
+        expect(result.reason).toBe('hot-patch-adoption-refused');
+        expect(result.moved).toBe(false); expect(git(['rev-parse', 'HEAD'])).toBe(good);
+        expect(readReadyCandidate(root, env)?.adopt.finalSha).toBe(sha);
+      }
+    } finally { releaseRead(root, reader); }
+  }));
+}
 
 for (const evidence of ['missing', 'unreadable', 'wrong-sha', 'unknown-result', 'bad-host', 'bad-finish', 'forged']) {
   test(`caller green cannot bypass ${evidence} verify marker`, fixture(async ({ root, env, sha, home, marker }) => {

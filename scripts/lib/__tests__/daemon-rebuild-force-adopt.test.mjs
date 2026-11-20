@@ -26,6 +26,7 @@ import { gitRun } from '../main-staleness.mjs';
 import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
 import * as rebuildPrepare from '../daemon-rebuild/prepare.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -139,6 +140,17 @@ const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: 
 const headOf = (dir) => gitOk(dir, ['rev-parse', 'HEAD']).trim();
 const forceEnv = (env, base) => ({ ...env, WE_FORCE_ADOPT_HANDOFF: join(base, 'handoff.md'), WE_FORCE_ADOPT_CORONER: join(base, 'coroner.jsonl'), WE_DAEMON_EVENTS: join(base, 'events.jsonl') });
 
+function writeHotPatchVerifyMarker(env, base, sha, result = 'green') {
+  env.HOME = join(base, 'hot-patch-home');
+  const record = { sha, suite: 'full', shards: 1, result, startedAt: '2026-11-19T10:00:00Z',
+    finishedAt: '2026-11-19T10:01:00Z', host: 'test-host' };
+  const key = Buffer.alloc(32, 7);
+  mkdirSync(dirname(urgentKeyPath(env.HOME)), { recursive: true });
+  writeFileSync(urgentKeyPath(env.HOME), key);
+  mkdirSync(dirname(urgentLedger(env.HOME)), { recursive: true });
+  writeFileSync(urgentLedger(env.HOME), JSON.stringify({ ...record, sig: urgentSignature(record, key) }) + '\n');
+}
+
 describe('R1100 hot-patch smoke adoption', () => {
   it.each(['verify-red', 'health-failed'])('rollback withdraws and clears hot-patch through the normal rebuild tick: %s', async (reason) => {
     const { cloneDir, originDir, env: initialEnv, base } = makeFixture();
@@ -147,10 +159,16 @@ describe('R1100 hot-patch smoke adoption', () => {
     const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
     await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
       kind: 'incident', files: ['scripts/lib/daemon-tool.mjs'] });
+    writeHotPatchVerifyMarker(env, base, target);
     const tick = { root: cloneDir, env, prState: async () => null, lockOpts: LOCK_OPTS,
       runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) };
-    await rebuildClone({ ...tick, forceWatchProbe: async () => ({ healthy: true }) });
-    if (reason === 'verify-red') await recordVerifyResult({ root: cloneDir, env, sha: target, result: 'red' });
+    const adopted = await rebuildClone({ ...tick, forceWatchProbe: async () => ({ healthy: true }) });
+    expect(adopted.adopted).toBe(true);
+    expect(readHotPatch(cloneDir, env).adoptedSha).toBe(headOf(cloneDir));
+    if (reason === 'verify-red') {
+      writeHotPatchVerifyMarker(env, base, target, 'red');
+      expect((await recordVerifyResult({ root: cloneDir, env, sha: target })).ok).toBe(true);
+    }
     await rebuildClone({ ...tick, forceWatchProbe: async () => ({ healthy: reason === 'verify-red' }) });
     expect(headOf(cloneDir)).toBe(lastGood); expect(readHotPatch(cloneDir, env)).toBeNull();
   });
@@ -162,10 +180,17 @@ describe('R1100 hot-patch smoke adoption', () => {
     addOverlay(cloneDir, { ref: 'lane/hot', pinned: true }, { env });
     await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
       kind: 'incident', files: ['scripts/lib/daemon-tool.mjs'] });
-    expect(recordHotPatchPr({ root: cloneDir, env, sha: target, pr: 42 }).ok).toBe(true);
+    const run = vi.fn((cmd, args) => {
+      expect(cmd).toBe('gh');
+      expect(args).toEqual(['pr', 'view', '42', '--json', 'headRefName,headRefOid,state']);
+      return { status: 0, stdout: JSON.stringify({ headRefName: 'lane/hot', headRefOid: target, state: 'MERGED' }) };
+    });
+    expect(recordHotPatchPr({ root: cloneDir, env, sha: target, pr: 42, run }).ok).toBe(true);
+    expect(readHotPatch(cloneDir, env).prVerifiedSha).toBe(target);
     await rebuildClone({ root: cloneDir, env, prState: async () => 'MERGED', lockOpts: LOCK_OPTS,
       runSmoke: async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }) });
     expect(readHotPatch(cloneDir, env)).toBeNull();
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   it.each([false, true])('passing smoke opens 10 ticks plus 15 minutes, including ready adoption=%s', async (deferred) => {
@@ -175,6 +200,7 @@ describe('R1100 hot-patch smoke adoption', () => {
     const target = pushBranch(originDir, 'lane/hot', dir => writeFile(dir, 'fix.mjs', 'export const fixed = true;\n'));
     await requestHotPatch({ root: cloneDir, env, daemon: 'review', branch: 'lane/hot', sha: target,
       kind: 'daemon-tooling', files: ['scripts/lib/daemon-tool.mjs'] });
+    writeHotPatchVerifyMarker(env, base, target);
     const runSmoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
     const tick = { root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
       skipCheck: () => ({ skip: true }), forceWatchProbe: async () => ({ healthy: true }) };
