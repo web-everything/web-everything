@@ -138,7 +138,8 @@ export function chooseBuilder({ kind = 'build', capacities, settings = {}, fallb
   const ranked = inputs.filter(i => i.allowed && !i.emergencyOnly && i.score !== null).sort((a, b) => b.score - a.score);
   if (ranked.length) return { provider: ranked[0].provider, account: ranked[0].account, model: ranked[0].model, launcher: ranked[0].launcher, reason: 'capacity-score', inputs };
   const emergency = inputs.find(i => i.emergencyOnly && i.allowed && i.label === 'unknown' && i.fit);
-  if (emergency && s.allowUnknownEmergency) return { provider: emergency.provider, account: emergency.account, reason: 'unknown-emergency', inputs };
+  if (emergency && s.allowUnknownEmergency) return { provider: emergency.provider, account: emergency.account,
+    model: emergency.model, launcher: emergency.launcher, reason: 'unknown-emergency', inputs };
   if (!capacities.some(c => c.known) && !capacities.some(c => c.held) && inputs.some(i => i.provider === fallback && i.allowed && i.fit && i.label === 'unknown')) return { provider: fallback, reason: 'all-readers-unknown', inputs };
   // Unknown usage never competes on score. If every measured option is excluded,
   // retain the legacy launcher fallback without assigning an unattributed account.

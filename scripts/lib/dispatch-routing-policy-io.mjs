@@ -139,7 +139,9 @@ export function resolveDispatchRoute(dispatch, options = {}) {
     : null;
   const ciHealNativeFallback = claudeBuilds && dispatch?.kind === 'ci-heal' && !ciHealNativeHold;
   if (BUILD_KINDS.includes(dispatch.kind) && (builder?.decision?.reason === 'capacity-score' || builder?.decision?.reason === 'unknown-emergency')) {
-    const provider = builder.decision.launcher === 'codex' ? 'codex' : builder.builder;
+    // Native model aliases execute through their configured launcher. Antigravity
+    // keeps its distinct policy providers (agy-claude / agy-gemini).
+    const provider = ['claude', 'codex'].includes(builder.decision.launcher) ? builder.decision.launcher : builder.builder;
     let inheritedRoute;
     const sameRoute = (a, b) => a.provider === b.provider
       && resolvePureModel(a.provider, a.model, routingPolicy) === resolvePureModel(b.provider, b.model, routingPolicy);

@@ -92,6 +92,34 @@ it('pinned routes still refuse an unavailable Claude launcher', () => {
     availability: { claude: 'operator hold' } })).toThrow(/no available route/);
 });
 
+it.each([
+  ['claude-alt', 'claude', 'claude-sonnet-5-5', false],
+  ['claude', 'claude', 'claude-sonnet-5-5', false],
+  ['codex-alt', 'codex', 'gpt-6.1-sol', false],
+  ['claude-alt', 'claude', 'claude-sonnet-5-5', true],
+  ['codex-alt', 'codex', 'gpt-6.1-sol', true],
+])('projects capacity provider %s through its configured %s launcher with %s (emergency=%s)', (id, launcher, model, emergency) => {
+  const now = Date.parse('2026-11-20T15:00:00Z');
+  const provider = { id, launcher, model, tier: 3, allowedKinds: ['build'], windowModel: 'fixed',
+    windows: [{ name: 'five_hour', lengthHours: 5 }], readers: [], emergencyOnly: emergency };
+  const record = vi.fn();
+  const dispatch = { kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] };
+  const options = {
+    env: {}, repo: { routing: { builder: 'auto', capacity: { allowUnknownEmergency: emergency } },
+      providerCapacity: { providers: [provider] } },
+    routingPolicy: DEFAULT_ROUTING_POLICY, now, quota: () => null, record, scorecards: [],
+    capacity: [{ provider: id, health: 1, known: !emergency,
+      windows: emergency ? [] : [{ name: 'five_hour', usedPercent: 10, resetsAt: now + 2 * 3600000 }] }],
+  };
+  const route = resolveDispatchRoute(dispatch, options);
+  expect(record).toHaveBeenCalledWith(expect.objectContaining({ provider: id, launcher, model,
+    reason: emergency ? 'unknown-emergency' : 'capacity-score' }), expect.any(Object));
+  expect(route).toMatchObject({ outcome: 'routed', executed: launcher, model,
+    policyRoute: { provider: launcher, model } });
+  expect(resolveDispatchRoute(dispatch, { ...options, availability: { [launcher]: 'operator hold' } }))
+    .toMatchObject({ outcome: 'refused' });
+});
+
 it.each([false, true])('retains the eligible Claude route when capacity projects an ordinary critical fix onto Codex (explicit=%s)', explicit => {
   const now = Date.parse('2026-11-20T15:00:00Z');
   const capacity = readProviderCapacity({ env: { WE_CAPACITY_READERS: 'off' }, now,
