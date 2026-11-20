@@ -254,6 +254,7 @@ import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIO
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
+import { codeDirty } from './lib/main-staleness.mjs';
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
@@ -1592,7 +1593,8 @@ export function spawnReviewSetLabel({ pr, repo, to, cwd, actor, channel, reason,
 }
 
 export function restampAcceptance({ pr, repo, newHead, cwd, freshRoot = process.cwd(),
-  gitRun = (args, opts) => spawnSync('git', args, opts), spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }), env = process.env }) {
+  gitRun = (args, opts) => spawnSync('git', args, opts), spawn = spawnSync, localRepo = () => localRepoSlug({ cwd }), env = process.env,
+  readSettings = readDeclaredDrainSettings }) {
   try {
     const target = repo || localRepo();
     if (!target) return { ok: false, reason: 'no repo to re-stamp (PR repo unset and the local repo slug unreadable)' };
@@ -1603,16 +1605,18 @@ export function restampAcceptance({ pr, repo, newHead, cwd, freshRoot = process.
     try {
       const candidate = join(freshRoot, 'scripts/review-set-label.mjs');
       const opts = { cwd: freshRoot, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 };
-      if (env.WE_OPERATOR_CLI_FRESH_FALLBACK !== 'off' && statSync(candidate).isFile()) {
+      // Same knob precedence as main-staleness: env wins, then settings; any value but 'off' leaves it on.
+      const knob = env.WE_OPERATOR_CLI_FRESH_FALLBACK ?? readSettings()?.operatorCli?.freshFallback;
+      if (knob !== 'off' && statSync(candidate).isFile()) {
         const tree = gitRun(['rev-parse', '--is-inside-work-tree'], opts);
         if (tree.status === 0 && String(tree.stdout).trim() === 'true') {
-          const status = gitRun(['status', '--porcelain', '--untracked-files=no'], opts);
-          if (status.status === 0 && typeof status.stdout === 'string' && status.stdout.trim() === '') {
+          // Same predicate as the CLI fallback: tracked changes or untracked code files both disqualify.
+          if (!codeDirty(freshRoot, (args, o) => gitRun(args, { ...opts, ...o }))) {
             const dataOrigin = gitRun(['remote', 'get-url', 'origin'], opts);
             const codeOrigin = gitRun(['remote', 'get-url', 'origin'], { ...opts, cwd: dirname(dirname(script)) });
             if (dataOrigin.status === 0 && codeOrigin.status === 0 && dataOrigin.stdout?.trim()
               && dataOrigin.stdout.trim() === codeOrigin.stdout?.trim()) {
-              const fetched = gitRun(['fetch', 'origin', 'main'], opts);
+              const fetched = gitRun(['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main'], opts);
               if (fetched.status === 0) {
                 const head = gitRun(['rev-parse', 'HEAD'], opts);
                 const main = gitRun(['rev-parse', 'origin/main'], opts);

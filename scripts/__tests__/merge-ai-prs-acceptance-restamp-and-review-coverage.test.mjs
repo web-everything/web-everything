@@ -185,6 +185,22 @@ describe('restampAcceptance fresh data clone selection', () => {
     expect(gitRun).not.toHaveBeenCalled();
   }));
 
+  it('settings off switch retains the old script without probing the data checkout', () => withDataClone((root) => {
+    const gitRun = vi.fn(freshGit);
+    const spawn = vi.fn(() => ({ status: 0 }));
+    restampAcceptance({ pr: 1, repo: 'owner/we', newHead: 'abc', freshRoot: root, env: {},
+      readSettings: () => ({ operatorCli: { freshFallback: 'off' } }), gitRun, spawn });
+    expect(spawn.mock.calls[0][1][0]).toBe(fallback);
+    expect(gitRun).not.toHaveBeenCalled();
+  }));
+
+  it('an untracked code file in the data checkout retains the old script (codeDirty parity)', () => withDataClone((root) => {
+    const gitRun = vi.fn((args) => (args[0] === 'status' ? { status: 0, stdout: '?? scripts/lib/evil.mjs\n' } : freshGit(args)));
+    const spawn = vi.fn(() => ({ status: 0 }));
+    restampAcceptance({ pr: 1, repo: 'owner/we', newHead: 'abc', freshRoot: root, env: {}, readSettings: () => ({}), gitRun, spawn });
+    expect(spawn.mock.calls[0][1][0]).toBe(fallback);
+  }));
+
   it('defaults to process.env but an injected env overrides the ambient off switch', () => withDataClone((root, script) => {
     vi.stubEnv('WE_OPERATOR_CLI_FRESH_FALLBACK', 'off');
     try {
@@ -197,13 +213,12 @@ describe('restampAcceptance fresh data clone selection', () => {
     } finally { vi.unstubAllEnvs(); }
   }));
 
-  it.each(['dirty', 'unreadable-status', 'missing-status-output', 'ahead', 'different-origin', 'unreadable-data-origin', 'unreadable-code-origin', 'empty-origin', 'unreadable-head', 'empty-head', 'unreadable-main'])(
+  it.each(['dirty', 'unreadable-status','ahead', 'different-origin', 'unreadable-data-origin', 'unreadable-code-origin', 'empty-origin', 'unreadable-head', 'empty-head', 'unreadable-main'])(
     '%s evidence retains the old script', (failure) => withDataClone((root) => {
       const gitRun = vi.fn((args, opts) => {
         if (args[0] === 'status') {
           if (failure === 'dirty') return { status: 0, stdout: ' M scripts/review-set-label.mjs\n' };
           if (failure === 'unreadable-status') return { status: 1 };
-          if (failure === 'missing-status-output') return { status: 0 };
         }
         if (args[0] === 'remote') {
           if (failure === 'different-origin' && opts.cwd === root) return { status: 0, stdout: 'other-origin\n' };
@@ -236,9 +251,9 @@ describe('restampAcceptance fresh data clone selection', () => {
     expect(spawn).toHaveBeenCalledWith(process.execPath, [script, '7204', '--repo=owner/we', '--to=restamp', '--actor=drain', '--channel=drain-rebase',
       "--reason=head moved to abc by this drain's own content-preserving rebase", '--new-head=abc'], { encoding: 'utf8', cwd: undefined });
     expect(gitRun.mock.calls.map(([args]) => args)).toEqual([
-      ['rev-parse', '--is-inside-work-tree'], ['status', '--porcelain', '--untracked-files=no'],
+      ['rev-parse', '--is-inside-work-tree'], ['status', '--porcelain', '--untracked-files=all'],
       ['remote', 'get-url', 'origin'], ['remote', 'get-url', 'origin'],
-      ['fetch', 'origin', 'main'], ['rev-parse', 'HEAD'], ['rev-parse', 'origin/main'],
+      ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main'], ['rev-parse', 'HEAD'], ['rev-parse', 'origin/main'],
     ]);
     expect(gitRun.mock.calls[3][1].cwd).toBe(codeRoot);
     for (const [index, [, opts]] of gitRun.mock.calls.entries()) {
