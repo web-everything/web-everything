@@ -4919,6 +4919,10 @@ Keep tracer tests mock-only: inject filesystem/child-process objects and exercis
 Review lens: each settings catch fallback needs a named test forcing the loader to fail,
 including malformed input and valid overrides. The `honours fallback settings after loader failure`
 cases in `scripts/ci/__tests__/dep-trace.test.mjs` exercise startup's fallback directly.
+Review lens: the child-process wrappers must never throw where unwrapped Node would not. Every `cwd` form
+Node accepts (string, `Buffer`, file `URL` from any realm) resolves; any other value goes to Node unchanged
+for Node to judge. A non-string `NODE_OPTIONS` is stringified. The `accepts a … cwd` and
+`never throws from tracing` cases pin this.
 ## Workflow-protection review admission
 
 The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged

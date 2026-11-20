@@ -31,9 +31,8 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
   const exists = io.statSync?.bind(io);
   function path(value, cwd = root) {
     try {
-      if (value instanceof URL || (typeof value === 'string' && value.startsWith('file:'))) value = fileURLToPath(value);
-      if (Buffer.isBuffer(value)) value = value.toString();
-      if (typeof value !== 'string' || value.startsWith('node:')) return null;
+      value = typeof value === 'string' && value.startsWith('file:') ? fileURLToPath(value) : toPath(value);
+      if (value === null || value.startsWith('node:')) return null;
       const name = relative(root, resolve(cwd, value));
       if (name === '..' || name.startsWith(`..${sep}`) || isAbsolute(name) || name.split(sep).includes('node_modules')) return null;
       return name.split(sep).join('/') || '.';
@@ -76,13 +75,16 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
         const index = Array.isArray(args[0]) ? 1 : 0;
         const hasOptions = args[index] && typeof args[index] === 'object';
         const options = hasOptions ? args[index] : {};
-        const cwd = options.cwd instanceof URL ? fileURLToPath(options.cwd) : resolve(process.cwd(), options.cwd || '.');
+        // Tracing must never throw: resolve every cwd form Node accepts, and leave any other value for Node to judge.
+        let cwd = process.cwd();
+        try { const given = options.cwd == null ? null : toPath(options.cwd); if (given !== null) cwd = resolve(cwd, given); } catch { /* Node reports it */ }
         for (const value of [command, ...(Array.isArray(args[0]) ? args[0] : [])]) {
           if (path(value, cwd) === null) continue;
           try { if (exists?.(resolve(cwd, value)).isFile()) add(value, 'spawn', cwd); } catch { /* not an existing script */ }
         }
         const childEnv = { ...(options.env ?? env), ...traceEnv };
-        childEnv.NODE_OPTIONS = inheritOptions(childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions);
+        // Node stringifies env values; a non-string NODE_OPTIONS must not break the wrapper.
+        childEnv.NODE_OPTIONS = inheritOptions(String(childEnv.NODE_OPTIONS ?? env.NODE_OPTIONS ?? initialNodeOptions ?? ''));
         // Replace an options placeholder too, so a following callback keeps its position.
         args.splice(index, hasOptions || (index < args.length && args[index] == null) ? 1 : 0, { ...options, env: childEnv });
         return [command, ...args];
@@ -96,6 +98,18 @@ export function createTracer({ test, root, record = () => {}, fs: io = {}, child
     }
   } };
   return tracer;
+}
+
+/**
+ * The path forms Node's fs and child_process accept: string, Buffer/Uint8Array, or a file URL.
+ * URLs are duck-typed because a test environment may install a different URL global than node:url's.
+ * Returns null for anything else.
+ */
+function toPath(value) {
+  if (typeof value === 'string') return value;
+  if (value instanceof Uint8Array) return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString();
+  if (value !== null && typeof value === 'object' && typeof value.href === 'string' && value.protocol === 'file:') return fileURLToPath(value.href);
+  return null;
 }
 
 function inheritOptions(options = '') {

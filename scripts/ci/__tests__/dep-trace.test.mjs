@@ -88,6 +88,29 @@ describe('shadow dependency tracer', () => {
     expect(call[3]).toBe(callback);
     expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
   });
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => [
+    ['Buffer', () => Buffer.from(resolve(root, 'scripts'))],
+    ['URL', () => pathToFileURL(resolve(root, 'scripts'))],
+    ['relative string', () => 'scripts'],
+  ].map(([label, cwd]) => [name, label, cwd])))('%s accepts a %s cwd and resolves scripts against it', (name, _label, makeCwd) => {
+    const f = fixture();
+    const cwd = makeCwd();
+    expect(() => f.child_process[name]('node', ['script.mjs'], { cwd })).not.toThrow();
+    expect(f.originals[name].mock.calls[0][2].cwd).toBe(cwd);
+    expect(f.tracer.snapshot().edges).toEqual([{ file: 'scripts/script.mjs', kind: 'spawn' }]);
+  });
+  it.each(['spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork'].flatMap(name => [
+    ['number cwd', { cwd: 7 }],
+    ['object cwd', { cwd: { toString: () => 'scripts' } }],
+    ['numeric NODE_OPTIONS', { env: { NODE_OPTIONS: 7 } }],
+  ].map(([label, options]) => [name, label, options])))('%s never throws from tracing on %s; Node judges the input', (name, _label, options) => {
+    const f = fixture();
+    expect(() => f.child_process[name]('node', ['script.mjs'], options)).not.toThrow();
+    expect(f.originals[name]).toHaveBeenCalledTimes(1);
+    const passed = f.originals[name].mock.calls[0][2];
+    expect(typeof passed.env.NODE_OPTIONS).toBe('string');
+    expect(passed.env.WE_TRACE_TEST).toBe(test);
+  });
   it('preserves execFile callback overload and fork options overload', () => {
     const f = fixture();
     const callback = vi.fn();
