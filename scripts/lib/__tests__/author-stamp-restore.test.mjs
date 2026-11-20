@@ -994,3 +994,53 @@ describe('planStampRestore — marker inside a markdown link title is not a stam
     expect(plan({ edits: [edit(`[ref]: https://example.test "title"\n${m()}`)] })).toMatchObject({ action: 'restore' });
   });
 });
+
+describe('reference titles containing inline code cannot supply author stamps', () => {
+  const snapshot = (open = '"', close = '"', newline = '\n', nextLine = true) =>
+    `[ref]: https://example.test${nextLine ? newline : ' '}${open}${newline}\`<div>\`${newline}${buildAuthorActorMarker(ID)}${newline}${close}${newline}${newline}[ref]`;
+
+  it.each([
+    ['double quote on next line', '"', '"', '\n', true],
+    ['double quote on definition line', '"', '"', '\n', false],
+    ['single quote on next line', "'", "'", '\n', true],
+    ['single quote on definition line', "'", "'", '\n', false],
+    ['parenthesis on next line', '(', ')', '\n', true],
+    ['parenthesis on definition line', '(', ')', '\n', false],
+    ['four-space indented title', '    "', '    "', '\n', true],
+    ['tab-indented title', '\t"', '\t"', '\n', true],
+    ['mixed indentation and CR-only lines', ' \t   "', ' \t   "', '\r', true],
+    ['CRLF title', '"', '"', '\r\n', true],
+  ])('refuses a same-author marker inside a %s', (_name, open, close, newline, nextLine) => {
+    const result = planStampRestore({ state: 'OPEN', body: 'Current description', authorLogin: 'alice',
+      edits: [edit(snapshot(open, close, newline, nextLine), 'alice', '2026-11-20T10:00:00Z', 'User')] });
+    expect(result).toMatchObject({ action: 'refuse', reason: expect.stringMatching(/unsupported HTML edit snapshot/) });
+  });
+
+  it('refuses through the restoration write path without promoting a title marker', () => {
+    const seams = io({ readPr: vi.fn(() => ({ state: 'OPEN', body: 'Current description', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(snapshot(), 'alice', '2026-11-20T10:00:00Z', 'User')]) });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse' });
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses an indented title through the restoration write path', () => {
+    const seams = io({ readEdits: vi.fn(() => [edit(snapshot('    "', '    "'))]) });
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse' });
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+
+  it('refuses title HTML even when no marker was found, rather than recording stamp-lost', () => {
+    expect(plan({ edits: [edit(snapshot().replace(buildAuthorActorMarker(ID), 'Example title text'))] }))
+      .toMatchObject({ action: 'refuse', reason: expect.stringMatching(/unsupported HTML edit snapshot/) });
+  });
+
+  it('refuses an indented multiline title marker even without HTML or backticks', () => {
+    expect(plan({ edits: [edit(snapshot('    "', '    "').replace('`<div>`', 'Example title text'))] }))
+      .toMatchObject({ action: 'refuse' });
+  });
+
+  it('still restores a real marker below a completed indented reference title', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test\n    "title"\n\n${buildAuthorActorMarker(ID)}`)] }))
+      .toMatchObject({ action: 'restore', id: ID });
+  });
+});

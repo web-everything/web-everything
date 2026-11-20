@@ -23,8 +23,8 @@ const safe = (value) => String(value).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/
 // Allowlist, not a Markdown parser: the only text treated as plain is a bare placeholder token
 // (<name>: no attributes, slash or other characters) inside a balanced single-line inline code span.
 // The token is removed; every other character, including other tag-like text in the span, stays visible
-// to the HTML refusal. Escaped or unmatched backticks are ambiguous; a snapshot with link/reference brackets
-// anywhere gets no exemption at all (see planStampRestore).
+// to the HTML refusal. Escaped or unmatched backticks and potentially open links/titles are ambiguous;
+// such snapshots get no exemption at all (see planStampRestore).
 function outsideInlineCode(line) {
   if (!line.includes('`')) return line;
   if (line.includes('\\`')) return undefined;
@@ -53,8 +53,9 @@ function linkMayEnclose(diff) {
   const count = (s, re) => (s.match(re) ?? []).length;
   return diff.split(/\r\n|[\r\n]/).some((l) => {
     if (/[\[\]]/.test(l) && (count(l, /\[/g) !== count(l, /\]/g) || count(l, /\(/g) !== count(l, /\)/g))) return true;
+    // Reference title continuation lines may have more than three spaces (or tabs) of indentation.
     const open = l.match(/^[ \t]{0,3}\[[^\]]*\]:[ \t]*\S*[ \t]*(["'(])(.*)$/)
-      ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]{0,3}(["'(])(.*)$/);
+      ?? l.match(/\]\([ \t]*\S+[ \t]+(["'(])(.*)$/) ?? l.match(/^[ \t]*(["'(])(.*)$/);
     // Any link-syntax line with an odd count of unescaped quotes may leave a title open, wherever it starts.
     if (/\]\(|^[ \t]{0,3}\[[^\]]*\]:/.test(l)) {
       const bare = l.replace(/\\./g, '');
@@ -157,7 +158,9 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     }
     // Tags can span lines and contain an apparently standalone stamp in an attribute.
     // Preserve snapshot-wide detection after exempting only validated inline spans.
-    const noExempt = ambiguousTicks || bracketed;
+    // Backticks inside a possible link title do not prove that HTML is in code.
+    const ambiguousLink = linkMayEnclose(edit.diff);
+    const noExempt = ambiguousTicks || bracketed || ambiguousLink;
     // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
     // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
     const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
@@ -169,7 +172,7 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
         contentEvidence(edit, htmlOffender(candidate)));
     }
     // A marker is not a stamp when a link title/destination or link text may still be open around it.
-    if (markers.length && linkMayEnclose(edit.diff)) {
+    if (markers.length && ambiguousLink) {
       return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
         contentEvidence(edit, markerLine(edit.diff)));
     }
