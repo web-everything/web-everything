@@ -547,3 +547,11 @@ describe('fix evidence is drain-transient', () => {
     expect(calls.some((c) => ['commit-tree', 'push'].includes(c.args[0]))).toBe(false);
   });
 });
+
+
+it('an explicit ledger-bounded failed-gate refresh rebuilds an already-current tree', () => {
+  const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+    'rev-parse': { stdout: 'resolvedTree'.padEnd(40, '0') }, 'merge-base': { status: 0 } });
+  expect(rebaseDropManifest({ laneRef: 'lane/test', forceRefresh: true, run })).toMatchObject({ action: 'rebased' });
+  expect(calls.some(c => c.args[0] === 'push')).toBe(true);
+});

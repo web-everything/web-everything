@@ -188,13 +188,13 @@ export function buildCandidates(prs, {
  */
 export function refreshOntoMain(laneRef, {
   root = REPO_ROOT, base = 'origin/main', rebase = rebaseDropManifest,
-  prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository,
+  prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository, forceRefresh = false,
 } = {}) {
   if (prNumber !== null) {
     const refused = sameRepoRefusal(prNumber, { repo, readIsCrossRepository });
     if (refused) return refused;
   }
-  const result = rebase({ laneRef, base, cwd: root });
+  const result = rebase({ laneRef, base, cwd: root, ...(forceRefresh ? { forceRefresh: true } : {}) });
   if (result.action === 'error') return { ok: false, action: 'error', error: result.reason };
   if (result.action === 'skip') return { ok: false, action: 'skip', error: result.reason };
   // #2811 — `newCommit` threaded through (never dropped): `sweepCiRedRecovery`'s own apply loop needs the

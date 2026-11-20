@@ -1373,7 +1373,6 @@
   "scripts/lib/__tests__/soak-replay-gate-workflow.test.mjs": 13.82,
   "scripts/lib/__tests__/soak-replay-gate.test.mjs": 0.15,
   "scripts/lib/__tests__/spawn-to-completion.test.mjs": 0.36,
-  "scripts/lib/__tests__/stale-gate-update-branch.test.mjs": 0.05,
   "scripts/lib/__tests__/standards-cache.test.mjs": 1.52,
   "scripts/lib/__tests__/standards-sections.test.mjs": 27.32,
   "scripts/lib/__tests__/stdout-flush-scan.test.mjs": 0.02,

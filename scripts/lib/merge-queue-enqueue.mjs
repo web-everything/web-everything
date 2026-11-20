@@ -17,6 +17,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
@@ -137,7 +138,7 @@ export async function handleRequiredWorkflowsRefusal(options) {
 
 async function handleQueueRefresh({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
   readState = readRequiredWorkflowsRefreshState, record = recordRequiredWorkflowsRefresh,
-  decide = decideRequiredWorkflowsRefresh, runId = null, runConclusion = null, label = 'required-workflows', wording = 'required workflows unsatisfied', dryRun = false,
+  decide = decideRequiredWorkflowsRefresh, runId = null, runConclusion = null, forceRefresh = false, label = 'required-workflows', wording = 'required workflows unsatisfied', dryRun = false,
   refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn = () => {}, now = () => new Date().toISOString() }) {
   if (dryRun) return { handled: false };
   const decision = decide({ key, headSha, setting, state: readState(statePath) });
@@ -146,7 +147,7 @@ async function handleQueueRefresh({ c, key, headSha, setting, statePath = requir
   let out;
   try {
     out = !cloneDir ? { ok: false, error: `no ${c.repo} clone provisioned` }
-      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, ...(runConclusion ? { runConclusion } : {}), expectedHead: headSha });
+      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, ...(runConclusion ? { runConclusion } : {}), ...(forceRefresh ? { forceRefresh: true } : {}), expectedHead: headSha });
   } catch (e) { out = { ok: false, error: errText(e) }; }
   if (out.action === 'gate-refresh-pending') return { handled: true, action: out.action,
     reason: `merge-queue: ${wording} → gate-refresh-pending: ${out.error}`,
@@ -512,6 +513,31 @@ function readMergeGateRuns({ repo, headSha }) {
   return out.workflow_runs;
 }
 
+/** Live, bounded check history and required app identity. Unknown evidence never triggers a refresh. */
+export function readFailedMergeGateEvidence({ repo, headSha, branch = 'main', gh = execFileSyncThrottled,
+  readRequired = readRequiredStatusChecksDetailed } = {}) {
+  if (!/^[0-9a-f]{40}(?![\s\S])/.test(headSha ?? '')) throw Error('pinned head unreadable');
+  const checks = JSON.parse(gh('gh', ['api', `repos/${repo}/commits/${headSha}/check-runs?per_page=100&filter=all&check_name=merge-gate`],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
+  if (!Array.isArray(checks?.check_runs) || !Number.isSafeInteger(checks.total_count)
+    || checks.total_count !== checks.check_runs.length || checks.total_count > 100)
+    throw Error('incomplete or oversized gate history; inspect and refresh the branch manually');
+  const { requiredCheckApps } = readRequired({ repo, branch, includeAppIds: true });
+  const apps = requiredCheckApps?.filter(row => row?.context === 'merge-gate');
+  const requiredAppId = apps?.length && apps.every(row => Number.isSafeInteger(row.appId) && row.appId > 0)
+    && new Set(apps.map(row => row.appId)).size === 1 ? apps[0].appId : null;
+  return { checkRuns: checks.check_runs, requiredAppId };
+}
+
+function newestRequiredFailedGate({ checkRuns, requiredAppId } = {}, headSha) {
+  if (!/^[0-9a-f]{40}(?![\s\S])/.test(headSha ?? '') || !Number.isSafeInteger(requiredAppId) || requiredAppId <= 0
+    || !Array.isArray(checkRuns)) return false;
+  const runs = checkRuns.filter(row => row?.name === 'merge-gate' && row.head_sha === headSha);
+  if (!runs.length || runs.some(row => !Number.isSafeInteger(row.id) || row.id <= 0)) return false;
+  const newest = runs.reduce((a, b) => a.id > b.id ? a : b);
+  return newest.app?.id === requiredAppId && newest.status === 'completed' && newest.conclusion === 'failure';
+}
+
 function everyOtherRequiredGreen(requiredChecks, rollup) {
   if (!Array.isArray(requiredChecks) || !Array.isArray(rollup)) return false;
   const latest = new Map(collapseRollupToLatestPerName(rollup).map(row => [row?.name ?? row?.context, row]));
@@ -539,7 +565,9 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
   // Reserve atomically BEFORE dispatching (wx): concurrent passes cannot both push, and a failed ledger write cannot re-arm the head.
   const key = `${c.repo}#${c.num}`;
   const handleArgs = { ...refreshOptions, warn, c, key, headSha, setting, statePath, decide: decideStaleMergeGateRefresh,
-    runId: classification.runId, runConclusion: 'startup_failure', label: 'stale merge-gate', wording: `merge-gate workflow startup_failure (run ${classification.runId})` };
+    runId: classification.runId, runConclusion: classification.runConclusion ?? 'startup_failure',
+    forceRefresh: classification.runConclusion === 'failure', label: 'stale merge-gate',
+    wording: classification.runConclusion === 'failure' ? 'newest required-app merge-gate failed' : `merge-gate workflow startup_failure (run ${classification.runId})` };
   // A ledger skip (already refreshed once) needs no claim and keeps its own wording.
   if (decideStaleMergeGateRefresh({ key, headSha, setting, state: (refreshOptions.readState ?? readRequiredWorkflowsRefreshState)(statePath) }).action !== 'refresh') return handleQueueRefresh(handleArgs);
   const claimFor = (kind, sha) => join(dirname(statePath), `drain-stale-merge-gate-claim-${kind}-${createHash('sha256').update(`${key}\n${sha ?? ''}`).digest('hex').slice(0, 24)}`);
@@ -624,7 +652,7 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
 
 /** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
-  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
+  readFailedGate = readFailedMergeGateEvidence, readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
   writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
   statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
   const unchanged = { handled: false };
@@ -634,6 +662,7 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
   // The real classifier must also pass its gates AFTER the merge-state arm (body and review holds).
   if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
   const headSha = pr.headRefOid;
+  if ((c.listedHeadSha || c.headSha || headSha) !== headSha) return unchanged;
   const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
   // A startup_failure Merge gate run creates no check-run, so the row can be absent; any other refusal stays refused.
   // reviewCiGate drops checks implied by others (integration under test), so here EVERY other required row must be present and successful.
@@ -648,6 +677,17 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
     return refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions });
   }
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
+  // failedRequiredGateRefresh: another trigger for the same guarded refresh and its existing per-head ledger.
+  // A check-run id is not a workflow run id; this trigger rebuilds the head instead of rerunning the old workflow.
+  if (everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) {
+    try {
+      if (newestRequiredFailedGate(await readFailedGate({ repo: c.repo, headSha,
+        branch: classifyOptions.defaultBranch || 'main' }), headSha)) {
+        return refreshStartupFailure({ c, headSha, classification: { runId: null, runConclusion: 'failure' },
+          setting, statePath, writeClaim, warn, refreshOptions });
+      }
+    } catch (error) { return { ...unchanged, reason: `failed merge-gate evidence unreadable: ${errText(error)}` }; }
+  }
   const run = latestFailingMergeGate(pr.statusCheckRollup);
   if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
   const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');

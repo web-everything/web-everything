@@ -2,7 +2,7 @@
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
+import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold, sendBackReason, redTeamLabelHoldReason } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
 import { resolveApprovalLicensesEnqueue, proveHumanOnlyLicense } from './lib/human-only-enqueue-license.mjs';
@@ -253,7 +253,6 @@ import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIO
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
-import { readStaleGateUpdateBranchMax, readStaleGateRequiredAppId, updateStaleGateBranches } from './lib/stale-gate-update-branch.mjs';
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
@@ -913,14 +912,6 @@ export function unlandableStateReason(state) {
     return 'merge state BLOCKED (branch protection unsatisfied: required checks pending or red, or an uncleared review) — owned by the ci-heal / review daemons, nothing for the drain to rebase';
   }
   return `merge state ${st} (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author`;
-}
-
-/** Select advisory repairs without changing any merge verdict. Shared with the hermetic soak replay. */
-export function refreshStaleBlockedGates(verdicts, { localSlug, ...options } = {}) {
-  return updateStaleGateBranches({ ...options,
-    candidates: verdicts.filter(v => v.decision === 'skip' && v.reason === unlandableStateReason('BLOCKED'))
-      .map(v => ({ repo: v.repo || localSlug, num: v.num, head: v.listedHeadSha || v.headSha })),
-  });
 }
 
 /** Unreadable verification defers this pass before any review-label writer runs. */
@@ -5134,13 +5125,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
-  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
-    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
-    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
-      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
-      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
-      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
-      enqueueAllowed: () => {
+  function queueHeadMutationAllowed(c, sha) {
         const repo = c.repo ?? localSlug;
         const exec = createMqLiveReader();
         const gh = args => exec('gh', args, { encoding: 'utf8', timeout: 60_000,
@@ -5179,7 +5164,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const license = proveHumanOnlyLicense({ repo, pr: c.num, headSha: sha, cwd: process.cwd(), exec });
           return license?.licensed === true && ['exact', 'numbering', 'mechanical'].includes(license.tier);
         } catch { return false; }
-      } });
+  }
+  function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
+    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
+      approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
+      // with fresh evidence at H, before the refresh's label read or once-per-head claim.
+      enqueueAllowed: () => queueHeadMutationAllowed(c, sha) });
     const guard = mqSameHeadGuard({ refresh, dryRun: DRY_RUN, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
@@ -6179,7 +6171,24 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         hold: pr?.mergeStateStatus === 'BEHIND' && approvedHeadHold({ repo, num }, opts.expectedHeadSha) });
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
-  const refreshApprovedHead = (v, options) => refreshApprovedHeadChecked({
+  const refreshApprovedHead = async (v, options) => {
+    // Gate recovery is a head mutation under the same admission policy as the queue's existing refresh.
+    if (options.forceRefresh || options.runConclusion === 'startup_failure') {
+      try {
+        if (cardGrouping.inGroup(v)) throw Error('open card group owns this head');
+        const live = await fetchFreshPrForRevalidation(v.repo, v.num);
+        if (!live || live.headRefOid !== options.expectedHead
+          || classifyPr({ ...live, mergeStateStatus: 'CLEAN' }, { requiredCheck: REQUIRED,
+            defaultBranch: defaultBranchOf(v.repo) }).decision !== 'merge') throw Error('live PR admission refused');
+        const held = sendBackReason(live.labels) || redTeamLabelHoldReason(live.labels);
+        if (held) throw Error(held);
+        if (options.forceRefresh && !hasLabel(live, 'red-team:clear')) throw Error('red-team:clear missing');
+        if (mqSameHeadGuard({ repo: v.repo || localSlug, pr: v.num, head: options.expectedHead,
+          allowAlreadyQueued: false, dryRun: true }).hold) throw Error('merge-queue history refuses refresh');
+        if (!queueHeadMutationAllowed(v, options.expectedHead)) throw Error('queue head mutation authorization refused');
+      } catch (error) { return { ok: false, action: 'held', error: String(error?.message ?? error) }; }
+    }
+    return refreshApprovedHeadChecked({
     readHold: () => {
       let unreadable = null;
       const hold = approvedHeadHold(v, options.expectedHead, { strict: true, onUnreadable: (e) => { unreadable = e; } });
@@ -6194,7 +6203,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     },
     options, prNumber: Number(v.num), repo: v.repo || localSlug, refresh: refreshStalePr,
     warn: (msg) => process.stderr.write(`  ⚠ PR ${repoTag(v.repo)}${v.num}: ${msg}\n`),
-  });
+    });
+  };
   // #2198 — rebase-drop the transient manifest so a certified+green PR that is only CONFLICTING/BEHIND on the
   // shared `.lane-manifest.json` path lands instead of walling the whole queue. Per candidate: merge-tree
   // main×lane; if the ONLY conflict is the manifest, rebuild its tip onto main (manifest dropped) via pure
@@ -7342,27 +7352,6 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // hold below then keeps every source out of the queue this same pass. Never throws.
   runCardGroupPass({ grouping: cardGrouping, onlyPr, enqueues: mergeStrategy.enqueues(null), enqueueOutcomes, deferred: preparedPass.plan.deferred, verdicts,
     mainFixNums: [...passMainFix], isLocalRepo });
-  // Advisory repair of the stale-failed gate only. These verdicts remain skips this pass.
-  const staleGateSetting = readStaleGateUpdateBranchMax({ env });
-  process.stderr.write(`drain.staleGateUpdateBranchMax=${staleGateSetting.value} (${staleGateSetting.source})\n`);
-  if (!DRY_RUN) {
-    const staleGateAppIds = new Map();
-    const staleGateRepoKey = repo => REPOS.find(r => (r || localSlug) === repo);
-    refreshStaleBlockedGates(verdicts, {
-      localSlug, max: staleGateSetting.value,
-      defaultBranchOf: repo => defaultBranchOf(staleGateRepoKey(repo)),
-      requiredAppIdOf: repo => {
-        if (!staleGateAppIds.has(repo)) {
-          const repoKey = staleGateRepoKey(repo);
-          const appId = readStaleGateRequiredAppId({ repo, branch: defaultBranchOf(repoKey) });
-          staleGateAppIds.set(repo, appId);
-        }
-        return staleGateAppIds.get(repo);
-      },
-      fixClaimHeld: (repo, num) => !repoKeyForSlug(repo) || prestageFixClaimHeld(num, { claimKey: repoKeyForSlug(repo) }),
-      humanSurfaceGuardAllows: (repo, num, head) => !approvedHeadHold({ repo: staleGateRepoKey(repo), num }, head, { strict: true }),
-    });
-  }
   let deferred = [];
   if (DRY_RUN) {
     // Report the planned first-pass order (blockedBy + #2393 stackParents-honoured) without merging. Nothing has

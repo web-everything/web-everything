@@ -13,8 +13,8 @@ import {
   SETTING_KEY_CLASSES, SETTING_CLASSES, settingKeyClass,
   LEGACY_SETTINGS_LEAVES, LEGACY_SETTINGS_PATH, SETTINGS_DIR, FEATURE_FILE_RE, LEGACY_ONLY_READERS, LEGACY_FILE_GUARD_HINT,
 } from '../settings-files.mjs';
-import { readStaleGateUpdateBranchMax } from '../stale-gate-update-branch.mjs';
 import { resolveFixerSlotSettings } from '../../conveyor/fixer-slot-rules.mjs';
+import { resolveRefreshOnStaleMergeGate } from '../merge-queue-enqueue.mjs';
 import { readCostAdmissionSettings } from '../cost-admission-facts.mjs';
 import { resolveHeavyAdmissionCap, resolveCpuIdleMinPct } from '../dispatch-throttle.mjs';
 
@@ -493,33 +493,16 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     });
     expect(readSettings().fixDispatch).toMatchObject({ borrowBuildSlots: 'on', borrowAfterMinutes: 15, borrowExecutor: 'codex', skipEmptySteps: true });
     expect(real.owners['fixDispatch.skipEmptySteps']).toBe('settings/fix-empty-steps.json');
-    expect(readSettings().drain.staleGateUpdateBranchMax).toBe(2);
-    expect(real.owners['drain.staleGateUpdateBranchMax']).toBe('settings/drain-stale-gate-update-branch.json');
     expect(resolveHeavyAdmissionCap({ env: {} })).toBe(3);
     expect(resolveCpuIdleMinPct('build', { env: {} })).toBe(15);
     expect(readCostAdmissionSettings({ env: {} })).toBeTruthy();
   });
 });
 
-// Exercise the production checked-file reader, including object-valued leaves.
-describe('stale-gate repair invalid persisted settings', () => {
-  it.each([null, {}, 'abc', -1, 1.5])('disables persisted %j', value => {
-    const root = mkdtempSync(join(tmpdir(), 'stale-settings-'));
-    try {
-      writeFileSync(join(root, 'repair.json'), JSON.stringify({ drain: { staleGateUpdateBranchMax: value } }));
-      expect(readStaleGateUpdateBranchMax({ env: {},
-        readTool: options => readSettingsChecked({ ...options, dir: root, legacyPath: join(root, 'absent.json') }),
-        readPlatform: () => ({ prefs: {}, errors: [] }) })).toMatchObject({ value: 0, source: expect.stringContaining('manually') });
-    } finally { rmSync(root, { recursive: true, force: true }); }
-  });
-});
 
-it('only an absent persisted stale-gate bound uses the standard default', () => {
-  const root = mkdtempSync(join(tmpdir(), 'stale-absent-'));
-  try {
-    writeFileSync(join(root, 'repair.json'), JSON.stringify({ drain: {} }));
-    expect(readStaleGateUpdateBranchMax({ env: {},
-      readTool: options => readSettingsChecked({ ...options, dir: root, legacyPath: join(root, 'absent.json') }),
-      readPlatform: () => ({ prefs: {}, errors: [] }) })).toEqual({ value: 2, source: 'standard' });
-  } finally { rmSync(root, { recursive: true, force: true }); }
+it('reuses the declared stale merge-gate refresh setting for failed-gate recovery', () => {
+  expect(readSettings().mergeQueue.refreshOnStaleMergeGate).toBe('on');
+  expect(resolveRefreshOnStaleMergeGate({env:{},settings:{},platform:{}})).toMatchObject({value:'on',source:'standard'});
+  expect(resolveRefreshOnStaleMergeGate({env:{},settings:{mergeQueue:{refreshOnStaleMergeGate:'off'}},platform:{}}))
+    .toMatchObject({value:'off',source:'settings'});
 });

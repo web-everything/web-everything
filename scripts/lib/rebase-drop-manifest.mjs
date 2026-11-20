@@ -129,6 +129,7 @@ export { gitRunner };
  *                                       tip (reusing #2222's `applyCollisionHealToIndex`), so the rebuild that
  *                                       already runs to shed the manifest also clears an `ids must be unique` dup
  *                                       against `<base>` — otherwise the rebuilt tip stays red and never merges.
+ * @param {boolean} [o.forceRefresh=false] Rebuild a current tree for the drain's ledger-bounded failed-gate repair.
  * @param {string} [o.cwd]              run every git invocation in THIS directory instead of `process.cwd()`
  *                                       (#2263) — routes the plumbing through a SIBLING clone (e.g. `../frontierui`)
  *                                       for a remote-repo candidate, so the local-only rebase-drop can rebuild a
@@ -145,6 +146,7 @@ export function rebaseDropManifest({
   message,
   tmpIndex = '.git/rebase-drop-index',
   healCollision = false,
+  forceRefresh = false,
   cwd,
   run = gitRunner,
 } = {}) {
@@ -237,7 +239,7 @@ export function rebaseDropManifest({
   // — so it still gets rebuilt to drop it). Over-conservative direction: when uncertain, rebuild.
   const curTreeOid = String(run('git', ['rev-parse', `${mergeRef}^{tree}`], { cwd }).stdout || '').trim();
   const isAncestor = run('git', ['merge-base', '--is-ancestor', base, mergeRef], { cwd }).status === 0;
-  if (isAncestor && curTreeOid && curTreeOid === resolvedTree) {
+  if (!forceRefresh && isAncestor && curTreeOid && curTreeOid === resolvedTree) {
     const curCommit = String(run('git', ['rev-parse', mergeRef], { cwd }).stdout || '').trim();
     // Guard: only claim 'current' if we can actually resolve the tip's commit sha; otherwise fall through to
     // the normal rebuild rather than return a bogus result.

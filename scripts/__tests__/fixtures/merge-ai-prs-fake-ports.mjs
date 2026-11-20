@@ -1,5 +1,6 @@
 // Function ports and executable shims share the same response code and call logs.
 import * as fs from 'node:fs';
+import { basename } from 'node:path';
 import { openPrPageFixture } from './open-pr-page-fixture.mjs';
 
 function prestageGh(process, fs, page) {
@@ -11,20 +12,28 @@ if (a[0] === 'repo') out('main');
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
 if (a[0] === 'pr' && a[1] === 'list') out([pr]);
+if (a[0] === 'pr' && a[1] === 'view' && a.includes('.isCrossRepository')) out(String(pr.isCrossRepository));
 if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
+  if (path.includes('/rules/branches/') && pr.failedGate) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'},{context:'merge-gate', integration_id:1}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'},{context:'merge-gate', integration_id:1}]}}]);
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
+  if (path.includes('/comments') && a.includes('--jq')) {
+    const tsv = value => String(value ?? '').replace(/\\/g,'\\\\').replace(/\t/g,'\\t').replace(/\r/g,'\\r').replace(/\n/g,'\\n');
+    out(pr.comments.map((c,i) => [c.body,c.createdAt,c.author.login,c.id || 'IC_fixture'+i,''].map(tsv).join('\t')).join('\n'));
+  }
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (path.includes('/check-runs') && pr.failedGate) out({total_count:1,check_runs:[{id:20,name:'merge-gate',head_sha:pr.headRefOid,app:{id:1},status:'completed',conclusion:'failure'}]});
   if (path.includes('/check-runs')) out(pr.checkRuns || [{check_runs:[]}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
+    if (q.includes('comments{totalCount}')) out({data:{repository:{pullRequest:{comments:{totalCount:pr.comments.length}}}}});
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
-      nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
+      nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:!!pr.unknownMqHistory}
     } } } } });
     if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
     if (q.includes('isInMergeQueue')) {
@@ -43,6 +52,15 @@ out([]);
 function prestageGit(process, fs, page) {
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
+const pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+if (pr.failedGate) {
+  if (a[0] === 'ls-tree' && a.includes('.lane-manifest.json')) return;
+  if (a[0] === 'ls-remote') { process.stdout.write(pr.headRefOid+'\trefs/heads/'+pr.headRefName+'\n'); return; }
+  if (a[0] === 'merge-tree' || a[0] === 'write-tree') { process.stdout.write('c'.repeat(40)+'\n'); return; }
+  if (a[0] === 'commit-tree') { process.stdout.write('b'.repeat(40)+'\n'); return; }
+  if (a[0] === 'diff' && a.includes('--name-only') && pr.humanSurface) { process.stdout.write('webeverything.config.json\0'); return; }
+  if (a[0] === 'diff' && a.includes('--name-only') && pr.workflowEdit) { process.stdout.write('.github/workflows/ci.yml\0'); return; }
+}
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\n');
 else if (a[0] === 'merge-base' || a[0] === 'rev-parse') process.stdout.write('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
 else if (a[0] === 'diff') {
@@ -90,7 +108,19 @@ function capture(port, args, env) {
   return { status, stdout, stderr: '' };
 }
 const port = fn => (args, env) => capture(fn, args, env);
-export const prestagePorts = { gh: port(prestageGh), git: port(prestageGit) };
+// Model only the acceptance writer at the subprocess boundary; admission and refresh stay real.
+function prestageNode(args, env) {
+  if (basename(args[0] || '') !== 'review-set-label.mjs' || args[1] !== '42'
+    || !args.includes(`--repo=${env.PRESTAGE_REPO}`) || !args.includes('--to=restamp')
+    || !args.includes('--actor=drain') || !args.includes('--channel=drain-rebase')
+    || !args.some(a => /^--new-head=[0-9a-f]{40}$/.test(a))) {
+    throw new Error(`Unexpected prestage Node subprocess: ${args.join(' ')}`);
+  }
+  fs.appendFileSync(env.PRESTAGE_LOG, JSON.stringify(['node', ...args]) + '\n');
+  return { status: 0, stdout: '', stderr: '' };
+}
+export const prestagePorts = { gh: port(prestageGh), git: port(prestageGit),
+  [basename(process.execPath)]: prestageNode };
 export const listingPorts = { gh: port(listingGh), git: args => {
   // The original throwaway repo has no origin and no commits.
   return { status: 128, stdout: '', stderr: 'fatal: no origin or revision' };

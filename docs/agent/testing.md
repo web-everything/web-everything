@@ -1,19 +1,5 @@
 # Testing — Three-Tier Strategy
 
-## Stale merge-gate branch repair
-
-The drain's stale-gate repair is advisory: a BLOCKED skip remains a skip for the pass.
-Exercise the real `refreshStaleBlockedGates` hook with injected GitHub IO, including the exact
-`expected_head_sha` PUT, a repeated pass on the same head, and a 422. Reserve the head before
-the write; an uncertain response must not permit another attempt. The soak break
-`stale-failed-merge-gate-blocks-drain` uses only the exported planner name as its fix-presence marker,
-so deleting a guard cannot turn a regression into an expected failure. Eligibility uses the newest
-check-run id on the pinned head from the required merge-gate app id (live branch protection/rulesets).
-Other apps are ignored; missing/unreadable app identity, non-failed or unfinished newest runs,
-and unreadable or blocking fresh review decisions skip repair. Other required checks do not enter
-this advisory repair decision. Cover these paths in `stale-gate-update-branch.test.mjs`. Its 422
-assertion scopes logs to the conflict action; the log-suppression regression must fail the scenario.
-
 ## Review PR fetch isolation (R37)
 
 Review PR transport runs in a fresh temporary bare repository with empty global/system
@@ -5211,3 +5197,24 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+
+## Failed required merge-gate refresh
+
+`mergeQueue.refreshOnStaleMergeGate` also admits the newest completed-failure check run on the
+pinned head from the live required app. Exercise it through the existing stale-gate refresh and
+real drain CLI, including each queue/review/workflow/group/claim/approved-head hold. The existing
+refresh ledger and atomic claims bound rebuilds per head; no separate repair state is needed.
+A current branch must still produce a new head, since label events cannot refresh this required gate.
+The soak break `stale-failed-merge-gate-blocks-drain` drives that production CLI with private transport
+fixtures; its single source marker detects presence only. Truncated check history or unreadable app
+identity keeps the PR skipped and asks the operator to inspect and refresh the branch manually.
+
+## Failed merge-gate drain refresh fixtures
+
+The prestage world keeps `WE_SHARED_RUNS_DIR` inside its temporary root. A missing-result
+red-team guard needs head-bound scheduled work; an accepted label alone schedules nothing.
+Live fix claims need `meta.who`, and approved human-surface fixtures must name an active human
+surface such as `webeverything.config.json` (the drain engine is agent-reviewable). The in-process Node port models
+only the `review-set-label.mjs` acceptance-restamp subprocess after the real guarded refresh
+rebases; assert its new-head argument and retain the original BLOCKED skip across passes.

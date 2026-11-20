@@ -357,7 +357,7 @@ export function recordRefreshed(path, key, headSha, { max = 500, pass = null, no
  * use the shared gate:refresh trigger, with live head verification, to produce a fresh gate.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
-export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, runConclusion = null, expectedHead = null, readTip, refresh, rerun, execGh, gateRefreshPending = null }) {
+export async function refreshStalePr({ laneRef, root, repo = null, prNumber = null, runId = null, runConclusion = null, expectedHead = null, readTip, refresh, rerun, execGh, gateRefreshPending = null, forceRefresh = false }) {
   if (!laneRef) return { ok: false, action: 'error', error: 'no head ref' };
   // The same-repo guard needs the PR number; without one a fork PR could be rebased, so refuse (fail closed).
   if (!Number.isSafeInteger(prNumber)) return { ok: false, action: 'unverified-pr', error: 'no verifiable PR number for the same-repo check' };
@@ -370,9 +370,10 @@ export async function refreshStalePr({ laneRef, root, repo = null, prNumber = nu
     if (tip !== expectedHead) return { ok: false, action: 'head-moved', error: `branch tip ${tip ? tip.slice(0, 9) : 'unreadable'} is not the judged head ${expectedHead.slice(0, 9)}` };
   }
   const doRefresh = refresh ?? (await import('../conveyor/ci-red-recovery-watch.mjs')).refreshOntoMain;
-  const r = gateRefreshPending ? { ok: true, action: 'current' } : doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo });
+  const r = gateRefreshPending ? { ok: true, action: 'current' } : doRefresh(laneRef, { ...(root ? { root } : {}), prNumber, repo, ...(forceRefresh ? { forceRefresh: true } : {}) });
   if (!r?.ok) return { ok: false, action: r?.action ?? 'error', error: r?.error ?? 'refresh failed' };
   if (!gateRefreshPending && r.action !== 'current') return { ok: true, action: r.action, newCommit: r.newCommit ?? null };
+  if (forceRefresh) return { ok: false, action: 'held-current', error: 'failed gate needs a new head; approved head retained — ask an operator to refresh the branch' };
   if (!runId) return { ok: false, action: 'current-no-run', error: 'branch already on main and the required run id is unknown' };
   let call = execGh;
   if (!call) {
