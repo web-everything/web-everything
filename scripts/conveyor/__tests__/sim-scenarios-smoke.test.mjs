@@ -14,6 +14,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { scenario, runScenario } from './sim/scenario.mjs';
 import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
 
@@ -23,6 +25,12 @@ function tracerDef() {
     daemons: ['review'],
     lanes: 3,
     setup(w) {
+      // This world runs fake Claude sessions, not host review-job processes. A denied
+      // host process-table read must not consume its simulated review capacity.
+      const bin = join(w.root, 'unreadable-process-table');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'ps'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+      w.env.PATH = `${bin}${delimiter}${w.env.PATH}`;
       w.git.createBranch('we', 'lane/tracer-1-thing', { from: 'main', files: { 'a.txt': 'hello from the PR\n' } });
       const pr = w.gh.openPr({
         repo: 'we',
@@ -65,7 +73,7 @@ function tracerDef() {
 }
 
 describe('#3383 daemon scenario simulator — tracer scenario', () => {
-  it('dispatches, accepts, and settles a single review:pending PR', async () => {
+  it('dispatches, accepts, and settles a single review:pending PR with an unreadable host process table', async () => {
     await runScenario(tracerDef(), { timeoutMs: 180_000 });
   }, 180_000);
 });

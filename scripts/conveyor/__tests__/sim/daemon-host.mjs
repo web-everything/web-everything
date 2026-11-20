@@ -85,7 +85,14 @@ async function bootInProcess(modulePath) {
   const onRestart = (info) => { restartInfo = info ?? {}; return { simRestart: true }; };
 
   const effects = withSelfSync(
-    withGithubAppAuth(daemonModule.buildCliDaemonEffects({ owner: `sim-${KIND}`, log }), { log }),
+    withGithubAppAuth(daemonModule.buildCliDaemonEffects({
+      owner: `sim-${KIND}`, log,
+      // The world uses fake Claude sessions, not review-job processes. Supply its
+      // process facts so host jobs or an unreadable ps cannot spend its review seats.
+      ...(KIND === 'review' ? {
+        reviewTickOpts: opts => daemonModule.cliReviewTickOpts({ ...opts, listCommands: () => '' }),
+      } : {}),
+    }), { log }),
     // #4044: `entries` = the daemon's own script, exactly what `process.argv[1]` is in production (here argv[1]
     // is this host), so the restart gate walks the real daemon's import closure.
     // x44lnnt: pin the INLINE rebuild path (`background: null`) — the shipped settings file turns background builds

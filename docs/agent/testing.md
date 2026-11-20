@@ -1059,6 +1059,12 @@ in the shared world environment. Keep the planner and dispatch-time gate on the 
 daemon restarts. Production fast-check eligibility is covered by `review-timing-dispatch.test.mjs` and
 `review-ci-gate-io.test.mjs`; scenarios exercising that timing must explicitly set their world policy and checks.
 
+The simulator's review host must also inject `cliReviewTickOpts({ listCommands })`. Its session-mode
+world has no real review-job processes: use an empty process listing for that budget, while retaining
+the real lane and fake-session admission checks. Reading the host's `ps` can strand owed reviews
+when process inspection is denied or unrelated jobs consume capacity. The tracer scenario in
+`sim-scenarios-smoke.test.mjs` keeps the host process table unreadable to exercise this boundary.
+
 Fake-`gh` CLI fixtures that exercise throttling must set `WE_GH_THROTTLE_LOCK_ROOT` to a temporary
 directory per invocation and route the binary to their fake. An intentional rate-limit response writes
 cooldown state; sharing that state with another test or the host delays unrelated reads.
