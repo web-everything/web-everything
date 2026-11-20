@@ -2526,8 +2526,8 @@ async function cmdAcquire(repo) {
   // applied (log line + JSON `base`), so an orchestrator stacking a serial batch would believe the lane sits on
   // the predecessor tip when HEAD was never moved. Reject the combo BEFORE claiming any lane (touches nothing) —
   // failing loud beats silently misreporting for a primitive other automation trusts.
-  if (flags.purpose === 'conveyor-prepare-item' && (flags['no-reset'] || flags.reserve || (flags.base && flags.base !== 'origin/main'))) {
-    fail('prepare-item requires a fresh origin/main lane; no alternate base, reservation, or --no-reset');
+  if (flags.purpose === 'conveyor-prepare-item' && (flags.at !== undefined || flags['no-reset'] || flags.reserve || (flags.base && flags.base !== 'origin/main'))) {
+    fail('prepare-item requires a fresh origin/main lane; no --at, alternate base, reservation, or --no-reset');
   }
   if (flags.base && flags['no-reset']) {
     fail(`--base=${flags.base} and --no-reset are mutually exclusive: --base resets the clone to that ref, which --no-reset would skip. Pass one or the other.`);
@@ -3031,21 +3031,31 @@ async function cmdAcquire(repo) {
     }
   }
   if (flags.at !== undefined) {
+    const currentPinClaim = readLease(dir);
+    const pinnedClaim = currentPinClaim?.holder === holderSlug ? currentPinClaim : null;
     try {
+      if (!pinnedClaim) throw new Error('pinned claim changed; inspect the current holder');
       const target = `refs/remotes/origin/${flags.branch}`;
       git(['fetch', '--quiet', 'origin', `+refs/heads/${flags.branch}:${target}`], dir);
       const tip = git(['rev-parse', '--verify', target], dir).trim();
       if (!/^[a-f0-9]{40}$/.test(tip) || tip !== flags.at) throw new Error('--at must equal the fetched origin branch tip; inspect the branch and retry');
       git(['cat-file', '-e', `${flags.at}^{commit}`], dir);
       git(['checkout', '--detach', flags.at, '--quiet'], dir);
+      if (!flags['no-install']) ensureDeps(dir);
       journalLaneEvent(dir, { action: 'acquire-detach', headAfter: laneHead(dir), reason: `pinned ${flags.branch} at ${flags.at}` });
     } catch (e) {
       // All target checks precede checkout; restore main even if checkout partially failed.
       try {
+        if (!sameLease(readLease(dir), pinnedClaim)) throw new Error('pinned rollback lease changed; inspect the current holder');
         git(['checkout', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
         journalLaneEvent(dir, { action: 'acquire-rollback', headAfter: laneHead(dir), reason: 'pinned target refused' });
       }
-      finally { restoreLeaseAfterRefusedClaim(dir, preClaimLease); }
+      finally {
+        if (takeMarkerIf(dir, moved => sameLease(moved, pinnedClaim), chosen)
+          && preClaimLease && !isLeaseStale(preClaimLease, Date.now(), ttlMsFromFlags())) {
+          try { writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preClaimLease, null, 2) + '\n', { exclusive: true }); } catch { /* replacement holder wins */ }
+        }
+      }
       fail(msgOf(e));
     }
   }
@@ -3959,7 +3969,11 @@ async function cmdRelease(repo) {
         continue;
       }
       try {
-        git(['checkout', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
+        if (git(['rev-parse', '--verify', 'HEAD'], dir).trim() !== lease.at) throw new Error('pinned HEAD moved; inspect the lane before release');
+        const dirty = git(['status', '--porcelain', '--untracked-files=all'], dir).trim();
+        if (dirty && !flags.discard) throw new Error('pinned lane has new work; inspect it or release with --discard');
+        if (!sameLease(readLease(dir), lease)) throw new Error('lease changed before pinned checkout; inspect the current holder');
+        git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
         journalLaneEvent(dir, { action: 'release-reset', headAfter: laneHead(dir), reason: 'return pinned lease to integration branch' });
       } catch (e) {
         kept.push({ lane: n, reason: 'reset-failed', details: msgOf(e) });

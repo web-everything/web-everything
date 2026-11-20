@@ -39,6 +39,19 @@ function fixture(options = {}) {
 }
 
 describe('runner freshness policy', () => {
+  it('scrubs repository redirection and disables lane-config executable helpers on real Git calls', async () => {
+    await withBareOrigin(async ctx => {
+      ctx.git(['config', 'core.fsmonitor', 'false']);
+      ctx.git(['config', 'core.hooksPath', '/does-not-exist']);
+      ctx.git(['config', 'core.sshCommand', 'exit 99']);
+      expect(assertRunnerFreshness({ declaration: resolveOperation('verify').declaration,
+        moduleUrl: pathToFileURL(join(ctx.clone, 'run.mjs')).href }, {
+        env: { ...process.env, GIT_DIR: '/missing-git-dir', GIT_WORK_TREE: '/missing-work-tree',
+          GIT_INDEX_FILE: '/missing-index', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.bare', GIT_CONFIG_VALUE_0: 'true',
+          LANE_POOL_ROOT: join(ctx.tmp, 'pool'), WE_DAEMON_MANAGED_CLONE: '', WE_OPERATION_ALLOW_STALE: '' },
+      })).toEqual({ behind: 0, uncertainty: '' });
+    });
+  });
   it.each(['runner', 'dispatch'])('%s freshness cannot launch automatic maintenance even when the checkout enables it', async kind => {
     await withBareOrigin(async ctx => {
       ctx.git(['config', 'maintenance.auto', 'true']);

@@ -5,6 +5,8 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { isLeaseStale } from '../lib/lane-lease.mjs';
+import { laneGitHardeningEnv, scrubInheritedGitEnv } from '../lib/lane-git-hardening.mjs';
 import { isReadOnlyOperation } from './registry.mjs';
 
 export const FRESHNESS_TTL = 5 * 60_000;
@@ -18,7 +20,7 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
   // Waiting for Git alone does not wait for maintenance it detaches after a fetch.
   git = (args, cwd) => execFileSync('git', ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], {
     cwd, encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+    env: { ...laneGitHardeningEnv(scrubInheritedGitEnv(env)), GIT_OPTIONAL_LOCKS: '0' },
   }),
   diagnostic = (line) => process.stderr.write(`${line}\n`),
 } = {}) {
@@ -41,20 +43,32 @@ export function assertRunnerFreshness({ declaration, moduleUrl, zeroWrites = fal
       lane = parts.length === 2 && parts[0] !== '..' && parts[0] !== '' && /^lane-\d+$/.test(parts[1]);
     } catch { /* A missing pool grants no exemption. */ }
     if (lane && declaration.name === 'open-pr') {
-      // A detached runner must prove its pinned lease against a fresh remote tip.
+      // Read the lease even when attached: attachment cannot bypass a recorded pin.
+      pinnedRunner = true;
+      const leasePath = resolve(root, readGit(['rev-parse', '--git-path', '.lane-lease']));
+      const lease = JSON.parse(filesystem.readFileSync(leasePath, 'utf8'));
+      if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new Error('invalid runner lease; reacquire the lane');
       let attached = '';
-      try { attached = readGit(['symbolic-ref', '--quiet', '--short', 'HEAD']); } catch { /* detached or unreadable: require pin proof */ }
-      if (!attached) {
-        pinnedRunner = true;
-        const leasePath = resolve(root, readGit(['rev-parse', '--git-path', '.lane-lease']));
-        const lease = JSON.parse(filesystem.readFileSync(leasePath, 'utf8'));
-        if (typeof lease.at !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(lease.at)
+      try { attached = readGit(['symbolic-ref', '--quiet', '--short', 'HEAD']); }
+      catch (error) { if (error.status !== 1) throw error; }
+      if (!attached || lease?.at !== undefined || lease?.branch !== undefined) {
+        if (!lease || typeof lease !== 'object' || typeof lease.session !== 'string' || !lease.session
+          || !Number.isFinite(Date.parse(lease.acquiredAt)) || Date.parse(lease.acquiredAt) > now()
+          || (lease.renewedAt !== undefined && (!Number.isFinite(Date.parse(lease.renewedAt)) || Date.parse(lease.renewedAt) > now()))
+          || (lease.ttlMinutes !== undefined && (!Number.isFinite(lease.ttlMinutes) || lease.ttlMinutes <= 0))
+          || lease.reserved || isLeaseStale(lease, now())
+          || typeof lease.at !== 'string' || !/^[a-f0-9]{40}(?![\s\S])/.test(lease.at)
           || typeof lease.branch !== 'string' || !lease.branch.startsWith('lane/')) throw new Error('missing or invalid pinned runner lease; reacquire the lane');
+        if (attached) throw new Error('pinned runner HEAD is attached; reacquire the lane');
         git(['check-ref-format', `refs/heads/${lease.branch}`], root);
         head = readGit(['rev-parse', '--verify', 'HEAD']);
         if (head !== lease.at) throw new Error('pinned runner lease at differs from HEAD; reacquire the lane');
         const target = `refs/remotes/origin/${lease.branch}`;
         readGit(['fetch', '--quiet', 'origin', `+refs/heads/${lease.branch}:${target}`]);
+        let symbolic = false;
+        try { git(['symbolic-ref', '-q', target], root); symbolic = true; }
+        catch (error) { if (error.status !== 1) throw error; }
+        if (symbolic) throw new Error('pinned runner tracking ref is symbolic; reacquire the lane');
         if (readGit(['rev-parse', '--verify', target]) !== lease.at) throw new Error('pinned runner branch tip moved; reacquire the lane');
       }
     }
