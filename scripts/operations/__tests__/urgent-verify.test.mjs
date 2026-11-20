@@ -368,7 +368,8 @@ describe('CI gate mirroring fails closed', () => {
   it.each([
     ['merge', 'npm run coverage:merge -- coverage-shards --threshold=80 --expect=9'],
     ['lint', 'node scripts/lint-host-paths.mjs'],
-    ['integration', 'npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")'],
+    ['integration', 'npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")'],
+    ['integration timings upload', 'name: timing-integration-${{ matrix.group }}'],
     ['upload', 'path: web-everything/coverage/coverage-final.json'],
     ['download', 'pattern: coverage-shard-*'],
   ])('refuses changed %s before running suites', (_, command) => {

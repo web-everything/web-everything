@@ -505,7 +505,17 @@ jobs:
         working-directory: web-everything
         env:
           WE_INTEGRATION_GROUP: ${{ matrix.group }}
-        run: npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")
+        run: npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")
+
+      # Per-file timing evidence only; missing reports never gate CI. One artifact per matrix group
+      # (upload-artifact@v4 refuses a duplicate name across matrix legs).
+      - name: Upload integration timings
+        if: ${{ needs.changes.outputs.light != 'true' && (always()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-integration-${{ matrix.group }}
+          path: web-everything/coverage/timing-integration-${{ matrix.group }}.json
+          if-no-files-found: ignore
 
   integration:
     needs: [changes, integration-part]
