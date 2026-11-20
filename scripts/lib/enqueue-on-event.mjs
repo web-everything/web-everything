@@ -412,6 +412,13 @@ export function catchUpSkipReason(pr, defaultBranch = 'main') {
   return null;
 }
 
+/** A check run is finished when it carries a conclusion or a real completedAt, whatever a stale `status` says (#7112). */
+function checkRunUnfinished(c) {
+  if (!c?.status || c.status === 'COMPLETED') return false;
+  if (c.conclusion) return false;
+  return !(c.completedAt && !String(c.completedAt).startsWith('0001-'));
+}
+
 /**
  * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly
  * no-op (a fast drain lists and classifies for ~1 min, and most green-check events are for PRs that are not queued yet
@@ -429,7 +436,7 @@ export function wakeWorthy(pr, defaultBranch = 'main') {
   if (hold) return { wake: false, reason: hold };
   if (!labels.includes(READY_LABEL)) return { wake: false, reason: `no ${READY_LABEL} label yet` };
   const running = (Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [])
-    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : c?.status && c.status !== 'COMPLETED'));
+    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : checkRunUnfinished(c)));
   if (running.length) return { wake: false, reason: `${running.length} check(s) still running (${running.slice(0, 3).map((c) => c.name || c.context).join(', ')})` };
   return { wake: true, reason: 'ready-to-merge, every check finished' };
 }
