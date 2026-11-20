@@ -11,7 +11,7 @@ const live = 'b'.repeat(40);
 const mk = (body, t) => ({ author: { login: AUTOMATION_LOGINS[0] }, createdAt: t, body });
 const named = scenario === 'later-verdict' ? live : 'a'.repeat(40);
 const comments = [mk('review paused: head ' + named + ' was already reviewed\\n\\nWaiting on your ruling (block, card or not-real):\\n- \`src/a.mjs:5\` — x\\n\\n<!-- review-referral-hold: a1b5166bcd74 -->', '2026-11-19T22:05:00Z')];
-if (scenario === 'later-verdict') comments.push(mk('🔁 review — changes requested\\n\\n- \`src/a.mjs:5\` — not real', '2026-11-19T23:00:00Z'));
+if (scenario === 'later-verdict') comments.push(mk('🔁 review — changes requested\\n\\nhead ' + live + '\\n-\`src/a.mjs:5\` — not real', '2026-11-19T23:00:00Z'));
 process.stdout.write(JSON.stringify(detectRoundCap({ comments, pr: 14, head: live, state: 'at-round-limit', repo: 'web-everything/web-everything' })));`;
 
 function probe(root, scenario = 'stale-head') {

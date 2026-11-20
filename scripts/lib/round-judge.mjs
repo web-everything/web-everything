@@ -138,14 +138,16 @@ export function extractRounds(comments, pr) {
 function holdSettled(list, holdIdx, live) {
   const named = /^review paused: head ([0-9a-f]{7,40})\b/i.exec(bodyOf(list[holdIdx]).trimStart())?.[1]?.toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(live)) return false; // an unreadable live head never settles
-  if (named && !live.startsWith(named)) return true;
+  if (!named) return false; // a hold that names no readable head is never settled
+  if (!live.startsWith(named)) return true;
   // A later reviewer changes-requested comment for THIS head (not a mechanical bounce, not another head's) settles it.
   return list.slice(holdIdx + 1).some((c) => {
     if (!isTrustedMarkerAuthor(c)) return false;
     const b = bodyOf(c).trimStart();
     if (!b.startsWith('🔁 review — changes requested') || /Recorded by /i.test(b.slice(0, 400))) return false;
-    const heads = b.match(/\b[0-9a-f]{40}\b/gi) ?? [];
-    return heads.every((x) => x.toLowerCase() === live);
+    // It must name this head in full, and no other head (any 7+ hex run) at all.
+    const heads = (b.match(/\b[0-9a-f]{7,40}\b/gi) ?? []).map((x) => x.toLowerCase());
+    return heads.includes(live) && heads.every((x) => live.startsWith(x));
   });
 }
 
