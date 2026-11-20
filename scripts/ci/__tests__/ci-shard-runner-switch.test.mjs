@@ -30,9 +30,9 @@ describe('ci.yml test-shard runner switch (#5027)', () => {
     for (const name of ['test', 'changes', 'daemon-soak-scope', 'soak-shard']) expect(jobs[name]).toBeDefined();
   });
 
-  it('keeps 25 shards on a single matrix axis, with 24 coverage shards', () => {
+  it('keeps 10 shards on a single matrix axis, with 9 coverage shards (R1104 spend bound)', () => {
     const matrix = jobs['test-shard'].strategy.matrix;
     expect(Object.keys(matrix)).toEqual(['shard']);
-    expect(matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+    expect(matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   });
 });
