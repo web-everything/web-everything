@@ -415,9 +415,11 @@ export function catchUpSkipReason(pr, defaultBranch = 'main') {
 /** A check run is finished when it carries a conclusion or a real completedAt, whatever a stale `status` says (#7112). */
 function checkRunUnfinished(c) {
   if (!c?.status || c.status === 'COMPLETED') return false;
-  if (c.conclusion) return false;
-  return !(c.completedAt && !String(c.completedAt).startsWith('0001-'));
+  if (CHECK_CONCLUSIONS.has(String(c.conclusion ?? '').toUpperCase())) return false;
+  const done = typeof c.completedAt === 'string' ? Date.parse(c.completedAt) : NaN;
+  return !(Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z') && done <= Date.now() + 60_000);
 }
+const CHECK_CONCLUSIONS = new Set(['SUCCESS', 'FAILURE', 'CANCELLED', 'TIMED_OUT', 'NEUTRAL', 'SKIPPED', 'STALE', 'STARTUP_FAILURE', 'ACTION_REQUIRED']);
 
 /**
  * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly

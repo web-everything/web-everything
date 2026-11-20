@@ -461,6 +461,11 @@ describe('wakeWorthy — a wake filter, never the gate', () => {
     expect(roll({ status: 'IN_PROGRESS', conclusion: '', completedAt: '0001-01-01T00:00:00Z' }).wake).toBe(false);
     expect(roll({ status: 'IN_PROGRESS', conclusion: null }).wake).toBe(false);
     expect(roll({ status: 'QUEUED', conclusion: '' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: 'UNKNOWN' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', conclusion: ' ' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', completedAt: 'garbage' }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', completedAt: true }).wake).toBe(false);
+    expect(roll({ status: 'IN_PROGRESS', completedAt: '2999-01-01T00:00:00Z' }).wake).toBe(false);
     // a failure with a stale status is completed, and its conclusion is not rewritten into a pass
     const failed = { __typename: 'CheckRun', name: 'x', status: 'IN_PROGRESS', conclusion: 'FAILURE' };
     expect(wakeWorthy({ ...READY_PR, statusCheckRollup: [failed] }).wake).toBe(true);
