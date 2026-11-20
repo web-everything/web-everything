@@ -9,7 +9,7 @@ import { rollbackToGood } from '../rebuild.mjs';
 import { writeRebuildState, readRebuildState } from '../state.mjs';
 import { runHotPatchTick, hotPatchLedgerPath, HOT_PATCH_ALLOWLIST, HOT_PATCH_OVERLAY_REASON } from '../../hot-patch.mjs';
 
-it('R3.9 after rollback, origin/main merging rejected SHA is refused with HEAD unchanged and needs-you event', async () => {
+it.each(['merge', 'squash', 'unreadable'])('R3.9 after rollback, %s rejection evidence refuses adoption with HEAD unchanged and needs-you event', async mode => {
   const home = mkdtempSync(join(tmpdir(), 'hot-patch-rejected-'));
   const root = join(home, 'clone');
   mkdirSync(root);
@@ -29,7 +29,14 @@ it('R3.9 after rollback, origin/main merging rejected SHA is refused with HEAD u
     writeFileSync(path, '// patch\n'); git(['commit', '-qam', 'patch']);
     const sha = git(['rev-parse', 'HEAD']);
     git(['checkout', 'main']); git(['merge', '--no-ff', 'lane/repair', '-m', 'merge rejected patch']);
-    const merged = git(['rev-parse', 'HEAD']);
+    let merged = git(['rev-parse', 'HEAD']);
+    if (mode === 'squash') {
+      git(['reset', '--hard', good]);
+      git(['cherry-pick', '--no-commit', sha]);
+      git(['commit', '-qm', 'equivalent squash on main']);
+      merged = git(['rev-parse', 'HEAD']);
+      expect(merged).not.toBe(sha);
+    }
     git(['reset', '--hard', sha]);
     const preGood = { head: good, mainSha: good, inputsKey: 'c'.repeat(40), applied: [] };
     writeRebuildState(root, { adopted: { head: sha, mainSha: good, inputsKey: 'd'.repeat(40), applied: [] } }, env);
@@ -48,6 +55,7 @@ it('R3.9 after rollback, origin/main merging rejected SHA is refused with HEAD u
       rollbackToGood: (good, context) => rollbackToGood({ root, env, run, good, expectHead: context.expectHead }),
     });
     expect(git(['rev-parse', 'HEAD'])).toBe(good);
+    if (mode === 'unreadable') writeFileSync(join(env.WE_DAEMON_STATE_DIR, 'hot-patch-rejected.json'), '{bad');
     git(['update-ref', 'refs/remotes/origin/main', merged]);
     const result = await finalizeRebuild({ root, env, run, now: Date.now,
       prevHead: good, lease: { token: 'main-sync-after-rollback' },

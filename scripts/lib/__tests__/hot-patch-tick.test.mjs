@@ -210,12 +210,21 @@ test('lost tick lock after overlay removal stops rollback and retirement', fixtu
   assert.equal(f.rollbacks.length, 0);
   assert(readHotPatch(f.env).rollbackPending);
 }));
-for (const source of ['remote', 'tracking', 'applied', 'missing tracking', 'missing applied']) {
+test('pre-adoption monitoring preserves a registered patch while HEAD and adopted state are preGood', fixture(async f => {
+  f.git(['reset', '--hard', f.good]);
+  await f.tick({ readRebuildState: () => ({ adopted: f.preGood }) });
+  assert.deepEqual(readHotPatch(f.env), f.record);
+  assert.deepEqual(f.overlays(), [f.overlay]);
+  assert.deepEqual(f.rollbacks, []);
+  assert(!existsSync(join(f.env.WE_DAEMON_STATE_DIR, 'hot-patch-rejected.json')));
+}));
+
+for (const source of ['remote', 'tracking', 'applied', 'missing tracking']) {
   test(`${source} SHA mismatch gives overlay-sha-moved and removes before rollback`, fixture(async f => {
     if (source === 'remote') f.git(['update-ref', `refs/heads/${f.record.branch}`, f.good], f.remote);
     if (source === 'tracking') f.git(['update-ref', `refs/remotes/origin/${f.record.branch}`, f.good]);
     if (source === 'missing tracking') f.git(['update-ref', '-d', `refs/remotes/origin/${f.record.branch}`]);
-    const options = source === 'missing applied' ? { readRebuildState: () => ({ adopted: { applied: [] } }) } : source === 'applied'
+    const options = source === 'applied'
       ? { readRebuildState: () => ({ adopted: { applied: [{ ref: f.record.branch, sha: f.good }] } }) } : {};
     let reason;
     await f.tick({ ...options, removeOverlay: async () => {
@@ -393,3 +402,15 @@ for (const retirement of ['rollback', 'merged']) {
       new RegExp(`${f.record.branch}.*(?:retain|left|audit)|(?:retain|left|audit).*${f.record.branch}`, 'i'));
   }));
 }
+
+
+for (const clone of [null, 'foreign']) test(`orphan recovery refuses ${clone} clone identity in the ticking store`, fixture(async f => {
+  writeFileSync(hotPatchLedgerPath(f.env), '{bad');
+  mkdirSync(f.env.WE_DAEMON_OVERLAY_DIR, { recursive: true });
+  const path = overlayFilePath(f.root, f.env);
+  const payload = JSON.stringify({ clone: clone === null ? null : join(f.home, 'foreign'), overlays: [f.overlay] });
+  writeFileSync(path, payload);
+  await assert.rejects(() => f.tick({ readOverlays: undefined }), /clone mismatched/);
+  assert.equal(readFileSync(path, 'utf8'), payload);
+  assert.deepEqual(f.rollbacks, []);
+}));

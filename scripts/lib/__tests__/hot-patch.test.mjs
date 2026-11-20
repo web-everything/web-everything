@@ -492,3 +492,24 @@ test('request registration composes A after the actual PR branch advances to B',
     { cwd: f.root, env: f.env, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
   assert.equal(containsB.status, 1, containsB.stderr);
 }));
+
+
+test('ruleset evidence over 100 rules refuses with an operator protection-repair fallback', fixture(async f => {
+  await assert.rejects(() => requestHotPatch({ ...f.request, ghJson: async args => {
+    if (args.some(a => a.includes('/rules/branches/'))) return Array.from({ length: 101 }, (_, i) =>
+      ({ type: ['update', 'deletion', 'non_fast_forward'][i % 3], ruleset_id: 27726920 }));
+    return f.request.ghJson(args);
+  } }), /operator must repair protection/);
+  assert(!f.effects.includes('overlay')); assert(!f.effects.includes('rebuild'));
+}));
+
+test('rejection containment over 512 commits requires operator inspection without accepting the target', fixture(async f => {
+  writeFileSync(join(f.env.WE_DAEMON_STATE_DIR, 'hot-patch-rejected.json'), JSON.stringify([
+    { sha: f.sha, patchId: 'd'.repeat(40), pr: 42, reason: 'ci-red', at: new Date(at).toISOString() },
+  ]));
+  assert.throws(() => hotPatch.rejectionBlocks(f.env, f.good, args => {
+    if (args[0] === 'merge-base') return f.good;
+    assert.equal(args[0], 'rev-list'); assert(args.includes('--max-count=513'));
+    return Array(513).fill(f.good).join('\n');
+  }), /operator must inspect history/);
+}));

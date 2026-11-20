@@ -268,7 +268,7 @@ describe('rebuildClone coordination events', () => {
       'diff-unknown', 'dirty', 'disabled', 'dispatch-smoke', 'executable-or-runtime-file-change',
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
-      'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
+      'harness-broken-adopted-not-worse', 'held-after-rollback', 'hot-patch-rejected', 'imported-change', 'in-main',
       'index-locked', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
@@ -282,6 +282,7 @@ describe('rebuildClone coordination events', () => {
       'stack-contained', 'state-file-busy', 'superseded-live-set-unknown', 'superseded-omits-live-overlay',
       'swapped', 'switch-busy', 'touches-dispatch-path', 'unaudited-tip-held', 'unknown', 'unsafe-ref',
       'untracked-collision', 'unverified-build', 'up-to-date',
+      'Unsupported hot-patch repository', // CI diagnostic; the hot-patch watcher emits its own operator event.
     ]);
     const reasons = new Set();
     function collect(expression) {

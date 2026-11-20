@@ -1,6 +1,7 @@
 /** @file scripts/lib/daemon-rebuild/rebuild.mjs — `rebuildClone`, the IO shell that runs the three phases
  * (locked prepare → unlocked candidate smoke → locked finalize). Split out of daemon-rebuild.mjs (move-only).
- * Force-adopt and owning-clone hot-patch watches share the locked rollback finalizer after each daemon tick.
+ * Owning-clone hot-patch monitoring runs before prepare; force-adopt monitoring runs after the tick.
+ * Both watches share the locked rollback finalizer.
  * The design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 
@@ -16,10 +17,10 @@ import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
-import { runHotPatchTick } from '../hot-patch.mjs';
+import { runHotPatchTick, cleanHotPatchEnv, hotPatchEasternTime } from '../hot-patch.mjs';
 import { hotPatchCiVerdict, requiredChecksForMain } from '../hot-patch-ci.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
-import { readOverlays, readOverlayState, removeOverlay } from '../daemon-overlays.mjs';
+import { readOverlayState, removeOverlay } from '../daemon-overlays.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
 import { isGithubRemoteFor } from '../git-pr-commits.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
@@ -113,7 +114,9 @@ function trustedIgnoreOwners(raw, spawnerOwners, log) {
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
   const startedAtMs = Date.now();
+  const hotPatchAlert = await hotPatchWatch(options, emitEvent);
   const result = await rebuildCloneInternal(options);
+  if (hotPatchAlert) result.alerts = [...(result.alerts ?? []), hotPatchAlert];
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -136,7 +139,6 @@ export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options }
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
   await forceWatch(options, emitEvent, startedAtMs);
-  await hotPatchWatch(options, emitEvent);
   return result;
 }
 
@@ -194,10 +196,10 @@ async function hotPatchWatch(options, emitEvent) {
     const git = makeGit({ run, cwd: root, env });
     const repo = 'web-everything/web-everything';
     const ghJson = args => JSON.parse(runGhSync(args, {
-      cwd: root, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
+      cwd: root, env: cleanHotPatchEnv(env), encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024,
     }));
     await runHotPatchTick({
-      root, env: stEnv, now,
+      root, env: stEnv, now, log, run: (_cmd, args, opts) => run(args, opts),
       ciVerdict: record => {
         const origin = git(['remote', 'get-url', 'origin']);
         if (origin.status !== 0 || !isGithubRemoteFor(origin.stdout, repo))
@@ -213,8 +215,10 @@ async function hotPatchWatch(options, emitEvent) {
       }),
       removeOverlay,
       readOverlays: target => {
-        if (readOverlayState(target, { env: stEnv }).corrupt) throw Error('hot-patch overlay state unreadable');
-        return readOverlays(target, { env: stEnv });
+        const state = readOverlayState(target, { env: stEnv });
+        if (state.corrupt || (state.overlays.length && (typeof state.clone !== 'string' || cloneKeyOf(state.clone) !== cloneKeyOf(target))))
+          throw Error('hot-patch overlay state unreadable or clone mismatched');
+        return state.overlays;
       },
       readHead: () => verifyRev(git, 'HEAD'),
       headContains: sha => {
@@ -226,7 +230,14 @@ async function hotPatchWatch(options, emitEvent) {
         hotPatchRollbackLock.run({ key: cloneKeyOf(target), stillHeld }, () => fn(stillHeld)), opts),
       emit: event => emitEvent(event, { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } }),
     });
-  } catch { /* a watch failure never changes the rebuild outcome */ }
+  } catch (error) {
+    const detail = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+    log.error?.(`${hotPatchEasternTime(typeof now === 'function' ? now() : now)} ET ALERT hot-patch tick failed: ${detail}; operator must repair evidence`);
+    try {
+      await emitEvent({ kind: 'hot-patch-needs-you', daemon: basename(root), detail }, { env: stEnv });
+    } catch { /* Preserve the rebuild outcome even if the event sink is unavailable. */ }
+    return { kind: 'hot-patch-tick-failed', detail };
+  }
 }
 
 /** Default health probe: the clone's tracked tree is intact and its entry module still loads. A crash-loop signal

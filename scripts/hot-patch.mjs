@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 /**
  * @file hot-patch.mjs — bounded hot-patch request and global status CLI (ET timestamps).
- * Usage: node scripts/hot-patch.mjs request --daemon=<clone> --pr=<n> | status
+ * Usage: node scripts/hot-patch.mjs request --daemon=<clone> --pr=<n> | status | clear-rejection --sha=<sha>
  * Admission uses the shared helper's real defaults; refusals require evidence repair
  * or ordinary delivery. Status includes the ledger, current overlay and force-watch.
  */
+import { writeFileSync, renameSync, rmSync } from 'node:fs';
+import { withWriteLock } from './lib/daemon-clone-lock.mjs';
+import { stateDir } from './lib/daemon-rebuild/state.mjs';
+import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { parseArgs } from 'node:util';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { requestHotPatch, readHotPatch } from './lib/hot-patch.mjs';
+import { requestHotPatch, readHotPatch, readRejected, hotPatchLedgerPath } from './lib/hot-patch.mjs';
 import { forcedWatchStatus, readForceWatch } from './lib/daemon-force-adopt.mjs';
 import { readOverlayState } from './lib/daemon-overlays.mjs';
 import { DAEMON_CLONE_SEED, daemonCloneForLabel } from './lib/daemon-clone-registry.mjs';
@@ -43,11 +47,30 @@ export async function main(argv = process.argv.slice(2), { cwd = process.cwd(), 
   request = requestHotPatch, stdout = s => process.stdout.write(s), stderr = s => process.stderr.write(s) } = {}) {
   try {
     const [command, ...args] = argv;
-    if (!['request', 'status'].includes(command)) throw new Error('expected request or status');
+    if (!['request', 'status', 'clear-rejection'].includes(command)) throw new Error('expected request, status or clear-rejection');
     const { values: f } = parseArgs({ args, options: command === 'request'
-      ? { daemon: { type: 'string' }, pr: { type: 'string' } } : {} });
+      ? { daemon: { type: 'string' }, pr: { type: 'string' } } : command === 'clear-rejection' ? { sha: { type: 'string' } } : {} });
     let result;
-    if (command === 'status') {
+    if (command === 'clear-rejection') {
+      if (!/^[a-f0-9]{40}$/.test(f.sha ?? '')) throw Error('--sha requires a full 40-hex SHA');
+      const cleared = await withWriteLock(hotPatchLedgerPath(env), async stillHeld => {
+        const records = readRejected(env), next = records.filter(r => r.sha !== f.sha);
+        const path = join(stateDir(env), 'hot-patch-rejected.json'), tmp = `${path}.${process.pid}.tmp`;
+        if (!stillHeld()) throw Error('hot-patch rejection lock lost; operator retry required');
+        if (next.length !== records.length) {
+          try { writeFileSync(tmp, JSON.stringify(next), { flag: 'wx' }); renameSync(tmp, path); }
+          finally { rmSync(tmp, { force: true }); }
+          if (!stillHeld() || JSON.stringify(readRejected(env)) !== JSON.stringify(next))
+            throw Error('hot-patch rejection clear not durable; operator repair required');
+        }
+        const at = easternIso(Date.now());
+        await appendDaemonEvent({ kind: 'hot-patch-rejection-cleared', detail: { sha: f.sha, at, operator: true } }, { env });
+        return { sha: f.sha, cleared: records.length - next.length, at };
+      }, { lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT, waitMs: 15000 });
+      if (!cleared.ok) throw Error('hot-patch rejection lock unavailable; operator retry required');
+      stdout(`${cleared.value.at} ET operator cleared hot-patch rejection ${f.sha} (${cleared.value.cleared})\n`);
+      return 0;
+    } else if (command === 'status') {
       const ledger = readHotPatch(env);
       if (!ledger) { stdout('no hot-patch open\n'); return 0; }
       const state = readOverlayState(ledger.root, { env });

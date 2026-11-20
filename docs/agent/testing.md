@@ -5528,3 +5528,16 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+
+## Hot-patch immutable-ref fixtures (R1100)
+
+The Node hot-patch suites use real local Git repositories and bare remotes; admission injects
+GitHub evidence and transport so no live protection mutation is needed. Keep remote, tracking,
+and adopted-SHA mismatches separate. Rebuild refusal covers both ancestry and patch-equivalent
+squashes, plus unreadable rejection evidence. In Vitest 1, async mock results may already contain
+the settled value: `expect(await mock.mock.results[n].value)` checks either representation.
+
+Before first adoption, a registered hot patch has no adopted entry: monitoring must preserve its
+ledger and overlay while HEAD is `preGood`, then reach rebuild preparation. Keep this lifecycle
+regression alongside the remote, tracking, and existing-adopted-entry mismatch refusal cases.

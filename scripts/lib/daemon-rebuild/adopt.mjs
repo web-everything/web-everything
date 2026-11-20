@@ -13,6 +13,8 @@ import { releaseBuildLease } from './lease.mjs';
 import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
+import { rejectionBlocks, hotPatchEasternTime } from '../hot-patch.mjs';
+import { appendDaemonEvent } from '../daemon-events.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 
 const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
@@ -432,6 +434,22 @@ async function finalizeRebuildLocked({
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
+
+  // Durable hot-patch rejections also apply when the patch returns through main or a squash.
+  // Unknown containment evidence holds the last good build for operator repair.
+  let hotPatchRejection = null;
+  try {
+    if (rejectionBlocks(stEnv, plan.finalSha, git)) hotPatchRejection = 'rejected SHA or equivalent patch';
+  } catch (error) {
+    hotPatchRejection = String(error?.message || error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
+  }
+  if (hotPatchRejection) {
+    const detail = { target: plan.finalSha, reason: hotPatchRejection, message: 'holding last good; operator must inspect or clear the hot-patch rejection' };
+    alert('hot-patch-rejected', detail);
+    log?.error?.(`${hotPatchEasternTime(nowMs())} ET hot-patch-rejected: ${JSON.stringify(detail)}`);
+    await appendDaemonEvent({ kind: 'hot-patch-needs-you', detail }, { env: stEnv });
+    return terminal({ moved: false, reason: 'hot-patch-rejected', plan });
   }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either

@@ -3,7 +3,7 @@
  * @description Exact-SHA hot-patch CI evidence from required jobs on mapped Actions workflows.
  * GitHub reads are injected; unreadable or ambiguous evidence is unknown, never green.
  */
-import { readRequiredStatusChecksDetailed, FALLBACK_REQUIRED_STATUS_CHECKS } from './required-status-checks.mjs';
+import { readRequiredStatusChecksDetailed } from './required-status-checks.mjs';
 
 export const REQUIRED_CHECK_WORKFLOW = Object.freeze({
   test: '.github/workflows/ci.yml',
@@ -15,23 +15,20 @@ const REPO = 'web-everything/web-everything';
 const validId = id => ['string', 'number'].includes(typeof id) && /^[1-9][0-9]*$/.test(String(id))
   && (typeof id !== 'number' || Number.isSafeInteger(id));
 
-/** Read main's required names, retaining the declared policy when the read is unavailable. */
+/** Unreadable or degraded policy cannot authorize a hot patch. */
 export function requiredChecksForMain(read = readRequiredStatusChecksDetailed) {
-  const fallbackUnion = partial => [...new Set([...FALLBACK_REQUIRED_STATUS_CHECKS,
-    ...(Array.isArray(partial) ? partial.filter(name => typeof name === 'string' && name.length) : [])])];
   try {
-    const { checks, partialChecks } = read({ repo: REPO, branch: 'main' });
-    if (Array.isArray(partialChecks)) return fallbackUnion([...partialChecks, ...(Array.isArray(checks) ? checks : [])]);
-    if (Array.isArray(checks) && checks.length && checks.every(name => typeof name === 'string' && name.length))
-      return checks;
-    return fallbackUnion(checks);
-  } catch (error) { return fallbackUnion(error?.partialChecks); }
+    const { checks, partialChecks, source } = read({ repo: REPO, branch: 'main' });
+    if (partialChecks !== undefined || (source !== undefined && !['live', 'cache'].includes(source))) return null;
+    return Array.isArray(checks) && checks.length && checks.every(name => typeof name === 'string' && name.length)
+      ? checks : null;
+  } catch { return null; }
 }
 
 class IncompleteCiEvidence extends Error {}
 
 /** At most ten 100-item pages per collection; incomplete evidence never authorizes green. */
-async function readPages(fetchJson, path, key) {
+async function readPages(fetchJson, path, key, observe = () => {}) {
   const items = [];
   let total;
   for (let page = 1; page <= 10; page++) {
@@ -41,6 +38,7 @@ async function readPages(fetchJson, path, key) {
       if (!Number.isSafeInteger(payload.total_count) || payload.total_count < 0) throw new IncompleteCiEvidence('Invalid Actions total; inspect workflows manually');
       total = Math.max(total ?? 0, payload.total_count);
     }
+    observe(payload[key]);
     items.push(...payload[key]);
     if (total !== undefined && items.length >= total) return items;
     if (payload[key].length < 100) {
@@ -53,10 +51,13 @@ async function readPages(fetchJson, path, key) {
 
 /** Evaluate required jobs on each workflow's newest trusted run, ordered by numeric ID. */
 export async function hotPatchCiVerdict({ repo, sha, required, fetchJson } = {}) {
-  const unknown = reason => ({ state: 'unknown', reason });
+  let pending = false, red = false;
+  const unknown = reason => red
+    ? { state: 'red', reason: 'A required Actions job completed without success' }
+    : { state: 'unknown', reason };
   if (repo !== REPO) return unknown('Unsupported hot-patch repository');
   if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/i.test(sha)) return unknown('Invalid commit SHA');
-  if (!Array.isArray(required) || !required.length) return unknown('Required checks unavailable');
+  if (!Array.isArray(required) || !required.length) return unknown('Required-check policy unreadable');
   if (required.some(name => typeof name !== 'string' || !Object.hasOwn(REQUIRED_CHECK_WORKFLOW, name)))
     return unknown('Required check has no trusted workflow mapping');
   const workflows = new Map();
@@ -65,7 +66,6 @@ export async function hotPatchCiVerdict({ repo, sha, required, fetchJson } = {})
     if (!workflows.has(path)) workflows.set(path, []);
     workflows.get(path).push(name);
   }
-  let pending = false, red = false;
   try {
     for (const [workflow, names] of workflows) {
       const filename = workflow.split('/').at(-1);
@@ -89,13 +89,18 @@ export async function hotPatchCiVerdict({ repo, sha, required, fetchJson } = {})
       candidates.sort((a, b) => a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
       if (!candidates.length) return unknown('No trusted exact-SHA Actions run');
       const { run } = candidates[0];
-      const allJobs = await readPages(fetchJson, `/repos/${repo}/actions/runs/${run.id}/jobs`, 'jobs');
+      const allJobs = await readPages(fetchJson, `/repos/${repo}/actions/runs/${run.id}/jobs`, 'jobs', jobs => {
+        // Preserve trusted red evidence even when a subsequent jobs page is unavailable.
+        if (jobs.some(job => names.includes(job?.name) && job.status === 'completed'
+          && typeof job.conclusion === 'string' && job.conclusion.length && job.conclusion !== 'success')) red = true;
+      });
       for (const name of names) {
         const jobs = allJobs.filter(job => job?.name === name);
         if (!jobs.length) { pending = true; continue; }
         for (const job of jobs) {
           if (typeof job.status !== 'string' || !job.status.length) return unknown('Required job status unreadable');
-          if (job.status !== 'completed') { pending = true; continue; }
+          if (['queued', 'in_progress', 'waiting', 'requested', 'pending'].includes(job.status)) { pending = true; continue; }
+          if (job.status !== 'completed') return unknown('Required job status unreadable');
           if (typeof job.conclusion !== 'string' || !job.conclusion.length)
             return unknown('Completed required job conclusion unreadable');
           if (job.conclusion !== 'success') red = true;

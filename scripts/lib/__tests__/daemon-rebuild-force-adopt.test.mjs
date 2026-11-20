@@ -988,6 +988,41 @@ describe('shared hot-patch rollback wiring', () => {
     expect(readFileSync(hotPatchLedgerPath(env), 'utf8')).toBe('{corrupt');
   });
 
+  it('registered not-yet-adopted patch survives monitoring and reaches rebuild preparation', async () => {
+    const { cloneDir, env, sha, good, overlay } = isolationFixture();
+    const record = { ...readHotPatch(env), loadedAt: new Date().toISOString() };
+    writeFileSync(hotPatchLedgerPath(env), JSON.stringify(record));
+    gitOk(cloneDir, ['reset', '--hard', good]);
+    writeRebuildState(cloneDir, { ...readRebuildState(cloneDir, env), adopted: record.preGood }, env);
+    gitOk(cloneDir, ['update-ref', `refs/remotes/origin/${record.branch}`, sha]);
+    const actualTick = hotPatchModule.runHotPatchTick, probes = [];
+    const watch = vi.spyOn(hotPatchModule, 'runHotPatchTick').mockImplementation(options => actualTick({
+      ...options, ciVerdict: async () => ({ state: 'pending' }),
+      prState: async () => ({ state: 'OPEN', headRefOid: sha }),
+      run: (cmd, args, opts) => {
+        if (cmd === 'git' && args.includes('ls-remote')) {
+          probes.push(args); return { status: 0, stdout: `${sha}\trefs/heads/${record.branch}\n`, stderr: '' };
+        }
+        return spawnSync(cmd, args, { ...opts, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+      },
+    }));
+    const prepare = vi.spyOn(prepareModule, 'prepareRebuild').mockImplementation(() => {
+      expect(probes).toHaveLength(1);
+      expect(headOf(cloneDir)).toBe(good);
+      expect(readRebuildState(cloneDir, env).adopted).toEqual(record.preGood);
+      expect(readHotPatch(env)).toEqual(record);
+      expect(readOverlays(cloneDir, { env })).toEqual([overlay]);
+      expect(existsSync(join(env.WE_DAEMON_STATE_DIR, 'hot-patch-rejected.json'))).toBe(false);
+      return { terminal: true, result: { reason: 'test-pre-adoption-prepare' } };
+    });
+    try {
+      const result = await tick(cloneDir, env, { versions: null, adoptOnly: true, emitEvent: async () => true });
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(result.reason).toBe('test-pre-adoption-prepare');
+      expect(result.alerts ?? []).toEqual([]);
+    } finally { watch.mockRestore(); prepare.mockRestore(); }
+  });
+
   it('remote immutable SHA movement rolls back through the wrapper before prepareRebuild', async () => {
     const { cloneDir, env, sha, good } = isolationFixture();
     const record = readHotPatch(env);

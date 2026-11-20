@@ -178,7 +178,7 @@ describe('hot-patch one-shot wake through the rebuild-job-spaced cooldown', () =
     store.update(queued.id, r => markSucceeded(r, { at: new Date(finished + 120000).toISOString() }));
     expect((await tick(240000, { claimHotPatchWake })).reason).toBe('rebuild-job-spaced');
     expect(claimHotPatchWake).toHaveBeenCalledTimes(2);
-    await expect(claimHotPatchWake.mock.results[1].value).resolves.toBe(false);
+    expect(await claimHotPatchWake.mock.results[1].value).toBe(false);
     expect(create).toHaveBeenCalledTimes(1);
     expect(hotPatch.readHotPatch(env).wokeAt).toBe(wokeAt);
   });

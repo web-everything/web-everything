@@ -12,7 +12,8 @@ const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'hot-patch-cli-')); dirs.push(dir);
-  const env = { WE_DAEMON_STATE_DIR: dir, WE_DAEMON_OVERLAY_DIR: dir };
+  const env = { WE_DAEMON_STATE_DIR: dir, WE_DAEMON_OVERLAY_DIR: dir,
+    WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'), WE_DAEMON_EVENTS: join(dir, 'events.jsonl') };
   let out = '', err = '';
   return { dir, env, io: { env, stdout: s => { out += s; }, stderr: s => { err += s; } },
     output: () => out, error: () => err };
@@ -110,6 +111,11 @@ test('clear-rejection removes only the selected SHA from durable rejection evide
   expect(await main(['clear-rejection', `--sha=${sha}`], f.io)).toBe(0);
   expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual([other]);
   expect(f.error()).toBe('');
+  expect(f.output()).toMatch(/(?:-0[45]:00).*ET operator cleared hot-patch rejection/);
+  expect(f.output()).toContain(sha);
+  expect(JSON.parse(readFileSync(f.env.WE_DAEMON_EVENTS, 'utf8'))).toMatchObject({
+    kind: 'hot-patch-rejection-cleared', detail: { sha, operator: true },
+  });
 });
 test('clear-rejection refuses unreadable evidence without overwriting it', async () => {
   const f = fixture(), path = join(f.dir, 'hot-patch-rejected.json');
@@ -117,4 +123,13 @@ test('clear-rejection refuses unreadable evidence without overwriting it', async
   expect(await main(['clear-rejection', `--sha=${'a'.repeat(40)}`], f.io)).toBe(1);
   expect(f.error()).toMatch(/unreadable|repair/i);
   expect(readFileSync(path, 'utf8')).toBe('{bad');
+});
+
+
+test.each(['', 'short', 'A'.repeat(40)])('clear-rejection refuses invalid exact SHA %s without changing evidence', async sha => {
+  const f = fixture(), path = join(f.dir, 'hot-patch-rejected.json');
+  writeFileSync(path, '[]');
+  expect(await main(['clear-rejection', `--sha=${sha}`], f.io)).toBe(1);
+  expect(f.error()).toMatch(/--sha requires a full 40-hex SHA/);
+  expect(readFileSync(path, 'utf8')).toBe('[]');
 });
