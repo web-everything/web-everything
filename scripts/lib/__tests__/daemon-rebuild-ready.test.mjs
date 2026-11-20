@@ -498,7 +498,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
         .toMatchObject({ reason: 'tick-in-progress' });
       expect(readReadyCandidate(cloneDir, env)?.adopt).toMatchObject({ finalSha: candidate, applied: [] });
     } finally { endTick(); }
-    const retired = { kind: 'auto-retired', ref, tip: sha, actor: OPERATOR_LOGINS[0], reason: 'withdraw fix', at: new Date().toISOString() };
+    const retired = { kind: 'auto-retired', ref, tip: sha, actor: OPERATOR_LOGINS[0], operatorReason: true, reason: 'withdraw fix', at: new Date().toISOString() };
     expect(overlayRetiredByOperator({ ref, sha, events: [added, retired], registered: () => false })).toBe(true);
     const noSmoke = vi.fn(async () => PASS);
     const result = await rebuildClone({

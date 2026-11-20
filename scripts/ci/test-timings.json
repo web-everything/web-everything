@@ -1972,6 +1972,7 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
+  "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
@@ -2022,6 +2023,7 @@
   "scripts/conveyor/soak/breaks/answer-scope-baseline-read-by-reset.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/answered-stand-down-never-redispatched.soak.test.mjs": 99.38,
   "scripts/conveyor/soak/breaks/argon-feature-dispatch.soak.test.mjs": 2.31,
+  "scripts/conveyor/soak/breaks/audited-tip-reads-ops-waiver-store.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/auto-rebase-operator-withdrawal.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/await-verify-delivered-previous-ci-never-retired.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/await-verify-lane-config-executes.soak.test.mjs": 1.33,
@@ -2203,6 +2205,7 @@
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,
+  "scripts/conveyor/soak/breaks/added-seats-concurrent-head-binding.soak.test.mjs": 4.67,
   "scripts/conveyor/soak/breaks/review-timing-refused-review-strands-heal.soak.test.mjs": 8.81,
   "scripts/conveyor/soak/daemon-soak.soak.test.mjs": 450.96,
   "scripts/conveyor/soak/breaks/approved-human-head-review-churn.soak.test.mjs": 1.4,
