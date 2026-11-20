@@ -5680,6 +5680,25 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
 
+## CI workflow self-test (ci-self.yml)
+
+An edit to `ci.yml` is never run by its own PR: the ruleset pins the workflow from main. Before a
+`clear-human` on a workflow edit, run `gh workflow run ci-self.yml --ref <branch>` and cite the green
+run id in the clearance comment. `ci-self.yml` is manual dispatch only and calls the branch's own
+`ci.yml` (`workflow_call`), so checks are named `self / <job>` and never satisfy or shadow the required
+`test`, `smoke` or `daemon-soak`. GitHub only dispatches a workflow that exists on main, so this works
+after the first merge. `scripts/ci/__tests__/ci-self-workflow.test.mjs` parses the YAML to keep the
+contract (triggers, local call, no required-name collision). Merge-gate enforcement is a later card.
+
+## File-item card publication replay
+
+Keep validated card content and the UTC batch date in the persisted publication payload.
+Test warning stops through the CLI with a JSON-round-tripped run store: publication stays
+retryable on `--resume` while the guarded write and queue effects remain applied. Read
+NUL-delimited Git paths without trimming; leading whitespace is part of the path.
+For an existing daily batch, validate its diff from the shared main ancestor, not
+from the moving `origin/main` tip. Cover independent main advancement and a lane refresh
+between two same-day publications.
 ## Lane reset safety probe regressions
 
 `lane-pool-acquire-reset-probe-failed.test.mjs` uses a PATH Git shim activated after fetch
@@ -5698,3 +5717,20 @@ Unknown subprocesses still fail the harness even when a best-effort reader catch
 the CLI's `gh-error` exit; `merge-ai-prs-prestage.test.mjs` covers paged heavy reads and enqueue gates.
 Use `keepAliveScript` for the hung-gh timeout fixture in `drain-gh-async.test.mjs` so it
 stays anchored to the test runner with a maximum lifetime if timeout cleanup is interrupted.
+## File-item batch history and warning coverage
+
+Existing batch validation must use the advertised remote main commit without updating the lane's
+tracking refs, and inspect every batch commit, including reverted additions. Refuse merge ancestry
+and unknown main evidence with the preserve-lane-and-retry warning. Keep stale and refreshed lane
+baselines, hidden side-parent history and oversized history evidence in `file-item-card-branch.test.mjs`.
+Its parameterized Git environment test supplies every scrubbed repository, object and index override
+and checks the intended origin, lane index and decoy repository. Its sixty-second publication check
+measures filing through remote visibility against a local bare origin; live remote latency still
+requires an observation outside the hermetic fixture.
+
+Every new exported effect primitive, guarded throw and CLI stop value needs a named test in its
+sibling unit suite. Map each PREP-listed test file to a changed test or explain the existing coverage
+in review evidence. For retryable warnings, `effect-executor.test.mjs` must defend the non-idempotent
+refusal and safe replay; `cli-adapter.test.mjs` must defend warning stops, fallback text and credential
+redaction in JSON and text output. These checks are deliberate contract pins when the behavior already
+exists; the stale-baseline and reverted-history cases must discriminate the publication repair.

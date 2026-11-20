@@ -157,6 +157,12 @@ export function isInFlightResult(value) {
   return !!value && typeof value === 'object' && value[IN_FLIGHT] === true;
 }
 
+/** A non-fatal stop whose idempotent effect must be retried on resume. */
+const RETRYABLE_WARNING = Symbol('operations.effect.warning');
+export function retryableWarning(result) {
+  return { ...result, [RETRYABLE_WARNING]: true };
+}
+
 /** Normalize a sinks map (plain object or `Map`) into a lookup fn. */
 function sinkLookup(sinks) {
   if (sinks instanceof Map) return (type) => sinks.get(type);
@@ -390,6 +396,13 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
         // record this executor writes, never a store it chose on its own (#6661).
         readRun: (id) => store.read(id),
       });
+      if (result?.[RETRYABLE_WARNING] === true) {
+        if (!live.idempotent) throw new Error('retryable warnings require an idempotent effect');
+        current = withEntry(current, live.key, { status: 'pending', result, error: null });
+        store.write(current);
+        return { run: current, applied, skipped, inFlight: inFlightKeys,
+          halted: current.effects.find(e => e.key === live.key), warning: result.warning, error: null };
+      }
       if (isInFlightResult(result)) {
         if (!live.dispatch) {
           throw new Error(
