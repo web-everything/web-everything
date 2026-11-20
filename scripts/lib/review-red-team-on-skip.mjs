@@ -4,6 +4,7 @@ import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { assertReviewRunEvidence, readNamedCandidates } from './review-run-index.mjs';
 import { listRunIds, readRun, sharedRunsDir } from '../operations/run-store.mjs';
+import { assertRunRecord, isValidRunId } from '../operations/run-record.mjs';
 import { resolveRunScanSettings } from './stream-filter-runs.mjs';
 import { runBacklogOnlyPrep, readBacklogOnlyNetFiles } from './red-team-backlog-only.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
@@ -422,13 +423,20 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
     const directorySnapshot = candidates => {
       const ids = new Set(candidates.ids);
       const names = readdir(runsDir).sort();
-      if (names.some(name => name.startsWith('review-') && name.endsWith('.json')
-        && !name.endsWith('.abandoned.json') && !ids.has(name.slice(0, -5)))) {
-        throw Error('review run filename omitted from candidates; inspect stored evidence');
+      for (const name of names) {
+        if (!name.startsWith('review-') || !name.endsWith('.json') || name.endsWith('.abandoned.json')) continue;
+        const id = name.slice(0, -5);
+        if (ids.has(id)) continue;
+        // review-prep shares the store but is not PR review evidence. Validate
+        // its payload under the same budget/cache before classifying it as unrelated.
+        if (!isValidRunId(id) || !id.startsWith('review-prep-')) {
+          throw Error('review run filename omitted from candidates; inspect stored evidence');
+        }
+        ids.add(id);
       }
-      return JSON.stringify(names);
+      return { names: JSON.stringify(names), ids: [...ids] };
     };
-    const namesBefore = directorySnapshot(candidates);
+    const { names: namesBefore, ids } = directorySnapshot(candidates);
     const maxParses = resolveRunScanSettings({ env, ...scanSettings }).value.scan.maxParses;
     const identity = id => {
       const { mtimeMs, ctimeMs, dev, size, ino } = stat(join(runsDir, `${id}.json`));
@@ -437,7 +445,7 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
     };
     let parsed = 0;
     const identities = new Map();
-    for (const id of candidates.ids) {
+    for (const id of ids) {
       const before = identity(id), key = JSON.stringify([runsDir, id]);
       identities.set(id, before);
       let summary = neverReviewedSummaryCache.get(key);
@@ -447,7 +455,10 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
         summary = { identity: before, valid: false };
         try {
           const run = read(id, runsDir);
-          assertReviewRunEvidence(run);
+          if (id.startsWith('review-prep-')) {
+            assertRunRecord(run);
+            if (run.op !== 'review-prep') throw Error('review-prep filename and operation disagree');
+          } else assertReviewRunEvidence(run);
           if (run.id !== id) throw Error('review run filename and payload id disagree');
           summary = { ...summary, valid: true, op: run.op, repo: run.input?.repo,
             pr: Number(run.input?.pr), head: run.findings?.read?.netBasis?.rev };
@@ -460,7 +471,7 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
         && (!isRealHead(summary.head) || summary.head === head)) return false;
     }
     const after = readNamedCandidates(runsDir, repo, pr, { list, readdir });
-    if (after === null || after.snapshot !== candidates.snapshot || directorySnapshot(after) !== namesBefore) return false;
+    if (after === null || after.snapshot !== candidates.snapshot || directorySnapshot(after).names !== namesBefore) return false;
     for (const [id, before] of identities) {
       if (identity(id) !== before) {
         neverReviewedSummaryCache.delete(JSON.stringify([runsDir, id]));

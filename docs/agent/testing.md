@@ -5496,7 +5496,12 @@ hold. Every candidate, including ids named for other PRs, is read and validated 
 `assertReviewRunEvidence` on a cache miss. Payload repo/PR determines relevance
 regardless of the filename's PR; corrupt or unreadable unrelated records refuse proof.
 Independently list the directory before and after parsing: any review-like JSON file
-omitted by candidate discovery refuses proof. Known `.abandoned.json` tombstones and
+omitted by candidate discovery refuses proof, except valid `review-prep-*` records.
+These share the run store but are unrelated operations: validate their run-record schema,
+payload ID and `review-prep` operation under the same parse budget, summary cache and
+file-identity checks before excluding them. Malformed or unreadable prep records,
+invalid filenames and mismatched IDs or operations retain the hold.
+Known `.abandoned.json` tombstones and
 temporary files ending in `.tmp` remain excluded. Operators must inspect and repair
 omitted or malformed evidence before retrying. An unfinished review on an older head
 permits a fresh full review (R640); any live-head review prevents this proof.
@@ -5515,6 +5520,9 @@ success and live-head refusal, unreadable heads, unrelated malformed records,
 other-PR payload validation and cached reuse, bounded cache resumption, rewritten
 identities (including ctime/device), omitted review filenames, listing races,
 null candidate discovery, and planner cooldown/formal-review/publishability holds.
+Prep fixtures cover valid coexisting records, malformed/unreadable payloads, ID/operation
+mismatches, shared budget resumption, cache invalidation, and the real-file default
+scanner dispatching a full review while preserving the pending red-team label.
 Keep index integrity/backfill tests in `review-run-index.test.mjs`; index corruption,
 poison, overflow or eviction alone no longer determines the never-reviewed proof.
 This proof only permits a full review. Red-team release still requires the unchanged

@@ -663,6 +663,10 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
       read: vi.fn(id => records[id] && ({ id, ...records[id] })), stat: vi.fn(() => ({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 })) };
   }
   const legacyRecords = () => Object.fromEntries(Array.from({ length: 401 }, (_, i) => [`review-pr-${i}`, run()]));
+  const prepId = 'review-prep-00000000-0000-0000-0000-000000000000';
+  const prep = (over = {}) => assertRunRecord({
+    ...newRunRecord({ id: prepId, op: 'review-prep', input: { repo, item: '1234' } }), ...over,
+  });
   function scan(f) {
     expect(mod.headNeverReviewedFromRuns, 'export the complete never-reviewed-head scanner').toBeTypeOf('function');
     return mod.headNeverReviewedFromRuns(f);
@@ -688,6 +692,52 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
   });
   it('proves an empty completed scan has never reviewed the head', () => {
     expect(scan(scanFixture())).toBe(true);
+  });
+  it.each([false, true])('valid review-prep records permit proof with older review present: %s', withReview => {
+    const f = scanFixture({ ...(withReview ? { 'review-pr-old': run() } : {}), [prepId]: prep() });
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledWith(prepId, f.runsDir);
+    const reads = f.read.mock.calls.length;
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(reads);
+  });
+  it.each(['malformed', 'unreadable', 'wrong id', 'wrong operation', 'live review'])('review-prep filename with %s payload refuses proof', kind => {
+    const records = { [prepId]: kind === 'malformed' ? {} : kind === 'wrong id' ? prep({ id: 'review-prep-other' })
+      : kind === 'wrong operation' ? prep({ op: 'unknown-operation' })
+      : kind === 'live review' ? prep({ op: 'review-pr', input: { repo, pr }, ...payload('accept') }) : prep() };
+    const f = scanFixture(records);
+    if (kind === 'unreadable') f.read.mockImplementation(() => { throw Error('unreadable prep'); });
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it('review-prep cache misses share the review parse budget and resume next tick', () => {
+    const f = scanFixture({ 'review-pr-old': run(), [prepId]: prep() });
+    f.scanSettings.file.runs.scan.maxParses = 1;
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+    expect(scan(f)).toBe(true);
+    expect(f.read).toHaveBeenCalledTimes(2);
+  });
+  it('a cached review-prep rewritten to malformed evidence refuses proof', () => {
+    const records = { [prepId]: prep() }, f = scanFixture(records);
+    expect(scan(f)).toBe(true);
+    records[prepId] = {};
+    f.stat.mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(2);
+  });
+  it('a prep file changing identity during parsing refuses proof', () => {
+    const f = scanFixture({ [prepId]: prep() });
+    f.stat.mockReturnValueOnce({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 100, ino: 1 })
+      .mockReturnValue({ mtimeMs: acceptedAt, ctimeMs: acceptedAt, dev: 1, size: 101, ino: 1 });
+    expect(scan(f)).toBe(false);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+  it('an invalid review-prep filename refuses proof before reading it', () => {
+    const f = scanFixture();
+    f.readdir.mockReturnValue(['review-prep-invalid!.json']);
+    expect(scan(f)).toBe(false);
+    expect(f.read).not.toHaveBeenCalled();
   });
   it('ignores old heads and exact-head records belonging to another repo or PR', () => {
     expect(scan(scanFixture({ 'review-pr-old': run(),
@@ -870,12 +920,16 @@ describe('R640 full review preserves pending', () => {
 });
 
 describe('R640 default never-reviewed scan', () => {
-  it('allows this head with a persisted unfinished review on another head', () => {
+  it.each([false, true])('allows this head with a persisted unfinished review and prep present: %s', withPrep => {
     const dir = mkdtempSync(join(tmpdir(), 'r640-review-runs-'));
     try {
       writeFileSync(join(dir, 'review-pr-old.json'), JSON.stringify(assertRunRecord({ ...newRunRecord({ id: 'review-pr-old', op: 'review-pr', input: { repo, pr } }),
         findings: payload('needs-human', old).findings, verdict: null,
         pending: { kind: 'confirm', step: 'verdict', stepIndex: 1 }, effects: [] })));
+      if (withPrep) {
+        const id = 'review-prep-00000000-0000-0000-0000-000000000000';
+        writeFileSync(join(dir, `${id}.json`), JSON.stringify(newRunRecord({ id, op: 'review-prep', input: { repo, item: '1234' } })));
+      }
       const o = runFixture({ env: { OPERATION_RUNS_DIR: dir }, readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) });
       expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('review');
       expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
