@@ -18,7 +18,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { createFileItemReader, createFileItemSinks } from '../file-item-io.mjs';
 import { SCAFFOLD_EFFECT } from '../scaffold.mjs';
-import { FILE_ITEM_QUEUE_EFFECT } from '../file-item.mjs';
+import { FILE_ITEM_QUEUE_EFFECT, FILE_ITEM_CARD_BRANCH_EFFECT } from '../file-item.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 
 describe('createFileItemReader is scaffold\'s own reader, not a re-derived copy', () => {
@@ -79,9 +79,9 @@ describe('the sink map', () => {
     }
   });
 
-  it('carries both effect types — scaffold\'s write AND the new queue-add', () => {
+  it('carries write, queue-add and card-branch effect types', () => {
     const sinks = createFileItemSinks({ root: '/repo' });
-    expect(new Set(Object.keys(sinks))).toEqual(new Set([SCAFFOLD_EFFECT, FILE_ITEM_QUEUE_EFFECT]));
+    expect(new Set(Object.keys(sinks))).toEqual(new Set([SCAFFOLD_EFFECT, FILE_ITEM_QUEUE_EFFECT, FILE_ITEM_CARD_BRANCH_EFFECT]));
   });
 
   it('the write sink still calls the injected writer with the planned bytes', async () => {
