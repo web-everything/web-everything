@@ -949,9 +949,9 @@ describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
   it('restores when snapshots carry backticked placeholder text and non-stamp size comments', () => {
     expect(plan({ edits: dropped() })).toMatchObject({ action: 'restore', id: ID });
   });
-  it('restores despite a balanced one-line markdown link in the snapshot', () => {
+  it('refuses (blunt bracket rule) a balanced one-line markdown link in the snapshot', () => {
     const edits = [edit(`${prBody}\nGenerated with [Claude Code](https://claude.com/claude-code)\n${buildAuthorActorMarker(ID)}`)];
-    expect(plan({ edits })).toMatchObject({ action: 'restore', id: ID });
+    expect(plan({ edits })).toMatchObject({ action: 'refuse' });
   });
   it('still refuses a backtick on a comment line (not code)', () => {
     const edits = [edit(`${prBody}\n<!-- \`x\` -->\n${buildAuthorActorMarker(ID)}`)];
@@ -990,8 +990,8 @@ describe('planStampRestore — marker inside a markdown link title is not a stam
   ])('refuses a marker in a %s', (_n, tpl) => {
     expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
   });
-  it('still restores beside a closed reference definition', () => {
-    expect(plan({ edits: [edit(`[ref]: https://example.test "title"\n${m()}`)] })).toMatchObject({ action: 'restore' });
+  it('refuses (blunt bracket rule) beside a closed reference definition', () => {
+    expect(plan({ edits: [edit(`[ref]: https://example.test "title"\n${m()}`)] })).toMatchObject({ action: 'refuse' });
   });
 });
 
@@ -1039,23 +1039,27 @@ describe('reference titles containing inline code cannot supply author stamps', 
       .toMatchObject({ action: 'refuse' });
   });
 
-  it('still restores a real marker below a completed indented reference title', () => {
+  it('refuses (blunt bracket rule) a marker below a completed indented reference title', () => {
     expect(plan({ edits: [edit(`[ref]: https://example.test\n    "title"\n\n${buildAuthorActorMarker(ID)}`)] }))
-      .toMatchObject({ action: 'restore', id: ID });
+      .toMatchObject({ action: 'refuse' });
   });
 });
 
-describe('planStampRestore — conservative link handling (judge R10 round 2)', () => {
+describe('planStampRestore — any bracket refuses a marker (judge R10 round 2)', () => {
   const m = () => buildAuthorActorMarker(ID);
-  it("refuses a marker inside a second link's multiline title", () => {
-    const snapshot = `[a](https://example.test "closed") [b "](https://example.test "open )\n\`<div>\`\n${m()}\nend")`;
-    expect(plan({ edits: [edit(snapshot)] })).toMatchObject({ action: 'refuse' });
+  it.each([
+    ['second link multiline title', `[a](https://example.test "closed") [b "](https://example.test "open )\n\`<div>\`\nMARK\nend")`],
+    ['escaped-bracket reference label', '[a\\[b\\]c]: https://example.test "t\n`<div>`\nMARK\nend"'],
+    ['title on line after URL-only definition', '[ref]: https://example.test\n"t\n`<div>`\nMARK\nend"'],
+    ['quote-cancel inline link', '[x](https://example.test/" "title )\n`<div>`\nMARK\nend")'],
+    ['plain link beside marker', `[Author's guide](https://example.test)\nMARK`],
+  ])('refuses a marker with brackets: %s', (_n, tpl) => {
+    expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'refuse' });
   });
   it.each([
-    ['apostrophe in link text', `[Author's guide](https://example.test)\n${'MARK'}`],
-    ['paren prose across lines', `Intro\n(see below\nmore)\n${'MARK'}`],
-    ['quoted prose across lines', `He said:\n"hello\nworld"\n${'MARK'}`],
-  ])('benign prose still restores: %s', (_n, tpl) => {
+    ['paren prose across lines', 'Intro\n(see below\nmore)\nMARK'],
+    ['quoted prose across lines', 'He said:\n"hello\nworld"\nMARK'],
+  ])('bracket-free prose still restores: %s', (_n, tpl) => {
     expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'restore', id: ID });
   });
 });

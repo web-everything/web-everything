@@ -45,29 +45,11 @@ function outsideInlineCode(line) {
   return delimiter ? undefined : plain + line.slice(start);
 }
 
-// Conservative, not a parser: a marker is refused when any link-syntax region may leave a title or destination
-// open. Regions are the text after each `](`, the rest of a reference definition, and a title-looking line that
-// directly follows a reference definition. A region is "closed" only when its unescaped quotes are even per type
-// and its parens close (the inline-link `)` included). Ordinary prose elsewhere (an apostrophe in link text, a
-// line starting with `(` or `"`) is never treated as a link. Unsure means refuse.
+// Blunt on purpose: any square bracket anywhere in the snapshot (links, reference labels and definitions,
+// escaped brackets, titles) means a marker cannot be proven outside a link title. Refusal only sends the repair
+// to manual review. Unsure means refuse.
 function linkMayEnclose(diff) {
-  const count = (s, re) => (s.match(re) ?? []).length;
-  const unclosed = (region, closers) => {
-    const bare = region.replace(/\\./g, '');
-    return count(bare, /"/g) % 2 === 1 || count(bare, /'/g) % 2 === 1
-      || count(bare, /\)/g) < count(bare, /\(/g) + closers;
-  };
-  let prevDef = false;
-  return diff.split(/\r\n|[\r\n]/).some((l) => {
-    const wasDef = prevDef;
-    const def = l.match(/^[ \t]{0,3}\[[^\]]*\]:(.*)$/);
-    prevDef = !!def || (wasDef && !l.trim());
-    if (/[\[\]]/.test(l) && count(l, /\[/g) !== count(l, /\]/g)) return true;
-    if (def && unclosed(def[1], 0)) return true;
-    if (wasDef && /^[ \t]*["'(]/.test(l) && unclosed(l, 0)) return true;
-    const parts = l.split('](');
-    return parts.slice(1).some((tail) => unclosed(tail, 1));
-  });
+  return /[\[\]]/.test(diff);
 }
 
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
