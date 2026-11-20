@@ -51,6 +51,7 @@ const ranges = [
   ['resourceGate.fixCap.ceiling', 1, 24],
   ['resourceGate.fixCap.raiseMinMemFreePct', 25, 60],
   ['redTeamQueue.minConcurrent', 0, 24],
+  ['redTeamQueue.maxProbesPerTick', 0, 50],
   ['deliveryCapacity.pinUnits', 1, 200],
 ];
 const EXPIRY_LEAVES = ['deliveryCapacity.pinUntil', 'deliveryCapacity.holdUntil']; // epoch-ms expiries, covered by delivery-capacity-override tests

@@ -1,0 +1,38 @@
+[
+  {
+    "databaseId": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "createdAt": "2026-11-01T00:00:00Z",
+    "startedAt": "2026-11-01T00:00:10Z",
+    "updatedAt": "2026-11-01T00:02:10Z",
+    "jobs": [
+      {
+        "name": "integration",
+        "status": "completed",
+        "conclusion": "success",
+        "createdAt": "2026-11-01T00:00:20Z",
+        "startedAt": "2026-11-01T00:00:30Z",
+        "completedAt": "2026-11-01T00:01:30Z"
+      }
+    ]
+  },
+  {
+    "databaseId": 2,
+    "status": "completed",
+    "conclusion": "success",
+    "createdAt": "2026-11-01T00:00:00Z",
+    "startedAt": "2026-11-01T00:00:30Z",
+    "updatedAt": "2026-11-01T00:04:30Z",
+    "jobs": [
+      {
+        "name": "integration",
+        "status": "completed",
+        "conclusion": "success",
+        "createdAt": "2026-11-01T00:00:20Z",
+        "startedAt": "2026-11-01T00:00:50Z",
+        "completedAt": "2026-11-01T00:02:50Z"
+      }
+    ]
+  }
+]
