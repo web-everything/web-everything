@@ -56,6 +56,7 @@ describe('ci-heal child loop wiring (async slice s2)', () => {
     expect(resolveCiHealLoopEnabled({ env: {}, settings: { ciHeal: { loop: 'maybe' } } })).toBe(false);
     expect(resolveCiHealLoopEnabled({ env: {}, settings: { ciHeal: { loop: 'on' } } })).toBe(true);
     expect(resolveCiHealLoopEnabled({ env: { WE_CI_HEAL_LOOP: 'off' }, settings: { ciHeal: { loop: 'on' } } })).toBe(false);
+    expect(resolveCiHealLoopEnabled({ env: { WE_CI_HEAL_LOOP: 'bogus' }, settings: { ciHeal: { loop: 'on' } } })).toBe(false);
     const spawnFn = vi.fn(() => ({ pid: 9 }));
     expect(spawnCiHealLoop({ env: {}, settings: {}, spawnFn, parentPid: 7 })).toBeNull();
     expect(spawnFn).not.toHaveBeenCalled();

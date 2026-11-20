@@ -48,7 +48,8 @@ export function resolveCiHealInterval({ env = process.env, settings = readSettin
 /** `ciHeal.loop` on|off: standard off; env WE_CI_HEAL_LOOP over the settings file; anything unknown is off. */
 export function resolveCiHealLoopEnabled({ env = process.env, settings = readSettings() } = {}) {
   const pick = value => (value === 'on' || value === 'off' ? value : undefined);
-  return (pick(env.WE_CI_HEAL_LOOP) ?? pick(settings?.ciHeal?.loop) ?? 'off') === 'on';
+  if (env.WE_CI_HEAL_LOOP !== undefined) return pick(env.WE_CI_HEAL_LOOP) === 'on'; // an invalid override fails closed
+  return (pick(settings?.ciHeal?.loop) ?? 'off') === 'on';
 }
 
 /** The single spawn point: null (nothing spawned) unless `ciHeal.loop` is on. */
