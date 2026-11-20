@@ -1971,6 +1971,7 @@
   "webtraits/__tests__/surfaceIntentResolver.test.ts": 0.02,
   "wrapper-conformance/__tests__/runner.test.ts": 0.01
  },
+ "integration": {},
  "soak": {
   "scripts/conveyor/soak/breaks/forge-manifest-untracked-shipped.soak.test.mjs": 0.3,
   "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
