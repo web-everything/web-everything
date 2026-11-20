@@ -686,7 +686,10 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const contains = ancestor('origin/main', input.sha);
       out.mainCheck = { contains, own };
       let comparison = input.sha;
-      if (!contains) {
+      // `conflict` is set only after exact-head GitHub evidence and a signed full-suite receipt.
+      // Keep that tested head intact: merging main would either refuse its known conflict or
+      // publish a different, unreceipted tree. The target overlay checks below still must pass.
+      if (!contains && !conflict) {
         const merge = git('merge-tree', '--write-tree', 'origin/main', input.sha);
         if (merge.code === 1) {
           const files = merge.stdout.split(/\r?\n/).flatMap((line) => /^\d{6} [a-f0-9]+ [123]\t(.+)$/.exec(line)?.slice(1) || []);
@@ -700,7 +703,9 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         out.wouldMerge = { ref, tree };
         // Prove the resulting tree before publishing it; a refused main guard never pushes.
       }
-      const effectivePaths = changedPaths(requireGit('diff', '--name-status', '-z', 'origin/main', comparison));
+      // An unmerged conflict head lacks main-only changes; those are not candidate reversions.
+      // Use its merge-base delta for overlap checks, while the overlay guard proves composition.
+      const effectivePaths = conflict ? own : changedPaths(requireGit('diff', '--name-status', '-z', 'origin/main', comparison));
       const difference = comparePaths(own, effectivePaths);
       out.mainCheck = { ...out.mainCheck, effectivePaths, ...difference };
       if (difference.outside.length || difference.missing.length) return stop('reverts-main', { offendingPaths: difference.outside, missingPaths: difference.missing });

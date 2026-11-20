@@ -3344,6 +3344,37 @@ describe('default test check-run reader (production wiring)', () => {
     expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', conflict: { pr: 42, mergeableState: pr.mergeable_state } }));
     expect(f.gh).toContain(`api repos/${REPO_SLUG}/pulls?head=web-everything%3Alane%2Fnew&state=open&per_page=2 --hostname github.com`);
   });
+  it.each([false, true])('admits the receipt-bound conflicting head behind main without synthesizing a merge (dry run: %s)', async dryRun => {
+    const f = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] },
+      behind: true, mergeConflict: true, diff: 'M\0x\0D\0main-only.mjs\0' });
+    const result = await f.run({ urgent: true, reason: 'Critical daemon repair', dryRun });
+    expect(result).toMatchObject({ ok: true, effectiveRef: BASE.branch, effectiveSha: SHA,
+      mainCheck: { contains: false, own: ['x'], effectivePaths: ['x'] } });
+    expect(result.wouldMerge).toBeUndefined();
+    expect(f.calls.some(c => ['commit-tree', 'push'].includes(c.args[0]))).toBe(false);
+    expect(f.calls.some(c => c.cmd === 'node' && c.args.includes('--check'))).toBe(true);
+    expect(mutations(f, 'add')).toHaveLength(dryRun ? 0 : 1);
+    if (!dryRun) {
+      expect(f.readyWrites.at(-1).testCheck).toMatchObject({ source: 'urgent-local-full', conflict: true });
+      expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent',
+        registration: { clone: expect.any(String), ref: BASE.branch, sha: SHA },
+        conflict: { pr: 42, mergeableState: 'dirty' } }));
+    }
+  });
+
+  it('still refuses a receipt-bound main conflict when the target overlay conflicts', async () => {
+    const f = ghFixture({ pr: conflictPr, urgentLedger: urgentReceipt(), checks: { total_count: 0, check_runs: [] },
+      behind: true, mergeConflict: true, conflicts: [BASE.branch] });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, stopReason: 'check-conflict' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+
+  it('does not bypass the main conflict guard on passing CI alone', async () => {
+    const f = ghFixture({ pr: conflictPr, behind: true, mergeConflict: true });
+    expect(await f.run({ urgent: true, reason: 'Critical daemon repair' })).toMatchObject({ ok: false, stopReason: 'behind-main-conflict' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+
   it.each([
     ['unknown', { pr: { ...conflictPr, mergeable_state: 'unknown', mergeable: null } }],
     ['missing', { pr: { ...conflictPr, mergeable_state: undefined, mergeable: undefined } }],
