@@ -414,11 +414,12 @@ export function runGate({ dir, mode, execFn = defaultExecFn }) {
  * The parent wall kills with SIGKILL; the child's close event drains remaining output before reporting.
  * Runs one attempt. Resume mode appends to the log and closes stdin without replaying the task.
  * exclusiveLog creates a fresh no-follow transcript and retains its fd until the run settles.
- * No child process is created by unit tests: spawnFn is injectable.
+ * No child process is created by unit tests: spawnFn is injectable. openLogFn lets tests observe real fds.
  */
 export async function runAgyDirectExec({
   dir, task, model, effort, jsonSchema, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
   logFile, exclusiveLog = false, stream = true, spawnFn = nodeSpawn, cli = AGY_CLI, resumeConversationId = null, review = false,
+  openLogFn = openSync,
   // Injected processes must not consume or publish the host's real quota observations.
   // Callers exercising quota behavior can inject both store operations explicitly.
   readHold = spawnFn === nodeSpawn ? readAgyHold : () => null,
@@ -435,7 +436,7 @@ export async function runAgyDirectExec({
     // A killed process can leave a partial final line. Separate attempts before appending new JSONL.
     if (exclusiveLog) {
       if (resumeConversationId !== null) throw new Error('exclusive transcript cannot be resumed');
-      logFd = openSync(logFile, constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      logFd = openLogFn(logFile, constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
       if (!fstatSync(logFd).isFile()) throw new Error('transcript must be a regular file');
     } else if (resumeConversationId !== null) appendFileSync(logFile, '\n');
     else writeFileSync(logFile, '');

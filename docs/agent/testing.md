@@ -5113,10 +5113,10 @@ Snapshot capture is bounded to 100,000 entries, depth 128, 64 MiB per file and 1
 exceeding a bound voids the run with a next-provider fallback before patch generation.
 Index-only changes, including staged submodule entries, void the whole run before any post-worker Git
 call. Keep the submodule regression paired with an ordinary doc edit to prove atomic refusal.
-Exclusive-transcript descriptor tests capture opens inside the `node:fs` mock factory;
-late namespace spies and `syncBuiltinESMExports()` can miss Vitest's earlier named-import bindings.
-Delegate to the real, setup-guarded `openSync` and clear captured descriptors after each test.
-Keep hold, success, spawn throw/error and timeout closure assertions against the real descriptor (`EBADF`).
+Exclusive-transcript descriptor tests inject `openLogFn` into `runAgyDirectExec`, wrapping the real,
+setup-guarded `openSync`. Builtin module mocks and spies can miss the runner's named-import bindings.
+Assert the exclusive no-follow flags and mode, a live regular-file descriptor at the quota check,
+and `EBADF` after hold, success, spawn throw/error and timeout, together with each path's result.
 Recheck every tracked and untracked diff path
 against the shared critical-work verdict as well as the allowlist predicate before applying anything.
 Keep regression cases asserting zero post-run exec calls after control tampering and atomic refusal

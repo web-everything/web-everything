@@ -1,7 +1,7 @@
 /** Mechanical tests only. Supplied live agy 1.2.2 streams are literal fixtures; real git regressions; no real agy processes. */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, fstatSync, openSync, constants } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
@@ -12,22 +12,6 @@ import {
   defaultExecFn,
   setupScratchClone, captureDiff, runGate, runAgyDirectExec, geminiDirectTask, parseFlags, main, formatReport,
 } from '../gemini-direct-task.mjs';
-
-const openedFiles = vi.hoisted(() => []);
-// Vitest can snapshot named exports before a test installs a namespace spy. Capture
-// opens inside the factory so every consumer retains the same observing function.
-// Keep the real, setup-guarded filesystem operations and real descriptors.
-vi.mock('node:fs', async importOriginal => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    openSync(...args) {
-      const fd = actual.openSync(...args);
-      openedFiles.push({ path: args[0], fd });
-      return fd;
-    },
-  };
-});
 
 const tempDirs = [];
 function tempDir() {
@@ -42,7 +26,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  openedFiles.length = 0;
   vi.unstubAllEnvs();
   vi.useRealTimers();
   process.exitCode = 0;
@@ -578,14 +561,26 @@ describe('runAgyDirectExec / geminiDirectTask — injected process mechanics', (
   it.each(['hold', 'success', 'spawn throw', 'spawn error', 'timeout'])('closes the exclusive transcript fd on %s', async mode => {
     const dir = tempDir();
     const logFile = join(dir, 'exclusive.jsonl');
+    // Observe the real open through the runner's IO seam, independent of builtin module mocking.
+    const openLogFn = vi.fn((...args) => openSync(...args));
+    let liveStat;
+    const readHold = vi.fn(() => {
+      liveStat = fstatSync(openLogFn.mock.results[0].value);
+      return mode === 'hold' ? { fallbackDecision: 'skip-quota-hold' } : null;
+    });
     const { fn } = fakeSpawn('recorded\n', { hang: mode === 'timeout', error: mode === 'spawn error' ? 'ENOENT' : null });
     const spawnFn = mode === 'spawn throw' ? vi.fn(() => { throw new Error('ENOENT'); }) : fn;
-    await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, stream: false,
-      timeoutMs: 20, spawnFn, readHold: () => mode === 'hold' ? { fallbackDecision: 'skip-quota-hold' } : null });
-    const entry = openedFiles.find(({ path }) => path === logFile);
-    expect(entry).toBeDefined();
-    const { fd } = entry;
+    const result = await runAgyDirectExec({ dir, task: 't', logFile, exclusiveLog: true, stream: false,
+      timeoutMs: 20, spawnFn, openLogFn, readHold });
+    expect(openLogFn).toHaveBeenCalledOnce();
+    expect(openLogFn).toHaveBeenCalledWith(logFile,
+      constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    expect(readHold).toHaveBeenCalledOnce();
+    expect(liveStat?.isFile()).toBe(true);
+    const fd = openLogFn.mock.results[0].value;
     expect(() => fstatSync(fd)).toThrow(/EBADF/);
+    expect(result.code).toBe(mode === 'hold' ? 1 : mode === 'success' ? 0 : null);
+    expect(result.timedOut).toBe(mode === 'timeout');
     expect(statSync(logFile).isFile()).toBe(true);
     if (mode === 'hold') {
       expect(spawnFn).not.toHaveBeenCalled();
