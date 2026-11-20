@@ -59,6 +59,7 @@ import { dirname, resolve, join } from 'node:path';
 import { isBlastRadiusPath, isStatutePath, isGateSelfPath } from '../lib/review-escalation.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { admittedArgv } from './heavy-admission.mjs';
+import { shadowSelection } from '../lib/static-selection-edges.mjs';
 
 // ── the flag (NOT defaulted — DoD) ───────────────────────────────────────────────────────────────────────────
 
@@ -337,7 +338,7 @@ export function changedFilesSince({ base = 'origin/main', runGit } = {}) {
  * @param {{base?: string, runGit: (args: string[]) => string, env?: Record<string,string|undefined>}} args
  * @returns {SelectionDecision & {changedFiles: string[]|null}}
  */
-export function selectTests({ base = 'origin/main', runGit, env = process.env } = {}) {
+export function selectTests({ base = 'origin/main', runGit, env = process.env, shadow } = {}) {
   const flagEnabled = selectionFlagEnabled(env);
   const changedFiles = changedFilesSince({ base, runGit });
   if (changedFiles === null) {
@@ -347,7 +348,12 @@ export function selectTests({ base = 'origin/main', runGit, env = process.env } 
       reasons: ['could not compute the pinned-merge-base diff — full suite (never shrink on an unknown diff)'],
     };
   }
-  return { changedFiles, ...decideSelection({ changedFiles, flagEnabled }) };
+  const decision = { changedFiles, ...decideSelection({ changedFiles, flagEnabled }) };
+  if (typeof shadow === 'function') {
+    try { decision.shadow = shadow({ changedFiles }); }
+    catch { decision.shadow = { tests: [], partial: true }; }
+  }
+  return decision;
 }
 
 // ── the LOCAL agent-gate policy (xpnhz4o) — a DIFFERENT, wider shrink than the CI one above ─────────────────
@@ -582,7 +588,13 @@ function vitestRelatedSelectedFiles(changedFiles) {
 function runCli(argv) {
   const flags = parseFlags(argv);
   const base = typeof flags.base === 'string' ? flags.base : 'origin/main';
-  const decision = selectTests({ base, runGit: realGit, env: process.env });
+  const shadow = flags.measure && (process.env.WE_STATIC_EDGES_SHADOW || selectionFlagEnabled(process.env))
+    ? ({ changedFiles }) => shadowSelection({
+      changedFiles,
+      files: realGit(['ls-files', '-z']).split('\0').filter(Boolean),
+      readFile: (file) => readFileSync(resolve(ROOT, file), 'utf8'),
+    }) : undefined;
+  const decision = selectTests({ base, runGit: realGit, env: process.env, shadow });
 
   // --measure: run the shadow compare against a FULL-run vitest json report and record the false-green sample.
   // A false-green = a full-suite FAILURE that falls OUTSIDE what `vitest related` on the diff would have run.
@@ -605,6 +617,10 @@ function runCli(argv) {
       }
     }
     const fg = assessFalseGreen({ failedTestFiles, selectedTestFiles, mode: decision.mode });
+    const shadowFields = decision.shadow ? {
+      shadow: decision.shadow,
+      shadowEscaped: [...new Set(failedTestFiles)].filter((file) => !decision.shadow.tests.includes(file)).sort(),
+    } : {};
     const sample = {
       at: new Date().toISOString(),
       mode: decision.mode,
@@ -615,10 +631,11 @@ function runCli(argv) {
       falseGreen: fg.falseGreen,
       escaped: fg.escaped,
       hadReport: report != null,
+      ...shadowFields,
       approx, // true ⇒ selectedTestFiles is the changed-file approximation, not the real `vitest related` set
     };
     recordFalseGreen(sample);
-    writeAllSync(1, JSON.stringify({ decision, falseGreen: fg, recorded: sample }, null, 2) + '\n');
+    writeAllSync(1, JSON.stringify({ decision, falseGreen: fg, ...shadowFields, recorded: sample }, null, 2) + '\n');
     process.exit(0);
   }
 

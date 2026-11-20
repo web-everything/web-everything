@@ -5568,3 +5568,14 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Shadow-only static selection edges
+
+`scripts/lib/static-selection-edges.mjs` measures comment-stripped imports, alias imports,
+and literal spawn/read paths without changing gate selection. An optional `selectTests`
+callback adds a `shadow: { tests, partial }` field; it never changes `mode` or the existing decision.
+In `--measure` only, `WE_STATIC_EDGES_SHADOW` or `WE_DIFF_TEST_SELECTION=1` enables this
+diagnostic and records `shadowEscaped` failures outside its test list. Each source has a
+512 KB UTF-8 input cap: oversized files are skipped; oversized or unreadable evidence
+sets `partial: true` (as does a truncated test list). Treat partial output as incomplete
+measurement requiring inspection, never as proof of coverage or an input to a gate.
