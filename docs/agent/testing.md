@@ -5670,17 +5670,27 @@ A current branch must still produce a new head, since label events cannot refres
 The soak break `stale-failed-merge-gate-blocks-drain` drives that production CLI with private transport
 fixtures; its single source marker detects presence only. Truncated check history or unreadable app
 identity keeps the PR skipped and asks the operator to inspect and refresh the branch manually.
-An evidence-reader exception still permits independently verified legacy stale-hold recovery.
+Recovery ordering is explicit: verified legacy stale-hold recovery runs before the failed-gate
+rebuild, preserving its rerun and head-bound evidence when both arms qualify. If legacy evidence
+is unavailable or ineligible, the independent required-app failure evidence can still qualify.
+Confirmed pre-mutation refusals release the head and PR claims and refund the shared pass budget;
+unknown outcomes and attempted pushes retain the claim and budget. The rebuild reports whether
+push was attempted, and the refresh wrapper exposes confirmed pre-push errors separately.
+Callers must supply a shared `failedGateBudget`; a missing budget throws instead of silently
+allocating a per-PR allowance. Settings readers are injectable; test environment flags never
+override the failed-gate settings-file kill switch.
 
-Acceptance coverage: `merge-queue-stale-merge-gate.test.mjs` pins exception fallthrough;
+Acceptance coverage: `merge-queue-stale-merge-gate.test.mjs` pins legacy priority and independent evidence;
 `merge-queue-enqueue.test.mjs` pins multi-PR default/explicit/zero budgets, cross-head exhaustion,
 listing/live mismatch, required app identity and bounded history; `merge-ai-prs-prestage.test.mjs`
 pins forks, bases, labels, merge states, other failing checks, moved branch tips, card ownership,
 human approval, fix claims, zero-disable wiring and startup-failure admission through the real drain.
 `required-status-checks.test.mjs` pins the ruleset and classic app-ID producers.
 
-Prevention for PR #7184: when adding a recovery arm, test a thrown read falling through to each
-pre-existing arm. A head-mutating retry needs a durable bound independent of the current SHA,
+Prevention for PR #7184: new recovery arms must declare their ordering and test overlaps with
+each existing arm, plus unavailable evidence. Test held candidates before an eligible one and
+three eligible candidates through the real drain to defend the pass-wide cap. Pin pre-push versus
+uncertain push failures through every wrapper. A head-mutating retry needs a durable bound independent of the current SHA,
 and the acceptance contract must name both its settings declaration and multi-candidate test.
 Shared admission changes must exercise each existing caller. Run changed test files and their
 soak fixture in the diff-selected verification gate; fixture capability checks must remain real.

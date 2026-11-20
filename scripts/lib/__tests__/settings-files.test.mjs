@@ -14,7 +14,7 @@ import {
   LEGACY_SETTINGS_LEAVES, LEGACY_SETTINGS_PATH, SETTINGS_DIR, FEATURE_FILE_RE, LEGACY_ONLY_READERS, LEGACY_FILE_GUARD_HINT,
 } from '../settings-files.mjs';
 import { resolveFixerSlotSettings } from '../../conveyor/fixer-slot-rules.mjs';
-import { resolveRefreshOnStaleMergeGate, resolveStaleGateUpdateBranchMax } from '../merge-queue-enqueue.mjs';
+import { resolveRefreshOnStaleMergeGate, resolveRefreshOnUnsatisfiedWorkflows, resolveStaleGateUpdateBranchMax } from '../merge-queue-enqueue.mjs';
 import { readCostAdmissionSettings } from '../cost-admission-facts.mjs';
 import { resolveHeavyAdmissionCap, resolveCpuIdleMinPct } from '../dispatch-throttle.mjs';
 
@@ -519,4 +519,20 @@ it.each([
   const resolved = resolveStaleGateUpdateBranchMax({ env, tool, platform });
   expect(resolved.value.staleGateUpdateBranchMax).toBe(value);
   expect(resolved.sources.staleGateUpdateBranchMax).toBe(source);
+});
+
+it.each(['VITEST', 'WE_UNDER_TEST'])('honours a settings-file kill switch with %s in the environment', key => {
+  const readSettings = () => ({ settings: { drain: { staleGateUpdateBranchMax: 0 } } });
+  const resolved = resolveStaleGateUpdateBranchMax({ env: { [key]: '1' }, platform: {}, readSettings });
+  expect(resolved.value.staleGateUpdateBranchMax).toBe(0);
+  expect(resolved.sources.staleGateUpdateBranchMax).toBe('tool');
+});
+
+it.each(['VITEST', 'WE_UNDER_TEST'])('honours sibling recovery switches with %s in the environment', key => {
+  const readSettings = () => ({ settings: { mergeQueue: {
+    refreshOnStaleMergeGate: 'off', refreshOnUnsatisfiedWorkflows: 'off',
+  } }, errors: [] });
+  for (const resolve of [resolveRefreshOnStaleMergeGate, resolveRefreshOnUnsatisfiedWorkflows]) {
+    expect(resolve({ env: { [key]: '1' }, platform: {}, readSettings })).toMatchObject({ value: 'off', source: 'settings' });
+  }
 });

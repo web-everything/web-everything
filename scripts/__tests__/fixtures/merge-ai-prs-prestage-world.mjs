@@ -22,9 +22,9 @@ export function createPrestageWorld(runCommand) {
         commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
         statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
         comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-      const run = async (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false, env: extraEnv = {} } = {}) => {
-        writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
-        const r = await runCommand([ ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
+      const run = async (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false, prs = [pr], only = 42, env: extraEnv = {} } = {}) => {
+        writeFileSync(fixture, JSON.stringify(prs.length === 1 ? prs[0] : prs)); writeFileSync(log, '');
+        const r = await runCommand([ ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge', ...(only === null ? [] : [`--only=${only}`]), '--json', ...args,
           '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
           ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
           env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,

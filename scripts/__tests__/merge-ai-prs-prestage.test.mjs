@@ -463,6 +463,15 @@ const repairEnv = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE:'on',
   WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE:'off' };
 const refreshPushes = calls => calls.filter(a => a[0] === 'git' && a[1] === 'push');
 describe('failed-gate trigger through the real drain', () => {
+  it('shares the default two-refresh budget across three eligible PRs in a real drain pass', () => world(async ({pr,run}) => {
+    failedGatePr(pr);
+    const prs = [42, 43, 44].map(number => ({ ...structuredClone(pr), number, id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
+    const out = await run(false, { prs, only: null, env: repairEnv });
+    expect(out.report.skipped.map(row => row.num)).toEqual(expect.arrayContaining([42, 43, 44]));
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toHaveLength(2);
+    expect(new Set(refreshPushes(out.calls).map(call => call.at(-1))).size).toBe(2);
+    expect(out.report.revalidationAborted.some(row => row.reason.includes('budget exhausted'))).toBe(true);
+  }));
   it('zero per-pass budget disables the failed-gate rebuild', () => world(async ({pr,run}) => {
     failedGatePr(pr);
     const out = await run(false, {env:{...repairEnv,WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX:'0'}});

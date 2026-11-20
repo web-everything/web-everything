@@ -45,16 +45,16 @@ export const REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT = 'on';
 
 /**
  * mergeQueue.refreshOnUnsatisfiedWorkflows: first valid env > settings > platform > standard value.
- * Inject settings/platform objects to avoid filesystem reads. Settings discovery and test isolation match
- * loadMergeQueueSettings; this key resolves independently of the other queue settings.
+ * Inject settings/platform objects or the settings reader to avoid filesystem reads;
+ * this key resolves independently of the other queue settings.
  * @returns {{value: 'on'|'off', source: string, invalid: string[]}}
  */
 export const resolveRefreshOnUnsatisfiedWorkflows = options => resolveRefreshSetting('refreshOnUnsatisfiedWorkflows', 'WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS', options);
 export const resolveRefreshOnStaleMergeGate = options => resolveRefreshSetting('refreshOnStaleMergeGate', 'WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE', options);
 
-export function resolveStaleGateUpdateBranchMax({ env = process.env, tool, platform, log = () => {} } = {}) {
+export function resolveStaleGateUpdateBranchMax({ env = process.env, tool, platform, readSettings = readDeclaredSettings, log = () => {} } = {}) {
   const raw = env.WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX;
-  const resolved = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readDeclaredSettings().settings.drain), {
+  const resolved = cascadePolicy('drain', tool ?? readSettings().settings.drain, {
     env, platform, standard: { staleGateUpdateBranchMax: 2 },
     envValues: { staleGateUpdateBranchMax: raw === undefined ? undefined : /^\d+$/.test(raw) ? Number(raw) : NaN },
     valid: { staleGateUpdateBranchMax: value => Number.isSafeInteger(value) && value >= 0 && value <= 100 },
@@ -63,7 +63,7 @@ export function resolveStaleGateUpdateBranchMax({ env = process.env, tool, platf
   return resolved;
 }
 
-function resolveRefreshSetting(key, envKey, { env = process.env, settings, platform } = {}) {
+function resolveRefreshSetting(key, envKey, { env = process.env, settings, platform, readSettings = readDeclaredSettings } = {}) {
   const invalid = [];
   const readJson = (path, source) => {
     try { return JSON.parse(readFileSync(path, 'utf8')); }
@@ -78,9 +78,8 @@ function resolveRefreshSetting(key, envKey, { env = process.env, settings, platf
       let src = settings;
       const override = String(env?.WE_MERGE_QUEUE_SETTINGS_FILE ?? '').trim();
       if (src === undefined && override) src = readJson(override, 'settings');
-      if (src === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) src = {};
       if (src === undefined) {
-        const read = readDeclaredSettings();
+        const read = readSettings();
         src = read.settings;
         invalid.push(...read.errors.map((e) => `settings: ${e.source}: ${e.error}`));
       }
@@ -645,9 +644,10 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
     dispatched = true;
     try {
       const out = await refreshOptions.refreshStalePr({ ...options, ...(pending ? { gateRefreshPending: pending } : {}) });
-      if (failedPrClaim && !out?.ok && ['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh'].includes(out?.action)) {
+      if (failedPrClaim && !out?.ok && ['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh', 'skip', 'pre-push-error'].includes(out?.action)) {
         // These are confirmed pre-mutation refusals. Retain every ambiguous failure.
         unlinkSync(failedPrClaim);
+        failedGateBudget.remaining += 1;
       }
       if (out?.state === 'pending-unknown') {
         uncertain = true;
@@ -684,7 +684,9 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
   readFailedGate = readFailedMergeGateEvidence, readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
   writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
-  statePath = staleMergeGateRefreshStatePath(), failedGateBudget = { remaining: 2 }, ...refreshOptions } = {}) {
+  statePath = staleMergeGateRefreshStatePath(), failedGateBudget, ...refreshOptions } = {}) {
+  if (!Number.isSafeInteger(failedGateBudget?.remaining) || failedGateBudget.remaining < 0)
+    throw new TypeError('handleStaleMergeGate requires a shared failedGateBudget with a nonnegative integer remaining');
   const unchanged = { handled: false };
   if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
     || !c.reason?.startsWith('merge state BLOCKED') || !pr?.headRefOid) return unchanged;
@@ -707,6 +709,12 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
     return refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions });
   }
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
+  // Recovery order: preserve verified legacy reruns before considering a head-mutating rebuild.
+  // An ineligible/unreadable legacy verdict does not authorize this arm, but independent
+  // required-app evidence below may still authorize the bounded failed-gate arm.
+  const legacy = await recoverLegacyStaleMergeGate({ c, pr, headSha, setting, statePath,
+    readVerdict, readAcceptance, acceptance, readFreeze, refreshOptions });
+  if (legacy.handled) return legacy;
   // failedRequiredGateRefresh: another trigger for the same guarded refresh and its existing per-head ledger.
   // A check-run id is not a workflow run id; this trigger rebuilds the head instead of rerunning the old workflow.
   if (everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) {
@@ -717,10 +725,16 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
           setting, statePath, writeClaim, warn, refreshOptions, failedGateBudget });
       }
     } catch (error) {
-      // Unknown evidence refuses this trigger, not the independent legacy verdict path.
-      warn(`failed merge-gate evidence unreadable: ${errText(error)}; trying legacy stale-hold evidence`);
+      // Both recovery arms remain refused when neither has usable independent evidence.
+      warn(`failed merge-gate evidence unreadable: ${errText(error)}; legacy stale-hold recovery unavailable`);
     }
   }
+  return legacy;
+}
+
+async function recoverLegacyStaleMergeGate({ c, pr, headSha, setting, statePath,
+  readVerdict, readAcceptance, acceptance, readFreeze, refreshOptions }) {
+  const unchanged = { handled: false };
   const run = latestFailingMergeGate(pr.statusCheckRollup);
   if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
   const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');

@@ -136,8 +136,21 @@ export { gitRunner };
  *                                       for a remote-repo candidate, so the local-only rebase-drop can rebuild a
  *                                       non-local lane tip too, given that repo's own clone is provisioned.
  * @param {(cmd:string,args:string[],opts?:object)=>{status:number,stdout:string,stderr:string}} [o.run] injected runner.
+ * Returned errors include pushAttempted; false confirms no push was invoked, while throws remain unknown.
  */
-export function rebaseDropManifest({
+export function rebaseDropManifest(options = {}) {
+  let pushAttempted = false;
+  const run = options.run ?? gitRunner;
+  const result = rebuildDropManifest({ ...options, run: (bin, args, config) => {
+    if (bin === 'git' && args[0] === 'push') pushAttempted = true;
+    return run(bin, args, config);
+  } });
+  // Only a completed return before any push is proof of a retryable pre-mutation error.
+  // A throwing runner remains unknown to callers; never turn it into permission to retry.
+  return result.action === 'error' ? { ...result, pushAttempted } : result;
+}
+
+function rebuildDropManifest({
   laneRef,
   base = 'origin/main',
   remote = 'origin',

@@ -65,7 +65,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
       pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
-      requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
+      requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on', failedGateBudget: { remaining: 2 },
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
       cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
@@ -919,6 +919,7 @@ describe('required-app failed gate uses the existing guarded refresh', () => {
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }] },
       requiredChecks: ['test', 'merge-gate'], classifyPr: () => ({ decision: 'merge' }), setting: 'on',
+      failedGateBudget: { remaining: 2 },
       readFailedGate: vi.fn(async () => ({ requiredAppId: 1, checkRuns: [failed()] })),
       readVerdict: vi.fn(() => { throw Error('no historical verdict needed'); }),
       cloneDir: '/clone', statePath: join(mkdtempSync(join(tmpdir(), 'failed-gate-')), 'ledger.json'),
@@ -970,6 +971,40 @@ describe('required-app failed gate uses the existing guarded refresh', () => {
     try {
       await handleStaleMergeGate(o); await handleStaleMergeGate(o);
       expect(o.refreshStalePr).toHaveBeenCalledTimes(2);
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it('requires an explicit shared pass budget instead of silently allocating one per PR', async () => {
+    const o = options({ failedGateBudget: undefined });
+    try {
+      await expect(handleStaleMergeGate(o)).rejects.toThrow('failedGateBudget');
+      expect(o.refreshStalePr).not.toHaveBeenCalled();
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it.each(['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh', 'skip', 'pre-push-error'])(
+    'refunds %s refusals so held PRs cannot starve an eligible PR in the same pass', async action => {
+      const o = options();
+      o.refreshStalePr.mockResolvedValueOnce({ ok: false, action }).mockResolvedValueOnce({ ok: false, action });
+      try {
+        for (const num of [7, 8, 9]) await handleStaleMergeGate({ ...o, c: { ...o.c, num } });
+        expect(o.refreshStalePr).toHaveBeenCalledTimes(3);
+        expect(o.failedGateBudget.remaining).toBe(1);
+        const claims = readdirSync(dirname(o.statePath)).filter(name => name.includes('failed-pr'));
+        expect(claims).toHaveLength(1);
+        // Both claims (head and PR) must be released so a later pass can retry.
+        o.failedGateBudget.remaining = 2;
+        await handleStaleMergeGate(o);
+        expect(o.refreshStalePr).toHaveBeenCalledTimes(4);
+      } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+    });
+  it.each(['error', 'push-error'])('retains the claim and budget on ambiguous or attempted push %s', async action => {
+    const o = options();
+    o.refreshStalePr.mockResolvedValue({ ok: false, action });
+    try {
+      await handleStaleMergeGate(o);
+      expect(o.failedGateBudget.remaining).toBe(1);
+      await handleStaleMergeGate(o);
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+      expect(readdirSync(dirname(o.statePath)).filter(name => name.includes('failed-pr'))).toHaveLength(1);
     } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
   });
   it('routes the highest check id on the pinned head through refreshStalePr once', async () => {

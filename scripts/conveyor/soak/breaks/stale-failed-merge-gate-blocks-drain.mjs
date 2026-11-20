@@ -40,6 +40,20 @@ export default {
       }
       writeFileSync(state, JSON.stringify({ groups: [], failed: {}, lastReconcileAt: Date.now() }));
       report.disabled = (await run(false, { env: { ...env, WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX: '0' } })).calls;
+      // A fetched-head race is a confirmed pre-push failure, so it must not consume
+      // the PR's only recovery claim before the next pass can re-read the head.
+      pr.fetchedHead = 'f'.repeat(40);
+      report.fetchFailed = (await run(false, { env })).calls;
+      delete pr.fetchedHead;
+      // Two held PRs precede three eligible PRs. Holds refund the pass budget;
+      // the following two refresh and the final one still hits the shared cap.
+      const prs = [42, 43, 44, 45, 46].map(number => ({ ...structuredClone(pr), number,
+        id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
+      writeFileSync(state, JSON.stringify({ groups: [{ id: 'held', repo: slug, pr: 77,
+        branch: 'lane/card-group-fixture', sources: [42, 43].map(num => ({ num, headSha: pr.headRefOid })),
+        files: ['backlog/xfixture.md'] }], failed: {}, lastReconcileAt: Date.now() }));
+      report.multi = await run(false, { prs, only: null, env });
+      writeFileSync(state, JSON.stringify({ groups: [], failed: {}, lastReconcileAt: Date.now() }));
       const first = await run(false, { env });
       const second = await run(false, { env });
       report.first = first.calls;
@@ -68,6 +82,10 @@ export default {
       violations.push('failed gate did not rebuild through the production refresh path');
     if (pushes(report.second).length) violations.push('same head refreshed twice');
     if (pushes(report.disabled).length) violations.push('zero pass budget still refreshed');
+    if (pushes(report.fetchFailed).length) violations.push('fetched-head race reached a push');
+    if (pushes(report.multi.calls).length !== 2
+      || !report.multi.report.revalidationAborted.some(row => row.reason.includes('budget exhausted')))
+      violations.push('held PRs consumed the shared budget or the per-pass cap was lost');
     if (report.laterHeads.some(calls => pushes(calls).length)) violations.push('later head reset the PR refresh bound');
     if (report.merged.length) violations.push('repair changed the original skip into a merge');
     if ([...report.first, ...report.second].some(a => a.includes('PUT') || (a[0] === 'api' && a[1] === 'graphql' && a.some(x => x.startsWith('query=mutation')))))

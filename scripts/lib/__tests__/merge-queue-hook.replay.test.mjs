@@ -18,6 +18,7 @@ import { readApprovedHumanSurfaceHold, refreshApprovedHeadChecked, resolveSkipRe
 import { createMqLiveReader } from '../drain-queue-safety.mjs';
 import { assertCapability } from '../repo-profile.mjs';
 import { SETTINGS_DIR } from '../settings-files.mjs';
+import { refreshOntoMain } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -655,6 +656,16 @@ it.each([null, { state: 'pending-unknown', confirmed: false }])('failed-gate ref
     runConclusion: 'failure', forceRefresh: true, gateRefreshPending, expectedHead: 'a'.repeat(40), readTip: () => 'a'.repeat(40), refresh });
   expect(out).toMatchObject({ ok: true, action: 'rebased', newCommit: 'b'.repeat(40) });
   expect(refresh).toHaveBeenCalledWith('lane/x', expect.objectContaining({ forceRefresh: true, expectedHead: 'a'.repeat(40) }));
+});
+
+it.each([false, true, undefined])('preserves pre-push versus uncertain failure through both refresh wrappers: %s', async pushAttempted => {
+  const out = await refreshStalePr({ laneRef: 'lane/x', prNumber: 7, repo: 'o/r', forceRefresh: true,
+    refresh: (laneRef, options) => refreshOntoMain(laneRef, { ...options,
+      readIsCrossRepository: () => false,
+      rebase: () => ({ action: 'error', reason: 'transport failure', ...(pushAttempted === undefined ? {} : { pushAttempted }) }),
+    }),
+  });
+  expect(out).toMatchObject({ ok: false, action: pushAttempted === false ? 'pre-push-error' : 'error' });
 });
 
 

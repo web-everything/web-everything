@@ -4,7 +4,10 @@ import { basename } from 'node:path';
 import { openPrPageFixture } from './open-pr-page-fixture.mjs';
 
 function prestageGh(process, fs, page) {
-const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const a = process.argv.slice(2), prs = [JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'))].flat();
+const number = a[0] === 'pr' ? Number(a[2]) : Number(a.find(x => /^number=\d+$/.test(x))?.slice(7)
+  || a.join(' ').match(/\/(?:pulls|issues)\/(\d+)/)?.[1] || a.join(' ').match(/number:\s*(\d+)/)?.[1]);
+const pr = prs.find(row => row.number === number) || prs[0];
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\n\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
@@ -14,7 +17,7 @@ if (a[0] === 'repo') {
 }
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
-if (a[0] === 'pr' && a[1] === 'list') out([pr]);
+if (a[0] === 'pr' && a[1] === 'list') out(prs);
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('.isCrossRepository')) out(String(pr.isCrossRepository));
 if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
@@ -47,7 +50,7 @@ if (a[0] === 'api') {
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
     const [owner, name] = process.env.PRESTAGE_REPO.split('/');
     if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
-    out(page([pr], q));
+    out(page(prs, q));
   }
 }
 out([]);
@@ -56,7 +59,8 @@ out([]);
 function prestageGit(process, fs, page) {
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
-const pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const prs = [JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'))].flat();
+const pr = prs.find(row => a.some(arg => arg.includes(row.headRefName))) || prs[0];
 if (pr.failedGate || pr.startupFailure) {
   if (a[0] === 'ls-tree' && a.includes('.lane-manifest.json')) return;
   if (a[0] === 'ls-remote') { process.stdout.write((pr.remoteHead || pr.headRefOid)+'\trefs/heads/'+pr.headRefName+'\n'); return; }

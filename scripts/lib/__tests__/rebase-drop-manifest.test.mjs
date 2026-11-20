@@ -570,3 +570,14 @@ it('an explicit ledger-bounded failed-gate refresh rebuilds an already-current t
   expect(rebaseDropManifest({ laneRef: 'lane/test', forceRefresh: true, run })).toMatchObject({ action: 'rebased' });
   expect(calls.some(c => c.args[0] === 'push')).toBe(true);
 });
+
+it.each(['fetch', 'head-moved', 'write-tree', 'push'])('distinguishes pre-push failure from attempted push: %s', failure => {
+  const head = 'a'.repeat(40);
+  const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+    'rev-parse': { stdout: failure === 'head-moved' ? 'b'.repeat(40) : head },
+    ...(failure !== 'head-moved' ? { [failure]: { status: 1, stderr: 'transient failure' } } : {}),
+  });
+  const out = rebaseDropManifest({ laneRef: 'lane/test', forceRefresh: true, expectedHead: head, run });
+  expect(out).toMatchObject({ action: 'error', pushAttempted: failure === 'push' });
+  expect(calls.some(c => c.args[0] === 'push')).toBe(failure === 'push');
+});

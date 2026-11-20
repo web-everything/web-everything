@@ -14,12 +14,35 @@ const freeze = { frozen: false, publishedAt: '2026-10-12T12:49:00Z' };
 const classify = (results, extra = {}) => q.classifyStaleMergeGate({ verdict: verdict(results), headSha: head, landableApartFromMergeState: true, freeze, ...extra });
 const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
 const pr = { baseRefName: 'main', number: 5006, headRefOid: head, headRefName: 'lane/test', body: 'A real description', labels: [{ name: 'ready-to-merge' }], mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', statusCheckRollup: [green('test'), { ...green('merge-gate'), conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/123/job/456' }] };
-function options(extra = {}) { return { c: { num: 5006, repo: 'o/r', headRef: 'lane/test', ...classifyPr(pr, { defaultBranch: 'main', queueRequiredChecks: ['test', 'merge-gate'] }) }, pr, requiredChecks: ['test', 'merge-gate'], classifyPr, classifyOptions: { defaultBranch: 'main' }, setting: 'on', readVerdict: vi.fn(() => verdict([freezeRow])), readFreeze: () => freeze, readAcceptance: vi.fn(), cloneDir: '/clone', statePath: '/unused', readGateRuns: vi.fn(() => []), readFailedGate: vi.fn(() => ({requiredAppId:null,checkRuns:[]})), readState: () => ({}), record: vi.fn(), refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: head })), ...extra }; }
+function options(extra = {}) { return { failedGateBudget: { remaining: 2 }, c: { num: 5006, repo: 'o/r', headRef: 'lane/test', ...classifyPr(pr, { defaultBranch: 'main', queueRequiredChecks: ['test', 'merge-gate'] }) }, pr, requiredChecks: ['test', 'merge-gate'], classifyPr, classifyOptions: { defaultBranch: 'main' }, setting: 'on', readVerdict: vi.fn(() => verdict([freezeRow])), readFreeze: () => freeze, readAcceptance: vi.fn(), cloneDir: '/clone', statePath: '/unused', readGateRuns: vi.fn(() => []), readFailedGate: vi.fn(() => ({requiredAppId:null,checkRuns:[]})), readState: () => ({}), record: vi.fn(), refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: head })), ...extra }; }
 describe('stale merge-gate refresh', () => {
-  it('falls through to the legacy stale-hold recovery when failed-gate evidence throws', async () => {
-    const o = options({ readFailedGate: () => { throw new Error('throttled'); } });
+  it.each(['legacy', 'real-hold', 'unreadable'])('declares recovery ordering when failed-gate and %s evidence overlap', async mode => {
+    const dir = mkdtempSync(join(tmpdir(), 'stale-overlap-'));
+    const failedGateBudget = { remaining: 2 };
+    const o = options({ statePath: join(dir, 'ledger.json'), failedGateBudget,
+      readFailedGate: vi.fn(() => ({ requiredAppId: 1, checkRuns: [{ id: 20, name: 'merge-gate', head_sha: head,
+        app: { id: 1 }, status: 'completed', conclusion: 'failure' }] })),
+      readVerdict: vi.fn(() => mode === 'unreadable' ? { error: 'offline' } : verdict([mode === 'legacy' ? freezeRow : hold('codeql')])),
+    });
+    try {
+      expect((await q.handleStaleMergeGate(o)).handled).toBe(true);
+      expect(o.readVerdict).toHaveBeenCalledTimes(1);
+      if (mode === 'legacy') {
+        expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ runId: 123 }));
+        expect(o.refreshStalePr.mock.calls[0][0].forceRefresh).toBeUndefined();
+        expect(failedGateBudget.remaining).toBe(2);
+        expect(readdirSync(dir).some(name => name.includes('failed-pr'))).toBe(false);
+      } else {
+        expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ forceRefresh: true, expectedHead: head }));
+        expect(failedGateBudget.remaining).toBe(1);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('legacy stale-hold recovery does not depend on a throwing failed-gate reader', async () => {
+    const o = options({ readFailedGate: vi.fn(() => { throw new Error('throttled'); }) });
     expect((await q.handleStaleMergeGate(o)).reason).toContain('refresh rerun');
     expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+    expect(o.readFailedGate).not.toHaveBeenCalled();
   });
   it('5006: requires a readable manual freeze clear newer than completion', () => {
     expect(classify([freezeRow]).stale).toBe(true);
