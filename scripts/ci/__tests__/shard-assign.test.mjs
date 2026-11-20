@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync,
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assignByTime, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
+import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -154,5 +154,43 @@ describe('integration timing persistence', () => {
       expect(empty.stderr).toMatch(/refusing to overwrite/);
       expect(loadTimings(file)).toEqual(updated);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('shard balance metrics', () => {
+  it('computes max/mean with median fallback for missing timings', () => {
+    expect(balanceRatio([['a', 'missing'], ['b']], { a: 6, b: 2 })).toBeCloseTo(10 / 6);
+    expect(() => balanceRatio([[], []], {})).toThrow(/positive shard loads/);
+  });
+
+  it('balances skewed synthetic timings within 1.2 using LPT', () => {
+    const timings = { a: 100, b: 50, c: 40, d: 30, e: 20, f: 10, g: 10, h: 10 };
+    expect(predictedBalance(Object.keys(timings), timings, 3)).toBeLessThanOrEqual(1.2);
+  });
+
+  it('detects drift in the old assignment while a fresh assignment stays balanced', () => {
+    const old = { a: 1, b: 1, c: 1, d: 1 };
+    const fresh = { a: 10, b: 1, c: 10, d: 1 };
+    expect(staleRatio(Object.keys(old), old, fresh, 2)).toBeCloseTo(20 / 11);
+    expect(predictedBalance(Object.keys(old), fresh, 2)).toBe(1);
+  });
+
+  it('refuses a balance check whose assignment leaves a shard empty', () => {
+    const timings = Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`t${i}`, 1]));
+    expect(() => predictedBalance(Object.keys(timings), timings, 9)).toThrow(/empty/);
+  });
+
+  it('refuses a balance check with negative timings', () => {
+    expect(() => predictedBalance(['a', 'b'], { a: 1, b: -1 }, 2)).toThrow(/negative/);
+  });
+
+  it('refuses a balance check without measurements', () => {
+    expect(() => predictedBalance(['a', 'b'], {}, 2)).toThrow(/measured timings/);
+  });
+
+  it('refuses a balance check when any file is unmeasured, and passes a fully measured skewed set under 1.2', () => {
+    expect(() => predictedBalance(['a', 'b', 'c'], { a: 1, b: 1 }, 2)).toThrow(/measured timings/);
+    const timings = Object.fromEntries(Array.from({ length: 60 }, (_, i) => [`t${i}`, i % 7 === 0 ? 90 : 1 + (i % 5)]));
+    expect(predictedBalance(Object.keys(timings), timings, 9)).toBeLessThanOrEqual(1.2);
   });
 });
