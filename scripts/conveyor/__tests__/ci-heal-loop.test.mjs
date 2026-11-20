@@ -190,7 +190,7 @@ describe('CI heal audit regressions', () => {
     expect(deps.write).toHaveBeenCalledWith('ci-heal-loop: completed in 15ms');
   });
 
-  it.each([undefined, 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE'])('returns error for a failed once iteration (%s) and main sets exit code 1', async code => {
+  it.each([undefined])('returns error for a failed once iteration (%s) and main sets exit code 1', async code => {
     const deps = fixture();
     deps.tick.mockRejectedValue(Object.assign(new Error('failed'), { code }));
     expect(await runCiHealLoop({ ...deps, once: true })).toEqual({ exit: 'error' });
@@ -201,7 +201,14 @@ describe('CI heal audit regressions', () => {
     } finally { process.exitCode = previous; }
   });
 
-  it.each([undefined, 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE'])('logs an iteration error (%s) and continues in loop mode', async code => {
+  it('rethrows the GitHub App auth guard refusal and never continues', async () => {
+    const deps = fixture();
+    deps.tick.mockRejectedValueOnce(Object.assign(new Error('guard'), { code: 'GITHUB_APP_AUTH_GUARD_UNAVAILABLE' }));
+    await expect(runCiHealLoop({ ...deps, parentPid: 42 })).rejects.toThrow('guard');
+    expect(deps.sleep).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined])('logs an iteration error (%s) and continues in loop mode', async code => {
     const deps = fixture();
     deps.tick.mockRejectedValueOnce(Object.assign(new Error('failed'), { code }));
     deps.sleep.mockImplementation(async () => { deps.parentAlive.mockReturnValue(false); });

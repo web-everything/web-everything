@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
-import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../lib/github-app-auth-env.mjs';
+import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
 import { acquireRead, releaseRead, defaultOwner, cloneLockDirs, HEARTBEAT_INTERVAL_MS } from '../lib/daemon-clone-lock.mjs';
 import { planClaudeAuthDispatchGate } from './claude-auth-health.mjs';
@@ -148,6 +148,7 @@ export async function runCiHealLoop({
       const result = await iteration({ ...iterationDeps, root, write, bootHead, readHead });
       if (result?.exit === 'head-moved' || result?.exit === 'head-unknown') return result;
     } catch (error) {
+      if (isGithubAppAuthGuardError(error)) throw error;
       write(`ci-heal-loop: iteration failed: ${String(error?.message ?? error)}`);
       if (once) return { exit: 'error' };
     }
