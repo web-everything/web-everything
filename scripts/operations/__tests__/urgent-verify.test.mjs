@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo, urgentFuiRepo } from '../urgent-verify-marker.mjs';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
+import { admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 
@@ -75,9 +76,20 @@ describe('urgent verifier', () => {
   });
   it.each(['fetch-main-history', 'install-fui', 'install', 'shard', 'coverage', 'hostPaths', 'integration', 'standards'])('records red when %s fails', async stage => {
     const d = fixture(); d[stage] = vi.fn(() => { throw new Error('failed'); });
-    expect(await urgentVerify({ sha, result: 'green' }, d)).toMatchObject({ ok: false, marker: { result: 'red' } });
+    const failure = { step: stage === 'shard' ? 'unit:unit:1/2' : stage, message: 'failed' };
+    expect(await urgentVerify({ sha, result: 'green' }, d)).toMatchObject({ ok: false, marker: { result: 'red' }, failure });
     expect(d.append).toHaveBeenCalledTimes(1);
+    expect(d.append.mock.calls[0][0].failure).toEqual(failure);
     if (stage === 'shard') { expect(d.shard).toHaveBeenCalledTimes(1); expect(d.standards).not.toHaveBeenCalled(); }
+  });
+  it.each(['initial', 'final'])('attributes %s FUI validation failure in the result and receipt', async phase => {
+    const d = fixture();
+    if (phase === 'final') d.verifyFui.mockReturnValueOnce({ sha, repo: urgentFuiRepo });
+    d.verifyFui.mockImplementationOnce(() => { throw new Error('FUI validation failed'); });
+    const result = await urgentVerify({ sha }, d);
+    const failure = { step: phase === 'initial' ? 'verify-fui' : 'verify-fui-final', message: 'FUI validation failed' };
+    expect(result).toMatchObject({ ok: false, failure });
+    expect(d.append.mock.calls[0][0].failure).toEqual(failure);
   });
   it.each(['dirty', 'wrong head', 'short sha', 'unreadable workflow'])('refuses %s before suites and writes no marker', async kind => {
     const d = fixture();
@@ -98,7 +110,7 @@ describe('urgent verifier', () => {
   ])('records red if final FUI %s differs from the recorded checkout', async (_, finalFui) => {
     const d = fixture();
     d.verifyFui.mockReturnValueOnce({ sha, repo: urgentFuiRepo }).mockReturnValueOnce(finalFui);
-    expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false, marker: { result: 'red', fuiSha: sha, fuiRepo: urgentFuiRepo } });
+    expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false, marker: { result: 'red', fuiSha: sha, fuiRepo: urgentFuiRepo }, failure: { step: 'verify-fui-final' } });
     expect(d.verifyFui).toHaveBeenLastCalledWith({ sha, repo: urgentFuiRepo });
     expect(d.verifyFui.mock.invocationCallOrder.at(-1)).toBeGreaterThan(d.standards.mock.invocationCallOrder[0]);
     expect(d.append).toHaveBeenCalledTimes(1);
@@ -146,12 +158,12 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
       'BUILDKITE', 'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'TEAMCITY_VERSION', 'TF_BUILD', 'BUILD_NUMBER'];
     const env = { PATH: '/bin', HOME: '/home/test', ...Object.fromEntries(markers.map(k => [k, 'true'])) };
     const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
-    const deps = createUrgentDeps({ env, spawnSync });
+    const deps = createUrgentDeps({ cwd: '/repo', env, spawnSync });
     deps.standards(); deps.shard({ shard: '1/1' });
     expect(spawnSync).toHaveBeenCalledTimes(2);
     for (const [, args, options] of spawnSync.mock.calls) {
       expect(args[0]).toBe('scripts/readiness/heavy-admission.mjs');
-      expect(options.env).toEqual({ PATH: '/bin', HOME: '/home/test' });
+      expect(options.env).toEqual({ PATH: '/bin:/repo/node_modules/.bin:/frontierui/node_modules/.bin', HOME: '/home/test', LANE_POOL_ROOT: '/.lanes' });
       for (const marker of markers) expect(options.env).not.toHaveProperty(marker);
     }
     expect(env.CI).toBe('true');
@@ -171,7 +183,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(spawnSync).toHaveBeenCalledWith('sh', ['scripts/ci/fetch-main-history.sh'], expect.objectContaining({ cwd: '/repo' }));
     const heavy = spawnSync.mock.calls.filter(([, args]) => args[0].endsWith('scripts/readiness/heavy-admission.mjs'));
     expect(heavy).toHaveLength(17);
-    expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(4), o.cwd])).toEqual([
+    expect(heavy.slice(0, 3).map(([, a, o]) => [a.slice(5), o.cwd])).toEqual([
       [['npm', 'ci'], '/frontierui'], [['npm', 'run', 'build:tools'], '/frontierui'], [['npm', 'ci'], '/repo']]);
     expect(spawnSync.mock.calls.every(([, , o]) => !JSON.stringify(o.env).includes(urgentKeyPath('/home/test')) && !Object.keys(o.env).some(k => k.startsWith('URGENT_')))).toBe(true);
     // The local mirror must cover the union of every matrix part, even from a grouped parent.
@@ -181,10 +193,10 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(heavy.every(([, args, opts]) => args.includes('--wait-ms=60000') && opts.maxBuffer > 0 && opts.timeout > 0)).toBe(true);
     expect(heavy.slice(3, 13).every(([, args]) => args.includes('vitest') && args.includes('scripts/example.test.mjs'))).toBe(true);
     const coverageArgs = JSON.parse(packageText).scripts['test:coverage:shard'].split(' -- ')[1].split(' ');
-    expect(heavy[3][1].slice(4, -1)).toEqual(coverageArgs);
-    expect(heavy[13][1].slice(4)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
-    expect(heavy[14][1].slice(4)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
-    expect(heavy[15][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
+    expect(heavy[3][1].slice(5, -1)).toEqual(coverageArgs);
+    expect(heavy[13][1].slice(5)).toEqual(['npm', 'run', 'coverage:merge', '--', 'coverage-shards', '--threshold=80', '--expect=9']);
+    expect(heavy[14][1].slice(5)).toEqual(['node', 'scripts/lint-host-paths.mjs']);
+    expect(heavy[15][1].slice(5)).toEqual(['npm', 'run', 'test:integration:vitest', '--']);
     expect(heavy[16][1]).toContain('check:standards');
     expect(fs.copyFileSync.mock.calls).toEqual(Array.from({ length: 9 }, (_, i) => ['/repo/coverage/coverage-final.json', `/repo/coverage-shards/coverage-shard-${i + 1}/coverage-final.json`]));
     expect(fs.rmSync).toHaveBeenCalledWith('/repo/coverage-shards', { recursive: true, force: true });
@@ -368,7 +380,8 @@ describe('CI gate mirroring fails closed', () => {
   it.each([
     ['merge', 'npm run coverage:merge -- coverage-shards --threshold=80 --expect=9'],
     ['lint', 'node scripts/lint-host-paths.mjs'],
-    ['integration', 'npm run test:integration:vitest -- $(node scripts/ci/quarantine-skip.mjs --job="integration")'],
+    ['integration', 'npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")'],
+    ['integration timings upload', 'name: timing-integration-${{ matrix.group }}'],
     ['upload', 'path: web-everything/coverage/coverage-final.json'],
     ['download', 'pattern: coverage-shard-*'],
   ])('refuses changed %s before running suites', (_, command) => {
@@ -382,7 +395,7 @@ describe('CI gate mirroring fails closed', () => {
       if (output.startsWith('$')) { expect(() => deps.integration()).toThrow(); expect(spawnSync).toHaveBeenCalledTimes(1); }
       else {
         deps.integration();
-        expect(spawnSync.mock.calls[1][1].slice(4)).toEqual(['npm', 'run', 'test:integration:vitest', '--', ...(output ? [output] : [])]);
+        expect(spawnSync.mock.calls[1][1].slice(5)).toEqual(['npm', 'run', 'test:integration:vitest', '--', ...(output ? [output] : [])]);
         expect(spawnSync.mock.calls.every(([, , opts]) => !opts.shell)).toBe(true);
       }
     }
@@ -457,5 +470,385 @@ describe('FUI origin binding', () => {
     const spawnSync = vi.fn(() => ({ status: 1, stdout: '' }));
     expect(() => createUrgentDeps({ spawnSync }).verifyFui()).toThrow();
     expect(spawnSync).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('urgent-verify blocker fixes', () => {
+  it('appends the checkout node_modules/.bin after system PATH so it cannot shadow system tools', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: 'x' }));
+    createUrgentDeps({ cwd: '/repo', env: { PATH: '/usr/bin:/bin', HOME: '/h' }, spawnSync }).standards(); // the admission wrapper is the only caller that gets checkout-local bins
+    const parts = spawnSync.mock.calls[0][2].env.PATH.split(':');
+    expect(parts).toEqual(['/usr/bin', '/bin', '/repo/node_modules/.bin', '/frontierui/node_modules/.bin']);
+  });
+  it('records exit code and stderr tail in the red marker and result', async () => {
+    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+    const fs = { readFileSync: p => p.endsWith('.key') ? key : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn() };
+    const lines = Array.from({ length: 30 }, (_, i) => `line${i}`).join('\n');
+    const spawnSync = vi.fn((cmd, args) => cmd === 'sh' ? { status: 127, stdout: '', stderr: lines } : { status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : marker.repo });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const result = await urgentVerify({ sha }, createUrgentDeps({ cwd: '/repo', fs, spawnSync }));
+    const failure = { step: 'fetch-main-history', exit: 127, stderrTail: Array.from({ length: 20 }, (_, i) => `line${i + 10}`).join('\n') };
+    expect(result.failure).toMatchObject(failure);
+    expect(JSON.parse(fs.appendFileSync.mock.calls[0][1]).failure).toMatchObject(failure);
+  });
+  it.each(['x', '😀'])('bounds a long %s stderr line to 8 KiB in returned and persisted diagnostics', async char => {
+    const d = fixture();
+    d.standards = createUrgentDeps({ cwd: '/repo', spawnSync: () => ({ status: 1, stderr: `${char.repeat(10000)}END` }) }).standards;
+    const result = await urgentVerify({ sha }, d);
+    expect(Buffer.byteLength(result.failure.stderrTail)).toBeLessThanOrEqual(8192);
+    expect(result.failure.stderrTail.endsWith('END')).toBe(true);
+    expect(result.failure.stderrTail).not.toContain('\uFFFD');
+    expect(d.append.mock.calls[0][0].failure.stderrTail).toBe(result.failure.stderrTail);
+  });
+  it.each(['git@github.com:chalbert/frontierui.git', 'https://github.com/chalbert/frontierui', 'ssh://git@github.com/frontier-ui/frontierui.git'])('accepts FUI origin %s', url => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: cmd === 'gh' ? urgentFuiRepo : args[0] === 'remote' ? url : args[0] === 'status' ? '' : sha }));
+    expect(createUrgentDeps({ cwd: '/repo/x', spawnSync }).verifyFui({ sha, repo: urgentFuiRepo })).toEqual({ sha, repo: urgentFuiRepo });
+  });
+  it('rejects the old owner when gh does not resolve it to the canonical repo', () => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: cmd === 'gh' ? 'https://github.com/chalbert/frontierui' : args[0] === 'remote' ? 'git@github.com:chalbert/frontierui.git' : '' }));
+    expect(() => createUrgentDeps({ spawnSync }).verifyFui()).toThrow(/frontier-ui/);
+  });
+  it.each(['git@github.com:evil/frontierui.git', 'https://gitlab.com/frontier-ui/frontierui'])('rejects FUI origin %s', url => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'remote' ? url : '' }));
+    expect(() => createUrgentDeps({ spawnSync }).verifyFui()).toThrow(/frontier-ui/);
+  });
+});
+
+// Isolation: urgent-verify runs in its own detached worktree (real temp git repos, doubles only for the steps).
+import { afterAll } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, existsSync, realpathSync, rmSync, chmodSync, symlinkSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { spawnSync as spawnSyncReal } from 'node:child_process';
+const tempParents = []; // os.tmpdir() is the hermetic per-run root; still remove what we make (tmp-leak budget)
+afterAll(() => { for (const p of tempParents.splice(0)) rmSync(p, { recursive: true, force: true }); });
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join as pjoin } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1' } }).trim();
+function tempRepo() {
+  const parent = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-iso-'))), repo = pjoin(parent, 'repo');
+  tempParents.push(parent);
+  execFileSync('mkdir', [repo]);
+  git(repo, 'init', '-q'); git(repo, 'remote', 'add', 'origin', 'https://github.com/o/r.git');
+  writeFileSync(pjoin(repo, '.gitignore'), 'node_modules/\ncoverage/\ncoverage-shards/\n'); writeFileSync(pjoin(repo, 'a.txt'), 'a');
+  git(repo, 'add', '-A'); git(repo, 'commit', '-qm', 'init');
+  return { parent, repo, head: git(repo, 'rev-parse', 'HEAD') };
+}
+// Real deps in a real repo; only the CI steps are doubles. `standards` runs `hook(dir, repo)` inside the run.
+function isoDeps({ parent, repo }, hook, dirs = []) {
+  const noop = () => {};
+  return createUrgentDeps({ isolated: true, cwd: repo, home: pjoin(parent, 'home'), decorate: (d, dir) => ({ ...d,
+    plan: () => [{ shard: '1/1' }], 'fetch-main-history': noop, verifyFui: () => ({ sha: 'f'.repeat(40), repo: urgentFuiRepo }),
+    'install-fui': noop, install: noop, shard: noop, coverage: noop, hostPaths: noop, integration: noop,
+    standards: () => { dirs.push(dir); hook(dir, repo); } }) });
+}
+const leftovers = parent => readdirSync(parent).filter(n => n.startsWith('.urgent-verify-'));
+
+describe('urgent-verify isolated worktree', () => {
+  it.each([0, 1])('keeps the throwaway HOME present for wrapper children and removes it after exit %s', async exit => {
+    const t = tempRepo(); let childHome;
+    const noop = () => {};
+    const spawnSync = (cmd, args, options) => {
+      if (!String(args[0]).endsWith('heavy-admission.mjs')) return spawnSyncReal(cmd, args, options);
+      childHome = options.env.HOME;
+      return spawnSyncReal(process.execPath, ['-e', `require('fs').writeFileSync(require('path').join(process.env.HOME, 'probe'), 'ok'); process.exit(${exit})`], options);
+    };
+    const d = createUrgentDeps({ isolated: true, cwd: t.repo, home: pjoin(t.parent, 'home'), spawnSync,
+      decorate: scoped => ({ ...scoped, plan: () => [{ shard: '1/1' }], 'fetch-main-history': noop,
+        verifyFui: () => ({ sha, repo: urgentFuiRepo }), 'install-fui': noop, install: noop, shard: noop,
+        coverage: noop, hostPaths: noop, integration: noop }) });
+    const result = await urgentVerify({ sha: t.head }, d);
+    expect(result).toMatchObject({ ok: exit === 0 });
+    if (exit) expect(result.failure).toMatchObject({ step: 'standards', exit, stderrTail: '' });
+    expect(childHome).toBeTruthy();
+    expect(existsSync(childHome)).toBe(false);
+  });
+  it('a file written into the caller checkout mid-run does not change the verdict', async () => {
+    const t = tempRepo(), dirs = [];
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, (_dir, repo) => writeFileSync(pjoin(repo, 'intruder.md'), 'x'), dirs));
+    expect(r).toMatchObject({ ok: true, marker: { result: 'green', sha: t.head } });
+    expect(dirs).toHaveLength(1); expect(dirs[0]).not.toBe(t.repo); expect(dirs[0]).toMatch(/\.urgent-verify-/);
+    expect(existsSync(pjoin(t.repo, 'intruder.md'))).toBe(true);
+  });
+  it('removes its worktree afterwards, green or red', async () => {
+    const t = tempRepo();
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => { throw new Error('boom'); }));
+    expect(leftovers(t.parent)).toEqual([]);
+    expect(git(t.repo, 'status', '--porcelain')).toBe('');
+  });
+  it('the isolated checkout is a standalone repo, not a linked worktree of the caller', async () => {
+    const t = tempRepo(); let gitDir;
+    await urgentVerify({ sha: t.head }, isoDeps(t, dir => { gitDir = git(dir, 'rev-parse', '--absolute-git-dir'); }));
+    expect(gitDir).toMatch(/\.urgent-verify-[^/]+\/\.git$/);
+    expect(gitDir.startsWith(pjoin(t.repo, '.git'))).toBe(false);
+  });
+  it('refuses, with a clear error, when a system tool is missing instead of falling back to checkout bins', async () => {
+    const t = tempRepo(); mkdirSync(pjoin(t.repo, 'node_modules/.bin'), { recursive: true });
+    for (const tool of ['git', 'node', 'npm', 'sh']) writeFileSync(pjoin(t.repo, 'node_modules/.bin', tool), '#!/bin/sh\n', { mode: 0o755 });
+    const deps = createUrgentDeps({ isolated: true, cwd: t.repo, home: pjoin(t.parent, 'home'), env: { PATH: pjoin(t.parent, 'empty') } });
+    const r = await urgentVerify({ sha: t.head }, deps);
+    expect(r).toMatchObject({ ok: false, detail: expect.stringMatching(/required system tool "git" not found.*refusing/) });
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it.each([
+    ['git', 'non-executable file'], ['node', 'non-executable file'],
+    ['npm', 'non-executable file'], ['sh', 'non-executable file'],
+    ['npm', 'directory'], ['npm', 'broken symlink'], ['npm', 'non-executable symlink target'],
+  ])('refuses system %s that is a %s before any checkout replacement can execute', async (tool, kind) => {
+    const parent = mkdtempSync(pjoin(tmpdir(), 'uv-tool-'));
+    tempParents.push(parent);
+    const repo = pjoin(parent, 'repo'), systemBin = pjoin(parent, 'system-bin');
+    const checkoutBin = pjoin(repo, 'node_modules/.bin'), executed = pjoin(parent, 'replacement-executed');
+    mkdirSync(systemBin); mkdirSync(checkoutBin, { recursive: true });
+    for (const name of ['git', 'node', 'npm', 'sh']) {
+      if (name !== tool) writeFileSync(pjoin(systemBin, name), '#!/bin/sh\nexit 99\n', { mode: 0o755 });
+    }
+    const candidate = pjoin(systemBin, tool);
+    if (kind === 'directory') mkdirSync(candidate);
+    else if (kind.includes('symlink')) {
+      const target = pjoin(parent, 'target');
+      if (kind === 'non-executable symlink target') writeFileSync(target, '#!/bin/sh\n', { mode: 0o644 });
+      symlinkSync(target, candidate);
+    } else writeFileSync(candidate, '#!/bin/sh\n', { mode: 0o644 });
+    writeFileSync(pjoin(checkoutBin, tool), '#!/bin/sh\nprintf executed > ../replacement-executed\n', { mode: 0o755 });
+    const spawnSync = vi.fn(spawnSyncReal);
+    const deps = createUrgentDeps({ isolated: true, cwd: repo, home: pjoin(parent, 'home'),
+      env: { PATH: systemBin }, spawnSync });
+    const result = await urgentVerify({ sha }, deps);
+    expect(result).toMatchObject({ ok: false, detail: expect.stringContaining(`required system tool "${tool}" not found`) });
+    expect(result.detail).toContain('refusing to fall back to checkout node_modules/.bin');
+    expect(result.marker).toBeUndefined();
+    expect(spawnSync).not.toHaveBeenCalled();
+    expect(existsSync(executed)).toBe(false);
+    expect(leftovers(parent)).toEqual([]);
+  });
+  it('accepts executable symlinks and continues past a non-executable PATH candidate', () => {
+    const parent = mkdtempSync(pjoin(tmpdir(), 'uv-tool-'));
+    tempParents.push(parent);
+    const first = pjoin(parent, 'first'), second = pjoin(parent, 'second');
+    mkdirSync(first); mkdirSync(second);
+    writeFileSync(pjoin(first, 'npm'), '#!/bin/sh\n', { mode: 0o644 });
+    const target = pjoin(parent, 'executable');
+    writeFileSync(target, '#!/bin/sh\n', { mode: 0o755 });
+    for (const tool of ['git', 'node', 'npm', 'sh']) symlinkSync(target, pjoin(second, tool));
+    const spawnSync = vi.fn(() => ({ status: 99, stderr: 'preflight passed' }));
+    const deps = createUrgentDeps({ isolated: true, cwd: pjoin(parent, 'repo'),
+      env: { PATH: [first, second].join(':') }, spawnSync });
+    expect(() => deps.isolate(sha)).toThrow(/subprocess failed.*exit 99/);
+    expect(spawnSync).toHaveBeenCalledTimes(1);
+    expect(spawnSync).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], expect.any(Object));
+  });
+  it('a dirty caller checkout before the run does not matter either', async () => {
+    const t = tempRepo(); writeFileSync(pjoin(t.repo, 'dirt.md'), 'x'); writeFileSync(pjoin(t.repo, 'a.txt'), 'changed');
+    expect(await urgentVerify({ sha: t.head }, isoDeps(t, () => {}))).toMatchObject({ ok: true });
+  });
+  it('an unknown sha is red-equivalent (not ok) and leaves nothing behind', async () => {
+    const t = tempRepo();
+    expect(await urgentVerify({ sha: 'c'.repeat(40) }, isoDeps(t, () => {}))).toMatchObject({ ok: false });
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('prunes a dead run leftover on start', async () => {
+    const t = tempRepo(), dead = pjoin(t.parent, `.urgent-verify-${t.head.slice(0, 12)}-2147483646`);
+    mkdirSync(dead); writeFileSync(pjoin(dead, 'stale'), 'x');
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
+    expect(existsSync(dead)).toBe(false);
+  });
+  it('git and gh calls never see checkout-local node_modules/.bin on PATH', () => {
+    const paths = [], spawnSync = (cmd, args, o) => { paths.push(o.env.PATH); return { status: 0, stdout: 'https://github.com/frontier-ui/frontierui' }; };
+    const d = createUrgentDeps({ cwd: '/r', env: { PATH: '/bin' }, spawnSync });
+    d.head(); d.clean(); d.repo();
+    expect(paths.length).toBe(3);
+    for (const p of paths) expect(p).toBe('/bin');
+  });
+  it('child env carries no GIT_DIR / GIT_WORK_TREE', () => {
+    const seen = [], spawnSync = (cmd, args, o) => { seen.push(o.env); return { status: 0, stdout: '' }; };
+    createUrgentDeps({ cwd: '/r', env: { PATH: '/bin', GIT_DIR: '/x', GIT_WORK_TREE: '/y', GIT_INDEX_FILE: '/z' }, spawnSync }).head();
+    expect(seen[0]).not.toHaveProperty('GIT_DIR'); expect(seen[0]).not.toHaveProperty('GIT_WORK_TREE'); expect(seen[0]).not.toHaveProperty('GIT_INDEX_FILE');
+  });
+});
+
+describe('urgent-verify worktree tampered', () => {
+  it('a file written INTO the worktree gives red "checkout changed"', async () => {
+    const t = tempRepo();
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => writeFileSync(pjoin(dir, 'tamper.md'), 'x')));
+    expect(r).toMatchObject({ ok: false, marker: { result: 'red' }, failure: { message: expect.stringContaining('checkout changed') } });
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it.each(['--assume-unchanged', '--skip-worktree'])('hiding a tracked-file edit with update-index %s still gives red', async flag => {
+    const t = tempRepo();
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => { git(dir, 'update-index', flag, 'a.txt'); writeFileSync(pjoin(dir, 'a.txt'), 'forged'); }));
+    expect(r).toMatchObject({ ok: false, failure: { message: expect.stringContaining('checkout changed') } });
+  });
+  it('a moved HEAD in the worktree gives red "checkout changed"', async () => {
+    const t = tempRepo();
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, dir => git(dir, 'commit', '--allow-empty', '-qm', 'moved')));
+    expect(r).toMatchObject({ ok: false, failure: { message: expect.stringContaining('checkout changed') } });
+  });
+  it('is re-checked after EACH step, not only at the end', async () => {
+    const t = tempRepo(); let later = 0;
+    const deps = createUrgentDeps({ isolated: true, cwd: t.repo, home: pjoin(t.parent, 'home'), decorate: (d, dir) => ({ ...d,
+      plan: () => [{ shard: '1/1' }], 'fetch-main-history': () => writeFileSync(pjoin(dir, 'early.md'), 'x'),
+      verifyFui: () => ({ sha: 'f'.repeat(40), repo: urgentFuiRepo }), 'install-fui': () => later++, install: () => later++,
+      shard: () => later++, coverage: () => later++, hostPaths: () => later++, integration: () => later++, standards: () => later++ }) });
+    expect(await urgentVerify({ sha: t.head }, deps)).toMatchObject({ ok: false });
+    expect(later).toBe(0);
+  });
+});
+
+describe('urgent-verify red exits non-zero', () => {
+  const { finish } = resolveOperation('urgent-verify');
+  it('red result exits 1, green exits 0', async () => {
+    const t = tempRepo();
+    const red = await urgentVerify({ sha: t.head }, isoDeps(t, () => { throw new Error('boom'); }));
+    const green = await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
+    expect(finish({ run: { verdict: red }, code: 0, lines: [] }).code).toBe(1);
+    expect(finish({ run: { verdict: green }, code: 0, lines: [] }).code).toBe(0);
+  });
+  it('a missing verdict never exits 0', () => {
+    expect(finish({ run: {}, code: 0, lines: [] }).code).not.toBe(0);
+  });
+});
+
+describe('urgent-verify signing isolation', () => {
+  const keyOf = t => urgentKeyPath(pjoin(t.parent, 'home'));
+  const ledgerOf = t => urgentLedger(pjoin(t.parent, 'home'));
+  const ledgerText = t => { try { return readFileSync(ledgerOf(t), 'utf8'); } catch { return ''; } };
+  it('a step cannot read the signing key', async () => {
+    const t = tempRepo(); let leaked = false;
+    await urgentVerify({ sha: t.head }, isoDeps(t, () => { try { readFileSync(keyOf(t)); leaked = true; } catch { /* EACCES expected */ } }));
+    expect(leaked).toBe(false);
+  });
+  it('the key and ledger are usable again afterwards (parent signs last)', async () => {
+    const t = tempRepo();
+    expect(await urgentVerify({ sha: t.head }, isoDeps(t, () => {}))).toMatchObject({ ok: true });
+    expect(ledgerText(t)).toContain('"result":"green"');
+    expect(readFileSync(keyOf(t)).length).toBe(32);
+  });
+  it('a step that appends a receipt to the ledger gives red and no green record', async () => {
+    const t = tempRepo(); mkdirSync(pjoin(t.parent, 'home/workspace/.operations/coordination'), { recursive: true });
+    const r = await urgentVerify({ sha: t.head }, isoDeps(t, () => { writeFileSync(ledgerOf(t), '{"forged":true}\n'); }));
+    expect(r).toMatchObject({ ok: false, marker: { result: 'red' }, failure: { message: expect.stringContaining('signing state changed') } });
+    expect(ledgerText(t)).not.toContain('"result":"green"');
+  });
+  it('a step that creates the ledger when absent, or replaces the key, gives red', async () => {
+    const a = tempRepo();
+    expect(await urgentVerify({ sha: a.head }, isoDeps(a, () => { mkdirSync(dirname(ledgerOf(a)), { recursive: true }); writeFileSync(ledgerOf(a), 'x\n'); })))
+      .toMatchObject({ ok: false, failure: { message: expect.stringContaining('signing state changed') } });
+    const b = tempRepo();
+    expect(await urgentVerify({ sha: b.head }, isoDeps(b, () => { chmodSync(keyOf(b), 0o600); writeFileSync(keyOf(b), Buffer.alloc(32, 1)); })))
+      .toMatchObject({ ok: false, failure: { message: expect.stringContaining('signing state changed') } });
+  });
+  it('a lock left by a crashed run heals on the next start', async () => {
+    const t = tempRepo(), home = pjoin(t.parent, 'home');
+    createUrgentDeps({ home }).readKey(); chmodSync(keyOf(t), 0o000);
+    expect(await urgentVerify({ sha: t.head }, isoDeps(t, () => {}))).toMatchObject({ ok: true });
+  });
+  it('step children get the throwaway HOME, parent-side git calls keep the real one', () => {
+    const calls = [], spawnSync = (cmd, args, o) => { calls.push({ args, home: o.env.HOME, cache: o.env.npm_config_cache }); return { status: 0, stdout: '' }; };
+    const d = createUrgentDeps({ cwd: '/r', home: '/home/user', env: { PATH: '/bin', HOME: '/home/user' }, spawnSync, stepHome: '/tmp/step-home' });
+    d.standards(); d.head();
+    expect(calls[0]).toMatchObject({ home: '/tmp/step-home', cache: '/home/user/.npm' });
+    expect(calls[1].home).toBe('/home/user');
+  });
+  it.each(['absolute', 'relative', 'home-relative', 'default'])('preserves the parent admission pool for %s paths under a throwaway HOME', kind => {
+    const env = { PATH: '/bin', HOME: '/home/user', ...(kind === 'absolute' ? { LANE_POOL_ROOT: '/private/pool' }
+      : kind === 'home-relative' ? { LANE_POOL_ROOT: '~/pool' } : kind === 'relative' ? { LANE_POOL_ROOT: 'pool' } : {}) };
+    const expected = kind === 'relative' ? '/repo/pool' : poolRootOf(admissionLockRoot('/repo', env, { exists: () => false }));
+    const calls = [];
+    const d = createUrgentDeps({ cwd: '/repo', env, stepHome: '/tmp/private-home',
+      spawnSync: (_cmd, _args, options) => { calls.push(options.env); return { status: 0, stdout: '' }; } });
+    d.standards(); d.shard({ shard: '1/1' });
+    for (const wrapperEnv of calls) {
+      expect(wrapperEnv.HOME).toBe('/tmp/private-home');
+      expect(wrapperEnv.LANE_POOL_ROOT).toBe(expected);
+      expect(poolRootOf(admissionLockRoot('/repo', wrapperEnv))).toBe(expected);
+    }
+  });
+  it('the real wrapper admits an isolated step into the parent temporary pool with the exact wrapper env', async () => {
+    const t = tempRepo(), home = pjoin(t.parent, 'home'), pool = pjoin(home, 'pool');
+    mkdirSync(pool, { recursive: true });
+    const env = { PATH: process.env.PATH, HOME: home, LANE_POOL_ROOT: '~/pool' };
+    const cli = pjoin(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    let admitted;
+    const noop = () => {};
+    const spawnSync = (cmd, args, options) => {
+      if (!String(args[0]).endsWith('heavy-admission.mjs')) return spawnSyncReal(cmd, args, options);
+      // Refuse to probe any shared pool if the adapter loses the explicit private pool.
+      expect(options.env.LANE_POOL_ROOT).toBe(pool);
+      expect(existsSync(options.env.HOME)).toBe(true);
+      // Keep the real wrapper and semaphore; fixture only the host-load reading so this
+      // wiring test cannot wait on the machine running it. --local also avoids remote policy.
+      const argv = [...args.slice(1, args.indexOf('--')), '--local', '--', process.execPath, cli, 'status', '--cap=1'];
+      const bootstrap = `import { main } from ${JSON.stringify(pathToFileURL(cli).href)}; await main(${JSON.stringify(argv)}, { hostAdmission: () => ({ admitted: true, reason: 'fixture host' }) });`;
+      admitted = spawnSyncReal(cmd, ['--input-type=module', '-e', bootstrap],
+        { ...options, timeout: 15000 });
+      return admitted;
+    };
+    const d = createUrgentDeps({ isolated: true, cwd: t.repo, home, env, spawnSync,
+      decorate: scoped => ({ ...scoped, plan: () => [{ shard: '1/1' }], 'fetch-main-history': noop,
+        verifyFui: () => ({ sha, repo: urgentFuiRepo }), 'install-fui': noop, install: noop, shard: noop,
+        coverage: noop, hostPaths: noop, integration: noop }) });
+    expect(await urgentVerify({ sha: t.head }, d)).toMatchObject({ ok: true });
+    expect(admitted.status, admitted.stderr).toBe(0);
+    expect(JSON.parse(admitted.stdout.trim().split('\n').at(-1)).heldCount).toBe(1);
+  }, 30000);
+  it('every admission call requires a slot (no-pool / bypass means refusal)', () => {
+    const argvs = [], spawnSync = (cmd, args) => { argvs.push(args); return { status: 0, stdout: '' }; };
+    const d = createUrgentDeps({ cwd: '/r', spawnSync });
+    d.standards(); d.shard({ shard: '1/1' });
+    const admission = argvs.filter(a => String(a[0]).endsWith('heavy-admission.mjs'));
+    expect(admission.length).toBeGreaterThan(0);
+    for (const a of admission) expect(a).toContain('--require-admission');
+  });
+  it('heavy-admission --require-admission refuses (126) when there is no pool, and does not run the command', () => {
+    const t = tempRepo(), marker = pjoin(t.parent, 'ran');
+    const r = spawnSyncReal(process.execPath, [pjoin(process.cwd(), 'scripts/readiness/heavy-admission.mjs'), 'run', '--require-admission', '--', process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)},'x')`],
+      { cwd: t.repo, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: t.parent, LANE_POOL_ROOT: pjoin(t.parent, 'no-such-pool') } });
+    expect(r.status).toBe(126);
+    expect(r.stderr).toMatch(/require-admission refused: admission bypassed \(no-pool\)/);
+    expect(existsSync(marker)).toBe(false);
+  });
+  it.each([
+    ['required timeout', true, true, 'run', 126],
+    ['ordinary timeout', false, true, 'run', 0],
+    ['required deferral', true, true, 'defer', 75],
+    ['required admission', true, false, 'run', 0],
+  ])('heavy-admission CLI preserves the slot requirement: %s', (_name, required, occupied, onTimeout, expectedExit) => {
+    const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-admission-')));
+    tempParents.push(root);
+    const marker = pjoin(root, 'ran'), cli = pjoin(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const argv = ['run', '--local', '--cap=1', '--kind=FULL', '--ceiling-ms=0', '--wait-ms=0',
+      ...(required ? ['--require-admission'] : []), '--', process.execPath, '-e',
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`];
+    // Use the real CLI and semaphore with a live holder; only host telemetry is a fixture.
+    const bootstrap = `import { main, admissionLockRoot, tryAcquireSlot } from ${JSON.stringify(pathToFileURL(cli).href)};
+      if (${occupied}) {
+        const held = tryAcquireSlot({ lockRoot: admissionLockRoot(process.cwd(), process.env), cap: 1, owner: 'fixture-holder',
+          nowMs: Date.now(), nowIso: new Date().toISOString() });
+        if (!held.ok) throw new Error('fixture did not acquire its slot');
+      }
+      await main(${JSON.stringify(argv)}, { hostAdmission: () => ({ admitted: true, reason: 'fixture host' }) });`;
+    const r = spawnSyncReal(process.execPath, ['--input-type=module', '-e', bootstrap], {
+      cwd: root, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
+      env: { PATH: process.env.PATH, HOME: root, LANE_POOL_ROOT: root,
+        WE_PLATFORM_PREFERENCES: pjoin(root, 'no-preferences'), WE_HEAVY_ADMISSION_ON_TIMEOUT: onTimeout },
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status, r.stderr).toBe(expectedExit);
+    expect(existsSync(marker)).toBe(expectedExit === 0);
+    if (expectedExit === 126) expect(r.stderr).toMatch(/require-admission refused.*timed out.*NOT run/);
+  });
+  it.each(['off', 'held', 'ci', 'no-pool', null])('required admission refuses runner bypass/disabled acquisition: %s', async bypass => {
+    const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-admission-')));
+    tempParents.push(root);
+    const exec = vi.fn(), log = vi.fn();
+    const result = await runUnderAdmission({ lockRoot: root, cap: 1, owner: 'required-fixture',
+      command: 'fixture-command', requireAdmission: true, bypass, env: { WE_HEAVY_ADMISSION: 'off' }, exec, log });
+    expect(result.exitCode).toBe(126);
+    expect(exec).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('the command was NOT run'));
   });
 });

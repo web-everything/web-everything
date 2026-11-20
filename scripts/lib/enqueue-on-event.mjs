@@ -74,6 +74,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
+import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
 import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
@@ -411,6 +412,15 @@ export function catchUpSkipReason(pr, defaultBranch = 'main') {
   return null;
 }
 
+/** A check run is finished when it carries a conclusion or a real completedAt, whatever a stale `status` says (#7112). */
+function checkRunUnfinished(c) {
+  if (!c?.status || c.status === 'COMPLETED') return false;
+  if (CHECK_CONCLUSIONS.has(String(c.conclusion ?? '').toUpperCase())) return false;
+  const done = typeof c.completedAt === 'string' ? Date.parse(c.completedAt) : NaN;
+  return !(Number.isFinite(done) && done > Date.parse('2000-01-01T00:00:00Z') && done <= Date.now() + 60_000);
+}
+const CHECK_CONCLUSIONS = new Set(['SUCCESS', 'FAILURE', 'CANCELLED', 'TIMED_OUT', 'NEUTRAL', 'SKIPPED', 'STALE', 'STARTUP_FAILURE', 'ACTION_REQUIRED']);
+
 /**
  * Is the PR worth a fast drain right now? A WAKE filter, never the gate: it only skips a run the drain would certainly
  * no-op (a fast drain lists and classifies for ~1 min, and most green-check events are for PRs that are not queued yet
@@ -428,7 +438,7 @@ export function wakeWorthy(pr, defaultBranch = 'main') {
   if (hold) return { wake: false, reason: hold };
   if (!labels.includes(READY_LABEL)) return { wake: false, reason: `no ${READY_LABEL} label yet` };
   const running = (Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [])
-    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : c?.status && c.status !== 'COMPLETED'));
+    .filter((c) => (c?.__typename === 'StatusContext' ? ['PENDING', 'EXPECTED'].includes(String(c.state).toUpperCase()) : checkRunUnfinished(c)));
   if (running.length) return { wake: false, reason: `${running.length} check(s) still running (${running.slice(0, 3).map((c) => c.name || c.context).join(', ')})` };
   return { wake: true, reason: 'ready-to-merge, every check finished' };
 }
@@ -808,6 +818,7 @@ export function createEnqueueOnEvent({
   cwd, localSlug, defaultBranch, execFileSyncImpl = execFileSyncThrottled,
   scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
+  writeRoundSnapshot = writeFastDrainRoundDefaultBranch,
   refreshPending = () => {
     try {
       const root = scriptRoot();
@@ -852,6 +863,7 @@ export function createEnqueueOnEvent({
       || pr.state && pr.state !== 'OPEN') { missBackoff.delete(num); return null; }
     return now() - held.at < missSettings(s).ttlMinutes * 60_000 ? held : null;
   };
+  let defaultBranchReadAt = null; // Only an actual live read in this daemon can timestamp branch evidence.
   let listingSnapshot = null;
   const snapshotPrefix = `we-fast-drain-${process.pid}-${randomUUID()}`;
   const clearSnapshot = () => {
@@ -962,6 +974,7 @@ export function createEnqueueOnEvent({
           { cwd, env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
         if (typeof branch !== 'string' || !branch.trim() || branch.trim() === 'null') throw new Error('default branch unreadable');
         defaultBranch = branch.trim();
+        defaultBranchReadAt = now();
       } catch {
         log('enqueue-on-event: default branch unreadable — deferring wakes and catch-up; retrying on next tick');
         return [];
@@ -1000,6 +1013,8 @@ export function createEnqueueOnEvent({
         catchUpRound++;
         clearSnapshot();
         listingSnapshot = join(tmpdir(), `${snapshotPrefix}-${catchUpRound}.json`);
+        if (defaultBranchReadAt !== null) writeRoundSnapshot({ path: listingSnapshot, repo: localSlug,
+          defaultBranch, observedAt: defaultBranchReadAt });
         listedPrs = result.prs;
         catchUpMainCiRunId = result.mainCiRunId;
         const listed = new Set(result.prs.filter(p => !p.inQueue).map(p => p.num));

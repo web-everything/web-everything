@@ -4,6 +4,10 @@ import { readDrainRedTeamEvidence, redTeamStatusDir, settleUnknownEvidenceByComm
 import { needsPublish, publishStoredRedTeamResult } from '../lib/red-team-withheld-publish.mjs';
 import { redTeamCarrySources } from '../lib/red-team-gate.mjs';
 import { readSealedStatus } from '../lib/red-team-sealed-status.mjs';
+import { latestHumanClearance } from '../lib/human-clearance-carry.mjs';
+import { closeConfirmRunsAfterClearance } from '../review-set-label.mjs';
+import { readReviewRunIndex } from '../lib/review-run-index.mjs';
+import { resolveRunsDir } from '../operations/run-store.mjs';
 /**
  * @file scripts/conveyor/advisory-label-sweep.mjs
  * @description THE `advisory:*` STALENESS SWEEP — drops `advisory:accepted` / `advisory:changes` from any open PR
@@ -159,6 +163,8 @@ export function defaultListUnpublishedStatuses({ dir = redTeamStatusDir() } = {}
 export function sweepAdvisoryLabels({
   repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false, readStatusEvidence = readDrainRedTeamEvidence,
   publishStored = publishStoredRedTeamResult, listUnpublishedStatuses = defaultListUnpublishedStatuses,
+  settleRuns = closeConfirmRunsAfterClearance,
+  listRunIds = ({ repo, pr }) => readReviewRunIndex(resolveRunsDir(), repo, pr),
   readSeal = key => readSealedStatus({ ...key, env: process.env }),
   log = line => process.stderr.write(`${line}\n`),
 } = {}) {
@@ -190,6 +196,24 @@ export function sweepAdvisoryLabels({
         throw error;
       }
       if (!live || (live.state && live.state !== 'OPEN')) continue;
+      if (!dryRun) {
+        try {
+          const liveLabels = labelNames(live.labels);
+          const clearance = liveLabels.includes('review:accepted') ? latestHumanClearance(live.comments) : null;
+          if (clearance && !liveLabels.includes('review:human') && !liveLabels.includes('review:changes')
+            && !(Array.isArray(live.reviews) && live.reviews.some(review => review?.state === 'CHANGES_REQUESTED'))
+            && /^[0-9a-f]{40}$/i.test(live.headRefOid ?? '')
+            && clearance.sha.toLowerCase() === live.headRefOid.toLowerCase()) {
+            const ids = listRunIds({ repo: resolvedRepo, pr: pr.number });
+            if (Array.isArray(ids) && ids.length) {
+              const { closed, failed } = settleRuns({ repo: resolvedRepo, pr: pr.number, headSha: live.headRefOid, ids });
+              if (closed.length || failed.length) log(`clear-human runs #${pr.number}: closed=${closed.length} failed=${failed.length}`);
+            }
+          }
+        } catch (e) {
+          log(`clear-human runs #${pr.number}: failed: ${String(e?.message ?? e).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 200)}`);
+        }
+      }
       let evidence = readStatusEvidence({ repo: resolvedRepo, pr: pr.number, head: live.headRefOid });
       let comments = live.comments;
       if (!dryRun && needsPublish(evidence.status)) {

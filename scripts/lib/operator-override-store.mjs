@@ -6,7 +6,8 @@ import { withNumberingLock } from '../readiness/drain-lock.mjs';
 import { userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { CAPACITY_LEAVES, readOperatorOverrides, operatorOverridesPath, validateKey } from './operator-override-reader.mjs';
+import { CAPACITY_LEAVES, operatorOverridesPath, validateKey } from './operator-override-reader.mjs';
+import { readStrictStore, validateStrictStoreText } from './capacity-leaf.mjs';
 export * from './operator-override-reader.mjs';
 
 const safe = s => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ');
@@ -22,13 +23,17 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
   if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs < 0 || lockWaitMs > 5000)
     throw Error('operator-override: lockWaitMs must be an integer in 0..5000; retry with the default bounded wait');
   const locked = withNumberingLock(() => {
-    const current = readOperatorOverrides({ file, normalize: false });
-    if (!current.readable || current.invalidPolicies?.length) throw Error('operator-override: unreadable or invalid store; repair it before writing');
-    const values = current.values;
+    const current = readStrictStore({ file });
+    if (!current.ok && current.reason !== 'absent')
+      throw Error(`operator-override: unreadable or invalid store (${current.reason}); repair it before writing`);
+    const values = current.ok ? current.values : {};
     const before = { ...values };
     if (clear) delete values[key]; else values[key] = value;
     if (values['resourceGate.fixCap.ceiling'] < values['resourceGate.fixCap.floor'])
       values['resourceGate.fixCap.floor'] = values['resourceGate.fixCap.ceiling'];
+    const candidate = JSON.stringify(values, null, 2) + '\n';
+    const validated = validateStrictStoreText(candidate);
+    if (!validated.ok) throw Error(`operator-override: invalid store (${validated.reason}); repair it before writing`);
     // One audit row per key whose stored value changed, plus the requested key, recording the value actually stored.
     const keys = [key, ...Object.keys({ ...before, ...values }).filter(k => k !== key && (before[k] ?? null) !== (values[k] ?? null))];
     const changes = keys.map(k => ({ key: k, old: before[k] ?? null, new: values[k] ?? null }));
@@ -40,7 +45,7 @@ function publish({ file = operatorOverridesPath(), key, value, reason, actor,
     }) + '\n').join(''), { mode: 0o600 });
     const temporary = `${file}.${randomUUID()}.tmp`;
     try {
-      io.writeFileSync(temporary, JSON.stringify(values, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+      io.writeFileSync(temporary, candidate, { mode: 0o600, flag: 'wx' });
       io.renameSync(temporary, file);
     } finally { try { unlinkSync(temporary); } catch { /* Rename consumes the temporary file. */ } }
     const effective = changes[0];
