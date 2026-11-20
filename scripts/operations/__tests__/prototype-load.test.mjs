@@ -3725,6 +3725,45 @@ describe('hot-patch urgent admission (R1100)', () => {
   const vetoRun = (name, id, conclusion = 'failure') => ({ id, head_sha: SHA, name, status: 'completed', conclusion,
     app: { id: 15368 }, check_suite: { id: 7 } });
   const pendingTest = () => ({ ...vetoRun('test', 1), status: 'in_progress', conclusion: null });
+  const shardRows = () => [
+    { ...pendingTest(), name: 'test-shard (1)' },
+    vetoRun('test-shard (2)', 2, 'success'),
+  ];
+  it.each(['queued', 'in_progress', 'completed'])('admits bound %s shards without test as pending through the final re-read', async status => {
+    const rows = shardRows().map(r => ({ ...r, status, conclusion: status === 'completed' ? 'success' : null }));
+    const f = hotFixture({ rows });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.readyWrites[0]).toMatchObject({ tests: 'pending', testCheck: { name: 'test', status: 'in_progress', conclusion: null, suiteIds: [7] } });
+  });
+  it('refuses pending shards without test outside hot-patch mode', async () => {
+    const f = hotFixture({ rows: shardRows() });
+    expect(await f.run({ branch: 'lane/repair', urgent: false })).toMatchObject({ ok: false, registered: false, detail: 'ci-test-check-missing' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure'])('refuses a %s shard at admission and final re-read', async conclusion => {
+    const failed = [shardRows()[0], vetoRun('test-shard (2)', 2, conclusion)];
+    for (const final of [false, true]) {
+      const f = hotFixture({ rows: final ? shardRows() : failed, ...(final ? { finalRows: failed } : {}) });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false,
+        detail: final ? 'hot-patch-admission-changed' : 'ci-failed-urgent' });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
+  });
+  it.each([
+    ['foreign app', () => shardRows().map(r => ({ ...r, app: { id: 99 } }))],
+    ['unbound workflow', () => shardRows().map(r => ({ ...r, check_suite: { id: 9 } }))],
+    ['wrong SHA', () => shardRows().map(r => ({ ...r, head_sha: TREE }))],
+    ['zero shards', () => []],
+    ['unknown shard name', () => [{ ...pendingTest(), name: 'test-shard (unknown)' }]],
+    ['unknown conclusion', () => [vetoRun('test-shard (1)', 1, 'neutral')]],
+    ['malformed shard', () => [{ ...shardRows()[0], check_suite: null }]],
+  ])('refuses %s shard evidence at admission and final re-read', async (_, rows) => {
+    for (const final of [false, true]) {
+      const f = hotFixture({ rows: final ? shardRows() : rows(), ...(final ? { finalRows: rows() } : {}) });
+      expect(await f.run()).toMatchObject({ ok: false, registered: false, ...(final ? { detail: 'hot-patch-admission-changed' } : {}) });
+      expect(mutations(f, 'add')).toHaveLength(0);
+    }
+  });
   it.each(['test', 'unknown-job', 'review-gatekeeper', 'prefix-review-gate'])('vetoes review-gate red plus failing %s at admission and final re-read', async name => {
     for (const final of [false, true]) {
       const rows = [pendingTest(), vetoRun('review-gate', 2)];

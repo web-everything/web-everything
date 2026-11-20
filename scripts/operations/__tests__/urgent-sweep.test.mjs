@@ -1026,6 +1026,27 @@ describe('hot-patch sweep (R1100)', () => {
     f.d.pr = vi.fn(() => openPr());
     return f;
   }
+  it('keeps bound pending shards without test loaded past the unknown-evidence deadline', async () => {
+    const f = hotFixture([check('changes'), check('test-shard (1)'), check('test-shard (2)', null, { status: 'in_progress' })]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    expect(await f.run()).toMatchObject({ results: [{ status: 'pending' }] });
+    expect(f.d.remove).not.toHaveBeenCalled();
+    expect(f.d.escalate).not.toHaveBeenCalled();
+  });
+  it('rolls back a bound failed shard without an aggregate test check', async () => {
+    const f = hotFixture([check('changes'), check('test-shard (1)', null, { status: 'in_progress' }), check('test-shard (2)', 'failure')]);
+    decisionBeforeRemoval(f, 'ci-failed');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
+  it.each(['foreign app', 'unbound workflow'])('treats %s pending shards without test as unknown', async kind => {
+    const f = hotFixture([check('changes'), check('test-shard (1)', null, { status: 'queued',
+      ...(kind === 'foreign app' ? { app: { id: 99 } } : { check_suite: { id: 9 } }) })]);
+    f.d.now = () => new Date(Date.parse(load.at) + 31 * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    expect(f.d.remove).toHaveBeenCalledTimes(1);
+  });
   it('reads a hot-patch PR from a renamed recorded origin', () => {
     const ghExec = vi.fn((cmd, args, options) => {
       expect(options.env).not.toHaveProperty('GH_REPO');

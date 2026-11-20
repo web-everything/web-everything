@@ -12,7 +12,7 @@ import { retireRegistration, recoverDrops } from '../daemon-overlay.mjs';
 import { resolveOriginRepository } from './prototype-retire.mjs';
 import { safeRegistrationRef, validSha, TEST_CHECK_APP_ID, testCheckEvidence, testWorkflowBound } from './prototype-load.mjs';
 import { ciGatePlan, urgentLedger, normalizeUrgentRepo, resolveOriginRepo, canonicalUrgentRepo } from './urgent-verify-marker.mjs';
-import { readHotPatchVetoPolicy, hotPatchIgnoresCheck, DEFAULT_VETO_IGNORE_CHECKS } from './prototype-load-io.mjs';
+import { readHotPatchVetoPolicy, hotPatchIgnoresCheck, hotPatchTestEvidence, DEFAULT_VETO_IGNORE_CHECKS } from './prototype-load-io.mjs';
 import { writeEscalationPacket } from './land-advance-escalations.mjs';
 
 const failedCheck = (c, sha) => c?.head_sha === sha && c.status === 'completed'
@@ -41,7 +41,10 @@ export function hotPatchCiEvidence(data, sha, required, now, vetoIgnoreChecks = 
   validateChecks(data, sha);
   if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
     throw Error('unreadable required CI jobs');
-  if (required.some(n => !data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && (c.name === n || c.name.startsWith(`${n} (`)) && Number.isSafeInteger(c.check_suite?.id) && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, sha, n === 'soak-replay-gate' ? '.github/workflows/soak-replay-gate.yml' : data.testWorkflowPath)))) throw Error('missing required Actions check; inspect CI or unload manually');
+  const testEvidence = hotPatchTestEvidence(data, sha);
+  if (required.some(n => n === 'test'
+    ? !testWorkflowBound(testEvidence, data.workflows, sha, data.testWorkflowPath)
+    : !data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && (c.name === n || c.name.startsWith(`${n} (`)) && Number.isSafeInteger(c.check_suite?.id) && testWorkflowBound({ suiteIds: [c.check_suite.id] }, data.workflows, sha, n === 'soak-replay-gate' ? '.github/workflows/soak-replay-gate.yml' : data.testWorkflowPath)))) throw Error('missing required Actions check; inspect CI or unload manually');
   const latest = new Map();
   for (const c of data.check_runs) {
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
@@ -50,7 +53,7 @@ export function hotPatchCiEvidence(data, sha, required, now, vetoIgnoreChecks = 
   if ([...latest.values()].some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID
     && c.status === 'completed' && c.conclusion !== 'success') || data.check_runs.some(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && c.app.id === TEST_CHECK_APP_ID && failedCheck(c, sha) && latest.get(JSON.stringify([c.app.id, c.check_suite?.id, c.name])).status !== 'completed' && (!Number.isFinite(Date.parse(c.completed_at)) || now - Date.parse(c.completed_at) >= 30 * 60_000)))
     throw Error('unknown hot-patch CI conclusion; inspect checks or unload manually');
-  if (!testWorkflowBound(testCheckEvidence(data, sha), data.workflows, sha, data.testWorkflowPath))
+  if (!testWorkflowBound(testEvidence, data.workflows, sha, data.testWorkflowPath))
     throw Error('unreadable hot-patch CI binding');
 }
 export function createSweepDeps({ home = homedir(), io = fs, exec = execFileSync, ghExec = execFileSyncThrottled, retire = retireRegistration, recover = recoverDrops, readState = readOverlayState, env = process.env } = {}) {
@@ -337,7 +340,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           }
         } catch (e) { evidenceError = ciEvidenceError = e; }
         if (hotPatch) {
-          if (!testWorkflowBound(testCheckEvidence(data ?? {}, r.sha), data?.workflows, r.sha, data?.testWorkflowPath)) {
+          if (!testWorkflowBound(hotPatchTestEvidence(data ?? {}, r.sha), data?.workflows, r.sha, data?.testWorkflowPath)) {
             ciEvidenceError ||= Error('unreadable hot-patch CI binding; repair workflow evidence or unload manually');
             evidenceError ||= ciEvidenceError;
           }

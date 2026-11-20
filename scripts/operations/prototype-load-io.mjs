@@ -78,6 +78,21 @@ export function readHotPatchVetoPolicy({ fs = nodeFs, env = process.env, setting
 export const hotPatchIgnoresCheck = (name, names) => typeof name === 'string'
   && names.some(n => name === n || name.startsWith(`${n} (`));
 
+/** Hot-patch only: shards precede the aggregate test job. Callers must bind every suite. */
+export function hotPatchTestEvidence(data, sha) {
+  const test = testCheckEvidence(data, sha);
+  if (test || !Array.isArray(data?.check_runs) || data.check_runs.some(r => r?.name === 'test')) return test;
+  if (!Number.isInteger(data.total_count) || data.total_count < 0 || data.total_count > 100
+    || data.check_runs.length !== data.total_count) return null;
+  const shards = data.check_runs.filter(r => /^test-shard \([1-9]\d*\)$/.test(r?.name)
+    && r.head_sha === sha && r.app?.id === TEST_CHECK_APP_ID);
+  if (!shards.length || shards.some(r => !Number.isSafeInteger(r.id) || !Number.isSafeInteger(r.check_suite?.id)
+    || !(['queued', 'in_progress'].includes(r.status) && r.conclusion === null
+      || r.status === 'completed' && r.conclusion === 'success'))) return null;
+  return { sha, name: 'test', status: 'in_progress', conclusion: null, appId: TEST_CHECK_APP_ID,
+    suiteIds: [...new Set(shards.map(r => r.check_suite.id))].sort((a, b) => a - b) };
+}
+
 /** Keep runner diagnostics safe for both terminal output and persisted evidence. */
 function sanitizeCombinedOutput(value, env, worktree, preserveLines = false) {
   let message = String(value).replace(ANSI_SEQUENCE, '').replace(/[\p{Cc}\p{Cf}]/gu, (char) => preserveLines && /[\t\n]/.test(char) ? char : '');
@@ -660,7 +675,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         if (hotPatchMode && data.check_runs.some(r => r.name === 'test' && r.head_sha === sha && r.app.id === TEST_CHECK_APP_ID
           && !(r.status === 'queued' || r.status === 'in_progress' || r.status === 'completed' && r.conclusion === 'success')))
           throw Error('hot-patch test check is neither pending nor successful; repair CI and retry');
-        const evidence = testCheckEvidence(data, sha);
+        const evidence = hotPatchMode ? hotPatchTestEvidence(data, sha) : testCheckEvidence(data, sha);
         // Only "no check named test at all" can be the no-CI-run signature of a conflicting head; a test check
         // from another app, or on another sha, is mis-bound evidence and must keep refusing.
         if (!evidence) { noTestCheckAtAll = !data.check_runs.some(r => r.name === 'test');
