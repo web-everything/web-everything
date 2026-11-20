@@ -724,7 +724,7 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
         branch: classifyOptions.defaultBranch || 'main' }), headSha)) {
         // Fail closed: the rebuild restamps the acceptance, so it must already cover THIS head (unknown = held).
         const evidence = acceptance ?? (readAcceptance ? await readAcceptance({ pr: c.num, repo: c.repo, cwd: refreshOptions.cwd }) : null);
-        const coverage = acceptanceCoversHead(evidence ?? {});
+        const coverage = evidence?.headSha === headSha ? acceptanceCoversHead(evidence) : { covers: false, reason: 'acceptance evidence is for another head' };
         if (!coverage.covers) return { ...unchanged, reason: `failed merge-gate refresh held: acceptance does not cover head (${coverage.reason || 'unknown'})` };
         return refreshStartupFailure({ c, headSha, classification: { runId: null, runConclusion: 'failure' },
           setting, statePath, writeClaim, warn, refreshOptions, failedGateBudget });

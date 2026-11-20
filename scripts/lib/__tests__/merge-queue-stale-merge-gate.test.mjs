@@ -53,6 +53,11 @@ describe('stale merge-gate refresh', () => {
       expect(o.refreshStalePr).not.toHaveBeenCalled();
       expect(o.failedGateBudget.remaining).toBe(2);
     });
+    it('evidence read for another head is refused', async () => {
+      const { o, r } = await run(vi.fn(() => ({ acceptedSha: other, headSha: other })));
+      expect(r.handled).toBe(false);
+      expect(o.refreshStalePr).not.toHaveBeenCalled();
+    });
     it.each([['unreadable', () => { throw new Error('offline'); }], ['missing', () => undefined]])('%s acceptance fails closed', async (_n, read) => {
       const { o, r } = await run(vi.fn(read));
       expect(r.handled).toBe(false);
