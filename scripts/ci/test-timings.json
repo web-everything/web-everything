@@ -2233,6 +2233,7 @@
   "scripts/conveyor/soak/breaks/red-team-skip-reason-drops-comment-error.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-stale-refusal-burns-start-slot.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/red-team-stored-break-cleared-by-comment.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/redteam-not-owed-after-confirm-accept.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/redteam-pending-label-never-settles.soak.test.mjs": 2.02,
   "scripts/conveyor/soak/breaks/refresh-config-before-healing.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/refused-stage-pending-referrals-never-resume.soak.test.mjs": 1.5,
