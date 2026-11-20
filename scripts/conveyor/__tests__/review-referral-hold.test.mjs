@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import * as daemonEvents from '../../lib/daemon-events.mjs';
 import { createActionStore } from '../../operations/action-store.mjs';
 import { publishAttention, runOnce as pollNeedsYou, unacknowledged, acknowledge } from '../../operations/needs-you-feed.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
+import { listRunIds, newRunRecord, runPath, tryReadRun, writeRun } from '../../operations/run-store.mjs';
 import { markRunAbandoned } from '../../lib/run-abandoned.mjs';
-import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
+import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord, VERDICTS } from '../../lib/jury-core.mjs';
 import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { runReconcilePass as runReconcilePassWithTiming } from '../reconcile-pass.mjs';
@@ -16,6 +19,7 @@ import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
   GH_LIST_COMMENT_CAP, findResumableParkedRun, RESUME_MAX_ATTEMPTS,
+  INVALID_RUN_EVIDENCE_MAX_BYTES,
   VERDICT_COOLDOWN_BASE_MS, VERDICT_COOLDOWN_CAP_MS, VERDICT_COOLDOWN_MAX_RELEASES,
   resolveNoVerdictRetry, NO_VERDICT_RETRY_STANDARD, raiseNoVerdictNeedsYou, NO_VERDICT_NEEDS_YOU_KIND, needsYouClaimRoot,
 } from '../review-referral-hold.mjs';
@@ -233,6 +237,264 @@ describe('attempted mandatory referrals', () => {
       expect(hold(pr({ comments: [comment(renderReferralRecord(r), at - 120_000)] }))).toBeNull();
     }
   });
+  it('enumerates valid evidence beside tombstones and stray JSON, alerting once before any record reads', () => {
+    const dir = temp();
+    writeRun(run(), dir);
+    for (const name of ['x y.json', 'review-pr-abc.abandoned.json']) writeFileSync(join(dir, name), '{}');
+    writeFileSync(join(dir, 'review-pr-bad name.json'), JSON.stringify({ ...run(), id: 'review-pr-bad name', input: { repo } }));
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    const read = vi.fn(tryReadRun);
+    try {
+      const options = { dir, readRun: read, memo: new Map(), persist: false };
+      expect(readReviewRunEvidence(options)).toHaveLength(1);
+      expect(readReviewRunEvidence(options)).toHaveLength(1);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(read).toHaveBeenCalledWith('review-pr-parked', dir);
+      expect(alert.mock.calls.map(([event]) => event)).toEqual([
+        { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'x y.json') } },
+        { kind: 'run-store-invalid-entry', detail: { path: join(dir, 'review-pr-bad name.json'), severity: 'high', reason: 'no PR number' } },
+      ]);
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each(['parked', 'completed', 'incomplete'])('retains misnamed %s evidence without weakening named reads or id lists', state => {
+    const dir = temp();
+    const valid = run();
+    const invalid = { ...run(), id: 'review-pr-bad name' };
+    if (state === 'completed') invalid.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
+    if (state === 'incomplete') invalid.stepTimings = invalid.stepTimings.filter(t => t.step !== 'advise');
+    writeRun(valid, dir);
+    writeFileSync(join(dir, 'review-pr-bad name.json'), JSON.stringify(invalid));
+    writeFileSync(join(dir, 'review-pr-valid.abandoned.json'), JSON.stringify(invalid));
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      for (const persist of [false, true]) {
+        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
+        expect(rows).toEqual([reviewRunEvidence(valid),
+          { ...reviewRunEvidence(invalid), ...(state === 'incomplete' ? { misnamed: true } : {}) }]);
+        if (state === 'parked') expect(hold(pr(), [rows[1]])).not.toBeNull();
+        else expect(rows[1]).toMatchObject(state === 'completed' ? { parked: false } : { incomplete: true });
+      }
+      expect(listRunIds(dir)).toEqual([valid.id]);
+      expect(() => tryReadRun(invalid.id, dir)).toThrow(/invalid run id/);
+      expect(() => runPath(invalid.id, dir)).toThrow(/invalid run id/);
+      expect(alert).toHaveBeenCalledTimes(1);
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each([
+    ['none', undefined],
+    ...['run', 'referral'].flatMap(source => ['', 'unknown-verdict', ...Object.values(VERDICTS)].map(value => [source, value])),
+  ])('requires a recognized verdict before a newer misnamed record can supersede a persistence-failure hold (%s: %s)', (source, value) => {
+    const dir = temp();
+    const failed = run({ failure: true });
+    const newer = { ...run({ time: at + 1 }), id: 'review-pr-no verdict' };
+    delete newer.verdict;
+    delete newer.findings.referralVerdict;
+    newer.pending = null;
+    if (source === 'run') newer.verdict = { verdict: value, pendingReferrals: [] };
+    if (source === 'referral') newer.findings.referralVerdict = { verdict: value, pendingReferrals: [] };
+    writeRun(failed, dir);
+    writeFileSync(join(dir, `${newer.id}.json`), JSON.stringify(newer));
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      for (const persist of [false, true]) {
+        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
+        const recovered = rows.find(row => row.id === newer.id);
+        if (!Object.values(VERDICTS).includes(value)) {
+          expect(recovered).toMatchObject({ misnamed: true, incomplete: true, completedAt: null, pending: ['review-incomplete'] });
+          expect(hold(pr(), rows)).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
+          expect(findResumableParkedRun(pr(), rows, { repo })).toEqual({ id: failed.id, head });
+        } else {
+          expect(recovered.incomplete).toBeUndefined();
+          expect(recovered).toMatchObject({ completedAt: at + 1, parked: false });
+          expect(hold(pr(), rows)).toBeNull();
+        }
+      }
+    } finally { alert.mockRestore(); }
+  });
+
+  it('counts misnamed no-verdict incomplete evidence toward no-verdict retries', () => {
+    const dir = temp();
+    for (let i = 0; i < 3; i++) {
+      const r = { ...run({ time: at + i }), id: `review-pr-no verdict-${i}`, pending: null };
+      delete r.verdict;
+      delete r.findings.referralVerdict;
+      writeFileSync(join(dir, `${r.id}.json`), JSON.stringify(r));
+    }
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      const rows = readReviewRunEvidence({ dir, memo: new Map(), persist: false });
+      expect(rows).toHaveLength(3);
+      expect(rows.every(r => r.misnamed && r.incomplete && r.completedAt === null)).toBe(true);
+      expect(decideSameHeadHold(pr({ labels: [{ name: 'review:pending' }] }), rows,
+        { repo, env: {}, now: at + 1, retry: { cooldownReleases: 0, source: 'standard' } }))
+        .toMatchObject({ count: 3, noVerdict: { exhausted: true } });
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each([
+    ['missing version', r => { delete r.v; }],
+    ['invalid cursor', r => { r.cursor = -1; }],
+    ['invalid effects', r => { r.effects = {}; }],
+    ['invalid pending', r => { r.pending = {}; }],
+    ['invalid telemetry', r => { r.telemetry = {}; }],
+    ['invalid step timing', r => { delete r.stepTimings[0].stepIndex; }],
+    ['needs-human without pendingReferrals', r => { r.findings.referralVerdict = r.verdict = { verdict: 'needs-human' }; }],
+    ['a null pendingReferrals element', r => { r.findings.referralVerdict = r.verdict = { verdict: 'needs-human', pendingReferrals: [null] }; }],
+    ['an empty-string pendingReferrals element', r => { r.findings.referralVerdict = r.verdict = { verdict: 'needs-human', pendingReferrals: [''] }; }],
+    ['a non-object blockedReferrals element', r => { r.findings.referralVerdict = r.verdict = { verdict: 'needs-human', pendingReferrals: ['x'], blockedReferrals: [7] }; }],
+    ['a valid top-level accept masking a malformed referral verdict', r => {
+      r.verdict = { verdict: 'accept', pendingReferrals: [] };
+      r.findings.referralVerdict = { verdict: 'needs-human' };
+    }],
+  ])('a newer misnamed record with %s cannot clear a persistence-failure hold', (_, corrupt) => {
+    const dir = temp();
+    const failed = run({ failure: true });
+    const newer = run({ time: at + 60_000 });
+    newer.id = 'review-pr-bad name';
+    newer.findings.referralVerdict = newer.verdict = { verdict: 'accept', pendingReferrals: [] };
+    corrupt(newer);
+    writeRun(failed, dir);
+    const path = join(dir, 'review-pr-bad name.json');
+    writeFileSync(path, JSON.stringify(newer));
+    utimesSync(runPath(failed.id, dir), at / 1000, at / 1000);
+    utimesSync(path, (at + 60_000) / 1000, (at + 60_000) / 1000);
+    expect(statSync(path).mtimeMs).toBeGreaterThan(statSync(runPath(failed.id, dir)).mtimeMs);
+    // Without structural validation this projection would supersede the parked failure.
+    expect(hold(pr(), [reviewRunEvidence(failed), reviewRunEvidence(newer)])).toBeNull();
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+    try {
+      for (const persist of [false, true]) {
+        const rows = readReviewRunEvidence({ dir, memo: new Map(), persist });
+        expect(rows).toEqual([reviewRunEvidence(failed)]);
+        expect(hold(pr(), rows)).toMatchObject({ persistenceFailed: true, retryAt: at + REFERRAL_RETRY_MS[0] });
+      }
+      expect(alert).toHaveBeenCalledWith({ kind: 'run-store-invalid-entry', detail: {
+        path, severity: 'high', reason: expect.any(String),
+      } });
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each(['unparseable', 'no PR', 'oversized'])(
+    'skips %s misnamed content with an operator-visible invalid-entry alert', kind => {
+      const dir = temp();
+      const path = join(dir, 'review-pr-bad name.json');
+      const r = { ...run(), id: 'review-pr-bad name' };
+      if (kind === 'no PR') delete r.input.pr;
+      writeFileSync(path, kind === 'unparseable' ? '{' : JSON.stringify(r));
+      if (kind === 'oversized') truncateSync(path, INVALID_RUN_EVIDENCE_MAX_BYTES + 1);
+      const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValue(true);
+      try {
+        expect(readReviewRunEvidence({ dir, memo: new Map(), persist: false })).toEqual([]);
+        expect(alert).toHaveBeenCalledTimes(1);
+        expect(alert).toHaveBeenCalledWith({ kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) } });
+      } finally { alert.mockRestore(); }
+    });
+
+  it('retries HIGH alerts until durably delivered even after a filename warning', async () => {
+    const dir = temp();
+    const path = join(dir, 'review-pr-bad name.json');
+    writeFileSync(path, '{');
+    const alert = vi.spyOn(daemonEvents, 'appendDaemonEvent').mockResolvedValueOnce(true)
+      .mockImplementationOnce(() => { throw new Error('unavailable'); })
+      .mockRejectedValueOnce(new Error('unavailable')).mockResolvedValueOnce(false).mockResolvedValue(true);
+    const scan = () => readReviewRunEvidence({ dir, memo: new Map(), persist: false });
+    const settle = () => new Promise(resolve => setImmediate(resolve));
+    try {
+      expect(listRunIds(dir)).toEqual([]);
+      await settle();
+      expect(scan()).toEqual([]); // synchronous delivery failure
+      expect(scan()).toEqual([]); // rejection
+      expect(scan()).toEqual([]); // concurrent delivery suppressed
+      expect(alert).toHaveBeenCalledTimes(3);
+      await settle();
+      expect(scan()).toEqual([]); // false delivery
+      await settle();
+      expect(scan()).toEqual([]); // successful durable delivery
+      await settle();
+      expect(scan()).toEqual([]);
+      expect(alert).toHaveBeenCalledTimes(5);
+      for (const [event] of alert.mock.calls.slice(1)) expect(event).toMatchObject({
+        kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) },
+      });
+    } finally { alert.mockRestore(); }
+  });
+
+  it.each(['FIFO', 'directory', 'unreadable file'])('rejects a misnamed %s without blocking, retaining the invalid-entry alert', type => {
+    const dir = temp();
+    const path = join(dir, 'review-pr-bad name.json');
+    if (type === 'FIFO') execFileSync('mkfifo', [path]);
+    else if (type === 'directory') mkdirSync(path);
+    else writeFileSync(path, '{}');
+    const events = join(dir, 'events.jsonl');
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { readReviewRunEvidence } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/conveyor/review-referral-hold.mjs')).href)};
+      let reads = 0;
+      if (${JSON.stringify(type)} === 'unreadable file') {
+        const open = fs.openSync;
+        fs.openSync = (path, ...args) => {
+          if (path === process.argv[2]) throw new Error('EACCES: unreadable record');
+          return open(path, ...args);
+        };
+      }
+      const read = fs.readSync;
+      fs.readSync = (...args) => { reads++; return read(...args); };
+      syncBuiltinESMExports();
+      const rows = readReviewRunEvidence({ dir: process.argv[1], persist: false });
+      console.log(JSON.stringify({ rows, reads }));
+    `, dir, path], { encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, WE_UNDER_TEST: '1', WE_DAEMON_EVENTS: events } });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({ rows: [], reads: 0 });
+    expect(JSON.parse(readFileSync(events, 'utf8').trim())).toMatchObject({
+      kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) },
+    });
+  });
+
+  it('reads at most MAX_BYTES+1 bytes from the same descriptor when a misnamed file grows after fstat', () => {
+    const dir = temp();
+    const path = join(dir, 'review-pr-bad name.json');
+    writeFileSync(path, JSON.stringify({ ...run(), id: 'review-pr-bad name' }));
+    const events = join(dir, 'events.jsonl');
+    // Native ESM keeps builtin bindings live; the test runner can snapshot those exports.
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { readReviewRunEvidence, INVALID_RUN_EVIDENCE_MAX_BYTES as max } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/conveyor/review-referral-hold.mjs')).href)};
+      const stat = fs.fstatSync, read = fs.readSync, close = fs.closeSync;
+      let fd, stats = 0, bytes = 0, sameFd = true, closed = false;
+      fs.fstatSync = handle => {
+        fd = handle; stats++;
+        const snapshot = stat(handle);
+        fs.truncateSync(process.argv[2], max + 4096);
+        return snapshot;
+      };
+      fs.readSync = (handle, buffer, offset, length, position) => {
+        sameFd &&= handle === fd;
+        // Exercise accumulation across short reads.
+        const count = read(handle, buffer, offset, Math.min(length, 64 * 1024), position);
+        bytes += count;
+        return count;
+      };
+      fs.closeSync = handle => { if (handle === fd) closed = true; return close(handle); };
+      syncBuiltinESMExports();
+      const rows = readReviewRunEvidence({ dir: process.argv[1], persist: false });
+      console.log(JSON.stringify({ rows, stats, bytes, sameFd, closed }));
+    `, dir, path], { encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, WE_UNDER_TEST: '1', WE_DAEMON_EVENTS: events } });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({ rows: [], stats: 1,
+      bytes: INVALID_RUN_EVIDENCE_MAX_BYTES + 1, sameFd: true, closed: true });
+    expect(JSON.parse(readFileSync(events, 'utf8').trim())).toMatchObject({
+      kind: 'run-store-invalid-entry', detail: { path, severity: 'high', reason: expect.any(String) },
+    });
+  });
+
   it('reads real run-store shape and withholds an unchanged head in the shared planner, across repeated passes', () => {
     const dir = temp(); vi.stubEnv('OPERATION_RUNS_DIR', dir); writeRun(run(), dir);
     for (let tick = 0; tick < 3; tick++) {

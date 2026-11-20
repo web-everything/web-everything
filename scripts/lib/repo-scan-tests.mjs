@@ -43,6 +43,15 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/capability-dispatch-only.test.mjs',
+    scope: 'files',
+    why: 'capability checks admit dispatch only; roster filtering and unapproved admission are forbidden per source file',
+    matches: (f) => /\.(mjs|js|ts)$/.test(f) && !/(?:^|\/)(__tests__|node_modules)(?:\/|$)/.test(f)
+      && !/\.(test|spec)\./.test(f)
+      && (f === 'scripts/merge-ai-prs.mjs' || inTree(f, ['scripts/conveyor', 'skills-src/conveyor', 'scripts/operations'])),
+    inputs: ['scripts/__tests__/capability-dispatch-only.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/health-watch-lane-scan-boundary.test.mjs',
     scope: 'files',
     why: 'inventories health-watch and stale-state command/helper calls so new destructive lane actions require guard coverage',

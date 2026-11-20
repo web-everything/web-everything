@@ -134,7 +134,7 @@ export function newJobRunRecord({ id, kind, input = {}, codeMode, maxAttempts, c
  * THE METERED FIELDS of one juror spawn, and NOTHING ELSE. See {@link normalizeJudgeTelemetry}.
  * `usage` is handled separately (it is an object of counters, not a scalar).
  */
-const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens', 'exitCode', 'attempts']);
+const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens', 'exitCode', 'attempts', 'firstOutputMs', 'cooldownMs']);
 const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure', 'failureKind', 'failureText']);
 /**
  * Held item 223 — WHY A SEAT FAILED, not only what it cost. `exitCode`, `signal`, `attempts`, `failure` and a
