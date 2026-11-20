@@ -1,9 +1,12 @@
 import { it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { emptyCwdsArgs } from './fixtures/empty-lane-cwds.mjs';
 
 it('empty-cwd loader preserves liveness exports and only replaces the cwd probe', () => {
-  const moduleUrl = new URL('../lib/lane-lease-liveness.mjs', import.meta.url).href;
+  // Resolve a filesystem path first so Vite cannot rewrite the child import to an HTTP asset URL.
+  const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lib/lane-lease-liveness.mjs')).href;
   const source = `
     import assert from 'node:assert/strict';
     import * as fixture from ${JSON.stringify(moduleUrl)};
