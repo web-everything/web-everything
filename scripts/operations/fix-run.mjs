@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
@@ -124,6 +125,7 @@ export function parseFixRunArgv(argv = []) {
     repairKind, pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
+    size: opt('size') === null ? undefined : Number(opt('size')),
     mergeOnto: opt('merge-onto'), provider: opt('provider') ?? 'codex', taskKind: opt('task-kind') ?? 'fix', effort: opt('effort'), model: opt('model'),
   };
 }
@@ -635,6 +637,10 @@ export async function runFixCli(argv = [], {
   removePrompt = removePromptFile,
   pendingRearm = defaultPendingRearm(),
   resolveProvider = resolveFixProvider,
+  loadFixItem = async num => {
+    const { defaultLoadItems } = await import('./dispatch-lane-io.mjs');
+    return defaultLoadItems(REPO_ROOT).find(i => String(i.num) === num || String(i.bornAs) === num);
+  },
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
   readCiHeal = readCiHealInputs,
@@ -1069,7 +1075,14 @@ export async function runFixCli(argv = [], {
       }, heartbeatMs);
       heartbeat.unref();
       try {
+        let admission;
+        if (launch.provider === 'antigravity') {
+          let item;
+          try { item = launch.item ? await loadFixItem(launch.item) : {}; } catch { item = null; }
+          admission = item && deriveAgyFixAdmission(item, { ...launch, repo: launch.claimRepo ?? 'we' });
+        }
         spawned = await provider.spawn({
+          ...admission,
           taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
           sessionId: undefined, prompt: renderNoPromptCommandRules(mergePrompt + (launch.repairKind === 'ci-heal'
             ? SANDBOX_PREAMBLE.replace(/The reviewer's finding[\s\S]*?authoritative ask\.\n/, 'The failing checks and tests are in the CI FAILURE CONTEXT section below.\n')

@@ -85,7 +85,7 @@
 import { pickAgyEvidence, agyRunEvidence, readAgyHold, saveAgyHold } from './lib/antigravity-run-evidence.mjs';
 import { hasAntigravityEffortSuffix } from './lib/antigravity-model-effort.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, constants, openSync, closeSync, fstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, isAbsolute, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -413,11 +413,12 @@ export function runGate({ dir, mode, execFn = defaultExecFn }) {
  * Stream raw JSONL to logFile and optionally stdout. Always resolves, including spawn/log/timeout errors.
  * The parent wall kills with SIGKILL; the child's close event drains remaining output before reporting.
  * Runs one attempt. Resume mode appends to the log and closes stdin without replaying the task.
+ * exclusiveLog creates a fresh no-follow transcript and retains its fd until the run settles.
  * No child process is created by unit tests: spawnFn is injectable.
  */
 export async function runAgyDirectExec({
   dir, task, model, effort, jsonSchema, addDirs, sandbox = false, timeoutMs = DEFAULT_TIMEOUT_MS,
-  logFile, stream = true, spawnFn = nodeSpawn, cli = AGY_CLI, resumeConversationId = null, review = false,
+  logFile, exclusiveLog = false, stream = true, spawnFn = nodeSpawn, cli = AGY_CLI, resumeConversationId = null, review = false,
   // Injected processes must not consume or publish the host's real quota observations.
   // Callers exercising quota behavior can inject both store operations explicitly.
   readHold = spawnFn === nodeSpawn ? readAgyHold : () => null,
@@ -425,17 +426,26 @@ export async function runAgyDirectExec({
 } = {}) {
   let argv = [];
   let stdinLine;
+  let logFd;
   try {
     validateTimeout(timeoutMs);
     argv = buildAgyDirectTaskArgv({ model, effort, jsonSchema, addDirs, sandbox, printTimeoutMs: timeoutMs, resumeConversationId, review });
     if (resumeConversationId === null) stdinLine = buildAgyStdinLine(buildAgyPrompt(task, dir, { review }));
     requireText(logFile, 'logFile');
     // A killed process can leave a partial final line. Separate attempts before appending new JSONL.
-    if (resumeConversationId !== null) appendFileSync(logFile, '\n');
+    if (exclusiveLog) {
+      if (resumeConversationId !== null) throw new Error('exclusive transcript cannot be resumed');
+      logFd = openSync(logFile, constants.O_NOFOLLOW | constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+      if (!fstatSync(logFd).isFile()) throw new Error('transcript must be a regular file');
+    } else if (resumeConversationId !== null) appendFileSync(logFile, '\n');
     else writeFileSync(logFile, '');
     const hold = readHold(model);
-    if (hold) return { stdout: '', stderr: `agy quota exhausted: ${hold.fallbackDecision} until ${hold.quotaResetsAt} (held by ${hold.heldBackend} model ${hold.heldModel})`, code: 1, timedOut: false, argv, ...hold };
+    if (hold) {
+      if (logFd !== undefined) { closeSync(logFd); logFd = undefined; }
+      return { stdout: '', stderr: `agy quota exhausted: ${hold.fallbackDecision} until ${hold.quotaResetsAt} (held by ${hold.heldBackend} model ${hold.heldModel})`, code: 1, timedOut: false, argv, ...hold };
+    }
   } catch (e) {
+    if (logFd !== undefined) closeSync(logFd);
     return { stdout: '', stderr: e.message, code: null, timedOut: false, argv };
   }
   return new Promise((resolvePromise) => {
@@ -445,6 +455,14 @@ export async function runAgyDirectExec({
     let settled = false;
     let timer;
     let child;
+    let groupStopError;
+    let groupStopped = false;
+    const stopExclusiveGroup = () => {
+      if (groupStopped || !exclusiveLog || !Number.isInteger(child?.pid) || child.pid <= 0) return;
+      groupStopped = true;
+      try { process.kill(-child.pid, 'SIGKILL'); }
+      catch (e) { if (e.code !== 'ESRCH') groupStopError = e; }
+    };
     const removeSignalListeners = () => {
       process.removeListener('SIGINT', onSigint);
       process.removeListener('SIGTERM', onSigterm);
@@ -464,6 +482,8 @@ export async function runAgyDirectExec({
       settled = true;
       clearTimeout(timer);
       removeSignalListeners();
+      stopExclusiveGroup();
+      if (groupStopError) { err += `worker group cleanup failed: ${groupStopError.message}\n`; code = null; }
       const evidence = agyRunEvidence({ stdout: out, stderr: err, requestedModel: model });
       try { saveHold(evidence); } catch (e) { err += `quota hold persistence failed: ${e.message}`; code = 1; }
       if (evidence.fallbackDecision !== 'none') {
@@ -495,7 +515,7 @@ export async function runAgyDirectExec({
       if (!text) return;
       out += text;
       try {
-        appendFileSync(logFile, text);
+        appendFileSync(logFd ?? logFile, text);
         if (stream) process.stdout.write(text);
       } catch (e) {
         recordError(e);
@@ -505,6 +525,9 @@ export async function runAgyDirectExec({
     child.stdout?.on('data', (d) => recordStdout(stdoutDecoder.decode(d, { stream: true })));
     child.stderr?.on('data', (d) => { err += d.toString(); });
     child.on('error', (e) => { recordError(e); settle(null); });
+    // exit precedes close: descendants may still hold the pipes open. Stop the detached
+    // group now, then await close before returning any transcript to the confined builder.
+    child.on('exit', stopExclusiveGroup);
     child.on('close', (code) => {
       recordStdout(stdoutDecoder.decode());
       settle(code);
@@ -514,6 +537,8 @@ export async function runAgyDirectExec({
       recordError(e);
       try { child.kill('SIGKILL'); } catch { settle(null); }
     }
+  }).finally(() => {
+    if (logFd !== undefined) closeSync(logFd);
   });
 }
 
