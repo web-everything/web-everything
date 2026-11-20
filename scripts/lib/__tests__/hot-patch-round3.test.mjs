@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
+
 import { requestHotPatch, readHotPatch, recordVerifyResult, recordHotPatchPr, hotPatchPath } from '../hot-patch.mjs';
 import { main } from '../../hot-patch.mjs';
 import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
@@ -27,24 +27,25 @@ const fixture = fn => async () => {
     WE_DAEMON_OVERLAY_DIR: join(home, 'overlays'), WE_DAEMON_CLONE_LOCK_ROOT: join(home, 'locks'),
     WE_DAEMON_EVENTS: join(home, 'events.jsonl'), WE_PLATFORM_PREFERENCES_FILE: join(home, 'preferences.json'),
     WE_POLICY_CASCADE_LOG: '0' };
-  const marker = (change = {}) => {
-    const record = { sha, suite: 'full', shards: 1, result: 'green', startedAt: '2026-11-19T10:00:00Z',
-      finishedAt: '2026-11-19T10:01:00Z', host: 'test-host', ...change };
-    const key = Buffer.alloc(32, 7);
-    mkdirSync(dirname(urgentKeyPath(home)), { recursive: true }); writeFileSync(urgentKeyPath(home), key);
-    mkdirSync(dirname(urgentLedger(home)), { recursive: true });
-    writeFileSync(urgentLedger(home), JSON.stringify({ ...record, sig: urgentSignature(record, key) }) + '\n');
+  let ci = 'green';
+  env.WE_HOT_PATCH = JSON.stringify({ verifyRepo: 'owner/repo' });
+  const marker = ({ result = 'green' } = {}) => { ci = result; };
+  const runGh = () => {
+    if (ci === 'unreadable') throw Error('offline');
+    return JSON.stringify(ci === 'missing' ? [] : [{ id: 1, name: 'test', head_sha: sha,
+      app: { id: 15368, slug: 'github-actions' }, status: ci === 'pending' ? 'in_progress' : 'completed',
+      conclusion: ci === 'red' ? 'failure' : 'success' }]);
   };
   try {
     expect((await requestHotPatch({ root, env, sha, branch: 'lane/hot', daemon: 'review', kind: 'incident',
       files: ['scripts/tool.mjs'] })).ok).toBe(true);
-    await fn({ root, env, sha, good, home, marker, git });
+    await fn({ root, env, sha, good, home, marker, git, runGh });
   } finally { rmSync(home, { recursive: true, force: true }); }
 };
 
-for (const evidence of ['green', 'red-marker', 'missing-marker', 'unreadable-marker',
+for (const evidence of ['green', 'pending', 'red-ci', 'missing-ci', 'unreadable-ci',
   'red-ledger', 'missing-ledger', 'unreadable-ledger', 'rollbackPending', 'unreadable-watch']) {
-  test(`final adoption lock rechecks ${evidence} after approval and retains refused candidate`, fixture(async ({ root, env, sha, good, home, marker, git }) => {
+  test(`final adoption lock rechecks ${evidence} after approval and retains refused candidate`, fixture(async ({ root, env, sha, good, home, marker, git, runGh }) => {
     marker();
     writeRebuildState(root, { adopted: { head: good, mainSha: good, inputsKey: 'base', applied: [] } }, env);
     const reader = { owner: 'race-reader', lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT };
@@ -56,7 +57,7 @@ for (const evidence of ['green', 'red-marker', 'missing-marker', 'unreadable-mar
         run: (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024, ...opts }), stateOpts: { env }, now: Date.now,
         plan: { finalSha: sha, mainSha: good, inputsKey: 'patch', applied: [{ ref: 'lane/hot', sha }] },
         prevHead: good, lease: { token: 'race', path: join(home, 'candidate') }, overlaysBefore: [], prepAlerts: [],
-        dispatchSmoke: { settings: { dispatchSmoke: 'off' } }, finalLockOpts,
+        runGh, dispatchSmoke: { settings: { dispatchSmoke: 'off' } }, finalLockOpts,
         finalizeLockOpts: { ...finalLockOpts,
           now: () => {
             if (!entered) {
@@ -70,9 +71,10 @@ for (const evidence of ['green', 'red-marker', 'missing-marker', 'unreadable-mar
           sleep: async () => {
             expect(changed).toBe(false);
             changed = true;
-            if (evidence === 'red-marker') marker({ result: 'red' });
-            if (evidence === 'missing-marker') rmSync(urgentLedger(home));
-            if (evidence === 'unreadable-marker') writeFileSync(urgentLedger(home), '{bad');
+            if (evidence === 'red-ci') marker({ result: 'red' });
+            if (evidence === 'missing-ci') marker({ result: 'missing' });
+            if (evidence === 'unreadable-ci') marker({ result: 'unreadable' });
+            if (evidence === 'pending') marker({ result: 'pending' });
             if (evidence === 'red-ledger') {
               const hot = readHotPatch(root, env); hot.owed.verify = 'red';
               writeFileSync(hotPatchPath(root, env), JSON.stringify(hot));
@@ -88,7 +90,7 @@ for (const evidence of ['green', 'red-marker', 'missing-marker', 'unreadable-mar
         runSmoke: async () => ({ verdict: 'pass', smoke: { results: [] } }),
       });
       expect(entered && changed, JSON.stringify(result)).toBe(true);
-      if (evidence === 'green') {
+      if (['green', 'pending'].includes(evidence)) {
         expect(result.adopted).toBe(true); expect(git(['rev-parse', 'HEAD'])).toBe(sha);
       } else {
         expect(result.reason).toBe('hot-patch-adoption-refused');
@@ -99,27 +101,26 @@ for (const evidence of ['green', 'red-marker', 'missing-marker', 'unreadable-mar
   }));
 }
 
-for (const evidence of ['missing', 'unreadable', 'wrong-sha', 'unknown-result', 'bad-host', 'bad-finish', 'forged']) {
-  test(`caller green cannot bypass ${evidence} verify marker`, fixture(async ({ root, env, sha, home, marker }) => {
-    if (evidence !== 'missing') marker(evidence === 'wrong-sha' ? { sha: 'a'.repeat(40) }
-      : evidence === 'unknown-result' ? { result: 'pending' }
-        : evidence === 'bad-host' ? { host: '' } : evidence === 'bad-finish' ? { finishedAt: 'bad' } : {});
-    if (evidence === 'unreadable') writeFileSync(urgentLedger(home), '{bad\n');
-    if (evidence === 'forged') writeFileSync(urgentKeyPath(home), Buffer.alloc(32, 8));
+for (const evidence of ['missing', 'unreadable']) {
+  test(`caller green cannot bypass ${evidence} CI`, fixture(async ({ root, env, sha, marker, runGh }) => {
+    marker({ result: evidence });
     const before = readFileSync(hotPatchPath(root, env), 'utf8');
-    expect((await recordVerifyResult({ root, env, sha, result: 'green' })).ok).toBe(false);
+    expect((await recordVerifyResult({ root, env, sha, result: 'green', runGh })).ok).toBe(false);
     expect(readFileSync(hotPatchPath(root, env), 'utf8')).toBe(before);
     expect(await main(['verify-result', '--daemon', root, '--sha', sha, '--result=green'],
-      { env, stdout: () => {}, stderr: () => {} })).toBe(1);
+      { env, runGh, stdout: () => {}, stderr: () => {} })).toBe(1);
   }));
 }
-test('red marker overrides caller green and makes rollback durable', fixture(async ({ root, env, sha, marker }) => {
+test('CI red overrides caller green and later CI green cannot clear durable red', fixture(async ({ root, env, sha, marker, runGh }) => {
   marker({ result: 'red' });
-  expect((await recordVerifyResult({ root, env, sha, result: 'green' })).ok).toBe(true);
+  expect((await recordVerifyResult({ root, env, sha, result: 'green', runGh })).ok).toBe(true);
+  marker();
+  expect((await recordVerifyResult({ root, env, sha, runGh })).ok).toBe(true);
   expect(readHotPatch(root, env)).toMatchObject({ owed: { verify: 'red' }, rollbackPending: 'verify-red' });
 }));
-test('green comes from the signed marker without a caller result', fixture(async ({ root, env, sha, marker }) => {
-  marker(); expect((await recordVerifyResult({ root, env, sha })).ok).toBe(true);
+test('CLI green comes from CI without a caller result', fixture(async ({ root, env, sha, runGh }) => {
+  expect(await main(['verify-result', '--daemon', root, '--sha', sha],
+    { env, runGh, stdout: () => {}, stderr: () => {} })).toBe(0);
   expect(readHotPatch(root, env).owed.verify).toBe('green');
 }));
 

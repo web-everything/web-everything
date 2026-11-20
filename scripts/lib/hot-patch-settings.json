@@ -1,4 +1,7 @@
 {
+  "verifyRepo": "",
+  "verifyAppId": 15368,
+  "verifyAppSlug": "github-actions",
   "ticks": 10,
   "minMinutes": 15,
   "owedPrMinutes": 120,

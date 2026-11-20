@@ -1,3 +1,4 @@
+import { vi } from 'vitest';
 /** @file hot-patch.test.mjs - R1100 decisions, durable rollback and bounded wake regressions. */
 import { test as nodeTest } from 'node:test';
 const test = process.env.VITEST ? (await import('vitest')).test : nodeTest;
@@ -5,7 +6,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
+vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...(await importOriginal()), runGhSync: vi.fn() }));
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { classifyHotPatch, requestHotPatch, readHotPatch, hotPatchPath, evaluateOwed, openHotPatchWatch,
@@ -23,13 +25,9 @@ let sha = 'b'.repeat(40), good = 'a'.repeat(40);
 const at = 1700000000000;
 const verifiedPr = () => ({ status: 0, stdout: JSON.stringify({ headRefName: 'lane/repair', headRefOid: sha, state: 'OPEN' }) });
 const verifyMarker = (env, sha, result) => {
-  const key = Buffer.alloc(32, 7);
-  const record = { sha, suite: 'full', shards: 1, result, host: 'test-host',
-    startedAt: new Date(at).toISOString(), finishedAt: new Date(at + 60000).toISOString() };
-  mkdirSync(dirname(urgentKeyPath(env.HOME)), { recursive: true });
-  writeFileSync(urgentKeyPath(env.HOME), key);
-  mkdirSync(dirname(urgentLedger(env.HOME)), { recursive: true });
-  appendFileSync(urgentLedger(env.HOME), JSON.stringify({ ...record, sig: urgentSignature(record, key) }) + '\n');
+  env.WE_HOT_PATCH = JSON.stringify({ verifyRepo: 'owner/repo' });
+  runGhSync.mockReturnValue(JSON.stringify([{ id: 1, name: 'test', head_sha: sha,
+    app: { id: 15368, slug: 'github-actions' }, status: 'completed', conclusion: result === 'red' ? 'failure' : 'success' }]));
 };
 const fixture = fn => async () => {
   const home = mkdtempSync(join(tmpdir(), 'hot-patch-'));

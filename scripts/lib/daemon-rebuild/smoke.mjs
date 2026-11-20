@@ -29,7 +29,7 @@ import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunSc
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 import { openHotPatchWatch, readHotPatch } from '../hot-patch.mjs';
-import { readHotPatchVerifyMarker } from '../hot-patch-verify-marker.mjs';
+import { readVerifyResult } from '../hot-patch-verify-marker.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -355,7 +355,7 @@ async function resolveDispatchSmoke(opt, env) {
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, runGh, readyOnly = false,
 }) {
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
@@ -678,17 +678,18 @@ export async function smokeAndAdopt({
         const current = readHotPatch(root, stEnv);
         if (approvedHotPatch || current) {
           const watch = readForceWatch(root, stEnv);
-          const verified = readHotPatchVerifyMarker({ sha: current?.sha, env: stEnv });
+          const verified = readVerifyResult({ sha: current?.sha, root, env: stEnv, runGh });
+          // Pending CI permits live adoption during the full test run; unknown and red refuse.
           if (!current || current.sha !== approvedHotPatch?.sha
             || !(current.sha === p.finalSha || p.applied?.some(a => a.ref === current.branch && a.sha === current.sha))
             || current.owed.verify === 'red' || current.rollbackPending
-            || !verified.ok || verified.marker.result !== 'green'
+            || !verified.ok || verified.result === 'red'
             || !watch || watch.sha !== p.finalSha || watch.hotPatchSha !== current.sha || watch.rollbackPending) {
             throw new Error('hot-patch evidence changed or unavailable');
           }
         }
       } catch {
-        const detail = 'repair hot-patch ledger, verify marker and watch evidence; ready candidate retained for the next tick';
+        const detail = 'repair hot-patch ledger, GitHub CI and watch evidence; ready candidate retained for the next tick';
         alert('hot-patch-adoption-refused', { reason: detail, target: p.finalSha });
         return { moved: false, adopted: false, reason: 'hot-patch-adoption-refused', detail, plan: p, alerts: [] };
       }

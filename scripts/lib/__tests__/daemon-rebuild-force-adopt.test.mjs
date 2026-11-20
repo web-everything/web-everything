@@ -26,7 +26,8 @@ import { gitRun } from '../main-staleness.mjs';
 import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
 import * as rebuildPrepare from '../daemon-rebuild/prepare.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
-import { urgentLedger, urgentKeyPath, urgentSignature } from '../../operations/urgent-verify-marker.mjs';
+import { runGhSync } from '../gh-throttle.mjs';
+vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...(await importOriginal()), runGhSync: vi.fn() }));
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -141,14 +142,9 @@ const headOf = (dir) => gitOk(dir, ['rev-parse', 'HEAD']).trim();
 const forceEnv = (env, base) => ({ ...env, WE_FORCE_ADOPT_HANDOFF: join(base, 'handoff.md'), WE_FORCE_ADOPT_CORONER: join(base, 'coroner.jsonl'), WE_DAEMON_EVENTS: join(base, 'events.jsonl') });
 
 function writeHotPatchVerifyMarker(env, base, sha, result = 'green') {
-  env.HOME = join(base, 'hot-patch-home');
-  const record = { sha, suite: 'full', shards: 1, result, startedAt: '2026-11-19T10:00:00Z',
-    finishedAt: '2026-11-19T10:01:00Z', host: 'test-host' };
-  const key = Buffer.alloc(32, 7);
-  mkdirSync(dirname(urgentKeyPath(env.HOME)), { recursive: true });
-  writeFileSync(urgentKeyPath(env.HOME), key);
-  mkdirSync(dirname(urgentLedger(env.HOME)), { recursive: true });
-  writeFileSync(urgentLedger(env.HOME), JSON.stringify({ ...record, sig: urgentSignature(record, key) }) + '\n');
+  env.WE_HOT_PATCH = JSON.stringify({ verifyRepo: 'owner/repo' });
+  runGhSync.mockReturnValue(JSON.stringify([{ id: 1, name: 'test', head_sha: sha,
+    app: { id: 15368, slug: 'github-actions' }, status: 'completed', conclusion: result === 'red' ? 'failure' : 'success' }]));
 }
 
 describe('R1100 hot-patch smoke adoption', () => {
