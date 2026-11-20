@@ -12,6 +12,12 @@
  * non-drain merge is never silent.
  */
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import ts from 'typescript';
+import micromatch from 'micromatch';
+import { parseVitestGlobs } from './test-result-cache.mjs';
+import { DEFAULT_REPO_ROOT, liveSuiteFiles, loadHermeticSettings } from './hermetic-tests.mjs';
 
 /** The `gh pr merge` method flag (default `--merge` = the --no-ff history the drain wants). Pure. */
 export function mergeMethodFlag(method) {
@@ -184,15 +190,200 @@ export function parseUnifiedDiff(diffText) {
  * in the diff it flags:
  *   - `test-file-removed`  — the whole test file was deleted.
  *   - `test-skipped`       — a `.skip`/`.only` (or `xit`/`fit`/…) marker was ADDED (a live test disabled/narrowed).
- *   - `tests-removed`      — net test CASES removed (removed `it(`/`test(` openers exceed added ones).
+ *   - `tests-removed`      — net test CASES removed, excluding unambiguous, body-preserving moves in this diff.
  * Returns `{ tampered, findings, reasons }`, mirroring the manifest-tamper shape the drain's land loop already
  * consumes, so wiring it is a drop-in park. A clean diff (no test file, or only ADDED tests) → `tampered:false`.
- * @param {{diffText?:string}} o  the two-tree net diff TEXT (`computeNetDiffText`, merge-ai-prs.mjs).
+ * @param {{diffText?:string, readFile?:(path:string, side:'base'|'head')=>string}} o  the two-tree net diff TEXT (`computeNetDiffText`, merge-ai-prs.mjs).
  * @returns {{tampered:boolean, findings:Array<{path:string,kind:string,detail:string}>, reasons:string[]}}
  */
-export function scanTestTampering({ diffText = '' } = {}) {
+export function scanTestTampering({ diffText = '', readFile } = {}) {
   const findings = [];
-  for (const f of parseUnifiedDiff(diffText)) {
+  const files = parseUnifiedDiff(diffText);
+  // Move evidence is deliberately stricter than ordinary same-file churn: complete parseable hunks,
+  // static describe/title paths and identical executable bodies (formatting/comments may differ).
+  // Unknown evidence receives no credit: the existing HOLD asks a human to review the full diff.
+  const records = { removed: new Map(), added: new Map() };
+  let oversized = String(diffText).length > 1024 * 1024;
+  let complete = !oversized && !files.some((f) => /(?:^|\/)vitest[^/]*config\.|hermetic-tests\.settings\.json$/.test(f.path || ''));
+  const total = (side) => files.filter((f) => isTestPath(f.path))
+    .reduce((sum, f) => sum + f[side].filter((line) => TEST_CASE_OPENER_RE.test(line)).length, 0);
+  if (total('removed') > total('added')) complete = false;
+  const normalize = (s) => s.replace(/\s+/g, ' ').trim();
+  const remember = (side, key, value) => {
+    if (!records[side].has(key)) records[side].set(key, []);
+    records[side].get(key).push(value);
+  };
+  const fullFiles = typeof readFile === 'function';
+  const staticTitle = (node) => {
+    if (node && ts.isStringLiteralLike(node)) return node.text;
+    if (node && ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = staticTitle(node.left), right = staticTitle(node.right);
+      if (left !== null && right !== null) return left + right;
+    }
+    return null;
+  };
+  function collect(path, lines, side) {
+    if (!lines.length) return;
+    const text = lines.map((l) => l.text).join('\n');
+    const tree = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
+    if (tree.parseDiagnostics.length) { complete = false; return; }
+    const changed = new Set();
+    let offset = 0;
+    for (const line of lines) {
+      if (line.changed) changed.add(offset);
+      offset += line.text.length + 1;
+    }
+    function hasSuiteExit(node) {
+      // Returns/throws in test callbacks or helper functions do not exit the enclosing suite.
+      if (ts.isFunctionLike(node)) return false;
+      if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) return true;
+      return !!ts.forEachChild(node, hasSuiteExit);
+    }
+    function visit(node, parents = [], disabled = false, container = tree) {
+      // Parameterized declarations are not counted by the legacy opener counter. In full-file
+      // evidence retain their static titles for collisions, but never award them move credit.
+      const parameterized = fullFiles && ts.isCallExpression(node) && ts.isCallExpression(node.expression) &&
+        /^(?:it|test)\.each$/.test(node.expression.expression.getText(tree));
+      if (ts.isCallExpression(node) && (parameterized || /^(?:describe|it|test)(?:\.(?:skip|todo|only))?$/.test(node.expression.getText(tree)))) {
+        if (!ts.isExpressionStatement(node.parent) || node.parent.parent !== container) { complete = false; return; }
+        const callee = node.expression.getText(tree);
+        const [title, fn] = node.arguments;
+        const titleText = fullFiles ? staticTitle(title) : title && ts.isStringLiteralLike(title) ? title.text : null;
+        if (titleText === null || !fn ||
+            !(ts.isArrowFunction(fn) || ts.isFunctionExpression(fn))) { complete = false; return; }
+        const key = [...parents, normalize(titleText)];
+        // Calling a generator returns an iterator without running its assertions (or suite setup).
+        const blocked = disabled || parameterized || !!fn.asteriskToken || callee.includes('.');
+        if (callee.startsWith('describe')) {
+          // Direct nesting alone does not prove registration: a prior (even conditional)
+          // exit can leave declarations unreachable. Refuse credit throughout such a suite.
+          const suiteBlocked = blocked || hasSuiteExit(fn.body);
+          ts.forEachChild(fn.body, (child) => visit(child, key, suiteBlocked, fn.body));
+          return;
+        }
+        const start = tree.getLineStarts()[tree.getLineAndCharacterOfPosition(node.getStart(tree)).line];
+        // Compare parsed statements, not whitespace-stripped tokens: `return\nexpect(...)`
+        // skips the assertion even though it has the same tokens as `return expect(...)`.
+        const body = ts.createPrinter({ removeComments: true }).printNode(ts.EmitHint.Unspecified, fn.body, tree);
+        let assertions = 0;
+        let trivial = false;
+        function assertion(n) {
+          if (ts.isCallExpression(n) && n.expression.getText(tree) === 'expect') {
+            assertions++;
+            const arg = n.arguments[0];
+            if (!arg || ts.isLiteralExpression(arg) || [ts.SyntaxKind.TrueKeyword, ts.SyntaxKind.FalseKeyword,
+              ts.SyntaxKind.NullKeyword].includes(arg.kind)) trivial = true;
+          }
+          ts.forEachChild(n, assertion);
+        }
+        assertion(fn.body);
+        remember(side, JSON.stringify(key), { path, changed: changed.has(start),
+          body, valid: !blocked && assertions > 0 && !trivial });
+        return;
+      }
+      if (ts.isCallExpression(node) && /^(?:describe|it|test)\b/.test(node.expression.getText(tree))) {
+        complete = false; // e.g. .each / computed titles: cannot prove unique case identity
+        return;
+      }
+      ts.forEachChild(node, (child) => visit(child, parents, disabled, container));
+    }
+    visit(tree);
+  }
+  if (typeof readFile === 'function') {
+    // Resolve both complete trees, but mark only changed opener lines as spendable.
+    // Unchanged cases still participate in identity collision detection.
+    let file = null, oldLine = 0, newLine = 0;
+    const evidence = [];
+    for (const line of String(diffText).split('\n')) {
+      if (line.startsWith('diff --git ')) {
+        const match = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+        file = match ? { base: match[1], head: match[2], absent: {}, baseLines: new Set(), headLines: new Set() } : null;
+        if (file) evidence.push(file);
+        else complete = false;
+      } else if (file) {
+        if (line === '--- /dev/null') file.absent.base = true;
+        else if (line === '+++ /dev/null') file.absent.head = true;
+        else if (line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+        else if (line.startsWith('@@')) {
+          const match = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+          if (!match) { complete = false; continue; }
+          oldLine = Number(match[1]); newLine = Number(match[2]);
+        } else if (line.startsWith('-')) file.baseLines.add(oldLine++);
+        else if (line.startsWith('+')) file.headLines.add(newLine++);
+        else if (line.startsWith(' ')) { oldLine++; newLine++; }
+      }
+    }
+    let evidenceSize = String(diffText).length;
+    for (const f of evidence) {
+      if (!complete || !isTestPath(f.head)) continue;
+      try {
+        for (const [side, bucket] of [['base', 'removed'], ['head', 'added']]) {
+          const text = f.absent[side] ? '' : readFile(f[side], side);
+          if (typeof text !== 'string') throw new Error('unreadable full file');
+          evidenceSize += text.length;
+          if (evidenceSize > 1024 * 1024) { oversized = true; throw new Error('oversized full-file evidence'); }
+          collect(f.head, text.split('\n').map((text, i) => ({ text, changed: f[`${side}Lines`].has(i + 1) })), bucket);
+        }
+      } catch { complete = false; } // No partial credit: retain the human HOLD on any failed read/parse.
+    }
+  } else {
+    // Keep context (for suite ancestry and existing-title collisions), but never join separate hunks.
+    let path = null;
+    let old = [], next = [];
+    const flush = () => {
+      if (complete && path && isTestPath(path)) {
+        try { collect(path, old, 'removed'); collect(path, next, 'added'); }
+        catch { complete = false; } // Parser failure retains the existing human HOLD.
+      }
+      old = []; next = [];
+    };
+    for (const line of String(diffText).split('\n')) {
+      if (line.startsWith('diff --git ')) { flush(); path = line.match(/ b\/(.+)$/)?.[1]; }
+      else if (line.startsWith('@@')) {
+        flush();
+        // Without the file prefix a syntactically valid test may still sit inside an unseen describe,
+        // skipped suite, conditional or comment. Never infer a root scope from a mid-file fragment.
+        if (path && isTestPath(path) && !/^@@ -[01](?:,\d+)? \+[01](?:,\d+)? @@/.test(line)) complete = false;
+      }
+      else if (line.startsWith('+++') || line.startsWith('---')) continue;
+      else if (line.startsWith('-')) old.push({ text: line.slice(1), changed: true });
+      else if (line.startsWith('+')) next.push({ text: line.slice(1), changed: true });
+      else if (line.startsWith(' ')) {
+        old.push({ text: line.slice(1), changed: false }); next.push({ text: line.slice(1), changed: false });
+      }
+    }
+    flush();
+  }
+  const credits = new Map();
+  if (complete && records.removed.size && records.added.size) {
+    try {
+      // Only credit destinations selected by the checked-in unit config. Integration-only / scheduled
+      // suites conservatively retain HOLD; a filename alone is not evidence CI executes it.
+      const { include, exclude } = parseVitestGlobs(readFileSync(join(DEFAULT_REPO_ROOT, 'vitest.config.ts'), 'utf8'));
+      const live = liveSuiteFiles(loadHermeticSettings());
+      for (const [key, removed] of records.removed) {
+        const added = records.added.get(key);
+        if (removed.length !== 1 || added?.length !== 1) continue;
+        const [a] = removed, [b] = added;
+        if (!a.changed || !b.changed || a.path === b.path || !a.valid || !b.valid || a.body !== b.body) continue;
+        if (!isTestPath(b.path) || /(^|\/)(?:node_modules|\.git|dist|coverage)(\/|$)/.test(b.path) ||
+            !micromatch.isMatch(b.path, include) || micromatch.isMatch(b.path, [...exclude, ...live])) continue;
+        credits.set(a.path, (credits.get(a.path) || 0) + 1);
+      }
+    } catch { /* Unreadable/unknown config: no move credits; retain human HOLD. */ }
+  }
+  const retained = new Map();
+  if (credits.size) {
+    // Once moves are paired, only the same case identity can cancel a local removal.
+    // Otherwise an unrelated addition can spend a second cancellation on a genuinely deleted case.
+    for (const [key, removed] of records.removed) {
+      const added = records.added.get(key);
+      if (removed.length !== 1 || added?.length !== 1) continue;
+      const [a] = removed, [b] = added;
+      if (a.changed && b.changed && a.path === b.path) retained.set(a.path, (retained.get(a.path) || 0) + 1);
+    }
+  }
+  for (const f of files) {
     if (!f.path || !isTestPath(f.path)) continue;
     if (f.deleted) {
       findings.push({ path: f.path, kind: 'test-file-removed', detail: 'a test file was deleted' });
@@ -209,7 +400,10 @@ export function scanTestTampering({ diffText = '' } = {}) {
     if (skipAdds) findings.push({ path: f.path, kind: 'test-skipped', detail: `${skipAdds} skip/only marker(s) added` });
     const removedCases = f.removed.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
     const addedCases = f.added.filter((l) => TEST_CASE_OPENER_RE.test(l)).length;
-    if (removedCases > addedCases) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${removedCases - addedCases} test case(s) removed` });
+    const netRemoved = credits.size
+      ? removedCases - (retained.get(f.path) || 0) - (credits.get(f.path) || 0)
+      : removedCases - addedCases;
+    if (netRemoved > 0) findings.push({ path: f.path, kind: 'tests-removed', detail: `net ${netRemoved} test case(s) removed${oversized ? '; move evidence exceeds 1 MiB: human review of full diff required' : ''}` });
   }
   const reasons = findings.map((x) => `${x.kind}: ${x.path} (${x.detail})`);
   return { tampered: findings.length > 0, findings, reasons };

@@ -5568,3 +5568,15 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+
+### Test-move evidence in the merge gate
+
+`scanTestTampering` can accept a synchronous `readFile(path, side)` resolver for the net diff's
+base/head trees. Mid-file hunks cannot prove suite ancestry on their own. Full-file parsing keeps
+unchanged declarations in collision checks and only spends changed opener lines as move credit.
+Parameterized declarations contribute static title collisions but earn no move credit; constant
+string concatenations are resolved as titles. Generator callbacks and suites containing possible
+returns or throws receive no move credit; exits inside nested callbacks/helpers do not exit a suite. A failed read, parse, or evidence-size limit retains
+the existing human HOLD. Replay mid-file splits and failure paths in
+`scripts/lib/__tests__/pr-merge-gate.test.mjs` through heavy admission.

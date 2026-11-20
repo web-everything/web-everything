@@ -6630,7 +6630,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // clone ⇒ no text ⇒ the scan is a no-op — the same fail-open the manifest baseline gate documents).
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
-      const gaming = scanTestTampering({ diffText: netDiffText.text });
+      const gaming = scanTestTampering({
+        diffText: netDiffText.text,
+        readFile: diffExec && netDiffText.scored && netDiffText.base && netDiffText.rev
+          ? (path, side) => diffExec('git', ['show', '--no-ext-diff', '--end-of-options',
+            `${side === 'base' ? netDiffText.base : netDiffText.rev}:${path}`],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 })
+          : undefined,
+      });
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
       // diff, even seconds after a human ran the sanctioned `--to=clear-human` ceremony specifically to clear it
