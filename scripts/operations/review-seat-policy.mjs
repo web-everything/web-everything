@@ -12,7 +12,7 @@ export { DAILY_CAP_ENV, DEFAULT_DAILY_CAP, PROVIDER_CAP_ENV, PROVIDER_CAP_DEFAUL
 
 /**
  * THE one definition of "this optional reviewer seat is disabled", used wherever a referral may be retired.
- * The Antigravity review seat runs on its own gate (`REVIEW_PR_ANTIGRAVITY_REVIEW` / probation), which never
+ * The Antigravity review seat runs on its own gate (`advisorySeats.antigravityReview` / `REVIEW_PR_ANTIGRAVITY_REVIEW`), which never
  * reads the Gemini cap, so its default cap of 0 alone must not disable it: only the flag being off, or an
  * operator who EXPLICITLY set the cap to 0, does. The direct `agy-*` finding seats are enforced by their
  * provider cap alone. Unpromoted Carbon, like the default zero cap, cannot retire prior referrals:

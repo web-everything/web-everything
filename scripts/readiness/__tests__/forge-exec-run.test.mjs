@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, stat, readdir, utimes, realpath, rename, link, chmod} from 'node:fs/promises';
 import {join} from 'node:path';
 import micromatch from 'micromatch';
 import {createHash} from 'node:crypto';
@@ -389,16 +389,33 @@ else {
     }
     expect(await readFile(join(victim,'assertions.cjs'),'utf8')).toBe('process.exit(0)');
     await expect(other.run(second)).rejects.toThrow('Input digest mismatch');
-    expect(await other.finish(second)).toBeNull();
+    // The first protected rejection is immutable; both attempts stayed prepared.
+    expect(await other.finish(second)).toEqual({v:1,nonce:second.nonce,run:second.run,
+      phase:'rejected',reason:'forge-busy',siblings:false,started:false});
     expect(await runner.finish(request)).toMatchObject({phase:'test',code:0});
   }, 15000);
+  it('certifies a busy full unit run only from protected prepared state without execution', async () => {
+    const command = ['npm','run','test:unit'];
+    const full = {...request,argv:command,argvDigest:digestArgv(command)};
+    await mkdir(join(root,'receipts','worker-active'),{mode:0o700});
+    await expect(runner.run(full)).rejects.toMatchObject({code:'forge-busy'});
+    await expect(readFile(join(root,'install.log'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(await runner.finish(full)).toEqual({v:1,nonce:full.nonce,run:full.run,
+      phase:'rejected',reason:'forge-busy',siblings:false,started:false});
+  });
+  it('does not certify a busy rejection once protected running state exists', async () => {
+    await rename(join(root,'receipts',request.run+'.prepared'),join(root,'receipts',request.run+'.running'));
+    await writeFile(join(root,'receipts',request.run+'.rejected'),JSON.stringify({v:1,nonce:request.nonce,
+      run:request.run,phase:'rejected',reason:'forge-busy',siblings:false}));
+    expect(await runner.finish(request)).toBeNull();
+  });
   it('keeps an abandoned execution guard closed even after finish and pruning age', async () => {
     const active = join(root,'receipts','worker-active');
     await mkdir(active,{mode:0o700});
     const expired = new Date(Date.now()-30*24*60*60*1000);
     await utimes(active,expired,expired);
     await expect(runner.run(request)).rejects.toThrow('Worker execution busy');
-    expect(await runner.finish(request)).toBeNull();
+    expect(await runner.finish(request)).toMatchObject({phase:'rejected',reason:'forge-busy',siblings:false,started:false});
     expect((await stat(active)).isDirectory()).toBe(true);
   });
   it('retains the execution guard when a worker command rejects instead of confirming shutdown', async () => {
@@ -637,12 +654,16 @@ await runner.run(JSON.parse(process.argv[3]));`;
       expect(message).toBe('install');
       const blocked = await nextRequest();
       await expect(runner.run(blocked)).rejects.toThrow('Worker execution busy');
-      expect(await runner.finish(blocked)).toBeNull();
+      expect(await runner.finish(blocked)).toEqual({v:1,nonce:blocked.nonce,run:blocked.run,
+        phase:'rejected',reason:'forge-busy',siblings:false,started:false});
+      expect((await stat(join(root,'receipts','worker-active'))).isDirectory()).toBe(true);
       holder.kill('SIGKILL');
       expect(await exited).toEqual([null,'SIGKILL']);
       const interrupted = await nextRequest();
       await expect(runner.run(interrupted)).rejects.toThrow('Worker execution busy');
-      expect(await runner.finish(interrupted)).toBeNull();
+      expect(await runner.finish(interrupted)).toEqual({v:1,nonce:interrupted.nonce,run:interrupted.run,
+        phase:'rejected',reason:'forge-busy',siblings:false,started:false});
+      expect((await stat(join(root,'receipts','worker-active'))).isDirectory()).toBe(true);
       // Simulate explicit operator recovery only after the orphan is killed.
       const pid = Number(await readFile(join(root,'install-pid'),'utf8'));
       process.kill(-pid,'SIGKILL');
@@ -988,7 +1009,8 @@ with patch.object(os, 'open', side_effect=local_open), \
     expect(service).toContain('User=root');
     expect(service).toContain('ExecStart=/usr/bin/env node /usr/local/libexec/forge-exec-sweep.mjs --apply');
     const timer=setup.match(/<<'SWEEP_TIMER'\n([\s\S]*?)\nSWEEP_TIMER/)[1];
-    expect(timer).toContain('OnUnitActiveSec=30min');
+    expect(timer).toContain('Description=Check Forge execution retention every 5 minutes');
+    expect(timer).toContain('OnUnitActiveSec=5min');
     expect(timer).toContain('Unit=forge-exec-sweep.service');
     const expired=new Date(Date.now()-16*24*60*60*1000);
     const oldRun=join(root,'runs','r-'+'c'.repeat(32)), oldReceipt=join(root,'receipts','r-'+'c'.repeat(32)+'.consumed');
@@ -1226,6 +1248,23 @@ assert fired
     expect(result.error).toBeUndefined();expect(result.status).not.toBe(0);
     expect(result.stderr).toContain('Invalid copy source');expect(await readdir(destination)).toEqual([]);
     expect(result.stdout).toBe('');expect(result.stderr).not.toContain('private fixture');
+  });
+  it.skipIf(process.platform!=='linux')('copy source accepts a traverse-only (0710) ancestor and still refuses symlinks', async () => {
+    const outer=join(root,'slot-traverse');const source=join(outer,'src');const destination=join(root,'slot-traverse-dest');
+    await mkdir(source,{recursive:true});await mkdir(destination);
+    await writeFile(join(source,'leaf'),'public fixture');await symlink(join(source,'leaf'),join(source,'link'));
+    await chmod(outer,0o110);
+    try {
+      const run=(name,body)=>spawnSync('/usr/bin/python3',['-I','-c',verifiedCopySource],{
+        input:JSON.stringify({source,destination,entries:[{path:Buffer.from(name).toString('base64'),sha256:hash(body),executable:false}]}),
+        encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+      });
+      const ok=run('leaf','public fixture');
+      expect(ok.error).toBeUndefined();expect(ok.status).toBe(0);
+      expect(await readFile(join(destination,'leaf'),'utf8')).toBe('public fixture');
+      const bad=run('link','public fixture');
+      expect(bad.status).not.toBe(0);expect(await readdir(destination)).toEqual(['leaf']);
+    } finally {await chmod(outer,0o755);}
   });
   it('warm-install accepts an ordinary source and completes dependency installation', async () => {
     const source=join(root,'ordinary-warm-source');await mkdir(source);
