@@ -12,8 +12,11 @@ export function execDrainAsync(file, args, options = {}) {
   const testOptions = env.VITEST || env.WE_UNDER_TEST
     ? { env: { ...env, WE_GH_THROTTLE_GH_BIN: 'gh' } } : {};
   if (file !== 'gh') return exec(file, args, options);
-  const { timeout, killSignal, ...wrapperOptions } = options;
-  return exec(process.execPath, [worker, JSON.stringify({ timeout, killSignal }), ...args], {
+  const { timeout, killSignal: _requestedSignal, ...wrapperOptions } = options;
+  // spawnSync waits for gh to exit even after its timeout signal. A catchable signal can
+  // hang forever; drain reads therefore always use a hard kill at the child deadline.
+  // Leave the worker alive to reap gh and release its throttle slot before rejecting.
+  return exec(process.execPath, [worker, JSON.stringify({ timeout, killSignal: 'SIGKILL' }), ...args], {
     maxBuffer: 64 * 1024 * 1024, ...wrapperOptions, ...testOptions,
   });
 }

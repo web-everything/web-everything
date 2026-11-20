@@ -81,6 +81,41 @@ ${keepAliveScript({ maxLifetimeMs: 30_000 })}
   }
 }, 15000);
 
+it.each([undefined, 'SIGTERM', 'SIGINT', 15])(
+  'bounds a timeout and releases the slot when gh ignores killSignal %s', async killSignal => {
+    const root = mkdtempSync(join(tmpdir(), 'drain-soft-timeout-'));
+    const pidFile = join(root, 'pid');
+    let pid;
+    try {
+      const bin = join(root, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
+process.on('SIGTERM', () => {});
+process.on('SIGINT', () => {});
+require('node:fs').writeFileSync(process.env.DRAIN_TEST_PID, String(process.pid));
+${keepAliveScript({ maxLifetimeMs: 6000 })}
+`, { mode: 0o755 });
+      const lockRoot = join(root, 'throttle');
+      const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, VITEST: 'true',
+        DRAIN_TEST_PID: pidFile, WE_GH_THROTTLE_LOCK_ROOT: lockRoot,
+        WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1' };
+      const started = performance.now();
+      await expect(execDrainAsync('gh', ['pr', 'view', '1'], {
+        env, timeout: 500, ...(killSignal === undefined ? {} : { killSignal }), encoding: 'utf8',
+      })).rejects.toThrow();
+      const elapsed = performance.now() - started;
+      pid = Number(readFileSync(pidFile, 'utf8'));
+      expect(elapsed).toBeLessThan(3000);
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(readGhSlotHolders({ lockRoot, cap: 6 })).toEqual([]);
+    } finally {
+      if (!pid) { try { pid = Number(readFileSync(pidFile, 'utf8')); } catch {} }
+      if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15000,
+);
+
 it('never serves async gate reads from the gh read memo', async () => {
   const root = mkdtempSync(join(tmpdir(), 'drain-memo-'));
   try {
