@@ -1777,6 +1777,11 @@ let laneEligibilityProbeFailed = false; // Sticky: local inspection failure neve
 function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), ttlMs = ttlMsFromFlags()) {
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, exists: false };
+  // A vanished checkout is unavailable, not a failed inspection of an existing repository.
+  // Only ENOENT proves absence; unreadable/malformed metadata must still fail closed below.
+  try { lstatSync(join(dir, '.git')); } catch (e) {
+    if (e.code === 'ENOENT') return { lane: n, exists: false };
+  }
   const lease = readLease(dir);
   // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
   if (isHistoryQuarantined(repo, n)) return { lane: n, exists: false, quarantined: true };

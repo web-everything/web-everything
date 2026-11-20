@@ -5620,3 +5620,11 @@ to isolate the reset-time status/ahead probes. Cover both transient recovery and
 refusal, and assert no checkout/reset/clean follows a failed probe. The bounded process
 reader wraps the original stderr in `ProcReadError.cause`; preserve that stderr (or the
 spawn error message) in probe diagnostics rather than reporting zero counts as proof.
+
+## Lane eligibility: absent checkout versus failed probe
+
+`lane-pool-acquire-growth.test.mjs` covers both a removed lane directory and a removed
+`.git` entry: skip those candidates without blocking bounded growth or touching the
+remaining files. Only ENOENT proves absent metadata. Existing checkouts with failed
+status/history/ahead probes remain ineligible and block growth/recovery; keep the
+negative cases in `lane-pool-acquire-skips-unpushed.test.mjs` alongside this coverage.

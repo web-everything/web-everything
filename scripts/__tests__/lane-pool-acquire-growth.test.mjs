@@ -271,18 +271,23 @@ describe('lane-pool acquire (#3383) — remote-probe-failure stops growth, never
     expect(listLanes([])).toEqual([1, 2]);
   });
 
-  it('a vanished lowest-numbered lane does NOT make the growth probe misread a reachable remote as unreachable', () => {
+  it.each(['.git', 'directory'])('a vanished lowest-numbered lane (%s) does NOT block growth against a reachable remote', (missing) => {
     // PR #2607 review finding: the growth probe ran `ls-remote origin` inside `lanes[0]` unconditionally. With
     // lane-1's `.git` gone (a concurrent trim/vanish, #xixn30q) that probe failed for a LOCAL reason, and
     // acquire refused to grow a pool whose real origin was fully reachable — sticky until a human re-provisioned.
     provision(2);
-    rmSync(join(poolRoot, 'growacq', 'lane-1', '.git'), { recursive: true, force: true });
+    const vanished = join(poolRoot, 'growacq', 'lane-1');
+    rmSync(missing === '.git' ? join(vanished, '.git') : vanished, { recursive: true, force: true });
     leaseLane(2);
 
     const r = runPool(['acquire', ...REPO(), '--wait-ms=0', '--growth-max-new=1', '--session=picker']);
     expect(r.code, r.err).toBe(0);
     expect(r.err).not.toMatch(/remote-reachability probe.*failed/i);
-    expect(r.out.trim()).toMatch(/lane-3$/);
+    expect(r.err).not.toContain('eligibility probe failed');
+    // Growth fills a vacant number, but must leave a directory with missing metadata untouched.
+    expect(r.out.trim()).toMatch(missing === '.git' ? /lane-3$/ : /lane-1$/);
+    expect(r.err).toMatch(/growing by up to 1 new lane/);
+    if (missing === '.git') expect(readFileSync(join(vanished, 'file.txt'), 'utf8')).toBe('v1\n');
   });
 
   it('once the probe can succeed again (real git restored), acquire grows normally', () => {
