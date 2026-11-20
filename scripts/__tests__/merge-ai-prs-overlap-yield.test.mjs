@@ -144,7 +144,7 @@ describe('buildOverlapRows — #4308 row-shape wiring (2026-09-29 review finding
     const yBody = embedManifestInBody('', { item: 200, blockedBy: [100] });
     const openPrContext = { prsByRepo: new Map([['we', [
       { ...rawPr(1, { files: small }) },
-      { ...rawPr(2, { files: big, labels: [{ name: 'review:pending' }, { name: 'ready-to-merge' }] }), body: yBody },
+      { ...rawPr(2, { files: big, labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }] }), body: yBody },
     ]]]) };
     const x = { num: 1, repo: 'we', decision: 'merge', item: 100, blockedBy: [], stackParents: [], headSha: 'abc' };
     const { candidateRows, openPrRows } = buildOverlapRows({ candidates: [x], verdicts: [x], openPrContext });

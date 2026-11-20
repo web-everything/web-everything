@@ -669,6 +669,7 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
   }
   const classes = new Map(rankByDeliveryPriority(candidates.map((pr) => ({ id: pr.num, facts: {
     waitingSince: pr.firstAcceptedAt ?? pr.readyAt,
+    override: pr.labels?.some(label => label.name === 'priority:urgent') ? { value: 'urgent', byOperator: true } : undefined,
     incident: { open: !!mainFix, owner: !!mainFix && [mainFix.pr, ...(mainFix.prs || [])].includes(pr.num) &&
       (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) },
   } })), priority, now).map((p) => [p.id, PRIORITY_CLASSES.indexOf(p.class)]));

@@ -180,14 +180,15 @@ function openGroup(state, num, nowMs, mode, size, priorityClass = 'normal') {
  * @param {{state:BatchingState,num:number,nowMs:number,settings:object,inQueue:Set<number>}} input
  * @returns {{admit:boolean,mode:string,groupId:string|null,reason:string|null,state:BatchingState}}
  */
-export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, priorityClass = 'normal' }) {
+export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, priorityClass = 'normal', enqueueEligibility }) {
   priorityClass = batchClass(priorityClass);
   const state = structuredClone(input);
   if (settings.enabled) {
     healSoleSurvivors(state, inQueue, nowMs, settings);
     expireIsolation(state, nowMs, settings);
   }
-  const mode = currentMode(state, nowMs, settings);
+  const isolationPaused = state.isolate.length > 0 && state.isolate.every(n => !inQueue.has(n) && enqueueEligibility?.get(n) === false);
+  const mode = currentMode(isolationPaused ? { ...state, isolate: [] } : state, nowMs, settings);
   const result = (admit, groupId = null, reason = null) => ({ admit, mode, groupId, reason, state });
   if (mode === 'off') return result(true);
   // A fresh queue snapshot acknowledges absent recovery entries before a new
@@ -477,7 +478,24 @@ export function createAdaptiveBatching({ repo, exec = execFileSync, statePath = 
           }
           throw new Error(facts.error);
         }
-        const result = admitEnqueue({ state: load(), num, nowMs: nowMs(), settings, inQueue: facts.inQueue, priorityClass });
+        const state = load();
+        const enqueueEligibility = new Map();
+        // Bound live reads to 100 suspects; omitted/unknown evidence retains the hold.
+        if (state.isolate.length > 100) say('merge-queue batching: suspect read cap 100 exceeded; isolation hold retained — operator must inspect remaining suspects');
+        for (const suspect of state.isolate.slice(0, 100)) {
+          try {
+            const pr = JSON.parse(exec('gh', ['pr', 'view', String(suspect), '--repo', repo,
+              '--json', 'state,isDraft,labels,mergeStateStatus'], { ...ioOptions, timeout: 10_000, maxBuffer: 1024 * 1024 }));
+            const labels = Array.isArray(pr.labels) && pr.labels.every(l => typeof l?.name === 'string')
+              ? pr.labels.map(l => l.name) : null;
+            if (['CLOSED', 'MERGED'].includes(pr.state) || pr.isDraft === true
+              || ['BEHIND', 'BLOCKED', 'DIRTY', 'DRAFT', 'HAS_HOOKS', 'UNSTABLE'].includes(pr.mergeStateStatus)
+              || labels && (!labels.includes('ready-to-merge') || labels.some(l =>
+                ['blocked', 'ci:failed', 'review:changes', 'review:human', 'review:pending', 'red-team:pending', 'red-team:blocked', 'parked', 'hold'].includes(l)
+                || /^(review:held|park:)/.test(l)))) enqueueEligibility.set(suspect, false);
+          } catch { /* unreadable suspect keeps today's isolation hold */ }
+        }
+        const result = admitEnqueue({ state, num, nowMs: nowMs(), settings, inQueue: facts.inQueue, priorityClass, enqueueEligibility });
         persist(result.state);
         const g = result.state.groups.find(g => g.id === result.groupId);
         say(`merge-queue batching: ${result.mode} → ${result.admit

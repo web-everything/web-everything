@@ -2191,6 +2191,7 @@
   "scripts/conveyor/soak/breaks/ci-held-record-effect-never-resumes.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/accepted-pr-stale-accept-row-never-executed.soak.test.mjs": 15.28,
   "scripts/conveyor/soak/breaks/drain-rebases-clean-behind-pr.soak.test.mjs": 8,
+  "scripts/conveyor/soak/breaks/drain-urgent-behind-parked.soak.test.mjs": 8,
   "scripts/conveyor/soak/breaks/fixer-brief-chains-rearm-review.soak.test.mjs": 1.5,
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,

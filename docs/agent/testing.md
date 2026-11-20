@@ -5191,3 +5191,10 @@ Park opens ready for review; draft-promotion still handles older drafts.
 Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
 `main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
 `open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.
+
+## Drain priority and parked overlap fixtures
+
+Captured `gh pr view` file lists may omit additions/deletions. Positive overlap-yield
+controls must supply a larger target diff explicitly, otherwise both sizes are zero
+and no yield is exercised. Targets in dependency controls must also be enqueue-eligible
+(e.g. `review:accepted` rather than `review:pending`) so the test reaches dependency logic.

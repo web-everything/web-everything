@@ -611,7 +611,8 @@ describe('overlap-yield parked', () => {
     try {
       return buildOverlapRows({ candidates: verdicts, verdicts, localSlug: REPO,
         openPrContext: { prsByRepo: new Map([[null, [drainLabelPr(7183),
-          { ...drainLabelPr(7193), ...target }, ...extraPrs]]]) } });
+          // Captures omit line counts; give the target a larger diff so positive controls actually yield.
+          { ...drainLabelPr(7193), files: drainLabelPr(7193).files.map(file => ({ ...file, additions: 100 })), ...target }, ...extraPrs]]]) } });
     } finally {
       vi.unstubAllEnvs();
     }
@@ -681,7 +682,7 @@ describe('overlap-yield parked', () => {
     expect(waitForA(rowsFor({ targetVerdict: null }))?.yieldTo).toBe(7193);
   });
 
-  it.each([null, undefined])('keeps yielding when target merge state is unreadable: %s', mergeStateStatus => {
+  it.each([null, undefined, 'UNKNOWN', 'unreadable', {}])('keeps yielding when target merge state is unreadable: %s', mergeStateStatus => {
     expect(waitForA(rowsFor({ target: { mergeStateStatus } }))?.yieldTo).toBe(7193);
   });
 

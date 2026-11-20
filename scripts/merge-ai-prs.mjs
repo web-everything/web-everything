@@ -2698,7 +2698,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
           labels: Array.isArray(p.labels) ? p.labels : [], files, filesComplete: files.length < OVERLAP_FILES_PAGE_CAP,
           readyAtMs: null, windowMs: null, headSha: v?.headSha ?? p.headRefOid ?? null,
           item: v?.item ?? null, exempt: false, requiredCheckRed: isRequiredCheckFailed(p, requiredCheck),
-          requiredCheckGreen: isRequiredCheckGreen(p, requiredCheck),
+          requiredCheckGreen: isRequiredCheckGreen(p, requiredCheck), mergeStateStatus: p.mergeStateStatus,
           dependsOn: new Set([...(v?.blockedBy || []), ...(v?.stackParents || []), ...bodyDeps]),
         });
       }
@@ -2892,6 +2892,19 @@ export function isConfirmSweepSettled({ merged = 0, pendingRebased = 0, consider
  */
 export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, malformedRepos = null, strictAbsentHashDependencies = false, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
+  // Resolve ordinary deferrals first, then accept waits only on targets that
+  // neither defer on another gate nor yield themselves in this pass.
+  if (overlapContext instanceof Map && overlapContext.size) {
+    const base = planLabelDrain(candidates, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems,
+      contextComplete, malformedRepos, strictAbsentHashDependencies, isWeRepo, overlapLocalSlug });
+    const eligible = new Set(base.ready.map(c => overlapRowKey({ repo: c.repo || overlapLocalSlug, number: c.num })));
+    const known = new Set(list.map(c => overlapRowKey({ repo: c.repo || overlapLocalSlug, number: c.num })));
+    const waits = overlapContext;
+    overlapContext = new Map([...waits].filter(([, entry]) => {
+      const target = overlapRowKey({ repo: entry.repo || overlapLocalSlug, number: entry.yieldTo });
+      return !waits.has(target) && (!known.has(target) || eligible.has(target));
+    }));
+  }
   // card 8036 R2 — ONE absence predicate for every consumer below. A malformed manifest keeps `contextComplete`
   // true (so it holds only its own PR), but it still HIDES what that PR carries: its item, its couple refs. So an
   // ABSENT item or carrier is unproven whenever the context is incomplete OR any manifest was unreadable JSON.
