@@ -5836,7 +5836,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         const target = JSON.parse(stdout.trim() || 'null');
         return target ? (await resolveListedChecks(repo, [target]))[0] : null;
       });
-      const readLive = async () => {
+      const listLive = async () => {
         let snapshotSeed;
         // Snapshot rows seed heavy fields only. The open set must still be listed live:
         // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
@@ -5880,22 +5880,6 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         }
         return __t.timeAsync('listing.checks', () => resolveListedChecks(repo, listed.rows));
       };
-      // Per repo and per pass: round-file rows never populate this promise.
-      let liveRows;
-      const listLive = () => {
-        if (!liveRows) liveRows = readLive().then(rows => {
-          if (listed.truncated || isDegradedOpenPrListing(rows.length, OPEN_PR_LIST_LIMIT)) {
-            liveRows = null;
-            process.stderr.write('fast-drain: incomplete live listing not reused; next consumer falls back to a fresh full listing\n');
-          }
-          return rows;
-        }, error => {
-          liveRows = null;
-          process.stderr.write('fast-drain: failed live listing not reused; next consumer falls back to a fresh full listing\n');
-          throw error;
-        });
-        return liveRows;
-      };
       const rows = roundPath && slug
         ? await readFastDrainRoundListing({ path: roundPath, repo: slug, onlyPr, readTarget, requireDefaultBranch: true,
           defaultBranch: async () => {
@@ -5911,8 +5895,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       const prs = listedRows.filter(operatorSelects);
       if (listed.truncated || truncated) process.stderr.write(`  ⚠️  DEGRADED drain listing for ${repoTag(repo) || 'cwd'}: the open-PR list hit the --limit ${OPEN_PR_LIST_LIMIT} cap — it MAY be truncated, so a ${label || 'candidate'} PR past it can be missing this pass (#no-label-search)\n`);
       // A round listing is candidate evidence only, even after its target is refreshed.
-      // Context needs live rows to discover new blockers/carriers/siblings; reuse
-      // this pass's live read if round population already needed one.
+      // Context must re-list live to discover newly opened blockers/carriers/siblings.
       return { repo, prs, rows, listing: roundPath ? 'snapshot' : 'live', complete: !roundPath && !listed.truncated && !truncated, readLiveRows: listLive };
     }
     catch (e) { return { repo, err: describeGhListError(e) }; }

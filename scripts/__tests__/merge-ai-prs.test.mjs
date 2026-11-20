@@ -9,7 +9,6 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, readFreshQueueRollup, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
-import { assertInventoryComplete } from '../lib/pr-list-paged.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -493,7 +492,7 @@ describe('round listing freshness at the CLI boundary', () => {
     expect(buildLiveListingsByRepo([{ repo: 'web-everything/web-everything', rows: [{ number: 42 }], listing: 'snapshot' }]).has('web-everything/web-everything')).toBe(false);
   });
 
-  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0, targetState = 'OPEN' } = {}) => {
+  const run = (listing, { sendBack, reconcile = true, omitSibling = false, failListing = false, snapshotAgeMs = 0 } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
@@ -501,7 +500,7 @@ describe('round listing freshness at the CLI boundary', () => {
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
         labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
         body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/${number}` }] })) });
-      const target = { ...row(42, 42, ['43']), state: targetState };
+      const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
       const snapshot = join(dir, 'round.json');
       writeFileSync(snapshot, JSON.stringify({ repo: 'web-everything/web-everything', writtenAt: Date.now() - snapshotAgeMs, defaultBranch: 'main', rows: [target, ...(sendBack && !omitSibling ? [sibling] : [])] }));
@@ -533,7 +532,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
     const local = a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")'));
-    const nodes = (local ? rows.filter(r => r.state === 'OPEN') : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
+    const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
     out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
   }
 }
@@ -572,28 +571,13 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(calls.some(a => a[0] === 'repo' && a[1] === 'view')).toBe(false);
     expect(calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '42')).toBe(true);
   });
-  it('single-PR fast drain lists only its PR candidate and lists live siblings once after round expiry', () => {
+  it('discovers blockers live after an expired round is refreshed too', () => {
     const { payload, stderr, calls } = run('snapshot', { snapshotAgeMs: 60_001 });
     expect(stderr).toContain('listed-live');
     const liveListings = calls.filter(a => a[0] === 'api' && a[1] === 'graphql'
       && a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")') && v.includes('pullRequests(states:OPEN')));
-    expect(liveListings).toHaveLength(1);
+    expect(liveListings).toHaveLength(2);
     expect(payload.deferred).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, waitOn: expect.arrayContaining([43]) })]));
-  });
-  it.each(['CLOSED', 'MERGED'])('single-PR fast drain does not enqueue a %s target', targetState => {
-    const { payload, calls } = run('snapshot', { targetState, snapshotAgeMs: 60_001 });
-    expect(payload.considered).toBe(0);
-    expect(payload.toMerge).toEqual([]);
-    expect(payload.deferred ?? []).toEqual([]);
-    expect(calls.some(a => a.some(v => v.includes('enqueuePullRequest')))).toBe(false);
-    expect(calls.some(a => a[0] === 'pr' && a[1] === 'merge')).toBe(false);
-  });
-  it('single-PR fast drain decisions equal a fresh full listing with the same sibling fixture', () => {
-    const reused = run('snapshot', { snapshotAgeMs: 60_001 });
-    const fresh = run('live');
-    // Durations and fixture-local sweep errors are diagnostics, not gate decisions.
-    const decisions = ({ timings, strandedSweep, ...result }) => result;
-    expect(decisions(reused.payload)).toEqual(decisions(fresh.payload));
   });
   it('ignores --listing-snapshot when WE_FAST_DRAIN_LISTING=live', () => {
     const { stderr, calls } = run('live');
@@ -610,10 +594,9 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     ['red-team:blocked', true, true],
     ['red-team:blocked', false, false],
     ['review:changes', false, true],
-    ['red-team:blocked', false, false, 60_001],
-  ])('evicts manually queued #43 with live %s (reconcile=%s, omitted=%s)', (sendBack, reconcile, omitSibling, snapshotAgeMs = 0) => {
-    const { calls, stderr } = run('snapshot', { sendBack, reconcile, omitSibling, snapshotAgeMs });
-    expect(stderr).toContain(snapshotAgeMs ? 'listed-live' : 'served-from-snapshot');
+  ])('evicts manually queued #43 with live %s (reconcile=%s, omitted=%s)', (sendBack, reconcile, omitSibling) => {
+    const { calls, stderr } = run('snapshot', { sendBack, reconcile, omitSibling });
+    expect(stderr).toContain('served-from-snapshot');
     expect(calls.filter(a => a.some(v => v.includes('dequeuePullRequest')))).toHaveLength(1);
     expect(calls.filter(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '43')).toHaveLength(1);
     // No second candidate listing is needed when the context already listed this repo live.
@@ -731,71 +714,5 @@ describe('fresh queue rollup completeness', () => {
     expect(fresh.rowsComplete).toBe(false);
     expect(retained(fresh)).toBe(fresh);
     if (kind === 'oversized connection') expect(exec).toHaveBeenCalledTimes(10);
-  });
-});
-
-
-describe('single-PR fast drain pass-local live reader', () => {
-  // Exercise the production closure with hermetic listing/check IO, including failed reads.
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-  const start = source.indexOf('      const readLive =') === -1
-    ? source.indexOf('      const listLive =') : source.indexOf('      const readLive =');
-  const end = source.indexOf('      const rows = roundPath', start);
-  const create = (read, checks = vi.fn(async (_repo, rows) => rows), log = vi.fn()) => {
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const deps = { repo: 'owner/repo', slug: 'owner/repo', roundPath: 'round.json', onlyPr: 42,
-      fastDrainListing: {}, isFastDrainTarget: () => true, RECONCILE: true,
-      SWEEP_LIST_FIELDS: '', CANDIDATE_ONLY_FIELDS: '', workflowEditSetting: { value: 'off' },
-      __t: { time: (_name, fn) => fn(), timeAsync: (_name, fn) => fn() },
-      readSharedOpenPrs: () => [], resolvePrListPaging: () => ({}),
-      listOpenPrsPagedHydrated: read, withListRetry: fn => fn(),
-      execFileSyncThrottled: () => {}, drainHeavyCacheByRepo: new Map(),
-      OPEN_PR_LIST_LIMIT: 100, operatorSelects: () => true,
-      resolveListedChecks: checks, isDegradedOpenPrListing: (n, cap) => n >= cap,
-      repoTag: r => r, process: { stderr: { write: log } } };
-    return new Function(...Object.keys(deps), `let listed = {}; ${source.slice(start, end)}; return listLive;`)(...Object.values(deps));
-  };
-  it('single-PR fast drain lists only its PR candidate with one live read and check resolution per pass', async () => {
-    const rows = [{ number: 42 }, { number: 43 }];
-    const read = vi.fn(() => ({ rows, truncated: false }));
-    const checks = vi.fn(async (_repo, rows) => rows);
-    const firstPass = create(read, checks);
-    const [candidate, context] = await Promise.all([firstPass(), firstPass()]);
-    expect(candidate).toBe(rows);
-    expect(context).toBe(rows);
-    expect(read).toHaveBeenCalledOnce();
-    expect(checks).toHaveBeenCalledOnce();
-    expect(await firstPass()).toBe(rows);
-    expect(read).toHaveBeenCalledOnce();
-    expect(checks).toHaveBeenCalledOnce();
-    await create(read, checks)();
-    expect(read).toHaveBeenCalledTimes(2);
-    expect(checks).toHaveBeenCalledTimes(2);
-  });
-  it('does not cache a failed check resolution', async () => {
-    const rows = [{ number: 42 }];
-    const read = vi.fn(() => ({ rows, truncated: false }));
-    const checks = vi.fn().mockRejectedValueOnce(new Error('checks unreadable')).mockResolvedValue(rows);
-    const live = create(read, checks);
-    await expect(live()).rejects.toThrow('checks unreadable');
-    expect(await live()).toBe(rows);
-    expect(read).toHaveBeenCalledTimes(2);
-    expect(checks).toHaveBeenCalledTimes(2);
-  });
-  it.each(['failed', 'partial', 'truncated', 'cap'])('does not reuse a %s live listing as complete and logs the fresh fallback', async kind => {
-    const complete = [{ number: 42 }, { number: 43 }];
-    const read = vi.fn().mockImplementationOnce(() => {
-      if (kind === 'partial') assertInventoryComplete({ repo: 'owner/repo', rows: [{ number: 42 }], totalCount: 2 });
-      if (kind === 'failed') throw new Error('failed inventory');
-      return { rows: kind === 'cap' ? Array.from({ length: 100 }, (_, i) => ({ number: i + 1 })) : [{ number: 42 }], truncated: kind === 'truncated' };
-    }).mockReturnValue({ rows: complete, truncated: false });
-    const log = vi.fn();
-    const live = create(read, undefined, log);
-    if (kind === 'failed' || kind === 'partial') await expect(live()).rejects.toThrow(`${kind} inventory`);
-    else await live();
-    expect(await live()).toBe(complete);
-    expect(read).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledWith(expect.stringMatching(/not reused.*fresh full listing/));
   });
 });
