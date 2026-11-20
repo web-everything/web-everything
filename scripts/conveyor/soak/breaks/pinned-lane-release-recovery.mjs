@@ -1,4 +1,4 @@
-/** PR #7208: freeing a pinned lease must return its clone to the integration branch. */
+/** PR #7208: pinned lane switches preserve ignored files and recover the integration branch. */
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,11 +9,13 @@ const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const SOURCE = 'scripts/lane-pool.mjs';
 export default {
   id: 'pinned-lane-release-recovery',
-  title: 'pinned lanes recover moved HEAD with discard and reset during cross-pool release',
+  title: 'pinned lanes recover moved HEAD and refuse ignored configuration collisions',
   card: 'PR #7208',
   fixedBy: { sha: 'HEAD', where: 'lane/lane-at-sha', paths: [SOURCE] },
   fixPresent(root) {
-    return readFileSync(join(root, SOURCE), 'utf8').includes('function resetPinnedLaneForRelease(');
+    const source = readFileSync(join(root, SOURCE), 'utf8');
+    return source.includes('function resetPinnedLaneForRelease(')
+      && source.includes("['checkout', '--no-overwrite-ignore', '--detach', flags.at");
   },
   async run({ root = ROOT, log } = {}) {
     const scratch = mkdtempSync(join(tmpdir(), 'soak-pinned-release-'));
@@ -32,7 +34,8 @@ export default {
       git(['init', '--quiet', '--bare', '--initial-branch=main', origin], scratch);
       git(['clone', '--quiet', origin, reference], scratch);
       writeFileSync(join(reference, 'file.txt'), 'initial');
-      git(['add', 'file.txt']); git(['commit', '--quiet', '-m', 'initial']);
+      writeFileSync(join(reference, '.gitignore'), '.env\n');
+      git(['add', 'file.txt', '.gitignore']); git(['commit', '--quiet', '-m', 'initial']);
       const main = git(['rev-parse', 'HEAD']);
       git(['push', '--quiet', 'origin', 'HEAD:main']);
       writeFileSync(join(reference, 'file.txt'), 'target'); git(['commit', '-am', 'target', '--quiet']);
@@ -53,6 +56,22 @@ export default {
         }
         // A failed first case retains its lease; stop rather than treating a second acquire as recovery proof.
         if (violations.length) break;
+      }
+      if (!violations.length) {
+        writeFileSync(join(reference, '.env'), 'target configuration');
+        git(['add', '--force', '.env']); git(['commit', '--quiet', '-m', 'track target configuration']);
+        const collisionTip = git(['rev-parse', 'HEAD']);
+        git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
+        writeFileSync(join(lane, '.env'), 'precious local configuration');
+        if (git(['status', '--porcelain'], lane)) throw new Error('ignored collision fixture must be clean');
+        const acquired = run('acquire', ['--lane=1', `--at=${collisionTip}`, '--branch=lane/target']);
+        if (acquired.status === 0) violations.push('ignored collision: acquisition accepted');
+        if (!existsSync(join(lane, '.env')) || readFileSync(join(lane, '.env'), 'utf8') !== 'precious local configuration') {
+          violations.push('ignored collision: local configuration lost');
+        }
+        if (existsSync(join(lane, '.git', '.lane-lease'))) violations.push('ignored collision: lease remains');
+        if (readFileSync(join(lane, '.git', 'HEAD'), 'utf8').trim() !== 'ref: refs/heads/main'
+          || git(['rev-parse', 'HEAD'], lane) !== main) violations.push('ignored collision: main not restored');
       }
     } finally { rmSync(scratch, { recursive: true, force: true }); }
     log?.(`pinned release recovery: ${violations.length} violation(s)`);

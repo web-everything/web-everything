@@ -2480,7 +2480,9 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     acquireResetSnapshots.set(chosen, before);
     if (reclaimAhead) logReclaimedAheadCommits(dir, repo.branch, chosen);
     beforeDestructiveStep();
-    git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
+    // A pinned acquisition never authorizes discarding ignored local configuration,
+    // including when the preparatory integration-branch checkout tracks that path.
+    git(['checkout', '-B', repo.branch, baseRef, '--quiet', flags.at !== undefined ? '--no-overwrite-ignore' : '--force'], dir);
     beforeDestructiveStep();
     git(['clean', '-fd', '--quiet'], dir);
       return { before, baseRef };
@@ -3049,15 +3051,16 @@ async function cmdAcquire(repo) {
       const tip = git(['rev-parse', '--verify', target], dir).trim();
       if (!/^[a-f0-9]{40}$/.test(tip) || tip !== flags.at) throw new Error('--at must equal the fetched origin branch tip; inspect the branch and retry');
       git(['cat-file', '-e', `${flags.at}^{commit}`], dir);
-      git(['checkout', '--detach', flags.at, '--quiet'], dir);
+      git(['checkout', '--no-overwrite-ignore', '--detach', flags.at, '--quiet'], dir);
       // Do not execute branch-controlled install/lifecycle scripts in the acquirer's
       // context. Dependencies for a pinned checkout must be prepared during verification.
       journalLaneEvent(dir, { action: 'acquire-detach', headAfter: laneHead(dir), reason: `pinned ${flags.branch} at ${flags.at}` });
     } catch (e) {
-      // All target checks precede checkout; restore main even if checkout partially failed.
+      // All target checks precede checkout; restore main even if checkout partially failed,
+      // but refuse recovery if it would overwrite ignored local configuration.
       try {
         if (!sameLease(readLease(dir), pinnedClaim)) throw new Error('pinned rollback lease changed; inspect the current holder');
-        git(['checkout', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
+        git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
         journalLaneEvent(dir, { action: 'acquire-rollback', headAfter: laneHead(dir), reason: 'pinned target refused' });
       }
       finally {

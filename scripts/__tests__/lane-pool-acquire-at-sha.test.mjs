@@ -43,6 +43,44 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 describe('acquire at an exact pushed branch tip', () => {
+  it.each([['.env', 'target'], ['private/config.env', 'target'], ['.env', 'main']])('preserves ignored %s when %s tracks a collision', (path, destination) => {
+    writeFileSync(join(reference, '.gitignore'), '.env\nprivate/\n');
+    git(['add', '.gitignore']); git(['commit', '-m', 'ignore local configuration', '--quiet']);
+    initial = git(['rev-parse', 'HEAD']); git(['push', '--quiet', 'origin', 'HEAD:main']);
+    expect(run('acquire', ['--lane=1']).status).toBe(0);
+    expect(run('release', ['--lane=1']).status).toBe(0);
+    mkdirSync(join(reference, 'private'), { recursive: true });
+    mkdirSync(join(lane, 'private'), { recursive: true });
+    writeFileSync(join(reference, path), 'target configuration');
+    git(['add', '--force', path]); git(['commit', '-m', 'track target configuration', '--quiet']);
+    tip = git(['rev-parse', 'HEAD']); git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
+    if (destination === 'main') git(['push', '--quiet', 'origin', 'HEAD:main']);
+    writeFileSync(join(lane, path), 'precious local configuration');
+    expect(git(['status', '--porcelain'], lane)).toBe('');
+    const result = acquire();
+    expect(readFileSync(join(lane, path), 'utf8')).toBe('precious local configuration');
+    refused(result);
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(initial);
+  });
+  it('rollback refuses to overwrite ignored configuration after a partially failed checkout', () => {
+    writeFileSync(join(reference, '.env'), 'main configuration');
+    writeFileSync(join(reference, '.gitignore'), '.env\n');
+    git(['add', '--force', '.env', '.gitignore']); git(['commit', '-m', 'main configuration', '--quiet']);
+    git(['push', '--quiet', 'origin', 'HEAD:main']);
+    git(['rm', '.env']); git(['commit', '-m', 'target uses local configuration', '--quiet']);
+    tip = git(['rev-parse', 'HEAD']); git(['push', '--quiet', 'origin', 'HEAD:lane/target']);
+    const env = gitShim(`if (args.includes('checkout') && args.includes('--detach')) {
+      const result = cp.spawnSync(realGit, args, { stdio: 'inherit' });
+      if (result.status !== 0) process.exit(result.status ?? 1);
+      fs.writeFileSync('.env', 'precious local configuration');
+      process.exit(1);
+    }`);
+    const result = acquire(tip, [], env);
+    expect(result.status).not.toBe(0);
+    expect(readFileSync(join(lane, '.env'), 'utf8')).toBe('precious local configuration');
+    expect(git(['rev-parse', 'HEAD'], lane)).toBe(tip);
+    expect(result.stderr).toMatch(/overwritten by checkout/);
+  });
   it.each([false, true])('restores main after a partially failed pinned checkout (prior lease=%s)', prior => {
     if (prior) expect(run('acquire', ['--lane=1']).status).toBe(0);
     const originalLease = prior ? readFileSync(lease(), 'utf8') : null;
