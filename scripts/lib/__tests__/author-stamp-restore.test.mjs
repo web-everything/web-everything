@@ -1063,3 +1063,28 @@ describe('planStampRestore — any bracket refuses a marker (judge R10 round 2)'
     expect(plan({ edits: [edit(tpl.replace('MARK', m()))] })).toMatchObject({ action: 'restore', id: ID });
   });
 });
+
+describe('restoreAuthorStamp — second link title cannot supply a stamp', () => {
+  // A closed first title and a quote in the second label fooled snapshot-wide quote counting.
+  const snapshot = '[a] (https://example.test "closed") [b "] (https://example.test "open )\n`<div>`\n'
+    + buildAuthorActorMarker(ID) + '\nend")';
+
+  it.each([
+    ['reported payload', snapshot],
+    ['CRLF lines', snapshot.replaceAll('\n', '\r\n')],
+    ['CR lines', snapshot.replaceAll('\n', '\r')],
+    ['Unicode line separators', snapshot.replaceAll('\n', '\u2028')],
+    ['single-quoted titles', snapshot.replaceAll('"', "'")],
+    ['marker without HTML or inline code', snapshot.replace('`<div>`\n', '')],
+    ['HTML entities in title text', snapshot.replace('`<div>`', '&lt;div&gt;')],
+  ])('refuses %s without writing a promoted title marker', (_name, diff) => {
+    const seams = io({
+      readPr: vi.fn(() => ({ state: 'OPEN', body: 'Current description', author: { login: 'alice' } })),
+      readEdits: vi.fn(() => [edit(diff, 'alice', '2026-11-20T10:00:00Z', 'User')]),
+    });
+
+    expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse', contentRefusal: true });
+    expect(seams.readEdits).toHaveBeenCalledTimes(1);
+    expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+});
