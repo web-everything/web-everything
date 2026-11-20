@@ -3638,3 +3638,79 @@ describe('recorder-to-load same-diff waiver admission', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+
+// R1100 MVP: real CI reader, no urgent receipt, and one-field mutations of valid evidence.
+describe('hot-patch urgent admission (R1100)', () => {
+  const repo = 'web-everything/web-everything', branch = `hotpatch/${SHA}`;
+  const validPr = () => ({ number: 42, state: 'open', head: { sha: SHA, ref: 'lane/repair', repo: { full_name: repo } },
+    base: { ref: 'main', repo: { full_name: repo } }, mergeable: true, mergeable_state: 'clean' });
+  const validRules = () => ['update', 'deletion', 'non_fast_forward'].map(type => ({ type, ruleset_id: 27726920 }));
+  function hotFixture(change = {}) {
+    const prs = change.prs ?? [validPr()];
+    const rules = change.rules ?? validRules();
+    const ruleset = { id: 27726920, enforcement: 'active', current_user_can_bypass: 'never', ...change.ruleset };
+    const rows = change.rows ?? [{ id: 1, head_sha: SHA, name: 'test', status: 'in_progress', conclusion: null,
+      app: { id: 15368 }, check_suite: { id: 7 } }];
+    const gh = [];
+    const combinedIO = { fs: {}, handles: (cmd, args) => cmd === 'gh' || cmd === 'git' && args[0] === 'remote',
+      exec: (cmd, args) => {
+        if (cmd === 'git') return `https://github.com/${repo}.git\n`;
+        gh.push(args);
+        const path = args.find(a => a.startsWith('repos/'));
+        if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: repo, url: `https://github.com/${repo}` });
+        if (path?.includes('/check-runs')) return JSON.stringify({ total_count: rows.length, check_runs: rows });
+        if (path?.includes('/actions/runs')) return JSON.stringify({ total_count: 1, workflow_runs: [{ check_suite_id: 7, head_sha: SHA, path: '.github/workflows/ci.yml' }] });
+        if (path === `repos/${repo}/commits/${SHA}/pulls` || path?.includes('/pulls?')) return JSON.stringify(prs);
+        if (path === `repos/${repo}/pulls/42`) return JSON.stringify(prs[0]);
+        if (path?.includes('/rules/branches/')) return JSON.stringify(rules);
+        if (path === `repos/${repo}/rulesets/27726920`) return JSON.stringify(ruleset);
+        throw new Error(`unexpected hot-patch evidence read: ${args.join(' ')}`);
+      } };
+    const f = fixture({ ready: '', defaultTestCheck: true, combinedIO, ...change.options });
+    return { ...f, gh, run: (input = {}) => f.run({ branch, urgent: true, reason: 'R1100 hot-patch PR #42', ...input }) };
+  }
+  it.each(['queued', 'in_progress', 'completed'])('accepts bound Actions test %s without a receipt and records hotPatch.pr', async status => {
+    const f = hotFixture({ rows: [{ id: 1, head_sha: SHA, name: 'test', status, conclusion: status === 'completed' ? 'success' : null,
+      app: { id: 15368 }, check_suite: { id: 7 } }] });
+    expect(await f.run()).toMatchObject({ ok: true, registered: true });
+    expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', ref: branch, sha: SHA, hotPatch: { pr: 42 } }));
+    expect(f.reads.some(p => p.endsWith('/urgent-full-green.jsonl'))).toBe(false);
+    expect(f.gh.some(args => args.includes(`repos/${repo}/commits/${SHA}/pulls`))).toBe(true);
+    expect(f.gh.some(args => args.includes(`repos/${repo}/rulesets/27726920`))).toBe(true);
+  });
+  const refusalCases = [
+    ['zero PRs', { prs: [] }, /pr/i],
+    ['two PRs', { prs: [validPr(), { ...validPr(), number: 43 }] }, /pr/i],
+    ['PR head differs', { prs: [{ ...validPr(), head: { ...validPr().head, sha: TREE } }] }, /pr|head/i],
+    ['base differs', { prs: [{ ...validPr(), base: { ...validPr().base, ref: 'release' } }] }, /pr|base/i],
+    ['foreign repo', { prs: [{ ...validPr(), head: { ...validPr().head, repo: { full_name: 'other/repo' } } }] }, /pr|repo/i],
+    ['missing rule', { rules: validRules().filter(r => r.type !== 'deletion') }, /rules|protect/i],
+    ['inactive ruleset', { ruleset: { enforcement: 'disabled' } }, /rules|protect/i],
+    ['bypassable ruleset', { ruleset: { current_user_can_bypass: 'always' } }, /rules|protect/i],
+    ['ruleset id mismatch', { ruleset: { id: 27726921 } }, /rules|protect/i],
+    ['any failed check', { rows: [{ id: 1, head_sha: SHA, name: 'test', status: 'in_progress', conclusion: null, app: { id: 15368 }, check_suite: { id: 7 } },
+      { id: 2, head_sha: SHA, name: 'daemon-soak', status: 'completed', conclusion: 'failure', app: { id: 15368 }, check_suite: { id: 8 } }] }, /ci.*fail/i],
+    ['health-watch target', { options: { settings: { daemons: { 'health-watch': { label: 'com.we.health-watch', clone: 'wev-health-watch' } } } } }, /health.watch/i],
+    ['no audit', { options: { audits: '' } }, /audit/i],
+  ];
+  it.each(refusalCases)('refuses %s on its own evidence field', async (name, change, diagnostic) => {
+    const f = hotFixture(change);
+    const result = await f.run(name === 'health-watch target' ? { daemon: 'health-watch' } : {});
+    expect(result).toMatchObject({ ok: false, registered: false });
+    // A generic bad-branch or missing-receipt refusal does not prove the new evidence gate.
+    expect([result.stopReason, result.detail, result.error, result.fallback].filter(Boolean).join(' ')).toMatch(diagnostic);
+    expect(result.detail).not.toBe('bad-branch');
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it.each([`hotpatch/${TREE}`, `hotpatch/${SHA}-other`])('refuses ref %s that is not exactly hotpatch/input.sha', async ref => {
+    const f = hotFixture();
+    expect(await f.run({ branch: ref })).toMatchObject({ ok: false, stopReason: 'bad-input', registered: false });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+  it('a lane urgent load still requires the signed full-suite receipt', async () => {
+    const f = hotFixture();
+    expect(await f.run({ branch: BASE.branch })).toMatchObject({ ok: false, detail: 'no-urgent-marker' });
+    expect(mutations(f, 'add')).toHaveLength(0);
+  });
+});

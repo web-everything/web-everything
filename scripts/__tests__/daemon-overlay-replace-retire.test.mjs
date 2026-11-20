@@ -742,3 +742,61 @@ describe('replaceRegistration races', () => {
     expect(r.stderr).toContain('--allow-no-pr requires --reason');
   });
 });
+
+
+// R1100: new decisions authorize withdrawal only for immutable hot-patch loads.
+describe('hot-patch retirement decision authorization', () => {
+  const tip = 'a'.repeat(40), other = 'b'.repeat(40);
+  const reasons = [
+    ['ci-unknown', 30 * 60_000, null],
+    ['expired', 24 * 60 * 60_000, null],
+    ['pr-head-moved', 0, { number: 42, state: 'open', merged: false, head: { sha: other } }],
+    ['pr-closed', 0, { number: 42, state: 'closed', merged: false, head: { sha: tip } }],
+  ];
+  function retirement(reason, age, pr, lane = false) {
+    const f = fixture(), ref = lane ? 'lane/urgent' : `hotpatch/${tip}`;
+    addOverlay(f.clone, { ref, reason: 'R1100 hot-patch PR #42' }, { env: f.env });
+    const entry = f.entry(ref), registration = { clone: f.clone, ref, sha: tip };
+    const load = { type: 'prototype-load.urgent', trackingId: 'hot-attempt', at: '2026-01-01T00:00:00Z',
+      ref, sha: tip, clone: f.clone, registration, hotPatch: { pr: 42 } };
+    const decision = { status: 'unload-decision', trackingId: load.trackingId,
+      at: new Date(Date.parse(load.at) + age).toISOString(), reason, clone: f.clone, ref, sha: tip, registration,
+      ...(pr ? { pr } : {}) };
+    const args = { root: f.clone, ref, expectedTip: tip, expectedEntry: entry, mode: 'urgent-failed',
+      trackingId: load.trackingId, env: f.env, deps: {
+        prove: () => ({ action: 'keep', reason: 'pr-open', tip }), tip: () => tip,
+        readUrgentLoads: () => [load], readUrgentDecisions: () => [decision],
+      } };
+    return { f, args, decision, ref };
+  }
+  it.each(reasons)('accepts %s at its threshold with exact-load evidence', async (reason, age, pr) => {
+    const { f, args } = retirement(reason, age, pr);
+    expect(await retireRegistration(args)).toMatchObject({ retired: true, reason: 'urgent-failed' });
+    expect(f.list()).toEqual([]);
+    expect(f.events().at(-1)).toMatchObject({ kind: 'auto-retired' });
+  });
+  it.each(reasons)('refuses %s for a lane ref even with otherwise matching evidence', async (reason, age, pr) => {
+    const { f, args, ref } = retirement(reason, age, pr, true);
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
+  it.each(reasons.slice(0, 2))('refuses %s one millisecond below threshold', async (reason, age, pr) => {
+    const { f, args, ref } = retirement(reason, age - 1, pr);
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+  });
+  it.each([
+    ['pr-head-moved', { number: 43, state: 'open', head: { sha: other } }],
+    ['pr-head-moved', { number: 42, state: 'open', head: { sha: tip } }],
+    ['pr-head-moved', { number: 42, state: 'open', head: {} }],
+    ['pr-closed', { number: 43, state: 'closed', merged: false, head: { sha: tip } }],
+    ['pr-closed', { number: 42, state: 'open', merged: false, head: { sha: tip } }],
+    ['pr-closed', { number: 42, state: 'closed', merged: true, head: { sha: tip } }],
+    ['pr-closed', null],
+  ])('refuses %s with mismatched or missing PR evidence %j', async (reason, pr) => {
+    const { f, args, ref } = retirement(reason, 0, pr);
+    expect(await retireRegistration(args)).toMatchObject({ retired: false, refused: 'urgent-decision-required' });
+    expect(f.list()).toEqual([ref]);
+    expect(readPendingDrops(f.clone, f.env)).toEqual([]);
+  });
+});
