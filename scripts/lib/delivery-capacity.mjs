@@ -1,7 +1,7 @@
 /** S1 read-only delivery capacity. Assessment and rendering perform no IO. */
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
-import { CAPACITY_LEAVES, OVERRIDE_MAX_HOURS } from './operator-override-reader.mjs';
+import { OVERRIDE_MAX_HOURS } from './operator-override-reader.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 export { renderCapacityLine } from './delivery-capacity-render.mjs';
 import { ACCEPTED_LABEL, isBuilderPr } from './open-pr-cap-scope.mjs';
@@ -61,9 +61,6 @@ const valid = {
   memMinGb: nonnegative, maxStartsPerCheck: value => Number.isSafeInteger(value) && value >= 0,
 };
 
-for (const key of ['openPrCap', 'maxStartsPerCheck', 'softOverCapStarts'])
-  valid[key] = CAPACITY_LEAVES[`deliveryCapacity.${key}`].validate;
-
 /** Settings IO shell: invalid leaves retain their valid lower layer. */
 export function resolveDeliveryCapacity(options = {}) {
   try {
@@ -72,11 +69,7 @@ export function resolveDeliveryCapacity(options = {}) {
     try { tool = read()?.deliveryCapacity; } catch { /* retain lower layers */ }
     return cascadePolicy('deliveryCapacity', tool, {
       standard: DELIVERY_CAPACITY_DEFAULTS, platform, env, log, valid,
-      envValues: { mode: env?.WE_DELIVERY_CAPACITY_MODE,
-        ...Object.fromEntries(['openPrCap', 'maxStartsPerCheck', 'softOverCapStarts'].map(key => {
-          const raw = env?.[`WE_DELIVERY_CAPACITY_${key.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`];
-          return [key, raw === undefined || raw === '' ? undefined : Number(raw)];
-        })) },
+      envValues: { mode: env?.WE_DELIVERY_CAPACITY_MODE },
     });
   } catch {
     return { value: structuredClone(DELIVERY_CAPACITY_DEFAULTS), sources: standardSources() };

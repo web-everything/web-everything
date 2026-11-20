@@ -12,32 +12,12 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 exec python3 - "$slot_settings" <<'PYTHON'
-import json, os, pwd, re, socket, sys
+import json, os, re, socket, sys
 try:
     def checked(value, label):
         if type(value) is not int or not 1 <= value <= 128:
             raise ValueError(label + ' must be 1..128')
         return value
-    host = os.environ.get('FORGE_HOST', socket.gethostname()).split('.')[0]
-    override = None
-    try:
-        with open(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, '.claude', 'operator-overrides.json')) as stream:
-            store = json.load(stream)
-        key = 'forgeSlots.' + host
-        if not isinstance(store, dict):
-            raise ValueError('not a JSON object')
-        nested = store.get('forgeSlots', {})
-        raw = store.get(key, nested.get(host) if isinstance(nested, dict) else None)
-        if host in ('forge', 'forge-b') and raw is not None:
-            if type(raw) is int and 1 <= raw <= 128:
-                override = raw
-            else:
-                print('operator-override: operator-db-invalid ' + key + '; dropping this key', file=sys.stderr)
-    except FileNotFoundError:
-        pass
-    except Exception as error:
-        message = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(error))
-        print('operator-override: operator-db-unreadable store (' + message + '); using lower setting', file=sys.stderr)
     if 'FORGE_EXEC_SLOTS' in os.environ:
         value = os.environ['FORGE_EXEC_SLOTS']
         if not re.fullmatch(r'[1-9][0-9]*', value):
@@ -53,8 +33,6 @@ try:
             checked(value, 'forgeSlots.hosts.' + name)
         host = os.environ.get('FORGE_HOST', socket.gethostname()).split('.')[0]
         count = config['hosts'].get(host, config['default'])
-    if override is not None:
-        count = override
     print(count)
 except Exception as error:
     print('forge-slots: ' + str(error), file=sys.stderr)

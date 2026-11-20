@@ -1,5 +1,4 @@
-import { resolveCapacityLeaf } from './policy-cascade.mjs';
-/** Live provider-cap policy shared by routing validation and review launchers. */
+/** Pure provider-cap policy shared by routing validation and review launchers. */
 /** LEGACY — the old SHARED per-day cap on non-Claude seat CALLS, counted across every provider together. Card
  *  xn2wf9t (2026-09-27) replaced it with a cap PER PROVIDER ({@link PROVIDER_CAP_ENV}): Codex's own weekly
  *  allowance is comparatively tight while both antigravity backends are separate and generous, so one shared
@@ -41,31 +40,27 @@ export function resolveCarbonShadowCap(env = process.env) {
  *  Gemini too weak for review until Gemini 4; its own env cap can explicitly enable it. */
 export const PROVIDER_CAP_DEFAULT = Object.freeze({ codex: 80, 'agy-claude': 300, 'agy-gemini': 0 });
 /** The daily call cap for ONE provider: its own env var, else (codex only) the legacy shared env var, else its
- *  own default. Never throws; an unparseable or negative value is treated as unset. Reads the host override each call. */
+ *  own default. Never throws; an unparseable or negative value is treated as unset. PURE. */
 export function resolveProviderCap(provider, env = process.env) {
   const ownName = PROVIDER_CAP_ENV[provider];
   const own = ownName ? Number(env?.[ownName]) : Number.NaN;
-  const key = `reviewSeats.${provider}`;
-  if (Number.isInteger(own) && own >= 0 && own <= 10000) return resolveCapacityLeaf(key, { env, envValue: own }).value;
+  if (Number.isInteger(own) && own >= 0) return own;
   // codex's OWN env unset: fall back to the legacy shared one — reusing `resolveDailyCap` itself (rather than
   // re-parsing inline) so a garbage legacy value degrades to ITS OWN default (40, `DEFAULT_DAILY_CAP`), not
   // codex's new one — the one existing behavior this fallback is pinned to keep byte-identical for a release.
-  if (provider === 'codex' && env?.[DAILY_CAP_ENV] !== undefined)
-    return resolveCapacityLeaf(key, { env, standard: resolveDailyCap(env) }).value;
-  if (!ownName) return DEFAULT_DAILY_CAP;
-  return resolveCapacityLeaf(key, { env }).value;
+  if (provider === 'codex' && env?.[DAILY_CAP_ENV] !== undefined) return resolveDailyCap(env);
+  return PROVIDER_CAP_DEFAULT[provider] ?? DEFAULT_DAILY_CAP;
 }
 /** Live operation controls may enable a default-disabled provider; explicit env caps always win. */
 export function resolveRoutingProviderCap(provider, env = process.env, entry) {
   if (entry?.disabledProviders?.includes(provider)) return 0;
   const cap = resolveProviderCap(provider, env);
-  const operator = PROVIDER_CAP_ENV[provider] ? resolveCapacityLeaf(`reviewSeats.${provider}`, { env }) : {};
-  return operator.source !== 'operator-db' && entry?.enabledProviders?.includes(provider) && cap === 0 && PROVIDER_CAP_DEFAULT[provider] === 0
+  return entry?.enabledProviders?.includes(provider) && cap === 0 && PROVIDER_CAP_DEFAULT[provider] === 0
     && env?.[PROVIDER_CAP_ENV[provider]] === undefined
     ? 300 : cap;
 }
-/** @returns {number} the configured daily call cap (a non-negative integer), else the default. Reads the host override each call. */
+/** @returns {number} the configured daily call cap (a non-negative integer), else the default. PURE. */
 export function resolveDailyCap(env = process.env) {
   const n = Number(env?.[DAILY_CAP_ENV]);
-  return resolveCapacityLeaf('reviewSeats.extraSeatsDailyCap', { env, envValue: n }).value;
+  return Number.isInteger(n) && n >= 0 ? n : DEFAULT_DAILY_CAP;
 }

@@ -300,7 +300,7 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
     expect(r.sources.maxLiveReviewRounds).toBe('operator-db');
     expect(formatCascadeSourcesLine('reviewConcurrency', r)).toContain('maxLiveReviewRounds=5 (operator-db)');
   });
-  it('invalid operator leaf tightens the env cap to the stricter built-in default', () => {
+  it('invalid operator override fails closed instead of accepting a looser env cap', () => {
     const r = resolveCascade({ ...layers, operatorOverride: { maxLiveReviewRounds: 'bad' } });
     expect(r.value.maxLiveReviewRounds).toBe(1);
     expect(r.sources.maxLiveReviewRounds).toBe('standard');
@@ -309,6 +309,12 @@ describe('operator-db capacity layer above environment (R907/R915)', () => {
   it('no operator layer preserves the full existing result', () => {
     expect(resolveCascade(layers)).toEqual(resolveCascade({ ...layers, operatorOverride: {} }));
     expect(resolveCascade(layers).value.maxLiveReviewRounds).toBe(4);
+  });
+  it('keeps main behavior and the invalid list for other leaves when an operator sibling is unknown', () => {
+    const r = resolveCascade({ ...layers, operatorOverride: { maxLiveReviewRounds: 5, unknown: 1 } });
+    expect(r.value).toEqual({ maxLiveReviewRounds: 1 });
+    expect(r.sources).toEqual({ maxLiveReviewRounds: 'standard' });
+    expect(r.invalid).toEqual(['operator-db.unknown=1']);
   });
   it.each([{ fixCap: { floor: 7 } }, { 'fixCap.floor': 7 }])('accepts nested or dotted override maps: %j', operatorOverride => {
     const r = resolveCascade({ standard: { fixCap: { floor: 2, ceiling: 10 } }, operatorOverride });
@@ -416,7 +422,7 @@ describe('R907 malformed review capacity evidence', () => {
     ['below hard floor', 'reviewConcurrency.maxLiveReviewRounds', 0],
     ['unknown key', 'reviewConcurrency.unknown', 1],
     ['non-allowlisted guard', 'reviewConcurrency.enabled', false],
-  ])('%s tightens the affected leaf in both cascade results and daemon budget', (_label, key, value) => {
+  ])('%s fails closed for both cascade results and daemon budget', (_label, key, value) => {
     const path = file({ [key]: value });
     operatorEnv(path);
     const log = vi.fn();

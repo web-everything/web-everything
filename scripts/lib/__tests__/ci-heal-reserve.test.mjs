@@ -18,16 +18,17 @@ const idle = { sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 
 // Live incident 2026-10-07: PR #4235 failed its own required check, but two review-fix sessions held the whole
 // fixer cap, so its ci-heal was deferred pass after pass and no one owned it.
 describe('ci-heal reserve slot', () => {
-  it('defaults to 6; env overrides; junk falls back', () => {
+  it('defaults to 6; env overrides; zero and junk fall back', () => {
     expect(resolveCiHealReserve({ env: {} })).toBe(6);
     expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '2' } })).toBe(2);
-    expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '0' } })).toBe(0);
+    expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: '0' } })).toBe(6);
     expect(resolveCiHealReserve({ env: { WE_CI_HEAL_RESERVE: 'x' } })).toBe(6);
   });
   it('a live or same-pass ci-heal uses a slot up, with a logged reason that names who holds them', () => {
     const free = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '1' }, listClaims: () => [claim('fix', 1), claim('fix', 2)] });
     expect(free.tryAdmit()).toMatchObject({ admit: true });
     expect(free.tryAdmit()).toMatchObject({ admit: false, kind: 'fix-cap', why: expect.stringMatching(/reserved ci-heal/) });
+    // Pin the historical two-slot scenario independently of the new six-slot default.
     const live = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '2' }, listClaims: () => [claim('fix', 1), claim('ci-heal', 2), claim('ci-heal', 3)] });
     const refused = live.tryAdmit();
     expect(refused.admit).toBe(false);
@@ -59,8 +60,10 @@ describe('ci-heal reserve slot', () => {
     expect(refused.why).toContain('(4 live ci-heal)');
     expect(refused.why).toContain('held by ci-heal #5042, #5051, unknown PR, unknown PR; queued oldest-first');
   });
-  it('reserve 0 is off; host load still refuses', () => {
-    expect(createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '0' } }).tryAdmit().admit).toBe(false);
+  it('reserve zero uses the safe default; host load still refuses', () => {
+    const reserve = createCiHealReserve({ ...idle, env: { WE_CI_HEAL_RESERVE: '0' } });
+    for (let i = 0; i < 6; i++) expect(reserve.tryAdmit().admit).toBe(true);
+    expect(reserve.tryAdmit().admit).toBe(false);
     expect(createCiHealReserve({ sample: () => ({ ok: false }), loadavg: () => 36, cpuCount: () => 12, env: {} }).tryAdmit()).toMatchObject({ admit: false, kind: 'host-load' });
   });
   it('ci-heal dispatch for a PR runs when review fixes hold the whole fixer cap', async () => {

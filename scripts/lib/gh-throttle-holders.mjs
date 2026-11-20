@@ -8,24 +8,20 @@ import { cascadePolicy } from './policy-cascade.mjs';
 import { ghCommandWords } from './gh-argv.mjs';
 export { ghCommandWords } from './gh-argv.mjs';
 
-// Existing holders remain visible after a capacity reduction.
-const GH_SLOT_HARD_MAX = 50;
-
 export const GH_HOLDER_DEFAULTS = Object.freeze({ maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 });
-
+const cached = new WeakMap();
 export function loadGhThrottleSettings({ file, env = process.env } = {}) {
   const settings = file ?? readDeclaredSettings().settings;
   const number = (key) => env[key] == null || env[key] === '' ? undefined : Number(env[key]);
   return cascadePolicy('ghThrottle', settings?.ghThrottle, {
     env, standard: GH_HOLDER_DEFAULTS,
     envValues: { maxHoldSeconds: number('WE_GH_THROTTLE_MAX_HOLD_SECONDS'), perCallerMax: number('WE_GH_THROTTLE_PER_CALLER_MAX') },
-    valid: { perCallerMax: v => Number.isInteger(v) && v >= 1 && v <= 50,
-      cap: v => Number.isInteger(v) && v >= 1 && v <= 50,
-      maxHoldSeconds: v => Number.isInteger(v) && v >= 0, reapGraceSeconds: v => Number.isInteger(v) && v >= 0 },
+    valid: (v) => Number.isFinite(v) && v >= 0 && Number.isInteger(v),
   });
 }
 export function ghHolderPolicy(env = process.env) {
-  return loadGhThrottleSettings({ env }).value;
+  if (!cached.has(env)) cached.set(env, loadGhThrottleSettings({ env }).value);
+  return cached.get(env);
 }
 
 // Telemetry records command vocabulary only. Endpoints, flags, fields, headers and positional
@@ -125,7 +121,7 @@ function holder(slot, entry, nowMs) {
   return sanitizeGhHolder({ slot, pid: entry.pid, alive: alive(entry.pid), caller: m.caller ?? 'unknown', op: m.op ?? m.args ?? '', parent: m.parent ?? '', ppid: m.ppid ?? null, heldMs: Number.isFinite(acquired) ? Math.max(0, nowMs - acquired) : 0, timeoutMs: m.timeoutMs });
 }
 export function readGhSlotHolders({ lockRoot, cap, nowMs = Date.now() }) {
-  return Array.from({ length: Math.max(GH_SLOT_HARD_MAX, cap) }, (_, slot) => { const e = readLockEntry(lockRoot, slotPath(slot)); return e ? holder(slot, e, nowMs) : null; }).filter(Boolean);
+  return Array.from({ length: cap }, (_, slot) => { const e = readLockEntry(lockRoot, slotPath(slot)); return e ? holder(slot, e, nowMs) : null; }).filter(Boolean);
 }
 export function ghHoldersSummary(holders = []) {
   return holders.map(sanitizeGhHolder).map(h => `${h.caller}(${h.op}, ${Math.round(h.heldMs / 1000)}s)`).join(' ');
@@ -151,7 +147,7 @@ export function acquireGhHolderSlot({ lockRoot, cap, owner, pid, pollMs, timeout
   const overAge = h => h.timeoutMs !== 0 && h.heldMs > Math.max(policy.maxHoldSeconds * 1000, h.timeoutMs ?? 0) + policy.reapGraceSeconds * 1000;
   for (;;) {
     const nowMs = now();
-    const entries = Array.from({ length: Math.max(GH_SLOT_HARD_MAX, cap) }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
+    const entries = Array.from({ length: cap }, (_, slot) => readLockEntry(lockRoot, slotPath(slot)));
     let holders = entries.flatMap((e, slot) => e ? [holder(slot, e, nowMs)] : []);
     const capped = () => policy.perCallerMax > 0 && holders.filter((h) => h.alive && ghCallerKey(h) === ghCallerKey(slotMeta)).length >= policy.perCallerMax;
     let r = capped() ? { ok: false } : trySlot({ lockRoot, cap, owner, pid, nowMs, nowIso: new Date(nowMs).toISOString(), meta: { ...slotMeta, acquiredAt: new Date(nowMs).toISOString() } });

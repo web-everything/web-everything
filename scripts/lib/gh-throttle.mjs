@@ -194,7 +194,7 @@ import { isGhDeferred } from './gh-deferred.mjs';
 import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs';
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
-import { cascadePolicy, resolveCapacityLeaf } from './policy-cascade.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
@@ -770,8 +770,7 @@ export function resolveGhCapDetailed(env = process.env, { tool, toolFile = GH_SL
   };
   if (tool && Object.hasOwn(tool, 'cap')) apply(tool.cap, 'tool');
   if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_CAP')) apply(env.WE_GH_THROTTLE_CAP, 'env');
-  const operator = resolveCapacityLeaf('ghThrottle.cap', { standard: result.cap, env });
-  return { cap: operator.value, source: operator.source === 'operator-db' ? operator.source : result.source };
+  return result;
 }
 
 export function resolveGhCap(env = process.env, options = {}) {

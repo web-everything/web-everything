@@ -40,7 +40,7 @@ describe('lock-free operator override reader', () => {
     expect(CAPACITY_LEAVES[key]).toMatchObject({ direction: 'cap', failClosedFallback: 1 });
   });
 
-  it.each([11, 24])('rejects persisted exemption %i without erasing a valid fix sibling', value => {
+  it.each([11, 24])('rejects persisted exemption %i while retaining its valid sibling', value => {
     writeFileSync(file, JSON.stringify({
       'fix.conflictFixesPerPass': 24,
       'fix.conflictFixExemptPerPass': value,
@@ -88,7 +88,7 @@ describe('lock-free operator override reader', () => {
     }
   });
 
-  it('drops oversized capacity values and retains valid policy siblings', () => {
+  it('rejects oversized capacity values while retaining valid siblings and other policies', () => {
     writeFileSync(file, JSON.stringify({
       'resourceGate.fixCap.floor': 2,
       'resourceGate.fixCap.ceiling': 25,
@@ -121,6 +121,19 @@ describe('lock-free operator override reader', () => {
       expect(failClosedCapacity(key, 4, { codeDefault: 2, log }))
         .toBe(stricter(4, 2, failClosedFallback));
     }
+  });
+
+  it.each(['unknown', 'host.unknown', 'host.maxReviewDispatchPerTick.forbidden', '__proto__.polluted'])
+  ('drops %s without erasing nested valid siblings', bad => {
+    writeFileSync(file, JSON.stringify({
+      host: { maxReviewDispatchPerTick: 8 },
+      'reviewConcurrency.maxLiveReviewRounds': 12,
+      [bad]: 1,
+    }));
+    expect(readOperatorOverrides({ file, log: () => {} }).values).toEqual({
+      'host.maxReviewDispatchPerTick': 8, 'reviewConcurrency.maxLiveReviewRounds': 12,
+    });
+    expect({}.polluted).toBeUndefined();
   });
 });
 

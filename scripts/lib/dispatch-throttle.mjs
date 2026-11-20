@@ -10,7 +10,7 @@ import { pidIdentity } from './pid-alive.mjs';
  *   - heavyAdmissionCap          (env WE_HEAVY_ADMISSION_CAP)            default 3 — heavy-command slots. The
  *     per-daemon plist override lives in ~/Library/LaunchAgents/com.we.<daemon>.plist (templates:
  *     we:skills-src/conveyor/launchd/*.plist.example); remove it to follow this file.
- *   - fixDispatchMaxConcurrent   (env WE_FIX_DISPATCH_MAX_CONCURRENT)    default 6 — live fix-* + ci-heal-* sessions.
+ *   - fixDispatchMaxConcurrent   (env WE_FIX_DISPATCH_MAX_CONCURRENT)    default 2 — live fix-* + ci-heal-* sessions.
  *   - maxLoadPerCore             (env WE_MAX_LOAD_PER_CORE)              default 2.0 — 1-min loadavg / cores. FALLBACK
  *     only, used when the CPU sample fails (macOS load average overstates saturation).
  *   - cpuIdleMinPct.<kind>       (env WE_MIN_CPU_IDLE_PCT_<KIND>)        PRIMARY signal: hold a launch when real CPU idle %
@@ -22,14 +22,14 @@ import { pidIdentity } from './pid-alive.mjs';
  *   - fixDispatch.borrowExecutor (env WE_FIX_BORROW_EXECUTOR)            default codex; `codex` | `claude` | `agy-claude`.
  */
 import { readFileSync } from 'node:fs';
-import { cascadePolicy, resolveCapacityLeaf } from './policy-cascade.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import os from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sampleHost } from './host-sample.mjs';
 
 export const CPU_IDLE_MIN_BUILT_IN = Object.freeze({ fix: 8, 'ci-heal': 8, build: 15, prepare: 20, review: 10 });
-export const DISPATCH_SETTINGS_BUILT_IN = Object.freeze({ heavyAdmissionCap: 3, fixDispatchMaxConcurrent: 6, maxLoadPerCore: 2.0, memFreeMinPct: 15 });
+export const DISPATCH_SETTINGS_BUILT_IN = Object.freeze({ heavyAdmissionCap: 3, fixDispatchMaxConcurrent: 2, maxLoadPerCore: 2.0, memFreeMinPct: 15 });
 export const DISPATCH_SETTINGS_ENV = Object.freeze({
   heavyAdmissionCap: 'WE_HEAVY_ADMISSION_CAP',
   fixDispatchMaxConcurrent: 'WE_FIX_DISPATCH_MAX_CONCURRENT',
@@ -62,8 +62,6 @@ export function resolveDispatchSetting(key, { env = process.env, file } = {}) {
     try { raw = JSON.parse(readFileSync(defaultDispatchSettingsPath(), 'utf8')); } catch { raw = null; }
   }
   const v = raw && typeof raw === 'object' ? raw[key] : undefined;
-  if (key === 'fixDispatchMaxConcurrent') return resolveCapacityLeaf(key, { env, standard: DISPATCH_SETTINGS_BUILT_IN[key],
-    tool: v, envValue: envOk ? norm(key, Number(fromEnv)) : undefined }).value;
   const c = cascadePolicy(key, v, { env, standard: DISPATCH_SETTINGS_BUILT_IN[key],
     envValues: { '': envOk ? norm(key, Number(fromEnv)) : undefined }, valid: (x) => typeof x === 'number' && valid(key, x) });
   return c.value === undefined ? DISPATCH_SETTINGS_BUILT_IN[key] : norm(key, c.value);

@@ -29,8 +29,8 @@ import { resolveHandoffSettings } from './handoff-settings.mjs';
  *   threshold (e.g. `WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT`). Every leaf's source is logged once per
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
-import { CAPACITY_LEAVES, failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
-import { capacityPolicyLeaves, hasInvalidOperatorPolicy, readOperatorPolicy } from './policy-cascade.mjs';
+import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-reader.mjs';
+import { readOperatorPolicy } from './policy-cascade.mjs';
 import { readFileSync } from 'node:fs';
 import os, { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -60,7 +60,7 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
     holdCpuIdleBelowPct: 10,
   }),
 });
-const FIX_CAP_SIGNAL_LEAVES = ['raiseQueueOver', 'raiseStepPerPass', 'raiseMinMemFreePct', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes', 'lowerBelowMemFreePct',
+const FIX_CAP_SIGNAL_LEAVES = ['raiseMinMemFreePct', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes', 'lowerBelowMemFreePct',
   'lowerAboveSwapUsedPct', 'lowerAboveHeavyWaitMinutes', 'lowerBy', 'lowerMinimum', 'holdCpuIdleBelowPct'];
 const envNameOf = (leaf) => `WE_FIX_CAP_${leaf.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 export const RESOURCE_GATE_ENV = Object.freeze({
@@ -81,8 +81,6 @@ const VALID = {
   'fixCap.lowerBelowMemFreePct': pct, 'fixCap.lowerAboveSwapUsedPct': pct, 'fixCap.lowerAboveHeavyWaitMinutes': minutes,
   'fixCap.lowerBy': int(0), 'fixCap.lowerMinimum': int(1), 'fixCap.holdCpuIdleBelowPct': pct,
 };
-for (const leaf of ['raiseQueueOver', 'raiseStepPerPass', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes'])
-  VALID[`fixCap.${leaf}`] = CAPACITY_LEAVES[`resourceGate.fixCap.${leaf}`].validate;
 const LEAVES = Object.keys(VALID);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const leafOf = (block, leaf) => {
@@ -106,7 +104,6 @@ const parseEnv = (leaf, raw) => {
 export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFloor = 2, log = console.error } = {}) {
   const values = {}; const sources = {}; const invalid = [];
   const operatorOverride = readOperatorPolicy('resourceGate', { env, log });
-  const invalidOperator = hasInvalidOperatorPolicy(operatorOverride);
   for (const leaf of LEAVES) {
     values[leaf] = leafOf(RESOURCE_GATE_STANDARD, leaf); sources[leaf] = 'standard';
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
@@ -123,8 +120,7 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
       if (VALID[leaf](e)) { values[leaf] = e; sources[leaf] = `env ${envKey}`; } else invalid.push(`env ${envKey}=${JSON.stringify(rawEnv)}`);
     }
   }
-  // Malformed resource policy evidence closes the whole policy, even beside valid overrides.
-  for (const [leaf, value] of Object.entries(invalidOperator ? {} : operatorOverride ?? {})) {
+  for (const [leaf, value] of Object.entries(operatorOverride ?? {})) {
     if (!Object.hasOwn(VALID, leaf)) continue;
     if (VALID[leaf](value)) { values[leaf] = value; sources[leaf] = 'operator-db'; }
     else invalid.push(`operator-db.${leaf}=${JSON.stringify(value)}`);
@@ -136,22 +132,20 @@ export function resolveResourceGateSettings({ platform, tool, env = {}, legacyFl
     values['fixCap.ceiling'] = values['fixCap.floor'] + values['fixCap.ceilingAboveFloor'];
     sources['fixCap.ceiling'] = `floor + ${values['fixCap.ceilingAboveFloor']}`;
   }
-  if (invalidOperator) {
-    for (const leaf of capacityPolicyLeaves('resourceGate')) {
-      const before = values[leaf];
-      values[leaf] = failClosedCapacity(`resourceGate.${leaf}`, before, {
-        log, reason: operatorOverride === null ? 'unreadable' : 'invalid',
-      });
-      if (values[leaf] !== before) sources[leaf] = 'standard';
-    }
-  }
   if (values['fixCap.ceiling'] < values['fixCap.floor']) {
-    if (sources['fixCap.ceiling'] === 'operator-db' || invalidOperator) {
+    if (sources['fixCap.ceiling'] === 'operator-db') {
       values['fixCap.floor'] = values['fixCap.ceiling'];
-      sources['fixCap.floor'] = sources['fixCap.ceiling'];
+      sources['fixCap.floor'] = 'operator-db';
     } else {
       invalid.push(`fixCap.ceiling ${values['fixCap.ceiling']} < floor ${values['fixCap.floor']} (ceiling raised to the floor)`);
       values['fixCap.ceiling'] = values['fixCap.floor'];
+    }
+  }
+  if (operatorOverride === null) {
+    for (const leaf of ['fixCap.floor', 'fixCap.ceiling', 'fixCap.raiseMinMemFreePct']) {
+      const before = values[leaf];
+      values[leaf] = failClosedCapacity(`resourceGate.${leaf}`, before, { log });
+      if (values[leaf] !== before) sources[leaf] = 'standard';
     }
   }
   // The operator hard bound applies to ceilings derived from an operator floor.

@@ -24,35 +24,29 @@
  * following the SAME env-var-configurable convention `heavy-admission.mjs` already established
  * (`WE_HEAVY_ADMISSION_CAP`).
  *
- * DEFAULT — 8, on a host confirmed via `sysctl -n hw.ncpu`/`hw.physicalcpu` to have 12 logical cores the night
- * of the incident: comfortably below both the core count and tonight's 42-lane spike, leaving headroom for the
- * OS, the operator's own dev server, and one lane's own heavy-command burst (a `vitest` run alone was observed
- * at 182% CPU during the incident) without assuming every lane is CPU-idle. Overridable per machine via
- * `WE_MAX_CONCURRENT_LANES`.
+ * DEFAULT — 12. lanes.maxConcurrent resolves operator override > WE_MAX_CONCURRENT_LANES > preferences
+ * file > built-in, with integer bounds 1..24. Invalid evidence keeps the stricter lower/built-in cap.
  *
- * Settings IO reads the host override on every resolution; capToConcurrency remains pure.
+ * The resolver rereads settings on every call; capToConcurrency remains pure.
  */
 
-/** Conservative default — see the file header for the host capacity policy. */
 import { resolveCapacityLeaf } from './policy-cascade.mjs';
+
+/** Built-in concurrent-lane cap. */
 export const DEFAULT_MAX_CONCURRENT_LANES = 12;
 
 /** The env var a machine overrides the default with (mirrors `WE_HEAVY_ADMISSION_CAP`). */
 export const MAX_CONCURRENT_LANES_ENV = 'WE_MAX_CONCURRENT_LANES';
 
 /**
- * Resolve the concurrent-lane cap from env, clamped to a sane minimum of 1 — a cap of 0 would wedge ALL new
- * dispatch, which is a config bug, not a valid "admit nothing" policy. A genuine "stop all new dispatch, let
- * in-flight finish" lever is a distinct, explicit capability (see `we:backlog/xo94b41-a-manual-emergency-pause-
- * new-dispatch-lever-distinct-from-th.md`), never an accidental cap of 0. Mirrors
- * `we:scripts/readiness/heavy-admission.mjs#resolveCap`.
+ * Resolve the concurrent-lane cap through the bounded capacity cascade. Zero, fractional and
+ * oversized values are invalid; invalid evidence cannot raise the lower/file bound above the built-in.
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {number}
  */
 export function resolveMaxConcurrentLanes(env = process.env) {
-  const n = Number(env?.[MAX_CONCURRENT_LANES_ENV]);
-  return resolveCapacityLeaf('lanes.maxConcurrent', { standard: DEFAULT_MAX_CONCURRENT_LANES, env,
-    envValue: Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined }).value;
+  const e = env?.[MAX_CONCURRENT_LANES_ENV];
+  return resolveCapacityLeaf('lanes.maxConcurrent', { env, envValue: e === undefined ? undefined : Number(e) }).value;
 }
 
 /**

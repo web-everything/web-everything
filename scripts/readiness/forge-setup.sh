@@ -534,11 +534,10 @@ fi
 slot_source=$(dirname -- "$0")
 slot_settings="$slot_source/forge-slots.json"
 if [[ ! -e "$slot_settings" ]]; then slot_settings="$slot_source/../settings/forge-slots.json"; fi
-for slot_file in forge-slots.mjs forge-slots.sh forge-slots.json operator-override-reader.mjs; do
+for slot_file in forge-slots.mjs forge-slots.sh forge-slots.json; do
   slot_pending=$(mktemp /usr/local/libexec/.forge-slots.XXXXXX)
   slot_input="$slot_source/$slot_file"
   if [[ "$slot_file" == forge-slots.json ]]; then slot_input="$slot_settings"; fi
-  if [[ "$slot_file" == operator-override-reader.mjs && ! -e "$slot_input" ]]; then slot_input="$slot_source/../lib/operator-override-reader.mjs"; fi
   install -o root -g root -m 0644 "$slot_input" "$slot_pending"
   mv -f -- "$slot_pending" "/usr/local/libexec/$slot_file"
 done

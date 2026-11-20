@@ -9,6 +9,7 @@ import { capToConcurrency, resolveMaxConcurrentLanes, DEFAULT_MAX_CONCURRENT_LAN
 
 describe('resolveMaxConcurrentLanes', () => {
   it('defaults to DEFAULT_MAX_CONCURRENT_LANES with no env set', () => {
+    expect(DEFAULT_MAX_CONCURRENT_LANES).toBe(12);
     expect(resolveMaxConcurrentLanes({})).toBe(DEFAULT_MAX_CONCURRENT_LANES);
   });
 
@@ -25,8 +26,8 @@ describe('resolveMaxConcurrentLanes', () => {
     expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: 'not-a-number' })).toBe(DEFAULT_MAX_CONCURRENT_LANES);
   });
 
-  it('floors a fractional override', () => {
-    expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: '8.9' })).toBe(8);
+  it('rejects a fractional override', () => {
+    expect(resolveMaxConcurrentLanes({ [MAX_CONCURRENT_LANES_ENV]: '8.9' })).toBe(DEFAULT_MAX_CONCURRENT_LANES);
   });
 });
 

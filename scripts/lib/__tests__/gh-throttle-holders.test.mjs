@@ -7,7 +7,7 @@ import { keepAliveScript } from '../test-keepalive.mjs';
 import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough, classifyGhWrite, ghCallerPriority, classifyGhResource } from '../gh-throttle.mjs';
 import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, isGhWatch, ghOpLabel, acquireGhHolderSlot, describeLegacyHolders, ghHoldersSummary } from '../gh-throttle-holders.mjs';
 import { readLockEntry, reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
-import { releaseOwnedSlot, slotPath } from '../../readiness/heavy-admission.mjs';
+import { slotPath } from '../../readiness/heavy-admission.mjs';
 
 let root, logPath;
 const policy = { maxHoldSeconds: 90, reapGraceSeconds: 15, perCallerMax: 4 };
@@ -20,26 +20,6 @@ beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gh-holders-')); logPath = 
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('gh holders', () => {
-  const highHolder = () => reserve(root, slotPath(49), 'old-high', clock, new Date(clock).toISOString(), process.pid,
-    'unknown', 60, ghHolderMeta({ caller: 'worker', args: ['api', 'user'], nowMs: clock }));
-  it('counts high-index live holders after the global cap shrinks and releases them', () => {
-    highHolder();
-    expect(readGhSlotHolders({ lockRoot: root, cap: 1, nowMs: clock })).toMatchObject([{ slot: 49, caller: 'worker' }]);
-    expect(acquire('next', 'other', { cap: 1 })).toMatchObject({ ok: false, holders: [{ slot: 49 }] });
-    expect(releaseOwnedSlot({ lockRoot: root, cap: 1, fastSlots: 0, owner: 'old-high' })).toEqual({ released: true, slot: 49 });
-    expect(acquire('next', 'other', { cap: 1 }).ok).toBe(true);
-  });
-  it('counts high-index holders toward the per-caller limit after a shrink', () => {
-    highHolder();
-    const limits = { ...policy, perCallerMax: 1 };
-    expect(acquire('next', 'worker', { cap: 2, policy: limits }).ok).toBe(false);
-    expect(acquire('other', 'different', { cap: 2, policy: limits }).ok).toBe(true);
-  });
-  it('reaps over-age high-index holders before retrying a shrunken pool', () => {
-    highHolder();
-    expect(acquire('next', 'other', { cap: 1, now: () => clock + 106000 }).ok).toBe(true);
-    expect(rows()[0]).toMatchObject({ outcome: 'slot_reaped', slot: 49 });
-  });
   it.each([
     ['-fapi_key=hidden-value'], ['-Fprivate_key=hidden-value'], ['--field', 'credential=hidden-value'],
     ['--raw-field=body=hidden-value'], ['-HCookie: hidden-value'], ['--header', 'X-App-Key: hidden-value'],

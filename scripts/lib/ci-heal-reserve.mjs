@@ -4,7 +4,8 @@
  *   owner; review fixes that fill the cap must not starve it (live incident 2026-10-07: #4235 sat red for hours, the
  *   daemon logging `refused fix-cap ... ci-heal deferred` every pass). Used by `ci-heal-pr-dispatch.mjs` only when the
  *   shared throttle refused with `fix-cap`. Host load still refuses (a hot machine is not a cap). Defer-only, never
- *   interrupts running work. Env WE_CI_HEAL_RESERVE (default 6, 0 = off). Operator capacity overrides are read on each resolution.
+ *   interrupts running work. ciHeal.reserve resolves operator override > WE_CI_HEAL_RESERVE > preferences
+ *   file > built-in 6, with integer bounds 1..12. Invalid evidence keeps the stricter lower/built-in cap.
  */
 import os from 'node:os';
 import { resolveCapacityLeaf } from './policy-cascade.mjs';
@@ -12,7 +13,7 @@ import { gateLaunch } from './resource-gate.mjs';
 
 export function resolveCiHealReserve({ env = process.env } = {}) {
   const e = env?.WE_CI_HEAL_RESERVE;
-  return resolveCapacityLeaf('ciHeal.reserve', { env, envValue: e === undefined || e === '' ? undefined : Number(e) }).value;
+  return resolveCapacityLeaf('ciHeal.reserve', { env, envValue: e === undefined ? undefined : Number(e) }).value;
 }
 
 /** ONE per pass. `tryAdmit()` -> `{admit:true, reserved:true}` | `{admit:false, kind, why}`. */
