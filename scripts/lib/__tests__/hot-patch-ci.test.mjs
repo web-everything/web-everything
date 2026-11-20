@@ -5,16 +5,37 @@ import { hotPatchCiVerdict } from '../hot-patch-ci.mjs';
 const sha = 'a'.repeat(40), repo = 'web-everything/web-everything';
 // Fixtures ported from hot-patch-verify-source.test.mjs on origin/lane/hot-patch-s2.
 const run = (id, conclusion = 'success', extra = {}) => ({ id, name: 'test', head_sha: sha,
-  app: { id: 15368, slug: 'github-actions' }, status: 'completed', conclusion, ...extra });
+  check_suite_id: id, status: 'completed', conclusion, ...extra });
+const suite = id => ({ id, head_sha: sha, app: { id: 15368, slug: 'github-actions' } });
+test('workflow-run response without app authenticates through its linked check suite', async () => {
+  const response = run(30433642, 'success', { workflow_id: 159038, check_suite_id: 42,
+    path: '.github/workflows/ci.yml', run_attempt: 1 });
+  assert.equal(Object.hasOwn(response, 'app'), false);
+  assert.equal((await verdict({ runs: [response], jobs: { 30433642: [job('test')] } })).state, 'green');
+});
+for (const evidence of [null, {}, { ...suite(2) }, { ...suite(1), head_sha: 'b'.repeat(40) }]) {
+  test(`unreadable or mismatched linked check suite fails closed: ${JSON.stringify(evidence)}`, async () => {
+    assert.equal((await verdict({ suites: { 1: evidence } })).state, 'unknown');
+  });
+}
+test('linked check suite read failure is unknown', async () => {
+  assert.equal((await verdict({ fetchJson: async path => {
+    if (path.includes('/workflows/')) return { workflow_runs: [run(1)] };
+    assert.equal(path, `/repos/${repo}/check-suites/1`);
+    throw Error('offline');
+  } })).state, 'unknown');
+});
 const job = (name, conclusion = 'success', extra = {}) => ({ name, status: 'completed', conclusion, ...extra });
-const workflow = '.github/workflows/ci.yml';
+const workflow = 'ci.yml';
 async function verdict({ runs = [run(1)], jobs = { 1: [job('test')] }, required = ['test'],
-  repository = repo, fetchJson } = {}) {
+  repository = repo, fetchJson, suites = {} } = {}) {
   const paths = [];
   const result = await hotPatchCiVerdict({ repo: repository, sha, required,
     fetchJson: fetchJson ?? (async path => {
       paths.push(path);
       if (path === `/repos/${repo}/actions/workflows/${workflow}/runs?head_sha=${sha}`) return { workflow_runs: runs };
+      const suiteMatch = path.match(/\/check-suites\/(\d+)$/);
+      if (suiteMatch) return Object.hasOwn(suites, suiteMatch[1]) ? suites[suiteMatch[1]] : suite(suiteMatch[1]);
       const match = path.match(/^\/repos\/web-everything\/web-everything\/actions\/runs\/(\d+)\/jobs$/);
       assert(match, `unexpected API path: ${path}`);
       assert(Object.hasOwn(jobs, match[1]), `jobs requested for ignored run ${match[1]}`);
@@ -23,14 +44,14 @@ async function verdict({ runs = [run(1)], jobs = { 1: [job('test')] }, required 
   assert.equal(typeof result.reason, 'string'); assert(result.reason.length > 0);
   return { ...result, paths };
 }
-test('mapped workflow and exact sha produce green from the selected run jobs', async () => {
+test('endpoint construction uses the workflow filename as the REST identifier', async () => {
   const result = await verdict(); assert.equal(result.state, 'green');
   assert.deepEqual(result.paths, [`/repos/${repo}/actions/workflows/${workflow}/runs?head_sha=${sha}`,
-    `/repos/${repo}/actions/runs/1/jobs`]);
+    `/repos/${repo}/check-suites/1`, `/repos/${repo}/actions/runs/1/jobs`]);
 });
 for (const app of [{ id: 1, slug: 'github-actions' }, { id: 15368, slug: 'foreign' }, undefined]) {
   test(`another app newer success ignored: ${JSON.stringify(app)}`, async () => {
-    assert.equal((await verdict({ runs: [run(1, 'failure'), run(999, 'success', { app })],
+    assert.equal((await verdict({ runs: [run(1, 'failure'), run(999)], suites: { 999: { ...suite(999), app } },
       jobs: { 1: [job('test', 'failure')] } })).state, 'red');
   });
 }
@@ -69,12 +90,13 @@ test('soak-replay-gate uses its own frozen workflow mapping', async () => {
   const paths = [];
   const result = await verdict({ required: ['soak-replay-gate'], fetchJson: async path => {
     paths.push(path);
-    if (path === `/repos/${repo}/actions/workflows/.github/workflows/soak-replay-gate.yml/runs?head_sha=${sha}`)
+    if (path === `/repos/${repo}/actions/workflows/soak-replay-gate.yml/runs?head_sha=${sha}`)
       return { workflow_runs: [run(8)] };
+    if (path === `/repos/${repo}/check-suites/8`) return suite(8);
     assert.equal(path, `/repos/${repo}/actions/runs/8/jobs`);
     return { jobs: [job('soak-replay-gate')] };
   } });
-  assert.equal(result.state, 'green'); assert.equal(paths.length, 2);
+  assert.equal(result.state, 'green'); assert.equal(paths.length, 3);
 });
 test('unmapped required name is unknown before IO', async () => {
   let calls = 0;

@@ -78,7 +78,7 @@ for (const path of ['README.md', 'scripts/lib/hot-patch.mjs']) {
 }
 test('rename from a non-listed path refuses; diff uses --no-renames', fixture(async f => {
   f.git(['reset', '--hard', f.good]);
-  f.git(['rm', f.path]); f.git(['mv', 'README.md', f.path]);
+  f.git(['rm', f.path]); mkdirSync(join(f.root, dirname(f.path)), { recursive: true }); f.git(['mv', 'README.md', f.path]);
   f.git(['commit', '-qam', 'rename']);
   const sha = f.git(['rev-parse', 'HEAD']);
   await refused({ ...f.request, sha, ghJson: async () => ({ state: 'OPEN', headRefOid: sha, headRefName: 'lane/repair' }) });
