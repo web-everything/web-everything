@@ -32,6 +32,7 @@ import {
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
+import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
@@ -133,6 +134,10 @@ function makeFixture() {
 
 function passSmoke() {
   return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+}
+
+function writeFixtureOverlays(root, overlays, options) {
+  writeOverlays(root, overlays.map(o => ({ addedAt: '2026-10-05T00:00:00Z', addedBy: null, reason: null, ...o })), options);
 }
 
 function conflictFixture({ replay = false } = {}) {
@@ -369,7 +374,7 @@ describe('overlay conflict resolution', () => {
       gitOk(f.cloneDir, ['fetch', '-q', 'origin']); // the "previous run" left a cached edge ref behind
       const list = f.overlays.map((o) => (o.ref === 'lane/b'
         ? { ...o, edgeResolution: { sha: edgeSha, by: 'operator', at: '2026-10-05T00:00:00Z' } } : o));
-      writeOverlays(f.cloneDir, list, { env: f.env });
+      writeFixtureOverlays(f.cloneDir, list, { env: f.env });
       return edgeSha;
     };
     const failing = (match) => vi.fn((args, opts) => (match(args)
@@ -394,7 +399,7 @@ describe('overlay conflict resolution', () => {
       const f = conflictFixture();
       seeded(f);
       const other = 'c'.repeat(40);
-      writeOverlays(f.cloneDir, f.overlays.map((o) => (o.ref === 'lane/b'
+      writeFixtureOverlays(f.cloneDir, f.overlays.map((o) => (o.ref === 'lane/b'
         ? { ...o, edgeResolution: { sha: other, by: 'operator' } } : o)), { env: f.env });
       const run = vi.fn(gitRun);
       const result = await rebuildClone({
@@ -421,7 +426,7 @@ describe('overlay conflict resolution', () => {
       const f = conflictFixture();
       pushBranch(f.originDir, 'edge/lane/b', (dir) => writeFile(dir, 'edge-only.txt', 'x\n'));
       gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
-      writeOverlays(f.cloneDir, [{ ref: 'lane/b', pr: 2 }, { ref: 'edge/lane/b', pr: 3 }], { env: f.env });
+      writeFixtureOverlays(f.cloneDir, [{ ref: 'lane/b', pr: 2 }, { ref: 'edge/lane/b', pr: 3 }], { env: f.env });
       const result = await rebuildClone({
         root: f.cloneDir, env: f.env, run: vi.fn(gitRun), runSmoke: passSmoke(), prState: () => null, lockOpts: LOCK_OPTS,
       });
@@ -914,7 +919,7 @@ describe('rebuildClone', () => {
 
   // Advisory 2026-09-25 (PR #2625): a corrupt overlay file read as "no overlays", so the next rebuild silently
   // built main alone and dropped every registered fix, with no alert anywhere.
-  it('a corrupt overlay-state file refuses the rebuild with an alert, never builds main alone', async () => {
+  it('a corrupt overlay-state file refuses as state-unreadable with a visible log, never builds main alone', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     pushBranch(originDir, 'lane/kept', (dir) => writeFile(dir, 'kept.txt', 'x\n'));
     addOverlay(cloneDir, { ref: 'lane/kept' }, { env });
@@ -925,11 +930,12 @@ describe('rebuildClone', () => {
     writeFileSync(overlayFilePath(cloneDir, env), '{ not json');
 
     const runSmoke = passSmoke();
-    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    const log = { error: vi.fn() };
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, log });
 
     expect(result.moved).toBe(false);
-    expect(result.reason).toBe('overlay-state-corrupt');
-    expect(result.alerts.some((a) => a.kind === 'overlay-state-corrupt')).toBe(true);
+    expect(result.reason).toBe('state-unreadable');
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('state-unreadable'));
     expect(runSmoke).not.toHaveBeenCalled();
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(headBefore);
     expect(existsSync(join(cloneDir, 'kept.txt'))).toBe(true);
@@ -1014,7 +1020,7 @@ describe('rebuildClone', () => {
   function seedQuarantine(cloneDir, env, prevHead) {
     const file = rebuildStatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ quarantine: { prevHead, reason: 'smoke-code-rollback-failed' } }));
+    writeRebuildState(cloneDir, { quarantine: { prevHead, reason: 'smoke-code-rollback-failed' } }, env);
   }
 
   it('recovers from quarantine even when a harmless untracked file sits in the tree', async () => {
@@ -1072,7 +1078,10 @@ describe('rebuildClone', () => {
   function seedInProgress(cloneDir, env, inProgress) {
     const file = rebuildStatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ inProgress }));
+    inProgress.inputsKey ??= 'seeded-inputs';
+    inProgress.mainSha ??= inProgress.target;
+    inProgress.applied ??= [];
+    writeRebuildState(cloneDir, { inProgress }, env);
   }
   /** A pid on this host that has certainly exited (the child is reaped before spawnSync returns). */
   function deadPid() {
@@ -1143,16 +1152,15 @@ describe('rebuildClone', () => {
   // smoked is on disk — it must be rolled back and re-smoked off-lock, never promoted straight to adopted.
   function crashAfterLegacyReset(cloneDir, env, { asUnverified = false } = {}) {
     const { target, prevHead } = crashAfterReset(cloneDir, env);
-    const file = rebuildStatePath(cloneDir, env);
-    const legacy = asUnverified
-      ? { unverified: { head: target, prevHead } }
-      : { inProgress: { pid: deadPid(), host: hostname(), prevHead, target, startedAt: new Date().toISOString() } };
-    writeFileSync(file, JSON.stringify(legacy));
+    if (asUnverified) writeRebuildState(cloneDir, { unverified: { head: target, prevHead } }, env);
+    else seedInProgress(cloneDir, env, { pid: deadPid(), host: hostname(), prevHead, target,
+      startedAt: new Date().toISOString() });
+    if (!asUnverified) expect(readRebuildState(cloneDir, env).inProgress).not.toHaveProperty('verified');
     return { target, prevHead };
   }
 
   it.each([
-    ['a legacy inProgress record (no verified marker)', false],
+    ['a legacy inProgress record without verified', false],
     ['a legacy state.unverified record', true],
   ])('%s at HEAD is never promoted unsmoked — a failing smoke leaves the clone back on prevHead', async (_label, asUnverified) => {
     const { cloneDir, env } = makeFixture();
@@ -1173,7 +1181,7 @@ describe('rebuildClone', () => {
   });
 
   it.each([
-    ['a legacy inProgress record (no verified marker)', false],
+    ['a legacy inProgress record without verified', false],
     ['a legacy state.unverified record', true],
   ])('%s at HEAD is re-smoked, then adopted once the smoke passes', async (_label, asUnverified) => {
     const { cloneDir, env } = makeFixture();
@@ -1260,7 +1268,10 @@ describe('rebuildClone', () => {
   function seedBuilding(cloneDir, env, building) {
     const file = rebuildStatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ building }));
+    building.target ??= gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    building.inputsKey ??= 'seeded-inputs';
+    building.startedAt ??= new Date().toISOString();
+    writeRebuildState(cloneDir, { building }, env);
   }
 
   it('a live sibling build lease makes a second rebuild yield rebuild-in-progress — no candidate, no smoke', async () => {

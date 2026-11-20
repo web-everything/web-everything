@@ -5222,16 +5222,16 @@ Early admission and timed recovery use `readRebuildStateStrict`: only ENOENT is 
 The declared schema requires every top-level slot, with explicit null for an unused slot.
 For present records the admission inventory is: adopted head/inputsKey/mainSha/applied/at;
 inProgress pid/host/startedAt/prevHead/target/inputsKey/mainSha/applied/verified; quarantine
-prevHead/reason; unverified head/prevHead; building token/pid/host/startedAt/target/inputsKey/path/adoptOnly;
-held reason/since/updatedAt/retryAt/attempts; rejected inputsKey/reason/at/retryAt/attempts and
-harnessBroken/externalOnly/envLoad/dispatchSmoke booleans. retryAt may be null for a sticky
-rejection or a non-timeout hold; timeout holds and transient rejection flags require a date.
+prevHead/reason; unverified head/prevHead; building token/pid/host/startedAt/target/inputsKey/path (adoptOnly is optional);
+held reason/since/updatedAt; rejected inputsKey/reason/at. Backoff retryAt/attempts and
+harnessBroken/externalOnly/envLoad/dispatchSmoke booleans are typed when present. retryAt may be null;
+transient rejection flags require a date. Legacy env-timeout holds may omit retryAt.
 busySkippedTrees/forceUnverifiedTrees contain strings; smokePassed entries require key/tree/passedAt;
 pinnedNotified is a string-valued map. Applied entries require ref/sha and a nonempty string for any pinnedFrom.
 Strict ready pins require sha and pinnedFrom to be distinct full 40-hex SHAs. Strict ready pins also prove the registered ref/PR,
 exact held remote tip, and latest rebuild-authored second-parent adopted SHA on
 the running head. Malformed or unproven pins refuse as `state-unreadable`;
-operator repair is required. Tick-start keeps the legacy pin exemption.
+operator repair is required. Every provenance, including tick-start, requires that exact pinnedFrom SHA to be accepted for the ref by the audit gate; the pin-proof option cannot downgrade validation.
 Ready records require prevHead/tree/passedAt/kind/forced and adopt.finalSha/inputsKey/mainSha/applied.
 Fallbacks also require forInputsKey/dropRefs/failed, with ref/sha/pr on each drop (pr may be null).
 Optional diagnostic ready metadata remains typed when present.
@@ -5239,8 +5239,8 @@ Optional diagnostic ready metadata remains typed when present.
 The job fixture injects EACCES/EIO and corrupt JSON, and a recursive table deletes and mistypes
 every required field, asserting refusal, untouched bytes and no job. Historical incomplete files
 are deliberately refused until operator repair; the legacy reader retains its compatibility behavior
-for ordinary tick consumers. Producers write explicit policy defaults rather than admission
-inventing them. The pre-lock strict state read is an early refusal filter only. Launch-only
+for consumers outside a rebuild scope. Producers preserve legitimate legacy field absence rather than admission
+inventing defaults. The pre-lock strict state read is an early refusal filter only. Launch-only
 preparation re-reads and validates state under the clone write lock, using that locked snapshot
 for every check; an unreadable locked read refuses as `state-unreadable`.
 The ready snapshot still passes through `admissionEvidence`; missing handoff refuses.
@@ -5288,10 +5288,10 @@ timeout and a later passing smoke on unchanged inputs; the soak fixture checks q
 
 Early watcher jobs carry `early`; both timed env-timeout retries and overdue-registration
 recovery jobs carry `recovery`. Only the ordinary tick-start launch carries `tick-start`.
-`createRebuildReaders` derives one strict policy from that provenance at `rebuildClone` entry.
+`rebuildClone` installs the same strict evidence policy for every provenance, including tick-start and inline rebuilds.
 Its async scope covers indirect legacy consumers as well as prepare, smoke, lease renewal,
 cleanup and ready publication. Keep evidence entry points connected to this scope when adding
-readers; do not add a child-specific permissive fallback. Tick-start installs no policy.
+readers; do not add a child-specific permissive fallback. Only ENOENT means empty, including after queue admission and after waiting for the preparation lock.
 The build lease lives in the strictly validated rebuild state. Ready, pending adoptions,
 overlay registry/events, starvation, force request/watch, conflict wakes and pending drops
 also refuse malformed or unreadable evidence; only ENOENT is absent. Writes revalidate evidence
@@ -5300,8 +5300,7 @@ before replacing or deleting it. Refusal requires operator repair of the persist
 and corrupt JSON, EACCES and wrong shapes, at entry and after waiting for the write lock,
 asserting unchanged bytes. It also pins indirect legacy-reader inheritance and late ready
 corruption before publication/cleanup. The recovery suite pins both recovery launch origins
-and successful strict-child smoke/ready publication. Existing real CLI child probes retain
-legacy tick-start behavior and prove early/recovery entry refusal before Git IO.
+and successful strict-child smoke/ready publication. Real CLI child probes prove entry refusal before Git IO for every launch provenance.
 
 
 Strict early/recovery preparation defers these mutators to tick-start: index-lock
@@ -5319,3 +5318,53 @@ an abandoned lease's candidate worktree. The actionable-swap
 fixture asserts registry, event and swap bytes survive launch plus child prepare,
 with only the child's build lease changing in rebuild state, and proves the same
 swap removes the original registration when ordinary cleanup is called.
+
+
+### Tick-start pin and evidence security
+
+`daemon-rebuild/__tests__/pin-provenance.test.mjs` checks the exact per-ref audit gate
+membership of pinnedFrom, lowercase 40-hex syntax, revoked and other-ref evidence,
+and unconditional ready pin history proof. Never replace the gate with a truthy or
+format-only pin check. Tick-start uses the same strict readers as early/recovery;
+`evidence-readers.test.mjs` tables child and inline entry/locked refusal for malformed,
+wrong-type, wrong-shape and EACCES evidence, preserving pending notifications and bytes.
+Legacy records may omit backoff fields, env-timeout retryAt and lease adoptOnly.
+Force-watch health checks and owed rollback still run outside between-tick launches
+when unrelated admission evidence refuses. That bounded watch scope validates its
+own rebuild state, ready and watch evidence; it must never fall back to empty evidence
+or erase corrupt state while attempting rollback. Launch ownership and strict evidence
+are separate concerns: keep isBetweenTickLaunch and the once-per-tick watch tests.
+
+
+### Persisted rebuild producer compatibility
+
+Strict rebuild schemas must accept the records production writers leave on disk, without
+adding plan evidence. A force watch can store only `lastGood.head`; its rollback through
+`finalizeRebuild` writes swap/adopted records without `inputsKey` or `mainSha`. Interrupted
+recovery can promote those unknown adopted plan keys as null. Pre-fix swap records omit
+`verified`; recovery treats that absence as unsmoked and rolls back before rebuilding.
+Keep those fields typed when present and keep head/swap identity, timestamps and applied
+evidence mandatory. Production holds always write `since` and `updatedAt`: complete a
+hand-written fixture missing them instead of making the validator permissive.
+`rebuild-job.test.mjs` covers producer-shaped round trips and wrong types;
+`daemon-rebuild.test.mjs` proves absent-verification rollback with real Git;
+`daemon-rebuild-force-adopt.test.mjs` proves head-only force-watch rollback.
+
+Simulator runtime snapshots must also carry `.githooks/pre-commit` with its executable
+mode: real lane provisioning verifies the tracked, runnable guard before handing out a
+lane. The rebuild soak scenarios exercise this prerequisite through actual provisioning.
+For real-process teardown assertions, signal-zero ESRCH proves the descendant was reaped;
+other results still require the process-state check so live or unreadable processes never
+count as stopped.
+Cold imports of whole daemon module graphs belong in bounded suite setup (`beforeAll`),
+so the skipped-tick assertion retains its own deadline under a busy runner.
+
+Ready-candidate discard escalation writes an aggregate overlay event with `need`,
+`target`, `reason` and `refs` (possibly empty), rather than a single `ref`. Exercise
+`reportDiscardedCandidate` and `appendOverlayEvent` together when validating that shape;
+missing or wrongly typed identity/audit fields still refuse without changing bytes.
+Pin validation also runs after the verified reset, before adopted-state writes and ready
+cleanup. At that point HEAD may equal the exact ready target: require a matching durable
+verified swap or adopted record, then retain every registration, history and exact audit
+check. `pin-provenance.test.mjs` covers both transitions and missing, corrupt, mismatched
+and revoked evidence; real overlay-pin integration cases exercise the writer sequence.

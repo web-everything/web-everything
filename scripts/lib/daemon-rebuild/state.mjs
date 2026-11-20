@@ -1,6 +1,7 @@
 /** @file scripts/lib/daemon-rebuild/state.mjs — Per-clone state files.
  * Split out of daemon-rebuild.mjs (move-only).
  */
+import { makeAuditedTipGate } from './audited-tip.mjs';
 import { rebuildReaders } from './evidence-context.mjs';
 
 
@@ -98,9 +99,14 @@ export const rebuildStateSchema = {
   rejected: v => fields(v, { inputsKey: string, reason: string, at: date }, { ...backoff,
     harnessBroken: boolean, externalOnly: boolean, envLoad: boolean, dispatchSmoke: boolean })
     && (!(v.harnessBroken || v.externalOnly || v.envLoad) || date(v.retryAt)),
-  adopted: v => fields(v, { head: string, inputsKey: string, applied, mainSha: string, at: date }),
+  // A force watch can hold only lastGood.head. Its rollback writes no plan keys;
+  // interrupted recovery explicitly writes null for those same unknown keys.
+  // Keep the head, timestamp and applied evidence mandatory, without inventing a plan.
+  adopted: v => fields(v, { head: string, applied, at: date }, { inputsKey: nullable(string), mainSha: nullable(string) }),
+  // Pre-smoke-before-reset records lack verified: recovery must roll them back,
+  // rather than refusing the evidence before it can inspect that absent marker.
   inProgress: v => fields(v, { pid: positive, host: string, startedAt: date, prevHead: string, target: string,
-    inputsKey: string, mainSha: string, applied, verified: boolean }),
+    applied }, { inputsKey: string, mainSha: string, verified: boolean }),
   quarantine: v => fields(v, { prevHead: string, reason: string }),
   unverified: v => fields(v, { head: string, prevHead: string }),
   // `adoptOnly` is written only for adopt-only leases (legacy shape); absent means a real-job lease.
@@ -187,13 +193,13 @@ export function readReadyCandidate(root, env = process.env) {
 }
 
 /** Admission must distinguish absent ready evidence from unreadable or incomplete evidence. */
-export function readReadyCandidateStrict(root, env = process.env, read = readFileSync, { strictPins = true, run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...opts }) } = {}) {
+export function readReadyCandidateStrict(root, env = process.env, read = readFileSync, { run = (args, opts) => spawnSync('git', args, { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], ...opts }) } = {}) {
   let text;
   try { text = read(readyCandidatePath(root, env), 'utf8'); }
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   const r = JSON.parse(text);
   if (!fields(r, { prevHead: string, tree: string, passedAt: date, kind: v => ['candidate', 'fallback'].includes(v),
-    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: strictPins ? pinnedApplied : appliedShape }) }, {
+    forced: boolean, adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: pinnedApplied }) }, {
     at: date, token: string, pid: positive, host: string, forInputsKey: string,
     dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
       { ref: string, sha: string, pr: v => v === null || positive(v) })),
@@ -208,15 +214,34 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   // pinnedFrom bypasses audit revocation. Prove the same registration and adopted
   // second parent used by planRebuild, plus the exact branch tip being held back.
   const pins = r.adopt.applied.filter(a => Object.hasOwn(a, 'pinnedFrom'));
-  if (strictPins && pins.length) {
+  if (pins.length) {
     if (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha)) throw new Error('Invalid ready pin history bounds');
     const registry = JSON.parse(read(overlayFilePath(root, env), 'utf8'));
     const git = args => run(args, { cwd: root, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' },
       encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, killSignal: 'SIGKILL' });
-    if (verifyRev(git, 'HEAD') !== r.prevHead) throw new Error('Unproven ready pin head');
+    const head = verifyRev(git, 'HEAD');
+    if (head !== r.prevHead) {
+      // finalizeRebuild persists its verified swap before resetting HEAD, then
+      // writes adopted state and clears ready. Revalidation also runs between
+      // those writes: the exact target may already be HEAD. Require the durable
+      // transaction/adoption to corroborate the ready plan; an arbitrary moved
+      // head or a ready record alone never establishes this transition.
+      if (head !== r.adopt.finalSha || !FULL_SHA_RE.test(head)) throw new Error('Unproven ready pin head');
+      const state = readRebuildStateStrict(root, env, read);
+      const samePlan = v => v?.inputsKey === r.adopt.inputsKey && v?.mainSha === r.adopt.mainSha
+        && JSON.stringify(v?.applied) === JSON.stringify(r.adopt.applied);
+      const swapping = state.inProgress?.verified === true && state.inProgress.prevHead === r.prevHead
+        && state.inProgress.target === head && samePlan(state.inProgress);
+      const adopted = state.adopted?.head === head && samePlan(state.adopted);
+      if (!swapping && !adopted) throw new Error('Unproven ready pin transition');
+    }
     const history = git(['log', '--first-parent', '--format=%P%x09%ce%x09%s', r.prevHead, '--not', r.adopt.mainSha]);
     if (history.status !== 0) throw new Error('Unreadable ready pin history');
+    const auditedTip = makeAuditedTipGate(env);
     for (const pin of pins) {
+      // Follow mode disables audit revocation for every tip; it uses no pin exemption.
+      // With auditing enabled, exact ref/SHA acceptance is mandatory in addition to history.
+      if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.pinnedFrom) !== true) throw new Error('Unaudited ready pin');
       const registration = registry.overlays?.find(o => o.ref === pin.ref);
       if (!registration || (registration.pr ?? null) !== (pin.pr ?? null)
         || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new Error('Unproven ready pin registration');

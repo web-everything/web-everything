@@ -3,7 +3,7 @@
  * design notes it refers to as "the file header" are the header of `scripts/lib/daemon-rebuild.mjs`.
  */
 import { createRebuildReaders, RebuildEvidenceError } from './evidence-readers.mjs';
-import { rebuildReaders, withRebuildReaders } from './evidence-context.mjs';
+import { withRebuildReaders } from './evidence-context.mjs';
 
 
 import { resolveRecovery } from './recovery.mjs';
@@ -112,25 +112,29 @@ function isBetweenTickLaunch(options) {
  * @returns {Promise<object>} Legacy result shape, with phase waits in a non-enumerable `timing` record.
  */
 export async function rebuildClone({ emitEvent = appendDaemonEvent, ...options } = {}) {
-  const strict = options.launchedBy === 'early' || options.launchedBy === 'recovery';
-  if (!strict) return rebuildCloneWithReaders(emitEvent, options, false);
   // Between-tick launches leave force-watch checks and rollback to the next tick.
-  const readers = createRebuildReaders({ strict, read: options.evidenceRead });
+  const readers = createRebuildReaders({ strict: true, read: options.evidenceRead });
   return withRebuildReaders(readers, async () => {
     const startedAtMs = Date.now();
     try {
-      if (readers) readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
-      return await rebuildCloneWithReaders(emitEvent, options, strict);
+      readers.validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
+      return await rebuildCloneWithReaders(emitEvent, options);
     } catch (error) {
       if (!(error instanceof RebuildEvidenceError)) throw error;
       (options.log ?? console).error?.(error.message);
-      if (!isBetweenTickLaunch(options)) await forceWatch(options, emitEvent, startedAtMs);
+      if (!isBetweenTickLaunch(options)) {
+        try { await forceWatch(options, emitEvent, startedAtMs); }
+        catch (watchError) {
+          if (!(watchError instanceof RebuildEvidenceError)) throw watchError;
+          (options.log ?? console).error?.(watchError.message);
+        }
+      }
       return { moved: false, reason: 'state-unreadable' };
     }
   });
 }
 
-async function rebuildCloneWithReaders(emitEvent, options, strict) {
+async function rebuildCloneWithReaders(emitEvent, options) {
   const startedAtMs = Date.now();
   const result = await rebuildCloneInternal(options);
   const { waitInFlightTickMs, waitSmokeSlotMs } = result;
@@ -146,7 +150,7 @@ async function rebuildCloneWithReaders(emitEvent, options, strict) {
   if (result.reason === 'state-unreadable') {
     (options.log ?? console).error?.('daemon-rebuild: state-unreadable; repair persisted evidence before retrying; pending adoptions left unchanged');
   }
-  if ((strict && isBetweenTickLaunch(options)) || (!options.adoptOnly && isBetweenTickLaunch(options) && !result.moved && !result.adopted)) return result;
+  if (isBetweenTickLaunch(options)) return result;
   try {
     const eventOptions = { env: { WE_DAEMON_EVENTS: process.env.WE_DAEMON_EVENTS, ...options.env } };
     // adopted also describes a sibling's completed swap or crash recovery.
@@ -169,16 +173,25 @@ async function rebuildCloneWithReaders(emitEvent, options, strict) {
       emit: (event) => emitEvent(event, eventOptions),
     });
   } catch { /* Event failures must never change the rebuild outcome. */ }
-  if (!(strict && isBetweenTickLaunch(options))) await forceWatch(options, emitEvent, startedAtMs);
+  await forceWatch(options, emitEvent, startedAtMs);
   return result;
 }
 
 /** R508: after an operator force-adopt, each daemon tick checks the new build's health for N ticks and reverts the
- *  clone to the last-good build on a failed check or a crash loop. Never throws; readyOnly and between-tick launches skip it. */
+ *  clone to the last-good build on a failed check or a crash loop. Evidence errors refuse the rebuild;
+ *  readyOnly and between-tick launches skip it. */
 async function forceWatch(options, emitEvent, startedAtMs) {
-  // Watch rollback follows tick-start policy: unrelated strict admission evidence must
-  // not prevent ready cleanup or persistence of an already-owed rollback.
-  return withRebuildReaders(undefined, () => forceWatchAtTick(options, emitEvent, startedAtMs));
+  // Health checks and owed rollback still run when unrelated admission evidence
+  // refuses. Their own state, ready and watch evidence must remain strict.
+  if (!options.root || options.readyOnly || isBetweenTickLaunch(options)) return;
+  const readers = createRebuildReaders({ strict: true, read: options.evidenceRead });
+  const validate = (root, env) => {
+    readers.state(root, env); readers.ready(root, env); readers.forceWatch(root, env);
+  };
+  return withRebuildReaders({ ...readers, validate }, () => {
+    validate(options.root, { ...(options.env ?? process.env), ...options.stateOpts?.env });
+    return forceWatchAtTick(options, emitEvent, startedAtMs);
+  });
 }
 
 async function forceWatchAtTick(options, emitEvent, startedAtMs) {
@@ -211,7 +224,10 @@ async function forceWatchAtTick(options, emitEvent, startedAtMs) {
         return fin.value;
       },
     });
-  } catch { /* a watch failure never changes the rebuild outcome */ }
+  } catch (error) {
+    if (error instanceof RebuildEvidenceError) throw error;
+    // A health probe failure retains the existing watch retry policy.
+  }
 }
 
 /** Default health probe: the clone's tracked tree is intact and its entry module still loads. A crash-loop signal
@@ -331,10 +347,10 @@ async function rebuildCloneInternal({
 
   if (prep.ok) {
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
-    if (!rebuildReaders() && starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
+    if (launchedBy !== 'early' && launchedBy !== 'recovery' && starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
       writeRebuildStarvation(root, 0, stEnv);
     }
-  } else if (!rebuildReaders() && prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
+  } else if (launchedBy !== 'early' && launchedBy !== 'recovery' && prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);

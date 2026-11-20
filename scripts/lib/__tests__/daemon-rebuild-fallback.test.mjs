@@ -8,6 +8,7 @@
  *   `daemon-rebuild.test.mjs` (real temp git fixtures, injected `runSmoke` stubs) — the helpers below are
  *   copied from that file rather than imported, per this card's instructions.
  */
+import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import {
   describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
@@ -549,7 +550,8 @@ describe('single-flight build lease across the fallback (x5wbsbc on #2731)', () 
     const file = rebuildStatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
     const cur = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
-    writeFileSync(file, JSON.stringify({ ...cur, building }));
+    writeRebuildState(cloneDir, { ...cur, building: { target: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(),
+      inputsKey: 'seeded-inputs', ...building } }, env);
   };
 
   it('a live sibling lease returns rebuild-in-progress without smoking', async () => {

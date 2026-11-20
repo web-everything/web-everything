@@ -229,7 +229,8 @@ describe('rebuildClone coordination events', () => {
     expect(options.emitEvent).not.toHaveBeenCalled();
 
     writeRebuildState(options.root, {
-      inProgress: { target: sha, prevHead, verified: true, startedAt: '2000-01-01T00:00:00Z' },
+      inProgress: { pid: process.pid, host: 'fixture-host', target: sha, prevHead, verified: true,
+        startedAt: '2000-01-01T00:00:00Z', inputsKey: 'contract', mainSha: sha, applied: [] },
     }, options.env);
     const real = await vi.importActual('../daemon-rebuild/prepare.mjs');
     const recovered = await real.prepareRebuild({

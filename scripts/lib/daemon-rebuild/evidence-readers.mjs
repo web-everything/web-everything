@@ -1,6 +1,6 @@
-/** One policy for all evidence reads made by an early/recovery rebuild child.
+/** One strict policy for evidence reads in every rebuild launch.
  * Legacy entry points consult the async scope too, so adding an indirect caller cannot
- * silently downgrade the child. No scope is installed for tick-start compatibility.
+ * silently downgrade tick-start children or inline rebuilds.
  */
 import { readFileSync } from 'node:fs';
 import { readRebuildStateStrict, readReadyCandidateStrict } from './state.mjs';
@@ -13,7 +13,7 @@ import { daemonStateDir } from '../daemon-last-good.mjs';
 import { join } from 'node:path';
 
 export class RebuildEvidenceError extends Error {
-  constructor(cause) { super('state-unreadable: repair persisted rebuild evidence before retrying', { cause }); }
+  constructor(cause) { super('state-unreadable: repair persisted evidence before retrying', { cause }); }
 }
 export function createRebuildReaders({ strict = false, read = readFileSync } = {}) {
   if (!strict) return undefined;
@@ -76,12 +76,20 @@ export function createRebuildReaders({ strict = false, read = readFileSync } = {
       return { ...r, corrupt: false };
     }),
     overlayEvents: checked((root, env) => {
-      let text;
-      try { text = read(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8'); }
+      let source;
+      try { source = read(overlayFilePath(root, env).replace(/\.json$/, '.events.jsonl'), 'utf8'); }
       catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-      return text.split('\n').filter(line => line.trim()).map(line => {
+      return source.split('\n').filter(line => line.trim()).map(line => {
         const r = JSON.parse(line);
-        if (!r || typeof r !== 'object' || Array.isArray(r) || typeof r.ref !== 'string' || typeof r.kind !== 'string') {
+        // prepareRebuild/reportDiscardedCandidate emits one aggregate notice,
+        // including when an overlay-free candidate has refs: []. It names a
+        // target and reason instead of a single ref; keep that evidence typed.
+        const discard = object(r) && r.kind === 'needs-you' && r.need === 'ready-candidate-discarded'
+          && date(r.at) && text(r.target) && text(r.reason)
+          && Array.isArray(r.refs) && r.refs.every(text);
+        if (!object(r) || typeof r.kind !== 'string'
+          || (Object.hasOwn(r, 'ref') ? typeof r.ref !== 'string' : !discard)
+          || (r.kind === 'needs-you' && r.need === 'ready-candidate-discarded' && !discard)) {
           throw new Error('Invalid overlay event');
         }
         return r;

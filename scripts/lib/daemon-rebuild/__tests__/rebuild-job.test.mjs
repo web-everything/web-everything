@@ -1,12 +1,14 @@
 /** Rebuild herd spacing: stable identity, bounded additive jitter, and historical settings. */
+import { createRebuildReaders } from '../evidence-readers.mjs';
+import { watchPath } from '../../daemon-force-adopt.mjs';
 import { withRebuildReaders } from '../evidence-context.mjs';
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import nodeFs, { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { loadRebuildAsJobSettings, rebuildJobInterval, rebuildCloneAsJob, REBUILD_JOB_KIND } from '../rebuild-job.mjs';
 import { createJobStore, enqueueJob } from '../../daemon-jobs-runtime.mjs';
 import { writeReadyCandidate, readReadyCandidate, writeRebuildState, readRebuildState, readRebuildStateStrict, rebuildStatePath, readyCandidatePath, readReadyCandidateStrict } from '../state.mjs';
@@ -495,6 +497,8 @@ const requiredCases = [
     (path[0] === 'pinnedNotified' && path.length > 1)
     || (path[0] === 'rejected' && ['retryAt', 'attempts', 'harnessBroken', 'externalOnly', 'envLoad', 'dispatchSmoke'].includes(path[1]))
     || (path[0] === 'held' && ['retryAt', 'attempts'].includes(path[1])) // legacy env-timeout holds have no retryAt
+    || (['adopted', 'inProgress'].includes(path[0]) && ['inputsKey', 'mainSha'].includes(path[1])) // head-only force rollback has no plan keys
+    || (path[0] === 'inProgress' && path[1] === 'verified') // pre-smoke-before-reset records omit the marker
     || (path[0] === 'building' && path[1] === 'adoptOnly')); // legacy lease shape: written only for adopt-only leases
   return (optional ? ['wrong-type'] : ['missing', 'wrong-type']).map(mode => [kind, path.join('.'), mode]);
 });
@@ -534,6 +538,14 @@ it.each([
   ['rejected', { inputsKey: 'inputs', reason: 'failed', at: stamp }],
   ['held', { reason: 'smoke-rejected', since: stamp, updatedAt: stamp }],
   ['held', { reason: 'established-overlay-conflict', since: stamp, updatedAt: stamp }],
+  // finalizeRebuild during a head-only force-watch rollback has no original plan.
+  ['adopted', { head: 'last-good', applied: [], at: stamp }],
+  ['inProgress', { pid: 1, host: 'host', startedAt: stamp, prevHead: 'forced', target: 'last-good', applied: [], verified: true }],
+  // prepareRebuild promotes interrupted swaps with unknown plan keys as null.
+  ['adopted', { head: 'last-good', inputsKey: null, mainSha: null, applied: [], at: stamp }],
+  // Pre-fix swaps had no smoke verification marker: recovery must roll them back.
+  ['inProgress', { pid: 1, host: 'host', startedAt: stamp, prevHead: 'head', target: 'target',
+    inputsKey: 'inputs', mainSha: 'main', applied: [] }],
 ])('legacy %s records persist and pass strict admission without adding defaults: %j', (key, record) => {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
   writeRebuildState(root, { [key]: record }, env);
@@ -655,17 +667,36 @@ it('lost launch-only snapshot handoff refuses before any legacy read or Git IO',
 });
 
 it.each(['early', 'recovery', 'tick-start', 'unknown', undefined].flatMap(source =>
-  ['corrupt', 'EACCES'].map(failure => [source, failure])))(
-  'detached %s child re-reads %s evidence under its own lock after admission without changing bytes', (launchedBy, failure) => {
+  ['state', 'ready', 'pending', 'lease', 'forceWatch'].flatMap(reader =>
+    ['corrupt', 'EACCES', 'wrong type', 'wrong shape'].map(failure => [source, reader, failure]))))(
+  'detached %s child re-reads %s/%s after queue admission without changing bytes', async (launchedBy, reader, failure) => {
     const env = { ...process.env, WE_DAEMON_STATE_DIR: join(root, 'state'),
       WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'), WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
       WE_DAEMON_EVENTS: join(root, 'events.jsonl'), WE_DAEMON_AUTO_REBASE: '0', WE_OVERLAY_STALE: '0' };
     execFileSync('git', ['init', '-q', '-b', 'child-fixture', root], { timeout: 5000, maxBuffer: 65536 });
     writeRebuildState(root, {}, env);
-    expect(readRebuildStateStrict(root, env)).toMatchObject({ rejected: null }); // queue admission succeeded
-    const file = rebuildStatePath(root, env);
-    if (failure === 'corrupt') writeFileSync(file, '{corrupted-after-admission');
+    const readers = createRebuildReaders({ strict: true });
+    readers.validate(root, env);
+    const store = createJobStore(join(root, 'jobs'));
+    const admitted = await rebuildCloneAsJob({ root, env, store, launchedBy, codeSha: 'a'.repeat(40),
+      adopt: async () => ({ moved: false, reason: 'needs-build', plan: { finalSha: 'b'.repeat(40) } }),
+      reattach: async () => ({}), evict: () => ({}), log: { error() {} } });
+    expect(admitted.reason).toBe('rebuild-job-started');
+    expect(store.list().records).toHaveLength(1);
+    const file = ({ ready: readyCandidatePath, pending: pendingAdoptionPath, forceWatch: watchPath }[reader] ?? rebuildStatePath)(root, env);
+    mkdirSync(dirname(file), { recursive: true });
+    const valid = reader === 'ready' ? { prevHead: 'head', tree: 'tree', passedAt: stamp, kind: 'candidate', forced: false,
+      adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [] } }
+      : reader === 'pending' ? [] : reader === 'forceWatch' ? { daemon: 'test', ruling: 'R1', sha: 'a'.repeat(40),
+        startedAt: stamp, ticksLeft: 1, bad: 0, lastGood: null } : readRebuildStateStrict(root, env);
+    const bytesToWrite = failure === 'corrupt' ? '{corrupted-after-admission' : failure === 'wrong type' ? 'false'
+      : failure === 'wrong shape' ? JSON.stringify(reader === 'lease' ? { ...valid, building: { token: 'incomplete' } } : {})
+        : JSON.stringify(valid);
+    writeFileSync(file, bytesToWrite);
     const bytes = readFileSync(file);
+    const evidenceFiles = [rebuildStatePath, readyCandidatePath, pendingAdoptionPath, watchPath].map(path => path(root, env));
+    const snapshot = () => evidenceFiles.map(path => nodeFs.existsSync(path) ? readFileSync(path, 'utf8') : null);
+    const before = snapshot();
     const observed = join(root, 'locked-reads.jsonl');
     // Inject EACCES rather than chmod (privileged runners can read mode-000 files).
     // Observe the actual child read, including the lock it acquired independently.
@@ -689,13 +720,16 @@ it.each(['early', 'recovery', 'tick-start', 'unknown', undefined].flatMap(source
       resolve('scripts/lib/daemon-rebuild.mjs'));
     expect(argv).toEqual([resolve('scripts/lib/daemon-rebuild.mjs'), `--clone=${root}`, '--ready-only', '--json',
       ...(strict ? [`--launched-by=${launchedBy}`] : [])]);
-    const stdout = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, ...argv], {
+    const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, ...argv], {
       env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
-    expect(rebuildJob.parseRebuildChildOutput(stdout)).toMatchObject(strict
-      ? { moved: false, reason: 'state-unreadable' }
-      : { moved: false, reason: 'readonly-job-mutation-due', mutation: 'wrong-branch-heal' });
-    expect(readFileSync(observed, 'utf8')).toBe(strict ? 'false\n' : 'true\n');
+    expect(child.status).toBe(0);
+    expect(child.stderr).toContain('state-unreadable');
+    expect(rebuildJob.parseRebuildChildOutput(child.stdout)).toMatchObject({ moved: false, reason: 'state-unreadable' });
+    expect(snapshot()).toEqual(before);
+    expect(readFileSync(observed, 'utf8')).toBe('false\n');
+    expect(store.list().records).toHaveLength(1);
+    expect(store.list().records[0].job.status).toBe('queued');
     expect(readFileSync(file)).toEqual(bytes);
   });
 

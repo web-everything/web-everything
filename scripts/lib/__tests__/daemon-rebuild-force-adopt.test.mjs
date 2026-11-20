@@ -18,7 +18,7 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason } from '../daemon-force-adopt.mjs';
-import { readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidate, readRebuildStateStrict, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
@@ -223,14 +223,14 @@ describe('R508 force-adopt through rebuildClone', () => {
     expect(existsSync(plainFile) ? readFileSync(plainFile, 'utf8') : '').not.toMatch(/force-adopt-sha-mismatch/);
   });
 
-  it('an old request record with no sha never applies to any build, and does not block the normal ladder', async () => {
+  it('a complete request with a malformed legacy sha never applies to a build or blocks the normal ladder', async () => {
     const run = async (withRecord) => {
       const { base, originDir, cloneDir, env: env0 } = makeFixture();
       const env = { ...forceEnv(env0, base), WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' };
       const lastGood = headOf(cloneDir);
       advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
       const now = Date.now();
-      if (withRecord) writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-adopt.json`), JSON.stringify({ daemon: 'review', ruling: 'R508', quote: QUOTE, requestedAt: new Date(now).toISOString(), expiresAt: new Date(now + 3600_000).toISOString() }));
+      if (withRecord) writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-adopt.json`), JSON.stringify({ daemon: 'review', ruling: 'R508', quote: QUOTE, sha: 'legacy-without-build', requestedAt: new Date(now).toISOString(), expiresAt: new Date(now + 3600_000).toISOString() }));
       const r = await rebuildClone({ root: cloneDir, env, runSmoke: failing(), prState: async () => null, lockOpts: LOCK_OPTS });
       return { r, cloneDir, env, lastGood };
     };
@@ -342,7 +342,7 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     const key = readRebuildState(cloneDir, env).rejected.inputsKey;
     const statePath = rebuildStatePath(cloneDir, env);
     const st = JSON.parse(readFileSync(statePath, 'utf8'));
-    st.held = { reason: 'smoke-harness-broken', since: new Date().toISOString() };
+    st.held = { reason: 'smoke-harness-broken', since: new Date().toISOString(), updatedAt: new Date().toISOString() };
     st.rejected = { inputsKey: key, reason: 'daemon-entries-boot', at: new Date().toISOString(), harnessBroken: true, retryAt: new Date(Date.now() + 3600_000).toISOString() };
     writeFileSync(statePath, JSON.stringify(st));
     const blocked = failing();
@@ -367,7 +367,8 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
 
     const successor = advanceMainEmpty(originDir); // same tree, new sha: `same-tree` would substitute it for the forced build
     const smoke = failing();
-    await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: unhealthy });
+    const result = await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: unhealthy });
+    expect(result.reason).not.toBe('state-unreadable');
     expect(headOf(cloneDir)).not.toBe(successor); // not adopted off the forced record
     expect(headOf(cloneDir)).toBe(lastGood);
     expect(smoke).toHaveBeenCalled(); // the successor got its own fresh smoke instead
@@ -403,8 +404,9 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     block(cloneDir, env);
     arm();
     const smoke = failing();
-    for (let i = 0; i < 2; i += 1) expect((await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy })).reason).toBe('still-rejected');
+    for (let i = 0; i < 2; i += 1) expect((await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy })).reason).toBe('state-unreadable');
     expect(smoke).not.toHaveBeenCalled();
+    expect(readFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKeyOf(cloneDir)}.force-watch.json`), 'utf8')).toBe('{corrupt');
     expect(readForceAdopt(cloneDir, env)).toMatchObject({ sha: target });
     expect(headOf(cloneDir)).toBe(lastGood);
   });
@@ -458,11 +460,13 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true });
     const intact = readFileSync(watchFileOf(cloneDir, env), 'utf8');
     writeFileSync(watchFileOf(cloneDir, env), '{corrupt');
-    const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
-    expect(r.reason).toBe('forced-watch-unreadable');
+    const log = { error: vi.fn() };
+    const r = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy, log });
+    expect(r.reason).toBe('state-unreadable');
     expect(headOf(cloneDir)).toBe(lastGood); // fail closed: never adopted while its watch cannot be read
     expect(readReadyCandidate(cloneDir, env)).toMatchObject({ forced: true }); // kept, not dropped
-    expect(alertsOf(cloneDir, env).some((a) => a.kind === 'forced-watch-unreadable')).toBe(true);
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('state-unreadable'));
+    expect(readFileSync(watchFileOf(cloneDir, env), 'utf8')).toBe('{corrupt');
     expect(alertsOf(cloneDir, env).some((a) => a.kind === 'ready-candidate-discarded')).toBe(false);
     writeFileSync(watchFileOf(cloneDir, env), intact); // the read recovers
     const again = await tick(cloneDir, env, { runSmoke: failing(), forceWatchProbe: healthy });
@@ -470,7 +474,7 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     expect(headOf(cloneDir)).toBe(target);
   });
 
-  describe('a refused force-adopt (a watch is open / unreadable, or a rollback is owed) is a sticky rejection that consumes the request', () => {
+  describe('valid force-adopt blockers consume the request; unreadable evidence holds it untouched', () => {
     const blockers = {
       'watch-already-open': async ({ cloneDir, env, lastGood }) => {
         await recordForcedAdoption({ root: cloneDir, env, request: { daemon: 'review', ruling: 'R508', quote: QUOTE }, sha: 'c'.repeat(40),
@@ -491,6 +495,20 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
       expect(forceBlockedReason(cloneDir, env)).toBe(reason);
       arm();
       const smoke = failing();
+      if (reason === 'watch-unreadable') {
+        const request = readForceAdopt(cloneDir, env);
+        const before = readRebuildState(cloneDir, env);
+        for (let tickCount = 0; tickCount < 2; tickCount++) {
+          expect(await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy }))
+            .toEqual({ moved: false, reason: 'state-unreadable' });
+        }
+        expect(smoke).not.toHaveBeenCalled();
+        expect(headOf(cloneDir)).toBe(lastGood);
+        expect(readForceAdopt(cloneDir, env)).toEqual(request);
+        expect(readRebuildState(cloneDir, env)).toEqual(before);
+        expect(readFileSync(watchFileOf(cloneDir, env), 'utf8')).toBe('{corrupt');
+        return;
+      }
       const r = await tick(cloneDir, env, { runSmoke: smoke, forceWatchProbe: healthy });
       expect(r).toMatchObject({ moved: false, reason: 'force-adopt-refused', detail: reason });
       expect(headOf(cloneDir)).toBe(lastGood);
@@ -792,6 +810,20 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     expect(headOf(cloneDir)).toBe(F); // F is force-adopted
     return { originDir, cloneDir, env, F };
   };
+
+  it('a head-only last-good watch rolls back with the persisted production shape accepted by strict reads', async () => {
+    const { cloneDir, env } = await forceAdoptF();
+    const watch = readForceWatch(cloneDir, env);
+    expect(watch.lastGood).toEqual({ head: expect.any(String) });
+    await tick(cloneDir, env, { runSmoke: passing(), forceWatchProbe: unhealthy });
+    expect(() => readRebuildStateStrict(cloneDir, env)).not.toThrow();
+    expect(headOf(cloneDir)).toBe(watch.lastGood.head);
+    const adopted = readRebuildStateStrict(cloneDir, env).adopted;
+    expect(adopted).toMatchObject({ head: watch.lastGood.head, applied: [], at: expect.any(String) });
+    expect(adopted).not.toHaveProperty('mainSha');
+    expect(adopted).not.toHaveProperty('inputsKey');
+    expect(readForceWatch(cloneDir, env)).toBeNull();
+  });
 
   it.each([
     ['inline early', { launchedBy: 'early', asJob: false }],

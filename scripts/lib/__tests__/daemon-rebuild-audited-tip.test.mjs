@@ -4,6 +4,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { rebuildCloneAsJob } from '../daemon-rebuild/rebuild-job.mjs';
+import { createJobStore } from '../daemon-jobs-runtime.mjs';
 import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
 import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
@@ -705,7 +707,9 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none })).reason).toBe('ready-audit-revoked');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'H' })).match).toBe('superseded');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: none, carries: (sha, build) => sha === 'b1' && build === 'M2' })).match).toBe('superseded');
-    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: 'b1' }]), plan: cleared, auditedTip: none })).match).toBe('superseded');
+    const auditedPin = 'b'.repeat(40);
+    expect(matchReadyCandidate(args({ ready: candidate([{ ref, sha: 'a1', pinnedFrom: auditedPin }]), plan: cleared,
+      auditedTip: (_ref, sha) => sha === auditedPin })).match).toBe('superseded');
     expect(matchReadyCandidate(args({ plan: cleared, auditedTip: null })).match).toBe('superseded'); // follow mode: no gate
   });
 
@@ -880,7 +884,9 @@ describe('unaudited-tip wiring', () => {
     }
     expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-pinned '))).toHaveLength(1);
     expect(logs.filter(m => m.startsWith('daemon-rebuild: overlay-unaudited-tip '))).toHaveLength(1);
-  }, 60_000);
+  // Six real rebuild ticks plus repository setup: retain the requested two-minute
+  // integration budget when the host is busy, without changing any audit assertions.
+  }, 120_000);
 });
 
 describe('unaudited-tip evidence and policy', () => {
@@ -966,7 +972,7 @@ describe('unaudited-tip evidence and policy', () => {
 });
 
 
-it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; allows a proven adopted pin', async launchedBy => {
+it.each(['early', 'recovery', 'tick-start'])('%s refuses arbitrary or unproven ready pins; allows a proven adopted pin', async launchedBy => {
   const f = await fixture();
   f.env.WE_DAEMON_STATE_DIR = join(f.dir, 'state');
   f.env.WE_DAEMON_OVERLAY_DIR = join(f.dir, 'overlays');
@@ -983,11 +989,19 @@ it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; all
     [f.a, 'f'.repeat(40), 42], [f.a, f.b, 99]]) {
     writeReadyCandidate(f.root, { ...ready, adopt: { ...plan, applied: [{ ref, pr, sha, pinnedFrom }] } }, f.env);
     expect(() => readReadyCandidateStrict(f.root, f.env)).toThrow();
-    expect(readReadyCandidateStrict(f.root, f.env, readFileSync, { strictPins: false }).adopt.applied[0])
-      .toEqual({ ref, pr, sha, pinnedFrom });
+    expect(() => readReadyCandidateStrict(f.root, f.env, readFileSync, { strictPins: false })).toThrow();
     expect((await check()).reason).toBe('state-unreadable');
+    const adopt = vi.fn(), reattach = vi.fn();
+    const store = createJobStore(join(f.dir, 'jobs'));
+    expect((await rebuildCloneAsJob({ root: f.root, env: f.env, launchedBy, store, adopt, reattach,
+      log: { error() {} } })).reason).toBe('state-unreadable');
+    expect(adopt).not.toHaveBeenCalled();
+    expect(reattach).not.toHaveBeenCalled();
+    expect(store.list().records).toEqual([]);
     expect(readReadyCandidate(f.root, f.env).adopt.applied[0].pinnedFrom).toBe(pinnedFrom);
   }
+  // Legacy pin provenance is accepted only with current audit membership as well as history proof.
+  f.save(record(f.a), record(f.b));
   writeReadyCandidate(f.root, ready, f.env);
   expect(readReadyCandidateStrict(f.root, f.env).adopt.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
   expect((await check()).reason).toBe('ready-pending');
@@ -996,7 +1010,7 @@ it.each(['early', 'recovery'])('%s refuses arbitrary or unproven ready pins; all
     ? { status: null, error: Object.assign(new Error('history exceeds maxBuffer'), { code: 'ENOBUFS' }) }
     : spawnSync('git', args, opts) })).toThrow('Unreadable ready pin history');
   const args = { ready, plan, prevHead: ready.prevHead, treeOf: () => ready.tree, stillWanted: () => true,
-    verifyBuilt: () => true, auditedTip: () => false, nowMs: Date.now(), maxAgeMs: 60000 };
+    verifyBuilt: () => true, auditedTip: makeAuditedTipGate(f.env), nowMs: Date.now(), maxAgeMs: 60000 };
   expect(matchReadyCandidate(args).adopt).toBeTruthy();
   expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
     .toBe('ready-audit-revoked');

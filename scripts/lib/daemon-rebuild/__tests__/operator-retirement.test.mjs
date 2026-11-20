@@ -143,7 +143,8 @@ describe('operator retirement of a live overlay', () => {
       const candidate = 'd'.repeat(40);
       const plan = { ok: true, finalSha: 'e'.repeat(40), mainSha,
         inputsKey: 'new-plan', applied: [], decisions: [], alerts: [] };
-      writeRebuildState(root, { adopted: { head: liveHead, mainSha, applied: [{ ref, sha }] } }, env);
+      writeRebuildState(root, { adopted: { head: liveHead, inputsKey: 'live-plan', mainSha,
+        applied: [{ ref, sha }], at: '2026-11-15T09:00:00Z' } }, env);
       writeReadyCandidate(root, { kind: 'candidate', prevHead: liveHead,
         passedAt: '2026-11-15T10:00:00Z', tree: 'candidate-tree',
         adopt: { finalSha: candidate, mainSha, inputsKey: 'ready-plan', applied: [] } }, env);

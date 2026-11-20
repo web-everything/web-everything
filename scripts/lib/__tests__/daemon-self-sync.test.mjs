@@ -3,7 +3,7 @@
  * @description xv6fciw — the daemon clone self-sync. Pure decision + injected-git cases, plus one suite against
  *   REAL temporary git repos so the actual fetch/merge/abort commands are proven, not only mocked.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -215,14 +215,14 @@ describe('withSelfSync — DEFAULT path: rebuild-driven (#4044 Module E)', () =>
     expect(readState).toHaveBeenCalledWith('/x', expect.anything());
   });
 
-  it('a reason other than up-to-date is logged, and the tick still runs', async () => {
+  it.each(['fetch-failed', 'state-unreadable'])('a %s rebuild refusal is logged, and the tick still runs on last-good', async reason => {
     const log = { error: vi.fn() };
-    const rebuild = vi.fn(async () => ({ moved: false, reason: 'fetch-failed' }));
+    const rebuild = vi.fn(async () => ({ moved: false, reason }));
     const w = withSelfSync({ tickOnce: () => 'ticked' }, {
       root: '/x', onRestart: vi.fn(), rebuild, acquireRead: okLock, releaseRead: vi.fn(), readState: emptyState, log,
     });
     await expect(w.tickOnce()).resolves.toBe('ticked');
-    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('fetch-failed'));
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining(reason));
   });
 
   it('a refused read lock skips the tick entirely — never reads a tree mid-move', async () => {
@@ -1098,19 +1098,23 @@ describe('withSelfSync — restart gate wiring (#4044 live bug 2)', () => {
 
 // #4044 live (2026-09-25 ~13:20Z): every skipped tick crashed review-daemon's onTick on `result.repos.map`.
 describe('a skipped tick is an empty tick every real daemon onTick can log (#4044)', () => {
-  it('review-daemon and reconcile-fix-dispatch-daemon onTick accept skippedTick() without throwing', async () => {
-    const { skippedTick } = await import('../daemon-self-sync.mjs');
+  let skippedTick;
+  let effectsBuilders;
+  beforeAll(async () => {
+    ({ skippedTick } = await import('../daemon-self-sync.mjs'));
     const { buildCliDaemonEffects: reviewEffects } = await import('../../../skills-src/conveyor/review-daemon.mjs');
     const { buildCliDaemonEffects: fixEffects } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
-    for (const build of [reviewEffects, fixEffects]) {
+    effectsBuilders = [reviewEffects, fixEffects];
+  }, 120_000);
+  it('review-daemon and reconcile-fix-dispatch-daemon onTick accept skippedTick() without throwing', () => {
+    for (const build of effectsBuilders) {
       const log = { error: vi.fn() };
       const effects = build({ owner: 'test-owner', log });
       expect(() => effects.onTick(skippedTick('writer-active'), 0)).not.toThrow();
       expect(() => effects.onTick(skippedTick('quarantine'), 0)).not.toThrow();
     }
-    // Two cold dynamic imports of whole daemon module graphs: ~1.6 s on an idle Mac, past vitest's 5 s default
-    // under a loaded host (reproduced on origin/main at load average ~230, 2026-09-26). The assertion is about
-    // onTick's behaviour, not import speed, so it gets an explicit budget rather than failing the gate on load.
+    // Cold daemon module graphs load in bounded suite setup; keep the onTick
+    // assertion's own deadline independent of transform/import time under load.
   }, 60_000);
 });
 
@@ -1286,6 +1290,11 @@ setTimeout(() => { writeFileSync(process.env.PACK_FALLBACK_FILE, 'reached'); pro
     let writerBefore;
     let writerAfter;
     const expectPackStopped = () => {
+      // A reaped descendant needs no process-table read (which restricted hosts
+      // can deny). Only ESRCH proves exit; a live process or EPERM still needs
+      // the zombie check below and must never count as stopped by default.
+      try { realKill(packPid, 0); }
+      catch (error) { if (error.code === 'ESRCH') return; throw error; }
       // A terminated orphan can briefly remain a zombie until the host reaps it.
       let state = '';
       try { state = execFileSync('ps', ['-p', String(packPid), '-o', 'stat='], { encoding: 'utf8', timeout: 1000, maxBuffer: 1024 }).trim(); }

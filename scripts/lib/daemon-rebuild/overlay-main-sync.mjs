@@ -851,7 +851,7 @@ export async function runOverlayMainSync({ root, ref, token, env = process.env, 
     if (conflicts.length) {
       mergeConflict = true;
       conflictInfo = { files: conflicts, tip: from,
-        stderrTail: stderrTail(merge) || cleanText(merge?.stdout).slice(-500) };
+        stderrTail: cleanText([stderrTail(merge), merge?.stdout].filter(Boolean).join('\n')).slice(-500) };
       event(root, { kind: 'overlay-main-merge-conflict', ref, files: conflicts }, { env });
       if (old.pr) markOverlayConflictWake(env, { pr: old.pr, ref, files: conflicts, at: now(), clone: root });
       else publishNeedsYou(root, env, ref, 'overlay-main-merge-conflict',

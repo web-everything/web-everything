@@ -191,8 +191,7 @@ export async function rebuildCloneAsJob({
   launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
   readState = readRebuildStateStrict, readPending = readPendingAdoptionsStrict,
-  readReady = (root, env) => readReadyCandidateStrict(root, env, readFileSync,
-    { strictPins: launchOnly || launchedBy === 'early' || launchedBy === 'recovery' }),
+  readReady = readReadyCandidateStrict,
   codeSha, snapshot, settings = loadRebuildAsJobSettings(undefined, { env }), evict = evictSnapshots, rng,
 }) {
   const say = (m) => log.error?.(`daemon-rebuild-job: ${m}`);

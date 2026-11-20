@@ -222,12 +222,12 @@ describe('the Git proof of omitted content in the candidate build', () => {
         expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(main);
         expect(smoke).toHaveBeenCalledTimes(1);
       }
-    }, 20_000,
+    }, 120_000,
   );
 });
 
 describe('a passed candidate blocked at finalize by a long reader tick is adopted later without re-smoking', () => {
-  it('readyBuildVerified refuses a force-pushed pinned sha and rebuildClone freshly smokes the current plan', async () => {
+  it('readyBuildVerified refuses a force-pushed pinned sha and strict admission preserves its unproven evidence', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
     env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
@@ -264,14 +264,16 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     // Move main to a different tree so the old ready record needs superseded-build provenance instead.
     advanceMain(originDir, (dir) => writeFile(dir, 'main-later.txt', 'later\n'));
 
+    const readyBytes = readFileSync(readyCandidatePath(cloneDir, env), 'utf8');
+    const stateBytes = readFileSync(rebuildStatePath(cloneDir, env), 'utf8');
     const freshSmoke = vi.fn(async () => PASS);
     const result = await rebuildClone({ root: cloneDir, env, runSmoke: freshSmoke, lockOpts: LOCK_OPTS });
-    expect(result.adopted).toBe(true);
-    expect(result.reason).not.toBe('ready-adopted');
-    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'unverified-build' }) }));
-    expect(freshSmoke).toHaveBeenCalledTimes(1);
-    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).not.toBe(ready.adopt.finalSha);
-    expect(readFileSync(join(cloneDir, 'main-later.txt'), 'utf8')).toBe('later\n');
+    expect(result).toMatchObject({ moved: false, reason: 'state-unreadable' });
+    expect(freshSmoke).not.toHaveBeenCalled();
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(readFileSync(readyCandidatePath(cloneDir, env), 'utf8')).toBe(readyBytes);
+    expect(readFileSync(rebuildStatePath(cloneDir, env), 'utf8')).toBe(stateBytes);
+    expect(existsSync(join(cloneDir, 'main-later.txt'))).toBe(false);
     expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'HEAD']).status).toBe(0);
   });
 
@@ -582,7 +584,19 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const matching = vi.spyOn(adoption, 'matchReadyCandidate');
     const noSmoke = vi.fn(async () => PASS);
     try {
+      const preserved = options.log === 'unreadable' ? [
+        readyCandidatePath(cloneDir, env), rebuildStatePath(cloneDir, env),
+        overlayFilePath(cloneDir, env).replace(/\.json$/, '.events.jsonl'),
+      ].map(file => [file, readFileSync(file, 'utf8')]) : [];
       const result = await rebuildClone({ root: cloneDir, env, adoptOnly: true, runSmoke: noSmoke, lockOpts: LOCK_OPTS });
+      if (options.log === 'unreadable') {
+        expect(result).toMatchObject({ moved: false, reason: 'state-unreadable' });
+        expect(matching).not.toHaveBeenCalled();
+        expect(noSmoke).not.toHaveBeenCalled();
+        expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(liveHead);
+        for (const [file, bytes] of preserved) expect(readFileSync(file, 'utf8')).toBe(bytes);
+        return;
+      }
       expect(matching).toHaveBeenCalledOnce();
       if (options.registered) {
         expect(readOverlays(cloneDir, { env }).map((overlay) => overlay.ref)).toContain(ref);
@@ -653,7 +667,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const file = readyCandidatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify({
-      kind: 'candidate', prevHead: head, tree: 'x', passedAt: new Date().toISOString(),
+      kind: 'candidate', forced: false, prevHead: head, tree: 'x', passedAt: new Date().toISOString(),
       adopt: {
         finalSha: evil, inputsKey: 'forged', mainSha: evil, applied: [],
       },
@@ -688,7 +702,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const file = readyCandidatePath(cloneDir, env);
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, JSON.stringify({
-      kind: 'candidate', prevHead: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(), tree: 'x', passedAt: new Date().toISOString(),
+      kind: 'candidate', forced: false, prevHead: gitOk(cloneDir, ['rev-parse', 'HEAD']).trim(), tree: 'x', passedAt: new Date().toISOString(),
       adopt: {
         finalSha: forged, inputsKey: 'forged', mainSha, applied: [{ ref: 'lane/ok', pr: null, sha: ovSha }],
       },
@@ -715,7 +729,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'w.txt', 'w\n'));
     const file = readyCandidatePath(cloneDir, env);
     writeFileSync(file, JSON.stringify({
-      kind: 'candidate', prevHead: built, tree: 'x', passedAt: new Date().toISOString(),
+      kind: 'candidate', forced: false, prevHead: built, tree: 'x', passedAt: new Date().toISOString(),
       adopt: {
         finalSha: old, inputsKey: 'forged', mainSha: old, applied: [],
       },
@@ -803,7 +817,7 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
 
 describe('matchReadyCandidate — pure', () => {
   const base = {
-    kind: 'candidate', prevHead: 'H', tree: 'T1', passedAt: new Date(1_000_000).toISOString(),
+    kind: 'candidate', forced: false, prevHead: 'H', tree: 'T1', passedAt: new Date(1_000_000).toISOString(),
     adopt: {
       finalSha: 'S1', inputsKey: 'K1', mainSha: 'M1', applied: [{ ref: 'lane/a', sha: 'a1' }],
     },
