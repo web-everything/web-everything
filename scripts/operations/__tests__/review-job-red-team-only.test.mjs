@@ -2,7 +2,7 @@ import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,7 @@ import { proveCardOnlyHeadMove } from '../../lib/card-only-head-move.mjs';
 import { createReviewJobIo as productionJobIo, execReadRaw, prepareReviewArc, runReviewJob, dispatchReviewJob, writeJobRecord, redTeamRunnerArgs } from '../review-job.mjs';
 import { createExtraSeatsIo } from '../review-extra-seats.mjs';
 import { newRunRecord, writeRun } from '../run-store.mjs';
+import { abandonedPath, runRecordVersion } from '../../lib/run-abandoned.mjs';
 
 vi.mock('../../lib/red-team-status-labels.mjs', () => ({ syncRedTeamStatusLabels: vi.fn() }));
 vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
@@ -250,6 +251,58 @@ function runStoredRecovery(input, { status, prior, saved, failComment = false, f
 }
 
 describe('red-team-only completed accept with later advisory run', () => {
+  it.each(['bound tombstone', 'clear-human only', 'stale tombstone'])(
+    'auto planning, payload selection and admission share advisory release authority: %s', kind => {
+      const dir = mkdtempSync(join(tmpdir(), 'red-team-parked-auto-'));
+      const env = { WE_SHARED_RUNS_DIR: join(dir, 'runs') };
+      try {
+        const completed = { ...newRunRecord({ id: 'review-pr-completed', op: 'review-pr', input: { repo, pr } }),
+          ...payload(), pending: null,
+          effects: [{ key: 'label', type: 'review.label-swap', stepIndex: 1, index: 0, status: 'applied' }],
+          stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] };
+        const parked = { ...completed, id: 'review-pr-parked',
+          pending: { kind: 'effect', step: 'advise', stepIndex: 2 },
+          effects: [{ key: 'review-pr-parked#2#0', type: 'review.advisory-note', stepIndex: 2, index: 0, status: 'pending' }],
+          stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(15_000).toISOString() }] };
+        utimesSync(writeRun(completed, env.WE_SHARED_RUNS_DIR), 12, 12);
+        const parkedPath = writeRun(parked, env.WE_SHARED_RUNS_DIR);
+        utimesSync(parkedPath, 20, 20);
+        if (kind !== 'clear-human only') {
+          const sidecar = abandonedPath(parked.id, env.WE_SHARED_RUNS_DIR);
+          writeFileSync(sidecar, JSON.stringify({ at: new Date(25_000).toISOString(), by: 'session-reaper',
+            reason: 'owner proven dead', probes: { recordVersion: runRecordVersion(statSync(parkedPath)),
+              reviewJobs: 'dead', handles: 'dead', writers: 'dead', leases: 'absent', sessions: 'absent' } }));
+          utimesSync(sidecar, 25, 25);
+          if (kind === 'stale tombstone') utimesSync(parkedPath, 26, 26);
+        }
+        const priorResult = { status: 'ran', comment: { status: 'withheld' } };
+        recordRedTeamStatus({ repo, pr, loopPayload: completed, status: 'finished', result: priorResult }, { env });
+        // Exercise the default witness wiring. The retired clearance hook must not
+        // create a second authority for payload selection or queued admission.
+        const readHeadClearance = vi.fn(() => ({ sha: head, at: 30_000 }));
+        const production = productionJobIo({ env, readHeadClearance,
+          readSeatRecords: () => [{ dispatchKind: 'review-seat', seat: 'red-team', repo, pr, rev: head, status: 'ok' }] });
+        const io = fakeIo({ planRedTeamMode: vi.fn(production.planRedTeamMode),
+          readRedTeamOnlyPayload: production.readRedTeamOnlyPayload,
+          redTeamStatus: vi.fn(production.redTeamStatus),
+          runRedTeam: vi.fn(() => ({ status: 'resumed', comment: { status: 'posted' } })) });
+        const out = runReviewJob({ repo, pr, redTeamOnly: true, redTeamMode: 'auto' }, io);
+        if (kind === 'bound tombstone') {
+          expect(out.redTeam.status).toBe('resumed');
+          expect(io.runRedTeam.mock.calls[0][0]).toMatchObject({ redTeamMode: 'resume', loopPayload: completed });
+          expect(io.redTeamStatus.mock.calls[0][0]).toMatchObject({ status: 'queued', redTeamMode: 'resume' });
+          expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished', result: 'resumed' });
+        } else {
+          expect(out).toMatchObject({ outcome: 'blocked-on-infra', label: expect.stringContaining('review-unfinished') });
+          expect(io.runRedTeam).not.toHaveBeenCalled();
+          expect(io.redTeamStatus).not.toHaveBeenCalled();
+          expect(readRedTeamStatus({ repo, pr, head, env })).toMatchObject({ status: 'finished', result: priorResult });
+        }
+        expect(io.planRedTeamMode).toHaveBeenCalledOnce();
+        expect(readHeadClearance).not.toHaveBeenCalled();
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
   it.each(['accept', 'alone', 'other-head', 'label', 'empty-effects', 'no-applied-label'])(
     'holds later advisory bookkeeping despite a completed accept: %s', kind => {
       const dir = mkdtempSync(join(tmpdir(), 'red-team-completed-accept-'));

@@ -42,6 +42,36 @@ const sealAtFinish = (f, { findings = [], comments = [cleanResultComment(f)], ca
 const payload = head => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
 describe('tombstone-bound advisory release (#7167 committee)', () => {
+  it.each(['older rejection', 'no active review', 'newer active accept'])(
+    'quarantined accept and legacy clearance never override %s', kind => {
+      const f = fixture();
+      const rejected = { ...newRunRecord({ id: 'review-pr-rejected', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+        ...payload(f.head), verdict: { verdict: 'changes' }, pending: null, effects: [],
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(1000).toISOString() }] };
+      const quarantined = { ...rejected, id: 'review-pr-quarantined', verdict: { verdict: 'accept' },
+        pending: { kind: 'effect', step: 'record', stepIndex: 1 },
+        effects: [{ key: 'label', type: 'review.label-swap', stepIndex: 1, index: 0, status: 'failed' }],
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(15_000).toISOString() }] };
+      const quarantineDir = join(f.runsDir, '..', 'runs-quarantine');
+      utimesSync(writeRun(quarantined, quarantineDir), 20, 20);
+      if (kind !== 'no active review') utimesSync(writeRun(rejected, f.runsDir), 12, 12);
+      const accepted = { ...rejected, id: 'review-pr-accepted', verdict: { verdict: 'accept' },
+        effects: [{ key: 'label', type: 'review.label-swap', stepIndex: 1, index: 0, status: 'applied' }],
+        stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(22_000).toISOString() }] };
+      if (kind === 'newer active accept') utimesSync(writeRun(accepted, f.runsDir), 24, 24);
+      const listQuarantine = vi.fn(() => [quarantined.id]);
+      const readQuarantine = vi.fn(() => quarantined);
+      const witness = readRecoveryWitness({ ...f, now: 30_000,
+        clearance: { sha: f.head, at: 30_000 },
+        quarantine: { dir: quarantineDir, list: listQuarantine, read: readQuarantine } });
+      expect(witness.ok).not.toBe(false);
+      expect(witness.newest ?? null).toEqual(kind === 'no active review' ? null
+        : kind === 'newer active accept' ? accepted : rejected);
+      expect(redTeamOwedFor(witness.newest)).toBe(kind === 'newer active accept');
+      expect(listQuarantine).not.toHaveBeenCalled();
+      expect(readQuarantine).not.toHaveBeenCalled();
+    });
+
   it.each([
     'humanRequired accepting verdict', 'humanRequired run',
     'pending options', 'pending asks', 'pending of', 'resumeOf present', 'resumedAt present',

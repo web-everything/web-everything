@@ -5543,6 +5543,15 @@ when none exists; PR comments and quarantined records cannot authorize release.
 during the read. `red-team-advisory-parked-after-accept.soak.test.mjs` exercises
 valid release and missing/stale tombstone holds against persisted records.
 
+Auto red-team mode planning, payload selection and queued admission use the same
+raw witness authority. A completed red-team seat with a withheld result resumes
+after valid tombstone release; clear-human alone or a stale tombstone keeps the
+review held before any status write. The production IO regression is in
+`review-job-red-team-only.test.mjs`. Quarantined accepts remain excluded whether
+the active store has an older rejection, no review, or a newer completed accept;
+`drain-red-team-evidence.test.mjs` pins all three cases. Legacy `clearance` and
+`quarantine` reader options cannot change that selection.
+
 The shared accept-carry parser must still detect holds in the selected comment itself:
 a trusted revocation can quote previous clearance markers. Keep the parameterized
 `#7167 S2` regression in `accept-carry-forward.replay.test.mjs` when changing recovery
