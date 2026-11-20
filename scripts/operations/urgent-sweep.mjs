@@ -35,7 +35,7 @@ export function latestActionFailure(data, sha, vetoIgnoreChecks = readHotPatchVe
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);
     if (!latest.has(key) || c.id > latest.get(key).id) latest.set(key, c);
   }
-  return [...latest.values()].find(c => !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && failedCheck(c, sha));
+  return [...latest.values()].find(c => c.app.id === TEST_CHECK_APP_ID && !hotPatchIgnoresCheck(c.name, vetoIgnoreChecks) && failedCheck(c, sha));
 }
 export function hotPatchCiEvidence(data, sha, required, now, vetoIgnoreChecks = readHotPatchVetoPolicy().value.hotPatch.vetoIgnoreChecks) {
   validateChecks(data, sha);
@@ -191,8 +191,6 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
       }
     }
     const records = deps.loads();
-    const failed = new Set(records.filter(r => r.type === 'prototype-load.urgent-registration-failed'
-      && typeof r.trackingId === 'string').map(r => r.trackingId));
     const loads = new Map(records.filter(r => r.type === 'prototype-load.urgent').map(r => [identity(r), r]));
     const entries = [...loads], cursor = settlements.filter(r => r.status === 'sweep-cursor').at(-1)?.id;
     // Use the complete load order so even a cursor load settled last pass remains an anchor.
@@ -223,8 +221,6 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           || overlay.overlays.some(e => !safeRegistrationRef(e?.ref)))
           throw new Error('unreadable overlay state; repair store or inspect registration manually');
         const registered = overlay.overlays.some(e => e.ref === r.registration.ref);
-        // A failed command may have persisted its overlay before failing to append its event.
-        if (failed.has(r.trackingId) && !registered && !pending) continue;
         if (pending) {
           const removedAt = pending.removedAt ?? pending.at, now = Date.parse(deps.now());
           if (!Number.isFinite(Date.parse(removedAt)) || !Number.isFinite(now) || now < Date.parse(removedAt))
@@ -245,6 +241,7 @@ export async function urgentSweep(_input = {}, deps = createSweepDeps()) {
           continue;
         }
         if (!registered) {
+          // Failed adds also need ancestry proof before their urgent intent can settle.
           const contains = await deps.containsOverlay(r);
           if (typeof contains !== 'boolean') throw new Error('unreadable clone HEAD ancestry; inspect the daemon build manually');
           const merged = contains ? await deps.mergedOverlay(r) : false;
