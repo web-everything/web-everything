@@ -1,4 +1,5 @@
-import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isJudgeAuthored } from '../lib/marker-authorship.mjs';
+import { classAction } from '../lib/finding-class-policy.mjs';
+import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority, isSecurityClass, isJudgeAuthored } from '../lib/marker-authorship.mjs';
 import { assertJudgeReason, judgeEvidenceComment } from './record-referral-ruling.mjs';
 import { judgeRulingSink, judgeConfirm as defaultJudgeConfirm, readJudgeNotRealMode, readJudgeEvidence, readCardRulingFileMode, readCardAllowNonRegression, landRulingCard as defaultLandRulingCard, rulingCardFilingSink } from './record-referral-ruling-io.mjs';
 /**
@@ -259,6 +260,10 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
     // The SAME policy the plan held (#6494 F7): this sink's env and tool layer, narrowed by the gate-visible policy.
     assertJudgeAuthority(p.actor === JUDGE_ACTOR
       ? { isMainAncestor, judgeActorPolicy: readJudgeWriterPolicy({ env, tool: tool?.judgeActor, log: warn }) } : {}, p);
+    if (p.actor === JUDGE_ACTOR && p.ruling === 'card' && (!Array.isArray(p.findings) || !p.findings.length
+      || p.findings.some(f => f.security === true || f.securityReachableToday === true
+        || isSecurityClass(f.class ?? f.findingClass) || classAction(f, p.setting?.findingClasses) !== 'defer-card')))
+      throw new Error('judge card refuses a fix-now or security break; only coverage-class findings can be carded');
     assertRulingIdentity(resolveIdentity(p.actor), p.actor);
     const thread = readThread({ repo: p.repo, pr: p.pr });
     if (!Array.isArray(thread.labels) || !Array.isArray(thread.comments)) throw new Error('unreadable thread or labels; retry after a complete read');
@@ -320,9 +325,10 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
   };
   const reasonBody = (p, cardNote) => judgeEvidenceComment(p.judgeEvidence) + buildRuleReasonComment({ head: p.head, ruling: p.ruling, actor: p.actor, channel: p.channel,
     at: p.at, reason: p.reason, findings: p.findings, cardNote, cause: p.cause ?? null });
-  // Only judge block records carry the distinct actor and attribution.
-  const attributeRuling = (p, body) => p.actor === JUDGE_ACTOR && p.ruling === 'block'
+  // Keep attribution and card evidence after the action lines consumed by gate readers.
+  const attributeRuling = (p, body) => p.actor === JUDGE_ACTOR && ['block', 'card'].includes(p.ruling)
     ? body.replace(' -->', ` actor=${JUDGE_ACTOR} -->`) + `\n${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`
+      + (p.ruling === 'card' ? `\nPre-existing on main (${p.preExisting.mainSha}): probe ${p.preExisting.probe}; main=${p.preExisting.mainResult} pr=${p.preExisting.prResult}` : '')
     : body;
   const operatorRecord = (p, outcome, line) => attributeRuling(p, `${redTeamGateMarker(p.pr, p.head, outcome, p.resultId)}\n`
     + `**Red-team gate** operator ruling (\`record-red-team-ruling\`) on head \`${p.head.slice(0, 12)}\`:\n${line}`);
@@ -415,8 +421,8 @@ export function createRecordRedTeamRulingSinks({ judgeConfirm = defaultJudgeConf
       if (!completion(r, p)) return { ruling: 'card', head: p.head, indices: p.indices, pending: true, released: false, card,
         message: `No validated card completion yet; retry later. If it persists, inspect the landing log for ${session}; recover the owed card and cite its readable --card reference. Do not remove the shared claim.` };
       // Release only with positive child evidence that the card exists or is durably spooled.
-      const record = buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
-        plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card });
+      const record = attributeRuling(p, buildGateComment({ pr: p.pr, head: p.head, outcome: OPERATOR_CARD_OUTCOME, round: null, result: p.resultId,
+        plan: { sendBack: [], card: p.findings, advisory: [] }, cardResult: card }));
       post(p.repo, p.pr, reasonBody(p, `Follow-up card queued through the prevention landing job (${session}); filing may be paused, in which case it is owed in the spool.`), p.actor);
       // A receipt survives its backing card/spool. Re-read that evidence on every release attempt.
       const result = r.evidence.result, ref = landingRef(result);

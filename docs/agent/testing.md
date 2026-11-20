@@ -5716,3 +5716,12 @@ in review evidence. For retryable warnings, `effect-executor.test.mjs` must defe
 refusal and safe replay; `cli-adapter.test.mjs` must defend warning stops, fallback text and credential
 redaction in JSON and text output. These checks are deliberate contract pins when the behavior already
 exists; the stale-baseline and reverted-history cases must discriminate the publication repair.
+
+
+## Judge card operation evidence
+
+Operation findings are JSON snapshots; a reader's ancestry verifier function does not survive
+the run store. Restore the verifier from trusted injected IO at judge card validation, including
+preview; never replace it with a persisted boolean. Keep CLI JSON-evidence tests through the full
+operation alongside direct sink tests. Judge card release records append attribution and matching
+main/PR probe evidence after action lines so the gate can read the complete action block.

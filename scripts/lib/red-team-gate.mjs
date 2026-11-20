@@ -605,7 +605,8 @@ function gateRecordsFor(records, pr, sha, hit) {
   return records.flatMap(r => {
     const gate = parseRedTeamGateMarker(recordBody(r));
     if (gate?.pr !== Number(pr) || gate.rev !== sha || (gate.actor !== undefined && !r.ruling)) return [];
-    if (gate.actor !== undefined && gateActionLines(recordBody(r)).some(line => !['send-back', 'held'].includes(line.action))) return [];
+    if (gate.actor !== undefined && gateActionLines(recordBody(r)).some(line =>
+      !(gate.outcome === 'operator-card' ? ['card', 'operator-card'] : ['send-back', 'held']).includes(line.action))) return [];
     const decides = gate.result ? gate.result === id
       : threadOrder(r, hit) > 0 || (r.from != null && hit.from != null && r.at === hit.at);
     return decides ? [{ ...r, gate }] : [];
@@ -909,14 +910,14 @@ export function readRedTeamDisposition({ comments, pr, head, setting, env = proc
         if (action === 'operator-card') {
           // Operator card releases bind to the exact head/result; verdict carries cannot inherit them.
           if (!first || r.from || r.gate.result !== want) continue;
-          if (!r.gate.outcome.startsWith('operator-') || !isHumanOperatorComment(r.c)) continue;
+          if (!r.gate.outcome.startsWith('operator-') || !r.ruling) continue;
           action = 'card';
         }
-        // Only a human operator may release a break held at the round cap; automation lines release only what the gate itself decided.
+        // Only an honoured ruling may release a break held at the round cap; automation lines release only what the gate itself decided.
         // This is applied per action line (not by dropping the forged comment, which would also drop its restrictive `held` lines).
         const operatorRelease = RELEASING_ACTIONS.has(action) && !AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome);
         if (operatorRelease) {
-          if (!isHumanOperatorComment(r.c) || r.at <= hit.at) continue;
+          if (!r.ruling || r.at <= hit.at) continue;
           // Validate ownership for every release spelling, including automatic card filing and advisory.
           // Use ownership at posting time: later handovers/grants cannot change a ruling's validity.
           // Match the writer's grant-aware decision: a pending extension belongs to automation.
@@ -1032,8 +1033,7 @@ export function operatorRulingsOnLiveResult(comments, pr, head) {
     // Identical reposts keep their result id, but earlier operator rulings do not apply to them.
     // Match the release reader's binding to the latest result's thread position.
     if (r.gate.outcome.startsWith('operator-') && r.at <= hit.at) continue;
-    const human = isHumanOperatorComment(r.c);
-    const operator = r.gate.outcome.startsWith('operator-') && human && r.gate.result === id;
+    const operator = r.gate.outcome.startsWith('operator-') && r.ruling && r.gate.result === id;
     for (const { action, indices } of gateActionLines(recordBody(r))) {
       const card = action === 'card' || action === 'operator-card';
       if (card && (AUTOMATION_RELEASE_OUTCOMES.has(r.gate.outcome) || operator)) for (const index of indices) carded.add(index);

@@ -498,10 +498,10 @@ export function cardFilingVerdict(view) {
 }
 
 /** Shared step layout; all external filing remains in the injected sink. */
-export function rulingCardSteps(readRulingContext, planCard, type, selectJudge) {
+export function rulingCardSteps(readRulingContext, planCard, type, selectJudge, prepareRead = v => v.findings.read) {
   return {
     cardPlan: compute({ reads: ['input', 'findings.read'], fn: v => {
-      const judge = planJudgeRuling(v.findings.read, v.input, selectJudge);
+      const judge = planJudgeRuling(prepareRead(v), v.input, selectJudge);
       return judge ?? (v.input.fileCard ? planCard(v.findings.read, v.input) : null);
     } }),
     landCard: effectStep({ reads: ['input', 'findings.read', 'findings.cardPlan'],
@@ -602,6 +602,10 @@ export const judgeRulingInput = {
 
 /** Pure preflight; confirmation and any filing belong to the effect sink. */
 export function planJudgeRuling(read, input, select) {
+  if (typeof input.preExisting === 'string') {
+    try { input = { ...input, preExisting: JSON.parse(input.preExisting) }; }
+    catch { throw new Error('--preExisting must be a JSON object of pre-existing evidence'); }
+  }
   if (input.actor === JUDGE_ACTOR) assertJudgeAuthority(read, input);
   if (input.asJudge !== undefined && typeof input.asJudge !== 'boolean') throw new Error('asJudge must be boolean');
   if (!input.asJudge) return null;

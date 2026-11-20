@@ -19,6 +19,10 @@ import { parseLandPreventionCardArgv, runLandPreventionCardCli } from '../land-p
 import { parseFilingItems, planDedupe } from '../../lib/card-dedupe.mjs';
 import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 
+import { createRegistry } from '../registry.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+
 const ledgerIO = (rows = []) => ({
   readEvents: async () => ({ status: 'ok', rows: [...rows] }),
   appendEvents: async events => { rows.push(...events); },
@@ -2313,6 +2317,71 @@ describe('R671 v1 acting judge red-team blocks', () => {
     judgeActorPolicy: { value: { enabled: true, actor: 'judge:r10' } }, ...over });
   const judgeInput = (ruling = 'block', over = {}) => input({ actor: 'judge:r10', ruling, card: undefined, ...over });
   const preExisting = { mainSha: 'a'.repeat(40), probe: 'node probe.mjs', mainResult: 'null', prResult: 'null' };
+  it.each([{ securityReachableToday: true }, { findingClass: 'live-reproduced' },
+    { findingClass: 'security-reachable-today' }, { security: true },
+    { settingPolicy: { 'coverage-or-style': 'fix-now' } }])('direct judge card sink refuses unsafe finding %j before writes', fields => {
+    const plan = planRedTeamRuling(judgeRead({ isMainAncestor: () => true }), judgeInput('card', { card: CARD, preExisting }));
+    plan.findings = plan.findings.map(f => ({ ...f, ...fields }));
+    if (fields.settingPolicy) plan.setting = { ...plan.setting, findingClasses: fields.settingPolicy };
+    const post = vi.fn();
+    const sinks = createRecordRedTeamRulingSinks({ post, isMainAncestor: () => true, resolveIdentity: () => identity,
+      resolveCard: () => card, readStandingRulingScope: () => null, readScope: () => ({ value: { anyState: true } }),
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments: judgeRead().comments }), warn: () => {} });
+    expect(() => sinks[plan.effect](plan)).toThrow(/fix-now|security/);
+    expect(post).not.toHaveBeenCalled();
+  });
+  it('auto-filed judge card record carries evidence and proves release', async () => {
+    const repo = 'web-everything/web-everything';
+    const coordinationRoot = mkdtempSync(join(tmpdir(), 'judge-card-release-'));
+    try {
+      const actions = createActionStore({ root: coordinationRoot });
+      const comments = judgeRead().comments;
+      const plan = planRedTeamRuling(judgeRead({ card: null, comments, isMainAncestor: () => true }), judgeInput('card', { repo, preExisting }));
+      let binding;
+      const sinks = createRecordRedTeamRulingSinks({ actions, coordinationRoot, isMainAncestor: () => true,
+        resolveIdentity: () => identity, readStandingRulingScope: () => null,
+        readScope: () => ({ value: { anyState: true } }), resolveCard: ref => ({ ref, readable: true }),
+        readThread: () => ({ headRefOid: HEAD, labels: [], comments }),
+        fileCard: (_input, session, b) => { binding = b; return { ok: true, session, handle: 'pid:4242' }; },
+        post: (_repo, _pr, body) => comments.push({ author: identity, body }), syncLabels: () => null, warn: () => {} });
+      expect(sinks[plan.effect](plan)).toMatchObject({ pending: true });
+      await runCardLandingWithReceipt(binding, [], { actions, land: async () => ({ code: 0, result: { ok: true, step: 'held', rel: 'backlog/xabcdef-card.md' } }) });
+      expect(sinks[plan.effect](plan)).toMatchObject({ ruling: 'card', indices: [1] });
+      expect(comments.at(-1).body).toContain('actor=judge:r10');
+      expect(comments.at(-1).body).toContain('Pre-existing on main');
+      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+      expect(d.dispositions.get(1).state).toBe('released carded');
+    } finally { rmSync(coordinationRoot, { recursive: true, force: true }); }
+  });
+  it('planner honours setting findingClasses before fallback policy', () => {
+    expect(() => planRedTeamRuling(judgeRead({ isMainAncestor: () => true,
+      setting: { ...CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'coverage-or-style': 'fix-now' } } }),
+      judgeInput('card', { card: CARD, preExisting }))).toThrow(/fix-now/);
+  });
+  it.each([true, false])('full CLI accepts JSON evidence, preview=%s; real sink proves release', async preview => {
+    const comments = judgeRead().comments;
+    const post = vi.fn((_repo, _pr, body) => comments.push({ author: identity, body, createdAt: '2026-11-07T12:00:00Z' }));
+    const declaration = recordRedTeamRulingOperation({ readRulingContext: () => judgeRead({ comments, isMainAncestor: () => true }) });
+    const registry = createRegistry(); registry.register(declaration);
+    const sinks = createRecordRedTeamRulingSinks({ post, isMainAncestor: () => true, resolveIdentity: () => identity,
+      readThread: () => ({ headRefOid: HEAD, labels: [], comments }), resolveCard: () => card,
+      readScope: () => ({ value: { anyState: true } }), readStandingRulingScope: () => null, syncLabels: () => null, warn: () => {} });
+    const request = judgeInput('card', { card: CARD, preExisting: JSON.stringify(preExisting), preview });
+    const result = await runOperationCli({ declaration, registry,
+      argv: ['--json', ...Object.entries(request).map(([k, v]) => `--${k}=${v}`)],
+      store: createMemoryRunStore(), sinks, newRunId: () => 'judge-card-json' });
+    expect(result.code, JSON.stringify(result)).toBe(0);
+    expect(post).toHaveBeenCalledTimes(preview ? 0 : 2);
+    if (!preview) {
+      const body = comments.at(-1).body;
+      expect(body).toContain('actor=judge:r10');
+      expect(body).toContain(attribution);
+      expect(body.indexOf('Pre-existing on main')).toBeGreaterThan(body.indexOf('- 1 finding(s) carded'));
+      const d = readRedTeamDisposition({ comments, repo, pr: PR, head: HEAD, setting: CONFIRMED_BREAKS_DEFAULTS, operatorRulings: { anyState: true } });
+      expect(d.held).toEqual([]);
+      expect(d.rulings.get(1)).toEqual(expect.arrayContaining([expect.objectContaining({ source: 'operator', kind: 'card' })]));
+    }
+  });
   it.each([
     ['fix-now', { findingClass: 'live-reproduced' }, {}],
     ['unclassified', { findingClass: undefined }, {}],

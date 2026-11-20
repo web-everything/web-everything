@@ -84,11 +84,19 @@ export function assertRulingIdentity(identity, actor) {
   if (!isJudgeAuthored({ author: identity })) throw new Error('judge posting identity must be trusted automation');
   return identity.login;
 }
-/** Judge comments can only add a hold, with explicit attribution and live policy. */
+/** Judge card releases require a complete, matching pre-existing observation on the record. */
+function hasPreExistingEvidence(body) {
+  const lines = String(body ?? '').split(/\r?\n/).filter(line => line.startsWith('Pre-existing on main'));
+  if (lines.length !== 1) return false;
+  const m = /^Pre-existing on main \([0-9a-f]{40}\): probe (.+); main=(.+) pr=(.+)$/i.exec(lines[0]);
+  return Boolean(m && m[1].trim() && m[2].trim() && m[3].trim() && m[2] === m[3]);
+}
+
+/** Judge holds and evidenced card releases require attribution, trusted authorship and live policy. */
 export function isRulingComment(c, policy = judgePolicyOnce()) {
   const m = parseRedTeamGateMarker(c?.body);
   if (m?.actor === undefined) return isHumanOperatorComment(c);
-  if (m.actor !== JUDGE_ACTOR || m.outcome !== 'operator-block' || !isJudgeAuthored(c)
+  if (m.actor !== JUDGE_ACTOR || !(m.outcome === 'operator-block' || (m.outcome === 'operator-card' && hasPreExistingEvidence(c?.body))) || !isJudgeAuthored(c)
     || JUDGE_RESERVED_TOKEN_RE.test(String(c?.body ?? ''))
     || !String(c?.body ?? '').split(/\r?\n/).some(line => line === JUDGE_ATTRIBUTION || line === `${JUDGE_ATTRIBUTION} (${JUDGE_ACTOR})`)) return false;
   try { const p = policy(); return p.enabled === true && p.actor === JUDGE_ACTOR; }

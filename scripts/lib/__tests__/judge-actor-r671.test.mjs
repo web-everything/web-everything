@@ -91,6 +91,33 @@ describe('R671 judge readers bind actor and automation author', () => {
     expect(operatorRulingsOnLiveResult([result, block], pr, head).blocked.size).toBe(0);
     expect(liveResultGateState([result, block], pr, head, 'we', null).outcomes.has('operator-block')).toBe(false);
   });
+  it.each([
+    ['valid', 'node probe.mjs; main=null pr=null', botLogin, 'operator-card', true],
+    ['missing', null, botLogin, 'operator-card', false],
+    ['unequal', 'node probe.mjs; main=null pr=key', botLogin, 'operator-card', false],
+    ['empty probe', '; main=null pr=null', botLogin, 'operator-card', false],
+    ['untrusted author', 'node probe.mjs; main=null pr=null', 'mallory', 'operator-card', false],
+    ['not-real', 'node probe.mjs; main=null pr=null', botLogin, 'operator-not-real', false],
+  ])('judge card evidence %s releases only valid records', (_name, evidence, login, outcome, releases) => {
+    const c = judgeGate(outcome, '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).'
+      + (evidence === null ? '' : `\nPre-existing on main (${'b'.repeat(40)}): probe ${evidence}`), login);
+    expect(isRulingComment(c)).toBe(releases);
+    const d = disposition([result, cap, c]);
+    expect(d.held.map(f => f.index)).toEqual(releases ? [] : [1]);
+    if (releases) {
+      expect(d.rulings.get(1)).toEqual(expect.arrayContaining([expect.objectContaining({ source: 'operator', kind: 'card' })]));
+      expect(operatorRulingsOnLiveResult([result, cap, c], pr, head).carded.has(1)).toBe(true);
+    }
+  });
+  it('judge card refuses malformed SHA, disabled policy, missing attribution and reserved tokens', () => {
+    const c = judgeGate('operator-card', '- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).'
+      + `\nPre-existing on main (${'b'.repeat(40)}): probe node probe.mjs; main=null pr=null`);
+    expect(isRulingComment(c, () => ({ enabled: false, actor }))).toBe(false);
+    expect(isRulingComment({ ...c, body: c.body.replace('b'.repeat(40), 'abc') })).toBe(false);
+    expect(isRulingComment({ ...c, body: c.body.replace(attribution, '') })).toBe(false);
+    expect(isRulingComment({ ...c, body: c.body + '\nreviewed-sha' })).toBe(false);
+    expect(isRulingComment({ ...c, body: c.body.replace('main=null', 'main= ') })).toBe(false);
+  });
   it('automation without the judge actor cannot claim an operator card ruling', () => {
     const c = comment(redTeamGateMarker(pr, head, 'operator-card', rid)
       + '\n- 1 finding(s) carded by the operator to `we:backlog/x.md` (#1).');

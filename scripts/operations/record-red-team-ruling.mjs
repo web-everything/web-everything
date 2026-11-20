@@ -248,8 +248,8 @@ export function planRedTeamRuling(read, input) {
   }
   const { pr, ruling, actor, channel, reason } = input;
   const { head, comments, scope, state, atCap, selected } = selectRedTeamRulingFindings(read, input);
-  if (actor === JUDGE_ACTOR && ruling === 'card' && selected.some(f => f.securityReachableToday === true
-    || classAction(f, read.findingClassPolicy) !== 'defer-card' || isSecurityClass(f.class ?? f.findingClass)))
+  if (actor === JUDGE_ACTOR && ruling === 'card' && selected.some(f => f.security === true || f.securityReachableToday === true
+    || classAction(f, read.setting?.findingClasses ?? read.findingClassPolicy) !== 'defer-card' || isSecurityClass(f.class ?? f.findingClass)))
     throw new Error('judge card refuses a fix-now or security break; only coverage-class findings can be carded');
   const base = { repo: input.repo, pr: Number(pr), head, ruling, actor: String(actor).toLowerCase(), channel: String(channel).trim(),
     reason: actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}\n${reason}` : String(reason), at: read.now, resultId: state.resultId, findings: selected, setting: read.setting,
@@ -299,6 +299,11 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
     throw new TypeError('record-red-team-ruling: needs a `readRulingContext({repo, pr})` reader — the real binding is '
       + '`we:scripts/operations/record-red-team-ruling-io.mjs`.');
   }
+  // Run findings are JSON snapshots: restore the verifier from trusted IO, never from stored evidence.
+  const authorityRead = (view, read = view.findings.read) => view.input.actor === JUDGE_ACTOR && view.input.ruling === 'card'
+    ? { ...read, isMainAncestor: sha => readRulingContext({ repo: view.input.repo, pr: view.input.pr,
+      actor: view.input.actor, card: view.input.card }).isMainAncestor?.(sha) }
+    : read;
   return op(RECORD_RED_TEAM_RULING_OP, {
     input: {
       ...judgeRulingInput,
@@ -326,11 +331,11 @@ export function recordRedTeamRulingOperation({ readRulingContext, judgeConfirm }
       validateRedTeamRulingInput(read, input);
       const { selected, state } = selectRedTeamRulingFindings(read, input);
       return selected.map(f => ({ ...f, runId: state.resultId, key: String(f.index) }));
-    }),
+    }, authorityRead),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.break', 'input.ruling', 'input.actor', 'input.channel', 'input.reason', 'input.notWorseThanMain', 'input.preExisting', 'input.card', 'input.cause', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
       fn: (view) => {
-        const plan = cardFilingVerdict(view) ?? planRedTeamRuling(view.findings.reread ?? view.findings.read, (landedRulingCard(view.findings)?.input ?? view.input));
+        const plan = cardFilingVerdict(view) ?? planRedTeamRuling(authorityRead(view, view.findings.reread ?? view.findings.read), (landedRulingCard(view.findings)?.input ?? view.input));
         if (landedRulingCard(view.findings)?.judgeEvidence) plan.judgeEvidence = landedRulingCard(view.findings)?.judgeEvidence;
         return plan;
       },
