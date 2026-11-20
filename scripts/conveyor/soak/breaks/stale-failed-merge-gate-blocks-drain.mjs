@@ -54,6 +54,38 @@ export default {
         report.laterHeads.push((await run(false, { env })).calls);
       }
     }, { slug: 'web-everything/web-everything' });
+    // Review #7184: held admissions must not consume the pass cap, and only an
+    // attempted push may permanently consume the failed-PR claim.
+    const failGate = pr => {
+      pr.failedGate = true;
+      pr.labels.push({ name: 'red-team:clear' });
+      pr.statusCheckRollup = ['test', 'merge-gate'].map(name => ({ name, head_sha: pr.headRefOid,
+        status: 'COMPLETED', conclusion: name === 'test' ? 'SUCCESS' : 'FAILURE' }));
+    };
+    const env = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE: 'on',
+      WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX: undefined };
+    report.passBudgets = [];
+    for (const heldCount of [0, 2]) await world(async ({ pr, run, dir, slug }) => {
+      failGate(pr);
+      pr.extraPrs = [43, 44].map(number => ({ ...structuredClone(pr), number, id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
+      const state = join(dir, 'groups.json');
+      writeFileSync(state, JSON.stringify({ groups: heldCount ? [{ id: 'fixture', repo: slug, pr: 77,
+        branch: 'lane/card-group-fixture', sources: [42, 43].map(num => ({ num, headSha: pr.headRefOid })),
+        files: ['backlog/xfixture.md'], createdAt: Date.now() }] : [], failed: {}, lastReconcileAt: Date.now() }));
+      const out = await run(false, { only: null, env: { ...env, WE_DRAIN_CARD_GROUP_STATE: state } });
+      report.passBudgets.push({ heldCount, considered: out.report.considered, calls: out.calls });
+    }, { slug: 'web-everything/web-everything' });
+    report.errorRetries = [];
+    for (const step of ['fetch', 'fetched-head', 'push']) await world(async ({ pr, run }) => {
+      failGate(pr);
+      if (step === 'fetched-head') pr.fetchedHead = 'd'.repeat(40);
+      else pr.refreshFailureStep = step;
+      const failed = await run(false, { env });
+      delete pr.fetchedHead;
+      delete pr.refreshFailureStep;
+      const retry = await run(false, { env });
+      report.errorRetries.push({ step, failed: failed.calls, retry: retry.calls });
+    }, { slug: 'web-everything/web-everything' });
     return report;
   },
   judge(report) {
@@ -69,6 +101,15 @@ export default {
     if (pushes(report.second).length) violations.push('same head refreshed twice');
     if (pushes(report.disabled).length) violations.push('zero pass budget still refreshed');
     if (report.laterHeads.some(calls => pushes(calls).length)) violations.push('later head reset the PR refresh bound');
+    for (const pass of report.passBudgets) {
+      if (pass.considered !== 3 || pushes(pass.calls).length !== (pass.heldCount ? 1 : 2))
+        violations.push(`pass budget failed with ${pass.heldCount} held candidates`);
+    }
+    for (const error of report.errorRetries) {
+      if (pushes(error.failed).length !== (error.step === 'push' ? 1 : 0)
+        || pushes(error.retry).length !== (error.step === 'push' ? 0 : 1))
+        violations.push(`${error.step} failure did not preserve the correct retry claim`);
+    }
     if (report.merged.length) violations.push('repair changed the original skip into a merge');
     if ([...report.first, ...report.second].some(a => a.includes('PUT') || (a[0] === 'api' && a[1] === 'graphql' && a.some(x => x.startsWith('query=mutation')))))
       violations.push('repair bypassed the refresh path');

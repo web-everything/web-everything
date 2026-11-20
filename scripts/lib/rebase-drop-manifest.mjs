@@ -113,7 +113,8 @@ export { gitRunner };
  *   { action:'current', newCommit, reason, base, laneRef }  — tip already on base AND manifest-free; no rebuild
  *                                                             (idempotency — nothing minted, nothing pushed).
  *   { action:'skip',  reason, conflictPaths }               — a real (non-manifest) conflict; untouched.
- *   { action:'error', reason }                              — a plumbing step failed.
+ *   { action:'pre-push-error', reason }                    — forced refresh failed before any push attempt.
+ *   { action:'error', reason }                             — failed/uncertain push, or a legacy plumbing error.
  *
  * @param {object} o
  * @param {string} o.laneRef            the lane ref name (e.g. `lane/batch-…-2198`) — pushed back to `refs/heads/<laneRef>`.
@@ -137,7 +138,19 @@ export { gitRunner };
  *                                       non-local lane tip too, given that repo's own clone is provisioned.
  * @param {(cmd:string,args:string[],opts?:object)=>{status:number,stdout:string,stderr:string}} [o.run] injected runner.
  */
-export function rebaseDropManifest({
+export function rebaseDropManifest(options = {}) {
+  let pushAttempted = false;
+  const run = (...args) => {
+    // Mark BEFORE invoking the runner: even a thrown or rejected push can have reached the remote.
+    if (args[0] === 'git' && args[1]?.[0] === 'push') pushAttempted = true;
+    return (options.run ?? gitRunner)(...args);
+  };
+  const result = rebuildLaneTip({ ...options, run });
+  return options.forceRefresh && result.action === 'error' && !pushAttempted
+    ? { ...result, action: 'pre-push-error' } : result;
+}
+
+function rebuildLaneTip({
   laneRef,
   base = 'origin/main',
   remote = 'origin',

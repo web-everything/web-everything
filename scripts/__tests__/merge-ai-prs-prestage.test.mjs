@@ -463,6 +463,39 @@ const repairEnv = { WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE:'on',
   WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE:'off' };
 const refreshPushes = calls => calls.filter(a => a[0] === 'git' && a[1] === 'push');
 describe('failed-gate trigger through the real drain', () => {
+  it('shares the default two-rebuild budget across three eligible PRs in one real drain pass', () => world(async ({pr,run}) => {
+    failedGatePr(pr);
+    pr.extraPrs = [43, 44].map(number => ({ ...structuredClone(pr), number, id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
+    const out = await run(false, { only: null, env: { ...repairEnv, WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX: undefined } });
+    expect(out.report.skipped).toHaveLength(3);
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toHaveLength(2);
+    expect(out.report.revalidationAborted.some(row => row.reason.includes('budget exhausted'))).toBe(true);
+  }));
+  it('two card-group holds do not starve the eligible PR behind them', () => world(async ({pr,run,dir,slug}) => {
+    failedGatePr(pr);
+    pr.extraPrs = [43, 44].map(number => ({ ...structuredClone(pr), number, id: `PR_${number}`, headRefName: `lane/readme-${number}` }));
+    const state = join(dir, 'groups.json');
+    writeFileSync(state, JSON.stringify({ groups: [{ id: 'fixture', repo: slug, pr: 77, branch: 'lane/card-group-fixture',
+      sources: [{ num: 42, headSha: sha }, { num: 43, headSha: sha }], files: ['backlog/xfixture.md'], createdAt: Date.now() }],
+      failed: {}, lastReconcileAt: Date.now() }));
+    const out = await run(false, { only: null, env: { ...repairEnv, WE_DRAIN_CARD_GROUP_STATE: state } });
+    expect(out.report.revalidationAborted.filter(row => row.reason.includes('card group'))).toHaveLength(2);
+    expect(refreshPushes(out.calls), JSON.stringify(out.report)).toHaveLength(1);
+    expect(refreshPushes(out.calls)[0].some(arg => arg.includes('refs/heads/lane/readme-44'))).toBe(true);
+  }));
+  it.each(['fetch', 'fetched-head', 'push'])('a %s failure only consumes the PR claim if a push was attempted', step => world(async ({pr,run}) => {
+    failedGatePr(pr);
+    if (step === 'fetched-head') pr.fetchedHead = 'd'.repeat(40);
+    else pr.refreshFailureStep = step;
+    const first = await run(false, { env: repairEnv });
+    expect(refreshPushes(first.calls)).toHaveLength(step === 'push' ? 1 : 0);
+    expect(first.report.revalidationAborted[0].reason).toContain('refresh FAILED');
+    delete pr.fetchedHead;
+    delete pr.refreshFailureStep;
+    const retry = await run(false, { env: repairEnv });
+    expect(refreshPushes(retry.calls), JSON.stringify(retry.report)).toHaveLength(step === 'push' ? 0 : 1);
+    if (step === 'push') expect(retry.report.revalidationAborted[0].reason).toContain('already consumed');
+  }));
   it('zero per-pass budget disables the failed-gate rebuild', () => world(async ({pr,run}) => {
     failedGatePr(pr);
     const out = await run(false, {env:{...repairEnv,WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX:'0'}});

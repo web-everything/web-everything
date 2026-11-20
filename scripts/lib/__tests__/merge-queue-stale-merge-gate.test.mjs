@@ -14,8 +14,26 @@ const freeze = { frozen: false, publishedAt: '2026-10-12T12:49:00Z' };
 const classify = (results, extra = {}) => q.classifyStaleMergeGate({ verdict: verdict(results), headSha: head, landableApartFromMergeState: true, freeze, ...extra });
 const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
 const pr = { baseRefName: 'main', number: 5006, headRefOid: head, headRefName: 'lane/test', body: 'A real description', labels: [{ name: 'ready-to-merge' }], mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED', statusCheckRollup: [green('test'), { ...green('merge-gate'), conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/123/job/456' }] };
-function options(extra = {}) { return { c: { num: 5006, repo: 'o/r', headRef: 'lane/test', ...classifyPr(pr, { defaultBranch: 'main', queueRequiredChecks: ['test', 'merge-gate'] }) }, pr, requiredChecks: ['test', 'merge-gate'], classifyPr, classifyOptions: { defaultBranch: 'main' }, setting: 'on', readVerdict: vi.fn(() => verdict([freezeRow])), readFreeze: () => freeze, readAcceptance: vi.fn(), cloneDir: '/clone', statePath: '/unused', readGateRuns: vi.fn(() => []), readFailedGate: vi.fn(() => ({requiredAppId:null,checkRuns:[]})), readState: () => ({}), record: vi.fn(), refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: head })), ...extra }; }
+function options(extra = {}) { return { c: { num: 5006, repo: 'o/r', headRef: 'lane/test', ...classifyPr(pr, { defaultBranch: 'main', queueRequiredChecks: ['test', 'merge-gate'] }) }, pr, requiredChecks: ['test', 'merge-gate'], classifyPr, classifyOptions: { defaultBranch: 'main' }, setting: 'on', failedGateBudget: { remaining: 2 }, readVerdict: vi.fn(() => verdict([freezeRow])), readFreeze: () => freeze, readAcceptance: vi.fn(), cloneDir: '/clone', statePath: '/unused', readGateRuns: vi.fn(() => []), readFailedGate: vi.fn(() => ({requiredAppId:null,checkRuns:[]})), readState: () => ({}), record: vi.fn(), refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: head })), ...extra }; }
 describe('stale merge-gate refresh', () => {
+  it.each(['rerun', 'rebased', 'held'])('prefers verified legacy recovery (%s) when failed-gate evidence is also available', async action => {
+    const dir = mkdtempSync(join(tmpdir(), 'legacy-overlap-'));
+    const o = options({ statePath: join(dir, 'ledger.json'),
+      readFailedGate: vi.fn(() => ({ requiredAppId: 1, checkRuns: [{ id: 20, name: 'merge-gate',
+        head_sha: head, app: { id: 1 }, status: 'completed', conclusion: 'failure' }] })),
+      needsAcceptanceRestamp: () => false,
+      refreshStalePr: vi.fn(async () => ({ ok: action !== 'held', action, newCommit: head })) });
+    try {
+      const out = await q.handleStaleMergeGate(o);
+      expect(out.handled).toBe(true);
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+      expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ runId: 123, expectedHead: head }));
+      expect(o.refreshStalePr.mock.calls[0][0].forceRefresh).toBeUndefined();
+      expect(o.readFailedGate).not.toHaveBeenCalled();
+      expect(o.failedGateBudget.remaining).toBe(2);
+      expect(readdirSync(dir).some(name => name.includes('failed-pr'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('falls through to the legacy stale-hold recovery when failed-gate evidence throws', async () => {
     const o = options({ readFailedGate: () => { throw new Error('throttled'); } });
     expect((await q.handleStaleMergeGate(o)).reason).toContain('refresh rerun');

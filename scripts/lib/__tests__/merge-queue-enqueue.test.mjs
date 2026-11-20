@@ -65,7 +65,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
       pr: { headRefOid: HEAD, statusCheckRollup: [green('test'), green('merge-gate')] },
-      requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on',
+      requiredChecks: ['test', 'merge-gate'], classifyPr: vi.fn(() => ({ decision: 'merge' })), setting: 'on', failedGateBudget: { remaining: 2 },
       readGateRuns: vi.fn(() => [startupRun()]), readVerdict: vi.fn(), readFreeze: vi.fn(), readAcceptance: vi.fn(),
       cloneDir: '/clone', readState: () => ({}), record: vi.fn(), statePath: join(mkdtempSync(join(tmpdir(), 'sg-ledger-')), 'ledger.json'),
       refreshStalePr: vi.fn(async () => ({ ok: true, action: 'rerun', newCommit: HEAD })), ...extra,
@@ -918,7 +918,7 @@ describe('required-app failed gate uses the existing guarded refresh', () => {
       pr: { headRefOid: HEAD, statusCheckRollup: [
         { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' },
         { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE' }] },
-      requiredChecks: ['test', 'merge-gate'], classifyPr: () => ({ decision: 'merge' }), setting: 'on',
+      requiredChecks: ['test', 'merge-gate'], classifyPr: () => ({ decision: 'merge' }), setting: 'on', failedGateBudget: { remaining: 2 },
       readFailedGate: vi.fn(async () => ({ requiredAppId: 1, checkRuns: [failed()] })),
       readVerdict: vi.fn(() => { throw Error('no historical verdict needed'); }),
       cloneDir: '/clone', statePath: join(mkdtempSync(join(tmpdir(), 'failed-gate-')), 'ledger.json'),
@@ -951,6 +951,38 @@ describe('required-app failed gate uses the existing guarded refresh', () => {
       expect(await handleStaleMergeGate(o)).toEqual({ handled: false });
       expect(o.readFailedGate).not.toHaveBeenCalled();
       expect(o.refreshStalePr).not.toHaveBeenCalled();
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it.each([undefined, {}, { remaining: -1 }, { remaining: NaN }])('requires a valid pass-owned budget: %j', async failedGateBudget => {
+    const o = options({ failedGateBudget });
+    try {
+      await expect(handleStaleMergeGate(o)).rejects.toThrow('failedGateBudget');
+      expect(o.refreshStalePr).not.toHaveBeenCalled();
+    } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+  });
+  it.each(['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh', 'pre-push-error', 'skip'])(
+    'refunds a confirmed %s before the next candidate and allows a later retry', async action => {
+      const o = options();
+      const budget = o.failedGateBudget;
+      o.refreshStalePr.mockResolvedValueOnce({ ok: false, action }).mockResolvedValueOnce({ ok: false, action });
+      try {
+        for (const num of [7, 8, 9]) await handleStaleMergeGate({ ...o, c: { ...o.c, num } });
+        expect(o.refreshStalePr).toHaveBeenCalledTimes(3);
+        expect(budget.remaining).toBe(1);
+        await handleStaleMergeGate(o);
+        expect(o.refreshStalePr).toHaveBeenCalledTimes(4);
+        expect(budget.remaining).toBe(0);
+      } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
+    });
+  it('retains the claim and budget for an ambiguous push error', async () => {
+    const o = options();
+    o.refreshStalePr.mockResolvedValue({ ok: false, action: 'error', error: 'push outcome unknown' });
+    try {
+      await handleStaleMergeGate(o);
+      expect(o.failedGateBudget.remaining).toBe(1);
+      await handleStaleMergeGate(o);
+      expect(o.refreshStalePr).toHaveBeenCalledTimes(1);
+      expect(o.failedGateBudget.remaining).toBe(1);
     } finally { rmSync(dirname(o.statePath), { recursive: true, force: true }); }
   });
   it.each(['throw', 'lost-ledger', 'concurrent'])('keeps the PR bound through %s', async mode => {

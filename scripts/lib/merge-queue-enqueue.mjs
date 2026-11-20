@@ -52,9 +52,9 @@ export const REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT = 'on';
 export const resolveRefreshOnUnsatisfiedWorkflows = options => resolveRefreshSetting('refreshOnUnsatisfiedWorkflows', 'WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS', options);
 export const resolveRefreshOnStaleMergeGate = options => resolveRefreshSetting('refreshOnStaleMergeGate', 'WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE', options);
 
-export function resolveStaleGateUpdateBranchMax({ env = process.env, tool, platform, log = () => {} } = {}) {
+export function resolveStaleGateUpdateBranchMax({ env = process.env, tool, platform, readSettings = readDeclaredSettings, log = () => {} } = {}) {
   const raw = env.WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX;
-  const resolved = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readDeclaredSettings().settings.drain), {
+  const resolved = cascadePolicy('drain', tool ?? readSettings().settings.drain, {
     env, platform, standard: { staleGateUpdateBranchMax: 2 },
     envValues: { staleGateUpdateBranchMax: raw === undefined ? undefined : /^\d+$/.test(raw) ? Number(raw) : NaN },
     valid: { staleGateUpdateBranchMax: value => Number.isSafeInteger(value) && value >= 0 && value <= 100 },
@@ -645,9 +645,10 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
     dispatched = true;
     try {
       const out = await refreshOptions.refreshStalePr({ ...options, ...(pending ? { gateRefreshPending: pending } : {}) });
-      if (failedPrClaim && !out?.ok && ['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh'].includes(out?.action)) {
+      if (failedPrClaim && !out?.ok && ['held', 'held-current', 'head-moved', 'unverified-pr', 'proof-unreadable', 'refresh', 'pre-push-error', 'skip'].includes(out?.action)) {
         // These are confirmed pre-mutation refusals. Retain every ambiguous failure.
         unlinkSync(failedPrClaim);
+        failedGateBudget.remaining += 1;
       }
       if (out?.state === 'pending-unknown') {
         uncertain = true;
@@ -680,11 +681,35 @@ async function refreshStartupFailure({ c, headSha, classification, setting, stat
   return result;
 }
 
-/** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
+/** Read the legacy stale-hold verdict independently of the newer failed-check trigger. */
+async function readLegacyStaleGate({ c, pr, headSha, acceptance, readAcceptance, readFreeze, readVerdict, cwd, cloneDir }) {
+  const no = reason => ({ stale: false, ...(reason ? { reason } : {}) });
+  const run = latestFailingMergeGate(pr.statusCheckRollup);
+  if (!run || String(run.conclusion).toLowerCase() !== 'failure') return no();
+  const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');
+  const runId = Number(ids?.[1]), jobId = Number(ids?.[2]);
+  if (!Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(jobId) || jobId <= 0) return no('merge-gate run/job URL unreadable');
+  try {
+    const verdict = await readVerdict({ repo: c.repo, jobId, prNumber: c.num });
+    if (verdict?.num !== c.num) return no('merge-gate PR verdict unreadable');
+    let evidence = acceptance;
+    if (verdict.results?.some(r => r.status === 'hold' && (r.id === 'test-gaming' || (r.id === 'review-acceptance' && r.reason?.startsWith('human-only:'))))) {
+      evidence ??= await readAcceptance({ pr: c.num, repo: c.repo, cwd });
+      if (evidence?.headSha !== headSha) return no('merge-gate acceptance head mismatch');
+    }
+    const freeze = verdict.results?.some(r => r.status === 'hold' && r.id === 'red-main-freeze')
+      ? await readFreeze({ board: cloneDir }) : undefined;
+    return { ...classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze }), runId };
+  } catch (e) { return no(`merge-gate evidence unreadable: ${errText(e)}`); }
+}
+
+/** Post-cascade recovery. The caller must own one mutable failedGateBudget for the entire pass. */
 export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
   readFailedGate = readFailedMergeGateEvidence, readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance, readGateRuns = readMergeGateRuns,
   writeClaim = path => closeSync(openSync(path, 'wx')), warn = () => {},
-  statePath = staleMergeGateRefreshStatePath(), failedGateBudget = { remaining: 2 }, ...refreshOptions } = {}) {
+  statePath = staleMergeGateRefreshStatePath(), failedGateBudget, ...refreshOptions } = {}) {
+  if (!Number.isSafeInteger(failedGateBudget?.remaining) || failedGateBudget.remaining < 0 || failedGateBudget.remaining > 100)
+    throw new TypeError('handleStaleMergeGate requires a pass-owned failedGateBudget with remaining in [0, 100]');
   const unchanged = { handled: false };
   if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
     || !c.reason?.startsWith('merge state BLOCKED') || !pr?.headRefOid) return unchanged;
@@ -707,6 +732,12 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
     return refreshStartupFailure({ c, headSha, classification, setting, statePath, writeClaim, warn, refreshOptions });
   }
   if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
+  // Recovery ordering: verified legacy stale holds win over forced failed-gate rebuilds.
+  // Even a held/failed legacy refresh must not spend the failed-PR claim or invalidate head evidence.
+  const legacy = await readLegacyStaleGate({ c, pr, headSha, acceptance, readAcceptance, readFreeze, readVerdict,
+    cwd: refreshOptions.cwd, cloneDir: refreshOptions.cloneDir });
+  if (legacy.stale) return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
+    decide: decideStaleMergeGateRefresh, runId: legacy.runId, label: 'stale merge-gate', wording: `stale merge-gate (${legacy.reason})` });
   // failedRequiredGateRefresh: another trigger for the same guarded refresh and its existing per-head ledger.
   // A check-run id is not a workflow run id; this trigger rebuilds the head instead of rerunning the old workflow.
   if (everyOtherRequiredGreen(requiredChecks, pr.statusCheckRollup)) {
@@ -717,29 +748,8 @@ export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, 
           setting, statePath, writeClaim, warn, refreshOptions, failedGateBudget });
       }
     } catch (error) {
-      // Unknown evidence refuses this trigger, not the independent legacy verdict path.
-      warn(`failed merge-gate evidence unreadable: ${errText(error)}; trying legacy stale-hold evidence`);
+      warn(`failed merge-gate evidence unreadable: ${errText(error)}; legacy stale-hold recovery did not qualify`);
     }
   }
-  const run = latestFailingMergeGate(pr.statusCheckRollup);
-  if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
-  const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');
-  const runId = Number(ids?.[1]), jobId = Number(ids?.[2]);
-  if (!Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(jobId) || jobId <= 0) return { ...unchanged, reason: 'merge-gate run/job URL unreadable' };
-  let classification;
-  try {
-    const verdict = await readVerdict({ repo: c.repo, jobId, prNumber: c.num });
-    if (verdict?.num !== c.num) return { ...unchanged, reason: 'merge-gate PR verdict unreadable' };
-    let evidence = acceptance;
-    if (verdict.results?.some(r => r.status === 'hold' && (r.id === 'test-gaming' || (r.id === 'review-acceptance' && r.reason?.startsWith('human-only:'))))) {
-      evidence ??= await readAcceptance({ pr: c.num, repo: c.repo, cwd: refreshOptions.cwd });
-      if (evidence?.headSha !== headSha) return { ...unchanged, reason: 'merge-gate acceptance head mismatch' };
-    }
-    const freeze = verdict.results?.some(r => r.status === 'hold' && r.id === 'red-main-freeze')
-      ? await readFreeze({ board: refreshOptions.cloneDir }) : undefined;
-    classification = classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze });
-  } catch (e) { return { ...unchanged, reason: `merge-gate evidence unreadable: ${errText(e)}` }; }
-  if (!classification.stale) return { ...unchanged, reason: classification.reason };
-  return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
-    decide: decideStaleMergeGateRefresh, runId, label: 'stale merge-gate', wording: `stale merge-gate (${classification.reason})` });
+  return legacy.reason ? { ...unchanged, reason: legacy.reason } : unchanged;
 }

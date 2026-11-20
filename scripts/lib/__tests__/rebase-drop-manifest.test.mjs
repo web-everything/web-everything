@@ -84,6 +84,14 @@ const RESOLVED_PLUMBING = {
 };
 
 describe('rebaseDropManifest', () => {
+  it.each(['fetch', 'rev-parse', 'read-tree', 'write-tree', 'commit-tree', 'push'])(
+    'distinguishes a forced refresh failure at %s by whether a push was attempted', step => {
+      const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
+        'rev-parse': { stdout: 'a'.repeat(40) }, [step]: { status: 1, stderr: 'transient failure' } });
+      const out = rebaseDropManifest({ laneRef: 'lane/x', forceRefresh: true, expectedHead: 'a'.repeat(40), run });
+      expect(out.action).toBe(step === 'push' ? 'error' : 'pre-push-error');
+      expect(calls.some(c => c.args[0] === 'push')).toBe(step === 'push');
+    });
   it('pins a forced failed-gate rebuild after fetch and leases the judged head on push', () => {
     const expectedHead = 'a'.repeat(40);
     const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
@@ -96,7 +104,7 @@ describe('rebaseDropManifest', () => {
   it.each(['b'.repeat(40), '', 'bad-sha'])('refuses a moved or unreadable fetched head before a forced rebuild: %s', fetched => {
     const { run, calls } = scriptedRun({ ...MERGE_TREE_CLEAN, ...RESOLVED_PLUMBING,
       'rev-parse': { stdout: fetched } });
-    expect(rebaseDropManifest({ laneRef: 'lane/x', forceRefresh: true, expectedHead: 'a'.repeat(40), run }).action).toBe('error');
+    expect(rebaseDropManifest({ laneRef: 'lane/x', forceRefresh: true, expectedHead: 'a'.repeat(40), run }).action).toBe('pre-push-error');
     expect(calls.some(c => ['merge-tree', 'commit-tree', 'push'].includes(c.args[0]))).toBe(false);
   });
   it('a manifest-only conflict → resolves and pushes a rebuilt tip (dropped=true)', () => {

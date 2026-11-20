@@ -5658,8 +5658,10 @@ Check mode fetches origin main before evaluating canonical audit evidence. A fai
 pinned head from the live required app. Exercise it through the existing stale-gate refresh and
 real drain CLI, including each queue/review/workflow/group/claim/approved-head hold. The existing
 refresh ledger and atomic claims bound rebuilds per head. Failed-gate rebuilds also reserve a
-durable PR claim, so a later head cannot reset the attempt budget. A confirmed admission hold
-releases that claim; a successful or uncertain mutation retains it for operator inspection.
+durable PR claim, so a later head cannot reset the attempt budget. A confirmed admission hold,
+real-conflict skip or pre-push plumbing error releases that claim and refunds its pass reservation;
+a successful or uncertain push retains both for operator inspection. A thrown runner error is
+uncertain. The forced rebuild reports `pre-push-error` only when no push command was attempted.
 `drain.staleGateUpdateBranchMax` caps attempts per pass (standard 2, 0 disables this trigger),
 resolved through the policy cascade with `WE_DRAIN_STALE_GATE_UPDATE_BRANCH_MAX` as the env override.
 The setting lives in `scripts/settings/merge-queue.json`; recovery uses the existing
@@ -5670,17 +5672,23 @@ A current branch must still produce a new head, since label events cannot refres
 The soak break `stale-failed-merge-gate-blocks-drain` drives that production CLI with private transport
 fixtures; its single source marker detects presence only. Truncated check history or unreadable app
 identity keeps the PR skipped and asks the operator to inspect and refresh the branch manually.
-An evidence-reader exception still permits independently verified legacy stale-hold recovery.
+Verified legacy stale-hold recovery takes precedence over the forced rebuild, including when its
+refresh is held or fails. It keeps the workflow rerun available and never spends a failed-PR claim.
+An evidence-reader exception cannot prevent independently verified legacy stale-hold recovery.
 
-Acceptance coverage: `merge-queue-stale-merge-gate.test.mjs` pins exception fallthrough;
-`merge-queue-enqueue.test.mjs` pins multi-PR default/explicit/zero budgets, cross-head exhaustion,
+Acceptance coverage: `merge-queue-stale-merge-gate.test.mjs` pins recovery-arm overlap and exception fallthrough;
+`merge-queue-enqueue.test.mjs` pins required pass-owned budgets, refunds, multi-PR default/explicit/zero budgets, cross-head exhaustion,
 listing/live mismatch, required app identity and bounded history; `merge-ai-prs-prestage.test.mjs`
 pins forks, bases, labels, merge states, other failing checks, moved branch tips, card ownership,
-human approval, fix claims, zero-disable wiring and startup-failure admission through the real drain.
+human approval, fix claims, zero-disable wiring, the default cap across three candidates, admission-held
+candidates ahead of an eligible PR, and startup-failure admission through the real drain.
+`settings-files.test.mjs` pins a declared zero kill switch with either test environment variable set;
+inject the settings reader for isolation instead of bypassing operator settings in production code.
 `required-status-checks.test.mjs` pins the ruleset and classic app-ID producers.
 
-Prevention for PR #7184: when adding a recovery arm, test a thrown read falling through to each
-pre-existing arm. A head-mutating retry needs a durable bound independent of the current SHA,
+Prevention for PR #7184: new recovery arms must declare their ordering beside the dispatcher and
+test available-evidence overlap as well as a thrown read falling through to each pre-existing arm.
+A head-mutating retry needs a durable bound independent of the current SHA,
 and the acceptance contract must name both its settings declaration and multi-candidate test.
 Shared admission changes must exercise each existing caller. Run changed test files and their
 soak fixture in the diff-selected verification gate; fixture capability checks must remain real.

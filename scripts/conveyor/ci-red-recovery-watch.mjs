@@ -177,7 +177,7 @@ export function buildCandidates(prs, {
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#refreshOntoMain — refresh ONE PR's lane branch onto current
  * `main`, the ONE write this pass ever performs. A thin wrapper over the shared, proven
  * `we:scripts/lib/rebase-drop-manifest.mjs#rebaseDropManifest` — never a second rebase implementation. Reports
- * `rebaseDropManifest`'s own `action` verbatim (`'rebased'` / `'current'` / `'skip'` / `'error'`) so a reader can
+ * `rebaseDropManifest`'s own `action` verbatim (`'rebased'` / `'current'` / `'skip'` / `'pre-push-error'` / `'error'`) so a reader can
  * tell "refreshed" apart from "was already current" apart from "hit a real conflict, left for a human".
  * The sink guard: when the caller names the PR (`prNumber`), it must be provably same-repo
  * ({@link sameRepoRefusal}) before anything is rebased or pushed — a fork PR, or one whose head name merely
@@ -195,7 +195,7 @@ export function refreshOntoMain(laneRef, {
     if (refused) return refused;
   }
   const result = rebase({ laneRef, base, cwd: root, ...(forceRefresh ? { forceRefresh: true, expectedHead } : {}) });
-  if (result.action === 'error') return { ok: false, action: 'error', error: result.reason };
+  if (result.action === 'error' || result.action === 'pre-push-error') return { ok: false, action: result.action, error: result.reason };
   if (result.action === 'skip') return { ok: false, action: 'skip', error: result.reason };
   // #2811 — `newCommit` threaded through (never dropped): `sweepCiRedRecovery`'s own apply loop needs the
   // AUTHORITATIVE post-rebase head to re-verify/re-arm a live `review:accepted` against, the same "this

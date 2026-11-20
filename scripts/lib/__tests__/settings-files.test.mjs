@@ -520,3 +520,16 @@ it.each([
   expect(resolved.value.staleGateUpdateBranchMax).toBe(value);
   expect(resolved.sources.staleGateUpdateBranchMax).toBe(source);
 });
+
+it.each(['VITEST', 'WE_UNDER_TEST'])('honours the declared kill switch with %s set', flag => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-kill-switch-'));
+  try {
+    writeFileSync(join(dir, 'merge-queue.json'), JSON.stringify({ drain: { staleGateUpdateBranchMax: 0 } }));
+    let reads = 0;
+    const resolved = resolveStaleGateUpdateBranchMax({ env: { [flag]: '1' }, platform: {},
+      readSettings: () => { reads++; return readDeclaredSettings({ dir, legacyPath: join(dir, 'missing.json') }); } });
+    expect(resolved.value.staleGateUpdateBranchMax).toBe(0);
+    expect(resolved.sources.staleGateUpdateBranchMax).toBe('tool');
+    expect(reads).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
