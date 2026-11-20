@@ -614,6 +614,7 @@
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-deferred.test.mjs": 0.04,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-main-fix-cap.test.mjs": 0.18,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-operator-send-back.test.mjs": 0.02,
+  "scripts/conveyor/__tests__/reconcile-fix-dispatch-planning-deadline.test.mjs": 0.05,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch-step-timing.test.mjs": 0.04,
   "scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs": 1.87,
   "scripts/conveyor/__tests__/reconcile-note-comment.test.mjs": 0.05,
@@ -820,6 +821,7 @@
   "scripts/lib/__tests__/antigravity-judge-spawn.integration.test.mjs": 0,
   "scripts/lib/__tests__/antigravity-judge-spawn.test.mjs": 4.13,
   "scripts/lib/__tests__/antigravity-run-evidence.test.mjs": 0.04,
+  "scripts/lib/__tests__/external-juror-liveness.test.mjs": 2,
   "scripts/lib/__tests__/approval-prevention-notice.test.mjs": 0.03,
   "scripts/lib/__tests__/approved-human-surface-hold.test.mjs": 0.02,
   "scripts/lib/__tests__/archive-closed-review-runs.test.mjs": 0.48,
@@ -1970,7 +1972,9 @@
  },
  "soak": {
   "scripts/conveyor/soak/breaks/runtime-admission-infra-retention.soak.test.mjs": 0.1,
+  "scripts/conveyor/soak/breaks/catch-up-clean-first-snapshot-first.soak.test.mjs": 4.65,
   "scripts/conveyor/soak/breaks/rebuild-job-ready-candidate-starvation.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-queue-stale-eviction.soak.test.mjs": 4.12,
   "scripts/conveyor/soak/breaks/red-team-queue-verdict-evict.soak.test.mjs": 4.12,
@@ -1986,6 +1990,7 @@
   "scripts/conveyor/soak/breaks/lane-acquire-default-wait.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/ci-rerun-ignores-external-red-team.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/red-team-skip-reason-drops-comment-error.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/red-team-reservation-route-exhaustion.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/stall-sweep-pages-files-past-100.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rebuild-operator-retired-live-overlay-adopts.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/restamp-comment-does-not-retrigger-merge-gate.soak.test.mjs": 2,
@@ -2000,6 +2005,7 @@
   "scripts/conveyor/soak/breaks/review-hold-only-incomplete-inventory.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/clone-object-maintenance-borrowed-or-busy.soak.test.mjs": 0.79,
   "scripts/conveyor/soak/breaks/red-team-label-deadlock.soak.test.mjs": 2.53,
+  "scripts/conveyor/soak/breaks/fix-dispatch-plan-eats-budget.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/stall-sweep-informational-refusal.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/overlay-main-sync-unrunnable-selection.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/review-pr-list-504-reads-zero-owed.soak.test.mjs": 3.02,
@@ -2276,6 +2282,7 @@
   "scripts/conveyor/soak/breaks/post-accept-advisory-shadow-replay.soak.test.mjs": 2.91,
   "scripts/conveyor/soak/breaks/pr-sweep-invariant-four-cases.soak.test.mjs": 0.85,
   "scripts/conveyor/soak/breaks/prepare-launch-budget-starved-by-parked-reads.soak.test.mjs": 0.93,
+  "scripts/conveyor/soak/breaks/pinnedfrom-audited-exemption.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/probe-worker-termination-blocks-timeout.soak.test.mjs": 3.07,
   "scripts/conveyor/soak/breaks/ready-candidate-auto-retired-overlay-graduated.soak.test.mjs": 0.22,
   "scripts/conveyor/soak/breaks/rebuild-coordination-noop-events.soak.test.mjs": 0.05,
@@ -2305,8 +2312,10 @@
   "scripts/conveyor/soak/breaks/task-owner-dies-before-stop.soak.test.mjs": 0.18,
   "scripts/conveyor/soak/breaks/verdict-ledger-slow-push-race-refused.soak.test.mjs": 17.78,
   "scripts/conveyor/soak/breaks/ready-candidate-long-tick.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/agy-juror-first-output.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/timings-advisory-merge.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/superseded-omits-retired-merged-overlay.soak.test.mjs": 2,
-  "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/smoke-queue-force-priority.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1
  }
 }
