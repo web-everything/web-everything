@@ -1,15 +1,16 @@
 ---
+bornAs: xv2wrgp
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/review-run-index.mjs"]
+scope: ["we:scripts/operations/run.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# Retire the fullReviewRuns full-store backfill in the review run index
+# Schedule the review-run archive (archive-closed-review-runs)
 
-The full-store backfill in we:scripts/lib/review-run-index.mjs can never produce a usable proof on the live store (mid-rebuild, 512-key eviction, poison markers) and wastes about 25 parses per drain tick; retire it now that option G proves never-reviewed by name.
+The shared review run store holds about 3300 records; archive-closed-review-runs is never scheduled and its first run on the shared store needs an operator Go. Schedule it with a safe default minimum age.
 
 ## Acceptance
 

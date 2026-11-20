@@ -1,15 +1,16 @@
 ---
+bornAs: x264jrv
 kind: story
 size: 3
 status: open
-scope: ["we:scripts/operations/review-loop-cli.mjs"]
+scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/lib/review-run-index.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# Clear the pending ledgerEvents effect on needs-human review runs after the human accepts
+# Harden headNeverReviewedFromRuns store-identity validation (op, filename PR, abandoned id, archive keys)
 
-Runs ed6ff284 and 91368953 stay needs-human with the human-owned ledgerEvents effect pending although the PR shows review:accepted; this may be the cause of stranded red-team PRs (#7116, #7112). Find who should settle the effect and make the accept path do it.
+Audit follow-ups on the option-G never-reviewed proof in we:scripts/lib/review-red-team-on-skip.mjs: validate op=review-pr, the PR encoded in modern filenames, malformed repo ids (we:scripts/lib/review-run-index.mjs), abandoned-sidecar run ids, and archive keys under other PR directories; keep the bounded-parse convergence (401 records, 300 budget) visible to operators; restore index-test expectations for contradictory identity. Worst case today is one extra full review (R640), never a red-team release.
 
 ## Acceptance
 

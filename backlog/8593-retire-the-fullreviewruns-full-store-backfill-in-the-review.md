@@ -1,15 +1,16 @@
 ---
+bornAs: x4cf2iq
 kind: story
-size: 3
+size: 2
 status: open
-scope: ["we:scripts/lib/review-red-team-on-skip.mjs", "we:scripts/lib/review-run-index.mjs"]
+scope: ["we:scripts/lib/review-run-index.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# Harden headNeverReviewedFromRuns store-identity validation (op, filename PR, abandoned id, archive keys)
+# Retire the fullReviewRuns full-store backfill in the review run index
 
-Audit follow-ups on the option-G never-reviewed proof in we:scripts/lib/review-red-team-on-skip.mjs: validate op=review-pr, the PR encoded in modern filenames, malformed repo ids (we:scripts/lib/review-run-index.mjs), abandoned-sidecar run ids, and archive keys under other PR directories; keep the bounded-parse convergence (401 records, 300 budget) visible to operators; restore index-test expectations for contradictory identity. Worst case today is one extra full review (R640), never a red-team release.
+The full-store backfill in we:scripts/lib/review-run-index.mjs can never produce a usable proof on the live store (mid-rebuild, 512-key eviction, poison markers) and wastes about 25 parses per drain tick; retire it now that option G proves never-reviewed by name.
 
 ## Acceptance
 

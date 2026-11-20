@@ -1,15 +1,16 @@
 ---
+bornAs: xbepuwe
 kind: story
-size: 2
+size: 3
 status: open
-scope: ["we:scripts/operations/run.mjs"]
+scope: ["we:scripts/operations/review-loop-cli.mjs"]
 dateOpened: "2026-11-20"
 tags: []
 ---
 
-# Schedule the review-run archive (archive-closed-review-runs)
+# Clear the pending ledgerEvents effect on needs-human review runs after the human accepts
 
-The shared review run store holds about 3300 records; archive-closed-review-runs is never scheduled and its first run on the shared store needs an operator Go. Schedule it with a safe default minimum age.
+Runs ed6ff284 and 91368953 stay needs-human with the human-owned ledgerEvents effect pending although the PR shows review:accepted; this may be the cause of stranded red-team PRs (#7116, #7112). Find who should settle the effect and make the accept path do it.
 
 ## Acceptance
 
