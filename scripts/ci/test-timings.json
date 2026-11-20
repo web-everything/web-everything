@@ -2257,6 +2257,7 @@
   "scripts/conveyor/soak/breaks/run-store-stray-entry.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/runner-shutdown-abandons-passes.soak.test.mjs": 0.85,
   "scripts/conveyor/soak/breaks/runner-snapshot-blocks-deadlines.soak.test.mjs": 0.26,
+  "scripts/conveyor/soak/breaks/same-head-hold-clean-head-never-resolves.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/scope-bloat-net-diff-deadlock.soak.test.mjs": 0.81,
   "scripts/conveyor/soak/breaks/scope-overlap-waiter-starved-by-live-claims.soak.test.mjs": 2.41,
   "scripts/conveyor/soak/breaks/scorecard-dirt.soak.test.mjs": 330,
