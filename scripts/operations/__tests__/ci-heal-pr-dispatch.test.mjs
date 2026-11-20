@@ -172,6 +172,35 @@ describe('oldest owed CI-heal first', () => {
       expect(lines.some(l => /refused fix-cap PR #5087: /.test(l))).toBe(true);
     } finally { err.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
+
+  it('logs Phase B refusals (held, dispatch-failed) and not a false refusal for a dispatched PR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-refusal-log-b-'));
+    const plan = planReconcile({ requiredChecks: ['test'], prs: [5087, 5082, 5017].map(number => ({
+      number, state: 'OPEN', headRefName: `lane/${number}`, headRefOid: 'a'.repeat(40),
+      labels: [{ name: 'ci:failed' }], comments: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+    })) });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const dispatch = vi.fn(async planned => {
+      if (planned.pr === 5017) return { held: true, reason: 'already in flight' };
+      if (planned.pr === 5082) throw new Error('boom');
+      return { pr: planned.pr };
+    });
+    try {
+      await runReconcileCiHealDispatch({ root: '/repo', reconcile: () => plan,
+        checkStaleness: FRESH, dispatch, dispatchThrottle: { tryAdmit: () => ({ admit: true }), recheckHost: () => ({ admit: true }) },
+        pickFreeLanes: () => [1, 2, 3], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+        resolveProfile: () => ({ capabilities: { ciHeal: true } }), unsupportedPath: join(dir, 'u.json'),
+        flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [], timeoutHold: () => null,
+        salvage: async () => null, currentBuild: () => null,
+        fixLoop: { killed: () => false, readRows: () => [], append: vi.fn() },
+      });
+      const lines = err.mock.calls.map(c => String(c[0]));
+      expect(lines.some(l => /refused held PR #5017: already in flight/.test(l))).toBe(true);
+      expect(lines.some(l => /refused dispatch-failed PR #5082/.test(l))).toBe(true);
+      expect(lines.some(l => /refused unknown/.test(l))).toBe(false);
+    } finally { err.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 const TEMPLATE = 'heal #{{ITEM_NUM}} pr={{PR_NUM}} ref={{LANE_REF}} lane={{LANE}} slug={{SESSION_SLUG}} scope={{SCOPE}} why={{REASON}}';
