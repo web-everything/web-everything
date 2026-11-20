@@ -54,6 +54,7 @@ import { fileURLToPath } from 'node:url';
 import { assembleReviewDetail } from '../review-detail.mjs';
 import { computeNetDiffPaths, computeNetDiffText, resolveNetDiffBasis } from '../merge-ai-prs.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { OPERATOR_CLI_STALE_MARKER, STALE_MAIN_REFUSAL_MARKER } from '../lib/main-staleness.mjs';
 import { fingerprintOf, readStackBase, stackNetDiffText, stackNetFiles } from '../conveyor/review-stack-base.mjs';
 import { currentActorId, parseAuthorActorId } from '../lib/review-independence.mjs';
 // #xlw02hw — the `advise` step's sink posts a BARE comment (never `we:scripts/review-set-label.mjs`, which
@@ -936,6 +937,11 @@ export const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_R
 
 const PRE_WRITE_REFUSALS = Object.freeze([
   ...BODY_FILE_REFUSALS,
+  // The operator freshness guard runs at CLI entry, before any write. Require its full no-write evidence.
+  new RegExp('^review-set-label: this checkout is [^\\r\\n]*behind origin/[^\\r\\n]*'
+    + [STALE_MAIN_REFUSAL_MARKER, OPERATOR_CLI_STALE_MARKER]
+      .map(marker => marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^\\r\\n]*')
+    + '[^\\r\\n]*Nothing was changed\\.$'),
   'usage: review-set-label.mjs',
   'invalid --repo',
   'invalid --to',
