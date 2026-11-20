@@ -25,7 +25,7 @@ import { createRegistry } from '../registry.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { planScaffold, shapeScaffoldRead, SCAFFOLD_EFFECT } from '../scaffold.mjs';
 import {
-  planQueueing, NON_DISPATCHABLE_KINDS, fileItemOperation, FILE_ITEM_OP, FILE_ITEM_QUEUE_EFFECT,
+  planQueueing, NON_DISPATCHABLE_KINDS, fileItemOperation, FILE_ITEM_OP, FILE_ITEM_QUEUE_EFFECT, FILE_ITEM_CARD_BRANCH_EFFECT,
 } from '../file-item.mjs';
 
 const read = (over = {}) => shapeScaffoldRead({
@@ -97,7 +97,9 @@ describe('the declaration end to end', () => {
   // loops until the run is no longer `awaiting-effect`, so both sinks actually get called.
   async function runToCompletion(run, { registry, sinks, store }) {
     for (let i = 0; i < 10 && runStatus(run, { registry }) === 'awaiting-effect'; i += 1) {
-      const applied = await applyPendingEffects(run, { registry, sinks, store });
+      const applied = await applyPendingEffects(run, { registry, sinks: {
+        [FILE_ITEM_CARD_BRANCH_EFFECT]: async () => ({ pushed: true }), ...sinks,
+      }, store });
       run = applied.run;
       run = advanceWhileRunning(run, { registry });
     }
@@ -324,7 +326,7 @@ describe('the declaration end to end', () => {
     expect(queued[0].num).toBe('123');
   });
 
-  it('drives read → plan → queuePlan → write + queueAdd, hitting BOTH sinks for a plain task', async () => {
+  it('drives write → queueAdd → cardBranch for a plain task', async () => {
     const registry = buildRegistry();
     const written = [];
     const queued = [];
@@ -344,6 +346,8 @@ describe('the declaration end to end', () => {
     expect(written[0].rel).toMatch(/^backlog\/x[a-z0-9]+-a-new-task\.md$/);
     expect(queued).toHaveLength(1);
     expect(queued[0].num).toBe(run.verdict.num);
+    expect(run.effects.map(e => e.type)).toEqual([SCAFFOLD_EFFECT, FILE_ITEM_QUEUE_EFFECT, FILE_ITEM_CARD_BRANCH_EFFECT]);
+    expect(run.effects.at(-1).payload).toEqual({ rel: run.verdict.rel });
     // The verdict is scaffold's own shape, unchanged — a caller of `scaffold` and a caller of `file-item`
     // read the identical fields off `run.verdict` for the same input.
     expect(run.verdict.kind).toBe('task');
