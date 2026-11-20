@@ -71,6 +71,7 @@ import { isCardOnlyDiff, isCardPath, isDocsPath } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests, testDepths } from './related-test-selection.mjs';
+import { loadCiSelection } from './ci-selection-settings.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
 
@@ -560,16 +561,18 @@ function boundedRelatedSelection(targets, selection) {
 /**
  * #5128 — the bounded related-test selection, or null when it does not apply (limit off, no reader injected, no
  * target, or git/graph trouble — null keeps the plain `vitest related` gate, the pre-#5128 behaviour). The graph is
- * cached per injected reader, so the #66 variant matching re-resolves cheaply. The caller bounds both supplemental
- * command lists through boundedRelatedSelection before changing the original related targets.
+ * cached per injected reader and effective edge policy, so the #66 variant matching re-resolves cheaply.
+ * The caller bounds both supplemental command lists through boundedRelatedSelection before changing the original related targets.
  */
 function relatedSelection({ targets, runGit, readRepoFile, settings, env }) {
   if (typeof readRepoFile !== 'function' || !(settings.relatedMaxTests > 0) || !targets.length) return null;
   try {
+    const { staticEdges } = loadCiSelection({ env });
+    const policyKey = JSON.stringify(staticEdges);
     let graphs = graphCache.get(readRepoFile);
-    if (!graphs) {
+    if (!graphs || graphs.policyKey !== policyKey) {
       const files = gitPathLines(runGit(['ls-files', '--cached', '--others', '--exclude-standard']), { trim: true });
-      graphs = { reverse: buildReverseImportGraph({ files, readFile: readRepoFile }),
+      graphs = { policyKey, reverse: buildReverseImportGraph({ files, readFile: readRepoFile, staticEdges }),
         imports: buildReverseImportGraph({ files, readFile: readRepoFile, staticEdges: { spawnPath: false, alias: false, literalRead: false } }) };
       graphCache.set(readRepoFile, graphs);
     }

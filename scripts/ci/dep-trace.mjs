@@ -120,27 +120,30 @@ export function mergeTraces(traces) {
     [test, Object.fromEntries([...files].sort(([a], [b]) => a.localeCompare(b)).map(([file, kinds]) => [file, [...kinds].sort()]))]));
 }
 
-/** staticSelected is a list/Set of test paths. A missing trace is explicitly unknown. */
-export function compareCoverage({ misses, traceMap, staticSelected = [] }) {
+/** staticSelected is an optional list/Set of test paths. Missing evidence is explicitly unknown. */
+export function compareCoverage({ misses, traceMap, staticSelected }) {
+  const staticKnown = staticSelected !== undefined;
   const object = v => v && typeof v === 'object' && !Array.isArray(v);
   if (!Array.isArray(misses) || misses.some(v => !object(v) || typeof v.test !== 'string' || typeof v.changed !== 'string')
     || !object(traceMap) || Object.values(traceMap).some(files => !object(files) || Object.values(files).some(kinds =>
       !Array.isArray(kinds) || !kinds.length || kinds.some(k => !['load', 'read', 'list', 'spawn'].includes(k))))
-    || !(Array.isArray(staticSelected) || staticSelected instanceof Set) || [...staticSelected].some(v => typeof v !== 'string'))
+    || (staticKnown && (!(Array.isArray(staticSelected) || staticSelected instanceof Set) || [...staticSelected].some(v => typeof v !== 'string'))))
     throw new Error('invalid coverage evidence');
   const selected = new Set(staticSelected);
-  const results = misses.map(({ test, changed }) => ({ test, changed, static: selected.has(test),
+  const results = misses.map(({ test, changed }) => ({ test, changed, static: staticKnown ? selected.has(test) : null,
     traced: Object.hasOwn(traceMap[test] ?? {}, changed), traceKnown: Object.hasOwn(traceMap, test) }));
-  return { results, counts: { total: results.length, static: results.filter(r => r.static).length,
-    traced: results.filter(r => r.traced).length, additional: results.filter(r => r.traced && !r.static).length,
+  return { ...(!staticKnown ? { staticEvidence: 'not supplied' } : {}), results,
+    counts: { total: results.length, static: staticKnown ? results.filter(r => r.static).length : null,
+    traced: results.filter(r => r.traced).length, additional: staticKnown ? results.filter(r => r.traced && !r.static).length : null,
     unknown: results.filter(r => !r.traceKnown).length } };
 }
 
 /** Injectable startup keeps no-env and disabled paths completely inert. */
-export async function startTrace({ env = process.env, settings, activate = activateTrace } = {}) {
+export async function startTrace({ env = process.env, settings, activate = activateTrace,
+  loadSettings = async env => (await import('../lib/ci-selection-settings.mjs')).loadCiSelection({ env }).trace } = {}) {
   if (!env.WE_TRACE_TEST || !env.WE_TRACE_DIR) return;
   if (!settings) {
-    try { settings = (await import('../lib/ci-selection-settings.mjs')).loadCiSelection({ env }).trace; }
+    try { settings = await loadSettings(env); }
     catch {
       settings = { ...defaults };
       try {

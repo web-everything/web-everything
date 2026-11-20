@@ -10,7 +10,7 @@ import { compareCoverage } from '../ci/dep-trace.mjs';
 
 export function runTraceCoverage(argv, { readFile = readFileSync, print = console.log } = {}) {
   if (argv.length < 2 || argv.length > 3) throw new Error('usage: trace-coverage.mjs trace-map.json misses.json [static-selected.json]');
-  const [traceMap, misses, staticSelected = []] = argv.map(file => JSON.parse(readFile(file, 'utf8')));
+  const [traceMap, misses, staticSelected] = argv.map(file => JSON.parse(readFile(file, 'utf8')));
   const summary = compareCoverage({ misses, traceMap, staticSelected });
   print(JSON.stringify(summary));
   return summary;

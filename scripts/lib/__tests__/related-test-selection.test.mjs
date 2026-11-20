@@ -228,7 +228,8 @@ describe('S1 static edges', () => {
   it('preserves the observed merge-gate-hold-class direct imports, including multiple named imports', () => {
     expect(reach(`// @vitest-environment node
       import { isCandidacyHold, deferCandidacyHoldsOnPrEvent } from '../merge-gate-hold-class.mjs';
-      import { parsePrResultTable as rawParse } from '../merge-gate-hold-class.mjs';`, 'scripts/merge-gate-hold-class.mjs').size).toBe(1);
+      import { parsePrResultTable as rawParse } from '../merge-gate-hold-class.mjs';`, 'scripts/merge-gate-hold-class.mjs', {},
+      { staticEdges: { spawnPath: false, alias: false, literalRead: false } }).size).toBe(1);
   });
   it('reports partial truncation and unlimited CI despite caller and environment caps', () => {
     expect(selectHub()).toMatchObject({ partial: true, status: 'selection-truncated' });
@@ -349,6 +350,16 @@ describe('readiness graph selection fails closed', () => {
 });
 
 describe('CI static edge policy', () => {
+  it.each(['CI', 'GITHUB_ACTIONS'].flatMap(flag => ['env', 'file', 'platform'].map(layer => [flag, layer])))
+  ('keeps maxTestsInCi unlimited under %s despite a hostile %s layer', (flag, layer) => {
+    const hostile = { maxTestsInCi: 5 };
+    const settings = loadCiSelection({
+      env: { [flag]: 'true', ...(layer === 'env' ? { WE_CI_SELECTION: JSON.stringify(hostile) } : {}) },
+      platform: layer === 'platform' ? hostile : {}, tool: layer === 'file' ? undefined : {},
+      readFile: () => JSON.stringify({ ci: { selection: hostile } }),
+    });
+    expect(settings.maxTestsInCi).toBe(0);
+  });
   const allEdges = { spawnPath: true, alias: true, literalRead: true };
   const cases = ['spawnPath', 'alias', 'literalRead'].flatMap(edge => ['env', 'file', 'platform'].map(layer => [edge, layer]));
   const load = (edge, layer, env) => {

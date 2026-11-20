@@ -30,17 +30,37 @@ function fixture(extra = {}) {
 describe('shadow dependency tracer', () => {
   it('does nothing without both environment keys or when disabled', async () => {
     const activate = vi.fn();
+    const loadSettings = vi.fn(() => { throw new Error('must not load settings'); });
     for (const env of [{}, { WE_TRACE_TEST: test }, { WE_TRACE_DIR: 'artifacts' }]) {
-      await startTrace({ env, activate, settings: { get enabled() { throw new Error('must not read settings'); } } });
+      await startTrace({ env, activate, loadSettings, settings: { get enabled() { throw new Error('must not read settings'); } } });
     }
-    await startTrace({ env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, settings: { enabled: false }, activate });
+    await startTrace({ env: { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' }, settings: { enabled: false }, activate, loadSettings });
     expect(activate).not.toHaveBeenCalled();
+    expect(loadSettings).not.toHaveBeenCalled();
   });
   it('activates only the injected runtime with configured bounds', async () => {
     const activate = vi.fn();
     const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts' };
     await startTrace({ env, settings: { enabled: true, maxEdgesPerTest: 4 }, activate });
     expect(activate).toHaveBeenCalledWith(env, { enabled: true, maxEdgesPerTest: 4 });
+  });
+  it.each([
+    ['disabled', '{"trace":{"enabled":false,"maxEdgesPerTest":4}}', null],
+    ['bounded', '{"trace":{"enabled":true,"maxEdgesPerTest":4}}', 4],
+    ['zero cap', '{"trace":{"maxEdgesPerTest":0}}', 0],
+    ['malformed JSON', '{', 5000],
+    ['null JSON', 'null', 5000],
+    ['invalid leaves', '{"trace":{"enabled":"no","maxEdgesPerTest":-1}}', 5000],
+    ['fractional cap', '{"trace":{"maxEdgesPerTest":1.5}}', 5000],
+    ['unsafe cap', '{"trace":{"maxEdgesPerTest":9007199254740992}}', 5000],
+  ])('honours fallback settings after loader failure: %s', async (_label, raw, cap) => {
+    const env = { WE_TRACE_TEST: test, WE_TRACE_DIR: 'artifacts', WE_CI_SELECTION: raw };
+    const activate = vi.fn();
+    const loadSettings = vi.fn(async () => { throw new Error('settings import unavailable'); });
+    await startTrace({ env, activate, loadSettings });
+    expect(loadSettings).toHaveBeenCalledWith(env);
+    if (cap === null) expect(activate).not.toHaveBeenCalled();
+    else expect(activate).toHaveBeenCalledWith(env, { enabled: true, maxEdgesPerTest: cap });
   });
   it('records BOTH a started script and its JSON read in a fake child', () => {
     const parent = fixture();
@@ -242,9 +262,21 @@ describe('shadow dependency tracer', () => {
     expect(() => runTraceCoverage(['missing', 'misses'], { readFile, print })).toThrow();
     expect(() => runTraceCoverage(['map', 'misses'], { readFile: () => { throw new Error('unreadable'); }, print })).toThrow('unreadable');
   });
+  it('labels omitted static evidence unknown without claiming additional coverage', () => {
+    const evidence = { traceMap: { t: { data: ['read'] } }, misses: [{ test: 't', changed: 'data' }] };
+    const summary = compareCoverage(evidence);
+    expect(summary).toMatchObject({ staticEvidence: 'not supplied', results: [{ static: null, traced: true }],
+      counts: { static: null, traced: 1, additional: null } });
+    const print = vi.fn();
+    const readFile = file => JSON.stringify(file === 'map' ? evidence.traceMap : evidence.misses);
+    expect(runTraceCoverage(['map', 'misses'], { readFile, print })).toEqual(summary);
+    expect(JSON.parse(print.mock.calls[0][0]).staticEvidence).toBe('not supplied');
+    expect(compareCoverage({ ...evidence, staticSelected: [] }).counts).toMatchObject({ static: 0, additional: 1 });
+    expect(compareCoverage({ ...evidence, staticSelected: new Set(['t']) }).counts).toMatchObject({ static: 1, additional: 0 });
+  });
   it('rejects incomplete evidence shapes instead of reporting a clear replay', () => {
     for (const evidence of [{ misses: {} }, { traceMap: [] }, { traceMap: { t: { a: [] } } },
-      { traceMap: { t: { a: ['unknown'] } } }, { misses: [{ test: 't' }] }, { staticSelected: 't' }]) {
+      { traceMap: { t: { a: ['unknown'] } } }, { misses: [{ test: 't' }] }, { staticSelected: 't' }, { staticSelected: null }]) {
       expect(() => compareCoverage({ misses: [], traceMap: {}, ...evidence })).toThrow('invalid coverage evidence');
     }
   });

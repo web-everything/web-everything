@@ -1561,6 +1561,24 @@ describe('related gate routing in a sibling checkout without the WE admission wr
 
 
 describe('S1 static selection composition', () => {
+  it.each([
+    ['spawnPath', "spawn('node', ['scripts/child.mjs'])"],
+    ['literalRead', "readFileSync('scripts/child.mjs')"],
+    ['alias', "import 'we:scripts/child.mjs'"],
+  ])('honours %s policy changes with the same cached reader and restores edges in CI', (edge, source) => {
+    const files = { 'scripts/child.mjs': '', 'scripts/consumer.test.mjs': source };
+    const git = fakeGit(['scripts/child.mjs']);
+    const readRepoFile = p => files[p];
+    const resolveUnder = env => resolveDefaultGate({ env: { ...TODAY, ...env },
+      fileConfig: { relatedMaxTests: 1000, relatedDepth: 2 }, readRepoFile,
+      runGit: args => args[0] === 'ls-files' && args.includes('--cached') ? Object.keys(files).join('\n') : git(args) });
+    const disabled = { WE_CI_SELECTION: JSON.stringify({ staticEdges: { spawnPath: true, alias: true, literalRead: true, [edge]: false } }) };
+    expect(resolveUnder({}).decision.targets).toContain('scripts/consumer.test.mjs');
+    expect(resolveUnder(disabled).decision.targets).not.toContain('scripts/consumer.test.mjs');
+    expect(resolveUnder({ ...disabled, CI: 'true' }).decision.targets).toContain('scripts/consumer.test.mjs');
+    expect(resolveUnder(disabled).decision.targets).not.toContain('scripts/consumer.test.mjs');
+    expect(resolveUnder({ ...disabled, GITHUB_ACTIONS: 'true' }).decision.targets).toContain('scripts/consumer.test.mjs');
+  });
   const gate = (files, env = TODAY, relatedMaxTests = 1000) => {
     const git = fakeGit(['scripts/child.mjs']);
     return resolveDefaultGate({ env, fileConfig: { relatedMaxTests, relatedDepth: 2 },

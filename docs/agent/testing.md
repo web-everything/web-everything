@@ -4898,7 +4898,10 @@ tree. PR diff test paths are only related-test proxies. Supply `--evidence=relat
 with failing/related test lists to assess misses; absent evidence is labelled incomplete.
 A historical miss cannot be attributed to the parser merely because it happened:
 probe the actual imports. The current merge-gate-hold-class test is a direct importer
-and is reached even with all new static edge kinds disabled.
+and is reached even with all new static edge kinds disabled. The named test
+`preserves the observed merge-gate-hold-class direct imports, including multiple named imports`
+in `scripts/lib/__tests__/related-test-selection.test.mjs` passes all three switches as `false`.
+Review lens: every “even with X disabled” claim must cite a test that explicitly disables X.
 
 
 ## Shadow dependency tracing (S2)
@@ -4908,9 +4911,14 @@ and set `WE_TRACE_TEST` to the repo-relative test file and `WE_TRACE_DIR` to an 
 Node 22 uses `module.register` plus a loader message port; synchronous exit drains pending loader edges.
 Each process emits `trace-<pid>.json`; merge with `mergeTraces`, then replay via
 `scripts/readiness/trace-coverage.mjs trace-map.json misses.json [static-selected.json]`.
+Omitting static evidence prints `staticEvidence: "not supplied"`; static and additional counts
+are `null` (unknown). An explicit empty static list means known zero static coverage.
 Tracing stays shadow-only. The edge cap applies per process; a cap warning means incomplete evidence:
 rerun with a larger `ci.selection.trace.maxEdgesPerTest` before interpreting coverage.
 Keep tracer tests mock-only: inject filesystem/child-process objects and exercise loader hooks directly.
+Review lens: each settings catch fallback needs a named test forcing the loader to fail,
+including malformed input and valid overrides. The `honours fallback settings after loader failure`
+cases in `scripts/ci/__tests__/dep-trace.test.mjs` exercise startup's fallback directly.
 ## Workflow-protection review admission
 
 The `required-admission-gates-deadlock-review` soak probes the hold classifier and unchanged
