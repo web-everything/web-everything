@@ -47,6 +47,13 @@ function derFinding(bytes,tick) {
       if(algorithm?.length===2&&nonempty(algorithm[0],6)&&algorithm[1].tag===48)return true;
     }
     const version=fields[0];
+    // PKCS#8: importers can accept unfamiliar INTEGER versions. Recognize the
+    // private-key shape before applying the other formats' version restrictions.
+    if(nonempty(version,2)&&fields[1].tag===48&&nonempty(fields[2],4)
+      &&fields.slice(3).every(node=>[160,129,161].includes(node.tag))) {
+      const algorithm=children(fields[1]);
+      if(algorithm?.length&&nonempty(algorithm[0],6))return true;
+    }
     if(version.tag!==2||version.end-version.start!==1)continue;
     const value=bytes[version.start];
     if(value>1)continue;
@@ -57,12 +64,6 @@ function derFinding(bytes,tick) {
       &&(fields.length===9||(value===1&&fields.length===10&&fields[9].tag===48)))return true;
     // SEC1: version one, scalar OCTET STRING, optional parameters/public key.
     if(value===1&&nonempty(fields[1],4)&&fields.slice(2).every(node=>[160,161].includes(node.tag)))return true;
-    // PKCS#8 v0/v1: AlgorithmIdentifier and privateKey OCTET STRING.
-    if(fields[1].tag===48&&nonempty(fields[2],4)
-      &&fields.slice(3).every(node=>[160,129,161].includes(node.tag))) {
-      const algorithm=children(fields[1]);
-      if(algorithm?.length&&nonempty(algorithm[0],6))return true;
-    }
   }
   return false;
 }

@@ -5,6 +5,7 @@ import {runInNewContext} from 'node:vm';
 import {describe,expect,it} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
+import {scanBundleRange} from '../remote-git-bundle.mjs';
 
 // Adapted from origin/lane/forge-key-structure-s1; generate material instead of shipping secrets.
 const FINDING='private-key-structure';
@@ -38,6 +39,47 @@ const blocked=content=>{
 };
 
 describe('Forge key structure slice 1',()=>{
+  it('blocks the importable version-2 PKCS#8 key through every admission hook',()=>{
+    const bytes=Buffer.from('302e020102300506032b657004220420'+'01'.repeat(32),'hex');
+    const privateKey=createPrivateKey({key:bytes,format:'der',type:'pkcs8'});
+    const message=Buffer.from('unfamiliar version regression');
+    expect(verify(null,message,createPublicKey(privateKey),sign(null,message,privateKey))).toBe(true);
+    for(const content of [bytes,...Object.values(views).map(encode=>Buffer.from(encode(bytes)))])blocked(content);
+  });
+  it.each([[2],[127],[0,128],[1,0],[255],[255,127],[0,2]].map(version=>({version})))(
+    'recognizes PKCS#8 structure with unfamiliar INTEGER version $version',({version})=>{
+      const tail=keys[1].subarray(5);
+      const bytes=Buffer.concat([Buffer.from([48,2+version.length+tail.length,2,version.length,...version]),tail]);
+      for(const content of [bytes,...Object.values(views).map(encode=>Buffer.from(encode(bytes)))])blocked(content);
+    });
+  it('does not classify missing or empty PKCS#8 fields as private keys',()=>{
+    for(const hex of ['300a020102300306012a0400','3009020102300004020101',
+      '300a020102300306012a0500','300a0200300306012a040101'])
+      expect(keyStructureFinding(Buffer.from(hex,'hex'))).toBeNull();
+  });
+  it('refuses version-2 PKCS#8 in an ordinary bundled path',async()=>{
+    const bytes=Buffer.from('302e020102300506032b657004220420'+'01'.repeat(32),'hex');
+    const content=Buffer.from(bytes.toString('base64'));
+    const commit='a'.repeat(40),blob='b'.repeat(40),file='docs/config.txt';
+    const rawCommit=Buffer.from('tree '+'c'.repeat(40)+'\n\npublic update\n');
+    const exec=async ({args,input})=>{
+      const argv=args.slice(1);
+      let stdout;
+      if(argv[0]==='rev-parse')stdout=argv[1]==='--is-shallow-repository'?'false\n':'missing-grafts-fixture\n';
+      else if(argv[0]==='rev-list')stdout=commit+'\n';
+      else if(argv[0]==='log')stdout=argv.includes('--raw')
+        ?`:000000 100644 ${'0'.repeat(40)} ${blob} A\0${file}\0`:'';
+      else if(argv[0]==='cat-file') {
+        const isCommit=input.trim()===commit;
+        const sha=isCommit?commit:blob,type=isCommit?'commit':'blob',body=isCommit?rawCommit:content;
+        const header=`${sha} ${type} ${body.length}\n`;
+        stdout=argv[1]==='--batch'?Buffer.concat([Buffer.from(header),body,Buffer.from('\n')]):header;
+      } else throw new Error('unexpected Git read: '+argv.join(' '));
+      return {code:0,stdout:Buffer.isBuffer(stdout)?stdout:Buffer.from(stdout)};
+    };
+    expect(await scanBundleRange({cwd:process.cwd(),head:commit,prerequisite:null,exec}))
+      .toEqual({path:file,finding:FINDING});
+  });
   it.each(['\\x6bty','k\\x74y','kt\\x79','\\x6b\\x74\\x79','\\x6B\\u0074y','\\u{6b}t\\x79',
     'kt\\y','\\kt\\y',...['\n','\r','\r\n','\u2028','\u2029'].map(end=>'k\\'+end+'ty')])(
     'finds a private JWK with member %j after stray prose quotes',name=>{
