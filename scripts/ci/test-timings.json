@@ -378,6 +378,7 @@
   "scripts/ci/__tests__/ci-shard-steps.test.mjs": 0.18,
   "scripts/ci/__tests__/ci-shard-timeout-headroom.test.mjs": 0,
   "scripts/ci/__tests__/ci-smoke-runner-pin.test.mjs": 0.01,
+  "scripts/ci/__tests__/ci-soak-merge-queue-only.test.mjs": 0,
   "scripts/ci/__tests__/ci-test-gate-light.test.mjs": 0.8,
   "scripts/ci/__tests__/ci-timings-refresh-workflow.test.mjs": 1.19,
   "scripts/ci/__tests__/ci-unit-shard-step.test.mjs": 0.09,
