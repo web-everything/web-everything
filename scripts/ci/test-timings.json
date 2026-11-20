@@ -2239,6 +2239,7 @@
   "scripts/conveyor/soak/breaks/lease-reaper-borrowed-fixer-pid-invisible.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/mandatory-ruling-ledger-mirror.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/merged-prepare-guard-measures-from-merge.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/needs-you-feed-card-policy.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/needs-you-feed-disable.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-deadline-stop.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/nightly-coroner-never-judges.soak.test.mjs": 1.4,
