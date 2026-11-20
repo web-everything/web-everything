@@ -1,5 +1,5 @@
 // Per-pass heap record for the long-running daemons (operator ruling R368): one bounded structured line so a V8
-// Hot-patch live-proof marker (comment-only, R1100).
+// Hot-patch live-proof marker (comment-only, R1100; head-move part).
 // heap cap can be sized from data instead of RSS alone. On by default; switch off via env WE_DAEMON_HEAP_LOG=0 or the
 // `daemonHeapLog.enabled` platform preference. Observation only — never changes daemon behaviour.
 // (R1100 hot-patch live proof, comment-only change.)
