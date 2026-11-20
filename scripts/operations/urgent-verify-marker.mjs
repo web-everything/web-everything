@@ -286,7 +286,7 @@ export function ciGatePlan(workflow) {
         || (fui ? options.repository !== 'frontier-ui/frontierui' : Object.hasOwn(options, 'repository'));
     })) throw new Error(`unreadable-ci-gates: ${job} checkout layout; update the urgent verification mirror`);
     const jobEnvOk = job === 'test-shard'
-      ? isDeepStrictEqual(jobs[job].env, { WE_VITEST_MAX_WORKERS: "${{ vars.WE_VITEST_MAX_WORKERS || '4' }}" })
+      ? isDeepStrictEqual(jobs[job].env, { WE_VITEST_MAX_WORKERS: "${{ vars.WE_VITEST_MAX_WORKERS || '2' }}" })
       : jobs[job].env === undefined;
     if (jobs[job].defaults?.run !== undefined || !jobEnvOk || jobs[job].container !== undefined
       || jobs[job]['continue-on-error'] !== undefined)

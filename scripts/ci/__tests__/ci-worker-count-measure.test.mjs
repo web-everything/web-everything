@@ -7,7 +7,7 @@ const { jobs } = yaml.load(readFileSync(resolve(process.cwd(), '.github/workflow
 
 describe('CI worker count and shard measurements', () => {
   it('sets the test-shard worker override with an operator rollback', () => {
-    expect(jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '4' }}");
+    expect(jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '2' }}");
   });
 
   describe.each(['test-shard', 'soak-shard'])('%s', (name) => {
