@@ -38,13 +38,66 @@ export function parseGateArgs(argv) {
 }
 
 /**
- * Daemon identity for cleanup state: an explicit `--daemon=<name>` (the registry name/role), else the daemon's
- * script basename (first non-flag .js/.mjs/.cjs/.ts word) or the command basename. Never the checkout path or flags.
+ * Cleanup identity: explicit gate name, else script/command basename plus daemon role arguments.
+ * Node option operands are not scripts. Unknown Node syntax requires an explicit gate name.
  */
 export function daemonIdentity(parsed) {
   if (parsed.daemon) return parsed.daemon;
-  const script = parsed.args.find((word) => !word.startsWith('-') && /\.(?:[cm]?js|ts)$/.test(word));
-  return basename(script ?? parsed.cmd);
+  let scriptIndex = -1;
+  if (/^node(?:js|\.exe)?$/.test(basename(parsed.cmd))) {
+    // Keep arity explicit: silently skipping an unknown flag could select its value as the script.
+    const takesValue = new Set([
+      '--import', '--require', '-r', '--loader', '--experimental-loader',
+      '--experimental-default-type', '--experimental-policy', '--conditions', '-C',
+      '--icu-data-dir', '--openssl-config', '--redirect-warnings', '--diagnostic-dir',
+      '--title', '--unhandled-rejections', '--dns-result-order', '--disable-proto',
+      '--disable-warning', '--max-old-space-size', '--max-semi-space-size', '--stack-trace-limit',
+      '--stack-size', '--max-http-header-size', '--inspect-port', '--debug-port',
+      '--inspect-publish-uid', '--heapsnapshot-signal', '--heapsnapshot-near-heap-limit',
+      '--cpu-prof-dir', '--cpu-prof-name', '--cpu-prof-interval',
+      '--heap-prof-dir', '--heap-prof-name', '--heap-prof-interval',
+      '--report-dir', '--report-directory', '--report-filename', '--report-signal',
+      '--trace-event-categories', '--trace-event-file-pattern', '--tls-cipher-list', '--tls-keylog',
+    ]);
+    const flags = new Set([
+      '--no-warnings', '--no-deprecation', '--trace-warnings', '--trace-deprecation',
+      '--throw-deprecation', '--pending-deprecation', '--enable-source-maps', '--no-enable-source-maps',
+      '--preserve-symlinks', '--preserve-symlinks-main', '--inspect', '--inspect-brk', '--inspect-wait',
+      '--experimental-vm-modules', '--experimental-wasm-modules', '--experimental-network-imports',
+      '--experimental-import-meta-resolve', '--experimental-detect-module', '--experimental-require-module',
+      '--no-experimental-fetch', '--no-experimental-require-module', '--no-addons',
+      '--abort-on-uncaught-exception', '--trace-uncaught', '--trace-sync-io', '--trace-exit',
+      '--use-openssl-ca', '--use-bundled-ca', '--openssl-legacy-provider', '--openssl-shared-config',
+      '--enable-fips', '--force-fips', '--zero-fill-buffers', '--jitless', '--prof', '--cpu-prof', '--heap-prof',
+    ]);
+    for (let i = 0; i < parsed.args.length; i += 1) {
+      const word = parsed.args[i];
+      if (word === '--') { scriptIndex = i + 1; break; }
+      if (!word.startsWith('-')) { scriptIndex = i; break; }
+      const equal = word.indexOf('=');
+      const option = equal === -1 ? word : word.slice(0, equal);
+      if (!takesValue.has(option) && !flags.has(option)) {
+        throw new Error('cannot infer daemon script from Node options; set gate --daemon=<name>');
+      }
+      if (takesValue.has(option)) {
+        const value = equal === -1 ? parsed.args[++i] : word.slice(equal + 1);
+        if (!value || value.startsWith('-')) throw new Error('missing Node option operand');
+      }
+    }
+    const script = parsed.args[scriptIndex];
+    if (!script || script === '-' || script === 'inspect' || script.startsWith('-')) {
+      throw new Error('cannot infer daemon script; set gate --daemon=<name>');
+    }
+  } else {
+    // Preserve support for non-Node commands/interpreters.
+    scriptIndex = parsed.args.findIndex((word) => !word.startsWith('-') && /\.(?:[cm]?js|ts)$/.test(word));
+  }
+  const name = basename(scriptIndex < 0 ? parsed.cmd : parsed.args[scriptIndex]);
+  const roles = parsed.args.slice(scriptIndex + 1)
+    .filter((word) => /^--(?:pass|daemon)=/.test(word))
+    .map((word) => encodeURIComponent(word.slice(word.indexOf('=') + 1)));
+  // Escape separators only when composing a role key; keep existing unqualified marker keys intact.
+  return roles.length ? [encodeURIComponent(name), ...roles].join('#') : name;
 }
 
 const describeOwner = (reason) => {
@@ -238,9 +291,15 @@ export async function runGate(parsed, deps = {}) {
     processSignals = process,
     maxPolls = Infinity,
     killGraceMs = 30_000,
-    markerPath = defaultMarkerPath(parsed),
+    markerPath: suppliedMarkerPath,
     markerFs = nodeFs,
   } = deps;
+  let markerPath;
+  try { markerPath = suppliedMarkerPath ?? defaultMarkerPath(parsed); }
+  catch (error) {
+    log(`host-gate: ${error.message}; refusing to spawn`);
+    return 1;
+  }
   const marker = cleanupMarker(markerPath, markerFs, killGroup);
   try { marker.lock(); }
   catch (error) {

@@ -380,6 +380,101 @@ describe('completed command is never re-run after a failed ownership read', () =
 });
 
 describe('cleanup state is keyed by daemon identity', () => {
+  it('distinct pass roles both read ownership while their standby locks coexist', async () => {
+    const first = harness({ owners: [{ host: HOST_B, version: 'file' }] });
+    const second = harness({ owners: [{ host: HOST_B, version: 'file' }] });
+    delete first.deps.markerPath;
+    delete second.deps.markerPath;
+    second.deps.markerFs = first.deps.markerFs;
+    first.deps.maxPolls = second.deps.maxPolls = 1;
+    let release;
+    first.deps.sleep = () => new Promise((resolve) => { release = resolve; });
+    const run = runGate(parseGateArgs(['--', 'node', 'pass-daemon.mjs', '--pass=a']), first.deps);
+    await new Promise(setImmediate);
+    let code;
+    try {
+      code = await runGate(parseGateArgs(['--', 'node', 'pass-daemon.mjs', '--pass=b']), second.deps);
+    } finally { release(); await run; }
+    expect(code).toBe(75);
+    expect([first.polls(), second.polls()]).toEqual([1, 1]);
+    expect(second.logs.join('\n')).not.toContain('cleanup lock');
+  });
+
+  it.each([
+    ['--import', '/checkout/setup.mjs'], ['-r', '/checkout/setup.cjs'],
+    ['--require=/checkout/setup.cjs'], ['--loader', '/checkout/setup.mjs'],
+    ['--experimental-loader', '/checkout/setup.mjs'],
+  ])('preload %j preserves an unconfirmed-live marker across restart', async (...options) => {
+    const owners = [{ host: HOST_A, version: 'file' }];
+    const first = harness({ owners });
+    delete first.deps.markerPath;
+    first.deps.killGroup = () => true;
+    const run = runGate({ cmd: 'node', args: ['/checkout/scripts/d.mjs'] }, first.deps);
+    await new Promise(setImmediate);
+    first.children[0].emit('exit', 0, null);
+    expect(await run).toBe(1);
+    const saved = [...first.files.entries()];
+    const second = harness({ owners });
+    delete second.deps.markerPath;
+    second.deps.markerFs = first.deps.markerFs;
+    second.deps.killGroup = vi.fn(() => true);
+    const spawn = second.deps.spawn;
+    second.deps.spawn = (...args) => {
+      const child = spawn(...args);
+      setImmediate(() => child.emit('exit', 0, null));
+      return child;
+    };
+    expect(await runGate({ cmd: 'node', args: [...options, '/checkout/scripts/d.mjs'] }, second.deps)).toBe(1);
+    expect(second.spawns).toHaveLength(0);
+    expect(second.polls()).toBe(0);
+    expect(second.deps.killGroup).toHaveBeenCalledWith(1000, 0);
+    expect([...first.files.entries()]).toEqual(saved);
+  });
+
+  it('a preload without old evidence starts with the script identity d.mjs', async () => {
+    const parsed = parseGateArgs(['--', 'node', '--import', 'setup.mjs', 'd.mjs']);
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+    delete h.deps.markerPath;
+    const run = runGate(parsed, h.deps);
+    await new Promise(setImmediate);
+    h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
+    expect(h.spawns[0].args).toEqual(parsed.args);
+    expect(daemonIdentity(parsed)).toBe('d.mjs');
+  });
+
+  it.each([
+    [], ['--import'], ['--import', 'setup.mjs'], ['--require', '--no-warnings', 'd.mjs'],
+    ['--unknown-option', 'setup.mjs', 'd.mjs'], ['--eval', 'setup.mjs', 'd.mjs'],
+    ['--print=setup.mjs', 'd.mjs'], ['--'], ['-'],
+  ])('unparseable Node argv %j refuses with exit 1 before ownership or spawn', async (...args) => {
+    const h = harness({ owners: [{ host: HOST_A, version: 'file' }] });
+    delete h.deps.markerPath;
+    const spawn = h.deps.spawn;
+    h.deps.spawn = (...values) => {
+      const child = spawn(...values);
+      setImmediate(() => child.emit('exit', 0, null));
+      return child;
+    };
+    expect(await runGate({ cmd: 'node', args }, h.deps)).toBe(1);
+    expect(h.polls()).toBe(0);
+    expect(h.spawns).toHaveLength(0);
+    expect(h.files.size).toBe(0);
+  });
+
+  it('parses Node operands and role arguments without treating later script arguments as Node options', () => {
+    expect(daemonIdentity({ cmd: '/usr/bin/node', args: [
+      '--no-warnings', '--experimental-default-type', 'module', '--import=setup.mjs',
+      '--require', 'setup.cjs', '--stack-trace-limit', '50', '--', 'pass-daemon.mjs', '--pass=a',
+    ] })).toBe('pass-daemon.mjs#a');
+    expect(daemonIdentity({ cmd: 'node', args: ['d.mjs', '--daemon=worker'] })).toBe('d.mjs#worker');
+    expect(daemonIdentity({ cmd: 'node', args: ['d.mjs', '--import', 'app.mjs'] })).toBe('d.mjs');
+    expect(daemonIdentity({ cmd: 'node', args: ['worker', 'data.mjs'] })).toBe('worker');
+    expect(daemonIdentity({ cmd: 'node', args: ['d.mjs', '--pass=a#b'] }))
+      .not.toBe(daemonIdentity({ cmd: 'node', args: ['d.mjs', '--pass=a', '--daemon=b'] }));
+    expect(daemonIdentity({ cmd: 'node', args: ['d.mjs', '--pass=a'], daemon: 'explicit' })).toBe('explicit');
+  });
+
   it('derives one identity from the daemon script, not its checkout path or flags', () => {
     expect(daemonIdentity({ cmd: 'node', args: ['/a/checkout/scripts/d.mjs', '--x'] }))
       .toBe(daemonIdentity({ cmd: 'node', args: ['/b/other/scripts/d.mjs', '--y', '1'] }));
