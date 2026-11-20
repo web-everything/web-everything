@@ -710,3 +710,31 @@ describe('fix-ready takes findings from the recorded waiver', () => {
     expect(run([`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=NOT-WEAKENED', '--from-waiver'], [w]).code).toBe(1);
   });
 });
+
+describe('fix-ready waiver lookup through the production loader', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const mk = (platformWaivers, toolWaivers) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-ready-w-'));
+    const pref = join(dir, 'prefs.json');
+    writeFileSync(pref, JSON.stringify({ prototypeLoad: { ruledWeakened: platformWaivers } }));
+    const settingsFile = join(dir, 'p.json');
+    writeFileSync(settingsFile, JSON.stringify({ readyRecordPath: join(dir, 'l.jsonl'), ruledWeakened: toolWaivers }));
+    return { dir, env: { HOME: dir, WE_PLATFORM_PREFERENCES_FILE: pref }, settingsFile };
+  };
+  const w = { ref, sha, ruling: 'R816', findings };
+  const args = [`--ref=${ref}`, `--sha=${sha}`, '--tests=green', '--audit=WEAKENED', '--auditRuling=R816'];
+  it('refuses conflicting waivers in different layers as ambiguous (no dedupe hiding them)', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { dir, env, settingsFile } = mk([{ ...w, findings: ['other'] }], [w]);
+    expect(main(args, { env, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'l.jsonl') } })).toBe(1);
+    expect(err.mock.calls.map((c) => c[0]).join('\n')).toMatch(/ambiguous|unreadable/);
+  });
+  it('refuses when the waiver store is unreadable', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { dir, env, settingsFile } = mk([], [w]);
+    mkdirSync(join(dir, 'workspace/.operations/coordination'), { recursive: true });
+    mkdirSync(join(dir, 'workspace/.operations/coordination/ruled-weakened.jsonl'));
+    expect(main(args, { env, settingsFile, adoptionSettings: { fixReadyPath: join(dir, 'l.jsonl') } })).toBe(1);
+    expect(err.mock.calls.map((c) => c[0]).join('\n')).toMatch(/unreadable|ambiguous|no recorded/);
+  });
+});

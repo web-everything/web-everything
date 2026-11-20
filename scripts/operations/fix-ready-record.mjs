@@ -10,7 +10,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, parse, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { validSha, jsonLines } from './prototype-load.mjs';
-import { loadRuledWeakened } from './prototype-load-io.mjs';
+import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { loadAdoptionMatrixSettingsFile } from '../lib/adoption-matrix-settings.mjs';
 
@@ -272,10 +272,17 @@ export function waiverFindings(waivers, { ref, sha, ruling }) {
   return { ok: true, findings: [...hits[0].findings] };
 }
 
-function defaultWaivers(env) {
+function defaultWaivers(env, settingsFile = join(here, '..', 'settings', 'prototype-load.json')) {
   const platform = readPlatformPreferences({ env, readFile: (p, encoding) => fs.readFileSync(p, encoding) });
-  const tool = JSON.parse(fs.readFileSync(join(here, '..', 'settings', 'prototype-load.json'), 'utf8'));
-  return loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env });
+  const tool = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  if (platform.errors.length) throw new Error(`platform preferences unreadable: ${platform.errors[0]}`);
+  const store = readStore({ path: storePath(env), fs, warn: () => {} });
+  if (store.error) throw new Error(`ruled-weakened store unreadable: ${store.error}`);
+  const isRevoked = withdrawnRevocations({ fs, env, warn: () => {} });
+  // Raw, NOT de-duplicated: conflicting entries for one ref+sha+ruling must reach waiverFindings and refuse as ambiguous.
+  const list = (v) => (Array.isArray(v) ? v : []);
+  return [...list(tool.ruledWeakened), ...list(platform.prefs.prototypeLoad?.ruledWeakened), ...store.entries]
+    .filter((e) => e && typeof e === 'object' && !(typeof e.sha === 'string' && isRevoked(e)));
 }
 
 export function main(argv = process.argv.slice(2), deps = {}) {
@@ -288,7 +295,7 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   }
   if (wantWaiver) {
     let waivers;
-    try { waivers = deps.waivers !== undefined ? deps.waivers : defaultWaivers(deps.env ?? { ...process.env, HOME: process.env.HOME || homedir() }); }
+    try { waivers = deps.waivers !== undefined ? deps.waivers : defaultWaivers(deps.env ?? { ...process.env, HOME: process.env.HOME || homedir() }, deps.settingsFile); }
     catch (e) { console.error(`fix-ready-record: refused: recorded waivers are unreadable: ${e.message}`); return 1; }
     const w = waiverFindings(waivers, { ref: a.ref, sha: a.sha, ruling: a.auditRuling });
     if (!w.ok) { console.error(`fix-ready-record: refused: ${w.error}`); return 1; }
