@@ -1440,6 +1440,13 @@ export function watchParkedPrConflicts({
     // group is open: it dissolves the group on a conflict and returns the sources to the normal path, where
     // this watch applies again. A send-back here would strip the combined PR's review instead.
     if (inCardGroupFn({ num: pr?.number, repo: resolvedRepo, headRef: pr?.headRefName })) continue;
+    // Only a readable label array can establish the committee hold; unknown labels retain today's path.
+    if (Array.isArray(pr?.labels)
+      && pr.labels.every(l => typeof l === 'string' || (l && typeof l.name === 'string'))
+      && hasReviewLabel(pr.labels, 'review-status:draft-withdrawn')) {
+      process.stderr.write(`parked-pr-conflict-watch: #${pr.number} skipped — review-status:draft-withdrawn (committee-parked)\n`);
+      continue;
+    }
     const parked = isParkedConflictTarget(pr);
     const queued = !parked && isQueuedConflictTarget(pr);
     // #xs81oxb — the THIRD population: neither parked nor queued (no review-workflow label at all). Folded into

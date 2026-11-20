@@ -135,6 +135,64 @@ describe('the real incident that motivated this pass — WE PR #1920, captured l
     expect(seen[0]).toMatchObject({ num: 1920, headRef: REAL_1920_SNAPSHOT.headRefName });
   });
 
+  describe('committee-parked draft sweep exemption', () => {
+    const withdrawn = 'review-status:draft-withdrawn';
+    const sweep = (labels, extra = {}) => {
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), postComment: vi.fn() };
+      const postFinding = vi.fn(), postStandDown = vi.fn(), postRearm = vi.fn();
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const results = watchParkedPrConflicts({
+          repo: 'web-everything/web-everything', sameLineConflict: 'stand-down',
+          listPrs: () => [{ ...REAL_1920_SNAPSHOT, labels, ...extra }],
+          inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
+          provider, postFinding, postStandDown, postRearm,
+          listPrFiles: () => ['scripts/example.mjs'], listPrComments: () => [],
+          computeConflictingPaths: () => null, computeConflictDisposition: () => null,
+        });
+        return { results, provider, postFinding, postStandDown, postRearm, logs: stderr.mock.calls.map(([line]) => line) };
+      } finally { stderr.mockRestore(); }
+    };
+    const expectDispatch = (run) => {
+      expect(run.results).toEqual([expect.objectContaining({ num: 1920, routedTo: 'reconcile-finding', newlyDetected: true })]);
+      expect(run.postFinding).toHaveBeenCalledTimes(1);
+      expect(run.provider.setLabels).toHaveBeenCalledTimes(1);
+      expect(run.provider.postComment).toHaveBeenCalledTimes(1);
+      expect(run.logs).toEqual([]);
+    };
+
+    it.each([withdrawn, { name: withdrawn }])('skips exact draft-withdrawn label %j: no labels, comments or conflict-fix dispatch', (label) => {
+      const run = sweep([...REAL_1920_SNAPSHOT.labels, label], { isDraft: false });
+      expect(run.results).toEqual([]);
+      for (const effect of [...Object.values(run.provider), run.postFinding, run.postStandDown, run.postRearm])
+        expect(effect).not.toHaveBeenCalled();
+      expect(run.logs).toEqual(['parked-pr-conflict-watch: #1920 skipped — review-status:draft-withdrawn (committee-parked)\n']);
+    });
+
+    it('resumes dispatch when the withdrawn label is removed, even while isDraft is true', () => {
+      expectDispatch(sweep(REAL_1920_SNAPSHOT.labels, { isDraft: true }));
+    });
+
+    it.each([
+      ['undefined', undefined],
+      ['null entry', [...REAL_1920_SNAPSHOT.labels, withdrawn, null]],
+      ['undefined entry', [...REAL_1920_SNAPSHOT.labels, withdrawn, undefined]],
+      ['missing name', [...REAL_1920_SNAPSHOT.labels, withdrawn, {}]],
+      ['non-string name', [...REAL_1920_SNAPSHOT.labels, withdrawn, { name: 42 }]],
+      ['number entry', [...REAL_1920_SNAPSHOT.labels, withdrawn, 42]],
+    ])('unreadable labels (%s) preserve today\'s dispatch behaviour', (_, labels) => {
+      expectDispatch(sweep(labels));
+    });
+
+    it.each([['null', null], ['object', {}], ['string', withdrawn]])('unreadable labels (%s) retain the existing planner error rather than skip', (_, labels) => {
+      expect(() => sweep(labels)).toThrow(TypeError);
+    });
+
+    it.each(['review-status:draft-withdrawn-x', 'review-status:draft', 'review-status:active', 'draft-withdrawn'])('near-miss label %s still dispatches', (label) => {
+      expectDispatch(sweep([...REAL_1920_SNAPSHOT.labels, label, { name: label }]));
+    });
+  });
+
   it.each(['source', 'combined'])('default sweep resolves an omitted repo before the real group reader exempts a %s', role => {
     const dir = mkdtempSync(join(tmpdir(), 'conflict-watch-group-'));
     const statePath = join(dir, 'groups.json');
