@@ -686,11 +686,12 @@ describe('prepareRebuild after a mid-tick re-clone', () => {
     delete env.LANE_POOL_ROOT;
     const runSmoke = async () => { throw new Error('the tick must end before any candidate is smoked'); };
     // Persisted state from before the re-clone names the OLD clone's overlay merge as adopted / last-good.
+    // Include the hold writer's audit timestamp so strict admission reaches clone repair.
     const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
     writeRebuildState(clone, {
       ...readRebuildState(clone, env),
       adopted: { head: overlayHead, inputsKey: 'old', mainSha: overlayHead, applied: [], at: new Date().toISOString() },
-      held: { since: new Date().toISOString(), reason: 'x', failed: 'x', details: [], lastGood: overlayHead, target: null, mainSha: null },
+      held: { since: new Date().toISOString(), updatedAt: new Date().toISOString(), reason: 'x', failed: 'x', details: [], lastGood: overlayHead, target: null, mainSha: null },
     }, env);
     const r = await rebuildClone({ root: clone, env, log: { error() {}, log() {} }, runSmoke, prState: async () => null, lockOpts: { waitMs: 0 } });
     expect(r.reason).toBe('clone-recloned');
