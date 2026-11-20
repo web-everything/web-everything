@@ -925,6 +925,17 @@ async function timedRunGate(phase, command, args, { outcomeKey } = {}) {
           if (start < 0) continue;
           const mentionsWrapper = word => word.value.includes('verify-shard-run.mjs');
           if (!/(?:^|\/)node$/.test(words[start].value)) {
+            // Generated suite commands consume file names as data. Classify their executable
+            // prefix before looking for wrappers: --files may name the shard runner itself.
+            const argv = words.slice(start).map(word => word.value);
+            const npmScript = argv[0] === 'npm' && argv[1] === 'run'
+              && ['check:standards', 'test:unit'].includes(argv[2])
+              && (argv.length === 3 || argv[3] === '--');
+            const npmTest = argv[0] === 'npm' && argv[1] === 'test'
+              && (argv.length === 2 || argv[2] === '--');
+            const vitest = argv[0] === 'npx' && argv[1] === 'vitest'
+              && ['run', 'related'].includes(argv[2]);
+            if (npmScript || npmTest || vitest) continue;
             // env/command (including nested launchers and shell payloads) can hide a shard
             // runner that drops our held slot. Refuse before spawn instead of guessing prefix
             // semantics. Literal echo arguments are data and cannot execute the wrapper.
