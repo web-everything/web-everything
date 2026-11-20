@@ -10,7 +10,8 @@
  * Reserve before append for at-most-once delivery across restart; a failed append
  * requires operator inspection (automatic retry could duplicate a delivered event).
  */
-import { readFileSync, statSync, mkdirSync, writeFileSync, renameSync, rmSync, realpathSync } from 'node:fs';
+import { readFileSync, statSync, mkdirSync, writeFileSync, renameSync, rmSync, realpathSync,
+  openSync, readSync, fstatSync, closeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -31,6 +32,44 @@ function text(file) {
   return readFileSync(file, 'utf8');
 }
 const json = file => JSON.parse(text(file));
+/** Live logs are cumulative. Read a fixed byte window from one descriptor, discard
+ * only its cut first record and an unfinished final append. Interior corruption is unknown.
+ */
+function liveEventsTail(file) {
+  const fd = openSync(file, 'r');
+  try {
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - MAX_BYTES);
+    const bytes = Buffer.alloc(size - start);
+    let count = 0;
+    while (count < bytes.length) {
+      const n = readSync(fd, bytes, count, bytes.length - count, start + count);
+      if (!n) throw Error('log changed during read');
+      count += n;
+    }
+    let offset = 0;
+    if (start > 0) {
+      const previous = Buffer.alloc(1);
+      if (readSync(fd, previous, 0, 1, start - 1) !== 1) throw Error('log changed during read');
+      if (previous[0] !== 10) {
+        offset = bytes.indexOf(10) + 1;
+        if (!offset) throw Error('event line exceeds tail cap');
+      }
+    }
+    const events = [];
+    for (const line of bytes.subarray(offset).toString('utf8').split('\n')) {
+      const position = start + offset;
+      offset += Buffer.byteLength(line) + 1;
+      if (!line.trim()) continue;
+      let event;
+      try { event = JSON.parse(line); }
+      catch (error) { if (start + offset > size) break; throw error; }
+      if (!object(event)) throw Error('unknown event');
+      events.push({ ...event, source: event.source ?? `daemon-events:byte:${position}` });
+    }
+    return events;
+  } finally { closeSync(fd); }
+}
 function canonical(file) {
   try { return realpathSync(file); }
   catch { const parent = dirname(resolve(file));
@@ -38,7 +77,9 @@ function canonical(file) {
 }
 function save(file, state) {
   const temp = `${file}.${process.pid}.new`;
-  writeFileSync(temp, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  const contents = `${JSON.stringify(state)}\n`;
+  if (Buffer.byteLength(contents) > MAX_BYTES) throw Error('state cap; operator inspection required');
+  writeFileSync(temp, contents, { mode: 0o600 });
   renameSync(temp, file);
 }
 
@@ -61,24 +102,27 @@ export function readExpectationSettings({ env = process.env, settingsFiles, log 
 export function collectExpectationEvidence({ repo, pr, read, now }) {
   const [owner, name] = repo.split('/');
   const query = `query { repository(owner: "${owner}", name: "${name}") {
-    pullRequest(number: ${pr}) { number headRefOid mergedAt mergeStateStatus
+    pullRequest(number: ${pr}) { number state headRefOid mergedAt mergeStateStatus
       headRef { target { ... on Commit { committedDate } } }
       labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
       mergeQueueEntry { enqueuedAt } } } }`;
   const response = read(['api', 'graphql', '-f', `query=${query}`]);
   const pull = response?.data?.repository?.pullRequest;
+  const terminal = ['MERGED', 'CLOSED'].includes(pull?.state);
   const headAt = pull?.headRef?.target?.committedDate;
   if (response?.errors || pull?.number !== pr || !validSha(pull.headRefOid)
-    || !Number.isFinite(Date.parse(headAt)) || !Array.isArray(pull.labels?.nodes)
+    || !['OPEN', 'MERGED', 'CLOSED'].includes(pull.state)
+    || (!terminal && !Number.isFinite(Date.parse(headAt))) || !Array.isArray(pull.labels?.nodes)
     || pull.labels.pageInfo?.hasNextPage !== false || pull.labels.nodes.some(l => typeof l?.name !== 'string')
     || !Object.hasOwn(pull, 'mergeQueueEntry') || !Object.hasOwn(pull, 'mergedAt')
     || typeof pull.mergeStateStatus !== 'string') throw Error('unknown PR evidence');
   const sha = pull.headRefOid;
   const reactions = [];
-  const add = (action, at, source) => {
+  const add = (action, at, source, headBound = false) => {
     const item = { pr, sha, action, at, source };
     if (!validObservation(item)) throw Error('unknown reaction');
-    if (Date.parse(at) >= Date.parse(headAt) && Date.parse(at) <= Date.parse(now)) reactions.push(item);
+    // Checks name the exact head. Timeline labels need the commit date to bind to that head.
+    if ((headBound || Date.parse(at) >= Date.parse(headAt)) && Date.parse(at) <= Date.parse(now)) reactions.push(item);
   };
   let complete = false;
   for (let page = 1; page <= 10; page++) {
@@ -90,7 +134,7 @@ export function collectExpectationEvidence({ repo, pr, read, now }) {
         add('clear-human', row.created_at, row.url ?? `timeline:${row.id}`);
       if (row.event === 'labeled' && ['ready-to-merge', 'red-team:pending'].includes(label))
         add(label, row.created_at, row.url ?? `timeline:${row.id}`);
-      if (row.event === 'merged') add('merged', row.created_at, row.url ?? `timeline:${row.id}`);
+      if (row.event === 'merged') add('merged', row.created_at, row.url ?? `timeline:${row.id}`, true);
     }
     if (rows.length < 100) { complete = true; break; }
   }
@@ -110,23 +154,25 @@ export function collectExpectationEvidence({ repo, pr, read, now }) {
     const redTeam = /(^|[^a-z0-9])red[- ]team([^a-z0-9]|$)/i.test(check.name);
     const review = !redTeam && /(^|[^a-z0-9])review([^a-z0-9]|$)/i.test(check.name);
     if (check.started_at) add(gate ? 'merge-gate-started' : redTeam ? 'red-team-started'
-      : review ? 'review-started' : 'ci-started', check.started_at, check.html_url ?? `check:${check.id}`);
+      : review ? 'review-started' : 'ci-started', check.started_at, check.html_url ?? `check:${check.id}`, true);
     if (check.status === 'completed' && !['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'stale'].includes(check.conclusion)) throw Error('unknown check conclusion');
-    if (gate && check.conclusion === 'success') add('merge-gate-pass', check.completed_at, check.html_url ?? `check:${check.id}`);
+    if (gate && check.conclusion === 'success') add('merge-gate-pass', check.completed_at, check.html_url ?? `check:${check.id}`, true);
     if (!gate && !review && !redTeam && ['failure', 'timed_out'].includes(check.conclusion))
-      add('ci-red', check.completed_at, check.html_url ?? `check:${check.id}`);
+      add('ci-red', check.completed_at, check.html_url ?? `check:${check.id}`, true);
   }
-  if (pull.mergedAt !== null) add('merged', pull.mergedAt, 'github:mergedAt');
-  if (pull.mergeQueueEntry !== null) add('merge-queue-enqueued', pull.mergeQueueEntry.enqueuedAt, 'github:mergeQueueEntry');
+  if (pull.mergedAt !== null) add('merged', pull.mergedAt, 'github:mergedAt', true);
+  if (pull.mergeQueueEntry !== null) add('merge-queue-enqueued', pull.mergeQueueEntry.enqueuedAt, 'github:mergeQueueEntry', true);
   const final = read(['api', `repos/${repo}/pulls/${pr}`]);
   if (final?.head?.sha !== sha) throw Error('head changed during collection');
-  return { sha, complete: true, reactions,
-    eligible: pull.mergeStateStatus === 'CLEAN' && pull.labels.nodes.some(l => l.name === 'ready-to-merge') };
+  if (final.state !== (terminal ? 'closed' : 'open')) throw Error('PR state changed during collection');
+  return { sha, complete: true, terminal, reactions,
+    eligible: !terminal && pull.mergeQueueEntry === null && pull.mergeStateStatus === 'CLEAN'
+      && pull.labels.nodes.some(l => l.name === 'ready-to-merge') };
 }
 
 export async function runExpectationPass({ repo = ghRepoSlug(DEFAULT_REPO_KEY), pr,
   now = new Date().toISOString(), eventsFile, stateFile, evidenceFile, settings,
-  gh, emitEvent, env = process.env, home, log = console.error } = {}) {
+  gh, emitEvent, saveState = save, env = process.env, home, log = console.error } = {}) {
   const config = settings ?? readExpectationSettings({ env, log });
   if (config.mode === 'off') return { results: [], delivered: 0, incomplete: false };
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(repo) || !Number.isFinite(Date.parse(now))
@@ -158,10 +204,11 @@ export async function runExpectationPass({ repo = ghRepoSlug(DEFAULT_REPO_KEY), 
         || !p.observations.every(validObservation))) throw Error('unknown state');
     let events = null;
     try {
-      events = text(eventsFile).split('\n').filter(s => s.trim()).map(s => JSON.parse(s));
+      events = replay ? text(eventsFile).split('\n').filter(s => s.trim()).map(s => JSON.parse(s)) : liveEventsTail(eventsFile);
       events = events.filter(e => !e.repo || [repo, repo.split('/')[1]].includes(e.repo));
     } catch { fail(); }
     let evidence = { prs: {} };
+    let subjects;
     let read;
     if (evidenceFile) {
       try { evidence = json(evidenceFile); if (!object(evidence?.prs)) throw Error('unknown fixture'); }
@@ -175,37 +222,56 @@ export async function runExpectationPass({ repo = ghRepoSlug(DEFAULT_REPO_KEY), 
       const listed = pr ? [{ number: pr }] : listOpenPrs(repo, { gh: read });
       const numbers = [...new Set([...listed.map(p => p.number), ...Object.keys(state.prs).map(Number)])]
         .filter(n => !pr || n === pr).sort((a, b) => a - b);
+      subjects = new Set(numbers);
+      // Include unread/budget-deferred subjects as unknown, even without a trigger in this window.
+      for (const n of numbers) evidence.prs[n] = { sha: state.prs[n]?.observations.at(-1)?.sha, complete: false };
       const start = Math.max(0, numbers.findIndex(n => n >= state.cursor));
       for (const n of [...numbers.slice(start), ...numbers.slice(0, start)]) {
         state.cursor = n;
-        try { evidence.prs[n] = collectExpectationEvidence({ repo, pr: n, read, now }); }
+        try {
+          evidence.prs[n] = collectExpectationEvidence({ repo, pr: n, read, now });
+          // Once retired, an explicit --pr or a racing open list must not replay its historical misses.
+          if (evidence.prs[n].terminal && !state.prs[n]) { delete evidence.prs[n]; subjects.delete(n); }
+        }
         catch { fail(); }
         if (calls >= 128) break;
         state.cursor = n + 1;
       }
     }
-    const derived = deriveActions(events);
+    const allDerived = deriveActions(events);
+    const derived = allDerived?.filter(a => (!subjects || subjects.has(a.pr)) && (!pr || a.pr === pr)) ?? null;
     evidence.eventsReadable = derived !== null;
     // Retain identities even when the PR reader fails, so unavailable evidence is visible as unknown.
-    for (const a of derived ?? []) if (!evidence.prs[a.pr]) evidence.prs[a.pr] = { sha: a.sha, complete: false };
+    for (const a of derived ?? []) if (!evidence.prs[a.pr]?.sha) evidence.prs[a.pr] = { sha: a.sha, complete: false };
     for (const [n, p] of Object.entries(evidence.prs)) {
       if (pr && Number(n) !== pr) { delete evidence.prs[n]; continue; }
-      if (!validSha(p?.sha)) { fail(); delete evidence.prs[n]; continue; }
+      if (!validSha(p?.sha)) { fail(); continue; }
       const old = state.prs[n];
       const tracked = old ?? { emitted: {}, observations: [] };
       tracked.observations = tracked.observations.filter(a => a.sha === p.sha);
+      if (!replay) {
+        const known = new Set(tracked.observations.map(a => JSON.stringify([a.action, a.at])));
+        const observed = [...(derived ?? []), ...(Array.isArray(p.reactions) ? p.reactions : [])];
+        for (const a of observed) if (a.pr === Number(n) && a.sha === p.sha
+          && Date.parse(a.at) <= Date.parse(now) && !known.has(JSON.stringify([a.action, a.at]))) {
+          tracked.observations.push(a); known.add(JSON.stringify([a.action, a.at]));
+        }
+      }
       if (p.complete === true && p.eligible === true && !tracked.observations.some(a => a.action === 'enqueue-eligible'))
         tracked.observations.push({ pr: Number(n), sha: p.sha, action: 'enqueue-eligible', at: now, source: 'github:CLEAN+ready' });
-      if (p.complete === true && p.eligible === false) tracked.observations = [];
+      if (p.complete === true && p.eligible === false)
+        tracked.observations = tracked.observations.filter(a => a.action !== 'enqueue-eligible');
       state.prs[n] = tracked;
       if (Array.isArray(p.reactions) && derived) p.reactions = [...p.reactions,
-        ...derived.filter(a => a.pr === Number(n) && a.sha === p.sha)];
+        ...derived.filter(a => a.pr === Number(n) && a.sha === p.sha), ...tracked.observations];
     }
     const timeline = Object.values(evidence.prs).flatMap(p => Array.isArray(p.reactions) ? p.reactions : []);
     const actions = derived === null ? null : deriveActions(derived, [...timeline,
-      ...Object.values(state.prs).flatMap(p => p.observations)]);
+      ...Object.entries(state.prs).filter(([n]) => (!subjects || subjects.has(Number(n))) && (!pr || Number(n) === pr))
+        .flatMap(([, p]) => p.observations)]);
     result.results = evaluateExpectations({ settings: config, actions, evidence, now });
     if (result.results.some(r => r.status === 'unknown')) fail();
+    const failedDeliveries = new Set();
     for (const row of result.results.filter(r => r.status === 'missed')) {
       const tracked = state.prs[row.pr];
       const key = missKey(row);
@@ -215,15 +281,21 @@ export async function runExpectationPass({ repo = ghRepoSlug(DEFAULT_REPO_KEY), 
         daemon: 'expectation-babysitter', detail: { ...facts, mode: 'observe' } };
       const send = emitEvent ?? (e => appendDaemonEvent(e, {
         env: { ...env, WE_DAEMON_EVENTS: eventsFile }, now: () => new Date(now) }));
-      // Mark emitted only after a successful append, so a failed delivery is retried next pass.
+      // Persist the reservation BEFORE any append: even ambiguous delivery cannot be retried on restart.
+      tracked.emitted[key] = true;
+      saveState(stateFile, state);
       let sent = false;
       try { sent = (await send(event)) !== false; } catch { sent = false; }
-      if (!sent) { fail(); continue; }
-      tracked.emitted[key] = true;
-      save(stateFile, state);
+      if (!sent) { failedDeliveries.add(row.pr); fail(); continue; }
       result.delivered++;
     }
-    save(stateFile, state);
+    // Retire each fully evaluated terminal PR even when another PR exhausts the shared budget.
+    // Otherwise a large historical tracked set could never shrink below that budget.
+    if (config.valid && derived !== null) for (const [n, p] of Object.entries(evidence.prs)) {
+      if (p.terminal && p.complete === true && !failedDeliveries.has(Number(n))
+        && !result.results.some(r => r.pr === Number(n) && r.status === 'unknown')) delete state.prs[n];
+    }
+    saveState(stateFile, state);
   } catch { fail(); }
   finally { rmSync(lock, { recursive: true, force: true }); }
   return result;

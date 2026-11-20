@@ -48,7 +48,7 @@ export function resolveExpectationSettings({ standard = { mode: 'observe' }, pla
 }
 
 /** Normalized timeline observations and action events share one explicit head-bound shape.
- * Unknown kinds are ignored; a malformed known observation taints the entire read.
+ * Unknown kinds and unbindable events are ignored; malformed explicit bindings taint the read.
  */
 export function deriveActions(events, timeline = []) {
   if (!Array.isArray(events) || !Array.isArray(timeline)) return null;
@@ -60,11 +60,15 @@ export function deriveActions(events, timeline = []) {
 
       const action = row.detail?.action ?? row.action ?? row.kind;
       if (!ACTIONS.has(action)) continue;
-      const item = { pr: row.pr, sha: row.sha ?? row.detail?.sha ?? row.detail?.head,
+      // The operation logs attempts and no-ops too. Only a confirmed update starts a restart deadline.
+      if (action === 'update-branch' && row.detail?.status !== undefined
+        && (row.detail.status !== 'updated' || row.detail.ok !== true)) continue;
+      const sha = [row.sha, row.detail?.sha, row.detail?.head,
+        ...(action === 'update-branch' ? [row.detail?.afterHead] : [])].find(v => v !== undefined);
+      const item = { pr: row.pr, sha,
         action, at: row.at, source: row.source ?? `${prefix}:${i + 1}` };
-      // An event with no head sha at all (e.g. the merger's pr-merged) cannot bind to a head: ignore it,
-      // never let one ordinary event blind the whole log. A present-but-malformed sha still reads unknown.
-      if (item.sha === undefined && Object.values(REACTIONS).flat(2).includes(action)) continue;
+      // Ordinary daemon events need not identify a PR/head. Never infer a binding from beforeHead.
+      if (item.sha === undefined || item.pr === undefined) continue;
       if (!validObservation(item)) return null;
       out.push(item);
     }

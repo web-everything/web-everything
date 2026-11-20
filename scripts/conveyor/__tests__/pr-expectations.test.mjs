@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, symlinkSync, mkdirSync, truncateSync, existsSync } from 'node:fs';
 import { dirname, basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { deriveActions, evaluateExpectations, resolveExpectationSettings, REACTIONS } from '../pass-daemons/pr-expectations.mjs';
+import { deriveActions, evaluateExpectations, resolveExpectationSettings, REACTIONS, ACTIONS } from '../pass-daemons/pr-expectations.mjs';
+import { runUpdateBranch } from '../../operations/update-branch.mjs';
 import { runExpectationPass, runExpectationCli, collectExpectationEvidence, readExpectationSettings } from '../pass-daemons/pr-expectation-pass.mjs';
 
 const table = JSON.parse(readFileSync(fileURLToPath(new URL('../../settings/expectations.json', import.meta.url)), 'utf8'));
@@ -76,10 +77,44 @@ test('mode off, observe, garbage; settings defaults and malformed/absent setting
 test('derive explicit head-bound events and timeline; unknown actions ignored, malformed known actions taint', () => {
   assert.deepEqual(deriveActions([{ kind: 'unrelated' }]), []);
   assert.equal(deriveActions(null), null);
-  assert.equal(deriveActions([{ kind: 'worker-push', pr: 7 }]), null);
+  assert.deepEqual(deriveActions([{ kind: 'worker-push', pr: 7 }]), []);
   assert.deepEqual(deriveActions([{ pr: 7, kind: 'action', at: at(0), detail: { action: 'worker-push', head: sha } }]),
     [{ ...observation('worker-push'), source: 'daemon-events:1' }]);
   assert.deepEqual(deriveActions([], [observation('review-started')]), [observation('review-started')]);
+});
+test('real update-branch events bind the resulting head; unbindable triggers do not blind other PRs', () => {
+  const updated = { kind: 'update-branch', repo: 'example/widgets', pr: 7, at: at(0),
+    detail: { ok: true, status: 'updated', beforeHead: next, afterHead: sha } };
+  assert.deepEqual(deriveActions([updated]), [{ ...observation('update-branch'), source: 'daemon-events:1' }]);
+  assert.deepEqual(deriveActions([{ kind: 'update-branch', pr: 8, at: at(0), detail: {} },
+    observation('worker-push')]), [observation('worker-push')]);
+});
+test('every supported action ignores missing bindings but rejects malformed explicit bindings', () => {
+  for (const kind of ACTIONS) {
+    assert.deepEqual(deriveActions([{ kind, pr: 7, at: at(0) }]), [], kind);
+    assert.deepEqual(deriveActions([{ kind, sha, at: at(0) }]), [], kind);
+    assert.equal(deriveActions([{ kind, pr: 7, sha: 'bad', at: at(0) }]), null, kind);
+    assert.equal(deriveActions([{ kind, pr: 7, sha: null, at: at(0) }]), null, kind);
+    assert.equal(deriveActions([{ kind, pr: '7', sha, at: at(0) }]), null, kind);
+    assert.deepEqual(deriveActions([{ kind, pr: 7, sha, at: at(0) }]),
+      [{ ...observation(kind), source: 'daemon-events:1' }]);
+  }
+});
+test('update-branch producer contract: only confirmed head changes start a deadline', async () => {
+  for (const scenario of ['updated', 'already-up-to-date', 'unconfirmed', 'failed']) {
+    const events = []; let reads = 0;
+    await runUpdateBranch({ repo: 'example/widgets', pr: 7, reason: 'contract test' }, {
+      actor: () => 'fixture', sleep: async () => {}, update: async () => 202,
+      readPr: async () => {
+        if (scenario === 'failed') throw Error('unavailable');
+        return { state: 'open', head: { sha: ++reads > 1 && scenario === 'updated' ? sha : next }, base: { ref: 'main' },
+          mergeable: true, mergeable_state: 'behind' };
+      },
+      compare: async () => ({ behind_by: scenario === 'already-up-to-date' || (scenario === 'updated' && reads > 1) ? 0 : 1 }),
+      append: async e => { events.push({ ...e, at: at(0) }); return true; },
+    });
+    assert.equal(deriveActions(events)?.length, scenario === 'updated' ? 1 : 0, scenario);
+  }
 });
 function scratch(fn) {
   const root = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'expectations-'));
@@ -96,6 +131,9 @@ test('observe emits only expectation-missed; durable dedup across repeated passe
   assert.deepEqual(events.slice(1).map(e => e.kind), ['expectation-missed']);
   assert.equal(events[1].daemon, 'expectation-babysitter');
   assert.equal(events[1].detail.mode, 'observe');
+  assert.deepEqual(events[1].detail, { pr: 7, sha, expectationId: row.id, action: 'ready-to-merge',
+    actionAt: at(0), deadline: at(5), observedAt: at(6), minutesLate: 1,
+    evidenceRefs: ['fixture:ready-to-merge:0'], wouldBeResponse: row.wouldBeResponse, mode: 'observe' });
   assert.equal((await runExpectationPass(options(paths))).delivered, 0);
   const saved = JSON.parse(readFileSync(paths.stateFile));
   writeFileSync(paths.stateFile, JSON.stringify(saved)); // simulate process restart: no memory receipts
@@ -120,14 +158,44 @@ test('off performs no IO; replay paths are mandatory, distinct and cannot alias 
   await assert.rejects(runExpectationPass({ ...options(paths), env: { WE_DAEMON_EVENTS: link } }), /scratch paths/);
   await assert.rejects(runExpectationCli({ 'as-of': at(1) }), /scratch replay/);
 }));
-test('failed delivery is not marked emitted: the next pass retries, then dedupes', () => scratch(async paths => {
+test('failed delivery keeps its reservation and requires operator inspection without retry', () => scratch(async paths => {
   let attempts = 0; let ok = false;
   const opts = { ...options(paths), emitEvent() { attempts++; return ok; } };
   assert.equal((await runExpectationPass(opts)).incomplete, true);
   ok = true;
-  assert.equal((await runExpectationPass(opts)).delivered, 1);
   assert.equal((await runExpectationPass(opts)).delivered, 0);
-  assert.equal(attempts, 2);
+  assert.equal((await runExpectationPass(opts)).delivered, 0);
+  assert.equal(attempts, 1);
+}));
+test('receipt is durable before delivery; failure saving after successful delivery cannot duplicate on restart', () => scratch(async paths => {
+  let saves = 0, sends = 0;
+  const opts = { ...options(paths), saveState(file, state) {
+    if (++saves > 1) throw Error('disk full after delivery');
+    writeFileSync(file, JSON.stringify(state));
+  }, emitEvent() {
+    sends++;
+    assert.equal(Object.keys(JSON.parse(readFileSync(paths.stateFile)).prs[7].emitted).length, 1);
+    return true;
+  } };
+  const first = await runExpectationPass(opts);
+  assert.equal(first.incomplete, true); assert.equal(first.delivered, 1);
+  assert.equal((await runExpectationPass({ ...opts, saveState: undefined })).delivered, 0);
+  assert.equal(sends, 1);
+}));
+test('failed reservation save never delivers an event', () => scratch(async paths => {
+  let sends = 0;
+  const result = await runExpectationPass({ ...options(paths), saveState() { throw Error('disk full'); },
+    emitEvent() { sends++; return true; } });
+  assert.equal(result.incomplete, true); assert.equal(sends, 0);
+}));
+test('state growth beyond the byte cap refuses reservation before any event is sent', () => scratch(async paths => {
+  const state = { version: 1, prs: {}, cursor: 0, padding: '' };
+  state.padding = 'x'.repeat(16 * 1024 * 1024 - Buffer.byteLength(JSON.stringify(state)) - 10);
+  writeFileSync(paths.stateFile, JSON.stringify(state));
+  let sends = 0;
+  const result = await runExpectationPass({ ...options(paths), emitEvent() { sends++; return true; } });
+  assert.equal(result.incomplete, true); assert.equal(sends, 0);
+  assert.ok(readFileSync(paths.stateFile).length < 16 * 1024 * 1024);
 }));
 test('an event with no sha (pr-merged) is ignored; a malformed sha still reads unknown', () => {
   assert.deepEqual(deriveActions([{ kind: 'pr-merged', pr: 5, at: at(0) }]), []);
@@ -146,12 +214,12 @@ function githubRead() {
     if (args[1] === 'graphql') {
       assert.match(args[3], /^query=query /); assert.ok(!/mutation/.test(args[3]));
       return { data: { repository: { pullRequest: { number: 7, headRefOid: sha,
-        mergedAt: null, mergeStateStatus: 'CLEAN', headRef: { target: { committedDate: at(-1) } },
+        state: 'OPEN', mergedAt: null, mergeStateStatus: 'CLEAN', headRef: { target: { committedDate: at(-1) } },
         labels: { nodes: [{ name: 'ready-to-merge' }], pageInfo: { hasNextPage: false } }, mergeQueueEntry: null } } } };
     }
     if (args[1].includes('/timeline?')) return [];
     if (args[1].includes('/check-runs?')) return { total_count: 0, check_runs: [] };
-    if (args[1].endsWith('/pulls/7')) return { head: { sha } };
+    if (args[1].endsWith('/pulls/7')) return { state: 'open', head: { sha } };
     throw Error('unexpected gh read');
   };
   return { gh, calls };
@@ -166,6 +234,101 @@ test('live pass uses only gh GET/query reads and emits only expectation-missed',
   assert.deepEqual(emitted.map(e => e.kind), ['expectation-missed', 'expectation-missed']);
   assert.ok(emitted.some(e => e.detail.expectationId === 'clean-not-enqueued'));
   assert.equal(io.calls.length, 8);
+}));
+const liveOptions = paths => ({ repo: 'example/widgets', settings, now: at(0),
+  stateFile: paths.stateFile, env: { WE_DAEMON_EVENTS: paths.eventsFile }, log() {}, emitEvent: () => true });
+test('historical actions outside the collected set do not make the live pass incomplete', () => scratch(async paths => {
+  writeFileSync(paths.eventsFile, JSON.stringify({ ...observation('worker-push'), pr: 99 }) + '\n');
+  const io = githubRead();
+  const result = await runExpectationPass({ ...liveOptions(paths), gh: args => args[1].includes('/pulls?') ? [{ number: 7, state: 'open' }] : io.gh(args) });
+  assert.equal(result.incomplete, false);
+  assert.ok(result.results.every(r => r.pr === 7));
+  assert.equal(JSON.parse(readFileSync(paths.stateFile)).prs[99], undefined);
+}));
+test('merged and closed PRs are pruned after evaluation and absent from the next collection', () => scratch(async paths => {
+  for (const state of ['MERGED', 'CLOSED']) {
+    rmSync(paths.stateFile, { force: true });
+    writeFileSync(paths.eventsFile, '');
+    const io = githubRead(); let terminal = false; let reads = 0;
+    const opts = { ...liveOptions(paths), gh(args) {
+      if (args[1].includes('/pulls?')) return terminal ? [] : [{ number: 7, state: 'open' }];
+      reads++;
+      if (args[1].includes('/timeline?')) return [{ event: 'labeled', label: { name: 'ready-to-merge' },
+        created_at: at(0), url: 'fixture:timeline' }];
+      const response = io.gh(args);
+      if (terminal && args[1] === 'graphql') Object.assign(response.data.repository.pullRequest,
+        { state, headRef: null, mergedAt: state === 'MERGED' ? at(10) : null });
+      if (terminal && args[1].endsWith('/pulls/7')) response.state = 'closed';
+      return response;
+    } };
+    await runExpectationPass(opts); terminal = true;
+    const final = await runExpectationPass({ ...opts, now: at(16) });
+    assert.equal(final.incomplete, false);
+    assert.ok(final.results.some(r => r.expectationId === 'ready-no-gate' && r.status === 'missed'));
+    assert.equal(final.delivered, 1);
+    assert.equal(JSON.parse(readFileSync(paths.stateFile)).prs[7], undefined);
+    const before = reads;
+    assert.equal((await runExpectationPass({ ...opts, now: at(17) })).incomplete, false);
+    assert.equal(reads, before);
+  }
+}));
+test('terminal state shrinks even when other tracked PRs exhaust the tick budget', () => scratch(async paths => {
+  writeFileSync(paths.stateFile, JSON.stringify({ version: 1, cursor: 0, prs: Object.fromEntries(
+    Array.from({ length: 40 }, (_, i) => [i + 1, { emitted: {}, observations: [{ ...observation('worker-push'), pr: i + 1 }] }])) }));
+  const io = githubRead(); let calls = 0;
+  const opts = { ...liveOptions(paths), now: at(16), gh(args) {
+    calls++;
+    if (args[1].includes('/pulls?')) return [];
+    if (args[1] === 'graphql') {
+      const response = io.gh(args);
+      Object.assign(response.data.repository.pullRequest, { number: Number(args[3].match(/number: (\d+)/)[1]),
+        state: 'MERGED', mergedAt: at(10), headRef: null });
+      return response;
+    }
+    if (/\/pulls\/\d+$/.test(args[1])) return { state: 'closed', head: { sha } };
+    return io.gh(args);
+  } };
+  assert.equal((await runExpectationPass(opts)).incomplete, true);
+  assert.equal(calls, 128);
+  assert.equal(Object.keys(JSON.parse(readFileSync(paths.stateFile)).prs).length, 9);
+  assert.equal((await runExpectationPass(opts)).incomplete, false);
+  assert.deepEqual(JSON.parse(readFileSync(paths.stateFile)).prs, {});
+}));
+test('a reopened PR during collection is unknown and cannot be retired', () => {
+  const io = githubRead();
+  assert.throws(() => collectExpectationEvidence({ repo: 'example/widgets', pr: 7, now: at(16), read(args) {
+    const response = io.gh(args);
+    if (args[1] === 'graphql') response.data.repository.pullRequest.state = 'CLOSED';
+    return response;
+  } }), /state changed/);
+});
+test('already-enqueued PR does not start an enqueue deadline, including after dequeue and requeue', () => scratch(async paths => {
+  const io = githubRead(); let queued = true;
+  const opts = { ...liveOptions(paths), pr: 7, gh(args) {
+    const response = io.gh(args);
+    if (args[1] === 'graphql') response.data.repository.pullRequest.mergeQueueEntry = queued ? { enqueuedAt: at(-0.5) } : null;
+    return response;
+  } };
+  await runExpectationPass(opts);
+  assert.ok(!(await runExpectationPass({ ...opts, now: at(16) })).results.some(r => r.expectationId === 'clean-not-enqueued'));
+  queued = false;
+  await runExpectationPass({ ...opts, now: at(17) });
+  assert.ok((await runExpectationPass({ ...opts, now: at(33) })).results.some(r => r.expectationId === 'clean-not-enqueued' && r.status === 'missed'));
+  queued = true;
+  assert.ok(!(await runExpectationPass({ ...opts, now: at(34) })).results.some(r => r.expectationId === 'clean-not-enqueued'));
+}));
+test('bounded live log tail tolerates a torn append and preserves known triggers after rotation', () => scratch(async paths => {
+  const io = githubRead(); const opts = { ...liveOptions(paths), pr: 7, gh: io.gh };
+  const trigger = JSON.stringify(observation('worker-push'));
+  writeFileSync(paths.eventsFile, JSON.stringify({ kind: 'unrelated', padding: 'x'.repeat(16 * 1024 * 1024) }) + '\n' + trigger + '\n{"kind":');
+  assert.equal((await runExpectationPass(opts)).incomplete, false);
+  writeFileSync(paths.eventsFile, JSON.stringify({ kind: 'unrelated' }) + '\n');
+  const result = await runExpectationPass({ ...opts, now: at(16) });
+  assert.equal(result.incomplete, false);
+  assert.ok(result.results.some(r => r.expectationId === 'push-no-review' && r.status === 'missed'));
+  writeFileSync(paths.eventsFile, '{broken}\n' + trigger + '\n');
+  const corrupt = await runExpectationPass({ ...opts, now: at(17) });
+  assert.equal(corrupt.incomplete, true); assert.equal(corrupt.delivered, 0);
 }));
 test('oversized timeline/checks and head races refuse evidence with operator fallback', () => {
   for (const scenario of ['timeline', 'checks', 'head']) {
@@ -188,6 +351,18 @@ test('settings read through feature discovery and cascade with provenance; taint
   const resolved = readExpectationSettings({ settingsFiles: { dir, legacyPath: null },
     env: { WE_EXPECTATIONS_MODE: 'garbage', WE_PLATFORM_PREFERENCES_FILE: join(root, 'absent') }, log: line => lines.push(line) });
   assert.equal(resolved.mode, 'off'); assert.ok(lines[0].includes('policy-cascade'));
+}));
+test('unrelated settings taint preserves non-default expectation settings and evaluation', () => scratch(async (paths, root) => {
+  const dir = join(root, 'settings'); mkdirSync(dir);
+  const custom = { mode: 'observe', expectations: [{ ...row, deadlineMinutes: 2, wouldBeResponse: 'fixture response' }] };
+  writeFileSync(join(dir, 'expectations.json'), JSON.stringify(custom));
+  writeFileSync(join(dir, 'unrelated.json'), '{broken');
+  const config = readExpectationSettings({ settingsFiles: { dir, legacyPath: null }, env: {
+    WE_PLATFORM_PREFERENCES_FILE: join(root, 'absent') }, log() {} });
+  assert.equal(config.valid, true); assert.deepEqual(config.expectations, custom.expectations);
+  const result = await runExpectationPass({ ...options(paths), settings: config });
+  assert.equal(result.delivered, 1); assert.equal(result.results[0].deadline, at(2));
+  assert.equal(result.results[0].wouldBeResponse, 'fixture response');
 }));
 
 test('absent PR evidence and malformed settings retain known actions as unknown', () => {
