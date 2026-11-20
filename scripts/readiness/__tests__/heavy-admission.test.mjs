@@ -3191,7 +3191,7 @@ describe('canonical host manifest policy', () => {
     loadAdmissionPolicy({ home, repoRoot: lockRoot, env: {} });
     rmSync(host);
     if (fault === 'malformed') writeFileSync(host, '{');
-    if (fault === 'oversized') writeFileSync(host, ' '.repeat(256 * 1024 + 1));
+    if (fault === 'oversized') writeFileSync(host, JSON.stringify({ padding: 'x'.repeat(4 * 1024 * 1024 + 1) }));
     if (fault === 'unreadable') mkdirSync(host);
     if (fault === 'invalid root') writeFileSync(host, 'null');
     if (fault === 'invalid admission') writeFileSync(host, JSON.stringify({ heavyAdmission: [] }));
@@ -3204,6 +3204,7 @@ describe('canonical host manifest policy', () => {
     expect(policy.settings.remote).toMatchObject({ manifest: 'legacy', enabled: false });
     expect(policy.sources['remote.manifest']).toBe('standard');
     expect(policy.invalid).toContainEqual(expect.stringContaining('canonical platform manifest:'));
+    if (fault === 'oversized') expect(policy.invalid).toContainEqual(expect.stringContaining('file larger than 4194304 bytes'));
     expect(policy.sources['remote.enabled']).toBe('platform (canonical remote.manifest unavailable; local execution required)');
     const remoteExec = vi.fn(), log = vi.fn();
     expect(await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'fixture.test.mjs'],

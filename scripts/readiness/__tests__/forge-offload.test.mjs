@@ -902,7 +902,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
       if(fault==='tracked'||fault==='invalid')await fs.writeFile(path,JSON.stringify({heavyAdmission:{remote:{manifest:fault==='tracked'?'tracked':'trackd'}}}));
       if(fault==='missing')await fs.rm(path);
       if(fault==='malformed')await fs.writeFile(path,'{');
-      if(fault==='oversized')await fs.writeFile(path,' '.repeat(256*1024+1));
+      if(fault==='oversized')await fs.writeFile(path,JSON.stringify({padding:'x'.repeat(4*1024*1024+1)}));
       if(fault==='invalid object')await fs.writeFile(path,'[]');
       if(fault==='unreadable'){await fs.rm(path);await fs.mkdir(path);}
       const redirected=join(root,'redirected.json');

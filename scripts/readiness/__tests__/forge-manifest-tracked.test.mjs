@@ -203,7 +203,7 @@ it.each(['direct', 'redirected'].flatMap(mode =>
   await fs.mkdir(join(home,'.claude'),{recursive:true});
   if (fault === 'invalid') await fs.writeFile(hostPath,JSON.stringify({heavyAdmission:{remote:{manifest:'trackd',enabled:true}}}));
   if (fault === 'malformed') await fs.writeFile(hostPath,'{');
-  if (fault === 'oversized') await fs.writeFile(hostPath,' '.repeat(256*1024+1));
+  if (fault === 'oversized') await fs.writeFile(hostPath,JSON.stringify({padding:'x'.repeat(4*1024*1024+1)}));
   if (fault === 'invalid object') await fs.writeFile(hostPath,'[]');
   if (fault === 'unreadable') await fs.mkdir(hostPath);
   const redirected = join(root,'redirected.json');
