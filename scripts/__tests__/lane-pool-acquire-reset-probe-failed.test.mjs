@@ -95,7 +95,7 @@ describe('acquire reset-time re-verify fails closed when the status probe fails 
     expect(existsSync(failed)).toBe(true);
     expect(acquire.code).not.toBe(0);
     expect(acquire.err).toMatch(/no longer provably safe to reset/);
-    expect(acquire.err).toMatch(/0 uncommitted, 0 ahead/); // a failed count reads as 0 ahead — still refused
+    expect(acquire.err).toMatch(/0 uncommitted, null ahead/); // a failed count remains unknown and is refused
     expect(readFileSync(join(lane, 'file.txt'), 'utf8')).toBe('v1\n');
   });
 

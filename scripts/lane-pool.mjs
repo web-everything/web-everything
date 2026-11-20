@@ -1184,14 +1184,13 @@ function laneDirtyOrAhead(dir, branch) {
   const uncommitted = porcelain ? porcelain.split('\n').filter(Boolean).length : 0;
   const dirtyPaths = porcelain ? porcelainPaths(porcelain) : [];
   const aheadRaw = tryGit(['rev-list', '--count', `origin/${branch}..HEAD`], dir);
-  const ahead = aheadRaw === null ? 0 : Number(aheadRaw);
+  const ahead = aheadRaw !== null && /^\d+$/.test(aheadRaw) && Number.isSafeInteger(Number(aheadRaw)) ? Number(aheadRaw) : null;
   // #2452 review — this predicate reports the FACT only ("how many commits ahead of the local origin ref").
   // The Gap-1 relaxation used to live here, which silently changed reset/skip semantics for every caller
   // (`refreshLane`'s hard-reset decision, `status`, the board) even though it is justified only for acquire's
   // auto-pick. Policy now lives at that one call site — see `aheadIsProvablyPushed`.
-  // A git that failed (spawn error, kill, EMFILE under load) reads above as "nothing uncommitted / nothing ahead".
-  // That is the right fail-open answer for ONE scan, but it must never be REMEMBERED as a clean verdict.
-  return { dirty: uncommitted > 0, uncommitted, ahead, dirtyPaths, probeFailed: porcelain === null || aheadRaw === null };
+  // Unknown history is never evidence of zero ahead commits.
+  return { dirty: uncommitted > 0, uncommitted, ahead, dirtyPaths, probeFailed: porcelain === null || ahead === null };
 }
 
 /**
@@ -1401,11 +1400,12 @@ function litterAdjustedDirty(dir, rawDirty) {
  * @param {string} dir
  * @param {string} branch
  * @param {() => Set<string>} getRemoteShas
- * @returns {{dirty: boolean, uncommitted: number, ahead: number, aheadPushed?: boolean}}
+ * @returns {{dirty: boolean, uncommitted: number, ahead: number|null, aheadPushed?: boolean}}
  */
 function effectiveDirtyOrAhead(dir, branch, getRemoteShas) {
   const raw = laneDirtyOrAhead(dir, branch);
-  const dirty = litterAdjustedDirty(dir, raw.dirty);
+  // Eligibility consumes dirty/ahead; an unreadable probe must disqualify the lane too.
+  const dirty = raw.probeFailed || litterAdjustedDirty(dir, raw.dirty);
   let ahead = raw.ahead;
   let aheadPushed = false;
   if (ahead > 0) {
@@ -2840,9 +2840,10 @@ async function cmdAcquire(repo) {
         .filter((n) => !excluded.has(n) && !holdRefused.has(n) && n !== selfLane && !isHistoryQuarantined(repo, n))
         .sort((a, b) => a - b);
       for (const pick of pickable) {
-        if (retryingCandidates) {
-          // A grown/recovered lane can gain work or a foreign lease before this retry. Apply the
-          // scan's normal eligibility rule even with --force, which never widens auto-pick eligibility.
+        if (usingFreeList || retryingCandidates) {
+          // The free list is only a hint. Check current eligibility before claiming/provisioning,
+          // just as for grown/recovered lanes; an unsafe hint must not become a provision failure
+          // that blocks growth. --force never widens auto-pick eligibility.
           const candidateNow = Date.now();
           if (!isLaneAcquirable(laneAcquirableInfo(repo, pick, retryRemoteShasBox, candidateNow, ttlMs), candidateNow, ttlMs)) continue;
         }
