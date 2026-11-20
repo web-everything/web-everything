@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { userInfo } from 'node:os';
 import { basename } from 'node:path';
@@ -117,6 +118,14 @@ export function scrubInheritedGitEnv(env = process.env) {
   return out;
 }
 
+/** Pin Apple's git launcher to installed Command Line Tools without overriding caller intent. */
+export function pinDeveloperDir(env = process.env, { exists = existsSync } = {}) {
+  if (!env.DEVELOPER_DIR && exists('/Library/Developer/CommandLineTools')) {
+    env.DEVELOPER_DIR = '/Library/Developer/CommandLineTools';
+  }
+  return env;
+}
+
 /**
  * A copy of `env` without {@link GIT_REPO_LOCATION_ENV_KEYS}, with `GIT_REF_PARANOIA=1` (a broken ref aborts instead
  * of being skipped). For every git call in a lane: an inherited GIT_DIR / GIT_REFERENCE_BACKEND would send its writes
@@ -127,6 +136,7 @@ export function scrubInheritedGitEnv(env = process.env) {
 export function scrubGitLocationEnv(env) {
   const out = { ...env };
   for (const key of GIT_REPO_LOCATION_ENV_KEYS) delete out[key];
+  pinDeveloperDir(out);
   out.GIT_REF_PARANOIA = '1';
   return out;
 }

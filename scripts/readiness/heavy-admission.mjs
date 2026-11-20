@@ -145,6 +145,8 @@
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
+import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
+pinDeveloperDir();
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { execSync, execFile, spawn } from 'node:child_process';
@@ -432,7 +434,9 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
 
 const admissionPolicyCache = new Map();
 const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
-const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+// The host platform bag grew past 256 KiB on 2026-11-19 and every fresh process then read the standard layer
+// (remote.enabled=false); the bound is a sanity limit, not a policy limit.
+const PLATFORM_FILE_MAX_BYTES = 4 * 1024 * 1024;
 /**
  * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
  * On the shared host pool the platform file is the ONE capacity and priority source; every caller reads the SAME file:

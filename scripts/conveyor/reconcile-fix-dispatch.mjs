@@ -85,7 +85,7 @@ import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
-import { repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
+import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
@@ -1921,6 +1921,7 @@ export function runReconcileFixDispatch({
   let yieldedForAdoption = false;
   // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
   if (typeof now === 'function') now = now();
+  const tickEnteredAt = clock();
   const mainFixCapacity = resolveMainFixCapacity();
   const fixStep = (name, fn, pr = null) => {
     const startedAt = stepNow();
@@ -1957,11 +1958,11 @@ export function runReconcileFixDispatch({
 
   // CI-heal is a capability of its own — refused independently of whatever `fix` decides below (see this
   // function's own docblock).
-  const ciHealRefusals = profile?.capabilities?.ciHeal ? [] : unsupportedFor(
+  const ciHealRefusals = !assertCapability(repoKey, 'ciHeal', { resolveProfile: () => profile }) ? [] : unsupportedFor(
     'ci-heal', 'ci-heal', 'CI-heal dispatch requires a repo-specific brief and gate; the existing worker is WE-only.',
   );
 
-  if (!profile?.capabilities?.fix) {
+  if (assertCapability(repoKey, 'fix', { resolveProfile: () => profile })) {
     // This repo's fix stage is off entirely: every `fix` entry is unsupported, never touching the lane pool or
     // a dispatch sink. Durable ledger write mirrors the pre-slice-5 blanket branch exactly — preserve any
     // already-recorded `review` rows for this repo (a DIFFERENT stage this file knows nothing about), replace
@@ -2165,19 +2166,31 @@ export function runReconcileFixDispatch({
   const dispatched = [];
   let handled = 0;
   let deferred = [];
+  let conflictHandled = 0;
   let conflictExemptHandled = 0;
+  const conflictCap = Number.isSafeInteger(fixSettings.conflictFixesPerPass) && fixSettings.conflictFixesPerPass >= 0
+    && fixSettings.conflictFixesPerPass <= 24 ? fixSettings.conflictFixesPerPass : 0;
+  // LIVE: the open-PR read and plan above take 8-15 min against a 5 min fix budget, so the budget was spent before
+  // the first dispatch and every pass launched ~2 fixers (red-team send-backs starved for hours). The budget bounds
+  // DISPATCH work only: slide the deadline by the time the read/plan consumed.
+  const dispatchDeadlineAt = deadlineAt == null ? deadlineAt : deadlineAt + Math.max(0, clock() - tickEnteredAt);
   const exemptCap = Number.isSafeInteger(fixSettings.conflictFixExemptPerPass) && fixSettings.conflictFixExemptPerPass >= 0
     ? fixSettings.conflictFixExemptPerPass : 0;
   console.error(`reconcile-fix-dispatch: fix.conflictFixExemptPerPass=${exemptCap} (source ${fixSettings.sources?.conflictFixExemptPerPass ?? 'invalid'})`);
+  console.error(`reconcile-fix-dispatch: fix.conflictFixesPerPass=${conflictCap} (source ${fixSettings.sources?.conflictFixesPerPass ?? 'invalid'})`);
   for (const entry of planned) {
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    const exempt = entry.isConflict === true && entry.conflictFixMechanical === true && !entry.restack
-      && conflictExemptHandled < exemptCap;
-    if ((handled > 0 && deadlineAt != null && clock() > deadlineAt && !exempt) || yieldedForAdoption) {
+    const conflict = entry.isConflict === true && !entry.restack;
+    const mechanical = conflict && entry.conflictFixMechanical === true;
+    // Shared total bounds mixed mechanical/unproven conflicts too; allowances never add together.
+    const exempt = conflict && conflictHandled < Math.max(conflictCap, exemptCap)
+      && (conflictHandled < conflictCap || (mechanical && conflictExemptHandled < exemptCap));
+    if ((handled > 0 && dispatchDeadlineAt != null && clock() > dispatchDeadlineAt && !exempt) || yieldedForAdoption) {
       deferred.push(entry.pr);
       continue;
     }
-    if (exempt) conflictExemptHandled += 1;
+    if (conflict) conflictHandled += 1;
+    if (mechanical) conflictExemptHandled += 1;
     handled += 1;
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
@@ -2465,8 +2478,6 @@ export function planFixDispatchClaimStatus({
   assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
-  const profile = resolveProfile(repoKey);
-  if (!profile?.capabilities?.fix) return { repo: repoKey, entries: [] };
   const { planned } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
   const entries = planned.map((entry) => ({
     pr: entry.pr, itemNum: entry.itemNum, headRefOid: entry.headRefOid,

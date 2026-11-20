@@ -110,7 +110,7 @@ import { formatCascadeSourcesLine } from './lib/policy-cascade.mjs';
 import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-transcript-policy.mjs';
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
-import { laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
+import { pinDeveloperDir, laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { userInfo } from 'node:os';
 import { buildAgentArgs, buildAgentPath, launchAgent } from './lib/agent-launch.mjs';
@@ -134,6 +134,8 @@ import {
 import { resolveCodexTaskRoute } from './lib/codex-task-route.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
+pinDeveloperDir();
+
 export const CODEX_CLI = 'codex';
 
 /** #4194 — the suffix a `--review` task carries in place of the edit instruction. Codex reads the checkout under its

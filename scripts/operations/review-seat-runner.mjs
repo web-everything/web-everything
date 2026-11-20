@@ -86,7 +86,7 @@ export async function runSeatWithProvider(request, {
     }
     try { return await agyJuror({ request: plain, laneCwd: cwd, model: runModel }); } catch (e) {
       // A thrown error's text reaches the run record and a skipped advisory seat's PR summary: no local paths there.
-      return { status: 'failed', reasons: [scrubPaths(e?.message ?? e, [cwd])] };
+      return { status: 'failed', telemetry: e?.telemetry, reasons: [scrubPaths(e?.message ?? e, [cwd])] };
     }
   };
 
@@ -151,7 +151,7 @@ export async function runSeatWithProvider(request, {
   const fellBack = { provider: 'agy', model, status: agyRun.status === 'ok' ? 'voided' : agyRun.status, reasons: why };
   if (directive.onEscape === 'skip') {
     const reason = `agy seat ${fellBack.status}: ${why.join('; ') || 'no reason given'}`.slice(0, 600);
-    return wrap({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: 'agy', reason }, seatProvider: fellBack });
+    return wrap({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: 'agy', reason: agyRun.telemetry?.quotaState === 'provider-unresponsive' ? 'provider-unresponsive' : reason }, seatProvider: fellBack }, agyRun.telemetry);
   }
   const claude = unwrap(await claudeJudge(plain));
   return wrap({ ...claude.value, seatProvider: { provider: 'claude', fellBackFrom: fellBack } }, claude.telemetry);
