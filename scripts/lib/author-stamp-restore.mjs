@@ -162,6 +162,12 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
         contentEvidence(edit, markerLine(edit.diff)));
     }
+    // Blunt rule: fence/code-span parsing edge cases (tab indent, info strings, NBSP/form-feed suffixes) can
+    // hide a marker inside code. A snapshot with a stamp AND any backtick or tilde fence is never evidence.
+    if (markers.length && (edit.diff.includes('`') || /^[ \t]*~{3,}/m.test(edit.diff))) {
+      return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
+        contentEvidence(edit, markerLine(edit.diff)));
+    }
     // An unmatched backtick line may open a multiline code span around a marker: not evidence of authorship.
     if (ambiguousTicks && markers.length) {
       return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',

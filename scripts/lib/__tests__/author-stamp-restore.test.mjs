@@ -155,7 +155,8 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
       };
     };
     const baseline = plan(fixture('invariants.json'));
-    expect(baseline).toMatchObject({ action: 'restore', id: '00000000-0000-4000-8000-000000000000' });
+    // Blunt rule (#7231): any backtick beside a stamp is refused, placeholder or not.
+    expect(baseline).toMatchObject({ action: 'refuse' });
     const result = plan(fixture('<path>'));
     expect(result).toEqual(JSON.parse(JSON.stringify(baseline).replaceAll('invariants.json', '<path>')));
   });
@@ -164,9 +165,9 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     ['single backticks', '`<path>`'],
     ['double backticks containing single backticks', '`` `<path>` ``'],
     ['multiple spans', '`<path>` then ``<other>``'],
-  ])('ignores tag-like text in balanced inline code with %s', (_name, text) => {
+  ])('refuses (blunt backtick rule) balanced inline code with %s', (_name, text) => {
     expect(plan({ edits: [edit(`${text}\n\n${buildAuthorActorMarker(ID)}`)] }))
-      .toMatchObject({ action: 'restore', id: ID });
+      .toMatchObject({ action: 'refuse' });
   });
 
   it.each([
@@ -264,12 +265,11 @@ describe('plain snapshot provenance — oldest author snapshot and agreeing ids'
     expectReason(plan({ edits }), 'refuse');
   });
 
-  it.each(['```', '~~~'])('restores a standalone marker after a closed %s code fence', async (fence) => {
+  it.each(['```', '~~~'])('refuses (blunt fence rule) a marker after a closed %s code fence', async (fence) => {
     const marker = buildAuthorActorMarker(ID);
     const seams = io({ readEdits: vi.fn(() => [edit(`${fence}text\nexample\n${fence}\n\n${marker}\n`)]) });
-    expectReason(await restoreAuthorStamp(seams), 'restore');
-    expect(seams.writeBody).toHaveBeenCalledTimes(1);
-    expect(seams.writeBody).toHaveBeenCalledWith(6244, `${BODY}\n\n${marker}\n`);
+    expectReason(await restoreAuthorStamp(seams), 'refuse');
+    expect(seams.writeBody).not.toHaveBeenCalled();
   });
 
   it('refuses complete plain snapshots with a plus-prefixed forgery retained by the author without writing', async () => {
@@ -946,8 +946,8 @@ describe('planStampRestore — #7227 full-body edit dropped the stamp', () => {
     edit(BODY, 'chalbert', '2026-11-20T19:22:58Z'),
     edit(`${prBody}\n\n${buildAuthorActorMarker(ID)}`, AUTHOR, '2026-11-20T18:39:58Z'),
   ];
-  it('restores when snapshots carry backticked placeholder text and non-stamp size comments', () => {
-    expect(plan({ edits: dropped() })).toMatchObject({ action: 'restore', id: ID });
+  it('refuses (blunt backtick rule) when snapshots carry backticked text beside a stamp', () => {
+    expect(plan({ edits: dropped() })).toMatchObject({ action: 'refuse' });
   });
   it('refuses (blunt bracket rule) a balanced one-line markdown link in the snapshot', () => {
     const edits = [edit(`${prBody}\nGenerated with [Claude Code](https://claude.com/claude-code)\n${buildAuthorActorMarker(ID)}`)];
@@ -1086,5 +1086,22 @@ describe('restoreAuthorStamp — second link title cannot supply a stamp', () =>
     expect(restoreAuthorStamp(seams)).toMatchObject({ action: 'refuse', contentRefusal: true });
     expect(seams.readEdits).toHaveBeenCalledTimes(1);
     expect(seams.writeBody).not.toHaveBeenCalled();
+  });
+});
+
+describe('planStampRestore — blunt backtick/fence rule (#7231)', () => {
+  const m = () => buildAuthorActorMarker(ID);
+  const machine = '<!-- pr-size:begin -->';
+  it.each([
+    ['tab-indented closing fence', `${machine}\n\`\`\`\nexample\n\t\`\`\`\n${m()}\n\`\`\``],
+    ['backtick info string then longer fence', `${machine}\n\`\`\` a\`b\n\`\`\`\`\n${m()}\n\`\`\`\``],
+    ['NBSP/form-feed closing suffix', `${machine}\n\`\`\`\nexample\n\`\`\` \f\n${m()}\n\`\`\``],
+    ['tilde fence', `~~~\n${m()}\n~~~`],
+    ['any stray backtick', `use \`x\`\n${m()}`],
+  ])('refuses %s', (_n, diff) => {
+    expect(plan({ edits: [edit(diff)] })).toMatchObject({ action: 'refuse' });
+  });
+  it('plain-prose control still restores', () => {
+    expect(plan({ edits: [edit(`Plain prose.\n\n${m()}`)] })).toMatchObject({ action: 'restore', id: ID });
   });
 });
