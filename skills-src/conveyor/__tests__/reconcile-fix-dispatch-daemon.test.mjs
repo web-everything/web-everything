@@ -2632,6 +2632,17 @@ describe('fix pass budgets', () => {
     expect(formatPassPhaseTiming(result).join('\n')).toContain('pass-timing phase=main-red-rebase ms=5000 budgetMs=1000 budgetHit=true');
   });
 
+  it('main-red-rebase keeps a smaller WE_RECOVERY_APPLY_BUDGET_MS operator limit', async () => {
+    vi.stubEnv('WE_RECOVERY_APPLY_BUDGET_MS', '500');
+    try {
+      const seen = [];
+      await runTickAllRepos(fixture({ repos: ['a'], now: () => 0,
+        mainRedRebaseTick: opts => { seen.push(opts.applyBudgetMs); return { dispatch: [], refusals: [], applied: [] }; },
+        passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { mainRedRebaseMs: 90000 } } }) }));
+      expect(seen).toEqual([500]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('mainRedRebaseMs defaults to 170000, clamps to its max, and falls back on invalid values', () => {
     expect(resolveFixPassBudgets({ env: {}, file: {} }).mainRedRebaseMs).toEqual({ value: 170000, source: 'standard' });
     expect(resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { mainRedRebaseMs: 9999999 } } }).mainRedRebaseMs.value).toBe(600000);
