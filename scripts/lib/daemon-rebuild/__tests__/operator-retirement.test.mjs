@@ -299,6 +299,33 @@ describe('operator retirement of a live overlay', () => {
     });
   });
 
+  it.each([undefined, false, 'true'])('refuses missing registration history without explicit omission acceptance (%s)', acceptedOmission => {
+    removeOverlay(root, ref, { env });
+    refused(match([{ ...removed, liveApplied: true, acceptedOmission }]));
+  });
+
+  it.each([undefined, false, 'true'])('refuses missing registration history without recorded live-tip proof (%s)', liveApplied => {
+    removeOverlay(root, ref, { env });
+    refused(match([{ ...removed, acceptedOmission: true, liveApplied }]));
+  });
+
+  it('accepts exact-tip explicit withdrawal without registration history', () => {
+    removeOverlay(root, ref, { env });
+    expect(match([{ ...removed, acceptedOmission: true, liveApplied: true }])).toMatchObject({
+      adopt: { finalSha: 'candidate' }, retired: [ref],
+    });
+  });
+
+  it.each([
+    ['unknown add time', { ...added, at: undefined }],
+    ['later add time', { ...added, at: '2026-11-14T12:00:00Z' }],
+    ['equal add time', { ...added, at: removed.at }],
+    ['out-of-order adds', outOfOrderAdds[0]],
+  ])('explicit omission acceptance preserves the registration chronology veto (%s)', (_name, registration) => {
+    removeOverlay(root, ref, { env });
+    refused(match([registration, added, { ...removed, acceptedOmission: true, liveApplied: true }]));
+  });
+
   it('removal without an actor still removes but supplies no retirement proof', () => {
     expect(removeRegistration({ root, ref, reason: 'retire fix', env,
       deps: { tip: () => sha } }).removed).toBe(true);

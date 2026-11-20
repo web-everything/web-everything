@@ -173,7 +173,7 @@ export async function withdrawUnregisteredOverlay({ root, ref, tip, actor, reaso
     });
     if (!applied) throw new Error('--tip is not a live applied tip for this ref; inspect the clone rebuild merge parents and retry');
     appendOverlayEvent(root, { kind: 'auto-retired', ref, tip, reason: reason.trim(), actor: login,
-      operatorReason: true, acceptedOmission: true }, { env });
+      operatorReason: true, acceptedOmission: true, liveApplied: true }, { env });
     return { retired: true, list: state.overlays };
   });
 }

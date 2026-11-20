@@ -166,10 +166,13 @@ export function overlayRetiredByOperator({ ref, sha, registered, events } = {}) 
       ? [{ ...e, kind: 'added', ref }] : e?.ref === ref ? [e] : []);
     const removed = history.at(-1)?.kind === 'auto-retired' ? history.at(-1) : null; // `removed` never carries authenticated operator evidence; any later lifecycle event fails closed
     const added = history.filter((e) => e.kind === 'added');
+    // daemon-load-overlay can register without an add event. Only explicit withdrawal,
+    // whose writer proved this exact live merge tip, may stand without that chronology.
+    const liveWithdrawal = removed?.acceptedOmission === true && removed?.liveApplied === true;
     if (!removed || removed.operatorReason !== true || removed.tip !== sha || typeof removed.reason !== 'string' || !removed.reason.trim()
       || AUTOMATIC_RETIREMENT_REASONS.includes(removed.reason.trim().toLowerCase())
       || typeof removed.actor !== 'string' || !OPERATOR_LOGINS.includes(removed.actor.toLowerCase())
-      || typeof removed.at !== 'string' || !added.length) return false;
+      || typeof removed.at !== 'string' || (!added.length && !liveWithdrawal)) return false;
     const removedAt = Date.parse(removed.at);
     return Number.isFinite(removedAt)
       && history.lastIndexOf(removed) > history.findLastIndex((e) => e.kind === 'added')

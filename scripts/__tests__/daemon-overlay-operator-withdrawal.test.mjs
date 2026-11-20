@@ -8,6 +8,7 @@ import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays } from '.
 import { matchReadyCandidate, overlayRetiredByOperator } from '../lib/daemon-rebuild/adopt.mjs';
 import { createPrototypeLoader, defaultDeps } from '../operations/prototype-load-io.mjs';
 import { REBUILD_IDENTITY_ENV } from '../lib/daemon-rebuild/shared.mjs';
+import { runDaemonLoadOverlay } from '../lib/daemon-load-overlay.mjs';
 
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal();
@@ -48,6 +49,38 @@ function fixture() {
 }
 
 describe('operator withdrawal of an unregistered live overlay', () => {
+  it('authorizes omission after withdrawing a loader registration with no added event', async () => {
+    const f = fixture();
+    const ref = f.args.ref;
+    f.git('update-ref', `refs/remotes/origin/${ref}`, f.tip);
+    expect(await runDaemonLoadOverlay({
+      clone: f.root, ref, pr: 7199, env: f.env, versions: null,
+      settings: { dispatchSmoke: 'off' },
+      // Admission and rebuild effects are injected; registration and installed-tip proof are real.
+      admit: async ({ register }) => { register(null); return { registered: true }; },
+      rebuild: async () => ({ moved: true, adopted: true, head: f.git('rev-parse', 'HEAD') }),
+    })).toMatchObject({ registered: true, adopted: true });
+    expect(f.events()).toEqual([]);
+    expect(removeRegistration({ root: f.root, ref, env: f.env })).toMatchObject({ removed: true });
+    const registered = r => readOverlays(f.root, { env: f.env }).some(o => o.ref === r);
+    const match = events => matchReadyCandidate({
+      ready: { kind: 'candidate', prevHead: 'live', passedAt: new Date().toISOString(),
+        tree: 'candidate-tree', adopt: { finalSha: 'candidate', applied: [] } },
+      plan: { finalSha: 'new-plan' }, prevHead: 'live', treeOf: () => 'plan-tree',
+      stillWanted: () => true, verifyBuilt: () => true, nowMs: Date.now(), maxAgeMs: 3_600_000,
+      liveApplied: [{ ref, sha: f.tip }],
+      retiredByOperator: a => overlayRetiredByOperator({ ...a, registered, events }),
+    });
+    expect(match(f.events())).toMatchObject({ adopt: null, reason: `superseded-omits-live-overlay: ${ref}` });
+    expect(await withdrawUnregisteredOverlay(f.args)).toMatchObject({ retired: true });
+    const history = f.events();
+    expect(history.some(e => ['added', 'auto-rebase-registered'].includes(e.kind))).toBe(false);
+    expect(match(history)).toMatchObject({ adopt: { finalSha: 'candidate' }, retired: [ref] });
+    expect(match(history.map(e => ({ ...e, acceptedOmission: undefined })))).toMatchObject({ adopt: null });
+    expect(match(history.map(e => ({ ...e, liveApplied: undefined })))).toMatchObject({ adopt: null });
+    expect(match([...history, { kind: 'added', ref, at: new Date().toISOString() }])).toMatchObject({ adopt: null });
+  });
+
   it('withdraws an actorlessly removed auto-rebase replacement and authorizes candidate adoption', async () => {
     const root = mkdtempSync(join(tmpdir(), 'auto-rebase-withdraw-'));
     roots.push(root);
