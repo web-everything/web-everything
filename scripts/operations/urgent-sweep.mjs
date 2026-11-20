@@ -39,6 +39,7 @@ export function hotPatchCiEvidence(data, sha, required) {
   validateChecks(data, sha);
   if (!Array.isArray(required) || !required.includes('test') || required.some(n => typeof n !== 'string' || !n))
     throw Error('unreadable required CI jobs');
+  if (required.some(n => !data.check_runs.some(c => c.app.id === TEST_CHECK_APP_ID && (c.name === n || c.name.startsWith(`${n} (`))))) throw Error('missing required Actions check; inspect CI or unload manually');
   const latest = new Map();
   for (const c of data.check_runs) {
     const key = JSON.stringify([c.app.id, c.check_suite?.id, c.name]);

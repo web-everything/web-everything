@@ -3662,6 +3662,7 @@ describe('hot-patch urgent admission (R1100)', () => {
     const rows = change.rows ?? [{ id: 1, head_sha: SHA, name: 'test', status: 'in_progress', conclusion: null,
       app: { id: 15368 }, check_suite: { id: 7 } }];
     const gh = [];
+    let checkReads = 0, prReads = 0;
     const home = mkdtempSync(join(tmpdir(), 'hotpatch-load-'));
     hotHomes.push(home);
     const lockFs = Object.fromEntries(['openSync', 'closeSync', 'writeFileSync', 'unlinkSync', 'statSync'].map(k => [k, nodeFs[k]]));
@@ -3682,9 +3683,13 @@ describe('hot-patch urgent admission (R1100)', () => {
         gh.push(args);
         const path = args.find(a => a.startsWith('repos/'));
         if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: repo, url: `https://github.com/${repo}` });
-        if (path?.includes('/check-runs')) return JSON.stringify({ total_count: rows.length, check_runs: rows });
+        if (path?.includes('/check-runs')) {
+          const current = ++checkReads > 1 ? change.finalRows ?? rows : rows;
+          return JSON.stringify({ total_count: current.length, check_runs: current });
+        }
         if (path?.includes('/actions/runs')) return JSON.stringify({ total_count: 2, workflow_runs: [7, 8].map(check_suite_id => ({ check_suite_id, head_sha: SHA, path: '.github/workflows/ci.yml' })) });
-        if (path === `repos/${repo}/commits/${SHA}/pulls` || path?.includes('/pulls?')) return JSON.stringify(prs);
+        if (path === `repos/${repo}/commits/${SHA}/pulls`) return JSON.stringify(++prReads > 1 ? change.finalPrs ?? prs : prs);
+        if (path?.includes('/pulls?')) return JSON.stringify(prs);
         if (path === `repos/${repo}/pulls/42`) return JSON.stringify(prs[0]);
         if (path?.includes('/rules/branches/')) return JSON.stringify(rules);
         if (path === `repos/${repo}/rulesets/27726920`) return JSON.stringify(ruleset);
@@ -3712,10 +3717,28 @@ describe('hot-patch urgent admission (R1100)', () => {
       app: { id: 15368 }, check_suite: { id: 7 } }] });
     expect(await f.run()).toMatchObject({ ok: true, registered: true });
     expect(f.records).toContainEqual(expect.objectContaining({ type: 'prototype-load.urgent', ref: branch, sha: SHA, hotPatch: { pr: 42 } }));
-    expect(f.readyWrites[0]).toMatchObject({ tests: 'green', testCheck: { status } });
+    expect(f.readyWrites[0]).toMatchObject({ tests: status === 'completed' ? 'green' : 'pending', testCheck: { status } });
+    if (status !== 'completed') expect(prototypeLoad.readyEvidence(f.readyWrites, { branch, sha: SHA })).toBeNull();
     expect(f.reads.some(p => p.endsWith('/urgent-full-green.jsonl'))).toBe(false);
     expect(f.gh.some(args => args.includes(`repos/${repo}/commits/${SHA}/pulls`))).toBe(true);
     expect(f.gh.some(args => args.includes(`repos/${repo}/rulesets/27726920`))).toBe(true);
+  });
+  it('refuses hot-patch replacement without changing the existing registration', async () => {
+    const f = hotFixture({ options: { list: ['lane/old'], contained: ['lane/old'] } });
+    expect(await f.run({ replace: 'lane/old' })).toMatchObject({ ok: false, registered: false, stopReason: 'bad-input', detail: 'hot-patch-replace-refused' });
+    expect(f.registrations.has('lane/old')).toBe(true);
+    expect(mutations(f, 'replace')).toHaveLength(0);
+    expect(f.records.some(r => r.type === 'prototype-load.urgent')).toBe(false);
+  });
+  it.each([
+    ['PR closed', { finalPrs: [{ ...validPr(), state: 'closed' }] }],
+    ['CI failed', { finalRows: [{ id: 2, head_sha: SHA, name: 'daemon-soak', status: 'completed', conclusion: 'failure', app: { id: 15368 }, check_suite: { id: 8 } }] }],
+  ])('refuses %s during preparation before recording intent or registering', async (_, change) => {
+    const f = hotFixture(change);
+    expect(await f.run()).toMatchObject({ ok: false, registered: false });
+    expect(mutations(f, 'add')).toHaveLength(0);
+    expect(f.records.some(r => r.type === 'prototype-load.urgent')).toBe(false);
+    expect(f.readyWrites).toHaveLength(0);
   });
   it('passes hot-patch provenance through an in-process module invocation for check and registration', async () => {
     const f = hotFixture();

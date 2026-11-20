@@ -1040,6 +1040,16 @@ describe('hot-patch sweep (R1100)', () => {
     expect(await f.run()).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
     expect(f.d.remove).toHaveBeenCalledTimes(1);
   });
+  it.each([29, 30, 31])('missing required smoke is unknown at %i minutes despite a successful bound test', async minutes => {
+    const f = hotFixture([check('test')]);
+    f.d.required.mockReturnValue(['test', 'smoke']);
+    f.d.now = () => new Date(Date.parse(load.at) + minutes * 60_000).toISOString();
+    decisionBeforeRemoval(f, 'ci-unknown');
+    const result = await f.run();
+    expect(f.d.remove).toHaveBeenCalledTimes(minutes >= 30 ? 1 : 0);
+    if (minutes >= 30) expect(result).toMatchObject({ results: [{ status: 'unloaded-pending-adoption' }] });
+    else expect(f.state.some(r => r.status === 'unload-decision')).toBe(false);
+  });
   it('unloads pending CI after 31 minutes when PR evidence is unreadable', async () => {
     const f = hotFixture([check('test', null, { status: 'in_progress' })]);
     f.d.pr.mockImplementation(() => { throw Error('PR unavailable'); });
@@ -1060,7 +1070,7 @@ describe('hot-patch sweep (R1100)', () => {
     expect(f.d.remove).not.toHaveBeenCalled();
   });
   it('keeps the six-hour escalation for a seven-hour pending hot patch', async () => {
-    const f = hotFixture([check('test', null, { status: 'in_progress' })]);
+    const f = hotFixture(required.map(n => check(n, null, { status: 'in_progress' })));
     f.d.now = () => new Date(Date.parse(load.at) + 7 * 3600_000).toISOString();
     await f.run();
     expect(f.d.remove).not.toHaveBeenCalled();

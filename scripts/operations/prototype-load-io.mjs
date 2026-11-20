@@ -521,6 +521,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       }
       if (input.replace !== undefined && input.replace !== '' && (!safeRegistrationRef(input.replace) || input.replace === input.branch)) return stop('bad-input', { detail: 'invalid --replace ref' });
       const hotPatchMode = input.urgent === true && validSha(input.sha) && input.branch === `hotpatch/${input.sha}`;
+      if (hotPatchMode && input.replace) return stop('bad-input', { detail: 'hot-patch-replace-refused' });
       let hotPatch;
       if (hotPatchMode) {
         try {
@@ -667,19 +668,23 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         && (['queued', 'in_progress'].includes(checkRun.status)
           || (checkRun.appId === TEST_CHECK_APP_ID && checkRun.status === 'completed' && checkRun.conclusion === 'success'))))
         return stop('no-ready', { detail: 'ci-evidence-unreadable', fallback: 'Repair the CI evidence reader and retry with complete evidence.' });
+      const readHotPatchPr = async () => {
+        if (normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')) !== 'https://github.com/web-everything/web-everything') throw Error('canonical PR repository required');
+        const prs = await hotGh(['api', `repos/web-everything/web-everything/commits/${input.sha}/pulls`, '--repo', 'web-everything/web-everything']);
+        if (!Array.isArray(prs) || prs.length !== 1) throw Error('exactly one open PR required');
+        const pr = prs[0];
+        if (!Number.isSafeInteger(pr?.number) || pr.number <= 0 || pr.state !== 'open' || pr.head?.sha !== input.sha
+          || pr.base?.ref !== 'main' || pr.head?.repo?.full_name !== 'web-everything/web-everything'
+          || pr.base?.repo?.full_name !== 'web-everything/web-everything') throw Error('open canonical PR at exact head and base main required');
+        return pr;
+      };
       if (hotPatchMode) {
         if (ciRefusal || !checkRun || checkRun.sha !== input.sha || checkRun.name !== 'test'
           || checkRun.appId !== TEST_CHECK_APP_ID || !(['queued', 'in_progress'].includes(checkRun.status)
             || checkRun.status === 'completed' && checkRun.conclusion === 'success'))
           return stop('no-ready', { detail: 'hot-patch-ci-unbound', fallback: 'Require a bound Actions test check pending or successful at this SHA; repair evidence and retry.' });
         try {
-          if (normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')) !== 'https://github.com/web-everything/web-everything') throw Error('canonical PR repository required');
-          const prs = await hotGh(['api', `repos/web-everything/web-everything/commits/${input.sha}/pulls`, '--repo', 'web-everything/web-everything']);
-          if (!Array.isArray(prs) || prs.length !== 1) throw Error('exactly one open PR required');
-          const pr = prs[0];
-          if (!Number.isSafeInteger(pr?.number) || pr.number <= 0 || pr.state !== 'open' || pr.head?.sha !== input.sha
-            || pr.base?.ref !== 'main' || pr.head?.repo?.full_name !== 'web-everything/web-everything'
-            || pr.base?.repo?.full_name !== 'web-everything/web-everything') throw Error('open canonical PR at exact head and base main required');
+          const pr = await readHotPatchPr();
           await verifyRuleset({ sha: input.sha, ghJson: hotGh });
           hotPatch = { pr: pr.number };
         } catch (e) { return stop('no-ready', { detail: 'hot-patch-pr-protection', error: String(e.message), fallback: 'Repair PR/ruleset evidence or use ordinary delivery.' }); }
@@ -716,7 +721,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       const stored = [...new Set([...storedFor(canonical, 'head'), ...storedFor(out.gate?.record, 'sha')])];
       const producedFp = liveFp || (stored.length === 1 ? stored[0] : null);
       // Disclosed provisional readiness: hotPatch.pr on the urgent-load record marks pending-CI loads.
-      const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: 'green',
+      const producedReady = { at: new Date(now()).toISOString(), ref: input.branch, sha: input.sha, tests: hotPatch && checkRun.status !== 'completed' ? 'pending' : 'green',
         audit: canonical.verdict, testCheck: checkRun, ...(producedFp ? { fingerprint: producedFp } : {}),
         ...(auditGate?.ruledWeakened ? { auditRuling: auditGate.ruledWeakened.ruling, auditDisclosed: canonical.findings } : {}) };
       out.gate ||= { source: 'canonical-check-run', record: producedReady };
@@ -928,6 +933,14 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         fs.mkdirSync(dirname(file), { recursive: true });
         fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
       };
+      if (hotPatch) {
+        try {
+          const current = await readTestCheck({ sha: input.sha, branch: input.branch });
+          if (urgentCiFailed || ciRefusal || current?.sha !== input.sha || current.name !== 'test' || current.appId !== TEST_CHECK_APP_ID
+            || !(['queued', 'in_progress'].includes(current.status) || current.status === 'completed' && current.conclusion === 'success')) throw Error('hot-patch CI no longer pending or successful');
+          if ((await readHotPatchPr()).number !== hotPatch.pr) throw Error('hot-patch PR identity changed');
+        } catch (e) { return stop('no-ready', { detail: 'hot-patch-admission-changed', error: String(e.message), fallback: 'Repair PR/CI evidence at this SHA and retry.' }); }
+      }
       if (input.urgent) {
         urgentIntent = { trackingId: randomUUID(), at: new Date(now()).toISOString(), type: 'prototype-load.urgent', ref: input.branch, sha: input.sha, clone: out.clone, repo: normalizeUrgentRepo(requireGit('remote', 'get-url', 'origin')), registration: { clone: out.clone, ref: out.effectiveRef, sha: out.effectiveSha }, reason: input.reason, marker: checkRun.marker ?? null };
         if (hotPatch) urgentIntent.hotPatch = hotPatch;
