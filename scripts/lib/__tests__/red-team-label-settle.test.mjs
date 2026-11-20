@@ -1,5 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, readCheckClearFact, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const head = 'a'.repeat(40);
@@ -55,7 +59,32 @@ describe('red-team label settles from the head\'s check', () => {
     for (const evidence of [{ ok: false }, { inFlight: true }, { scheduled: true }, { carryConflict: true }, { status: changes }])
       expect(planRedTeamStatusLabels({ ...input, evidence, checkClear: true }).add).not.toBe('red-team:clear');
   });
+  describe('local publication holds', () => {
+    const withDir = (suffix, fn) => {
+      const base = mkdtempSync(join(tmpdir(), 'rt-settle-'));
+      const env = { ...input.env, WE_SHARED_RUNS_DIR: join(base, 'runs') };
+      const dir = redTeamStatusDir(env);
+      mkdirSync(dir, { recursive: true });
+      if (suffix) writeFileSync(join(dir, `${encodeURIComponent('o/n')}-42-${head}.json${suffix}`), '{}');
+      try { fn(env); } finally { rmSync(base, { recursive: true, force: true }); }
+    };
+    it('an .unpublished hold or a carried-check marker is no proof', () => {
+      for (const suffix of ['.unpublished', '.carried-check-unpublished'])
+        withDir(suffix, env => expect(readCheckClearFact({ ...input, env, gh: ghFor([run()]) })).toBe(false));
+    });
+    it('no hold files leaves the check as proof', () => {
+      withDir('', env => expect(readCheckClearFact({ ...input, env, gh: ghFor([run()]) })).toBe(true));
+    });
+  });
   describe('sync', () => {
+    it('re-reads the check at swap time and refuses a changed fact', () => {
+      const live3 = { headRefOid: head, labels: ['red-team:pending'] };
+      const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live3), readPrFiles: vi.fn(() => null) };
+      const reader = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+      syncRedTeamStatusLabels({ ...input, live: live3, provider, readCheckClear: reader, standingRuling: null });
+      expect(reader).toHaveBeenCalledTimes(2);
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    });
     it('production wiring: the default reader runs the real fact over the injected gh', () => {
       const live2 = { headRefOid: head, labels: ['red-team:pending'] };
       const mk = gh => {

@@ -2213,7 +2213,6 @@
   "scripts/conveyor/soak/breaks/review-fast-checks-strand-sibling-repos.soak.test.mjs": 5.24,
   "scripts/conveyor/soak/breaks/review-live-round-cap-accounting.soak.test.mjs": 9.01,
   "scripts/conveyor/soak/breaks/review-label-stale-guard-retryable.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/red-team-label-settles-from-check.soak.test.mjs": 1,
   "scripts/lib/__tests__/red-team-label-settle.test.mjs": 1,
   "scripts/conveyor/soak/breaks/redteam-label-settles-from-check.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/review-timing-optional-red-drops-reviewer-liveness.soak.test.mjs": 8.8,

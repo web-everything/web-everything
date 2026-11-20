@@ -5,6 +5,7 @@ import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs
 import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
+import { carriedCheckMarkerPresent } from './drain-red-team-evidence.mjs';
 import { redTeamCheckRunIsEvidence, readRedTeamPublicationHoldFact, readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
@@ -93,6 +94,8 @@ export function readCheckClearFact({ repo, pr, head, env = process.env, gh } = {
     const app = resolveWeAppId({ env });
     if (app.ok !== true) return false;
     const options = { repo, pr, headSha: head, appId: app.appId, ...(gh ? { gh } : {}) };
+    // An unconfirmed carried-check publish (its outbox marker, which may own a live hold) is no proof either.
+    if (carriedCheckMarkerPresent({ repo, pr, head, env })) return false;
     return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact(options).ok === true;
   } catch { return false; }
 }
@@ -136,6 +139,10 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     let again = null;
     try { again = provider.readPrState(repo, pr)?.headRefOid; } catch { again = null; }
     if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };
+    // Re-read the check and hold at swap time: evidence that changed or became unreadable since the plan refuses.
+    let still = false;
+    try { still = readCheckClear({ repo, pr, head }) === true; } catch { still = false; }
+    if (!still) return { add: null, remove: [], skipped: 'check-changed' };
   }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
