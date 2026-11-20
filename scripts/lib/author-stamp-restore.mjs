@@ -45,11 +45,14 @@ function outsideInlineCode(line) {
   return delimiter ? undefined : plain + line.slice(start);
 }
 
-// Blunt on purpose: any square bracket anywhere in the snapshot (links, reference labels and definitions,
-// escaped brackets, titles) means a marker cannot be proven outside a link title. Refusal only sends the repair
-// to manual review. Unsure means refuse.
+// Exempt only links whose label, destination and optional quoted title close on one line.
+// Inspect every link independently: a closed first title must not mask an open second one.
+// Backslashes, backticks, nested syntax and reference definitions remain ambiguous; do not
+// let a guessed escape or title boundary promote a marker from a later line into evidence.
+// Space between ] and ( is accepted for the ordinary generated PR footer as well.
 function linkMayEnclose(diff) {
-  return /[\[\]]/.test(diff);
+  const closedLinks = /\[[^\[\]\\`\r\n\u2028\u2029]*\][ \t]*\([^\s()[\]'"\\`<>]+(?:[ \t]+(?:"[^"\\`\r\n\u2028\u2029]*"|'[^'\\`\r\n\u2028\u2029]*'))?[ \t]*\)/g;
+  return /[\[\]]/.test(diff.replace(closedLinks, ''));
 }
 
 /** One bounded request. Truncation is not agreement: operators must investigate the full history. */
@@ -106,12 +109,6 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     const markers = [];
     const htmlLines = [];
     let ambiguousTicks = false;
-    // Brackets can make a backticked span part of a link target or text across lines: no exemption.
-    // A bracketed line is harmless only when it has no backtick and its brackets balance on that line
-    // (a one-line `[text](url)` cannot span a code span across lines).
-    const bracketed = edit.diff.split(/\r\n|[\r\n]/).some((l) => /[\[\]]/.test(l)
-      && (l.includes('`') || (l.match(/\[/g) ?? []).length !== (l.match(/\]/g) ?? []).length
-        || (l.match(/\(/g) ?? []).length !== (l.match(/\)/g) ?? []).length));
     let fence;
     for (const line of edit.diff.split(/\r\n|[\r\n]/)) {
       const delimiter = line.match(/^[ \t]{0,3}(`{3,}|~{3,})(.*)$/);
@@ -146,7 +143,7 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
     // Preserve snapshot-wide detection after exempting only validated inline spans.
     // Backticks inside a possible link title do not prove that HTML is in code.
     const ambiguousLink = linkMayEnclose(edit.diff);
-    const noExempt = ambiguousTicks || bracketed || ambiguousLink;
+    const noExempt = ambiguousTicks || ambiguousLink;
     // Raw HTML constructs (CDATA, processing instructions, declarations, comments other than a bare stamp
     // marker) open HTML blocks where backticks are not code: refuse them outright, outside code spans too.
     const candidate = (noExempt ? edit.diff.split(/\r\n|[\r\n]/) : htmlLines)
@@ -162,9 +159,9 @@ export function planStampRestore({ state, body, authorLogin, edits } = {}) {
       return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
         contentEvidence(edit, markerLine(edit.diff)));
     }
-    // Blunt rule: fence/code-span parsing edge cases (tab indent, info strings, NBSP/form-feed suffixes) can
-    // hide a marker inside code. A snapshot with a stamp AND any backtick or tilde fence is never evidence.
-    if (markers.length && (edit.diff.includes('`') || /^[ \t]*~{3,}/m.test(edit.diff))) {
+    // Fences retain a conservative refusal for tab indentation, info strings and non-ASCII
+    // closing suffixes. Balanced single-line inline code is handled above, independently.
+    if (markers.length && /^[ \t]*(?:`{3,}|~{3,})/m.test(edit.diff)) {
       return refusal('malformed or non-standalone historical stamp; inspect complete GitHub history manually',
         contentEvidence(edit, markerLine(edit.diff)));
     }
