@@ -49,6 +49,7 @@ function fixture(checks, mainRuns = redAtRemoval) {
       return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { nodes: [removal()], pageInfo: { hasPreviousPage: false } } } } } });
     if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
+    if (endpoint?.includes('/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }] });
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`))
       return JSON.stringify({ total_count: checks.length, check_runs: checks });
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {

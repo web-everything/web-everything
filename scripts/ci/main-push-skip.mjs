@@ -32,6 +32,22 @@ export function decideMainPushSkip(input = {}) {
   } catch { return full('unreadable input'); }
 }
 
+/** Artifact names locate evidence; only a complete record from the latest attempt authorizes reuse. */
+export function readQueueSiblingRecord({ queue, artifacts, download }) {
+  if (!id(queue?.run_attempt) || !Array.isArray(artifacts)
+    || artifacts.some(a => typeof a?.name !== 'string')) throw Error('unreadable artifact evidence');
+  const records = artifacts.filter(a => a.name.startsWith('fui-sibling-'));
+  if (records.length !== 1) throw Error('missing or ambiguous sibling record');
+  const artifact = records[0], fuiSha = oid(artifact.name.slice('fui-sibling-'.length));
+  if (!fuiSha || !id(artifact.id) || artifact.expired !== false) throw Error('expired or unreadable sibling record');
+  const record = JSON.parse(download(artifact.id));
+  if (oid(record?.sha) !== oid(queue.head_sha) || !oid(record?.sha)
+    || record.run_id !== queue.id || record.run_attempt !== queue.run_attempt
+    || record.job !== 'queue-reuse-record' || record.conclusion !== 'success')
+    throw Error('sibling record does not match latest queue execution');
+  return fuiSha;
+}
+
 const options = { encoding: 'utf8', timeout: 5_000, maxBuffer: 4 * 1024 * 1024,
   stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } };
 function resolveFuiTip() {
@@ -84,10 +100,14 @@ export function main(argv) {
       if (!id(run.check_suite_id)) throw Error('unreadable check suite identity');
       run.check_suite = api(`check-suites/${run.check_suite_id}`);
     }
-    const artifacts = pages(`actions/runs/${queue.id}/artifacts`, 'artifacts').artifacts;
-    if (artifacts.some(a => typeof a?.name !== 'string')) throw Error('unreadable artifact record');
-    const records = artifacts.filter(a => typeof a?.name === 'string' && a.name.startsWith('fui-sibling-'));
-    const queueFuiSha = records.length === 1 ? records[0].name.slice('fui-sibling-'.length) : null;
+    const queueFuiSha = readQueueSiblingRecord({ queue,
+      artifacts: pages(`actions/runs/${queue.id}/artifacts`, 'artifacts').artifacts,
+      download: artifactId => {
+        if (--budget < 0) throw Error('API budget exhausted');
+        const zip = exec('gh', ['api', `repos/${args.repo}/actions/artifacts/${artifactId}/zip`],
+          { ...options, encoding: 'buffer' });
+        return exec('funzip', [], { ...options, input: zip, stdio: ['pipe', 'pipe', 'pipe'] });
+      } });
     return decideMainPushSkip({ sha: args.sha, before: args.before, runs, queueFuiSha, fuiTip: resolveFuiTip(),
       event: args.event, ref: args.ref, currentRunId: Number(args['run-id']), beforeIsAncestor: true });
   } catch { return full('unreadable input, API, or ancestry'); }

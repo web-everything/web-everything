@@ -131,3 +131,15 @@ it('the actual test gate prints the queue run id from its skip reason', () => {
   expect(run.status, run.stderr).toBe(0);
   expect(run.stdout).toContain('queue run 100');
 });
+
+it('publishes the queue SHA, run, latest attempt and producing job in the sibling artifact', () => {
+  const step = jobs['queue-reuse-record'].steps.find(s => s.name === 'Prepare sibling record');
+  const dir = mkdtempSync(join(tmpdir(), 'queue-record-'));
+  try {
+    const result = spawnSync('bash', ['-e', '-c', step.run], { encoding: 'utf8', env: { ...process.env,
+      RUNNER_TEMP: dir, GITHUB_SHA: 'a'.repeat(40), GITHUB_RUN_ID: '100', GITHUB_RUN_ATTEMPT: '2', GITHUB_JOB: 'queue-reuse-record' } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(dir, 'fui-sibling-record'), 'utf8'))).toEqual({
+      sha: 'a'.repeat(40), run_id: 100, run_attempt: 2, job: 'queue-reuse-record', conclusion: 'success' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

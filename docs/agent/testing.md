@@ -2,11 +2,17 @@
 
 Main push CI can reuse a successful `ci.yml` merge-group run only for the exact SHA,
 with a trusted check-suite app, no other non-success (including older-id reruns), a proven fast-forward and the
-same recorded FUI SHA. Queue sibling records publish only after full CI and unquarantined
+same recorded FUI SHA. The downloaded, unexpired sibling record must match the queue SHA, run id,
+latest `run_attempt`, `queue-reuse-record` producer and successful conclusion. Queue sibling records publish only after full CI and unquarantined
 execution receipts from every unit, integration and soak leg; missing/unknown receipts publish no record.
 Reusing pushes export and record that verified FUI SHA for their remaining sibling checkouts.
 Unknown evidence runs full CI. The hourly schedule is isolated
-from push concurrency and always runs full CI. Light push success is status evidence;
+from push concurrency and always runs full CI. Drain retry readers inspect latest push jobs: light pushes use the same SHA's successful merge-group
+execution timestamps, never the push timestamps. `drain.mqReusedMainGreenMaxAgeMs`
+(default 7200000; `WE_DRAIN_MQ_REUSED_MAIN_GREEN_MAX_AGE_MS`) limits reused evidence even
+when main HEAD is unchanged. Missing, oversized or stale evidence holds for fresh main CI or
+operator inspection. `main-execution-evidence.test.mjs` covers the bound and cascade.
+Light push success is status evidence;
 quarantine readers require full timing artifacts from the same SHA's queue run with a matching
 push sibling record, the queue's own completion after removal, and no other newer or non-success run.
 Timing refresh accepts queue runs only with main ancestry or a matching main push SHA.

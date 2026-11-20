@@ -20,6 +20,7 @@ function fixture({ failQuery, latest, before, mergeState = 'BEHIND', checks } = 
   };
   const log = vi.fn();
   const exec = vi.fn((command, args) => {
+    if (args.some(arg => arg.includes('/jobs?filter=latest'))) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }] });
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
     if (args.some(arg => arg.includes('isInMergeQueue')))
       return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: head } } } });
@@ -53,7 +54,7 @@ describe('targeted main CI retry evidence lookup', () => {
     const reads = f.exec.mock.calls.filter(([, args]) => args[1]?.startsWith(endpoint));
     expect(reads.map(([, args]) => args[1])).toEqual([latestQuery, beforeQuery]);
     for (const [, , options] of reads) expect(options.throttle.maxAttempts).toBe(1);
-    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'api' && args[1].startsWith('repos/')).length).toBe(3);
+    expect(f.exec.mock.calls.filter(([, args]) => args[0] === 'api' && args[1].startsWith('repos/')).length).toBe(4);
   });
 
   it('permits the existing main-red retry when main is green and the PR is CLEAN', () => {

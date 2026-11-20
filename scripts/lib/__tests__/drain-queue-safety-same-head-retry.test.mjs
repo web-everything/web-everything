@@ -160,6 +160,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     const base = f.exec;
     f.exec = vi.fn((command, args, opts) => {
       const endpoint = args.find(arg => typeof arg === 'string' && arg.startsWith(`repos/${repo}/`)) ?? '';
+      if (endpoint.includes('/actions/runs/900/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (5)', status: 'completed', conclusion: 'success' }] });
       if (endpoint.includes(`/commits/${head}/check-runs`)) return JSON.stringify({ total_count: f.headChecks.length, check_runs: f.headChecks });
       if (/\/actions\/runs\/7$/.test(endpoint)) return JSON.stringify({ id: 7, path: f.headRunPath ?? '.github/workflows/ci.yml', head_sha: head });
       if (/\/actions\/jobs\/44$/.test(endpoint)) return JSON.stringify({ id: 44, run_id: 7, name: 'test-shard (2)', head_sha: f.job44Sha ?? head });
@@ -181,6 +182,20 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     tweak(f);
     test(f);
   });
+
+  it('a light push cannot make a pre-ejection queue execution into post-ejection flake proof', () => setup(f => {
+    expect(f.guard().hold).toBe(true);
+  }, f => {
+    const base = f.exec;
+    const queue = { ...f.mainRuns[0], id: 850, event: 'merge_group',
+      head_branch: 'gh-readonly-queue/main/pr-1', created_at: new Date(REMOVED_AT - 600_000).toISOString() };
+    f.exec = vi.fn((command, args, opts) => {
+      const endpoint = args[1] ?? '';
+      if (endpoint.includes('/runs/900/jobs?')) return JSON.stringify({ total_count: 0, jobs: [] });
+      if (endpoint.includes('event=merge_group&head_sha=')) return JSON.stringify({ total_count: 1, workflow_runs: [queue] });
+      return base(command, args, opts);
+    });
+  }));
 
   it('re-enqueues once when the failing test passed on the PR head CI and on a later main run', () => setup(f => {
     const result = f.guard();
@@ -433,6 +448,16 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.log.mock.calls[0]).toEqual([result.line]);
     expect(f.log.mock.calls.some(([line]) => /^mq-same-head-retry:/.test(line))).toBe(false);
   };
+
+  it('exact-test retry refuses a light push backed by stale queue execution', () => exactFixture(f => {
+    f.runJobs[900].forEach(job => { job.conclusion = 'skipped'; });
+    const base = f.exec;
+    const queue = { ...f.runs[900], id: 850, event: 'merge_group', head_branch: 'gh-readonly-queue/main/pr-1',
+      created_at: iso(removedAt - 4 * 3_600_000), updated_at: iso(removedAt - 3 * 3_600_000) };
+    f.exec = vi.fn((command, args, opts) => args[1]?.includes('event=merge_group&head_sha=')
+      ? JSON.stringify({ total_count: 1, workflow_runs: [queue] }) : base(command, args, opts));
+    expectExactHold(f);
+  }));
 
   it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);

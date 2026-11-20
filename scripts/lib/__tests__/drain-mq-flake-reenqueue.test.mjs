@@ -58,6 +58,7 @@ function fixture({ checks = [job(21)], events = history(1), mergeState = 'CLEAN'
       return JSON.stringify({ headRefOid: head, mergeStateStatus: mergeState });
     }
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
+    if (endpoint?.includes('/jobs?filter=latest')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: 'success' }] });
     if (args.includes('POST')) {
       posts.push([...args]);
       if (args[0] === 'api' && args[1] === '-X' && args[2] === 'POST'

@@ -197,7 +197,16 @@ jobs:
           NODE
       - name: Prepare sibling record
         if: ${{ steps.proof.outputs.eligible == 'true' }}
-        run: echo recorded > "$RUNNER_TEMP/fui-sibling-record"
+        run: |
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          writeFileSync(join(process.env.RUNNER_TEMP, 'fui-sibling-record'), JSON.stringify({
+            sha: process.env.GITHUB_SHA, run_id: Number(process.env.GITHUB_RUN_ID),
+            run_attempt: Number(process.env.GITHUB_RUN_ATTEMPT), job: process.env.GITHUB_JOB,
+            conclusion: 'success',
+          }));
+          NODE
       - uses: actions/upload-artifact@v4
         if: ${{ steps.proof.outputs.eligible == 'true' }}
         with:

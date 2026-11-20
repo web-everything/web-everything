@@ -36,6 +36,8 @@ function fixture(runs, events = [removal()], mainHead = null) {
       return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
     }
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
+    if (endpoint?.includes('/jobs?')) return JSON.stringify({ total_count: 1, jobs: [{ name: 'test-shard (1)', status: 'completed', conclusion: runs[0]?.light ? 'skipped' : 'success' }] });
+    if (endpoint?.includes('head_sha=')) return JSON.stringify({ total_count: 1, workflow_runs: [{ ...run(90, 'success', '2026-11-01T09:00:00Z', '2026-11-01T09:30:00Z'), head_sha: 'd'.repeat(40), head_branch: 'gh-readonly-queue/main/pr-1', event: 'merge_group' }] });
     if (endpoint === `repos/${repo}/git/ref/heads/main` && mainHead) return JSON.stringify({ object: { sha: mainHead } });
     if (endpoint?.startsWith(`repos/${repo}/commits/${mergeCommit}/check-runs?`)) {
       return JSON.stringify({ total_count: 1, check_runs: [{
@@ -71,6 +73,11 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
     vi.setSystemTime(now);
   });
   afterEach(() => vi.useRealTimers());
+
+  it('refuses a fresh light push whose reused queue evidence is older than two hours', () => {
+    const f = fixture([{ ...run(102), head_sha: 'd'.repeat(40), light: true }], [removal()], 'd'.repeat(40));
+    expect(f.guard().hold).toBe(true);
+  });
 
   it('accepts a recent completed green run while the newest main push is in progress', () => {
     const f = fixture([pending(), run(102)]);

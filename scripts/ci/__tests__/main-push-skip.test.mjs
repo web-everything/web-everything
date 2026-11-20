@@ -61,3 +61,29 @@ describe('exact-SHA main push reuse', () => {
     expect(await decide(input())).toMatchObject({ skip: true, fuiSha: fui });
   });
 });
+
+describe('queue sibling artifact content', () => {
+  const queue = { id: 100, head_sha: sha, run_attempt: 2 };
+  const artifact = { id: 7, name: `fui-sibling-${fui}`, expired: false };
+  const record = { sha, run_id: 100, run_attempt: 2, job: 'queue-reuse-record', conclusion: 'success' };
+  it('reads the record rather than trusting its artifact name', async () => {
+    const { readQueueSiblingRecord } = await import('../main-push-skip.mjs');
+    expect(readQueueSiblingRecord({ queue, artifacts: [artifact], download: () => JSON.stringify(record) })).toBe(fui);
+  });
+  it.each([
+    ['missing content', () => ''], ['unreadable download', () => { throw Error('unreadable'); }],
+    ['legacy content', () => 'recorded'], ['wrong SHA', () => JSON.stringify({ ...record, sha: 'd'.repeat(40) })],
+    ['wrong run', () => JSON.stringify({ ...record, run_id: 99 })],
+    ['wrong producer', () => JSON.stringify({ ...record, job: 'changes' })],
+    ['failed conclusion', () => JSON.stringify({ ...record, conclusion: 'failure' })],
+    ['missing attempt', () => JSON.stringify({ ...record, run_attempt: undefined })],
+    ['quarantined later attempt published no record', () => JSON.stringify({ ...record, run_attempt: 1 })],
+  ])('refuses %s', async (_, download) => {
+    const { readQueueSiblingRecord } = await import('../main-push-skip.mjs');
+    expect(() => readQueueSiblingRecord({ queue, artifacts: [artifact], download })).toThrow();
+  });
+  it.each([true, undefined])('refuses expired or unknown expiry (%s)', async expired => {
+    const { readQueueSiblingRecord } = await import('../main-push-skip.mjs');
+    expect(() => readQueueSiblingRecord({ queue, artifacts: [{ ...artifact, expired }], download: () => JSON.stringify(record) })).toThrow();
+  });
+});
