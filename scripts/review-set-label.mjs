@@ -101,6 +101,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
+import { gateOutcomesForHead, sendBackStepOutcome, GATE_OUTCOMES } from './lib/red-team-gate.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
 
@@ -381,7 +382,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  * fix-agent `rearm` (#2644, was `decideRearm`), and the #2895 gate-self `clear-human`. Every return carries
  * `keepsHuman` — whether the swap leaves `review:human` in place.
  *   • `accepted` — INVARIANT 2: REFUSED on a `review:human` PR (only a human's /review may clear the gate);
- *     otherwise adds `review:accepted`, drops the parked `review:pending` AND a stale `review:changes` (#2974 —
+ *     a same-head red-team send-back keeps live `review:changes`; otherwise adds `review:accepted`, drops the parked `review:pending` AND a stale `review:changes` (#2974 —
  *     a bounce that was fixed and re-verdicted straight to `accepted` must not still read as awaiting changes).
  *   • `changes` — a bounce lands nothing, so it is allowed regardless of the PR's state, with ONE refusal:
  *     #3334's reasonless bounce (a KNOWN zero finding count and no stated reason — see `isReasonlessBounce`).
@@ -399,7 +400,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *     a gate re-derive. REFUSED unless a live `review:accepted` is already on the PR: a re-stamp may only carry
  *     an acceptance ACROSS a head move, never manufacture one.
  * @param {{to:('accepted'|'changes'|'rearm'|'clear-human'), currentLabels?:Array, findingCount?:number|null,
- *   reason?:string, humanOnlyHold?:boolean, redTeamRulingHold?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
+ *   reason?:string, humanOnlyHold?:boolean, redTeamRulingHold?:boolean, sentBackSameHead?:boolean, requireLive?:(null|'accepted'|'missing')}} o - `currentLabels` is the observed label array (string or `{name}` shape, per
  *   `hasReviewLabel`). `findingCount` and `reason` are the #3334 decision inputs: how many findings the juror
  *   raised (tri-state — `null` is UNKNOWN and never refuses) and the reason the caller stated, if any. They are
  *   ARGUMENTS, never fetched: this function is pure and stays pure. `requireLive` (#4333, `rearm` only) is the
@@ -409,7 +410,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -687,6 +688,14 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // narrower and is tracked separately (`backlog/xy5uey0-…md`, needs `redteam:accepted` to earn its own
   // SHA-marker producer, #2896) rather than fixed by blanket-stripping here.
   if (to === 'accepted') {
+    if (sentBackSameHead && hasReviewLabel(currentLabels, REVIEW_LABELS.changes)) {
+      return {
+        allowed: true, addLabel: REVIEW_LABELS.changes,
+        removeLabels: presentRemoveLabels([REVIEW_LABELS.pending], currentLabels),
+        keepsHuman: isHuman,
+        reason: 'keeping review:changes — same-head red-team send-back stands or its evidence is unreadable; fix or retry the evidence read before accepting',
+      };
+    }
     return {
       allowed: true,
       addLabel: REVIEW_LABELS.accepted,
@@ -1188,7 +1197,7 @@ export function runReviewLabelCli({
   // same argv flag, so the two can never name different surfaces.
   const channelArg = (argv.find((a) => a.startsWith('--channel=')) || '').slice('--channel='.length);
   const pr = argv.find((a) => /^\d+$/.test(a));
-  const to = fixedTo || (argv.find((a) => a.startsWith('--to=')) || '').slice('--to='.length);
+  let to = fixedTo || (argv.find((a) => a.startsWith('--to=')) || '').slice('--to='.length);
   // #x9krtkb (bug 2) — `restamp`'s ONE caller (`restampAcceptance`, `we:scripts/merge-ai-prs.mjs`) already knows
   // the exact new head: it is the drain's OWN `git push`, computed locally, not a re-read. Before this it threw
   // that value away past `--reason`'s free text and let `runReviewLabelCli` re-derive the head from a fresh
@@ -1478,7 +1487,23 @@ export function runReviewLabelCli({
   // `restamp` stamps the markers — carrying them across a head the drain moved is the entire point — but it is
   // EXCLUDED from the independence check: no clearer is asserting anything, so there is nobody to be
   // independent OF. The acceptance it carries already passed that check when it was earned.
-  const stampsAcceptance = to === 'accepted' || to === 'clear-human' || to === 'restamp';
+  let sentBackSameHead = false;
+  if (to === 'accepted' && hasReviewLabel(currentLabels, REVIEW_LABELS.changes)) {
+    try {
+      if (!prCommentsReadable || !/^[0-9a-f]{40}$/i.test(headSha)) throw new Error('send-back evidence unreadable');
+      const thread = prComments.length < PR_COMMENTS_PAGE_SIZE ? prComments : provider.readComments(repo, pr);
+      if (!Array.isArray(thread) || thread.length < prComments.length
+        || !prComments.every(c => thread.some(full => full?.body === c?.body
+          && (full?.author?.login ?? full?.user?.login) === (c?.author?.login ?? c?.user?.login)))) {
+        throw new Error('send-back thread incomplete');
+      }
+      sentBackSameHead = sendBackStepOutcome(gateOutcomesForHead(thread, pr, headSha)) === GATE_OUTCOMES.SENT_BACK;
+    } catch {
+      // Unknown evidence must never erase a send-back. Retry the read or push the fix.
+      sentBackSameHead = true;
+    }
+  }
+  const stampsAcceptance = !sentBackSameHead && (to === 'accepted' || to === 'clear-human' || to === 'restamp');
   const independence = (stampsAcceptance && to !== 'restamp')
     // #3067 WIRED HERE — the module's own header named this as the owed follow-up: the pure decider grew
     // `prCreatedAt` and `stampLostMarked` as OPT-IN inputs, and until a live caller passed them a stripped
@@ -1587,6 +1612,7 @@ export function runReviewLabelCli({
     requireLive: onlyIf,
     humanOnlyHold,
     redTeamRulingHold,
+    sentBackSameHead,
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
@@ -1604,6 +1630,8 @@ export function runReviewLabelCli({
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
     process.exit(1);
   }
+  // All downstream stamps, approval effects and success framing follow the label actually kept.
+  if (to === 'accepted' && decision.addLabel === REVIEW_LABELS.changes) to = 'changes';
 
   // #x169fqe — capture the DIFF this verdict is being formed against, so the accept records WHAT was reviewed
   // and not merely WHICH COMMIT carried it. Without this the drain's own content-preserving rebase (the
