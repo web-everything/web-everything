@@ -28,6 +28,8 @@ export const HOME_REASONS = Object.freeze({
   // `PLAN.triggerDrain ? 'enqueued' : 'labelled-on-green'`): the PR is real and labelled ready-to-merge,
   // same as `parked`, just not merged by this call. Missing here, they fell to `unrun` and the sink threw
   // "the PR was NOT opened" for a PR that had, in fact, opened — hit live 7 times across 2026-08-29/30.
+  'preflight-unconfirmed': 'refused', 'prepare-invalid': 'refused',
+  'check-ok': 'checked',
   opened: 'opened', parked: 'opened', 'merged-git-fallback': 'opened', enqueued: 'opened', 'labelled-on-green': 'opened',
   // a guard answered — fix the request or the lane
   'bad-delegation': 'refused', 'bad-park': 'refused', 'bad-ref': 'refused', 'empty-body': 'refused', 'closing-keyword-body': 'refused', 'live-body-unconfirmed': 'refused', 'locus-prefix': 'refused',

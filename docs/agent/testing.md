@@ -4609,6 +4609,14 @@ Only the paged reader's partial-inventory error enables this recovery; other fai
 The `red-team-probe-cap-starvation` soak break reopens ten blocked entries between
 ticks and requires multiple probes in one tick and all ten within two default ticks;
 its presence probe executes behavior rather than matching source text.
+The `red-team-queue-verdict-evict` break also replays decided-head eviction: use
+`isPublishableRedTeamResult(redTeamForHead(...))` over complete trusted comments,
+then require readable carry/status/outbox evidence with no settlement owed and a
+confirmed completed check (success or failure). Missing checks, unfinished carries,
+unpublished carried checks, pending labels and unreadable evidence keep recovery queued.
+Readable live fixtures must supply `comments: []` when no result exists; missing
+comment evidence retains the entry and defers admission. Decided heads must stay
+evicted when stale planner candidates return, including the card-only bypass.
 Run the soak `.soak.test.mjs` with `--config vitest.soak.config.ts` through heavy admission.
 
 ## Timeout evidence synchronous worker pool
@@ -5182,3 +5190,14 @@ a reclaimed/remaining partial note. Invalid bounds use defaults and report
 `default (invalid budget value)` provenance. Partial work alone exits zero with a stderr
 warning. Unreadable reservations refuse and preserve the entire affected slot.
 The sweep unit suite and `forge-sweep-scan-bound-refusal` soak pin these guarantees.
+## Open-pr preflight
+
+`open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
+or writing bypass receipts. `pr-land-preflight.test.mjs` runs the actual CLI with gate/forge ports replaced and
+records push/create/card effects. A real refusal uses the same checkpoint. PR-limit refusal is a check-only
+blocker hint: a real open evaluates capacity after pushing and leaves the ref pushed when refusing.
+Park opens ready for review; draft-promotion still handles older drafts.
+
+Check mode fetches origin main before evaluating canonical audit evidence. A failed fetch reports
+`main not refreshed: <reason>` and refuses even when local evidence would pass against stale refs.
+`open-pr-audit-gate.test.mjs` covers both refresh outcomes, aggregation and an unconfirmed check child.

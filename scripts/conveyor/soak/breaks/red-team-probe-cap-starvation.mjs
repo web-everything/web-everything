@@ -38,7 +38,7 @@ export default {
         writeFile: (path, data) => files.set(path, data),
         rename: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
         unlink: path => files.delete(path),
-        readLivePr: () => ({ state: 'OPEN', headRefOid: head }),
+        readLivePr: () => ({ state: 'OPEN', headRefOid: head, comments: [] }),
       });
       const seen = new Set();
       for (let tick = 0; tick < 2; tick++) {
