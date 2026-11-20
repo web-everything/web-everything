@@ -13,7 +13,7 @@ const pr = (number, additions, labels) => ({ number, num: number, readyAt: numbe
   labels: ['ready-to-merge', 'review:accepted', ...labels].map(name => ({ name })),
   statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
   files: [{ path: 'shared.mjs', additions, deletions: 0 }] });
-const urgent = pr(2, 1, ['priority:urgent']);
+const urgent = { ...pr(2, 1, ['priority:urgent']), urgentLabelVerified: true };
 const plain = pr(1, 100, []);
 const violations = [];
 const order = planCatchUp({ prs: [plain, urgent], queued: 0, capacity: 1, repo, now: 1000,
@@ -39,8 +39,13 @@ function probe(root) {
     encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
     env: { ...process.env, WE_UNDER_TEST: '1', WE_DRAIN_OVERLAP_YIELD_ONLY_TO_ENQUEUEABLE: '1', WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE: '1' },
   });
-  try { return result.status === 0 ? JSON.parse(result.stdout.trim().split('\n').pop()) : null; }
-  catch { return null; }
+  if (result.error || result.status !== 0) throw new Error('urgent/parked drain probe failed', { cause: result.error ?? new Error(result.stderr) });
+  try {
+    const report = JSON.parse(result.stdout.trim().split('\n').pop());
+    if (report?.seam !== true || !Array.isArray(report.violations)
+      || !report.violations.every(v => typeof v === 'string')) throw new Error('invalid report');
+    return report;
+  } catch (cause) { throw new Error('urgent/parked drain probe returned an unreadable report', { cause }); }
 }
 
 export default {
@@ -50,11 +55,11 @@ export default {
   fixedBy: { sha: 'pending', where: 'drain priority and pass-local eligibility', paths: [
     'scripts/lib/enqueue-on-event.mjs', 'scripts/conveyor/overlap-yield-enqueueable.mjs', 'scripts/merge-ai-prs.mjs',
   ] },
-  // Detect the callable seam, independently of the outcome: a regression remains a failure.
-  fixPresent(root) { return probe(root)?.seam === true; },
+  // Behaviour decides expected failure; a broken probe must fail before registration.
+  fixPresent(root) { return probe(root).violations.length === 0; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
-    return probe(root) ?? { violations: ['urgent/parked drain probe could not run'] };
+    return probe(root);
   },
   judge(report) { return report.violations; },
 };

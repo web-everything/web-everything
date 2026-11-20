@@ -188,7 +188,8 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, prio
     expireIsolation(state, nowMs, settings);
   }
   const isolationPaused = state.isolate.length > 0 && state.isolate.every(n => !inQueue.has(n) && enqueueEligibility?.get(n) === false);
-  const mode = currentMode(isolationPaused ? { ...state, isolate: [] } : state, nowMs, settings);
+  // Releasing unrelated work retains singleton admission while recovery is pending.
+  const mode = settings.enabled && isolationPaused ? 'strict' : currentMode(state, nowMs, settings);
   const result = (admit, groupId = null, reason = null) => ({ admit, mode, groupId, reason, state });
   if (mode === 'off') return result(true);
   // A fresh queue snapshot acknowledges absent recovery entries before a new
@@ -212,6 +213,9 @@ export function admitEnqueue({ state: input, num, nowMs, settings, inQueue, prio
   }
   if (existing && !inQueue.has(num) && unobservedExit(existing)) {
     return result(false, null, `#${(existing.seen ?? []).find(n => !inQueue.has(n))} left the queue; observe its exit before re-enqueue`);
+  }
+  if (isolationPaused && existing && !inQueue.has(num) && existing.prs.length > 1) {
+    return result(false, null, `#${num} has a grouped reservation; wait for its prior reservation to expire`);
   }
   if (existing) return result(true, existing.id);
   // A PR already in the native queue needs no new admission/group record.

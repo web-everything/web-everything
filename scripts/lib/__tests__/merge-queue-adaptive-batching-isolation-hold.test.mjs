@@ -20,8 +20,8 @@ function eligibilityFor(suspect) {
   return new Map([[suspect.number, redTeamLabelHoldReason(suspect.labels) === null]]);
 }
 
-function decide(state, num, enqueueEligibility) {
-  return admitEnqueue({ state, num, nowMs, settings, inQueue: new Set(), enqueueEligibility });
+function decide(state, num, enqueueEligibility, overrides = {}) {
+  return admitEnqueue({ state, num, nowMs, settings: { ...settings, ...overrides }, inQueue: new Set(), enqueueEligibility });
 }
 
 describe('isolation hold', () => {
@@ -123,4 +123,44 @@ it('isolation hold retains the hold and asks for inspection beyond the 100-suspe
   expect(shell.gate(7183).admit).toBe(false);
   expect(reads).toBe(100);
   expect(logs).toContainEqual(expect.stringContaining('operator must inspect remaining suspects'));
+});
+
+
+it('released work stays in singleton groups until suspect recovery resolves', () => {
+  const eligibility = new Map([[7155, false]]);
+  const first = decide(isolation(), 7183, eligibility, { maxGroupsInFlight: 2 });
+  const second = decide(first.state, 7193, eligibility, { maxGroupsInFlight: 2 });
+  expect(first).toMatchObject({ admit: true, mode: 'strict' });
+  expect(second).toMatchObject({ admit: true, mode: 'strict' });
+  expect(second.groupId).not.toBe(first.groupId);
+  expect(second.state.groups.map(g => g.prs)).toEqual([[7183], [7193]]);
+  expect(second.state.groups.every(g => g.status === 'queued')).toBe(true);
+  expect(second.state.isolate).toEqual([7155]);
+});
+
+it('released work never joins an existing ordinary forming group', () => {
+  const forming = decide(initialBatchingState(), 7000);
+  const released = decide({ ...forming.state, isolate: [7155], isolateSinceMs: { 7155: 0 } },
+    7183, new Map([[7155, false]]), { maxGroupsInFlight: 2 });
+  expect(released.admit).toBe(true);
+  expect(released.groupId).not.toBe(forming.groupId);
+  expect(released.state.groups.map(g => g.prs)).toEqual([[7000], [7183]]);
+});
+
+
+it('released solo admission respects the shared group cap', () => {
+  const eligibility = new Map([[7155, false]]);
+  const first = decide(isolation(), 7183, eligibility);
+  expect(decide(first.state, 7193, eligibility)).toMatchObject({ admit: false, mode: 'strict',
+    reason: 'queue holds 1 group(s) (max 1)' });
+});
+
+it('released retry cannot reuse a persisted multi-PR reservation', () => {
+  const forming = decide(initialBatchingState(), 7000);
+  const grouped = decide(forming.state, 7183);
+  expect(grouped.state.groups[0].prs).toEqual([7000, 7183]);
+  const held = decide({ ...grouped.state, isolate: [7155], isolateSinceMs: { 7155: 0 } },
+    7183, new Map([[7155, false]]));
+  expect(held).toMatchObject({ admit: false, mode: 'strict',
+    reason: '#7183 has a grouped reservation; wait for its prior reservation to expire' });
 });

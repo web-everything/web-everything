@@ -86,6 +86,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { readOverlays, readOverlayState } from './daemon-overlays.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
 export const ENQUEUE_ON_EVENT_ENV = 'WE_ENQUEUE_ON_EVENT';
@@ -518,7 +519,7 @@ function ghGraphql({ query, owner, name, cursor, env, execFileImpl }) {
  * when each got its label and first acceptance (ready-time fallback when acceptance is unreadable). Never rejects.
  * @returns {Promise<{ok:true, prs:Array<{num:number, isDraft:boolean, inQueue:boolean, readyAt:(number|null)}>, queued:number}|{ok:false, error:string}>}
  */
-export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env = process.env, execFileImpl = execFile, readComments = readCompletePrComments }) {
+export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env = process.env, execFileImpl = execFile, readComments = readCompletePrComments, execLabelEvents = execFileSyncThrottled, log = console.error }) {
   const [owner, name] = String(repo ?? '').split('/');
   if (!owner || !name) return { ok: false, error: `not an owner/name repo: ${JSON.stringify(repo)}` };
   const prs = [];
@@ -541,6 +542,35 @@ export async function readCatchUpCandidates({ repo, defaultBranch = 'main', env 
     cursor = next;
   }
   const open = prs.filter((p) => !p.isDraft && !p.inQueue && !catchUpSkipReason(p, defaultBranch));
+  // At most 20 urgent candidates × 3 REST pages (60 calls) per listing. Partial
+  // histories never prove authorship; the operator can inspect/reapply the label.
+  const urgent = open.filter(p => p.labels.some(label => label.name === 'priority:urgent'));
+  for (const [index, p] of urgent.entries()) {
+    p.urgentLabelVerified = false;
+    if (index < 20) {
+      try {
+        let latest;
+        for (let page = 1; page <= 3; page++) {
+          const events = JSON.parse(execLabelEvents('gh', ['api',
+            `repos/${repo}/issues/${p.num}/events?per_page=100&page=${page}`],
+          { env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, throttle: { maxAttempts: 1 } }));
+          if (!Array.isArray(events) || events.length > 100) break;
+          let complete = true;
+          for (const event of events) {
+            if (event?.event !== 'labeled' || event.label?.name !== 'priority:urgent') continue;
+            if (!Number.isSafeInteger(event.id) || event.id <= 0) { complete = false; break; }
+            if (!latest || event.id > latest.id) latest = event;
+          }
+          if (!complete) break;
+          if (events.length < 100) {
+            p.urgentLabelVerified = isTrustedMarkerAuthor({ user: latest?.actor });
+            break;
+          }
+        }
+      } catch { /* Unreadable history leaves priority plain. */ }
+    }
+    if (!p.urgentLabelVerified) log(`enqueue-on-event: #${p.num} urgent label unverified — priority stays plain; operator must inspect/reapply the label or retry with readable history within the 20-candidate/300-event bounds`);
+  }
   // Keep each aliased timeline query bounded even when the listing spans many pages.
   for (let offset = 0; offset < open.length; offset += 100) {
     const batch = open.slice(offset, offset + 100);
@@ -669,7 +699,7 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
   }
   const classes = new Map(rankByDeliveryPriority(candidates.map((pr) => ({ id: pr.num, facts: {
     waitingSince: pr.firstAcceptedAt ?? pr.readyAt,
-    override: pr.labels?.some(label => label.name === 'priority:urgent') ? { value: 'urgent', byOperator: true } : undefined,
+    override: priority?.mode === 'enforce' && pr.urgentLabelVerified === true && pr.labels?.some(label => label.name === 'priority:urgent') ? { value: 'urgent', byOperator: true } : undefined,
     incident: { open: !!mainFix, owner: !!mainFix && [mainFix.pr, ...(mainFix.prs || [])].includes(pr.num) &&
       (mainFix.repo ?? 'we') === repoKeyFromSlug(repo) },
   } })), priority, now).map((p) => [p.id, PRIORITY_CLASSES.indexOf(p.class)]));

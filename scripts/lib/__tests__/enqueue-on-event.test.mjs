@@ -532,7 +532,7 @@ const drainLabelPr = (number) => ({
   statusCheckRollup: structuredClone(READY_PR.statusCheckRollup),
   ...JSON.parse(readFileSync(join(process.cwd(), 'scripts/lib/__tests__/fixtures', `drain-priority-label-gh-${number}.json`), 'utf8')),
 });
-const labelCandidate = (number, readyAt, extra = {}) => candidate(number, readyAt, { ...drainLabelPr(number), ...extra });
+const labelCandidate = (number, readyAt, extra = {}) => candidate(number, readyAt, { ...drainLabelPr(number), urgentLabelVerified: true, ...extra });
 const labelPlan = (prs, extra = {}) => planCatchUp({
   prs, queued: 0, capacity: 1, repo: REPO, now: 1000,
   priority: { mode: 'enforce', agingHours: null }, ...extra,
@@ -571,8 +571,7 @@ describe('priority label', () => {
     const plan = labelPlan([labelCandidate(7116, 100), labelCandidate(7183, 200)], {
       priority: { mode, agingHours: null },
     });
-    // The shared ranker derives classes in shadow too; catch-up consumes those classes today.
-    expect(plan.run.map(pr => pr.num)).toEqual(mode === 'off' ? [7116] : [7183]);
+    expect(plan.run.map(pr => pr.num)).toEqual(mode === 'enforce' ? [7183] : [7116]);
   });
 
   it.each([{ isDraft: true }, { mergeStateStatus: 'DIRTY' }, { labels: [{ name: 'priority:urgent' }, { name: 'review:changes' }] }])('never bypasses existing eligibility with urgent: %j', patch => {
@@ -3056,4 +3055,80 @@ it('catch-up miss backoff uses a nondefault TTL from the resolved setting', asyn
   await f.handle.catchUp();
   f.advance(600_000); await f.handle.catchUp();
   expect(f.calls).toHaveLength(2);
+});
+
+
+describe('urgent label actor verification', () => {
+  it.each([false, undefined, null, 'true'])('keeps unverified urgent plain (%s)', urgentLabelVerified => {
+    expect(labelPlan([labelCandidate(7116, 100), labelCandidate(7183, 200, { urgentLabelVerified })])
+      .run.map(pr => pr.num)).toEqual([7116]);
+  });
+
+  const event = (id, login, created_at = '2026-01-01') => ({ id, event: 'labeled',
+    label: { name: 'priority:urgent' }, actor: login ? { login } : null, created_at });
+  async function listing(execLabelEvents, count = 1) {
+    const log = vi.fn();
+    const result = await readCatchUpCandidates({ repo: REPO, readComments: () => [], log, execLabelEvents,
+      execFileImpl: (_cmd, args, _opts, cb) => cb(null, JSON.stringify({ data: { repository:
+        args.some(arg => arg.includes('pullRequests(')) ? { pullRequests: {
+          nodes: [{ ...CANDIDATE_FIELDS, number: 999 }, ...Array.from({ length: count }, (_, i) => ({
+            ...CANDIDATE_FIELDS, number: i + 1, labels: { nodes: [{ name: 'ready-to-merge' }, { name: 'priority:urgent' }],
+              pageInfo: { hasNextPage: false } },
+          }))], pageInfo: { hasNextPage: false },
+        } } : {},
+      } })),
+    });
+    return { result, log };
+  }
+
+  it.each([
+    ['operator', [event(2, 'chalbert')], true],
+    ['delivery App', [event(2, 'web-everything')], true],
+    ['latest id wins over timestamps and array order', [event(9, 'outsider', '2020-01-01'), event(8, 'chalbert', '2030-01-01')], false],
+    ['trusted latest id', [event(9, 'chalbert', '2020-01-01'), event(8, 'outsider', '2030-01-01')], true],
+    ['no actor', [event(2, null)], false],
+    ['latest actor missing', [event(1, 'chalbert'), event(2, null)], false],
+    ['no event', [], false],
+    ['malformed id', [event(null, 'chalbert')], false],
+    ['unreadable response', {}, false],
+    ['unrelated event', [{ ...event(2, 'chalbert'), event: 'unlabeled' }], false],
+  ])('%s', async (_name, events, verified) => {
+    const exec = vi.fn(() => JSON.stringify(events));
+    const { result } = await listing(exec);
+    expect(result.prs.find(pr => pr.num === 1).urgentLabelVerified).toBe(verified);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][1]).toEqual(['api', `repos/${REPO}/issues/1/events?per_page=100&page=1`]);
+    expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 10000, maxBuffer: 1024 * 1024, throttle: { maxAttempts: 1 } });
+    expect(result.prs.find(pr => pr.num === 999).urgentLabelVerified).not.toBe(true);
+  });
+
+  it('read failure keeps priority plain and names the fallback', async () => {
+    const { result, log } = await listing(() => { throw new Error('unreadable'); });
+    expect(result.prs.find(pr => pr.num === 1).urgentLabelVerified).toBe(false);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/plain.*operator/i));
+  });
+
+  it('reads all bounded pages and chooses the latest event id', async () => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => event(i + 1, 'chalbert'))))
+      .mockReturnValueOnce(JSON.stringify([event(101, 'outsider')]));
+    const { result } = await listing(exec);
+    expect(result.prs.find(pr => pr.num === 1).urgentLabelVerified).toBe(false);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it('oversized event history stays plain with an operator fallback', async () => {
+    const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => event(i + 1, 'chalbert'))));
+    const { result, log } = await listing(exec);
+    expect(exec).toHaveBeenCalledTimes(3);
+    expect(result.prs.find(pr => pr.num === 1).urgentLabelVerified).toBe(false);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/plain.*operator/i));
+  });
+
+  it('caps urgent candidate reads and leaves overflow plain with an operator fallback', async () => {
+    const exec = vi.fn(() => JSON.stringify([event(1, 'chalbert')]));
+    const { result, log } = await listing(exec, 21);
+    expect(exec).toHaveBeenCalledTimes(20);
+    expect(result.prs.find(pr => pr.num === 21).urgentLabelVerified).toBe(false);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/plain.*operator/i));
+  });
 });
